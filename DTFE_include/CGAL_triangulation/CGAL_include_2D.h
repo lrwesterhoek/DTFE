@@ -20,13 +20,10 @@
  *
  */
 
-
-#include <boost/multiprecision/gmp.hpp>
-
 #include <CGAL/basic.h>
 #include <CGAL/Exact_predicates_inexact_constructions_kernel.h>
-#include <CGAL/Delaunay_triangulation_3.h>
-#include <CGAL/Triangulation_vertex_base_with_info_3.h>
+#include <CGAL/Delaunay_triangulation_2.h>
+#include <CGAL/Triangulation_vertex_base_with_info_2.h>
 #include <CGAL/Timer.h>
 #include <CGAL/Cartesian.h>
 #include <CGAL/Bbox_2.h>
@@ -50,26 +47,20 @@ typedef boost::mt19937 base_generator_type;
 
 
 typedef CGAL::Exact_predicates_inexact_constructions_kernel         K;
-typedef CGAL::Triangulation_vertex_base_with_info_3<vertexData, K>  Vb;
-typedef CGAL::Triangulation_data_structure_3<Vb>                    Tds;
-typedef CGAL::Delaunay_triangulation_3<K, Tds, CGAL::Fast_location> DT;
+typedef CGAL::Triangulation_vertex_base_with_info_2<vertexData, K>  Vb;
+typedef CGAL::Triangulation_data_structure_2<Vb>                    Tds;
+typedef CGAL::Delaunay_triangulation_2<K, Tds>                      DT;
 
 typedef DT::Point                   Point;
 typedef DT::Locate_type             Locate_type;
-typedef DT::Cell_handle             Cell_handle;
-typedef DT::Cell_iterator           Cell_iterator;
-typedef DT::Finite_cells_iterator   Finite_cells_iterator;
+typedef DT::Face_handle             Cell_handle;
+typedef DT::Face_iterator           Cell_iterator;
+typedef DT::Finite_faces_iterator   Finite_cells_iterator;
 typedef DT::Vertex_handle           Vertex_handle;
 typedef CGAL::Timer                 Timer;
 
-typedef CGAL::Cartesian<Real>       K2;
+typedef CGAL::Cartesian<float>      K2;
 typedef K2::Point_2                 Point_22;
 typedef CGAL::Circle_2<K2>          Circle_2;
+typedef CGAL::Bbox_2                Bbox;
 typedef CGAL::Bbox_2                Bbox_2;
-typedef CGAL::Bbox_3                Bbox;
-
-
-
-
-
-

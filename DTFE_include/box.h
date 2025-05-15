@@ -141,6 +141,7 @@ struct Box
     Real volume() const
     {
         Real temp = 1.;
+        printf("%d\n", NO_DIM);
         for (size_t i=0; i<NO_DIM; i++) {
             temp *= 35000; //coords[2*i+1] - coords[2*i];
         }

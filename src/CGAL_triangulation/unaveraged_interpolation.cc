@@ -254,8 +254,8 @@ void interpolateGrid(DT &dt,
         dx[i] = boxLength[i] / nGrid[i];
     
 #ifdef TEST_PADDING
-    vector<size_t> incompleteCells_d;// keep track of grid cells where there is an error in the density field computation (because one of the vertices is a dummy point)
-    vector<size_t> incompleteCells;  // keep track of grid cells where there is an error in the field (all fields except density) computation (because one of the vertices is a dummy point)
+    vector<size_t> dummyGridCells_d; // instead of incompleteCells_d
+    vector<size_t> dummyGridCells;   // instead of incompleteCells  // keep track of grid cells where there is an error in the field (all fields except density) computation (because one of the vertices is a dummy point)
 #endif
     int prev = 0, amount100 = 0;    // variable to show the user about the progress of the computation
     

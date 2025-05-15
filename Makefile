@@ -2,13 +2,13 @@
 
 
 # Path to the GSL, Boost C++ and CGAL libraries - must be set by user (only if they aren't installed in the default system path) -- (NOTE: You must add only the directory where the libraries are installed, the program will add the '/lib' and '/include' parts automatically); C++ compiler - preferably a version that supports OpenMP
-GSL_PATH   = /cosma/local/gsl/2.4
-BOOST_PATH = /cosma/local/boost/gnu_7.3.0/1_67_0
-CGAL_PATH  = /cosma/home/dphlss/cautun/Programs/stow
-MPRF_PATH  = /cosma/home/dphlss/cautun/Programs/stow
-CC = g++
-# set the following if you have installed the HDF5 library and would like to read in HDF5 gadget files (you need to compile the HDF5 library with the '--enable-cxx' configure option)
-HDF5_PATH  = /cosma/local/hdf5/gnu_7.3.0/1.10.3
+GSL_PATH   = /opt/homebrew/opt/gsl
+BOOST_PATH = /opt/homebrew/opt/boost
+CGAL_PATH  = /opt/homebrew/opt/cgal
+MPFR_PATH  = /opt/homebrew/opt/mpfr
+HDF5_PATH  = /opt/homebrew/opt/hdf5
+GMP_PATH = /opt/homebrew/opt/gmp
+CC = /opt/homebrew/opt/llvm/bin/clang++
 
 
 # paths to where to put the object files and the executables files. If you build the DTFE library than you also need to specify the directory where to put the library and the directory where to copy the header files needed by the library (choose an empty directory for the header files).
@@ -16,8 +16,6 @@ OBJ_DIR = ./o
 BIN_DIR = ./
 LIB_DIR = ./
 INC_DIR = ./DTFE_include
-
-
 
 ############################# Choose the compiler directives ##################################
 
@@ -40,39 +38,39 @@ OPTIONS += -DNO_SCALARS=1
 ############################# Input and output operations default settings ##################################
 #------------------------ set which are the default input and output functions for doing data io
 # default function to read the input data (101-multiple gadget file, 102-single gadget file, 105-HDF5 gadget file, 111-text file, ... see documentation for more options). The input file type can be set during runtime using the option '--input'. This makefile option only sets a default input file in the case none is given via the program options.
-OPTIONS += -DINPUT_FILE_DEFAULT=101 
+OPTIONS += -DINPUT_FILE_DEFAULT=105
 # default value for the units of the input data (value=what is 1 Mpc in the units of the data - in this example the data is in kpc). You can change this also during runtime using the program option '--MpcUnit'.
-OPTIONS += -DMPC_UNIT=1000. 
+OPTIONS += -DMPC_UNIT=1000 
 # default function to write the output data (101-binary file, 111-text file, ... see documentation for more options). The output file type can be set during runtime using the option '--output'. This makefile option only sets a default output file in the case none is given via the program options.
-OPTIONS += -DOUTPUT_FILE_DEFAULT=101  
+OPTIONS += -DOUTPUT_FILE_DEFAULT=101
 #101 for binary file, 100 my density file
 
 ############################# additional compiler options ##################################
 # enable this option if to use OpenMP (share the workload between CPU cores sharing the same RAM)
 OPTIONS += -DOPEN_MP 
 # enable to check if the padding gives a complete Delaunay Tesselation of the region of interest
-# OPTIONS += -DTEST_PADDING 
+#OPTIONS += -DTEST_PADDING 
 # enable this option to shift from position space to redshift space; You also need to activate this option during run-time using '--redshift-space arguments'
 OPTIONS += -DREDSHIFT_SPACE
 
 #------------------------ options usefull when using DTFE as a library
 # uncomment the line to get access to a function that returns the Delaunay triangulation of the point set
-# OPTIONS += -DTRIANGULATION 
+#OPTIONS += -DTRIANGULATION
 
 
 ############################# Help menu messages options ##################################
 #------------------------ compiler directive that affect only the help messages when using the '-h / --help' option (it does not affect the program in any other way)- if the option is uncommented, than it will show that set of options in the help menu
 OPTIONS += -DFIELD_OPTIONS 
 OPTIONS += -DREGION_OPTIONS 
-# OPTIONS += -DPARTITION_OPTIONS 
-# OPTIONS += -DPADDING_OPTIONS 
-OPTIONS += -DAVERAGING_OPTIONS 
-# OPTIONS += -DREDSHIFT_CONE_OPTIONS 
+OPTIONS += -DPARTITION_OPTIONS 
+OPTIONS += -DPADDING_OPTIONS 
+OPTIONS += -DAVERAGING_OPTIONS
+OPTIONS += -DREDSHIFT_CONE_OPTIONS 
 OPTIONS += -DADDITIONAL_OPTIONS 
 
 
 
-
+OPTIONS += -DBOOST_TIMER_ENABLE_DEPRECATED
 
 
 
@@ -95,6 +93,14 @@ ifneq ($(strip $(CGAL_PATH)),)
 	INCLUDES += -I/$(strip $(CGAL_PATH))/include 
 	LIBRARIES += -L/$(strip $(CGAL_PATH))/lib 
 endif
+ifneq ($(strip $(GMP_PATH)),)
+    INCLUDES += -I/$(strip $(GMP_PATH))/include
+    LIBRARIES += -L/$(strip $(GMP_PATH))/lib
+endif
+ifneq ($(strip $(MPFR_PATH)),)
+    INCLUDES += -I$(MPFR_PATH)/include
+    LIBRARIES += -L$(MPFR_PATH)/lib
+endif
 ifneq ($(strip $(HDF5_PATH)),)
 	INCLUDES += -I/$(strip $(HDF5_PATH))/include 
 	LIBRARIES += -L/$(strip $(HDF5_PATH))/lib -lhdf5 -lhdf5_cpp
@@ -103,12 +109,11 @@ endif
 
 
 
-COMPILE_FLAGS = -frounding-math -O3 -fopenmp -DNDEBUG $(OPTIONS)
+COMPILE_FLAGS = -frounding-math -O3 -fopenmp=libomp -DNDEBUG $(OPTIONS)
 DTFE_INC = $(INCLUDES)
 # the following libraries should work in most cases
-DTFE_LIB = $(LIBRARIES) -lCGAL -lboost_thread -lboost_filesystem -lboost_program_options -lgsl -lgslcblas -lm  -lgmp -lmpfr -lboost_system
-
-
+DTFE_LIB = $(LIBRARIES) -lboost_thread -lboost_filesystem -lboost_program_options -lgsl -lgslcblas -lm  -lgmp -lmpfr -lboost_system
+#-lCGAL
 
 IO_SOURCES = $(addprefix io/, input_output.h gadget_reader_header.cc gadget_reader_binary.cc gadget_reader_HDF5.cc gadget_reader_HDF5_Cristian.cc gadget_reader_MOG.cc hdf5_input_my_DESI.cc text_io.cc binary_io.cc my_io.cc)
 MAIN_SOURCES = main.cpp DTFE.h message.h user_options.h input_output.cc $(IO_SOURCES)

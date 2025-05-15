@@ -115,22 +115,22 @@ void NGP_interpolation_regular_grid(vector<Particle_data> &particles,
     
     // divide the momentum by the mass in the cells
     if ( userOptions.aField.velocity )
-        for (size_t i=0; i<reserveSize; ++i)
-            if ( q->density[i]!=Real(0.) )
+        for (size_t i=0; i<reserveSize; ++i) {
+            if ( q->density[i]!=Real(0.) ) {
                 q->velocity[i] /= q->density[i];
-            else
+            } else {
                 q->velocity[i] = Pvector<Real,noVelComp>::zero();
+            }
+        }
     
     // normalize the density to average background density
-    if ( userOptions.aField.density )
-    {
+    if ( userOptions.aField.density ) {
         Real factor = Real( q->density.size() ) / box.volume() / userOptions.averageDensity;
         for (vector<Real>::iterator it=q->density.begin(); it!=q->density.end(); ++it)
             (*it) *= factor;
-    }
-    else
+    } else {
         q->density.clear();
-    
+    }
     message << "Done.\n" << MESSAGE::Flush;
     printElapsedTime( &t, &userOptions, "NGP interpolation" );
 }

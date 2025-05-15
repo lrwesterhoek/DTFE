@@ -53,7 +53,7 @@ void HDF5_readGadgetData_Cristian(std::string filename,
     
     // open the HDF5 file
     const H5std_string FILE_NAME( filename );
-    H5File *file = new H5File( FILE_NAME, H5F_ACC_RDONLY, H5P_DEFAULT );
+    H5File *file = new H5File( FILE_NAME, H5F_ACC_RDONLY, H5::FileAccPropList::DEFAULT );
     Group *group;
     
     
@@ -67,7 +67,7 @@ void HDF5_readGadgetData_Cristian(std::string filename,
         {
             if ( gadgetHeader.npart[type]<=0 ) continue;
             char buf[500];
-            sprintf( buf, "/PartType%d", type );
+            snprintf( buf, sizeof(buf), "/PartType%d", type );
             group = new Group( file->openGroup(buf) );
             
             // open the data set
@@ -107,7 +107,7 @@ void HDF5_readGadgetData_Cristian(std::string filename,
             else                                        // particle masses are variable
             {
                 char buf[500];
-                sprintf( buf, "/PartType%d", type );
+                snprintf( buf, sizeof(buf), "/PartType%d", type );
                 group = new Group( file->openGroup(buf) );
                 
                 DataSet dataset = group->openDataSet("Mass");
@@ -131,7 +131,7 @@ void HDF5_readGadgetData_Cristian(std::string filename,
         {
             if ( gadgetHeader.npart[type]<=0 ) continue;
             char buf[500];
-            sprintf( buf, "/PartType%d", type );
+            snprintf( buf, sizeof(buf), "/PartType%d", type );
             group = new Group( file->openGroup(buf) );
             
             // open the data set

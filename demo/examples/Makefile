@@ -2,10 +2,10 @@
 
 
 # Path to the GSL, Boost C++ and CGAL libraries - must be set by user (only if they aren't installed in the default system path); C++ compiler - preferably a version that supports OpenMP
-GSL_PATH = 
-BOOST_PATH = 
-CGAL_PATH = 
-CC = g++44
+GSL_PATH   = /opt/homebrew/opt/gsl
+BOOST_PATH = /opt/homebrew/opt/boost
+CGAL_PATH  = /opt/homebrew/opt/cgal
+CC = /opt/homebrew/opt/llvm/bin/clang++
 
 
 # paths to where to put the object files and the executables files. If you build the DTFE library than you also need to specify the directory where to put the library and the directory where to copy the header files needed by the library (choose an empty directory for the header files).
@@ -34,7 +34,7 @@ OPTIONS += -DNO_SCALARS=1
 # enable this option if to use OpenMP (share the workload between CPU cores sharing the same RAM)
 OPTIONS += -DOPEN_MP 
 # enable this if the input data is not in Mpc units (value=what is 1 MPc in the units of the data - in this example the data is in kpc)
-OPTIONS += -DMPC_UNIT=1000. 
+OPTIONS += -DMPC_UNIT=1. 
 #------------------------ options usefull when using DTFE as a library
 # uncomment the line to get access to a function that returns the Delaunay triangulation of the point set
 # OPTIONS += -DTRIANGULATION 

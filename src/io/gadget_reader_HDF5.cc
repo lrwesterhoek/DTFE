@@ -50,7 +50,7 @@ void HDF5_readGadgetHeader(std::string filename,
     const H5std_string FILE_NAME( filename );
     
     // open the HDF5 file and the header group
-    H5File *file = new H5File( FILE_NAME, H5F_ACC_RDONLY, H5P_DEFAULT );
+    H5File *file = new H5File( FILE_NAME, H5F_ACC_RDONLY, H5::FileAccPropList::DEFAULT );
     Group *group = new Group( file->openGroup("/Header") );
     
     
@@ -131,7 +131,7 @@ void HDF5_readGadgetData(std::string filename,
     
     // open the HDF5 file
     const H5std_string FILE_NAME( filename );
-    H5File *file = new H5File( FILE_NAME, H5F_ACC_RDONLY, H5P_DEFAULT );
+    H5File *file = new H5File( FILE_NAME, H5F_ACC_RDONLY, H5::FileAccPropList::DEFAULT );
     Group *group;
     
     
@@ -145,7 +145,7 @@ void HDF5_readGadgetData(std::string filename,
         {
             if ( gadgetHeader.npart[type]<=0 ) continue;
             char buf[500];
-            sprintf( buf, "/PartType%d", type );
+            snprintf( buf, sizeof(buf), "/PartType%d", type );
             group = new Group( file->openGroup(buf) );
             
             // open the data set
@@ -178,7 +178,7 @@ void HDF5_readGadgetData(std::string filename,
             else                                        // particle masses are variable
             {
                 char buf[500];
-                sprintf( buf, "/PartType%d", type );
+                snprintf( buf, sizeof(buf),  "/PartType%d", type );
                 group = new Group( file->openGroup(buf) );
                 
                 DataSet dataset = group->openDataSet("Mass");
@@ -202,11 +202,11 @@ void HDF5_readGadgetData(std::string filename,
         {
             if ( gadgetHeader.npart[type]<=0 ) continue;
             char buf[500];
-            sprintf( buf, "/PartType%d", type );
+            snprintf( buf, sizeof(buf), "/PartType%d", type );
             group = new Group( file->openGroup(buf) );
             
             // open the data set
-            DataSet dataset = group->openDataSet("Velocity");
+            DataSet dataset = group->openDataSet("Velocities");
             
             dataset.read( &(velocities[dataOffset]), PredType::NATIVE_FLOAT );
             delete group;
@@ -445,10 +445,10 @@ void HDF5_readGadgetData_HI(std::string filename,
     
     
     // open the HDF5 file - this gives the gas data
-    H5File *file = new H5File( filename.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT );
+    H5File *file = new H5File( filename.c_str(), H5F_ACC_RDONLY, H5::FileAccPropList::DEFAULT );
     Group *group;
     // open the file with the HI fraction
-    H5File *file2 = new H5File( h1FileName.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT );
+    H5File *file2 = new H5File( h1FileName.c_str(), H5F_ACC_RDONLY, H5::FileAccPropList::DEFAULT );
     
     
     // read the coordinates
@@ -461,7 +461,7 @@ void HDF5_readGadgetData_HI(std::string filename,
         {
             if ( gadgetHeader.npart[type]<=0 ) continue;
             char buf[500];
-            sprintf( buf, "/PartType%d", type );
+            snprintf( buf, sizeof(buf),  "/PartType%d", type );
             group = new Group( file->openGroup(buf) );
             
             // open the data set
@@ -494,7 +494,7 @@ void HDF5_readGadgetData_HI(std::string filename,
             else                                        // particle masses are variable
             {
                 char buf[500];
-                sprintf( buf, "/PartType%d", type );
+                snprintf( buf, sizeof(buf), "/PartType%d", type );
                 group = new Group( file->openGroup(buf) );
                 
                 DataSet dataset = group->openDataSet("Mass");
@@ -558,11 +558,11 @@ void HDF5_readGadgetData_HI(std::string filename,
         {
             if ( gadgetHeader.npart[type]<=0 ) continue;
             char buf[500];
-            sprintf( buf, "/PartType%d", type );
+            snprintf( buf, sizeof(buf), "/PartType%d", type );
             group = new Group( file->openGroup(buf) );
             
             // open the data set
-            DataSet dataset = group->openDataSet("Velocity");
+            DataSet dataset = group->openDataSet("Velocities");
             
             dataset.read( &(velocities[dataOffset]), PredType::NATIVE_FLOAT );
             delete group;

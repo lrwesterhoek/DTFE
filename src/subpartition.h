@@ -383,8 +383,7 @@ void copySubgridInformation(User_options *userOptions,
 }
 
 /* Output the subgrid used for single partition computation. */
-void subgrid(User_options &userOptions,
-			 std::vector< std::vector<size_t> > &subgrid)
+void subgrid(User_options &userOptions, std::vector< std::vector<size_t> > &subgrid)
 {
     MESSAGE::Message message( userOptions.verboseLevel );
     message << "\nYou choose to compute the results only for a partition of the data. The output files will contain only the results for the grid indices with:\n"

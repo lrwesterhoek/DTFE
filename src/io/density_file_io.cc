@@ -126,7 +126,7 @@ struct Density_header
             << "file type     = " << fileTypeName << "\n"
             << "# density file= " << noDensityFiles << "\n";
         if ( noDensityFiles>1 )
-            std::cout << "file grid size= " << densityFileGrid[0] << "  " << densityFileGrid[1] << "  " << densityFileGrid[3] << "\n"
+            std::cout << "file grid size= " << densityFileGrid[0] << "  " << densityFileGrid[1] << "  " << densityFileGrid[2] << "\n"
                 << "file index    = " << indexDensityFile << "\n";
         std::cout << "box coords    = " << box[0] << "  " << box[1] << "  " << box[2] << "  " << box[3] << "  " << box[4] << "  " << box[5] << "\n";
             

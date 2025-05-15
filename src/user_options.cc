@@ -36,9 +36,6 @@
 #define MPC_UNIT 1.
 #endif
 
-
-
-
 // class constructor
 User_options::User_options()
 {
@@ -269,7 +266,8 @@ void User_options::shortHelp( char *progName )
     mainOptions.add_options()
             ("help,h", "produce this help message.")
             ("full_help", "produce detailed help message.")
-            ("grid,g", po::value< Real >(&temp), "specify grid size along each direction.")
+            //("grid,g", po::value< Real >(&temp), "specify grid size along each direction.")
+            ("grid,g", po::value< std::vector<size_t> >(&(this->gridSize))->multitoken(), "specify grid size along each direction.")
             ("box", po::value< Real >(&temp), "specify the coordinates of the box encompasing all the particles.")
             ("input,i", po::value< std::vector<int> >()->multitoken(), "give the type of the input file, which data to read and for which particle species. See full help for details.")
             ("output,o", po::value< std::vector<int> >(), "give the type of the output file. See full help for details.")
@@ -415,7 +413,7 @@ void User_options::printOptions()
     else if ( this->SPH ) 
     {
         char temp[100];
-        sprintf( temp, "%d neighbors", this->SPH_neighbors );
+        snprintf( temp, sizeof(temp), "%d neighbors", this->SPH_neighbors );
         interpolationMethod = "SPH ";
         interpolationMethod += temp;
     }
@@ -603,17 +601,24 @@ void User_options::readOptions(int argc, char *argv[], bool getFileNames, bool s
     option_dependency(vm, "partNo", "partition");
     option_dependency(vm, "redshiftCone", "origin");
     
-    
-    
+
+
     // Read the options supplied to the program
     if ( vm.count("grid") )
     {
         int const temp = this->gridSize.size();
-        if ( temp==1 ) this->gridSize.assign( NO_DIM, this->gridSize.at(0) );
-        else if ( temp!=NO_DIM ) throwError( "You can only insert 1 or ", NO_DIM, " values for the '-g [ --grid ]' option (e.g. '-g 256' or '-g 128 256 256')." );
-        
-        for (size_t i=0; i<this->gridSize.size(); ++i)
+        //printf("%zu\n", this->gridSize.at(0));
+        if ( temp==1 ) {
+            //this->gridSize.assign( NO_DIM, this->gridSize.at(0) );
+            this->gridSize = std::vector<size_t>(NO_DIM, this->gridSize.at(0));
+            //printf("%zu\n", this->gridSize[0]);
+        } else if ( temp!=NO_DIM ) {
+            throwError( "You can only insert 1 or ", NO_DIM, " values for the '-g [ --grid ]' option (e.g. '-g 256' or '-g 128 256 256')." );
+        }
+        for (size_t i=0; i<this->gridSize.size(); ++i) {
             lowerBoundCheck( this->gridSize[i], size_t(1), "the values of option '-g [ --grid ]'" );
+            //printf("%zu\n", this->gridSize[i]);
+        }
     }
     if ( vm.count("box") )      // read the box coordinates
     {

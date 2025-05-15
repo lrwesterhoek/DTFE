@@ -43,7 +43,7 @@ using namespace H5;
 std::string HDF5_filename_DESI( std::string fileRoot, size_t fileNumber, bool checkFileExists=true )
     {
         char buf[500];
-        sprintf( buf, fileRoot.c_str(), fileNumber );
+        snprintf( buf, sizeof(buf), fileRoot.c_str(), fileNumber );
         std::string fileName( buf );
         if ( not bfs::exists(fileName) and checkFileExists )
             throwError( "The program could not open the input GADGET snapshot file/files: '" + fileName + "'. It cannot find the file/files." );
@@ -65,7 +65,7 @@ void HDF5_readHeader_DESI(std::string filename,
     const H5std_string FILE_NAME( filename );
     
     // open the HDF5 file and the header group
-    H5File *file = new H5File( FILE_NAME, H5F_ACC_RDONLY, H5P_DEFAULT );
+    H5File *file = new H5File( FILE_NAME, H5F_ACC_RDONLY, H5::FileAccPropList::DEFAULT );
     Group *group = new Group( file->openGroup("Header") );
     
     
@@ -203,7 +203,7 @@ void HDF5_readData_DESI(std::string filenameRoot,
         
         // open the HDF5 file
         const H5std_string FILE_NAME( filename );
-        H5File *file = new H5File( FILE_NAME, H5F_ACC_RDONLY, H5P_DEFAULT );
+        H5File *file = new H5File( FILE_NAME, H5F_ACC_RDONLY, H5::FileAccPropList::DEFAULT );
         Group *group;
         group = new Group( file->openGroup("Matter") );
     
@@ -233,7 +233,7 @@ void HDF5_readData_DESI(std::string filenameRoot,
             size_t dataOffset = numParticlesRead * NO_DIM;      // the offset in the velocity array from where to start reading the new data
             message << "\t reading the particles velocities ... " << MESSAGE::Flush;
             
-            DataSet dataset = group->openDataSet("Velocity");
+            DataSet dataset = group->openDataSet("Velocities");
             DataSpace dataspace = dataset.getSpace();
             hsize_t dims_out[2];
             int ndims = dataspace.getSimpleExtentDims( dims_out, NULL );

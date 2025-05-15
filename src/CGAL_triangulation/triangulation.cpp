@@ -206,6 +206,7 @@ void vertexDensity(DT & dt,
     {
         MESSAGE::Error error;
         error << "The member 'averageDensity' of class 'User_options' must be positive since it represents the average density. Error found in function 'vertexDensity'." << MESSAGE::EndError;
+        printf("%f\n", userOptions.averageDensity);
     }
     if ( dt.number_of_vertices()<NO_DIM+1 )
     {

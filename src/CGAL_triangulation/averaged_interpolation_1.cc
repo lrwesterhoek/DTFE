@@ -23,6 +23,7 @@
 
 /* This file contains most of the functions necessary to interpolate to grid volume averaged fields inside the sampling cell using averaging method 1 (= choose sampling points inside the Delaunay cell). */
 #include <typeinfo>
+#include <stdio.h>
 #include <gsl/gsl_qrng.h>
 
 
@@ -230,7 +231,7 @@ void interpolateGrid_averaged_1(DT &dt,
             << "There are " << NN << " random sampling points on average in each grid cell of the output fields (the random samples in the Delaunay triangulation's triangles/tetrahedra are proportional to the area/volume of the cell).\n" 
             << "\t Done: " << MESSAGE::Flush;
     
-    
+    //printf("grid!");
     // Initialize the grid field values to 0
     size_t const gridSize = (NO_DIM==2) ? nGrid[0]*nGrid[1] : nGrid[0]*nGrid[1]*nGrid[2];
     if ( field.density ) assingZeroValues<Real>( density, gridSize );
@@ -259,8 +260,8 @@ void interpolateGrid_averaged_1(DT &dt,
         dx[i] = boxLength[i] / nGrid[i];
     Real const gridCellVolume = (NO_DIM==2) ? (dx[0]*dx[1]) : (dx[0]*dx[1]*dx[2]);    // the volume of a grid cell
 #ifdef TEST_PADDING
-    vector<size_t> incompleteCells_d;// keep track of grid cells where there is an error in the density field computation (because one of the vertices is a dummy point)
-    vector<size_t> incompleteCells;  // keep track of grid cells where there is an error in the field (all fields except density) computation (because one of the vertices is a dummy point)
+    vector<size_t> dummyGridCells_d; // instead of incompleteCells_d
+    vector<size_t> dummyGridCells;   // instead of incompleteCells  // keep track of grid cells where there is an error in the field (all fields except density) computation (because one of the vertices is a dummy point)
 #endif
     
     

@@ -198,8 +198,8 @@ void interpolateGrid_averaged_0(DT &dt,
         dx[i] = boxLength[i] / nGrid[i];
     Real const gridCellVolume = (NO_DIM==2) ? (dx[0]*dx[1]) : (dx[0]*dx[1]*dx[2]);    // the volume of a grid cell
 #ifdef TEST_PADDING
-    vector<size_t> incompleteCells_d;// keep track of grid cells where there is an error in the density field computation (because one of the vertices is a dummy point)
-    vector<size_t> incompleteCells;  // keep track of grid cells where there is an error in the field (all fields except density) computation (because one of the vertices is a dummy point)
+    vector<size_t> dummyGridCells_d; // instead of incompleteCells_d
+    vector<size_t> dummyGridCells;   // instead of incompleteCells  // keep track of grid cells where there is an error in the field (all fields except density) computation (because one of the vertices is a dummy point)
 #endif
     
     

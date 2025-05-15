@@ -56,7 +56,7 @@ struct Gadget_header
     std::string filename(std::string fileRoot, int const fileNumber, bool checkFileExists=true )
     {
         char buf[500];
-        sprintf( buf, fileRoot.c_str(), fileNumber );
+        snprintf( buf, sizeof(buf), fileRoot.c_str(), fileNumber );
         std::string fileName( buf );
         if ( not bfs::exists(fileName) and checkFileExists )
             throwError( "The program could not open the input GADGET snapshot file/files: '" + fileName + "'. It cannot find the file/files." );

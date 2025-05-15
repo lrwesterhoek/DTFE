@@ -117,9 +117,6 @@ void DTFE(vector<Particle_data> *allParticles,
         tempOptions.aField.deselectVelocityDerivatives();
     }
     
-    
-    
-    
     //! Select only the particles in the region of interest
     vector<Particle_data> particlesRegion; // vector for storing the particles in '--region'
     if ( userOptions.regionOn )     // Select only the particles in the user defined region
@@ -316,7 +313,6 @@ void DTFE_parallel(vector<Particle_data> *allParticles,
     // reserve memory for the quantities of interest
     uQuantities->reserveMemory( &(userOptions.gridSize[0]), userOptions.uField );
     aQuantities->reserveMemory( &(userOptions.gridSize[0]), userOptions.aField );
-    
     // define some variables to keep track of the time and particle numbers associated to each processor
     MESSAGE::Message message( userOptions.verboseLevel );
     message << "From now on only the master thread will show messages on how the computation is going. Not all threads take the same execution time, so there may be a discrepancy between the messages displayed to the user and the computations across all threads.\n\n" << MESSAGE::Flush;
@@ -517,12 +513,12 @@ It takes the following arguments:
 NOTE: This function clears the vector 'allParticles'. */
 void DTFE(vector<Particle_data> *allParticles,
           vector<Sample_point> &samples,
-          User_options & userOptions,,
+          User_options & userOptions,
           Quantities *uQuantities,
           Quantities *aQuantities,
           DT &delaunay_triangulation)
 {
-    userOptions.field.triangulation = true;
+    //userOptions.triangulation = true;
     
     //! If the user requested for a set of random particles, generate them
     if ( userOptions.poisson!=0 )
@@ -648,7 +644,7 @@ void DTFE(vector<Particle_data> *allParticles,
     // if the computation was done only for a given partition, output to the user the grid indices used for that
     if ( userOptions.partitionOn and userOptions.partNo>=0 )
     {
-        subgrid( userOptions );
+        subgrid( userOptions, subgrid );
     }
 }
 #endif
