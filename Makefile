@@ -55,7 +55,7 @@ OPTIONS += -DREDSHIFT_SPACE
 
 #------------------------ options usefull when using DTFE as a library
 # uncomment the line to get access to a function that returns the Delaunay triangulation of the point set
-#OPTIONS += -DTRIANGULATION
+OPTIONS += -DTRIANGULATION
 
 
 ############################# Help menu messages options ##################################
@@ -112,8 +112,7 @@ endif
 COMPILE_FLAGS = -frounding-math -O3 -fopenmp=libomp -DNDEBUG $(OPTIONS)
 DTFE_INC = $(INCLUDES)
 # the following libraries should work in most cases
-DTFE_LIB = $(LIBRARIES) -lboost_thread -lboost_filesystem -lboost_program_options -lgsl -lgslcblas -lm  -lgmp -lmpfr -lboost_system
-#-lCGAL
+DTFE_LIB = $(LIBRARIES) -lboost_thread -lboost_filesystem -lboost_program_options -lgsl -lgslcblas -lm  -lgmp -lmpfr -lboost_system #-lCGAL
 
 IO_SOURCES = $(addprefix io/, input_output.h gadget_reader_header.cc gadget_reader_binary.cc gadget_reader_HDF5.cc gadget_reader_HDF5_Cristian.cc gadget_reader_MOG.cc hdf5_input_my_DESI.cc text_io.cc binary_io.cc my_io.cc)
 MAIN_SOURCES = main.cpp DTFE.h message.h user_options.h input_output.cc $(IO_SOURCES)

@@ -587,7 +587,11 @@ void DTFE(vector<Particle_data> *allParticles,
         MESSAGE::Message message( userOptions.verboseLevel );
         message << "The program will interpolate the fields in partition number " << userOptions.partNo << " of partition grid [" << MESSAGE::printElements( userOptions.partition, "," ) << "].\n" << MESSAGE::Flush;
         
-        subgrid( userOptions.gridSize, &tempOptions );  // computes what is the size of the subgrid (will be written to tempOptions.gridSize) and the boundaries of the box bounding the subgrid (saved in tempOptions.region)
+        // get the optimal division in a subgrid
+        std::vector< std::vector<size_t> > subgridList;
+        std::vector< Box > subgridCoords;
+        optimalPartitionSplit( *particlePointer, tempOptions, tempOptions.partition, &subgridList, &subgridCoords );
+        copySubgridInformation( &tempOptions, subgridList, subgridCoords );
         userOptions.region = tempOptions.region;
         
         // find the box values with padding added and find the particles in that extended region
@@ -644,7 +648,11 @@ void DTFE(vector<Particle_data> *allParticles,
     // if the computation was done only for a given partition, output to the user the grid indices used for that
     if ( userOptions.partitionOn and userOptions.partNo>=0 )
     {
-        subgrid( userOptions, subgrid );
+        // get the optimal division in a subgrid
+        std::vector< std::vector<size_t> > subgridList;
+        std::vector< Box > subgridCoords;
+        optimalPartitionSplit( *particlePointer, userOptions, userOptions.partition, &subgridList, &subgridCoords );
+        subgrid( userOptions, subgridList );
     }
 }
 #endif
