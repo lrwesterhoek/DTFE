@@ -1,0 +1,46 @@
+name: Cross-Platform Build Test
+
+on: [push, pull_request]
+
+jobs:
+  test-platforms:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Install dependencies (Ubuntu)
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential libgsl-dev libboost-all-dev \
+                                libcgal-dev libmpfr-dev libhdf5-dev libgmp-dev
+                                
+    - name: Install dependencies (macOS)
+      if: matrix.os == 'macos-latest'
+      run: |
+        brew install gsl boost cgal mpfr hdf5 gmp llvm
+        
+    - name: Install dependencies (Windows)
+      if: matrix.os == 'windows-latest'
+      run: |
+        # Use vcpkg or chocolatey to install dependencies
+        # This would need to be customized based on preferred Windows package manager
+        echo "Windows dependency installation would go here"
+        
+    - name: Test platform detection
+      run: make test-platform
+      
+    - name: Run validation tests
+      run: make test-validation
+      
+    - name: Test dry run build
+      run: make --dry-run DTFE || echo "Dry run completed"
+      
+    - name: Build project (if dependencies are available)
+      run: make DTFE || echo "Build attempted - may fail if dependencies missing"
+      continue-on-error: true

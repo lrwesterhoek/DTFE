@@ -79,3 +79,14 @@ demo/visit_visualization.bov
 demo/examples/Makefile
 demo/.DS_Store
 .DS_Store
+*.hdf5
+*.a_den
+*.a_vel
+*.a_velDiv
+*.a_velShear
+*.a_velGrad
+*.a_velVort
+*.png
+*.txt
+*.mp4
+*.py
