@@ -149,7 +149,7 @@ void showCellsContainingDummyPoints(vector<size_t> *dummyGridCells,
     if ( nGrid==NULL) nGrid = &(userOptions.gridSize[0]);
     size_t const totalSize = (NO_DIM==2)? (nGrid[0]*nGrid[1]) : (nGrid[0]*nGrid[1]*nGrid[2]);  // the number of cell in the density grid
     char threadId[100] = "";
-    if ( userOptions.noProcessors!=1 ) snprintf( threadId, sizeof(threadId), "%d", userOptions.threadId );
+    if ( userOptions.noProcessors!=1 ) sprintf( threadId, "%d", userOptions.threadId );
     string output = outputName + ".badGridPoints" + threadId;   // name of the output file
     
     sort( dummyGridCells->begin(), dummyGridCells->end() );

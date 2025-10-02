@@ -81,8 +81,8 @@ void interpolateGrid_averaged_2(DT &dt,
         dx[i] = boxLength[i] / nGrid[i];
     
 #ifdef TEST_PADDING
-    vector<size_t> incompleteCells_d;// keep track of grid cells where there is an error in the density field computation (because one of the vertices is a dummy point)
-    vector<size_t> incompleteCells;  // keep track of grid cells where there is an error in the field (all fields except density) computation (because one of the vertices is a dummy point)
+    vector<size_t> dummyGridCells_d; // instead of incompleteCells_d
+    vector<size_t> dummyGridCells;   // instead of incompleteCells  // keep track of grid cells where there is an error in the field (all fields except density) computation (because one of the vertices is a dummy point)
 #endif
     int prev = 0, amount100 = 0;    // variable to show the user about the progress of the computation
     
@@ -209,8 +209,8 @@ void interpolateGrid_averaged_2(DT &dt,
                 size_t k = 0;
 #endif
                 Real index = gridCellIndex( i,j,k, nGrid );
-                if ( dummyNeighbors ) updateDummyGridCells( index, &incompleteCells_d ); // if one of the vertices is or has dummy neighbors, keep track of this cell
-                if ( dummyVertices ) updateDummyGridCells( index, &incompleteCells ); // if one of the vertices is a dummy test point, keep track of this cell
+                if ( dummyNeighbors ) updateDummyGridCells( index, &dummyGridCells_d ); // if one of the vertices is or has dummy neighbors, keep track of this cell
+                if ( dummyVertices ) updateDummyGridCells( index, &dummyGridCells ); // if one of the vertices is a dummy test point, keep track of this cell
 #endif
                 
 #if NO_DIM==3     // end additional z-loop
@@ -226,9 +226,9 @@ void interpolateGrid_averaged_2(DT &dt,
     
 #ifdef TEST_PADDING
     if (field.density)
-        showCellsContainingDummyPoints( &incompleteCells_d, userOptions, userOptions.outputFilename+"_density", "density" ); // check if there are any cells which may have an error in thedensity estimation due to an incomplete Delaunay tesselation over the region of interest
+        showCellsContainingDummyPoints( &dummyGridCells_d, userOptions, userOptions.outputFilename+"_density", "density" ); // check if there are any cells which may have an error in thedensity estimation due to an incomplete Delaunay tesselation over the region of interest
     if ( field.velocity or field.velocity_gradient or field.scalar or field.scalar_gradient )
-        showCellsContainingDummyPoints( &incompleteCells, userOptions, userOptions.outputFilename+"_fields", "fields" ); // check if there are any cells which may have an error in the fields estimation (all fields except density) due to an incomplete Delaunay tesselation over the region of interest
+        showCellsContainingDummyPoints( &dummyGridCells, userOptions, userOptions.outputFilename+"_fields", "fields" ); // check if there are any cells which may have an error in the fields estimation (all fields except density) due to an incomplete Delaunay tesselation over the region of interest
 #endif
 }
 
@@ -435,8 +435,8 @@ void interpolateRedshiftCone_averaged_2(DT &dt,
                 size_t k = 0;
 #endif
                 Real index = gridCellIndex( i,j,k, nGrid );
-                if ( dummyNeighbors ) updateDummyGridCells( index, &incompleteCells_d ); // if one of the vertices is or has dummy neighbors, keep track of this cell
-                if ( dummyVertices ) updateDummyGridCells( index, &incompleteCells ); // if one of the vertices is a dummy test point, keep track of this cell
+                if ( dummyNeighbors ) updateDummyGridCells( index, &dummyGridCells_d ); // if one of the vertices is or has dummy neighbors, keep track of this cell
+                if ( dummyVertices ) updateDummyGridCells( index, &dummyGridCells ); // if one of the vertices is a dummy test point, keep track of this cell
 #endif
                 
 #if NO_DIM==3     // end additional z-loop
@@ -452,9 +452,9 @@ void interpolateRedshiftCone_averaged_2(DT &dt,
     
 #ifdef TEST_PADDING
     if (field.density)
-        showCellsContainingDummyPoints( &incompleteCells_d, userOptions, userOptions.outputFilename+"_density", "density" ); // check if there are any cells which may have an error in thedensity estimation due to an incomplete Delaunay tesselation over the region of interest
+        showCellsContainingDummyPoints( &dummyGridCells_d, userOptions, userOptions.outputFilename+"_density", "density" ); // check if there are any cells which may have an error in thedensity estimation due to an incomplete Delaunay tesselation over the region of interest
     if ( field.velocity or field.velocity_gradient or field.scalar or field.scalar_gradient )
-        showCellsContainingDummyPoints( &incompleteCells, userOptions, userOptions.outputFilename+"_fields", "fields" ); // check if there are any cells which may have an error in the fields estimation (all fields except density) due to an incomplete Delaunay tesselation over the region of interest
+        showCellsContainingDummyPoints( &dummyGridCells, userOptions, userOptions.outputFilename+"_fields", "fields" ); // check if there are any cells which may have an error in the fields estimation (all fields except density) due to an incomplete Delaunay tesselation over the region of interest
 #endif
 }
 
@@ -631,8 +631,8 @@ void interpolateUserSampling_averaged_2(DT &dt,
         
         // keep track of the cell index if the computation is incomplete
 #ifdef TEST_PADDING
-        if ( dummyNeighbors ) updateDummyGridCells( i, &incompleteCells_d ); // if one of the vertices is or has dummy neighbors, keep track of this cell
-        if ( dummyVertices ) updateDummyGridCells( i, &incompleteCells ); // if one of the vertices is a dummy test point, keep track of this cell
+        if ( dummyNeighbors ) updateDummyGridCells( i, &dummyGridCells_d ); // if one of the vertices is or has dummy neighbors, keep track of this cell
+        if ( dummyVertices ) updateDummyGridCells( i, &dummyGridCells ); // if one of the vertices is a dummy test point, keep track of this cell
 #endif
     }
     message << "100%\n" << MESSAGE::Flush;
@@ -640,9 +640,9 @@ void interpolateUserSampling_averaged_2(DT &dt,
     
 #ifdef TEST_PADDING
     if (field.density)
-        showCellsContainingDummyPoints( &incompleteCells_d, userOptions, userOptions.outputFilename+"_density", "density" ); // check if there are any cells which may have an error in thedensity estimation due to an incomplete Delaunay tesselation over the region of interest
+        showCellsContainingDummyPoints( &dummyGridCells_d, userOptions, userOptions.outputFilename+"_density", "density" ); // check if there are any cells which may have an error in thedensity estimation due to an incomplete Delaunay tesselation over the region of interest
     if ( field.velocity or field.velocity_gradient or field.scalar or field.scalar_gradient )
-        showCellsContainingDummyPoints( &incompleteCells, userOptions, userOptions.outputFilename+"_fields", "fields" ); // check if there are any cells which may have an error in the fields estimation (all fields except density) due to an incomplete Delaunay tesselation over the region of interest
+        showCellsContainingDummyPoints( &dummyGridCells, userOptions, userOptions.outputFilename+"_fields", "fields" ); // check if there are any cells which may have an error in the fields estimation (all fields except density) due to an incomplete Delaunay tesselation over the region of interest
 #endif
 }
 
@@ -842,8 +842,8 @@ void interpolateGrid_averaged_3(DT &dt,
                 size_t k = 0;
 #endif
                 Real index = gridCellIndex( i,j,k, nGrid );
-                if ( dummyNeighbors ) updateDummyGridCells( index, &incompleteCells_d ); // if one of the vertices is or has dummy neighbors, keep track of this cell
-                if ( dummyVertices ) updateDummyGridCells( index, &incompleteCells ); // if one of the vertices is a dummy test point, keep track of this cell
+                if ( dummyNeighbors ) updateDummyGridCells( index, &dummyGridCells_d ); // if one of the vertices is or has dummy neighbors, keep track of this cell
+                if ( dummyVertices ) updateDummyGridCells( index, &dummyGridCells ); // if one of the vertices is a dummy test point, keep track of this cell
 #endif
                 
 #if NO_DIM==3     // end additional z-loop
@@ -859,9 +859,9 @@ void interpolateGrid_averaged_3(DT &dt,
     
 #ifdef TEST_PADDING
     if (field.density)
-        showCellsContainingDummyPoints( &incompleteCells_d, userOptions, userOptions.outputFilename+"_density", "density" ); // check if there are any cells which may have an error in thedensity estimation due to an incomplete Delaunay tesselation over the region of interest
+        showCellsContainingDummyPoints( &dummyGridCells_d, userOptions, userOptions.outputFilename+"_density", "density" ); // check if there are any cells which may have an error in thedensity estimation due to an incomplete Delaunay tesselation over the region of interest
     if ( field.velocity or field.velocity_gradient or field.scalar or field.scalar_gradient )
-        showCellsContainingDummyPoints( &incompleteCells, userOptions, userOptions.outputFilename+"_fields", "fields" ); // check if there are any cells which may have an error in the fields estimation (all fields except density) due to an incomplete Delaunay tesselation over the region of interest
+        showCellsContainingDummyPoints( &dummyGridCells, userOptions, userOptions.outputFilename+"_fields", "fields" ); // check if there are any cells which may have an error in the fields estimation (all fields except density) due to an incomplete Delaunay tesselation over the region of interest
 #endif
 }
 
