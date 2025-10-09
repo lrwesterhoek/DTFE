@@ -1,7 +1,8 @@
 # DTFE Dependency Installation Script
-# 
+#
 # Automatically installs required dependencies for building DTFE
-# Supports: macOS (Intel/Apple Silicon), Ubuntu, Debian, Fedora, RHEL, CentOS, Arch, Manjaro
+# Supports: macOS (Intel/Apple Silicon), Linux (Ubuntu, Debian, Fedora, RHEL, CentOS, Arch, Manjaro),
+#           Windows (MSYS2/MinGW for x86_64 and ARM64)
 #
 
 set -e  # Exit on error
@@ -50,7 +51,7 @@ detect_os() {
     elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
         OS="linux"
         ARCH=$(uname -m)
-        
+
         # Detect Linux distribution
         if [ -f /etc/os-release ]; then
             . /etc/os-release
@@ -62,9 +63,28 @@ detect_os() {
             print_error "Cannot detect Linux distribution"
             exit 1
         fi
+    elif [[ "$OSTYPE" == "msys"* ]] || [[ "$OSTYPE" == "cygwin"* ]] || [[ "$OSTYPE" == "mingw"* ]]; then
+        OS="windows"
+        ARCH=$(uname -m)
+
+        # Detect Windows environment
+        if command -v pacman &> /dev/null; then
+            WIN_ENV="msys2"
+            if [[ "$ARCH" == "x86_64" ]]; then
+                print_info "Detected: Windows with MSYS2 (x86_64)"
+            elif [[ "$ARCH" == "aarch64" ]]; then
+                print_info "Detected: Windows with MSYS2 (ARM64)"
+            else
+                print_info "Detected: Windows with MSYS2 ($ARCH)"
+            fi
+        else
+            print_error "Windows environment detected but pacman (MSYS2) not found"
+            print_info "Please install MSYS2 from https://www.msys2.org/"
+            exit 1
+        fi
     else
         print_error "Unsupported operating system: $OSTYPE"
-        print_info "This script supports macOS and Linux only"
+        print_info "This script supports macOS, Linux, and Windows (MSYS2) only"
         exit 1
     fi
 }
@@ -236,7 +256,7 @@ install_arch() {
 # Install dependencies on openSUSE
 install_opensuse() {
     print_header "Installing openSUSE Dependencies"
-    
+
     print_info "Installing development tools and dependencies..."
     sudo zypper install -y -t pattern devel_C_C++
     sudo zypper install -y \
@@ -246,7 +266,40 @@ install_opensuse() {
         mpfr-devel \
         hdf5-devel \
         gmp-devel
-    
+
+    print_success "All dependencies installed successfully!"
+}
+
+# Install dependencies on Windows (MSYS2/MinGW)
+install_windows() {
+    print_header "Installing Windows (MSYS2) Dependencies"
+
+    # Determine architecture-specific package prefix
+    if [[ "$ARCH" == "x86_64" ]]; then
+        PKG_PREFIX="mingw-w64-x86_64"
+        print_info "Installing packages for x86_64 architecture..."
+    elif [[ "$ARCH" == "aarch64" ]]; then
+        PKG_PREFIX="mingw-w64-clang-aarch64"
+        print_info "Installing packages for ARM64 architecture..."
+    else
+        print_error "Unsupported architecture: $ARCH"
+        exit 1
+    fi
+
+    print_info "Updating MSYS2 package database..."
+    pacman -Sy --noconfirm
+
+    print_info "Installing DTFE dependencies..."
+    pacman -S --needed --noconfirm \
+        ${PKG_PREFIX}-gcc \
+        ${PKG_PREFIX}-gsl \
+        ${PKG_PREFIX}-boost \
+        ${PKG_PREFIX}-cgal \
+        ${PKG_PREFIX}-mpfr \
+        ${PKG_PREFIX}-hdf5 \
+        ${PKG_PREFIX}-gmp \
+        make
+
     print_success "All dependencies installed successfully!"
 }
 
@@ -330,32 +383,32 @@ main() {
             # Normalize to lowercase for comparison
             DISTRO_LOWER=$(echo "$DISTRO" | tr '[:upper:]' '[:lower:]')
             DISTRO_LIKE_LOWER=$(echo "$DISTRO_LIKE" | tr '[:upper:]' '[:lower:]')
-            
+
             # Determine which installer to use
             INSTALLER=""
-            
+
             # Check for Debian-based distros
             if [[ "$DISTRO_LOWER" =~ ^(ubuntu|debian|pop|linuxmint|elementary|zorin|kali|parrot|raspbian)$ ]] || \
                [[ "$DISTRO_LIKE_LOWER" =~ (ubuntu|debian) ]]; then
                 INSTALLER="ubuntu_debian"
-            
+
             # Check for Fedora-based distros (including Asahi Fedora)
             elif [[ "$DISTRO_LOWER" =~ ^(fedora|rhel|centos|rocky|almalinux|scientific|oracle|nobara|ultramarine|asahi)$ ]] || \
                  [[ "$DISTRO_LOWER" =~ fedora ]] || \
                  [[ "$DISTRO_LIKE_LOWER" =~ (fedora|rhel|centos) ]]; then
                 INSTALLER="fedora_rhel"
-            
+
             # Check for Arch-based distros
             elif [[ "$DISTRO_LOWER" =~ ^(arch|manjaro|endeavouros|garuda|artix|parabola|cachyos)$ ]] || \
                  [[ "$DISTRO_LIKE_LOWER" =~ arch ]]; then
                 INSTALLER="arch"
-            
+
             # Check for openSUSE-based distros
             elif [[ "$DISTRO_LOWER" =~ ^(opensuse|sles|suse)$ ]] || \
                  [[ "$DISTRO_LIKE_LOWER" =~ (opensuse|suse) ]]; then
                 INSTALLER="opensuse"
             fi
-            
+
             # Run the appropriate installer
             if [[ -n "$INSTALLER" ]]; then
                 case "$INSTALLER" in
@@ -379,6 +432,9 @@ main() {
                 print_info "Please install dependencies manually (see README.md)"
                 exit 1
             fi
+            ;;
+        windows)
+            install_windows
             ;;
     esac
     
