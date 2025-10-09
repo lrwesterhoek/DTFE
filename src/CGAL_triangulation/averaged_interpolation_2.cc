@@ -129,7 +129,7 @@ void interpolateGrid_averaged_2(DT &dt,
 #ifdef VELOCITY
                 Pvector<Real,noVelComp> tempV = Pvector<Real,noVelComp>::zero();
                 Pvector<Real,noGradComp> tempVG = Pvector<Real,noGradComp>::zero();
-                Pvector<Real,noVelComp> tempVelocities[NN];
+                std::vector<Pvector<Real,noVelComp>> tempVelocities(NN);
 #endif
 #ifdef SCALAR
                 Pvector<Real,noScalarComp> tempS = Pvector<Real,noScalarComp>::zero();
@@ -196,7 +196,7 @@ void interpolateGrid_averaged_2(DT &dt,
 #ifdef VELOCITY
                 if (field.velocity) velocity->push_back( tempV/NN );
                 if (field.velocity_gradient) velocity_gradient->push_back( tempVG/NN );
-                if (field.velocity_std) velocity_std->push_back( standardDeviation(tempVelocities,NN) );
+                if (field.velocity_std) velocity_std->push_back( standardDeviation(tempVelocities.data(),NN) );
 #endif
 #ifdef SCALAR
                 if (field.scalar) scalar->push_back( tempS/NN );
@@ -722,7 +722,7 @@ void interpolateGrid_averaged_3(DT &dt,
     
     
     // sequence to store the equidistant sample positions with respect to center of grid cell
-    Real samplePosition[NN][NO_DIM];
+    Real (*samplePosition)[NO_DIM] = new Real[NN][NO_DIM];
     for (int i1=0; i1<n; ++i1)
         for (int i2=0; i2<n; ++i2)
 #if NO_DIM==2
@@ -855,6 +855,9 @@ void interpolateGrid_averaged_3(DT &dt,
         x += dx[0];
     }
     message << "100%\n" << MESSAGE::Flush;
+    
+    // cleanup dynamically allocated memory
+    delete[] samplePosition;
     
     
 #ifdef TEST_PADDING

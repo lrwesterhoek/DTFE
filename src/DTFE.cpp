@@ -316,8 +316,8 @@ void DTFE_parallel(vector<Particle_data> *allParticles,
     // define some variables to keep track of the time and particle numbers associated to each processor
     MESSAGE::Message message( userOptions.verboseLevel );
     message << "From now on only the master thread will show messages on how the computation is going. Not all threads take the same execution time, so there may be a discrepancy between the messages displayed to the user and the computations across all threads.\n\n" << MESSAGE::Flush;
-    size_t processorParticles[noProcessors];    // number of particles associated to each processor
-    Real processorTime[noProcessors];           // the actual runtime of each thread
+    std::vector<size_t> processorParticles(noProcessors);    // number of particles associated to each processor
+    std::vector<Real> processorTime(noProcessors);           // the actual runtime of each thread
     size_t const noTotalParticles = allParticles->size();
     
     
@@ -374,8 +374,8 @@ void DTFE_parallel(vector<Particle_data> *allParticles,
     
     
     // show statistics to the user about the execution in parallel
-    userOptions.totalTime += maximum( processorTime, noProcessors );    // update total time by the largest value of CPU time
-    approximativeThreadTime( processorTime, noProcessors );   // compute approximative CPU times for each thread
+    userOptions.totalTime += maximum( processorTime.data(), noProcessors );    // update total time by the largest value of CPU time
+    approximativeThreadTime( processorTime.data(), noProcessors );   // compute approximative CPU times for each thread
     message << "Statistics of the execution across the " << noProcessors << " threads:\n";
     for (int i=0; i<noProcessors; ++i)
         message << "\t Thread " << i << " had " << processorParticles[i] << " particles (which represent " << setprecision(4) <<  Real(processorParticles[i])/noTotalParticles*100. << "\%) and took " << processorTime[i] << " sec. \n";

@@ -266,7 +266,7 @@ void interpolateGrid_averaged_1(DT &dt,
     
     
     // quasi-random sequence of numbers - using the GSL quasi-number generator
-    Real quasiRandomNumbers[maxNN][NO_DIM];
+    Real (*quasiRandomNumbers)[NO_DIM] = new Real[maxNN][NO_DIM];
     quasiRandomSequence( quasiRandomNumbers, maxNN );
     
     
@@ -345,8 +345,8 @@ void interpolateGrid_averaged_1(DT &dt,
         // get the quasi-random points inside the Delaunay cell
         size_t const tempInt = size_t(NN*cellVolume/gridCellVolume) + 1;
         size_t const noRandomPoints = (cellVolume/gridCellVolume>minRatio) ? (tempInt>maxNN ? maxNN:tempInt) : minNN;// number of random points
-        Point randomPoints[noRandomPoints];
-        quasiRandomPointsInCell( vertexMatrix, noRandomPoints, quasiRandomNumbers, randomPoints );   // get quasi-random points inside the Delaunay cell
+        std::vector<Point> randomPoints(noRandomPoints);
+        quasiRandomPointsInCell( vertexMatrix, noRandomPoints, quasiRandomNumbers, randomPoints.data() );   // get quasi-random points inside the Delaunay cell
         Real factor = cellVolume / noRandomPoints;  // volume associated with each random sample point
         Vertex_handle base = itC->vertex(0);  // stores the "base" vertex of the Delaunay cell
         
@@ -410,6 +410,9 @@ void interpolateGrid_averaged_1(DT &dt,
 #endif
     
     message << "100%\n" << MESSAGE::Flush;
+    
+    // cleanup dynamically allocated memory
+    delete[] quasiRandomNumbers;
     
     
 #ifdef TEST_PADDING

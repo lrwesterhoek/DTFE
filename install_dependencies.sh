@@ -170,17 +170,36 @@ install_fedora_rhel() {
     # Determine package manager (dnf for newer, yum for older)
     if command -v dnf &> /dev/null; then
         PKG_MGR="dnf"
+        # Check if it's dnf5 (which has different syntax)
+        DNF_VERSION=$(dnf --version 2>/dev/null | head -n1 | grep -oP '(?<=dnf5 )\d+' || echo "")
+        if [[ -n "$DNF_VERSION" ]]; then
+            print_info "Using package manager: dnf5"
+            IS_DNF5=true
+        else
+            print_info "Using package manager: dnf4"
+            IS_DNF5=false
+        fi
     elif command -v yum &> /dev/null; then
         PKG_MGR="yum"
+        IS_DNF5=false
+        print_info "Using package manager: yum"
     else
         print_error "Neither dnf nor yum found"
         exit 1
     fi
     
-    print_info "Using package manager: $PKG_MGR"
-    
     print_info "Installing development tools..."
-    sudo $PKG_MGR groupinstall -y "Development Tools"
+    if [[ "$IS_DNF5" == true ]]; then
+        # dnf5 uses "group install" instead of "groupinstall"
+        sudo $PKG_MGR group install -y "Development Tools" || \
+        sudo $PKG_MGR install -y @development-tools || \
+        sudo $PKG_MGR install -y gcc gcc-c++ make automake autoconf libtool
+    else
+        # dnf4 and yum use "groupinstall"
+        sudo $PKG_MGR groupinstall -y "Development Tools" || \
+        sudo $PKG_MGR install -y @development-tools || \
+        sudo $PKG_MGR install -y gcc gcc-c++ make automake autoconf libtool
+    fi
     
     print_info "Installing DTFE dependencies..."
     sudo $PKG_MGR install -y \
@@ -265,6 +284,7 @@ verify_installation() {
     fi
     
     if $all_good; then
+        print_success "All verification checks passed!"
         return 0
     else
         print_warning "Some verification checks failed"
