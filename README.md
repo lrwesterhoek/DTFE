@@ -63,7 +63,7 @@ For detailed information about the DTFE method see [Schaap and van de Weygaert (
 
 ### Supported Platforms
 - **macOS** (Intel and Apple Silicon)
-- **Linux** (Ubuntu, Debian, Fedora, CentOS, RHEL, and other distributions)
+- **Linux** (Ubuntu, Debian, Fedora, etc.)
 
 ### Prerequisites
 
@@ -110,7 +110,7 @@ sudo pacman -S base-devel gsl boost cgal mpfr hdf5 gmp
 
 1. **Clone the repository:**
    ```bash
-   git clone <repository-url>
+   git clone https://github.com/lrwesterhoek/DTFE.git
    cd DTFE
    ```
 
@@ -146,7 +146,7 @@ OPTIONS += -DNO_DIM=3    # 3D (default)
 
 #### Variable Precision
 ```makefile
-# OPTIONS += -DDOUBLE    # Use double precision (uncomment for double)
+# OPTIONS += -DDOUBLE    # Use double precision
 ```
 
 #### Computed Quantities
@@ -159,7 +159,7 @@ OPTIONS += -DNO_SCALARS=1      # Number of scalar components
 #### Input/Output Defaults
 ```makefile
 OPTIONS += -DINPUT_FILE_DEFAULT=105   # HDF5 gadget format
-OPTIONS += -DMPC_UNIT=1000            # Data units (kpc in this example)
+OPTIONS += -DMPC_UNIT=1000            # Data units
 OPTIONS += -DOUTPUT_FILE_DEFAULT=101  # Binary output
 ```
 

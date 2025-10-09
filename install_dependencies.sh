@@ -55,6 +55,7 @@ detect_os() {
         if [ -f /etc/os-release ]; then
             . /etc/os-release
             DISTRO=$ID
+            DISTRO_LIKE=$ID_LIKE
             DISTRO_VERSION=$VERSION_ID
             print_info "Detected: $PRETTY_NAME ($ARCH)"
         else
@@ -264,7 +265,6 @@ verify_installation() {
     fi
     
     if $all_good; then
-        print_success "All verification checks passed!"
         return 0
     else
         print_warning "Some verification checks failed"
@@ -306,25 +306,59 @@ main() {
             install_macos
             ;;
         linux)
-            case "$DISTRO" in
-                ubuntu|debian|pop|linuxmint)
-                    install_ubuntu_debian
-                    ;;
-                fedora|rhel|centos|rocky|almalinux)
-                    install_fedora_rhel
-                    ;;
-                arch|manjaro|endeavouros)
-                    install_arch
-                    ;;
-                opensuse*|sles)
-                    install_opensuse
-                    ;;
-                *)
-                    print_error "Unsupported Linux distribution: $DISTRO"
-                    print_info "Please install dependencies manually (see README.md)"
-                    exit 1
-                    ;;
-            esac
+            # Check both DISTRO and DISTRO_LIKE for better compatibility
+            # Normalize to lowercase for comparison
+            DISTRO_LOWER=$(echo "$DISTRO" | tr '[:upper:]' '[:lower:]')
+            DISTRO_LIKE_LOWER=$(echo "$DISTRO_LIKE" | tr '[:upper:]' '[:lower:]')
+            
+            # Determine which installer to use
+            INSTALLER=""
+            
+            # Check for Debian-based distros
+            if [[ "$DISTRO_LOWER" =~ ^(ubuntu|debian|pop|linuxmint|elementary|zorin|kali|parrot|raspbian)$ ]] || \
+               [[ "$DISTRO_LIKE_LOWER" =~ (ubuntu|debian) ]]; then
+                INSTALLER="ubuntu_debian"
+            
+            # Check for Fedora-based distros (including Asahi Fedora)
+            elif [[ "$DISTRO_LOWER" =~ ^(fedora|rhel|centos|rocky|almalinux|scientific|oracle|nobara|ultramarine|asahi)$ ]] || \
+                 [[ "$DISTRO_LOWER" =~ fedora ]] || \
+                 [[ "$DISTRO_LIKE_LOWER" =~ (fedora|rhel|centos) ]]; then
+                INSTALLER="fedora_rhel"
+            
+            # Check for Arch-based distros
+            elif [[ "$DISTRO_LOWER" =~ ^(arch|manjaro|endeavouros|garuda|artix|parabola|cachyos)$ ]] || \
+                 [[ "$DISTRO_LIKE_LOWER" =~ arch ]]; then
+                INSTALLER="arch"
+            
+            # Check for openSUSE-based distros
+            elif [[ "$DISTRO_LOWER" =~ ^(opensuse|sles|suse)$ ]] || \
+                 [[ "$DISTRO_LIKE_LOWER" =~ (opensuse|suse) ]]; then
+                INSTALLER="opensuse"
+            fi
+            
+            # Run the appropriate installer
+            if [[ -n "$INSTALLER" ]]; then
+                case "$INSTALLER" in
+                    ubuntu_debian)
+                        install_ubuntu_debian
+                        ;;
+                    fedora_rhel)
+                        install_fedora_rhel
+                        ;;
+                    arch)
+                        install_arch
+                        ;;
+                    opensuse)
+                        install_opensuse
+                        ;;
+                esac
+            else
+                print_error "Unsupported Linux distribution: $DISTRO"
+                print_info "Detected ID: $DISTRO"
+                print_info "Detected ID_LIKE: $DISTRO_LIKE"
+                print_info "Please install dependencies manually (see README.md)"
+                exit 1
+            fi
             ;;
     esac
     
