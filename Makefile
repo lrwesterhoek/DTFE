@@ -1,5 +1,11 @@
 # Cross-platform Makefile for compiling the DTFE code on Mac and Linux systems
 #
+# SUPPORTED ARCHITECTURES:
+# ========================
+# - x86_64 (Intel/AMD 64-bit) on both macOS and Linux
+# - ARM64 (aarch64/Apple Silicon) on both macOS and Linux
+# The Makefile automatically detects the architecture and sets appropriate paths.
+#
 # USAGE:
 # ======
 # This Makefile automatically detects your operating system and sets appropriate
@@ -65,15 +71,25 @@ endif
 
 # Platform-specific library paths and compiler settings
 ifeq ($(PLATFORM),macos)
-    # macOS with Homebrew
-    GSL_PATH   = /opt/homebrew/opt/gsl
-    BOOST_PATH = /opt/homebrew/opt/boost
-    CGAL_PATH  = /opt/homebrew/opt/cgal
-    MPFR_PATH  = /opt/homebrew/opt/mpfr
-    HDF5_PATH  = /opt/homebrew/opt/hdf5
-    GMP_PATH = /opt/homebrew/opt/gmp
+    # macOS with Homebrew - detect architecture for correct paths
+    ARCH := $(shell uname -m)
+    ifeq ($(ARCH),arm64)
+        # Apple Silicon (ARM64) - Homebrew installs to /opt/homebrew
+        BREW_PREFIX = /opt/homebrew
+    else
+        # Intel (x86_64) - Homebrew installs to /usr/local
+        BREW_PREFIX = /usr/local
+    endif
+    
+    GSL_PATH   = $(BREW_PREFIX)/opt/gsl
+    BOOST_PATH = $(BREW_PREFIX)/opt/boost
+    CGAL_PATH  = $(BREW_PREFIX)/opt/cgal
+    MPFR_PATH  = $(BREW_PREFIX)/opt/mpfr
+    HDF5_PATH  = $(BREW_PREFIX)/opt/hdf5
+    GMP_PATH   = $(BREW_PREFIX)/opt/gmp
+    
     # Try different compiler locations
-    CC := $(shell which /opt/homebrew/opt/llvm/bin/clang++ 2>/dev/null || which clang++ 2>/dev/null || which g++ 2>/dev/null || echo "clang++")
+    CC := $(shell which $(BREW_PREFIX)/opt/llvm/bin/clang++ 2>/dev/null || which clang++ 2>/dev/null || which g++ 2>/dev/null || echo "clang++")
 else ifeq ($(PLATFORM),linux)
     # Linux - try to auto-detect common package manager installations
     GSL_PATH   = $(shell pkg-config --variable=prefix gsl 2>/dev/null || echo "/usr")
@@ -322,6 +338,10 @@ clean:
 test-platform:
 	@echo "Detected platform: $(PLATFORM)"
 	@echo "Operating system: $(UNAME_S)"
+	@echo "Architecture: $(shell uname -m)"
+ifeq ($(PLATFORM),macos)
+	@echo "Homebrew prefix: $(BREW_PREFIX)"
+endif
 	@echo "Build mode: $(BUILD_MODE)"
 	@echo "Compiler: $(CC)"
 	@echo "Executable extension: '$(EXE_EXT)'"

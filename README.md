@@ -1,4 +1,3 @@
-
 # The DTFE public software
 
 The DTFE public code is a C++ implementation of the **Delaunay Tessellation Field Interpolation (DTFE)** method. Its purpose is to interpolate quantities stored at the location of an unstructured set of points to a regular grid using the maximum of information contained in the input points set. In particular, the code can calculate the following cosmological quantities:
@@ -53,11 +52,126 @@ For detailed information about the DTFE method see [Schaap and van de Weygaert (
 * Zoom in option for regions of interest.
 * Splitting the full data in smaller computational chunks when dealing with limited CPU resources.
 * The computation can be distributed in parallel on shared-memory architectures.
-* For comparison purposes, the software comes also with three other simpler interpolation techniques: nearest grid point (NGP), triangular shape cloud (TSC; ) and smoothed particle hydrodynamics (SPH; )\citep{1992ARA&A..30..543M}.
+* For comparison purposes, the software comes also with three other simpler interpolation techniques: nearest grid point (NGP), triangular shape cloud (TSC) and smoothed particle hydrodynamics (SPH).
 * Returns the Delaunay tessellation of the given point set.
 * Easy change of input/output data format.
 * Easy to use as an external library.
 * Extensive documentation of each feature.
+
+
+## Installation and Building
+
+### Supported Platforms
+- **macOS** (Intel and Apple Silicon)
+- **Linux** (Ubuntu, Debian, Fedora, CentOS, RHEL, and other distributions)
+
+### Prerequisites
+
+#### macOS
+1. **Install Xcode Command Line Tools:**
+   ```bash
+   xcode-select --install
+   ```
+
+2. **Install Homebrew** (if not already installed):
+   ```bash
+   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+   ```
+
+3. **Install dependencies:**
+   ```bash
+   brew install gsl boost cgal mpfr hdf5 gmp
+   ```
+
+#### Linux (Ubuntu/Debian)
+```bash
+sudo apt-get update
+sudo apt-get install build-essential
+sudo apt-get install libgsl-dev libboost-all-dev libcgal-dev libmpfr-dev libhdf5-dev libgmp-dev
+```
+
+#### Linux (Fedora/RHEL/CentOS)
+```bash
+# For Fedora
+sudo dnf groupinstall "Development Tools"
+sudo dnf install gsl-devel boost-devel CGAL-devel mpfr-devel hdf5-devel gmp-devel
+
+# For older RHEL/CentOS
+sudo yum groupinstall "Development Tools"
+sudo yum install gsl-devel boost-devel CGAL-devel mpfr-devel hdf5-devel gmp-devel
+```
+
+#### Linux (Arch/Manjaro)
+```bash
+sudo pacman -S base-devel gsl boost cgal mpfr hdf5 gmp
+```
+
+### Quick Start
+
+1. **Clone the repository:**
+   ```bash
+   git clone <repository-url>
+   cd DTFE
+   ```
+
+2. **Test platform detection:**
+   ```bash
+   make test-platform
+   ```
+
+3. **Build the main executable:**
+   ```bash
+   make DTFE
+   ```
+
+4. **Build the shared library:**
+   ```bash
+   make library
+   ```
+
+5. **Clean build files:**
+   ```bash
+   make clean
+   ```
+
+### Configuration Options
+
+The software behavior can be configured by editing the `OPTIONS` section in the Makefile:
+
+#### Spatial Dimensions
+```makefile
+OPTIONS += -DNO_DIM=3    # 3D (default)
+# OPTIONS += -DNO_DIM=2  # 2D
+```
+
+#### Variable Precision
+```makefile
+# OPTIONS += -DDOUBLE    # Use double precision (uncomment for double)
+```
+
+#### Computed Quantities
+```makefile
+OPTIONS += -DVELOCITY          # Enable velocity computations
+OPTIONS += -DSCALAR            # Enable scalar field interpolation
+OPTIONS += -DNO_SCALARS=1      # Number of scalar components
+```
+
+#### Input/Output Defaults
+```makefile
+OPTIONS += -DINPUT_FILE_DEFAULT=105   # HDF5 gadget format
+OPTIONS += -DMPC_UNIT=1000            # Data units (kpc in this example)
+OPTIONS += -DOUTPUT_FILE_DEFAULT=101  # Binary output
+```
+
+#### Additional Features
+```makefile
+OPTIONS += -DOPEN_MP              # Enable OpenMP parallelization
+OPTIONS += -DTEST_PADDING         # Validate Delaunay tesselation padding
+OPTIONS += -DREDSHIFT_SPACE       # Enable redshift space computations
+OPTIONS += -DTRIANGULATION        # Enable triangulation access
+```
+
+See the Makefile for the complete list of available options.
 
 
 ## Contributors
