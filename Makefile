@@ -162,7 +162,12 @@ else ifeq ($(PLATFORM),windows)
     GMP_PATH   = $(MINGW_PREFIX)
 
     # Try different compiler locations for Windows
-    CC := $(shell which $(MINGW_PREFIX)/bin/g++ 2>/dev/null || which g++ 2>/dev/null || which clang++ 2>/dev/null || echo "g++")
+    # ARM64 uses clang++, x86_64/i686 use g++
+    ifeq ($(MSYSTEM),CLANGARM64)
+        CC := $(shell which $(MINGW_PREFIX)/bin/clang++ 2>/dev/null || which clang++ 2>/dev/null || echo "clang++")
+    else
+        CC := $(shell which $(MINGW_PREFIX)/bin/g++ 2>/dev/null || which g++ 2>/dev/null || echo "g++")
+    endif
 endif
 
 # Common utilities
@@ -321,10 +326,18 @@ else ifeq ($(PLATFORM),linux)
     COMPILE_FLAGS += -fopenmp
     OPENMP_LIB = -lgomp
 else ifeq ($(PLATFORM),windows)
-    COMPILE_FLAGS += -fopenmp
-    OPENMP_LIB = -lgomp
-    # Windows-specific linking flags
-    LINK_FLAGS += -static-libgcc -static-libstdc++
+    # Windows ARM64 uses Clang with libomp, x86_64 uses GCC with libgomp
+    ifeq ($(MSYSTEM),CLANGARM64)
+        COMPILE_FLAGS += -fopenmp=libomp
+        OPENMP_LIB = -lomp
+        # Clang on Windows ARM64
+        LINK_FLAGS += -static-libgcc -static-libstdc++
+    else
+        COMPILE_FLAGS += -fopenmp
+        OPENMP_LIB = -lgomp
+        # GCC on Windows x86_64
+        LINK_FLAGS += -static-libgcc -static-libstdc++
+    endif
 endif
 
 DTFE_INC = $(INCLUDES)

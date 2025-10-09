@@ -334,15 +334,20 @@ install_windows() {
     $PACMAN_CMD -Sy --noconfirm
 
     print_info "Installing DTFE dependencies..."
-    $PACMAN_CMD -S --needed --noconfirm \
-        ${PKG_PREFIX}-gcc \
-        ${PKG_PREFIX}-gsl \
-        ${PKG_PREFIX}-boost \
-        ${PKG_PREFIX}-cgal \
-        ${PKG_PREFIX}-mpfr \
-        ${PKG_PREFIX}-hdf5 \
-        ${PKG_PREFIX}-gmp \
-        make
+
+    # Base packages for all architectures
+    PACKAGES="${PKG_PREFIX}-gsl ${PKG_PREFIX}-boost ${PKG_PREFIX}-cgal ${PKG_PREFIX}-mpfr ${PKG_PREFIX}-hdf5 ${PKG_PREFIX}-gmp make"
+
+    # Add compiler and OpenMP support based on architecture
+    if [[ "$ARCH" == "aarch64" ]]; then
+        # ARM64 uses clang, need separate OpenMP library
+        PACKAGES="${PACKAGES} ${PKG_PREFIX}-clang ${PKG_PREFIX}-openmp"
+    else
+        # x86_64 and i686 use GCC which includes OpenMP
+        PACKAGES="${PACKAGES} ${PKG_PREFIX}-gcc"
+    fi
+
+    $PACMAN_CMD -S --needed --noconfirm ${PACKAGES}
 
     print_success "All dependencies installed successfully!"
     print_info ""
