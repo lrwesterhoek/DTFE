@@ -37,7 +37,7 @@
 # Add or override compiler flags:
 #   make DTFE EXTRA_FLAGS="-Wno-unused -march=native"
 #
-# Note: Library headers are included with -isystem to suppress warnings from
+# Note: Library headers are included with -I to suppress warnings from
 # external code you cannot modify. Your own code warnings will still be shown.
 #
 # TARGETS:
@@ -187,29 +187,28 @@ INCLUDES =
 LIBRARIES = 
 
 # Library path setup
-# Use -isystem instead of -I to suppress warnings from library headers
 ifneq ($(strip $(GSL_PATH)),)
-    INCLUDES += -isystem $(strip $(GSL_PATH))/include
+    INCLUDES += -I $(strip $(GSL_PATH))/include
     LIBRARIES += -L$(strip $(GSL_PATH))/lib
 endif
 ifneq ($(strip $(BOOST_PATH)),)
-    INCLUDES += -isystem $(strip $(BOOST_PATH))/include
+    INCLUDES += -I $(strip $(BOOST_PATH))/include
     LIBRARIES += -L$(strip $(BOOST_PATH))/lib
 endif
 ifneq ($(strip $(CGAL_PATH)),)
-    INCLUDES += -isystem $(strip $(CGAL_PATH))/include
+    INCLUDES += -I $(strip $(CGAL_PATH))/include
     LIBRARIES += -L$(strip $(CGAL_PATH))/lib
 endif
 ifneq ($(strip $(GMP_PATH)),)
-    INCLUDES += -isystem $(strip $(GMP_PATH))/include
+    INCLUDES += -I $(strip $(GMP_PATH))/include
     LIBRARIES += -L$(strip $(GMP_PATH))/lib
 endif
 ifneq ($(strip $(MPFR_PATH)),)
-    INCLUDES += -isystem $(strip $(MPFR_PATH))/include
+    INCLUDES += -I $(strip $(MPFR_PATH))/include
     LIBRARIES += -L$(strip $(MPFR_PATH))/lib
 endif
 ifneq ($(strip $(HDF5_PATH)),)
-    INCLUDES += -isystem $(strip $(HDF5_PATH))/include
+    INCLUDES += -I $(strip $(HDF5_PATH))/include
     LIBRARIES += -L$(strip $(HDF5_PATH))/lib -lhdf5 -lhdf5_cpp
     OPTIONS += -DHDF5
 endif
