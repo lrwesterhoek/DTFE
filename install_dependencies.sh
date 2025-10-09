@@ -65,7 +65,6 @@ detect_os() {
         fi
     elif [[ "$OSTYPE" == "msys"* ]] || [[ "$OSTYPE" == "cygwin"* ]] || [[ "$OSTYPE" == "mingw"* ]]; then
         OS="windows"
-        ARCH=$(uname -m)
 
         # Detect Windows environment
         # Check for pacman in multiple locations
@@ -74,15 +73,28 @@ detect_os() {
            [ -x /bin/pacman ] || \
            [ -n "$MSYSTEM" ]; then
             WIN_ENV="msys2"
-            if [[ "$ARCH" == "x86_64" ]]; then
-                print_info "Detected: Windows with MSYS2 (x86_64)"
-                print_info "MSYSTEM: ${MSYSTEM:-not set}"
-            elif [[ "$ARCH" == "aarch64" ]]; then
+
+            # Architecture detection for Windows
+            # On Windows ARM64, uname -m may incorrectly report x86_64 due to emulation
+            # Use MSYSTEM environment variable as the source of truth
+            if [[ "$MSYSTEM" == "CLANGARM64" ]]; then
+                ARCH="aarch64"
                 print_info "Detected: Windows with MSYS2 (ARM64)"
-                print_info "MSYSTEM: ${MSYSTEM:-not set}"
+                print_info "MSYSTEM: $MSYSTEM"
+            elif [[ "$MSYSTEM" == "MINGW64" ]]; then
+                ARCH="x86_64"
+                print_info "Detected: Windows with MSYS2 (x86_64)"
+                print_info "MSYSTEM: $MSYSTEM"
+            elif [[ "$MSYSTEM" == "MINGW32" ]]; then
+                ARCH="i686"
+                print_info "Detected: Windows with MSYS2 (32-bit x86)"
+                print_info "MSYSTEM: $MSYSTEM"
             else
-                print_info "Detected: Windows with MSYS2 ($ARCH)"
-                print_info "MSYSTEM: ${MSYSTEM:-not set}"
+                # Fall back to uname if MSYSTEM is not set or unrecognized
+                ARCH=$(uname -m)
+                print_warning "MSYSTEM is '$MSYSTEM' (unexpected value)"
+                print_info "Detected architecture from uname: $ARCH"
+                print_info "This may not work correctly. Please use MINGW64, CLANGARM64, or MINGW32 terminal"
             fi
         else
             print_error "Windows environment detected but pacman (MSYS2) not found"

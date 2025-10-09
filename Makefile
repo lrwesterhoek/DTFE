@@ -125,19 +125,33 @@ else ifeq ($(PLATFORM),linux)
     CC := $(shell which g++ 2>/dev/null || which clang++ 2>/dev/null || echo "g++")
 else ifeq ($(PLATFORM),windows)
     # Windows with MSYS2/MinGW - detect architecture for correct paths
-    ARCH := $(shell uname -m)
-    ifeq ($(ARCH),x86_64)
-        # x86_64 architecture - use mingw64 prefix
-        MINGW_PREFIX = /mingw64
-    else ifeq ($(ARCH),aarch64)
+    # On Windows ARM64, uname -m may report x86_64 due to emulation
+    # Use MSYSTEM environment variable as the source of truth
+    ifeq ($(MSYSTEM),CLANGARM64)
         # ARM64 architecture - use clangarm64 prefix
         MINGW_PREFIX = /clangarm64
-    else ifeq ($(ARCH),i686)
+        ARCH = aarch64
+    else ifeq ($(MSYSTEM),MINGW64)
+        # x86_64 architecture - use mingw64 prefix
+        MINGW_PREFIX = /mingw64
+        ARCH = x86_64
+    else ifeq ($(MSYSTEM),MINGW32)
         # 32-bit x86 architecture - use mingw32 prefix
         MINGW_PREFIX = /mingw32
+        ARCH = i686
     else
-        # Default to mingw64 if architecture detection fails
-        MINGW_PREFIX = /mingw64
+        # Fall back to uname if MSYSTEM is not set
+        ARCH := $(shell uname -m)
+        ifeq ($(ARCH),x86_64)
+            MINGW_PREFIX = /mingw64
+        else ifeq ($(ARCH),aarch64)
+            MINGW_PREFIX = /clangarm64
+        else ifeq ($(ARCH),i686)
+            MINGW_PREFIX = /mingw32
+        else
+            # Default to mingw64 if detection fails
+            MINGW_PREFIX = /mingw64
+        endif
     endif
 
     GSL_PATH   = $(MINGW_PREFIX)
