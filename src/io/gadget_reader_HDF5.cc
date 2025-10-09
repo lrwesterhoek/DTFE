@@ -50,7 +50,7 @@ void HDF5_readGadgetHeader(std::string filename,
     const H5std_string FILE_NAME( filename );
     
     // open the HDF5 file and the header group
-    H5File *file = new H5File( FILE_NAME, H5F_ACC_RDONLY, H5::FileAccPropList::DEFAULT );
+    H5File *file = new H5File( FILE_NAME, H5F_ACC_RDONLY, H5::FileCreatPropList::DEFAULT, H5::FileAccPropList::DEFAULT );
     Group *group = new Group( file->openGroup("/Header") );
     
     
@@ -131,7 +131,7 @@ void HDF5_readGadgetData(std::string filename,
     
     // open the HDF5 file
     const H5std_string FILE_NAME( filename );
-    H5File *file = new H5File( FILE_NAME, H5F_ACC_RDONLY, H5::FileAccPropList::DEFAULT );
+    H5File *file = new H5File( FILE_NAME, H5F_ACC_RDONLY, H5::FileCreatPropList::DEFAULT, H5::FileAccPropList::DEFAULT );
     Group *group;
     
     
@@ -445,10 +445,10 @@ void HDF5_readGadgetData_HI(std::string filename,
     
     
     // open the HDF5 file - this gives the gas data
-    H5File *file = new H5File( filename.c_str(), H5F_ACC_RDONLY, H5::FileAccPropList::DEFAULT );
+    H5File *file = new H5File( filename.c_str(), H5F_ACC_RDONLY, H5::FileCreatPropList::DEFAULT, H5::FileAccPropList::DEFAULT );
     Group *group;
     // open the file with the HI fraction
-    H5File *file2 = new H5File( h1FileName.c_str(), H5F_ACC_RDONLY, H5::FileAccPropList::DEFAULT );
+    H5File *file2 = new H5File( h1FileName.c_str(), H5F_ACC_RDONLY, H5::FileCreatPropList::DEFAULT, H5::FileAccPropList::DEFAULT );
     
     
     // read the coordinates

@@ -53,7 +53,7 @@ void HDF5_readGadgetData_Cristian(std::string filename,
     
     // open the HDF5 file
     const H5std_string FILE_NAME( filename );
-    H5File *file = new H5File( FILE_NAME, H5F_ACC_RDONLY, H5::FileAccPropList::DEFAULT );
+    H5File *file = new H5File( FILE_NAME, H5F_ACC_RDONLY, H5::FileCreatPropList::DEFAULT, H5::FileAccPropList::DEFAULT );
     Group *group;
     
     

@@ -65,7 +65,7 @@ void HDF5_readHeader_DESI(std::string filename,
     const H5std_string FILE_NAME( filename );
     
     // open the HDF5 file and the header group
-    H5File *file = new H5File( FILE_NAME, H5F_ACC_RDONLY, H5::FileAccPropList::DEFAULT );
+    H5File *file = new H5File( FILE_NAME, H5F_ACC_RDONLY, H5::FileCreatPropList::DEFAULT, H5::FileAccPropList::DEFAULT );
     Group *group = new Group( file->openGroup("Header") );
     
     
@@ -203,7 +203,7 @@ void HDF5_readData_DESI(std::string filenameRoot,
         
         // open the HDF5 file
         const H5std_string FILE_NAME( filename );
-        H5File *file = new H5File( FILE_NAME, H5F_ACC_RDONLY, H5::FileAccPropList::DEFAULT );
+        H5File *file = new H5File( FILE_NAME, H5F_ACC_RDONLY, H5::FileCreatPropList::DEFAULT, H5::FileAccPropList::DEFAULT );
         Group *group;
         group = new Group( file->openGroup("Matter") );
     

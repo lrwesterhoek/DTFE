@@ -209,7 +209,20 @@ ifneq ($(strip $(MPFR_PATH)),)
 endif
 ifneq ($(strip $(HDF5_PATH)),)
     INCLUDES += -I $(strip $(HDF5_PATH))/include
+ifeq ($(PLATFORM),linux)
+    # On Linux (Ubuntu/Debian), HDF5 headers are in /usr/include/hdf5/serial
+    INCLUDES += -I $(strip $(HDF5_PATH))/include/hdf5/serial
+    # Detect architecture for library path
+    ARCH := $(shell uname -m)
+    ifeq ($(ARCH),x86_64)
+        LIBRARIES += -L$(strip $(HDF5_PATH))/lib/x86_64-linux-gnu/hdf5/serial
+    else ifeq ($(ARCH),aarch64)
+        LIBRARIES += -L$(strip $(HDF5_PATH))/lib/aarch64-linux-gnu/hdf5/serial
+    endif
     LIBRARIES += -L$(strip $(HDF5_PATH))/lib -lhdf5 -lhdf5_cpp
+else
+    LIBRARIES += -L$(strip $(HDF5_PATH))/lib -lhdf5 -lhdf5_cpp
+endif
     OPTIONS += -DHDF5
 endif
 
