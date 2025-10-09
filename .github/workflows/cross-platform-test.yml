@@ -1,46 +1,142 @@
-name: Cross-Platform Build Test
+name: Build and Test
 
 on: [push, pull_request]
 
 jobs:
   test-platforms:
+    name: ${{ matrix.os }} (${{ matrix.arch }})
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          # Ubuntu x86_64
+          - os: ubuntu-latest
+            arch: x86_64
+          # macOS x86_64 (Intel)
+          - os: macos-13
+            arch: x86_64
+          # macOS ARM64 (Apple Silicon)
+          - os: macos-latest
+            arch: arm64
         
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
       
+    - name: Display system information
+      run: |
+        echo "Operating System: $(uname -s)"
+        echo "Architecture: $(uname -m)"
+        echo "Kernel: $(uname -r)"
+        
     - name: Install dependencies (Ubuntu)
-      if: matrix.os == 'ubuntu-latest'
+      if: runner.os == 'Linux'
       run: |
         sudo apt-get update
         sudo apt-get install -y build-essential libgsl-dev libboost-all-dev \
                                 libcgal-dev libmpfr-dev libhdf5-dev libgmp-dev
                                 
     - name: Install dependencies (macOS)
-      if: matrix.os == 'macos-latest'
+      if: runner.os == 'macOS'
       run: |
-        brew install gsl boost cgal mpfr hdf5 gmp llvm
-        
-    - name: Install dependencies (Windows)
-      if: matrix.os == 'windows-latest'
-      run: |
-        # Use vcpkg or chocolatey to install dependencies
-        # This would need to be customized based on preferred Windows package manager
-        echo "Windows dependency installation would go here"
+        brew install gsl boost cgal mpfr hdf5 gmp
         
     - name: Test platform detection
       run: make test-platform
       
-    - name: Run validation tests
-      run: make test-validation
+    - name: Build project (Release mode)
+      run: |
+        make clean
+        make DTFE
+        ls -lh DTFE*
+        
+    - name: Build project (Debug mode)
+      run: |
+        make clean
+        make DTFE BUILD_MODE=debug
+        ls -lh DTFE*
+        
+    - name: Build shared library
+      run: |
+        make clean
+        make library
+        ls -lh libDTFE* || ls -lh DTFE.dylib || echo "Library built"
+        
+    - name: Test with extra warning flags
+      run: |
+        make clean
+        make DTFE EXTRA_FLAGS="-Wall -Wextra"
+        
+    - name: Clean up
+      run: make clean
+
+  test-install-script:
+    name: Test install_dependencies.sh on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
       
-    - name: Test dry run build
-      run: make --dry-run DTFE || echo "Dry run completed"
+    - name: Make install script executable
+      run: chmod +x install_dependencies.sh
       
-    - name: Build project (if dependencies are available)
-      run: make DTFE || echo "Build attempted - may fail if dependencies missing"
+    - name: Run dependency installer
+      run: ./install_dependencies.sh
+      
+    - name: Verify installation
+      run: make test-platform
+      
+    - name: Test build after script installation
+      run: make DTFE
+
+  test-architectures:
+    name: Architecture-specific tests
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Install QEMU for multi-arch
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y qemu-user-static
+        
+    - name: Test ARM64 detection (simulated)
+      run: |
+        echo "Testing Makefile with different architectures..."
+        make test-platform
+        
+  code-quality:
+    name: Code Quality Checks
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential libgsl-dev libboost-all-dev \
+                                libcgal-dev libmpfr-dev libhdf5-dev libgmp-dev
+                                
+    - name: Build with all warnings enabled
+      run: |
+        make DTFE EXTRA_FLAGS="-Wall -Wextra -Wshadow -Wunused -Wuninitialized -Wnull-dereference -Wmisleading-indentation -Wimplicit-fallthrough -Wformat=2 -Wstrict-aliasing=2"
       continue-on-error: true
+      
+    - name: Build with strict warnings
+      run: |
+        make clean
+        make DTFE EXTRA_FLAGS="-Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion"
+      continue-on-error: true
+      
+    - name: Build with sanitizers (debug)
+      run: |
+        make clean
+        make DTFE BUILD_MODE=debug

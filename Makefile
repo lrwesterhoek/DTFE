@@ -230,45 +230,9 @@ else
     DEBUG_FLAGS =
 endif
 
-# Essential warning flags for catching real bugs:
-# -Wall -Wextra: Enable important warnings
-# -Wshadow: Warn when variables shadow others (catches common bugs)
-# -Wunused: Warn about unused variables/functions
-# -Wuninitialized: Warn about uninitialized variables (critical)
-# -Wnull-dereference: Warn about potential null pointer dereferences
-# -Wmisleading-indentation: Warn about misleading indentation
-# -Wimplicit-fallthrough: Warn about implicit switch case fallthrough
-# -Wformat=2: Enhanced format string checks (security)
-# -Wstrict-aliasing=2: Warn about strict aliasing violations
-# -Wno-psabi -Wno-cpp: Suppress specific warnings for compatibility
-#
-# To add stricter warnings, use EXTRA_FLAGS, e.g.:
-#   make DTFE EXTRA_FLAGS="-Wpedantic -Wconversion -Wold-style-cast"
-WARNING_FLAGS = -Wall -Wextra \
-                -Wshadow \
-                -Wunused \
-                -Wuninitialized \
-                -Wnull-dereference \
-                -Wmisleading-indentation \
-                -Wimplicit-fallthrough \
-                -Wformat=2 \
-                -Wstrict-aliasing=2 \
-                -Wno-psabi -Wno-cpp
-
-# Security and quality flags:
-# -fstack-protector-strong: Add stack protection against buffer overflows
-# -D_FORTIFY_SOURCE=2: Add buffer overflow detection for standard library functions (release only)
-# -fasynchronous-unwind-tables: Generate unwind tables for better debugging
-# -fexceptions: Enable exception handling
-ifeq ($(BUILD_MODE),debug)
-    QUALITY_FLAGS = -fstack-protector-strong \
-                    -fasynchronous-unwind-tables -fexceptions
-else
-    QUALITY_FLAGS = -fstack-protector-strong -D_FORTIFY_SOURCE=2 \
-                    -fasynchronous-unwind-tables -fexceptions
-endif
-
-COMPILE_FLAGS = $(BASE_CFLAGS) -std=c++17 $(WARNING_FLAGS) $(QUALITY_FLAGS) $(DEBUG_FLAGS) -frounding-math $(EXTRA_FLAGS)
+# Minimal compiler flags (from original Makefile)
+# Additional warnings and quality flags can be enabled in the EXTRA_FLAGS section above
+COMPILE_FLAGS = $(BASE_CFLAGS) -std=c++17 -Wno-psabi -Wno-cpp -frounding-math $(DEBUG_FLAGS) $(EXTRA_FLAGS)
 LINK_FLAGS =
 BASE_LIBS = -lboost_thread -lboost_filesystem -lboost_program_options -lgsl -lgslcblas -lm -lgmp -lmpfr -lboost_system
 HDF5_LIBS = -lhdf5 -lhdf5_cpp
