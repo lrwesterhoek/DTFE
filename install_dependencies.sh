@@ -68,18 +68,30 @@ detect_os() {
         ARCH=$(uname -m)
 
         # Detect Windows environment
-        if command -v pacman &> /dev/null; then
+        # Check for pacman in multiple locations
+        if command -v pacman &> /dev/null || \
+           [ -x /usr/bin/pacman ] || \
+           [ -x /bin/pacman ] || \
+           [ -n "$MSYSTEM" ]; then
             WIN_ENV="msys2"
             if [[ "$ARCH" == "x86_64" ]]; then
                 print_info "Detected: Windows with MSYS2 (x86_64)"
+                print_info "MSYSTEM: ${MSYSTEM:-not set}"
             elif [[ "$ARCH" == "aarch64" ]]; then
                 print_info "Detected: Windows with MSYS2 (ARM64)"
+                print_info "MSYSTEM: ${MSYSTEM:-not set}"
             else
                 print_info "Detected: Windows with MSYS2 ($ARCH)"
+                print_info "MSYSTEM: ${MSYSTEM:-not set}"
             fi
         else
             print_error "Windows environment detected but pacman (MSYS2) not found"
-            print_info "Please install MSYS2 from https://www.msys2.org/"
+            print_info "Please make sure you're running this script from:"
+            print_info "  - MINGW64 terminal (for x86_64)"
+            print_info "  - CLANGARM64 terminal (for ARM64)"
+            print_info "  - NOT from Windows Command Prompt or PowerShell"
+            print_info ""
+            print_info "If MSYS2 is not installed, get it from https://www.msys2.org/"
             exit 1
         fi
     else
@@ -274,23 +286,43 @@ install_opensuse() {
 install_windows() {
     print_header "Installing Windows (MSYS2) Dependencies"
 
+    # Find pacman executable
+    PACMAN_CMD=""
+    if command -v pacman &> /dev/null; then
+        PACMAN_CMD="pacman"
+    elif [ -x /usr/bin/pacman ]; then
+        PACMAN_CMD="/usr/bin/pacman"
+    elif [ -x /bin/pacman ]; then
+        PACMAN_CMD="/bin/pacman"
+    else
+        print_error "Cannot find pacman executable"
+        print_info "Please ensure you're running this script from an MSYS2 terminal"
+        exit 1
+    fi
+
     # Determine architecture-specific package prefix
     if [[ "$ARCH" == "x86_64" ]]; then
         PKG_PREFIX="mingw-w64-x86_64"
         print_info "Installing packages for x86_64 architecture..."
+        if [[ "$MSYSTEM" != "MINGW64" && -n "$MSYSTEM" ]]; then
+            print_warning "Current MSYSTEM is $MSYSTEM, but MINGW64 is recommended for x86_64"
+        fi
     elif [[ "$ARCH" == "aarch64" ]]; then
         PKG_PREFIX="mingw-w64-clang-aarch64"
         print_info "Installing packages for ARM64 architecture..."
+        if [[ "$MSYSTEM" != "CLANGARM64" && -n "$MSYSTEM" ]]; then
+            print_warning "Current MSYSTEM is $MSYSTEM, but CLANGARM64 is recommended for ARM64"
+        fi
     else
         print_error "Unsupported architecture: $ARCH"
         exit 1
     fi
 
     print_info "Updating MSYS2 package database..."
-    pacman -Sy --noconfirm
+    $PACMAN_CMD -Sy --noconfirm
 
     print_info "Installing DTFE dependencies..."
-    pacman -S --needed --noconfirm \
+    $PACMAN_CMD -S --needed --noconfirm \
         ${PKG_PREFIX}-gcc \
         ${PKG_PREFIX}-gsl \
         ${PKG_PREFIX}-boost \
@@ -301,6 +333,10 @@ install_windows() {
         make
 
     print_success "All dependencies installed successfully!"
+    print_info ""
+    print_info "NOTE: Make sure you're using the correct MSYS2 environment when building:"
+    print_info "  - For x86_64: Use MINGW64 terminal"
+    print_info "  - For ARM64: Use CLANGARM64 terminal"
 }
 
 # Verify installation
