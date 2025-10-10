@@ -23,6 +23,8 @@
 
 /** The following functions are defined in "density_interpolation.cc" file. */
 
+// Include Accelerate framework optimizations if available
+#include "accelerate_math.h"
 
  /* Computes the minor determinant coresponding to entry (row,column) of a 3x3 matrix. */
 inline Real minorDeterminant(Real matrix[][NO_DIM],
@@ -39,6 +41,11 @@ inline void matrixMultiplication(Real M1[][NO_DIM],
                                  Real M2[][N],
                                  Real result[][N])
 {
+#ifdef USE_ACCELERATE
+    // Use Accelerate framework for larger matrices
+    matrixMultiplication_accelerate(M1, M2, result);
+#else
+    // Original implementation
     for (int i=0; i<NO_DIM; ++i)
         for (int j=0; j<N; ++j)
         {
@@ -46,17 +53,24 @@ inline void matrixMultiplication(Real M1[][NO_DIM],
             for (int k=0; k<NO_DIM; ++k)
                 result[i][j] += M1[i][k] * M2[k][j];
         }
+#endif
 }
 inline void matrixMultiplication(Real M1[][NO_DIM],
                                  Real *M2,
                                  Real *result)
 {
+#ifdef USE_ACCELERATE
+    // Use Accelerate framework optimized version
+    matrixMultiplication_accelerate(M1, M2, result);
+#else
+    // Original implementation
     for (int i=0; i<NO_DIM; ++i)
     {
         result[i] = 0.;
         for (int j=0; j<NO_DIM; ++j)
             result[i] += M1[i][j] * M2[j];
     }
+#endif
 }
 
 /* Computes the vertex position difference matrix for a given Delaunay cell. */

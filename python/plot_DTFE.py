@@ -19,7 +19,7 @@ from pathlib import Path
 BASE_DATA_DIR = "output/TNG50-3-Dark"
 OUTPUT_DIR = "python/figures/dtfe"
 
-FIELD_RESOLUTION = 512
+FIELD_RESOLUTION = 1024
 BOX_SIZE = 51.7  # Mpc
 AXIS_UNITS = "Mpc"
 VELOCITY_UNITS = "km/s"

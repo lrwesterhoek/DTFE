@@ -104,14 +104,18 @@ ifeq ($(PLATFORM),macos)
         # Intel (x86_64) - Homebrew installs to /usr/local
         BREW_PREFIX = /usr/local
     endif
-    
+
     GSL_PATH   = $(BREW_PREFIX)/opt/gsl
     BOOST_PATH = $(BREW_PREFIX)/opt/boost
     CGAL_PATH  = $(BREW_PREFIX)/opt/cgal
     MPFR_PATH  = $(BREW_PREFIX)/opt/mpfr
     HDF5_PATH  = $(BREW_PREFIX)/opt/hdf5
     GMP_PATH   = $(BREW_PREFIX)/opt/gmp
-    
+
+    # Enable Apple Accelerate framework for optimized linear algebra
+    USE_ACCELERATE = -DUSE_ACCELERATE
+    ACCELERATE_FRAMEWORK = -framework Accelerate
+
     # Try different compiler locations
     CC := $(shell which $(BREW_PREFIX)/opt/llvm/bin/clang++ 2>/dev/null || which clang++ 2>/dev/null || which g++ 2>/dev/null || echo "clang++")
 else ifeq ($(PLATFORM),linux)
@@ -318,8 +322,8 @@ endif
 
 # Minimal compiler flags (from original Makefile)
 # Additional warnings and quality flags can be enabled in the EXTRA_FLAGS section above
-COMPILE_FLAGS = $(BASE_CFLAGS) -std=c++17 -Wno-psabi -Wno-cpp -frounding-math $(DEBUG_FLAGS) $(EXTRA_FLAGS)
-LINK_FLAGS =
+COMPILE_FLAGS = $(BASE_CFLAGS) -std=c++17 -Wno-psabi -Wno-cpp -frounding-math $(DEBUG_FLAGS) $(USE_ACCELERATE) $(EXTRA_FLAGS)
+LINK_FLAGS = $(ACCELERATE_FRAMEWORK)
 
 # Platform-specific library names
 ifeq ($(PLATFORM),windows)

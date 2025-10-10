@@ -55,6 +55,11 @@ inline double minorDeterminant(double matrix[][NO_DIM],
 void matrixInverse(double matrix[][NO_DIM],
                    Real result[][NO_DIM])
 {
+#ifdef USE_ACCELERATE
+    // Use Accelerate framework optimized version
+    matrixInverse_accelerate(matrix, result);
+#else
+    // Original implementation
     double tempM[NO_DIM][NO_DIM];
 #if NO_DIM==2
     double det = matrix[0][0]*matrix[1][1] - matrix[0][1]*matrix[1][0];
@@ -62,7 +67,7 @@ void matrixInverse(double matrix[][NO_DIM],
     result[0][1] = -matrix[0][1] / det;
     result[1][0] = -matrix[1][0] / det;
     result[1][1] = matrix[0][0] / det;
-    
+
     // check that the determinat is well defined
     double temp = fabs(matrix[0][0]) + fabs(matrix[0][1]) + fabs(matrix[1][0]) + fabs(matrix[1][1]);
     if ( not (std::fabs(det/temp)>REAL_PRECISSION) )
@@ -73,7 +78,7 @@ void matrixInverse(double matrix[][NO_DIM],
         for (size_t row=0; row<NO_DIM; ++row)
             for (size_t column=0; column<NO_DIM; ++column)
                 result[row][column] = Real(tempM);
-    
+
 #elif NO_DIM==3
     double det = matrix[0][0] * minorDeterminant( matrix, 0, 0)
             + matrix[0][1] * minorDeterminant( matrix, 1, 0)
@@ -81,7 +86,7 @@ void matrixInverse(double matrix[][NO_DIM],
     for (size_t row=0; row<NO_DIM; ++row)
         for (size_t column=0; column<NO_DIM; ++column)
             tempM[row][column] = minorDeterminant( matrix, row, column) / det;
-    
+
     // check that the determinat is well defined
     double temp = fabs(matrix[0][0]) + fabs(matrix[0][1]) + fabs(matrix[0][2]) + fabs(matrix[1][0]) + fabs(matrix[1][1]) + fabs(matrix[1][2]) + fabs(matrix[2][0]) + fabs(matrix[2][1]) + fabs(matrix[2][2]);
     if ( not (std::fabs(det/temp)>REAL_PRECISSION) )
@@ -93,6 +98,7 @@ void matrixInverse(double matrix[][NO_DIM],
             for (size_t column=0; column<NO_DIM; ++column)
                 result[row][column] = Real(tempM[row][column]);
 #endif
+#endif // USE_ACCELERATE
 }
 
 /* Computes the vertex position difference matrix for a given Delaunay cell. */
