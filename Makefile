@@ -303,7 +303,12 @@ ifeq ($(BUILD_MODE),debug)
     # Debug build: no optimization, with debug symbols and sanitizers
     BASE_CFLAGS = -O0 -g3 -DDEBUG $(OPTIONS)
     # Add sanitizers for debug builds (catch memory errors, undefined behavior, etc.)
-    SANITIZER_FLAGS = -fsanitize=address -fsanitize=undefined -fsanitize=leak
+    # Note: leak sanitizer not available on Windows
+    ifeq ($(PLATFORM),windows)
+        SANITIZER_FLAGS = -fsanitize=address -fsanitize=undefined
+    else
+        SANITIZER_FLAGS = -fsanitize=address -fsanitize=undefined -fsanitize=leak
+    endif
     DEBUG_FLAGS = $(SANITIZER_FLAGS) -fno-omit-frame-pointer
 else
     # Release build: full optimization
