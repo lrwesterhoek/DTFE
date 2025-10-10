@@ -341,8 +341,7 @@ install_windows() {
     # Add compiler and OpenMP support based on architecture
     if [[ "$ARCH" == "aarch64" ]]; then
         # ARM64 uses clang, need separate OpenMP library
-        # Note: libomp is the OpenMP runtime for Clang
-        PACKAGES="${PACKAGES} ${PKG_PREFIX}-clang ${PKG_PREFIX}-libomp ${PKG_PREFIX}-compiler-rt"
+        PACKAGES="${PACKAGES} ${PKG_PREFIX}-clang ${PKG_PREFIX}-llvm-openmp ${PKG_PREFIX}-compiler-rt"
     else
         # x86_64 and i686 use GCC which includes OpenMP
         PACKAGES="${PACKAGES} ${PKG_PREFIX}-gcc"
