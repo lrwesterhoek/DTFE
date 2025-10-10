@@ -319,7 +319,8 @@ LINK_FLAGS =
 # Platform-specific library names
 ifeq ($(PLATFORM),windows)
     # Windows Boost libraries have -mt suffix for multi-threaded
-    BASE_LIBS = -lboost_thread-mt -lboost_filesystem-mt -lboost_program_options-mt -lgsl -lgslcblas -lm -lgmp -lmpfr -lboost_system-mt
+    # Note: boost_system is header-only in newer Boost versions
+    BASE_LIBS = -lboost_thread-mt -lboost_filesystem-mt -lboost_program_options-mt -lgsl -lgslcblas -lm -lgmp -lmpfr
 else
     # macOS and Linux use standard names
     BASE_LIBS = -lboost_thread -lboost_filesystem -lboost_program_options -lgsl -lgslcblas -lm -lgmp -lmpfr -lboost_system
