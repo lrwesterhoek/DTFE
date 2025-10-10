@@ -315,7 +315,16 @@ endif
 # Additional warnings and quality flags can be enabled in the EXTRA_FLAGS section above
 COMPILE_FLAGS = $(BASE_CFLAGS) -std=c++17 -Wno-psabi -Wno-cpp -frounding-math $(DEBUG_FLAGS) $(EXTRA_FLAGS)
 LINK_FLAGS =
-BASE_LIBS = -lboost_thread -lboost_filesystem -lboost_program_options -lgsl -lgslcblas -lm -lgmp -lmpfr -lboost_system
+
+# Platform-specific library names
+ifeq ($(PLATFORM),windows)
+    # Windows Boost libraries have -mt suffix for multi-threaded
+    BASE_LIBS = -lboost_thread-mt -lboost_filesystem-mt -lboost_program_options-mt -lgsl -lgslcblas -lm -lgmp -lmpfr -lboost_system-mt
+else
+    # macOS and Linux use standard names
+    BASE_LIBS = -lboost_thread -lboost_filesystem -lboost_program_options -lgsl -lgslcblas -lm -lgmp -lmpfr -lboost_system
+endif
+
 HDF5_LIBS = -lhdf5 -lhdf5_cpp
 
 # Platform-specific OpenMP settings only
