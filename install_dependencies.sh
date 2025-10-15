@@ -1,7 +1,8 @@
 # DTFE Dependency Installation Script
-# 
+#
 # Automatically installs required dependencies for building DTFE
-# Supports: macOS (Intel/Apple Silicon), Ubuntu, Debian, Fedora, RHEL, CentOS, Arch, Manjaro
+# Supports: macOS (Intel/Apple Silicon), Linux (Ubuntu, Debian, Fedora, RHEL, CentOS, Arch, Manjaro),
+#           Windows (MSYS2/MinGW for x86_64 and ARM64)
 #
 
 set -e  # Exit on error
@@ -50,7 +51,7 @@ detect_os() {
     elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
         OS="linux"
         ARCH=$(uname -m)
-        
+
         # Detect Linux distribution
         if [ -f /etc/os-release ]; then
             . /etc/os-release
@@ -62,9 +63,52 @@ detect_os() {
             print_error "Cannot detect Linux distribution"
             exit 1
         fi
+    elif [[ "$OSTYPE" == "msys"* ]] || [[ "$OSTYPE" == "cygwin"* ]] || [[ "$OSTYPE" == "mingw"* ]]; then
+        OS="windows"
+
+        # Detect Windows environment
+        # Check for pacman in multiple locations
+        if command -v pacman &> /dev/null || \
+           [ -x /usr/bin/pacman ] || \
+           [ -x /bin/pacman ] || \
+           [ -n "$MSYSTEM" ]; then
+            WIN_ENV="msys2"
+
+            # Architecture detection for Windows
+            # On Windows ARM64, uname -m may incorrectly report x86_64 due to emulation
+            # Use MSYSTEM environment variable as the source of truth
+            if [[ "$MSYSTEM" == "CLANGARM64" ]]; then
+                ARCH="aarch64"
+                print_info "Detected: Windows with MSYS2 (ARM64)"
+                print_info "MSYSTEM: $MSYSTEM"
+            elif [[ "$MSYSTEM" == "MINGW64" ]]; then
+                ARCH="x86_64"
+                print_info "Detected: Windows with MSYS2 (x86_64)"
+                print_info "MSYSTEM: $MSYSTEM"
+            elif [[ "$MSYSTEM" == "MINGW32" ]]; then
+                ARCH="i686"
+                print_info "Detected: Windows with MSYS2 (32-bit x86)"
+                print_info "MSYSTEM: $MSYSTEM"
+            else
+                # Fall back to uname if MSYSTEM is not set or unrecognized
+                ARCH=$(uname -m)
+                print_warning "MSYSTEM is '$MSYSTEM' (unexpected value)"
+                print_info "Detected architecture from uname: $ARCH"
+                print_info "This may not work correctly. Please use MINGW64, CLANGARM64, or MINGW32 terminal"
+            fi
+        else
+            print_error "Windows environment detected but pacman (MSYS2) not found"
+            print_info "Please make sure you're running this script from:"
+            print_info "  - MINGW64 terminal (for x86_64)"
+            print_info "  - CLANGARM64 terminal (for ARM64)"
+            print_info "  - NOT from Windows Command Prompt or PowerShell"
+            print_info ""
+            print_info "If MSYS2 is not installed, get it from https://www.msys2.org/"
+            exit 1
+        fi
     else
         print_error "Unsupported operating system: $OSTYPE"
-        print_info "This script supports macOS and Linux only"
+        print_info "This script supports macOS, Linux, and Windows (MSYS2) only"
         exit 1
     fi
 }
@@ -236,7 +280,7 @@ install_arch() {
 # Install dependencies on openSUSE
 install_opensuse() {
     print_header "Installing openSUSE Dependencies"
-    
+
     print_info "Installing development tools and dependencies..."
     sudo zypper install -y -t pattern devel_C_C++
     sudo zypper install -y \
@@ -246,8 +290,70 @@ install_opensuse() {
         mpfr-devel \
         hdf5-devel \
         gmp-devel
-    
+
     print_success "All dependencies installed successfully!"
+}
+
+# Install dependencies on Windows (MSYS2/MinGW)
+install_windows() {
+    print_header "Installing Windows (MSYS2) Dependencies"
+
+    # Find pacman executable
+    PACMAN_CMD=""
+    if command -v pacman &> /dev/null; then
+        PACMAN_CMD="pacman"
+    elif [ -x /usr/bin/pacman ]; then
+        PACMAN_CMD="/usr/bin/pacman"
+    elif [ -x /bin/pacman ]; then
+        PACMAN_CMD="/bin/pacman"
+    else
+        print_error "Cannot find pacman executable"
+        print_info "Please ensure you're running this script from an MSYS2 terminal"
+        exit 1
+    fi
+
+    # Determine architecture-specific package prefix
+    if [[ "$ARCH" == "x86_64" ]]; then
+        PKG_PREFIX="mingw-w64-x86_64"
+        print_info "Installing packages for x86_64 architecture..."
+        if [[ "$MSYSTEM" != "MINGW64" && -n "$MSYSTEM" ]]; then
+            print_warning "Current MSYSTEM is $MSYSTEM, but MINGW64 is recommended for x86_64"
+        fi
+    elif [[ "$ARCH" == "aarch64" ]]; then
+        PKG_PREFIX="mingw-w64-clang-aarch64"
+        print_info "Installing packages for ARM64 architecture..."
+        if [[ "$MSYSTEM" != "CLANGARM64" && -n "$MSYSTEM" ]]; then
+            print_warning "Current MSYSTEM is $MSYSTEM, but CLANGARM64 is recommended for ARM64"
+        fi
+    else
+        print_error "Unsupported architecture: $ARCH"
+        exit 1
+    fi
+
+    print_info "Updating MSYS2 package database..."
+    $PACMAN_CMD -Sy --noconfirm
+
+    print_info "Installing DTFE dependencies..."
+
+    # Base packages for all architectures
+    PACKAGES="${PKG_PREFIX}-gsl ${PKG_PREFIX}-boost ${PKG_PREFIX}-cgal ${PKG_PREFIX}-mpfr ${PKG_PREFIX}-hdf5 ${PKG_PREFIX}-gmp make"
+
+    # Add compiler and OpenMP support based on architecture
+    if [[ "$ARCH" == "aarch64" ]]; then
+        # ARM64 uses clang, need separate OpenMP library
+        PACKAGES="${PACKAGES} ${PKG_PREFIX}-clang ${PKG_PREFIX}-llvm-openmp ${PKG_PREFIX}-compiler-rt"
+    else
+        # x86_64 and i686 use GCC which includes OpenMP
+        PACKAGES="${PACKAGES} ${PKG_PREFIX}-gcc"
+    fi
+
+    $PACMAN_CMD -S --needed --noconfirm ${PACKAGES}
+
+    print_success "All dependencies installed successfully!"
+    print_info ""
+    print_info "NOTE: Make sure you're using the correct MSYS2 environment when building:"
+    print_info "  - For x86_64: Use MINGW64 terminal"
+    print_info "  - For ARM64: Use CLANGARM64 terminal"
 }
 
 # Verify installation
@@ -330,32 +436,32 @@ main() {
             # Normalize to lowercase for comparison
             DISTRO_LOWER=$(echo "$DISTRO" | tr '[:upper:]' '[:lower:]')
             DISTRO_LIKE_LOWER=$(echo "$DISTRO_LIKE" | tr '[:upper:]' '[:lower:]')
-            
+
             # Determine which installer to use
             INSTALLER=""
-            
+
             # Check for Debian-based distros
             if [[ "$DISTRO_LOWER" =~ ^(ubuntu|debian|pop|linuxmint|elementary|zorin|kali|parrot|raspbian)$ ]] || \
                [[ "$DISTRO_LIKE_LOWER" =~ (ubuntu|debian) ]]; then
                 INSTALLER="ubuntu_debian"
-            
+
             # Check for Fedora-based distros (including Asahi Fedora)
             elif [[ "$DISTRO_LOWER" =~ ^(fedora|rhel|centos|rocky|almalinux|scientific|oracle|nobara|ultramarine|asahi)$ ]] || \
                  [[ "$DISTRO_LOWER" =~ fedora ]] || \
                  [[ "$DISTRO_LIKE_LOWER" =~ (fedora|rhel|centos) ]]; then
                 INSTALLER="fedora_rhel"
-            
+
             # Check for Arch-based distros
             elif [[ "$DISTRO_LOWER" =~ ^(arch|manjaro|endeavouros|garuda|artix|parabola|cachyos)$ ]] || \
                  [[ "$DISTRO_LIKE_LOWER" =~ arch ]]; then
                 INSTALLER="arch"
-            
+
             # Check for openSUSE-based distros
             elif [[ "$DISTRO_LOWER" =~ ^(opensuse|sles|suse)$ ]] || \
                  [[ "$DISTRO_LIKE_LOWER" =~ (opensuse|suse) ]]; then
                 INSTALLER="opensuse"
             fi
-            
+
             # Run the appropriate installer
             if [[ -n "$INSTALLER" ]]; then
                 case "$INSTALLER" in
@@ -379,6 +485,9 @@ main() {
                 print_info "Please install dependencies manually (see README.md)"
                 exit 1
             fi
+            ;;
+        windows)
+            install_windows
             ;;
     esac
     

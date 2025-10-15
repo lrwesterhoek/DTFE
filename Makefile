@@ -1,9 +1,9 @@
-# Cross-platform Makefile for compiling the DTFE code on Mac and Linux systems
+# Cross-platform Makefile for compiling the DTFE code on Mac, Linux and Windows systems
 #
 # SUPPORTED ARCHITECTURES:
 # ========================
-# - x86_64 (Intel/AMD 64-bit) on both macOS and Linux
-# - ARM64 (aarch64/Apple Silicon) on both macOS and Linux
+# - x86_64 (Intel/AMD 64-bit) on macOS, Linux, and Windows
+# - ARM64 (aarch64/Apple Silicon) on macOS, Linux, and Windows
 # The Makefile automatically detects the architecture and sets appropriate paths.
 #
 # USAGE:
@@ -18,6 +18,12 @@
 #   Uses standard system paths (/usr). Install development packages:
 #   sudo apt-get install libgsl-dev libboost-all-dev libcgal-dev libmpfr-dev libhdf5-dev libgmp-dev
 #   or equivalent for your distribution, then run 'make DTFE'
+#
+# Windows (MSYS2/MinGW):
+#   Uses MSYS2 paths. Install MSYS2 and packages:
+#   pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-gsl mingw-w64-x86_64-boost
+#   mingw-w64-x86_64-cgal mingw-w64-x86_64-mpfr mingw-w64-x86_64-hdf5 mingw-w64-x86_64-gmp
+#   For ARM64: Replace x86_64 with clangarm64, then run 'make DTFE'
 #
 # CUSTOMIZATION:
 # ==============
@@ -56,17 +62,35 @@ UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)  # macOS
     PLATFORM := macos
     SHARED_EXT := .dylib
-    EXE_EXT := 
+    EXE_EXT :=
     OBJ_EXT := .o
     LIB_EXT := .a
 else ifeq ($(UNAME_S),Linux)
     PLATFORM := linux
     SHARED_EXT := .so
-    EXE_EXT := 
+    EXE_EXT :=
+    OBJ_EXT := .o
+    LIB_EXT := .a
+else ifneq (,$(findstring MINGW,$(UNAME_S)))  # Windows (MINGW32/MINGW64)
+    PLATFORM := windows
+    SHARED_EXT := .dll
+    EXE_EXT := .exe
+    OBJ_EXT := .o
+    LIB_EXT := .a
+else ifneq (,$(findstring MSYS,$(UNAME_S)))  # Windows (MSYS2)
+    PLATFORM := windows
+    SHARED_EXT := .dll
+    EXE_EXT := .exe
+    OBJ_EXT := .o
+    LIB_EXT := .a
+else ifneq (,$(findstring CYGWIN,$(UNAME_S)))  # Windows (Cygwin)
+    PLATFORM := windows
+    SHARED_EXT := .dll
+    EXE_EXT := .exe
     OBJ_EXT := .o
     LIB_EXT := .a
 else
-    $(error Unsupported operating system: $(UNAME_S). Only macOS and Linux are supported.)
+    $(error Unsupported operating system: $(UNAME_S). Only macOS, Linux, and Windows are supported.)
 endif
 
 # Platform-specific library paths and compiler settings
@@ -99,6 +123,51 @@ else ifeq ($(PLATFORM),linux)
     HDF5_PATH  = /usr
     GMP_PATH = /usr
     CC := $(shell which g++ 2>/dev/null || which clang++ 2>/dev/null || echo "g++")
+else ifeq ($(PLATFORM),windows)
+    # Windows with MSYS2/MinGW - detect architecture for correct paths
+    # On Windows ARM64, uname -m may report x86_64 due to emulation
+    # Use MSYSTEM environment variable as the source of truth
+    ifeq ($(MSYSTEM),CLANGARM64)
+        # ARM64 architecture - use clangarm64 prefix
+        MINGW_PREFIX = /clangarm64
+        ARCH = aarch64
+    else ifeq ($(MSYSTEM),MINGW64)
+        # x86_64 architecture - use mingw64 prefix
+        MINGW_PREFIX = /mingw64
+        ARCH = x86_64
+    else ifeq ($(MSYSTEM),MINGW32)
+        # 32-bit x86 architecture - use mingw32 prefix
+        MINGW_PREFIX = /mingw32
+        ARCH = i686
+    else
+        # Fall back to uname if MSYSTEM is not set
+        ARCH := $(shell uname -m)
+        ifeq ($(ARCH),x86_64)
+            MINGW_PREFIX = /mingw64
+        else ifeq ($(ARCH),aarch64)
+            MINGW_PREFIX = /clangarm64
+        else ifeq ($(ARCH),i686)
+            MINGW_PREFIX = /mingw32
+        else
+            # Default to mingw64 if detection fails
+            MINGW_PREFIX = /mingw64
+        endif
+    endif
+
+    GSL_PATH   = $(MINGW_PREFIX)
+    BOOST_PATH = $(MINGW_PREFIX)
+    CGAL_PATH  = $(MINGW_PREFIX)
+    MPFR_PATH  = $(MINGW_PREFIX)
+    HDF5_PATH  = $(MINGW_PREFIX)
+    GMP_PATH   = $(MINGW_PREFIX)
+
+    # Try different compiler locations for Windows
+    # ARM64 uses clang++, x86_64/i686 use g++
+    ifeq ($(MSYSTEM),CLANGARM64)
+        CC := $(shell which $(MINGW_PREFIX)/bin/clang++ 2>/dev/null || which clang++ 2>/dev/null || echo "clang++")
+    else
+        CC := $(shell which $(MINGW_PREFIX)/bin/g++ 2>/dev/null || which g++ 2>/dev/null || echo "g++")
+    endif
 endif
 
 # Common utilities
@@ -234,7 +303,12 @@ ifeq ($(BUILD_MODE),debug)
     # Debug build: no optimization, with debug symbols and sanitizers
     BASE_CFLAGS = -O0 -g3 -DDEBUG $(OPTIONS)
     # Add sanitizers for debug builds (catch memory errors, undefined behavior, etc.)
-    SANITIZER_FLAGS = -fsanitize=address -fsanitize=undefined -fsanitize=leak
+    # Note: leak sanitizer not available on Windows
+    ifeq ($(PLATFORM),windows)
+        SANITIZER_FLAGS = -fsanitize=address -fsanitize=undefined
+    else
+        SANITIZER_FLAGS = -fsanitize=address -fsanitize=undefined -fsanitize=leak
+    endif
     DEBUG_FLAGS = $(SANITIZER_FLAGS) -fno-omit-frame-pointer
 else
     # Release build: full optimization
@@ -246,7 +320,17 @@ endif
 # Additional warnings and quality flags can be enabled in the EXTRA_FLAGS section above
 COMPILE_FLAGS = $(BASE_CFLAGS) -std=c++17 -Wno-psabi -Wno-cpp -frounding-math $(DEBUG_FLAGS) $(EXTRA_FLAGS)
 LINK_FLAGS =
-BASE_LIBS = -lboost_thread -lboost_filesystem -lboost_program_options -lgsl -lgslcblas -lm -lgmp -lmpfr -lboost_system
+
+# Platform-specific library names
+ifeq ($(PLATFORM),windows)
+    # Windows Boost libraries have -mt suffix for multi-threaded
+    # Note: boost_system is header-only in newer Boost versions
+    BASE_LIBS = -lboost_thread-mt -lboost_filesystem-mt -lboost_program_options-mt -lgsl -lgslcblas -lm -lgmp -lmpfr
+else
+    # macOS and Linux use standard names
+    BASE_LIBS = -lboost_thread -lboost_filesystem -lboost_program_options -lgsl -lgslcblas -lm -lgmp -lmpfr -lboost_system
+endif
+
 HDF5_LIBS = -lhdf5 -lhdf5_cpp
 
 # Platform-specific OpenMP settings only
@@ -256,6 +340,19 @@ ifeq ($(PLATFORM),macos)
 else ifeq ($(PLATFORM),linux)
     COMPILE_FLAGS += -fopenmp
     OPENMP_LIB = -lgomp
+else ifeq ($(PLATFORM),windows)
+    # Windows ARM64 uses Clang with libomp, x86_64 uses GCC with libgomp
+    ifeq ($(MSYSTEM),CLANGARM64)
+        COMPILE_FLAGS += -fopenmp=libomp
+        OPENMP_LIB = -lomp
+        # Clang on Windows ARM64
+        LINK_FLAGS += -static-libgcc -static-libstdc++
+    else
+        COMPILE_FLAGS += -fopenmp
+        OPENMP_LIB = -lgomp
+        # GCC on Windows x86_64
+        LINK_FLAGS += -static-libgcc -static-libstdc++
+    endif
 endif
 
 DTFE_INC = $(INCLUDES)
@@ -284,7 +381,7 @@ HEADERS_2 = $(addprefix CGAL_triangulation/, CGAL_include_2D.h CGAL_include_3D.h
 
 
 DTFE: set_directories $(OBJ_DIR)/DTFE$(OBJ_EXT) $(OBJ_DIR)/triangulation$(OBJ_EXT) $(OBJ_DIR)/main$(OBJ_EXT) $(OBJ_DIR)/kdtree2$(OBJ_EXT) Makefile
-	$(CC) $(COMPILE_FLAGS) $(OBJ_DIR)/DTFE$(OBJ_EXT) $(OBJ_DIR)/triangulation$(OBJ_EXT) $(OBJ_DIR)/main$(OBJ_EXT) $(OBJ_DIR)/kdtree2$(OBJ_EXT) $(DTFE_LIB) -o $(BIN_DIR)/DTFE$(EXE_EXT)
+	$(CC) $(COMPILE_FLAGS) $(LINK_FLAGS) $(OBJ_DIR)/DTFE$(OBJ_EXT) $(OBJ_DIR)/triangulation$(OBJ_EXT) $(OBJ_DIR)/main$(OBJ_EXT) $(OBJ_DIR)/kdtree2$(OBJ_EXT) $(DTFE_LIB) -o $(BIN_DIR)/DTFE$(EXE_EXT)
 
 
 $(OBJ_DIR)/main$(OBJ_EXT): $(addprefix $(SRC)/, $(MAIN_SOURCES)) Makefile
@@ -304,7 +401,7 @@ library: set_directories set_directories_2 $(addprefix $(SRC)/, $(LIB_FILES) ) c
 	$(CC) $(COMPILE_FLAGS) -fPIC $(DTFE_INC) -o $(OBJ_DIR)/DTFE_l$(OBJ_EXT) -c $(SRC)/DTFE.cpp
 	$(CC) -O3 -ffast-math -fomit-frame-pointer -fPIC $(DTFE_INC) -o $(OBJ_DIR)/kdtree2_l$(OBJ_EXT) -c $(SRC)/kdtree/kdtree2.cpp
 	$(CC) $(COMPILE_FLAGS) -fPIC $(DTFE_INC) -o $(OBJ_DIR)/triangulation_l$(OBJ_EXT) -c $(SRC)/CGAL_triangulation/triangulation.cpp
-	$(CC) $(COMPILE_FLAGS) -shared $(OBJ_DIR)/DTFE_l$(OBJ_EXT) $(OBJ_DIR)/triangulation_l$(OBJ_EXT) $(OBJ_DIR)/kdtree2_l$(OBJ_EXT) $(DTFE_LIB) -o $(LIB_DIR)/libDTFE$(SHARED_EXT)
+	$(CC) $(COMPILE_FLAGS) $(LINK_FLAGS) -shared $(OBJ_DIR)/DTFE_l$(OBJ_EXT) $(OBJ_DIR)/triangulation_l$(OBJ_EXT) $(OBJ_DIR)/kdtree2_l$(OBJ_EXT) $(DTFE_LIB) -o $(LIB_DIR)/libDTFE$(SHARED_EXT)
 
 
 clean:
