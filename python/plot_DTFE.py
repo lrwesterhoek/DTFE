@@ -11,6 +11,8 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as colors
 from scipy.ndimage import gaussian_filter
 from pathlib import Path
+import dtfe_functions as dtfe
+from dtfe_shared import save_plot_to_multiple_paths
 
 # ============================================================================
 # Configuration Section
@@ -25,24 +27,7 @@ AXIS_UNITS = "Mpc"
 VELOCITY_UNITS = "km/s"
 
 # Snapshot to redshift mapping
-SNAPSHOT_TO_REDSHIFT = {
-    '000': 20.05,
-    '004': 10.00,
-    '008': 8.01,
-    '013': 6.01,
-    '017': 5.00,
-    '021': 4.01,
-    '025': 3.01,
-    '033': 2.00,
-    '040': 1.50,
-    '050': 1.00,
-    '067': 0.50,
-    '072': 0.40,
-    '078': 0.30,
-    '084': 0.20,
-    '091': 0.10,
-    '099': 0.00
-}
+SNAPSHOT_TO_REDSHIFT = dtfe.SNAPSHOT_TO_REDSHIFT
 
 # Which slice planes to visualize? (0=YZ, 1=XZ, 2=XY)
 SLICE_PLANES_TO_PLOT = [0, 1, 2]
@@ -70,41 +55,6 @@ SLICE_PLANES = {
 # File Loading Functions
 # ============================================================================
 
-def load_binary_field(binary_file, field_shape, num_components=1, dtype=np.float32):
-    """
-    Generic loader for binary field data.
-    Handles scalar and vector/tensor fields via num_components parameter.
-    """
-    data = np.fromfile(binary_file, dtype=dtype)
-    expected_size = np.prod(field_shape) * num_components
-    
-    if data.size != expected_size:
-        total_elements = data.size / num_components
-        cube_root = round(total_elements ** (1/3))
-        
-        if cube_root**3 * num_components == data.size:
-            field_shape = (cube_root, cube_root, cube_root)
-        else:
-            raise ValueError(
-                f"File {binary_file} has {data.size} elements, "
-                f"but expected {expected_size} for shape {field_shape}"
-            )
-    
-    if num_components == 1:
-        return data.reshape(field_shape)
-    else:
-        return data.reshape(field_shape + (num_components,))
-
-# ============================================================================
-# Slice Extraction
-# ============================================================================
-
-def extract_slice(field, slice_dim=2):
-    """Extract a 2D slice from a 3D field at the midpoint."""
-    idx = field.shape[slice_dim] // 2
-    slices = [slice(None)] * 3
-    slices[slice_dim] = idx
-    return field[tuple(slices)]
 
 def extract_velocity_slice(velocity_field, slice_dim=2):
     """Extract velocity components for a 2D slice."""
@@ -130,7 +80,7 @@ def extract_velocity_slice(velocity_field, slice_dim=2):
 
 def plot_density(density_field, slice_dim, box_size, redshift=None, save_path=None):
     """Create a density field visualization."""
-    dens_slice = extract_slice(density_field, slice_dim).T
+    dens_slice = dtfe.extract_2d_slice(density_field, slice_dim).T
     vmin = max(np.min(dens_slice[dens_slice > 0]), 1e-6)
     
     fig, ax = plt.subplots(figsize=(8, 7))
@@ -156,8 +106,7 @@ def plot_density(density_field, slice_dim, box_size, redshift=None, save_path=No
     plt.tight_layout()
     
     if save_path:
-        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(save_path, dpi=DPI, bbox_inches='tight')
+        save_plot_to_multiple_paths(fig, save_path, dpi=DPI, bbox_inches='tight')
         plt.close(fig)
     else:
         plt.show()
@@ -206,15 +155,14 @@ def plot_velocity(velocity_field, slice_dim, box_size, quiver_step,
     plt.tight_layout()
     
     if save_path:
-        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(save_path, dpi=DPI, bbox_inches='tight')
+        save_plot_to_multiple_paths(fig, save_path, dpi=DPI, bbox_inches='tight')
         plt.close(fig)
     else:
         plt.show()
 
 def plot_divergence(div_field, slice_dim, box_size, redshift=None, save_path=None):
     """Create a velocity divergence visualization."""
-    div_slice = extract_slice(div_field, slice_dim).T
+    div_slice = dtfe.extract_2d_slice(div_field, slice_dim).T
     vmin, vmax = np.percentile(div_slice, [1, 99])
     
     fig, ax = plt.subplots(figsize=(8, 7))
@@ -240,8 +188,7 @@ def plot_divergence(div_field, slice_dim, box_size, redshift=None, save_path=Non
     plt.tight_layout()
     
     if save_path:
-        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(save_path, dpi=DPI, bbox_inches='tight')
+        save_plot_to_multiple_paths(fig, save_path, dpi=DPI, bbox_inches='tight')
         plt.close(fig)
     else:
         plt.show()
@@ -260,7 +207,7 @@ def plot_shear(shear_field, slice_dim, box_size, redshift=None, save_path=None):
         2*(σ_xy**2 + σ_xz**2 + σ_yz**2)
     )
     
-    shear_slice = extract_slice(shear_mag, slice_dim).T
+    shear_slice = dtfe.extract_2d_slice(shear_mag, slice_dim).T
     vmin = max(np.min(shear_slice[shear_slice > 0]), 1e-6)
     
     fig, ax = plt.subplots(figsize=(8, 7))
@@ -286,8 +233,7 @@ def plot_shear(shear_field, slice_dim, box_size, redshift=None, save_path=None):
     plt.tight_layout()
     
     if save_path:
-        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(save_path, dpi=DPI, bbox_inches='tight')
+        save_plot_to_multiple_paths(fig, save_path, dpi=DPI, bbox_inches='tight')
         plt.close(fig)
     else:
         plt.show()
@@ -320,23 +266,23 @@ def process_snapshot(snapshot, redshift):
     
     try:
         if PROCESS_DENSITY:
-            dens = load_binary_field(str(file_paths['density']), field_shape, num_components=1)
+            dens = dtfe.load_binary_field(str(file_paths['density']), field_shape, num_components=1)
             if GAUSSIAN_SMOOTHING_SIGMA > 0:
-                dens = gaussian_filter(dens, sigma=GAUSSIAN_SMOOTHING_SIGMA, mode='wrap')
+                dens = dtfe.smooth_field(dens, sigma=GAUSSIAN_SMOOTHING_SIGMA)
             fields['density'] = dens
         
         if PROCESS_VELOCITY:
-            fields['velocity'] = load_binary_field(
+            fields['velocity'] = dtfe.load_binary_field(
                 str(file_paths['velocity']), field_shape, num_components=3
             )
         
         if PROCESS_DIVERGENCE:
-            fields['divergence'] = load_binary_field(
+            fields['divergence'] = dtfe.load_binary_field(
                 str(file_paths['divergence']), field_shape, num_components=1
             )
         
         if PROCESS_SHEAR:
-            fields['shear'] = load_binary_field(
+            fields['shear'] = dtfe.load_binary_field(
                 str(file_paths['shear']), field_shape, num_components=5
             )
         

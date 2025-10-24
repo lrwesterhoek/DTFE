@@ -89,3 +89,6 @@ demo/.DS_Store
 *.png
 *.txt
 *.mp4
+*.svg
+*.DS_Store
+*.pyc

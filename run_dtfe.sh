@@ -3,12 +3,12 @@
 # ============================================
 
 # Simulation snapshots to process
-SNAPSHOTS=(0 1 2 3 4 5 8 13 17 21 25 33 40 50 67 72 78 84 91 99)
+SNAPSHOTS=(0 4 8 13 17 21 25 33 40 50 67 72 78 84 91 99)
 
 # Grid parameters
 GRID_SIZE=512
-PADDING=20
-PARTITION="2 2 1"
+PADDING=15
+PARTITION="2 2 2"
 
 # Data locations (relative to script directory)
 DATA_DIR="output/TNG50-3-Dark"
@@ -16,7 +16,7 @@ INPUT_SUBDIR="snapdir"
 OUTPUT_SUBDIR="output"
 
 # DTFE fields to compute
-FIELDS="density_a velocity_a gradient_a divergence_a shear_a vorticity_a"
+FIELDS="density_a velocity_a divergence_a shear_a"
 
 # ============================================
 # Script Execution
