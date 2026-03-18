@@ -34,6 +34,10 @@
 #include "box.h"
 #include "user_options.h"
 #include "message.h"
+#include <boost/timer.hpp>
+
+void printElapsedTime(boost::timer *t, User_options *userOptions,
+                      std::string computationQuantityName);
 
 
 
@@ -60,7 +64,8 @@ void SPH_interpolation(vector<Particle_data> *particles,
     else
     {
         size_t const *grid = &(userOptions.gridSize[0]);
-        totalGrid = (NO_DIM==2) ? grid[0]*grid[1] : grid[0]*grid[1]*grid[2];
+        totalGrid = 1;
+        for (int d=0; d<NO_DIM; ++d) totalGrid *= grid[d];
     }
     
     kdtree2_array gridPoints(extents[totalGrid][NO_DIM]);
@@ -79,28 +84,12 @@ void SPH_interpolation(vector<Particle_data> *particles,
         for (size_t i=0; i<NO_DIM; ++i)
             dy[i] = (box[2*i+1] - box[2*i]) / grid[i];
         
-        size_t index = 0;
-        y[0] = box[0] + 0.5*dy[0];
-        for (size_t i1=0; i1<grid[0]; ++i1)
+        for (size_t flatIdx=0; flatIdx<totalGrid; ++flatIdx)
         {
-            y[1] = box[2] + 0.5*dy[1];
-            for (size_t i2=0; i2<grid[1]; ++i2)
-            {
-#if NO_DIM==3
-                y[2] = box[4] + 0.5*dy[2];
-                for (size_t i3=0; i3<grid[2]; ++i3)
-                {
-#endif
-                    for (size_t j=0; j<NO_DIM; ++j)
-                        gridPoints[index][j] = y[j];
-                    ++index;
-#if NO_DIM==3
-                    y[2] += dy[2];
-                }
-#endif
-                y[1] += dy[1];
-            }
-            y[0] += dy[0];
+            size_t gridIdx[NO_DIM], rem = flatIdx;
+            for (int d=NO_DIM-1; d>=0; --d) { gridIdx[d] = rem % grid[d]; rem /= grid[d]; }
+            for (size_t j=0; j<NO_DIM; ++j)
+                gridPoints[flatIdx][j] = box[2*j] + (gridIdx[j]+0.5)*dy[j];
         }
     }
     else if ( userOptions.redshiftConeOn )     //sample points on a light cone grid
@@ -191,11 +180,9 @@ Real SPH_smoothingKernelDerivative(Real x)
 /* Function that returns the constant in front of W(r,h), constant that depends only on h. */
 inline Real hFactor(Real h)
 {
-#if NO_DIM==2
-    return Real(1.)/(h*h);
-#elif NO_DIM==3
-    return Real(1.)/(h*h*h);
-#endif
+    Real result = Real(1.);
+    for (int d=0; d<NO_DIM; ++d) result /= h;
+    return result;
 }
 
 

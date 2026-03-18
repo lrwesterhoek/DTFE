@@ -29,15 +29,23 @@
 
 
 
+// In PS-DTFE mode, spatial sorting uses Lagrangian positions (which are the triangulation coordinates).
+// In standard mode, sorting uses Eulerian positions.
+#ifdef PHASE_SPACE
+#define SORT_POS lagPos
+#else
+#define SORT_POS pos
+#endif
+
 struct Particle_data_less_x
 {
     bool operator()(Particle_data p, Particle_data q) const
-    { return (p.pos[0] < q.pos[0]); }
+    { return (p.SORT_POS[0] < q.SORT_POS[0]); }
 };
 struct Particle_data_less_y
 {
     bool operator()(Particle_data p, Particle_data q) const
-    { return (p.pos[1] < q.pos[1]); }
+    { return (p.SORT_POS[1] < q.SORT_POS[1]); }
 };
 #if NO_DIM==2
 struct Particle_data_sort_traits
@@ -45,7 +53,7 @@ struct Particle_data_sort_traits
     typedef Particle_data Point_2;
     typedef Particle_data_less_x Less_x_2;
     typedef Particle_data_less_y Less_y_2;
-    
+
     Less_x_2 less_x_2_object() const
     { return Less_x_2(); }
     Less_y_2 less_y_2_object() const
@@ -57,7 +65,7 @@ struct Particle_data_sort_traits
 struct Particle_data_less_z
 {
     bool operator()(Particle_data p, Particle_data q) const
-    { return p.pos[2]<q.pos[2]; }
+    { return p.SORT_POS[2]<q.SORT_POS[2]; }
 };
 
 struct Particle_data_sort_traits
@@ -66,7 +74,7 @@ struct Particle_data_sort_traits
     typedef Particle_data_less_x Less_x_3;
     typedef Particle_data_less_y Less_y_3;
     typedef Particle_data_less_z Less_z_3;
-    
+
     Less_x_3 less_x_3_object() const
     { return Less_x_3(); }
     Less_y_3 less_y_3_object() const
@@ -77,6 +85,7 @@ struct Particle_data_sort_traits
 };
 #endif
 
+#undef SORT_POS
 
 // Compares two particles to be able to sort them according to positions
 template <typename T>

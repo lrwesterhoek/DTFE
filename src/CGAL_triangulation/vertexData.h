@@ -34,8 +34,11 @@ struct vertexData : public Data_structure
     protected:
     bool   dummy;         // true if the vertex is dummy test point - used to test padding efficiency
     bool   dummyNeighbor; // true if the vertex has at least one dummy point as neighbor - used to test padding efficiency for density computations
-    
-    
+#ifdef PHASE_SPACE
+    Pvector<Real,NO_DIM> _eulerianPos; // Eulerian position (triangulation vertices store Lagrangian coords in PS-DTFE mode)
+#endif
+
+
     public:
     // constructor
     vertexData(){ dummy=false; dummyNeighbor=false; }
@@ -57,7 +60,15 @@ struct vertexData : public Data_structure
 #ifdef SCALAR
         scalar() = other.scalar();
 #endif
+#ifdef PHASE_SPACE
+        _eulerianPos = other.position();
+#endif
     }
+
+#ifdef PHASE_SPACE
+    inline Pvector<Real,NO_DIM>& eulerianPosition() { return _eulerianPos; }
+    inline Real& eulerianPosition(int const i) { return _eulerianPos[i]; }
+#endif
     //! see the "particle_data.h" file for the rest of functions that can access and modify the values in 'Data_structure'
     
     

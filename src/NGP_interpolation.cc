@@ -32,6 +32,10 @@
 #include "box.h"
 #include "user_options.h"
 #include "message.h"
+#include <boost/timer.hpp>
+
+void printElapsedTime(boost::timer *t, User_options *userOptions,
+                      std::string computationQuantityName);
 
 using namespace std;
 typedef vector<Particle_data>::iterator     vectorIterator;
@@ -77,7 +81,8 @@ void NGP_interpolation_regular_grid(vector<Particle_data> &particles,
     
     
     // allocate memory for the results
-    size_t const reserveSize = (NO_DIM==2) ? nGrid[0]*nGrid[1] : nGrid[0]*nGrid[1]*nGrid[2];
+    size_t reserveSize = 1;
+    for (int d=0; d<NO_DIM; ++d) reserveSize *= nGrid[d];
     q->density.assign( reserveSize, Real(0.) );
     if ( userOptions.aField.velocity )
 		q->velocity.assign( reserveSize, Pvector<Real,noVelComp>::zero() );
@@ -102,11 +107,8 @@ void NGP_interpolation_regular_grid(vector<Particle_data> &particles,
 				validCell = false;
 		}
 		if ( not validCell ) continue;
-#if NO_DIM==2
-		int index = cell[0] * nGrid[1] + cell[1];
-#elif NO_DIM==3
-		int index = cell[0] * nGrid[1]*nGrid[2] + cell[1] * nGrid[2] + cell[2];
-#endif
+		int index = 0;
+		for (int d=0; d<NO_DIM; ++d) index = index * nGrid[d] + cell[d];
 		q->density[index] += it->weight();
 		if ( userOptions.aField.velocity )
 			q->velocity[index] += it->velocity() * it->weight();
@@ -143,7 +145,8 @@ void NGP_particle_count(vector<Particle_data> &particles,
                         vector<int> *counts)
 {
     // allocate memory for the results
-    size_t const reserveSize = (NO_DIM==2) ? nGrid[0]*nGrid[1] : nGrid[0]*nGrid[1]*nGrid[2];
+    size_t reserveSize = 1;
+    for (int d=0; d<NO_DIM; ++d) reserveSize *= nGrid[d];
     counts->assign( reserveSize, int(0) );
 	
     // get the grid spacing
@@ -164,11 +167,8 @@ void NGP_particle_count(vector<Particle_data> &particles,
 				validCell = false;
 		}
 		if ( not validCell ) continue;
-#if NO_DIM==2
-		int index = cell[0] * nGrid[1] + cell[1];
-#elif NO_DIM==3
-		int index = cell[0] * nGrid[1]*nGrid[2] + cell[1] * nGrid[2] + cell[2];
-#endif
+		int index = 0;
+		for (int d=0; d<NO_DIM; ++d) index = index * nGrid[d] + cell[d];
 		(*counts)[index] += 1;
 	}
 }

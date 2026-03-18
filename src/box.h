@@ -50,26 +50,28 @@ struct Box
     // returns true if the particle is inside the box
     template <typename Particle> bool isParticleInBox(Particle &p) const
     {
-#if NO_DIM==2
-        if ( p.pos[0]>=coords[0] and p.pos[0]<=coords[1] and p.pos[1]>=coords[2] and p.pos[1]<=coords[3] )
-            return true;
-#elif NO_DIM==3
-        if ( p.pos[0]>=coords[0] and p.pos[0]<=coords[1] and p.pos[1]>=coords[2] and p.pos[1]<=coords[3] and p.pos[2]>=coords[4] and p.pos[2]<=coords[5] )
-            return true;
-#endif
-    return false;
+        for (size_t i=0; i<NO_DIM; ++i)
+            if ( p.pos[i]<coords[2*i] or p.pos[i]>coords[2*i+1] )
+                return false;
+        return true;
     }
+#ifdef PHASE_SPACE
+    // returns true if the particle's Lagrangian position is inside the box
+    template <typename Particle> bool isParticleLagrangianInBox(Particle &p) const
+    {
+        for (size_t i=0; i<NO_DIM; ++i)
+            if ( p.lagPos[i]<coords[2*i] or p.lagPos[i]>coords[2*i+1] )
+                return false;
+        return true;
+    }
+#endif
     // returns true if the point is inside the box
     template <typename Point> bool isPointInBox(Point &p) const
     {
-#if NO_DIM==2
-        if ( p[0]>=coords[0] and p[0]<=coords[1] and p[1]>=coords[2] and p[1]<=coords[3] )
-            return true;
-#elif NO_DIM==3
-        if ( p[0]>=coords[0] and p[0]<=coords[1] and p[1]>=coords[2] and p[1]<=coords[3] and p[2]>=coords[4] and p[2]<=coords[5] )
-            return true;
-#endif
-    return false;
+        for (size_t i=0; i<NO_DIM; ++i)
+            if ( p[i]<coords[2*i] or p[i]>coords[2*i+1] )
+                return false;
+        return true;
     }
     
     // checks if second box is overlaping with this one
@@ -142,7 +144,7 @@ struct Box
     {
         Real temp = 1.;
         for (size_t i=0; i<NO_DIM; i++) {
-            temp *= 35000; //coords[2*i+1] - coords[2*i];
+            temp *= coords[2*i+1] - coords[2*i];
         }
         return temp;
     }

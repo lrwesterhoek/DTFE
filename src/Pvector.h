@@ -24,7 +24,7 @@
 /*
   This class implements a physical vector. The components of the vector can be access as the elements on an array (i.e. using []) with indices from 0 to N-1, where N is the number of components of the vector.
 The following mathematical operations are supported:
-        Pvector + Pvector       = vector addition 
+        Pvector + Pvector       = vector addition
         Pvector += Pvector      = vector addition with the left side of += (same as 'int i+= 2;')
         Pvector - Pvector       = vector substraction
         Pvector -= Pvector      = vector substraction
@@ -32,7 +32,7 @@ The following mathematical operations are supported:
         Pvector *= scalar       = vector multiplication with scalar value
         Pvector / scalar        = vector division via scalar value
         Pvector /= scalar       = vector division via scalar value
-        
+
         Pvector == Pvector      = check if the two vectors are the same (NOTE: doesnt not make sense for float and double since one should add a precision level - this is not included)
         Pvector != Pvector      = not ( Pvector == Pvector )
         zero()                  = returns a null vector (all entries are 0.)
@@ -46,7 +46,7 @@ template <typename T, size_t N>
 struct Pvector
 {
     T x[N];
-    
+
     Pvector() {
         for (size_t i=0; i<N; ++i)
             x[i] = T(0); }
@@ -64,89 +64,89 @@ struct Pvector
     Pvector(T *xVector) {
         for (size_t i=0; i<N; ++i)
             x[i] = xVector[i]; }
-    
+
     /* Overload the [] operator. */
     T& operator[](size_t i)
     {
         return x[i];
     }
-    
-   
-    Pvector operator +(Pvector<T,N> other)    // Overload the + operator.
+    const T& operator[](size_t i) const
+    {
+        return x[i];
+    }
+
+
+    Pvector operator +(const Pvector<T,N> &other) const
     {
         Pvector<T,N> result;
         for (size_t i=0; i<N; ++i )
-            result[i] = this->x[i] + other[i];
+            result.x[i] = x[i] + other.x[i];
         return result;
     }
-    Pvector& operator +=(Pvector<T,N> other)    // Overload the += operator.
+    Pvector& operator +=(const Pvector<T,N> &other)
     {
         for (size_t i=0; i<N; ++i )
-            x[i] += other[i];
+            x[i] += other.x[i];
         return *this;
     }
-    Pvector operator -(Pvector<T,N> other)    // Overload the - operator.
+    Pvector operator -(const Pvector<T,N> &other) const
     {
         Pvector<T,N> result;
         for (size_t i=0; i<N; ++i )
-            result[i] = this->x[i] - other[i];
+            result.x[i] = x[i] - other.x[i];
         return result;
     }
-    Pvector& operator -=(Pvector<T,N> other)    // Overload the += operator.
+    Pvector& operator -=(const Pvector<T,N> &other)
     {
         for (size_t i=0; i<N; ++i )
-            x[i] -= other[i];
+            x[i] -= other.x[i];
         return *this;
     }
-    Pvector operator *(T other)    // Overload the * operator.
+    Pvector operator *(T other) const
     {
         Pvector<T,N> result;
         for (size_t i=0; i<N; ++i )
-            result[i] = this->x[i] * other;
+            result.x[i] = x[i] * other;
         return result;
     }
-    Pvector& operator *=(T other)    // Overload the *= operator.
+    Pvector& operator *=(T other)
     {
         for (size_t i=0; i<N; ++i )
             x[i] *= other;
         return *this;
     }
-    Pvector operator /(T other)    // Overload the / operator.
+    Pvector operator /(T other) const
     {
         Pvector<T,N> result;
         for (size_t i=0; i<N; ++i )
-            result[i] = this->x[i] / other;
+            result.x[i] = x[i] / other;
         return result;
     }
-    Pvector& operator /=(T other)    // Overload the /= operator.
+    Pvector& operator /=(T other)
     {
         for (size_t i=0; i<N; ++i )
             x[i] /= other;
         return *this;
     }
-    
-    bool operator ==(Pvector<T,N> other)    // Overload the == operator.
+
+    bool operator ==(const Pvector<T,N> &other) const
     {
-        bool equal = true;
         for (size_t i=0; i<N; ++i )
-            if( not x[i] == other[i] )
-            {
-                equal = false; 
-                break;
-            }
-        return equal;
+            if ( x[i] != other.x[i] )
+                return false;
+        return true;
     }
-    bool operator !=(Pvector<T,N> other)    // Overload the != operator.
+    bool operator !=(const Pvector<T,N> &other) const
     {
         return !( (*this)==other );
     }
-    
-    
-    static Pvector zero()      // Creates a null Pvector
+
+
+    static Pvector zero()
     {
         Pvector<T,N> result;
         for (size_t i=0; i<N; ++i )
-            result[i] = T(0.);
+            result.x[i] = T(0.);
         return result;
     }
 };

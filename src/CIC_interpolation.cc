@@ -32,6 +32,10 @@
 #include "box.h"
 #include "user_options.h"
 #include "message.h"
+#include <boost/timer.hpp>
+
+void printElapsedTime(boost::timer *t, User_options *userOptions,
+                      std::string computationQuantityName);
 
 using namespace std;
 typedef vector<Particle_data>::iterator     vectorIterator;
@@ -77,7 +81,8 @@ void CIC_interpolation_regular_grid(vector<Particle_data> &particles,
     
     
     // allocate memory for the results
-    size_t const reserveSize = (NO_DIM==2) ? nGrid[0]*nGrid[1] : nGrid[0]*nGrid[1]*nGrid[2];
+    size_t reserveSize = 1;
+    for (int d=0; d<NO_DIM; ++d) reserveSize *= nGrid[d];
     q->density.assign( reserveSize, Real(0.) );
     q->velocity.assign( reserveSize, Pvector<Real,noVelComp>::zero() );
     
@@ -140,26 +145,19 @@ void CIC_interpolation_regular_grid(vector<Particle_data> &particles,
         }
         
         // get the density contribution of the particle to the neighboring cells
-#if NO_DIM==2
-        for (int i1=0; i1<3; ++i1)
-            for (int i2=0; i2<3; ++i2)
+        {
+            size_t const noNeighbors = (NO_DIM==2 ? 9 : 27);
+            for (size_t n=0; n<noNeighbors; ++n)
             {
-                int index = cell[0][i1] * nGrid[1] + cell[1][i2];
-                Real result = (*it)->weight() * weight[0][i1] * weight[1][i2];
+                int ni[NO_DIM]; size_t rem = n;
+                for (int d=NO_DIM-1; d>=0; --d) { ni[d] = rem % 3; rem /= 3; }
+                int index = 0;
+                Real result = (*it)->weight();
+                for (int d=0; d<NO_DIM; ++d) { index = index * nGrid[d] + cell[d][ni[d]]; result *= weight[d][ni[d]]; }
                 q->density[index] += result;
                 q->velocity[index] += (*it)->velocity() * result;
             }
-#elif NO_DIM==3
-        for (int i1=0; i1<3; ++i1)
-            for (int i2=0; i2<3; ++i2)
-                for (int i3=0; i3<3; ++i3)
-                {
-                    int index = cell[0][i1] * nGrid[1]*nGrid[2] + cell[1][i2] * nGrid[2] + cell[2][i3];
-                    Real result = (*it)->weight() * weight[0][i1] * weight[1][i2] * weight[2][i3];
-                    q->density[index] += result;
-                    q->velocity[index] += ( (*it)->velocity() * result );
-                }
-#endif
+        }
     }
     
     
@@ -223,26 +221,20 @@ void CIC_interpolation_regular_grid(vector<Particle_data> &particles,
         }
         
         // get the density contribution of the particle to the neighboring cells
-#if NO_DIM==2
-        for (int i1=0; i1<cellCount[0]; ++i1)
-            for (int i2=0; i2<cellCount[1]; ++i2)
+        {
+            int totalCount = 1;
+            for (int d=0; d<NO_DIM; ++d) totalCount *= cellCount[d];
+            for (int n=0; n<totalCount; ++n)
             {
-                int index = cell[0][i1] * nGrid[1] + cell[1][i2];
-                Real result = (*it)->weight() * weight[0][i1] * weight[1][i2];
+                int ni[NO_DIM]; int rem = n;
+                for (int d=NO_DIM-1; d>=0; --d) { ni[d] = rem % cellCount[d]; rem /= cellCount[d]; }
+                int index = 0;
+                Real result = (*it)->weight();
+                for (int d=0; d<NO_DIM; ++d) { index = index * nGrid[d] + cell[d][ni[d]]; result *= weight[d][ni[d]]; }
                 q->density[index] += result;
                 q->velocity[index] += (*it)->velocity() * result;
             }
-#elif NO_DIM==3
-        for (int i1=0; i1<cellCount[0]; ++i1)
-            for (int i2=0; i2<cellCount[1]; ++i2)
-                for (int i3=0; i3<cellCount[2]; ++i3)
-                {
-                    int index = cell[0][i1] * nGrid[1]*nGrid[2] + cell[1][i2] * nGrid[2] + cell[2][i3];
-                    Real result = (*it)->weight() * weight[0][i1] * weight[1][i2] * weight[2][i3];
-                    q->density[index] += result;
-                    q->velocity[index] += (*it)->velocity() * result;
-                }
-#endif
+        }
     }
     
     

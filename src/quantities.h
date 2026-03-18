@@ -64,8 +64,15 @@ struct Quantities
     std::vector<Real>                         velocity_std;         // vector that stores the velocity standard deviation map using the DTFE method
     std::vector< Pvector<Real,noScalarComp> > scalar;               // vector that stores a scalar field interpolated to grid using the DTFE method
     std::vector< Pvector<Real,noScalarGradComp> > scalar_gradient;  // vector that stores the gradient of the scalar field map using the DTFE method
+    std::vector<Real>                         velocity_tweb;        // T-web classification label (0=void, 1=wall, 2=filament, 3=node)
+    std::vector< Pvector<Real,NO_DIM> >       velocity_tweb_eigenvalues; // T-web eigenvalues (sorted descending)
+    std::vector<Real>                         velocity_vweb;        // V-web classification label (0=void, 1=wall, 2=filament, 3=node)
+    std::vector< Pvector<Real,NO_DIM> >       velocity_vweb_eigenvalues; // V-web eigenvalues (sorted descending)
+#ifdef PHASE_SPACE
+    std::vector<Real>                         stream_count;       // vector that stores the number of streams at each grid point (PS-DTFE only)
+#endif
         
-    //Functions - you need to modify the below function if you add aditional members to this class ( - this is the case to be able to use the 'partition' option) 
+    //Functions - you need to modify the below function if you add aditional members to this class ( - this is the case to be able to use the 'partition' option)
     void copyFromSubgrid(Quantities const &subgridResults,
                         Field const &field,
                         std::vector<size_t> const &mainGrid,
@@ -73,6 +80,7 @@ struct Quantities
                         std::vector<size_t> const &subgridOffset); // used to copy the results obtain on a subgrid using the option 'partion' to the results for the full grid
     size_t size() const;	// returns the size of any non-empty object
     void reserveMemory(size_t *gridSize, Field &field); // reserve memory for the main grid quantities when using the 'partition' option
+    void addFrom(Quantities const &other); // element-wise accumulate from another Quantities (for PS-DTFE partitioning)
 };
 
 

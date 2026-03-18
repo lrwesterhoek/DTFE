@@ -215,8 +215,64 @@ void HDF5_readGadgetData(std::string filename,
         }
         message << "Done\n";
     }
-    
-    
+
+
+
+    // read particle IDs and (optionally) Lagrangian positions for PS-DTFE
+#ifdef PHASE_SPACE
+    // Read particle IDs (needed for matching with separate Lagrangian file)
+    {
+        size_t dataOffset = *numberParticlesRead;
+        message << "\t reading ParticleIDs ... " << MESSAGE::Flush;
+        for(int type=0; type<6; type++)
+        {
+            if ( gadgetHeader.npart[type]<=0 ) continue;
+            char buf[500];
+            snprintf( buf, sizeof(buf), "/PartType%d", type );
+            group = new Group( file->openGroup(buf) );
+            DataSet dataset = group->openDataSet("ParticleIDs");
+            dataset.read( &(readData->_particleIDs[dataOffset]), PredType::NATIVE_UINT64 );
+            delete group;
+            dataOffset += gadgetHeader.npart[type];
+        }
+        message << "Done\n";
+    }
+
+    // Try to read InitialCoordinates (may not exist if lag positions come from separate file)
+    if ( readData->_lagrangianPosition._assigned )
+    {
+        float *lagPositions = readData->lagrangianPosition();
+        size_t dataOffset = (*numberParticlesRead) * NO_DIM;
+        bool success = true;
+        for(int type=0; type<6; type++)
+        {
+            if ( gadgetHeader.npart[type]<=0 ) continue;
+            char buf[500];
+            snprintf( buf, sizeof(buf), "/PartType%d", type );
+            group = new Group( file->openGroup(buf) );
+
+            // Check if 'InitialCoordinates' exists before trying to open it
+            if ( H5Lexists(group->getId(), "InitialCoordinates", H5P_DEFAULT) <= 0 )
+            {
+                delete group;
+                message << "\t No 'InitialCoordinates' dataset found (will use --lagrangianInput).\n" << MESSAGE::Flush;
+                success = false;
+                break;
+            }
+
+            DataSet dataset = group->openDataSet("InitialCoordinates");
+            dataset.read( &(lagPositions[dataOffset]), PredType::NATIVE_FLOAT );
+            delete group;
+            dataOffset += gadgetHeader.npart[type] * NO_DIM;
+        }
+        if (success)
+        {
+            message << "\t reading the Lagrangian positions ... Done\n" << MESSAGE::Flush;
+            readData->_lagrangianPositionPopulated = true;
+        }
+    }
+#endif
+
     int noScalarsRead = 0;
     // read the temperatures
     if ( userOptions.readParticleData[3] and gadgetHeader.npart[0]>0 )
@@ -228,7 +284,7 @@ void HDF5_readGadgetData(std::string filename,
         float *tempData = new float[ gadgetHeader.npart[0] ];
         dataset.read( tempData, PredType::NATIVE_FLOAT );
         delete group;
-        
+
         // get the mass weighted temperature
         float *scalar = readData->scalar();          // returns a pointer to the particle scalar properties array
         float *weights = readData->weight();         // returns a pointer to the particle weights array
@@ -239,13 +295,13 @@ void HDF5_readGadgetData(std::string filename,
             size_t index2 = index1 * NO_SCALARS + noScalarsRead;
             scalar[index2] = weights[index1] * tempData[i];
         }
-        
+
         delete[] tempData;
         noScalarsRead += 1;
         message << "Done\n";
     }
-    
-    
+
+
     delete file;
     for (int i=0; i<6; ++i)     // update the number of read particles
         (*numberParticlesRead) += gadgetHeader.npart[i];
@@ -322,6 +378,13 @@ void HDF5_initializeGadget(std::string filename,
     }
     else
         message << "The box coordinates were set by the user using the program options. The program will keep this values and will NOT use the box length information from the Gadget file!" << MESSAGE::Flush;
+
+    // Set Hubble parameter from header if not user-specified
+    if ( userOptions->hubbleParam < Real(0.) && gadgetHeader->HubbleParam > 0. )
+    {
+        userOptions->hubbleParam = Real(gadgetHeader->HubbleParam);
+        message << "Using HubbleParam = " << userOptions->hubbleParam << " from file header for T-web/V-web normalization.\n" << MESSAGE::Flush;
+    }
 #ifdef WOJTEK
     if ( userOptions->additionalOptions.size()!=0 ) //if inserted an option
         gadgetHeader->num_files = atoi( userOptions->additionalOptions[0].c_str() );
@@ -369,6 +432,10 @@ void HDF5_initializeGadget(std::string filename,
             noScalars += 1;
     if ( noScalars>0 )
         readData->scalar( *noParticles );  // particle scalar quantity
+#endif
+#ifdef PHASE_SPACE
+    readData->lagrangianPosition( *noParticles );  // Lagrangian positions for PS-DTFE
+    readData->_particleIDs.resize( *noParticles );  // particle IDs for Lagrangian matching
 #endif
     
     

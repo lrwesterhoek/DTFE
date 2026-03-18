@@ -9,11 +9,7 @@
     #define VOLUME_TOL Real(1.e-3)
 #endif
 
-#if NO_DIM==2
-    #define NO_PAIRS 3
-#else
-    #define NO_PAIRS 6
-#endif
+#define NO_PAIRS ((NO_DIM+1)*NO_DIM/2)
 
 
 namespace VOLUME_SPLIT
@@ -73,16 +69,11 @@ struct Simplex
     // returns the volume of a simplex
     Real volume()
     {
-        Real posDiff[NO_DIM][NO_DIM];
+        double posDiff[NO_DIM][NO_DIM];
         for (int i=0; i<NO_DIM; ++i)
             for (int j=0; j<NO_DIM; ++j)
-                posDiff[i][j] = this->pos[i+1][j] - this->pos[0][j];
-        
-#if NO_DIM==2
-        return Real(.5) * std::fabs( posDiff[0][0]*posDiff[1][1] - posDiff[0][1]*posDiff[1][0] );
-#elif NO_DIM==3
-        return Real(1./6.) * std::fabs( posDiff[0][0]*posDiff[1][1]*posDiff[2][2] + posDiff[0][1]*posDiff[1][2]*posDiff[2][0] + posDiff[0][2]*posDiff[1][0]*posDiff[2][1] - posDiff[0][2]*posDiff[1][1]*posDiff[2][0] - posDiff[0][0]*posDiff[1][2]*posDiff[2][1] - posDiff[0][1]*posDiff[1][0]*posDiff[2][2] );
-#endif
+                posDiff[i][j] = double(this->pos[i+1][j] - this->pos[0][j]);
+        return simplexVolume(posDiff);
     }
     
     // returns the center of mass of the simplex
@@ -138,18 +129,16 @@ struct VolumeSplit
         }
          simplices.assign( 50000, Simplex() );
         
-#if NO_DIM==2
-        pairs[0][0] = 0; pairs[0][1] = 1;
-        pairs[1][0] = 1; pairs[1][1] = 2;
-        pairs[2][0] = 2; pairs[2][1] = 0;
-#elif  NO_DIM==3
-        pairs[0][0] = 0; pairs[0][1] = 1;
-        pairs[1][0] = 0; pairs[1][1] = 2;
-        pairs[2][0] = 0; pairs[2][1] = 3;
-        pairs[3][0] = 1; pairs[3][1] = 2;
-        pairs[4][0] = 1; pairs[4][1] = 3;
-        pairs[5][0] = 2; pairs[5][1] = 3;
-#endif
+        {
+            int pairIdx = 0;
+            for (int i=0; i<NO_DIM+1; ++i)
+                for (int j=i+1; j<NO_DIM+1; ++j)
+                {
+                    pairs[pairIdx][0] = i;
+                    pairs[pairIdx][1] = j;
+                    ++pairIdx;
+                }
+        }
     }
     
     
@@ -189,14 +178,13 @@ struct VolumeSplit
     // returns the grid index for a cell of the small grid
     int index_smallGrid(int *n)
     {
-        if (n[0]<0 or n[0]>=this->newGrid[0]) return -1;
-        if (n[1]<0 or n[1]>=this->newGrid[1]) return -1;
-#if NO_DIM==2
-        return n[0]*newGrid[1] + n[1];
-#elif NO_DIM==3
-        if (n[2]<0 or n[2]>=this->newGrid[2]) return -1;
-        return n[0]*newGrid[1]*newGrid[2] + n[1]*newGrid[2] + n[2];
-#endif
+        int result = 0;
+        for (int d=0; d<NO_DIM; ++d)
+        {
+            if (n[d]<0 or n[d]>=this->newGrid[d]) return -1;
+            result = result * newGrid[d] + n[d];
+        }
+        return result;
     }
     
     // int returns the grid index of a point associated to the smaller grid
@@ -445,22 +433,20 @@ struct VolumeSplit
         
         // compute the indices of the large grid corresponding to the smaller grid
         indices.assign( newSize, size_t(-1) );
-        for (int i0=nMin[0], n0=0; i0<nMax[0]; ++i0, ++n0)
+        for (size_t flatIdx=0; flatIdx<newSize; ++flatIdx)
         {
-            if ( i0<0 or i0>=grid[0] ) continue;
-            for (int i1=nMin[1], n1=0; i1<nMax[1]; ++i1, ++n1)
+            size_t rem = flatIdx;
+            int cellIdx[NO_DIM];
+            bool valid = true;
+            for (int d=NO_DIM-1; d>=0; --d) { cellIdx[d] = nMin[d] + int(rem % this->newGrid[d]); rem /= this->newGrid[d]; }
+            size_t mainIdx = 0;
+            for (int d=0; d<NO_DIM; ++d)
             {
-                if ( i1<0 or i1>=grid[1] ) continue;
-#if NO_DIM==2
-                indices[ n0*this->newGrid[1]+n1 ] = i0*this->grid[1]+i1;
-#elif NO_DIM==3
-                for (int i2=nMin[2], n2=0; i2<nMax[2]; ++i2, ++n2)
-                {
-                    if ( i2<0 or i2>=grid[2] ) continue;
-                    indices[ n0*this->newGrid[1]*this->newGrid[2]+n1*this->newGrid[2]+n2 ] = i0*this->grid[1]*this->grid[2]+i1*this->grid[2]+i2;
-                }
-#endif
+                if (cellIdx[d]<0 or cellIdx[d]>=grid[d]) { valid = false; break; }
+                mainIdx = mainIdx * grid[d] + cellIdx[d];
             }
+            if (valid)
+                indices[flatIdx] = mainIdx;
         }
         
         //change the vertex positions to the new start of the grid

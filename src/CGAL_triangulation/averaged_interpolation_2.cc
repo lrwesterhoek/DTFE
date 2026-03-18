@@ -23,6 +23,7 @@
 
 /* This file contains most of the functions necessary to interpolate to grid volume averaged fields inside the sampling cell using averaging method 2 (= choose sampling points inside grid cell).
  NOTE: it also contains the function the interpolate using averaging method 3 - see end of the file.*/
+#include "triangulation_common.h"
 
 
 
@@ -129,12 +130,17 @@ void interpolateGrid_averaged_2(DT &dt,
 #ifdef VELOCITY
                 Pvector<Real,noVelComp> tempV = Pvector<Real,noVelComp>::zero();
                 Pvector<Real,noGradComp> tempVG = Pvector<Real,noGradComp>::zero();
-                Pvector<Real,noVelComp> tempVelocities[NN];
+                std::vector<Pvector<Real,noVelComp>> tempVelocities(NN);
 #endif
 #ifdef SCALAR
                 Pvector<Real,noScalarComp> tempS = Pvector<Real,noScalarComp>::zero();
                 Pvector<Real,noScalarGradComp> tempSG = Pvector<Real,noScalarGradComp>::zero();
 #endif
+                Cell_handle cachedCell;  // cache the last cell to avoid recomputing posMatrix
+                Real cachedPosMatInv[NO_DIM][NO_DIM];
+                Vertex_handle cachedBase;
+                bool hasCachedCell = false;
+
                 for (int w=0; w<NN; ++w)        // the Monte Carlo loop over the random samples inside each grid cell
                 {
 #if NO_DIM==2
@@ -144,19 +150,38 @@ void interpolateGrid_averaged_2(DT &dt,
                     samplePoint = Point( uni()*dx[0] + x, uni()*dx[1] + y, uni()*dx[2] + z );
                     current = dt.locate( samplePoint,lt,li,lj, previous );
 #endif
-                    
+
 #ifdef TEST_PADDING
                     if ( hasDummyNeighbor( current ) ) dummyNeighbors = true; // if one of the vertices is or has dummy neighbors, keep track of this cell
                     if ( hasDummyVertex( current ) ) dummyVertices = true; // if one of the vertices is a dummy test point, keep track of this cell
 #endif
-                    
+
                     // check if cell is infinite (one of the vertices is virtual) - don't add anything
                     if ( dt.is_infinite(current) )
                         continue;
-                    
-                    Real posMatrixInverse[NO_DIM][NO_DIM];  //stores the inverse of the vertex position difference matrix
-                    positionMatrix( current, posMatrixInverse );
-                    Vertex_handle base = current->vertex(0);  // stores the "base" vertex of the Delaunay cell
+
+                    // reuse posMatrix if we're still in the same cell
+                    Real posMatrixInverse[NO_DIM][NO_DIM];
+                    Vertex_handle base;
+                    if ( hasCachedCell && current == cachedCell )
+                    {
+                        for (int r=0; r<NO_DIM; ++r)
+                            for (int c=0; c<NO_DIM; ++c)
+                                posMatrixInverse[r][c] = cachedPosMatInv[r][c];
+                        base = cachedBase;
+                    }
+                    else
+                    {
+                        positionMatrix( current, posMatrixInverse );
+                        base = current->vertex(0);
+                        // cache for next iteration
+                        for (int r=0; r<NO_DIM; ++r)
+                            for (int c=0; c<NO_DIM; ++c)
+                                cachedPosMatInv[r][c] = posMatrixInverse[r][c];
+                        cachedBase = base;
+                        cachedCell = current;
+                        hasCachedCell = true;
+                    }
                     samplePoint = relativeSamplePoint( base, samplePoint ); // now sample point stores the relative position of the sample point with respect to the base vertex
                     
                     if (field.density)
@@ -196,7 +221,7 @@ void interpolateGrid_averaged_2(DT &dt,
 #ifdef VELOCITY
                 if (field.velocity) velocity->push_back( tempV/NN );
                 if (field.velocity_gradient) velocity_gradient->push_back( tempVG/NN );
-                if (field.velocity_std) velocity_std->push_back( standardDeviation(tempVelocities,NN) );
+                if (field.velocity_std) velocity_std->push_back( standardDeviation(tempVelocities.data(),NN) );
 #endif
 #ifdef SCALAR
                 if (field.scalar) scalar->push_back( tempS/NN );
@@ -352,6 +377,11 @@ void interpolateRedshiftCone_averaged_2(DT &dt,
                 Pvector<Real,noScalarComp> tempS = Pvector<Real,noScalarComp>::zero();
                 Pvector<Real,noScalarGradComp> tempSG = Pvector<Real,noScalarGradComp>::zero();
 #endif
+                Cell_handle cachedCell2;
+                Real cachedPosMatInv2[NO_DIM][NO_DIM];
+                Vertex_handle cachedBase2;
+                bool hasCachedCell2 = false;
+
                 for (int w=0; w<NN; ++w)        // the Monte Carlo loop over the random samples inside each grid cell
                 {
                     // get coordinates of the random sample point inside the grid cell and locate the Delaunay traingle/tetrahedron where the random point lies
@@ -372,20 +402,36 @@ void interpolateRedshiftCone_averaged_2(DT &dt,
                     samplePoint = Point(tempX,tempY,tempZ);
                     current = dt.locate( samplePoint,lt,li,lj, previous );
 #endif
-                    
+
 #ifdef TEST_PADDING
-                    if ( hasDummyNeighbor( current ) ) dummyNeighbors = true; // if one of the vertices is or has dummy neighbors, keep track of this cell
-                    if ( hasDummyVertex( current ) ) dummyVertices = true; // if one of the vertices is a dummy test point, keep track of this cell
+                    if ( hasDummyNeighbor( current ) ) dummyNeighbors = true;
+                    if ( hasDummyVertex( current ) ) dummyVertices = true;
 #endif
-                    
-                    // check if cell is infinite (one of the vertices is virtual) - don't add anything
+
                     if ( dt.is_infinite(current) )
                         continue;
-                    
-                    Real posMatrixInverse[NO_DIM][NO_DIM];  //stores the inverse of the vertex position difference matrix
-                    positionMatrix( current, posMatrixInverse );
-                    Vertex_handle base = current->vertex(0);  // stores the "base" vertex of the Delaunay cell
-                    samplePoint = relativeSamplePoint( base, samplePoint ); // now sample point stores the relative position of the sample point with respect to the base vertex
+
+                    Real posMatrixInverse[NO_DIM][NO_DIM];
+                    Vertex_handle base;
+                    if ( hasCachedCell2 && current == cachedCell2 )
+                    {
+                        for (int r=0; r<NO_DIM; ++r)
+                            for (int c=0; c<NO_DIM; ++c)
+                                posMatrixInverse[r][c] = cachedPosMatInv2[r][c];
+                        base = cachedBase2;
+                    }
+                    else
+                    {
+                        positionMatrix( current, posMatrixInverse );
+                        base = current->vertex(0);
+                        for (int r=0; r<NO_DIM; ++r)
+                            for (int c=0; c<NO_DIM; ++c)
+                                cachedPosMatInv2[r][c] = posMatrixInverse[r][c];
+                        cachedBase2 = base;
+                        cachedCell2 = current;
+                        hasCachedCell2 = true;
+                    }
+                    samplePoint = relativeSamplePoint( base, samplePoint );
                     
                     if (field.density)
                     {
@@ -560,6 +606,11 @@ void interpolateUserSampling_averaged_2(DT &dt,
         Pvector<Real,noScalarComp> tempS = Pvector<Real,noScalarComp>::zero();
         Pvector<Real,noScalarGradComp> tempSG = Pvector<Real,noScalarGradComp>::zero();
 #endif
+        Cell_handle cachedCell3;
+        Real cachedPosMatInv3[NO_DIM][NO_DIM];
+        Vertex_handle cachedBase3;
+        bool hasCachedCell3 = false;
+
         for (int w=0; w<NN; ++w)        // the Monte Carlo loop over the random samples inside each grid cell
         {
             Real tempX = samples[i].position(0) + uni()*samples[i].delta(0);
@@ -572,20 +623,36 @@ void interpolateUserSampling_averaged_2(DT &dt,
             samplePoint = Point(tempX,tempY,tempZ);
             current = dt.locate( samplePoint,lt,li,lj, previous );
 #endif
-            
+
 #ifdef TEST_PADDING
-            if ( hasDummyNeighbor( current ) ) dummyNeighbors = true; // if one of the vertices is or has dummy neighbors, keep track of this cell
-            if ( hasDummyVertex( current ) ) dummyVertices = true; // if one of the vertices is a dummy test point, keep track of this cell
+            if ( hasDummyNeighbor( current ) ) dummyNeighbors = true;
+            if ( hasDummyVertex( current ) ) dummyVertices = true;
 #endif
-            
-            // check if cell is infinite (one of the vertices is virtual) - don't add anything
+
             if ( dt.is_infinite(current) )
                 continue;
-            
-            Real posMatrixInverse[NO_DIM][NO_DIM];  //stores the inverse of the vertex position difference matrix
-            positionMatrix( current, posMatrixInverse );
-            Vertex_handle base = current->vertex(0);  // stores the "base" vertex of the Delaunay cell
-            samplePoint = relativeSamplePoint( base, samplePoint ); // now sample point stores the relative position of the sample point with respect to the base vertex
+
+            Real posMatrixInverse[NO_DIM][NO_DIM];
+            Vertex_handle base;
+            if ( hasCachedCell3 && current == cachedCell3 )
+            {
+                for (int r=0; r<NO_DIM; ++r)
+                    for (int c=0; c<NO_DIM; ++c)
+                        posMatrixInverse[r][c] = cachedPosMatInv3[r][c];
+                base = cachedBase3;
+            }
+            else
+            {
+                positionMatrix( current, posMatrixInverse );
+                base = current->vertex(0);
+                for (int r=0; r<NO_DIM; ++r)
+                    for (int c=0; c<NO_DIM; ++c)
+                        cachedPosMatInv3[r][c] = posMatrixInverse[r][c];
+                cachedBase3 = base;
+                cachedCell3 = current;
+                hasCachedCell3 = true;
+            }
+            samplePoint = relativeSamplePoint( base, samplePoint );
             
             if (field.density)
             {
@@ -722,7 +789,8 @@ void interpolateGrid_averaged_3(DT &dt,
     
     
     // sequence to store the equidistant sample positions with respect to center of grid cell
-    Real samplePosition[NN][NO_DIM];
+    std::vector<Real> samplePosition_buf(NN * NO_DIM);
+    Real (*samplePosition)[NO_DIM] = reinterpret_cast<Real(*)[NO_DIM]>(samplePosition_buf.data());
     for (int i1=0; i1<n; ++i1)
         for (int i2=0; i2<n; ++i2)
 #if NO_DIM==2
@@ -774,6 +842,11 @@ void interpolateGrid_averaged_3(DT &dt,
                 Pvector<Real,noScalarComp> tempS = Pvector<Real,noScalarComp>::zero();
                 Pvector<Real,noScalarGradComp> tempSG = Pvector<Real,noScalarGradComp>::zero();
 #endif
+                Cell_handle cachedCell4;
+                Real cachedPosMatInv4[NO_DIM][NO_DIM];
+                Vertex_handle cachedBase4;
+                bool hasCachedCell4 = false;
+
                 for (int w=0; w<NN; ++w)        // the loop over the equidistant sample points inside each grid cell
                 {
 #if NO_DIM==2
@@ -783,20 +856,36 @@ void interpolateGrid_averaged_3(DT &dt,
                     samplePoint = Point( x + samplePosition[w][0], y + samplePosition[w][1], z + samplePosition[w][2] );
                     current = dt.locate( samplePoint,lt,li,lj, previous );
 #endif
-                    
+
 #ifdef TEST_PADDING
-                    if ( hasDummyNeighbor( current ) ) dummyNeighbors = true; // if one of the vertices is or has dummy neighbors, keep track of this cell
-                    if ( hasDummyVertex( current ) ) dummyVertices = true; // if one of the vertices is a dummy test point, keep track of this cell
+                    if ( hasDummyNeighbor( current ) ) dummyNeighbors = true;
+                    if ( hasDummyVertex( current ) ) dummyVertices = true;
 #endif
-                    
-                    // check if cell is infinite (one of the vertices is virtual) - don't add anything
+
                     if ( dt.is_infinite(current) )
                         continue;
-                    
-                    Real posMatrixInverse[NO_DIM][NO_DIM];  //stores the inverse of the vertex position difference matrix
-                    positionMatrix( current, posMatrixInverse );
-                    Vertex_handle base = current->vertex(0);  // stores the "base" vertex of the Delaunay cell
-                    samplePoint = relativeSamplePoint( base, samplePoint ); // now sample point stores the relative position of the sample point with respect to the base vertex
+
+                    Real posMatrixInverse[NO_DIM][NO_DIM];
+                    Vertex_handle base;
+                    if ( hasCachedCell4 && current == cachedCell4 )
+                    {
+                        for (int r=0; r<NO_DIM; ++r)
+                            for (int c=0; c<NO_DIM; ++c)
+                                posMatrixInverse[r][c] = cachedPosMatInv4[r][c];
+                        base = cachedBase4;
+                    }
+                    else
+                    {
+                        positionMatrix( current, posMatrixInverse );
+                        base = current->vertex(0);
+                        for (int r=0; r<NO_DIM; ++r)
+                            for (int c=0; c<NO_DIM; ++c)
+                                cachedPosMatInv4[r][c] = posMatrixInverse[r][c];
+                        cachedBase4 = base;
+                        cachedCell4 = current;
+                        hasCachedCell4 = true;
+                    }
+                    samplePoint = relativeSamplePoint( base, samplePoint );
                     
                     if (field.density)
                     {

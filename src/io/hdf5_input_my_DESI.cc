@@ -108,13 +108,10 @@ void HDF5_initialize_DESI(std::string filename,
 {
     MESSAGE::Message message( userOptions->verboseLevel );
     std::string fileName = filename;
-    bool singleFile = true;
-    
     // check to see if there is only one input file or several
     if ( not bfs::exists(fileName) ) //if this is true, than the input is in several files
     {
         fileName = HDF5_filename_DESI( filename, 0 );
-        singleFile = false;
     }
     
     
@@ -218,25 +215,25 @@ void HDF5_readData_DESI(std::string filenameRoot,
             DataSet dataset = group->openDataSet("Position");
             DataSpace dataspace = dataset.getSpace();
             hsize_t dims_out[2];
-            int ndims = dataspace.getSimpleExtentDims( dims_out, NULL );
-            
+            dataspace.getSimpleExtentDims( dims_out, NULL );
+
             dataset.read( &(positions[dataOffset]), PredType::NATIVE_FLOAT );
             numParticlesRead2 = numParticlesRead + (unsigned long)(dims_out[0]);
             message << (unsigned long)(dims_out[0]) << " particles ... Done\n";
         }
-        
-        
+
+
         // read the velocities
         if ( userOptions->readParticleData[2] )
         {
             float *velocities = readData->velocity();              // returns a pointer to the particle velocity array
             size_t dataOffset = numParticlesRead * NO_DIM;      // the offset in the velocity array from where to start reading the new data
             message << "\t reading the particles velocities ... " << MESSAGE::Flush;
-            
+
             DataSet dataset = group->openDataSet("Velocities");
             DataSpace dataspace = dataset.getSpace();
             hsize_t dims_out[2];
-            int ndims = dataspace.getSimpleExtentDims( dims_out, NULL );
+            dataspace.getSimpleExtentDims( dims_out, NULL );
             
             dataset.read( &(velocities[dataOffset]), PredType::NATIVE_FLOAT );
             numParticlesRead2 = numParticlesRead + (unsigned long)(dims_out[0]);

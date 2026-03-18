@@ -41,14 +41,14 @@ void readMyFile(std::string filename,
     
     
     // Read the number of particles and the coordinates of the box encompassing the data
-    int noParticles;    // the number of particles
+    int noParticles = 0;    // the number of particles
     float boxCoordinates[2*NO_DIM];
     // read 'noParticles' and 'boxCoordinates'
     for (size_t i=0; i<2*NO_DIM; ++i) userOptions->boxCoordinates[i] = boxCoordinates[i];
-    
-    
+
+
     // reserve memory for the input data - select only the ones you use
-    Real *positions = readData->position(noParticles);  //particle positions
+    readData->position(noParticles);  //particle positions
 //     Real *weights = readData->weight(noParticles);      //particle weights (e.g. weights = particle masses)
 //     Real *velocities = readData->velocity(noParticles); //particle velocities
 //     Real *scalars = readData->scalar(noParticles);      //scalar component for each particle

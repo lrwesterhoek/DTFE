@@ -47,24 +47,25 @@ void copyField(T const &subgridResults,
     }
     
     
-    for (size_t i1=0, i2=start[0]; i1<subgrid[0]; ++i1)
+    size_t totalSubgrid = 1;
+    for (size_t d=0; d<NO_DIM; ++d) totalSubgrid *= subgrid[d];
+
+    for (size_t flatIdx=0; flatIdx<totalSubgrid; ++flatIdx)
     {
-        for (size_t j1=0, j2=start[1]; j1<subgrid[1]; ++j1)
+        size_t subIdx[NO_DIM], rem = flatIdx;
+        for (int d=NO_DIM-1; d>=0; --d)
         {
-#if NO_DIM==2
-            (*mainGridResults)[i2*mainGrid[1]+j2] = subgridResults[i1*subgrid[1]+j1];
-#elif NO_DIM==3
-            for (size_t k1=0, k2=start[2]; k1<subgrid[2]; ++k1)
-            {
-                size_t indexMain = i2*mainGrid[1]*mainGrid[2] + j2*mainGrid[2] + k2;
-                size_t indexSec = i1*subgrid[1]*subgrid[2] + j1*subgrid[2] + k1;
-                (*mainGridResults)[indexMain] = subgridResults[indexSec];
-                ++k2;
-            }
-#endif
-            ++j2;
+            subIdx[d] = rem % subgrid[d];
+            rem /= subgrid[d];
         }
-        ++i2;
+        size_t indexMain = 0, indexSub = 0;
+        for (int d=0; d<NO_DIM; ++d)
+        {
+            if (d > 0) { indexMain *= mainGrid[d]; indexSub *= subgrid[d]; }
+            indexMain += subIdx[d] + start[d];
+            indexSub += subIdx[d];
+        }
+        (*mainGridResults)[indexMain] = subgridResults[indexSub];
     }
 }
 
@@ -85,6 +86,10 @@ void Quantities::copyFromSubgrid(Quantities const &subgridResults,
     copyField( subgridResults.velocity_std, &(this->velocity_std), field.velocity_std,  mainGrid, subgrid, subgridOffset );
     copyField( subgridResults.scalar, &(this->scalar), field.scalar,  mainGrid, subgrid, subgridOffset );
     copyField( subgridResults.scalar_gradient, &(this->scalar_gradient), field.scalar_gradient,  mainGrid, subgrid, subgridOffset );
+    copyField( subgridResults.velocity_tweb, &(this->velocity_tweb), field.velocity_tweb,  mainGrid, subgrid, subgridOffset );
+    copyField( subgridResults.velocity_tweb_eigenvalues, &(this->velocity_tweb_eigenvalues), field.velocity_tweb,  mainGrid, subgrid, subgridOffset );
+    copyField( subgridResults.velocity_vweb, &(this->velocity_vweb), field.velocity_vweb,  mainGrid, subgrid, subgridOffset );
+    copyField( subgridResults.velocity_vweb_eigenvalues, &(this->velocity_vweb_eigenvalues), field.velocity_vweb,  mainGrid, subgrid, subgridOffset );
 }
 
 
@@ -117,7 +122,43 @@ size_t Quantities::size() const
     fieldSize( this->velocity_std, &temp );
     fieldSize( this->scalar, &temp );
     fieldSize( this->scalar_gradient, &temp );
+    fieldSize( this->velocity_tweb, &temp );
+    fieldSize( this->velocity_tweb_eigenvalues, &temp );
+    fieldSize( this->velocity_vweb, &temp );
+    fieldSize( this->velocity_vweb_eigenvalues, &temp );
     return temp;
+}
+
+
+/* Element-wise accumulate: add values from 'other' into this Quantities.
+   Used by PS-DTFE partitioning where each partition writes to a full grid
+   and results are summed across partitions. */
+template<typename T>
+void addField(std::vector<T> const &src, std::vector<T> *dst)
+{
+    if (src.empty()) return;
+    for (size_t i = 0; i < src.size(); ++i)
+        (*dst)[i] += src[i];
+}
+
+void Quantities::addFrom(Quantities const &other)
+{
+    addField(other.density, &this->density);
+    addField(other.velocity, &this->velocity);
+    addField(other.velocity_gradient, &this->velocity_gradient);
+    addField(other.velocity_divergence, &this->velocity_divergence);
+    addField(other.velocity_shear, &this->velocity_shear);
+    addField(other.velocity_vorticity, &this->velocity_vorticity);
+    addField(other.velocity_std, &this->velocity_std);
+    addField(other.scalar, &this->scalar);
+    addField(other.scalar_gradient, &this->scalar_gradient);
+    // Note: T-web/V-web classification is computed post-interpolation, so these are unused here
+    // but included for completeness
+    addField(other.velocity_tweb_eigenvalues, &this->velocity_tweb_eigenvalues);
+    addField(other.velocity_vweb_eigenvalues, &this->velocity_vweb_eigenvalues);
+#ifdef PHASE_SPACE
+    addField(other.stream_count, &this->stream_count);
+#endif
 }
 
 
@@ -146,6 +187,16 @@ void Quantities::reserveMemory(size_t *gridSize, Field &field)
         this->scalar.resize( totalSize, Pvector<Real,noScalarComp>::zero() );
     if ( field.scalar_gradient )
         this->scalar_gradient.resize( totalSize, Pvector<Real,noScalarGradComp>::zero() );
+    if ( field.velocity_tweb )
+    {
+        this->velocity_tweb.resize( totalSize, Real(0.) );
+        this->velocity_tweb_eigenvalues.resize( totalSize, Pvector<Real,NO_DIM>::zero() );
+    }
+    if ( field.velocity_vweb )
+    {
+        this->velocity_vweb.resize( totalSize, Real(0.) );
+        this->velocity_vweb_eigenvalues.resize( totalSize, Pvector<Real,NO_DIM>::zero() );
+    }
 }
 
 

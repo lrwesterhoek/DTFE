@@ -25,6 +25,8 @@
 #include <cstdio>
 #include "user_options.h"
 
+using namespace std;
+
 
 #ifndef INPUT_FILE_DEFAULT
 #define INPUT_FILE_DEFAULT 101
@@ -74,9 +76,15 @@ User_options::User_options()
     NGP = false;
     CIC = false;
     TSC = false;
+    PCS = false;
     SPH = false;
+    Voronoi = false;
+    interlace = false;
     MpcValue = Real(MPC_UNIT);
     extensive = false;
+    approxPSD = false;
+    lambda_th = Real(0.);
+    hubbleParam = Real(-1.);
     verboseLevel = 3;
     randomSample = Real(-1.);
     poisson = 0;
@@ -131,9 +139,13 @@ void User_options::addOptions(po::options_description &allOptions,
                     "  scalar = \tcompute scalar quantities at the sampling point position (use 'scalar_a' to get the averaged field components inside the sampling cell).\n"
                     "  scalarGradient = \tcompute the gradient of the scalar quantities at the sampling point position (use 'scalarGradient_a' to get the averaged field gradient inside the sampling cell).\n"
 #endif
+#ifdef VELOCITY
+                    "  tweb = \tT-web cosmic web classification (0=void, 1=wall, 2=filament, 3=node) from tidal tensor eigenvalues (use 'tweb_a' for volume averaged). Also outputs eigenvalues.\n"
+                    "  vweb = \tV-web cosmic web classification (0=void, 1=wall, 2=filament, 3=node) from velocity shear tensor eigenvalues (use 'vweb_a' for volume averaged). Also outputs eigenvalues.\n"
+#endif
             );
-    
-    
+
+
     po::options_description regionOptions("Region options");
     regionOptions.add_options()
             ("region", po::value< std::vector<Real> >()->multitoken(), "choose this option to compute the field interpolation only in a given part of the full box. Use this option to specify the region of interest in terms of fractions of box length (i.e. '--region 0.4 0.6 0.3 0.7 0.45 0.55' computes the density for the box that extends from 0.4 to 0.6 of the box length along direction x, 0.3 to 0.7 along direction y and 0.45 to 0.55 along direction z).")
@@ -188,7 +200,10 @@ void User_options::addOptions(po::options_description &allOptions,
             ("NGP", "choose the NGP (nearest grid point) as the grid interpolation method instead of DTFE. This method is available only for: density and velocity fields.")
             ("CIC", "choose the CIC (Cloud In Cell) as the grid interpolation method instead of DTFE. This method is available only for: density and velocity fields.")
             ("TSC", "choose the TSC (Triangular Shape Cloud) as the grid interpolation method instead of DTFE. This method is available only for: density and velocity fields.")
+            ("PCS", "choose the PCS (Piecewise Cubic Spline) as the grid interpolation method instead of DTFE. This method is available only for: density and velocity fields.")
             ("SPH", po::value<int>(&(this->SPH_neighbors)), "choose the SPH (Smoothed Particle Hydrodynamics) as the grid interpolation method instead of DTFE. This method is available only for: density, velocity and scalar fields.")
+            ("Voronoi", "use Voronoi volume density estimation with NGP grid assignment. Builds the Delaunay triangulation, computes vertex densities (1/Voronoi volume), and assigns them to the grid using nearest grid point. Gives a piecewise-constant density field. Only outputs density.")
+            ("interlace", "enable interlacing to reduce aliasing in the density field. Runs the grid interpolation twice with a half-cell offset and averages in Fourier space. Works with any interpolation method. Requires periodic boundary conditions.")
             ("MpcUnit", po::value<Real>(&(this->MpcValue)), "specify the value of 1Mpc in units of the input particle position data. [DEFAULT value is the one given in the 'DMPC_UNIT' variable in the Makefile.]")
             ("extensive", "specify that all the fields under 'scalar fields' are extensive quantities. If this option is missing than the code treats the variables as intensive fields. This option is important only when using the TSC or SPH interpolation methods applied to the scalar variable.")
             ("verbose,v", po::value<int>(&(this->verboseLevel))->default_value(verboseLevel), "choose the verbosity level of the program (a value from 0 to 3). See the documentation for additional help.")
@@ -198,6 +213,14 @@ void User_options::addOptions(po::options_description &allOptions,
             ("redshiftSpace", po::value< std::vector<Real> >()->multitoken(), "specify this option to transform the particle positions from position-space to redhsift-space. This option takes 3 arguments that specifies the direction (d1,d2,d3) along which to tranform to redshift-space. For example '--redshiftSpace d1 d2 d3' specifies to transform to 'redshift-space = position-space + (d1,d2,d3)*velocity / H', with H=100 h km/s /Mpc and (d1,d2,d3) normalized to a unit vector." )
 #endif
             ("options", po::value< std::vector<std::string> >( &(this->additionalOptions) )->multitoken(), "variable used to supply additional options to the program in a very simple way. Each additional option will be stored as a string in 'User_options.additionalOptions' (this variable is a vector of strings).")
+#ifdef PHASE_SPACE
+            ("lagrangianInput", po::value<std::string>(&(this->lagrangianInputFilename)), "specify the HDF5 file containing the Lagrangian (initial condition) positions for PS-DTFE. The file should contain particle coordinates in the same order as the main input file. If not specified, the Lagrangian positions are read from the 'InitialCoordinates' dataset in the main input file.")
+#endif
+#ifndef PHASE_SPACE
+            ("approxPSD", "compute approximate phase-space density f = rho * g, where rho is the spatial DTFE density and g is the velocity-space DTFE density. Builds a second Delaunay tessellation in velocity space. The result is stored in the scalar output field.")
+#endif
+            ("lambda_th", po::value<Real>(&(this->lambda_th))->default_value(Real(0.)), "eigenvalue threshold for T-web/V-web cosmic web classification. Grid cells with eigenvalues above this threshold are classified as collapsing along that axis. [DEFAULT: 0.0]")
+            ("hubble", po::value<Real>(&(this->hubbleParam)), "Hubble parameter h for T-web/V-web normalization (H=100 h km/s/Mpc). If not specified, the value is read from the simulation file header.")
             ;
     
     
@@ -289,6 +312,10 @@ void User_options::shortHelp( char *progName )
                     "  scalar = \tnon-averaged scalar quantities (use 'scalar_a' to get the volume averaged value).\n"
                     "  scalarGradient = \tnon-averaged gradient of the scalar quantities (use 'scalarGradient_a' to get the volume averaged value).\n"
 #endif
+#ifdef VELOCITY
+                    "  tweb = \tT-web cosmic web classification from tidal tensor eigenvalues (use 'tweb_a' for volume averaged).\n"
+                    "  vweb = \tV-web cosmic web classification from velocity shear tensor eigenvalues (use 'vweb_a' for volume averaged).\n"
+#endif
             );
     po::options_description regionOptions("Region options");
     regionOptions.add_options()
@@ -326,7 +353,10 @@ void User_options::shortHelp( char *progName )
             ("NGP", "choose NGP (Nearest Grid Point) for grid interpolation.")
             ("CIC", "choose CIC (Cloud In Cell) for grid interpolation.")
             ("TSC", "choose TSC (Triangular Shape Cloud) for grid interpolation.")
+            ("PCS", "choose PCS (Piecewise Cubic Spline) for grid interpolation.")
             ("SPH", po::value< Real >(&temp), "choose SPH for grid interpolation (argument = number nearest neighbors).")
+            ("Voronoi", "use Voronoi volume density with NGP grid assignment (density only).")
+            ("interlace", "enable interlacing to reduce aliasing (Fourier-space averaging of half-cell offset grids).")
             ("MpcUnit", po::value< Real >(&temp), "value of 1Mpc in units of the input position data.")
             ("extensive", "the fields under 'scalar fields' are extensive quantities [DEFAULT: intensive variables].")
             ("verbose,v", po::value< Real >(&temp), "choose the verbosity level (from 0 to 3).")
@@ -336,6 +366,11 @@ void User_options::shortHelp( char *progName )
             ("redshiftSpace", po::value< std::vector<Real> >()->multitoken(), "transform the particle positions from position-space to redhsift-space -- need to give 3 values that give the direction for the shift." )
 #endif
             ("options", po::value< Real >(&temp), "variable used to supply additional options.")
+#ifdef PHASE_SPACE
+            ("lagrangianInput", po::value<std::string>(&(this->lagrangianInputFilename)), "HDF5 file with Lagrangian (initial condition) positions for PS-DTFE.")
+#endif
+            ("lambda_th", po::value< Real >(&temp), "eigenvalue threshold for T-web/V-web classification [DEFAULT: 0.0].")
+            ("hubble", po::value< Real >(&temp), "Hubble parameter h for T-web/V-web normalization [DEFAULT: from file header].")
             ;
     
     po::options_description visibleOptions;
@@ -410,7 +445,9 @@ void User_options::printOptions()
     if ( this->CIC ) interpolationMethod = "CIC";
     else if ( this->NGP ) interpolationMethod = "NGP";
     else if ( this->TSC ) interpolationMethod = "TSC";
-    else if ( this->SPH ) 
+    else if ( this->PCS ) interpolationMethod = "PCS";
+    else if ( this->Voronoi ) interpolationMethod = "Voronoi (NGP)";
+    else if ( this->SPH )
     {
         char temp[100];
         snprintf( temp, sizeof(temp), "%d neighbors", this->SPH_neighbors );
@@ -454,12 +491,10 @@ void User_options::printOptions()
     
     if ( this->regionOn )
     {
-        message << "\t computing the grid interpolation only for the user specified region of coordinates:\n"
-            << "\t\t x extension : " << region[0] << "   " << region[1] << (regionMpcOn?"  Mpc":"  box length") << "\n"
-            << "\t\t y extension : " << region[2] << "   " << region[3] << (regionMpcOn?"  Mpc":"  box length") << "\n";
-#if NO_DIM==3
-        message << "\t\t z extension : " << region[4] << "   " << region[5] << (regionMpcOn?"  Mpc":"  box length") << "\n";
-#endif
+        char const axisName[] = "xyz";
+        message << "\t computing the grid interpolation only for the user specified region of coordinates:\n";
+        for (int d=0; d<NO_DIM; ++d)
+            message << "\t\t " << axisName[d] << " extension : " << region[2*d] << "   " << region[2*d+1] << (regionMpcOn?"  Mpc":"  box length") << "\n";
     }
     
     
@@ -473,12 +508,10 @@ void User_options::printOptions()
     
     if ( not this->paddingLength.isNullBox() )
     {
-        message << "\t padding length:\n"
-            << "\t\t x axis : " << paddingLength[0] << "   " << paddingLength[1] << (paddingMpcOn?"  Mpc":"  box length") << "\n"
-            << "\t\t y axis : " << paddingLength[2] << "   " << paddingLength[3] << (paddingMpcOn?"  Mpc":"  box length") << "\n";
-#if NO_DIM==3
-        message << "\t\t z axis : " << paddingLength[4] << "   " << paddingLength[5] << (paddingMpcOn?"  Mpc":"  box length") << "\n";
-#endif
+        char const padAxisName[] = "xyz";
+        message << "\t padding length:\n";
+        for (int d=0; d<NO_DIM; ++d)
+            message << "\t\t " << padAxisName[d] << " axis : " << paddingLength[2*d] << "   " << paddingLength[2*d+1] << (paddingMpcOn?"  Mpc":"  box length") << "\n";
     }
     else
         message << "\t number padding particles: " << this->paddingParticles << "\n";
@@ -506,6 +539,13 @@ void User_options::printOptions()
         message << "\t Computing the grid interpolation to a redshift cone grid of coordinates " << (NO_DIM==2? "[r_min, r_max, psi_min, psi_max]" : "[r_min, r_max, theta_min, theta_max, psi_min, psi_max]") << " = [" << MESSAGE::printElements( redshiftCone, ", " ) << "]\n"
             << "\t The origin of the light cone is (x,y,z) : (" << MESSAGE::printElements( originPosition, ", " ) << ")\n";
     
+#ifdef PHASE_SPACE
+    message << "\t PS-DTFE mode           : enabled (triangulation in Lagrangian space)\n";
+    if ( not this->lagrangianInputFilename.empty() )
+        message << "\t Lagrangian input file  : " << this->lagrangianInputFilename << "\n";
+    else
+        message << "\t Lagrangian positions   : read from 'InitialCoordinates' dataset in main input file\n";
+#endif
     message << "\t 1Mpc = " << MpcValue << " in units of input data.\n";
     if ( poisson>0 )
         message << "\t Particle positions will be generated randomly. Particle number = " << (NO_DIM==2? poisson*poisson : poisson*poisson*poisson) << ".\n";
@@ -591,10 +631,19 @@ void User_options::readOptions(int argc, char *argv[], bool getFileNames, bool s
     
     conflicting_options(vm, "SPH", "TSC");
     conflicting_options(vm, "SPH", "CIC");
+    conflicting_options(vm, "SPH", "PCS");
     conflicting_options(vm, "CIC", "TSC");
+    conflicting_options(vm, "CIC", "PCS");
+    conflicting_options(vm, "TSC", "PCS");
     conflicting_options(vm, "NGP", "CIC");
     conflicting_options(vm, "NGP", "TSC");
+    conflicting_options(vm, "NGP", "PCS");
     conflicting_options(vm, "NGP", "SPH");
+    conflicting_options(vm, "Voronoi", "NGP");
+    conflicting_options(vm, "Voronoi", "CIC");
+    conflicting_options(vm, "Voronoi", "TSC");
+    conflicting_options(vm, "Voronoi", "PCS");
+    conflicting_options(vm, "Voronoi", "SPH");
     conflicting_options(vm, "region", "regionMpc");
     conflicting_options(vm, "padding", "paddingMpc");
     
@@ -657,8 +706,8 @@ void User_options::readOptions(int argc, char *argv[], bool getFileNames, bool s
         for (size_t i=0; i<vm["field"].as< std::vector<std::string> >().size(); ++i)
         {
             std::string field = vm["field"].as< std::vector<std::string> >().at(i);
-            bool uFieldOption = this->uField.updateChoices( field, "triangulation", "density", "velocity", "gradient", "divergence", "shear", "vorticity", "", "scalar", "scalarGradient" );
-            bool aFieldOption = this->aField.updateChoices( field, "", "density_a", "velocity_a", "gradient_a", "divergence_a", "shear_a", "vorticity_a",  "velocityStd_a", "scalar_a", "scalarGradient_a" );
+            bool uFieldOption = this->uField.updateChoices( field, "triangulation", "density", "velocity", "gradient", "divergence", "shear", "vorticity", "", "scalar", "scalarGradient", "tweb", "vweb" );
+            bool aFieldOption = this->aField.updateChoices( field, "", "density_a", "velocity_a", "gradient_a", "divergence_a", "shear_a", "vorticity_a",  "velocityStd_a", "scalar_a", "scalarGradient_a", "tweb_a", "vweb_a" );
             if ( not(uFieldOption or aFieldOption) ) throwError( "Unknown value '" + field + "' for the option '--field'." );
         }
     }
@@ -800,15 +849,38 @@ void User_options::readOptions(int argc, char *argv[], bool getFileNames, bool s
         this->TSC = true;
         this->DTFE = false;
     }
+    if ( vm.count("PCS") )
+    {
+        this->PCS = true;
+        this->DTFE = false;
+    }
     if ( vm.count("SPH") )
     {
         this->SPH = true;
         this->DTFE = false;
     }
+    if ( vm.count("Voronoi") )
+    {
+        this->Voronoi = true;
+        // Voronoi goes through the DTFE pipeline (needs triangulation), so keep DTFE=true
+        // but force density-only output
+        this->aField.density = true;
+    }
+    if ( vm.count("interlace") )
+        this->interlace = true;
     if ( vm.count("MpcUnit") )
         lowerBoundCheck( MpcValue, Real(0.), "value of option '--MpcUnit'" );
     if ( vm.count("extensive") )
         this->extensive = true;
+#ifndef PHASE_SPACE
+    if ( vm.count("approxPSD") )
+    {
+        this->approxPSD = true;
+        // Auto-enable scalar field output
+        if ( not this->uField.scalar )
+            this->uField.scalar = true;
+    }
+#endif
     if ( vm.count("verbose") )
         intervalCheck( verboseLevel, 0, 3, "value of option '--verbose'" );
     if ( vm.count("randomSample") )
@@ -857,7 +929,7 @@ void User_options::readOptions(int argc, char *argv[], bool getFileNames, bool s
 #endif
     
     // some special settings only for the TSC or SPH methods
-    if ( this->NGP or this->CIC or this->TSC or this->SPH )
+    if ( this->NGP or this->CIC or this->TSC or this->PCS or this->SPH )
     {
         // for CIC, TSC and SPH only one type of fields are available - the averaged ones
         if ( this->uField.density ) this->aField.density = true;
@@ -874,17 +946,17 @@ void User_options::readOptions(int argc, char *argv[], bool getFileNames, bool s
         if ( this->aField.velocity_gradient or this->aField.selectedVelocityDerivatives() )
         {
             MESSAGE::Warning warning( verboseLevel );
-            warning << "The NGP, CIC, TSC or SPH grid interpolation methods do not have implemented a method for computing the velocity gradient. The velocity gradient will not be computed!" << MESSAGE::EndWarning;
+            warning << "The NGP, CIC, TSC, PCS or SPH grid interpolation methods do not have implemented a method for computing the velocity gradient. The velocity gradient will not be computed!" << MESSAGE::EndWarning;
             this->aField.velocity_gradient = false;
             this->aField.deselectVelocityDerivatives(); // switches off the divergence, shear and vorticity computations
         }
         if ( this->aField.scalar_gradient )
         {
             MESSAGE::Warning warning( verboseLevel );
-            warning << "The NGP, CIC, TSC or SPH grid interpolation methods do not have implemented a method for computing the velocity gradient. The velocity gradient will not be computed!" << MESSAGE::EndWarning;
+            warning << "The NGP, CIC, TSC, PCS or SPH grid interpolation methods do not have implemented a method for computing the velocity gradient. The velocity gradient will not be computed!" << MESSAGE::EndWarning;
             this->aField.scalar_gradient = false;
         }
-        if ( (this->NGP or this->CIC or this->TSC) and this->aField.scalar )
+        if ( (this->NGP or this->CIC or this->TSC or this->PCS) and this->aField.scalar )
         {
             MESSAGE::Warning warning( verboseLevel );
             warning << "The CIC and TSC grid interpolation method does not have implemented a method for computing the scalar fields on the grid. The scalar field cannot be computed!" << MESSAGE::EndWarning;
@@ -1030,14 +1102,14 @@ void User_options::updateEntries(size_t const noTotalParticles,
     
     
     // switch gradient computations off for the TSC and SPH methods
-    if ( NGP or CIC or TSC or SPH )
+    if ( NGP or CIC or TSC or PCS or SPH )
     {
         if ( aField.velocity_gradient or aField.selectedVelocityDerivatives() )
-            throwError( "The NGP, CIC, TSC and SPH grid interpolation methods do not have implemented a method for computing the velocity gradient. The velocity gradient cannot be computed!");
+            throwError( "The NGP, CIC, TSC, PCS and SPH grid interpolation methods do not have implemented a method for computing the velocity gradient. The velocity gradient cannot be computed!");
         if ( aField.scalar_gradient )
-            throwError( "The NGP, CIC, TSC and SPH grid interpolation methods do not have implemented a method for computing the scalar fields gradients. The scalar gradient cannot be computed!");
-        if ( (CIC or TSC) and aField.scalar )
-            throwError( "The NGP, CIC and TSC grid interpolation method does not have implemented a method for computing the scalar fields on the grid. The scalar field cannot be computed!");
+            throwError( "The NGP, CIC, TSC, PCS and SPH grid interpolation methods do not have implemented a method for computing the scalar fields gradients. The scalar gradient cannot be computed!");
+        if ( (CIC or TSC or PCS) and aField.scalar )
+            throwError( "The NGP, CIC, TSC and PCS grid interpolation methods do not have implemented a method for computing the scalar fields on the grid. The scalar field cannot be computed!");
     }
     
     

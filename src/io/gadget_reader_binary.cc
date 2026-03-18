@@ -132,6 +132,13 @@ void initializeGadget(std::string filename,
     }
     else
         message << "The box coordinates were set by the user using the program options. The program will keep this values and will NOT use the box length information from the Gadget file!" << MESSAGE::Flush;
+
+    // Set Hubble parameter from header if not user-specified
+    if ( userOptions->hubbleParam < Real(0.) && gadgetHeader->HubbleParam > 0. )
+    {
+        userOptions->hubbleParam = Real(gadgetHeader->HubbleParam);
+        message << "Using HubbleParam = " << userOptions->hubbleParam << " from file header for T-web/V-web normalization.\n" << MESSAGE::Flush;
+    }
 #ifdef WOJTEK
     if ( userOptions->additionalOptions.size()!=0 ) //if inserted an option
         gadgetHeader->num_files = atoi( userOptions->additionalOptions[0].c_str() );
@@ -535,7 +542,7 @@ void readGadgetData(std::string fileName,
         inputFile.read( reinterpret_cast<char *>( tempData ), readBytes );
 
         float mean = 0;
-        for (size_t i; i<size_t(tempHeader.npart[0]); ++i)
+        for (size_t i=0; i<size_t(tempHeader.npart[0]); ++i)
         {
             size_t index1 = dataOffset + i;
             size_t index2 = index1 * NO_SCALARS + noScalarsRead;

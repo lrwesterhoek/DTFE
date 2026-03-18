@@ -95,11 +95,19 @@ class Data_structure
 NOTE: Do not modify the name of the position variable from 'pos' since the program will not compile. */
 struct Particle_data : public Data_structure
 {
-    Pvector<Real,NO_DIM>   pos;    // stores particle's position
-    
+    Pvector<Real,NO_DIM>   pos;    // stores particle's Eulerian position
+#ifdef PHASE_SPACE
+    Pvector<Real,NO_DIM>   lagPos; // stores particle's Lagrangian (initial) position
+#endif
+
     inline Pvector<Real,NO_DIM>& position() { return pos;}
     inline Real& position(int const i) { return pos[i];}
     inline void setPosition(Real *p) { for(size_t j=0; j<NO_DIM; ++j) pos[j] = p[j];}
+#ifdef PHASE_SPACE
+    inline Pvector<Real,NO_DIM>& lagrangianPosition() { return lagPos;}
+    inline Real& lagrangianPosition(int const i) { return lagPos[i];}
+    inline void setLagrangianPosition(Real *p) { for(size_t j=0; j<NO_DIM; ++j) lagPos[j] = p[j];}
+#endif
 };
 
 

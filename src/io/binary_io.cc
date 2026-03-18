@@ -58,8 +58,8 @@ void readBinaryFile(std::string filename,
     
     // reserve memory for the input data
     Real *positions = readData->position(noParticles);  //particle positions
-    Real *weights = readData->weight(noParticles);      //particle weights (e.g. weights = particle masses)
-    Real *velocities = readData->velocity(noParticles); //particle velocities
+    readData->weight(noParticles);      //particle weights (e.g. weights = particle masses)
+    readData->velocity(noParticles); //particle velocities
     
     
     // read the rest of the input data: positions, weights and velocities
@@ -197,7 +197,6 @@ void writeBinaryFile(T const &dataToWrite,
     
     // write the data to file
     // it is very simple to write data to a binary file, just do: outputFile.write( reinterpret_cast<char const *>(&(dataToWrite[0])), dataSize ). The following implements a recursive method that deals with possible issuess in writing very large data sets.
-    size_t dataSize = dataToWrite.size()*sizeof(dataToWrite[0]);    //total number of data bytes to be written
     size_t maxSize = 256*256*256;   // write at most 256^3 elements at once, otherwise the write function might fail
     size_t noRepeats = size_t( dataToWrite.size() / maxSize ), currentPosition = 0;
     size_t tempBuffer = maxSize * sizeof(dataToWrite[0]);

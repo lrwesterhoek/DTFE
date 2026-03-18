@@ -79,9 +79,9 @@ void readTextFile(std::string filename,
     // assign memory to store the particle data being read from file
     // the following assumes that the text file has a line for each particle with: posX, posY, posZ, velX, velY, velZ, weight(=particle mass), scalar(1 component)
     Real *positions = readData->position(noParticles);  //particle positions
-    Real *velocities = readData->velocity(noParticles); //particle velocities
+    readData->velocity(noParticles); //particle velocities (allocate memory)
     Real *weights = readData->weight(noParticles);      //particle weights (e.g. weights = particle/galaxy masses)
-    Real *scalars = readData->scalar(noParticles);      //scalar component for each particle
+    readData->scalar(noParticles);      //scalar component for each particle (allocate memory)
     
     
     // now read the particle data
@@ -293,25 +293,16 @@ void writeTextFile_gridIndex(std::vector<Real> &dataToWrite,
     
     // write the data to file
     size_t const *grid = &(userOptions.gridSize[0]);
-#if NO_DIM==2   // for the 2D case
-    for (size_t i=0; i<grid[0]; ++i)
-        for (size_t j=0; j<grid[1]; ++j)
-        {
-            size_t index = i*grid[1] + j;
-            outputFile << i << "\t" << j << "\t";
-            outputFile << dataToWrite[index] << "\n";
-        }
-#elif NO_DIM==3 // for the 3D case
-    for (size_t i=0; i<grid[0]; ++i)
-        for (size_t j=0; j<grid[1]; ++j)
-            for(size_t k=0; k<grid[2]; ++k)
-            {
-                size_t index = i*grid[1]*grid[2] + j*grid[2] + k;
-                outputFile << i << "\t" << j << "\t" << k << "\t";
-                outputFile << dataToWrite[index] << "\n";
-            }
-#endif
-    
+    size_t totalGrid = 1;
+    for (int d=0; d<NO_DIM; ++d) totalGrid *= grid[d];
+    for (size_t flatIdx=0; flatIdx<totalGrid; ++flatIdx)
+    {
+        size_t gridIdx[NO_DIM], rem = flatIdx;
+        for (int d=NO_DIM-1; d>=0; --d) { gridIdx[d] = rem % grid[d]; rem /= grid[d]; }
+        for (int d=0; d<NO_DIM; ++d) outputFile << gridIdx[d] << "\t";
+        outputFile << dataToWrite[flatIdx] << "\n";
+    }
+
     checkFileOperations( outputFile, "write to" );   // check that the data writing was succesful
     outputFile.close();
     message << "Done.\n";
@@ -336,29 +327,18 @@ void writeTextFile_gridIndex(std::vector< Pvector<T,N> > &dataToWrite,
     
     // write the data to file
     size_t const *grid = &(userOptions.gridSize[0]);
-#if NO_DIM==2   // for the 2D case
-    for (size_t i=0; i<grid[0]; ++i)
-        for (size_t j=0; j<grid[1]; ++j)
-        {
-            size_t index = i*grid[1] + j;
-            outputFile << i << "\t" << j << "\t";
-            for (size_t i1=0; i1<N; ++i1)
-                outputFile << dataToWrite[index][i1] << "\t";
-            outputFile << "\n";
-        }
-#elif NO_DIM==3 // for the 3D case
-    for (size_t i=0; i<grid[0]; ++i)
-        for (size_t j=0; j<grid[1]; ++j)
-            for(size_t k=0; k<grid[2]; ++k)
-            {
-                size_t index = i*grid[1]*grid[2] + j*grid[2] + k;
-                outputFile << i << "\t" << j << "\t" << k << "\t";
-                for (size_t i1=0; i1<N; ++i1)
-                    outputFile << dataToWrite[index][i1] << "\t";
-                outputFile << "\n";
-            }
-#endif
-    
+    size_t totalGrid = 1;
+    for (int d=0; d<NO_DIM; ++d) totalGrid *= grid[d];
+    for (size_t flatIdx=0; flatIdx<totalGrid; ++flatIdx)
+    {
+        size_t gridIdx[NO_DIM], rem = flatIdx;
+        for (int d=NO_DIM-1; d>=0; --d) { gridIdx[d] = rem % grid[d]; rem /= grid[d]; }
+        for (int d=0; d<NO_DIM; ++d) outputFile << gridIdx[d] << "\t";
+        for (size_t i1=0; i1<N; ++i1)
+            outputFile << dataToWrite[flatIdx][i1] << "\t";
+        outputFile << "\n";
+    }
+
     checkFileOperations( outputFile, "write to" );   // check that the data writing was succesful
     outputFile.close();
     message << "Done.\n";
@@ -394,30 +374,17 @@ void writeTextFile_samplingPosition(std::vector<Real> &dataToWrite,
     Real dx[NO_DIM];
     for (size_t i=0; i<NO_DIM; ++i) dx[i] = (boxCoordinates[2*i+1]-boxCoordinates[2*i]) / grid[i];
     
-#if NO_DIM==2   // for the 2D case
-    for (size_t i=0; i<grid[0]; ++i)
-        for (size_t j=0; j<grid[1]; ++j)
-        {
-            size_t index = i*grid[1] + j;
-            Real x = boxCoordinates[0] + dx[0] * (i+0.5);
-            Real y = boxCoordinates[2] + dx[1] * (j+0.5);
-            outputFile << x << "\t" << y << "\t";
-            outputFile << dataToWrite[index] << "\n";
-        }
-#elif NO_DIM==3 // for the 3D case
-    for (size_t i=0; i<grid[0]; ++i)
-        for (size_t j=0; j<grid[1]; ++j)
-            for(size_t k=0; k<grid[2]; ++k)
-            {
-                size_t index = i*grid[1]*grid[2] + j*grid[2] + k;
-                Real x = boxCoordinates[0] + dx[0] * (i+0.5);
-                Real y = boxCoordinates[2] + dx[1] * (j+0.5);
-                Real z = boxCoordinates[4] + dx[2] * (k+0.5);
-                outputFile << x << "\t" << y << "\t" << z << "\t";
-                outputFile << dataToWrite[index] << "\n";
-            }
-#endif
-    
+    size_t totalGrid = 1;
+    for (int d=0; d<NO_DIM; ++d) totalGrid *= grid[d];
+    for (size_t flatIdx=0; flatIdx<totalGrid; ++flatIdx)
+    {
+        size_t gridIdx[NO_DIM], rem = flatIdx;
+        for (int d=NO_DIM-1; d>=0; --d) { gridIdx[d] = rem % grid[d]; rem /= grid[d]; }
+        for (int d=0; d<NO_DIM; ++d)
+            outputFile << (boxCoordinates[2*d] + dx[d] * (gridIdx[d]+0.5)) << "\t";
+        outputFile << dataToWrite[flatIdx] << "\n";
+    }
+
     checkFileOperations( outputFile, "write to" );   // check that the data writing was succesful
     outputFile.close();
     message << "Done.\n";
@@ -446,33 +413,18 @@ void writeTextFile_samplingPosition(std::vector< Pvector<T,N> > &dataToWrite,
     Real dx[NO_DIM];
     for (size_t i=0; i<NO_DIM; ++i) dx[i] = (boxCoordinates[2*i+1]-boxCoordinates[2*i]) / grid[i];
     
-#if NO_DIM==2   // for the 2D case
-    for (size_t i=0; i<grid[0]; ++i)
-        for (size_t j=0; j<grid[1]; ++j)
-        {
-            size_t index = i*grid[1] + j;
-            Real x = boxCoordinates[0] + dx[0] * (i+0.5);
-            Real y = boxCoordinates[2] + dx[1] * (j+0.5);
-            outputFile << x << "\t" << y << "\t";
-            for (size_t i1=0; i1<N; ++i1)
-                outputFile << dataToWrite[index][i1] << "\t";
-            outputFile << "\n";
-        }
-#elif NO_DIM==3 // for the 3D case
-    for (size_t i=0; i<grid[0]; ++i)
-        for (size_t j=0; j<grid[1]; ++j)
-            for(size_t k=0; k<grid[2]; ++k)
-            {
-                size_t index = i*grid[1]*grid[2] + j*grid[2] + k;
-                Real x = boxCoordinates[0] + dx[0] * (i+0.5);
-                Real y = boxCoordinates[2] + dx[1] * (j+0.5);
-                Real z = boxCoordinates[4] + dx[2] * (k+0.5);
-                outputFile << x << "\t" << y << "\t" << z << "\t";
-                for (size_t i1=0; i1<N; ++i1)
-                    outputFile << dataToWrite[index][i1] << "\t";
-                outputFile << "\n";
-            }
-#endif
+    size_t totalGrid = 1;
+    for (int d=0; d<NO_DIM; ++d) totalGrid *= grid[d];
+    for (size_t flatIdx=0; flatIdx<totalGrid; ++flatIdx)
+    {
+        size_t gridIdx[NO_DIM], rem = flatIdx;
+        for (int d=NO_DIM-1; d>=0; --d) { gridIdx[d] = rem % grid[d]; rem /= grid[d]; }
+        for (int d=0; d<NO_DIM; ++d)
+            outputFile << (boxCoordinates[2*d] + dx[d] * (gridIdx[d]+0.5)) << "\t";
+        for (size_t i1=0; i1<N; ++i1)
+            outputFile << dataToWrite[flatIdx][i1] << "\t";
+        outputFile << "\n";
+    }
     
     checkFileOperations( outputFile, "write to" );   // check that the data writing was succesful
     outputFile.close();

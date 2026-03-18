@@ -86,6 +86,11 @@ struct Read_data
     PairPtrBool<T>  _velocity;   // pointer to array storing the velocity data
     PairPtrBool<T>  _weight;     // pointer to array storing the weight data
     PairPtrBool<T>  _scalar;     // pointer to array storing the scalar data
+#ifdef PHASE_SPACE
+    PairPtrBool<T>  _lagrangianPosition; // pointer to array storing the Lagrangian (initial) position data
+    std::vector<uint64_t> _particleIDs;  // particle IDs for ID-based Lagrangian matching
+    bool _lagrangianPositionPopulated;   // true if lag positions were actually read (not just allocated)
+#endif
     
     size_t _noSamples;   // stores the number of user given sample points (if any)
     PairPtrBool<T>  _sampling;   // pointer to array storing the user given sampling grid points
@@ -96,6 +101,9 @@ struct Read_data
     {
         _noParticles = 0;
         _noSamples = 0;
+#ifdef PHASE_SPACE
+        _lagrangianPositionPopulated = false;
+#endif
     }
     
     
@@ -123,8 +131,14 @@ struct Read_data
     { return _scalar.returnPointer("scalar"); }
     T * scalar( size_t const noParticles)
     { return _scalar.assignMemory( noParticles, &_noParticles, noScalarComp, "scalar" ); }
-    
-    
+
+#ifdef PHASE_SPACE
+    T * lagrangianPosition()
+    { return _lagrangianPosition.returnPointer("lagrangianPosition"); }
+    T * lagrangianPosition( size_t const noParticles)
+    { return _lagrangianPosition.assignMemory( noParticles, &_noParticles, NO_DIM, "lagrangianPosition" ); }
+#endif
+
     T * sampling()
     { return _sampling.returnPointer("sampling"); }
     T * sampling( size_t const noSamples)
@@ -159,6 +173,11 @@ struct Read_data
                 if ( _scalar._assigned )   // copy scalar fields if assigned
                     for (size_t j=0; j<noScalarComp; ++j)
                         temp.scalar(j) = _scalar._ptr[noScalarComp*i+j];
+#ifdef PHASE_SPACE
+                if ( _lagrangianPosition._assigned )   // copy Lagrangian positions if assigned
+                    for (size_t j=0; j<NO_DIM; ++j)
+                        temp.lagrangianPosition(j) = _lagrangianPosition._ptr[NO_DIM*i+j];
+#endif
                 p->push_back( temp );
             }
         }

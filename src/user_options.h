@@ -57,12 +57,14 @@ struct Field
     bool velocity_std;
     bool scalar;
     bool scalar_gradient;
-    
+    bool velocity_tweb;
+    bool velocity_vweb;
+
     Field()
-    { triangulation = false; density = false; velocity = false; velocity_gradient = false; velocity_divergence = false; velocity_shear = false; velocity_vorticity = false; velocity_std = false; scalar = false; scalar_gradient = false; }
-    
+    { triangulation = false; density = false; velocity = false; velocity_gradient = false; velocity_divergence = false; velocity_shear = false; velocity_vorticity = false; velocity_std = false; scalar = false; scalar_gradient = false; velocity_tweb = false; velocity_vweb = false; }
+
     bool updateChoices(std::string choice,
-                       std::string str_triang, std::string str_den, std::string str_vel, std::string str_grad, std::string str_div, std::string str_shear, std::string str_vort, std::string str_velstd, std::string str_scalar, std::string str_scalarGrad)
+                       std::string str_triang, std::string str_den, std::string str_vel, std::string str_grad, std::string str_div, std::string str_shear, std::string str_vort, std::string str_velstd, std::string str_scalar, std::string str_scalarGrad, std::string str_tweb, std::string str_vweb)
     {
         if ( choice.compare(str_triang)==0 ) triangulation = true;
         else if ( choice.compare(str_den)==0 ) density = true;
@@ -74,22 +76,24 @@ struct Field
         else if ( choice.compare(str_velstd)==0 ) velocity_std = true;
         else if ( choice.compare(str_scalar)==0 ) scalar = true;
         else if ( choice.compare(str_scalarGrad)==0 ) scalar_gradient = true;
+        else if ( choice.compare(str_tweb)==0 ) velocity_tweb = true;
+        else if ( choice.compare(str_vweb)==0 ) velocity_vweb = true;
         else return false;
         return true;
     }
-    
+
     bool selected()
-    { return ( density or velocity or velocity_gradient or velocity_divergence or velocity_shear or velocity_vorticity or velocity_std or scalar or scalar_gradient ); }
-    
+    { return ( density or velocity or velocity_gradient or velocity_divergence or velocity_shear or velocity_vorticity or velocity_std or scalar or scalar_gradient or velocity_tweb or velocity_vweb ); }
+
     bool selectedVelocityDerivatives()
-    { return ( velocity_divergence or velocity_shear or velocity_vorticity ); }
+    { return ( velocity_divergence or velocity_shear or velocity_vorticity or velocity_tweb or velocity_vweb ); }
     void deselectVelocityDerivatives()
-    { velocity_divergence = false; velocity_shear = false; velocity_vorticity = false; }
+    { velocity_divergence = false; velocity_shear = false; velocity_vorticity = false; velocity_tweb = false; velocity_vweb = false; }
     bool selectedVelocity()
-    { return ( velocity or velocity_gradient or velocity_divergence or velocity_shear or velocity_vorticity or velocity_std ); }
+    { return ( velocity or velocity_gradient or velocity_divergence or velocity_shear or velocity_vorticity or velocity_std or velocity_tweb or velocity_vweb ); }
     void deselectVelocity()
-    { velocity = false; velocity_gradient = false; velocity_divergence = false; velocity_shear = false; velocity_vorticity = false;  velocity_std = false; }
-    
+    { velocity = false; velocity_gradient = false; velocity_divergence = false; velocity_shear = false; velocity_vorticity = false; velocity_std = false; velocity_tweb = false; velocity_vweb = false; }
+
     bool selectedScalar()
     { return ( scalar or scalar_gradient ); }
     void deselectScalar()
@@ -102,6 +106,9 @@ struct User_options
 {
     std::string inputFilename; // name of input particle positions
     std::string outputFilename;// name/root name of output file/files
+#ifdef PHASE_SPACE
+    std::string lagrangianInputFilename; // name of file with Lagrangian (initial condition) positions for PS-DTFE
+#endif
     
     
     std::vector<size_t> gridSize;// grid size along the 3 directions
@@ -152,13 +159,19 @@ struct User_options
     
     // additional options
     std::string configFilename;// the program options can be supplied in a file too. This keeps track of the file name where the options where supplied.
-    bool   NGP;           // true if to use CIC grid interpolation instead of DTFE
+    bool   NGP;           // true if to use NGP grid interpolation instead of DTFE
     bool   CIC;           // true if to use CIC grid interpolation instead of DTFE
     bool   TSC;           // true if to use TSC grid interpolation instead of DTFE
+    bool   PCS;           // true if to use PCS grid interpolation instead of DTFE
     bool   SPH;           // true if to use SPH grid interpolation instead of DTFE
+    bool   Voronoi;       // true if to use Voronoi volume density with NGP grid assignment
+    bool   interlace;     // true if to use interlacing to reduce aliasing in density field
     int    SPH_neighbors; // keep track of the number of neighbors used for the SPH grid interpolation
     Real   MpcValue;      // the value of 1Mpc in input units
     bool   extensive;     // variable used for scalar field computations using the TSC or SPH method - true if the scalar fields are extensive (if false than the scalar fields are intensive)
+    bool   approxPSD;     // compute approximate phase-space density f = rho * g (velocity-space DTFE)
+    Real   lambda_th;    // eigenvalue threshold for T-web/V-web classification (default 0.0)
+    Real   hubbleParam;  // Hubble parameter h for T-web/V-web normalization (-1 = read from header)
     int    verboseLevel;  // keep track of the verbose level of the program (see header 'message.h' for additional details)
     Real   randomSample;  // the size of the random subsample if the users wishes to use only a subset of all the data for computations
     size_t poisson;       // if !=0 - generate a random sample of particles instead of reading the positions from a file
@@ -169,6 +182,9 @@ struct User_options
     
     
     //! this options cannot be set from the command line - they are set during runtime
+#ifdef PHASE_SPACE
+    Box    lagrangianRegion; // unpadded Lagrangian partition region (for PS-DTFE cell ownership check)
+#endif
     Box    paddedBox;      // this gives the dimensions of the padded box
     std::vector<Real> fullBoxOffset; // stores the positions of the full box left side along each axis (redundant information with 'boxCoordinates')
     std::vector<Real> fullBoxLength; // stores the full box length along each axis (redundant information with 'boxCoordinates')

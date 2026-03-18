@@ -22,6 +22,7 @@
 
 
 /* This file contains most of the functions necessary to interpolate to grid volume averaged fields inside the sampling cell using averaging method 1 (= choose sampling points inside the Delaunay cell). */
+#include "triangulation_common.h"
 #include <typeinfo>
 #include <stdio.h>
 #include <gsl/gsl_qrng.h>
@@ -266,7 +267,8 @@ void interpolateGrid_averaged_1(DT &dt,
     
     
     // quasi-random sequence of numbers - using the GSL quasi-number generator
-    Real quasiRandomNumbers[maxNN][NO_DIM];
+    std::vector<Real> quasiRandomNumbers_buf(maxNN * NO_DIM);
+    Real (*quasiRandomNumbers)[NO_DIM] = reinterpret_cast<Real(*)[NO_DIM]>(quasiRandomNumbers_buf.data());
     quasiRandomSequence( quasiRandomNumbers, maxNN );
     
     
@@ -345,8 +347,8 @@ void interpolateGrid_averaged_1(DT &dt,
         // get the quasi-random points inside the Delaunay cell
         size_t const tempInt = size_t(NN*cellVolume/gridCellVolume) + 1;
         size_t const noRandomPoints = (cellVolume/gridCellVolume>minRatio) ? (tempInt>maxNN ? maxNN:tempInt) : minNN;// number of random points
-        Point randomPoints[noRandomPoints];
-        quasiRandomPointsInCell( vertexMatrix, noRandomPoints, quasiRandomNumbers, randomPoints );   // get quasi-random points inside the Delaunay cell
+        std::vector<Point> randomPoints(noRandomPoints);
+        quasiRandomPointsInCell( vertexMatrix, noRandomPoints, quasiRandomNumbers, randomPoints.data() );   // get quasi-random points inside the Delaunay cell
         Real factor = cellVolume / noRandomPoints;  // volume associated with each random sample point
         Vertex_handle base = itC->vertex(0);  // stores the "base" vertex of the Delaunay cell
         

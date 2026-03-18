@@ -60,6 +60,34 @@ void insertParticlesInBox(std::vector<Particle_data> &p,
                         Box const &box,
                         Real const offset[]);
 
+#ifdef PHASE_SPACE
+/* Finds all particles whose Lagrangian position is inside the padded box.
+   Used by PS-DTFE partitioning where partitions are defined in Lagrangian space. */
+void findParticlesInBoxLagrangian(std::vector<Particle_data> &p,
+                                  std::vector<Particle_data> *output,
+                                  Box const &paddedBox,
+                                  int verboseLevel)
+{
+    MESSAGE::Message message( verboseLevel );
+    message << "Finding particles with Lagrangian positions in box " << paddedBox.print() << " ... " << MESSAGE::Flush;
+    output->reserve( p.size() / 4 );  // rough estimate
+
+    for (vectorIterator it=p.begin(); it!=p.end(); ++it)
+    {
+        bool inside = true;
+        for (size_t i=0; i<NO_DIM; ++i)
+            if ( it->lagPos[i]<paddedBox.coords[2*i] or it->lagPos[i]>paddedBox.coords[2*i+1] )
+            { inside = false; break; }
+        if (inside)
+            output->push_back( *it );
+    }
+
+    message << "Done.\n"
+            << "\t Selected " << output->size() << " of " << p.size() << " particles ("
+            << std::setprecision(4) << output->size()/float(p.size())*100. << "\%).\n" << MESSAGE::Flush;
+}
+#endif
+
 
 
 
@@ -104,23 +132,15 @@ void findParticlesInBox(std::vector<Particle_data> &p,
         // check if the padded box extends outside of the full particle data box, if so must include the additional particles also by periodically translating the particle positions
         size_t const noOffsets = (NO_DIM==2 ? 9:27);
         Real offset[noOffsets][NO_DIM];
-#if NO_DIM==2
-        for (int i1=0; i1<3; ++i1)
-            for (int i2=0; i2<3; ++i2)
+        for (size_t n=0; n<noOffsets; ++n)
+        {
+            size_t idx = n;
+            for (int d=NO_DIM-1; d>=0; --d)
             {
-                offset[i1*3+i2][0] = Real(i1-1) * boxLength[0];
-                offset[i1*3+i2][1] = Real(i2-1) * boxLength[1];
+                offset[n][d] = Real(int(idx % 3) - 1) * boxLength[d];
+                idx /= 3;
             }
-#elif NO_DIM==3
-        for (int i1=0; i1<3; ++i1)
-            for (int i2=0; i2<3; ++i2)
-                for (int i3=0; i3<3; ++i3)
-                {
-                    offset[i1*9+i2*3+i3][0] = Real(i1-1) * boxLength[0];
-                    offset[i1*9+i2*3+i3][1] = Real(i2-1) * boxLength[1];
-                    offset[i1*9+i2*3+i3][2] = Real(i3-1) * boxLength[2];
-                }
-#endif
+        }
         
         for (size_t n=0; n<noOffsets; ++n)
         {
@@ -185,14 +205,14 @@ void optimalSplit(std::vector<size_t> &counts,
 			
 			// check which split is more balanced: at index i-1 or index i
 			if ( i==size_t(0) )				//first partition must have at least one cell
-				i = i;
+				(void)i; // keep i unchanged
 			else if ( i==counts.size()-1 )	//last partition must have at least one cell
 			{
 				temp -= counts[i];
 				--i;
 			}
 			else if ( partitionIndexCount>size_t(1) and (i-partitionIndices[partitionIndexCount-1])==size_t(1) )	//each partition must have at least one cell
-				i = i;
+				(void)i; // keep i unchanged
 			else  if ( std::abs(int(temp)-int(temp1))<std::abs(int(temp)-int(temp2)) )	//more balanced load when splitting at index i-1
 			{
 				temp -= counts[i];
@@ -226,7 +246,7 @@ void optimalPartitionSplit(std::vector<Particle_data> &particles,
 	size_t noPartitions = 1;	// total number of partitions
     for (size_t i=0; i<NO_DIM; ++i)
         noPartitions *= partition[i];
-	Real dx[NO_DIM]; 				// to compute the region coordinates for each sub-box
+    Real dx[NO_DIM]; 				// to compute the region coordinates for each sub-box
 	for (int i=0; i<NO_DIM; ++i)
 		dx[i] = (userOptions.region[2*i+1] - userOptions.region[2*i]) / grid[i];
 	
@@ -386,12 +406,10 @@ void copySubgridInformation(User_options *userOptions,
 void subgrid(User_options &userOptions, std::vector< std::vector<size_t> > &subgrid)
 {
     MESSAGE::Message message( userOptions.verboseLevel );
-    message << "\nYou choose to compute the results only for a partition of the data. The output files will contain only the results for the grid indices with:\n"
-            << "\t nx = [" << subgrid[userOptions.partNo][0] << " to " << subgrid[userOptions.partNo][1]-1 << "]\n"
-            << "\t ny = [" << subgrid[userOptions.partNo][2] << " to " << subgrid[userOptions.partNo][3]-1 << "]\n";
-#if NO_DIM==3
-    message << "\t nz = [" << subgrid[userOptions.partNo][4] << " to " << subgrid[userOptions.partNo][5]-1 << "]\n";
-#endif
+    char const axisName[] = "xyz";
+    message << "\nYou choose to compute the results only for a partition of the data. The output files will contain only the results for the grid indices with:\n";
+    for (int d=0; d<NO_DIM; ++d)
+        message << "\t n" << axisName[d] << " = [" << subgrid[userOptions.partNo][2*d] << " to " << subgrid[userOptions.partNo][2*d+1]-1 << "]\n";
 }
 
 
@@ -516,10 +534,9 @@ void parallelGrid(size_t const noAvailableProcessors,
         grid[i%(NO_DIM-x3)] *= 2;
     for (int i=0; i<x2-i1; ++i) // distribute the remaining 2's starting with the first grid axis
         grid[i%NO_DIM] *= 2;
-    
-	
-	// Check that the parallel split is consistent with the main grid axes
-	size_t const *mainGrid = &(userOptions.gridSize[0]);
+
+    // Check that the parallel split is consistent with the main grid axes
+    size_t const *mainGrid = &(userOptions.gridSize[0]);
 	for (int i=0; i<NO_DIM; ++i)
 		if ( mainGrid[i]>=grid[i] )	//don't do anything if you can split the mainGrid to have at least one cell per parallel partition
 			continue;

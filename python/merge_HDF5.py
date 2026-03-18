@@ -1,6 +1,9 @@
 """
 Merge multiple HDF5 snapshot subfiles into a single combined file.
-Handles unit conversions from comoving to physical coordinates.
+Handles unit conversions from comoving ckpc/h to ckpc (removing the h factor).
+
+Also supports converting single-file snapshots (like IC files) to the same
+coordinate convention, so all files use consistent units.
 """
 
 import h5py
@@ -11,7 +14,7 @@ from pathlib import Path
 # Configuration Section - Adjust these for your simulation data
 # ============================================================================
 
-# Which snapshots do you want to process?
+# Which snapshots do you want to process? (multi-subfile snapshots in snapdir_XXX/)
 SNAPSHOT_NUMBERS = [0]
 
 # How many subfiles per snapshot?
@@ -20,8 +23,15 @@ NUM_SUBFILES = 4
 # Where are your snapshot directories? (relative to this script)
 BASE_DIR = "output/TNG50-3-Dark"
 
+# Single-file snapshots that just need h-factor conversion (e.g., IC files).
+# Each entry is a path relative to BASE_DIR. Output will be written next to
+# the input with a "combined_" prefix (e.g., snap_ics.hdf5 → combined_ics.hdf5).
+SINGLE_FILES = [
+    "snap_ics.hdf5",
+]
+
 # Hubble parameter for unit conversion (check your simulation parameters)
-H_VALUE = 0.6774 
+H_VALUE = 0.6774
 
 # Modify this if you're working with gas (PartType0), stars (PartType4), etc.
 DATASETS_INFO = {
@@ -152,21 +162,91 @@ def merge_snapshot_files(snapshot_num, num_subfiles, base_dir, h_value, datasets
     print('='*60)
 
 
+def convert_single_file(input_path, h_value, datasets_info):
+    """
+    Convert a single HDF5 file to physical coordinates (remove h factor).
+
+    This applies the same coordinate conversion as merge_snapshot_files,
+    but for files that aren't split into subfiles (e.g., IC snapshots).
+    Output is written next to the input with a "combined_" prefix.
+    """
+    input_path = Path(input_path)
+    if not input_path.exists():
+        print(f"\nSkipping {input_path} - file not found")
+        return
+
+    # Build output filename: snap_ics.hdf5 → combined_ics.hdf5
+    stem = input_path.stem  # e.g., "snap_ics"
+    suffix = input_path.suffix  # e.g., ".hdf5"
+    prefix = stem.split("_", 1)[1] if "_" in stem else stem  # e.g., "ics"
+    output_path = input_path.parent / f"combined_{prefix}{suffix}"
+
+    print(f"\n{'='*60}")
+    print(f"Converting single file: {input_path}")
+    print(f"Output: {output_path}")
+
+    with h5py.File(input_path, 'r') as f_in:
+        box_size = f_in['Header'].attrs.get('BoxSize')
+        box_size_physical = box_size / h_value
+        print(f"  BoxSize: {box_size:.2f} ckpc/h → {box_size_physical:.2f} ckpc")
+
+        with h5py.File(output_path, 'w') as f_out:
+            # Copy metadata groups
+            for group_name in f_in:
+                if group_name not in datasets_info:
+                    f_out.copy(f_in[group_name], group_name)
+
+            # Update box size to physical units
+            f_out["Header"].attrs["BoxSize"] = box_size_physical
+
+            # Copy and convert particle data
+            for group_name, dsets in datasets_info.items():
+                if group_name not in f_in:
+                    continue
+                grp = f_out.create_group(group_name)
+
+                for dset_name in dsets:
+                    if dset_name not in f_in[group_name]:
+                        continue
+
+                    data = f_in[group_name][dset_name][...]
+                    n = data.shape[0]
+
+                    if dset_name == "Coordinates":
+                        data = (data / h_value).astype(dsets[dset_name]["dtype"])
+                        print(f"  {group_name}/{dset_name}: {n} particles, divided by h={h_value}")
+                    else:
+                        print(f"  {group_name}/{dset_name}: {n} entries (copied as-is)")
+
+                    grp.create_dataset(dset_name, data=data)
+
+    print(f"  Saved: {output_path}")
+    print('='*60)
+
+
 def main():
-    """Process all requested snapshots."""
+    """Process all requested snapshots and single files."""
     print("\nHDF5 Snapshot Merger")
     print(f"Base directory: {BASE_DIR}")
     print(f"Snapshots to process: {SNAPSHOT_NUMBERS}")
-    
+    print(f"Single files to convert: {SINGLE_FILES}")
+
     for snapshot_num in SNAPSHOT_NUMBERS:
         merge_snapshot_files(
-            snapshot_num, 
-            NUM_SUBFILES, 
-            BASE_DIR, 
-            H_VALUE, 
+            snapshot_num,
+            NUM_SUBFILES,
+            BASE_DIR,
+            H_VALUE,
             DATASETS_INFO
         )
-    
+
+    for single_file in SINGLE_FILES:
+        convert_single_file(
+            Path(BASE_DIR) / single_file,
+            H_VALUE,
+            DATASETS_INFO
+        )
+
     print("\nDone!")
 
 
