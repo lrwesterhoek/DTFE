@@ -213,54 +213,7 @@ The outputs are raw binary, one value per grid cell (row-major, single precision
 | `scalar` | `.scalar` | `NO_SCALARS` | mass-weighted scalar field(s) |
 | _(always)_ | `.streams` | 1 | number of streams per cell (1 single-stream, ≥3 in a caustic) |
 
-Every field also has a **volume-averaged `_a` form** (`density_a`, `velocity_a`, `dispersion_a`, …) that sub-samples an `nSub³` grid (nSub=3) inside each cell and writes the matching `.a_*` file (`.a_den`, `.a_velDisp`, …); `.a_streams` is the per-cell average stream count. The dispersion is σ_ij = Σ ρ_s (v_s−⟨v⟩)_i (v_s−⟨v⟩)_j / Σ ρ_s = ⟨v_i v_j⟩ − ⟨v_i⟩⟨v_j⟩ — ≈0 in cold single-stream void interiors, large in multi-stream walls/filaments. In single-stream regions the velocity, gradient and dispersion reproduce the standard DTFE result (dispersion → 0), validated by [`tests/ps_standard_cross_check.py`](tests/ps_standard_cross_check.py).
-
-### Parallelization, scaling, and memory
-PS-DTFE parallelizes **coarse-grained over Lagrangian partitions**, selected with `--partition nx ny nz`. Each OpenMP thread builds an independent Delaunay triangulation for one partition, interpolates it onto the full Eulerian grid, and the per-partition grids are summed into the shared output under a critical section (the per-cell scatter inside a partition is serial). Speedup therefore comes from `--partition`, and parallelism scales up to the number of partitions:
-```bash
-./PS-DTFE snapshot.hdf5 out --grid 256 --periodic --partition 2 2 2 --field density velocity --MpcUnit 1
-```
-Strong scaling measured on a 10-core Apple Silicon laptop (`N=48³`, `grid=96³`, `--partition 2 2 2`, `--field density velocity density_a`):
-
-| cores | wall time | speedup | efficiency |
-|------:|----------:|--------:|-----------:|
-| 1     | 24.0 s    | 1.00×   | 100 %      |
-| 2     | 12.3 s    | 1.95×   | 98 %       |
-| 4     | 6.37 s    | 3.78×   | 94 %       |
-| 8     | 3.63 s    | 6.63×   | 83 %       |
-
-Reproduce (and regression-check the scaling) with [`tests/ps_scaling_benchmark.sh`](tests/ps_scaling_benchmark.sh).
-
-> **Experimental: TBB-parallel triangulation.** `make PS-DTFE TBB=1` (needs `brew install tbb`) builds the *single global* tessellation — the no-`--partition` path — with CGAL's parallel Delaunay insertion. It is correct and genuinely multi-threaded, but on these point sets it benchmarks **~2× slower** than the default build: the parallel path cannot use CGAL's `Fast_location` (a sequential point-location hierarchy) and its lock-grid overhead outweighs the parallelism on the grid-structured + periodic-copy distribution (CGAL parallel Delaunay is tuned for much larger, uniform point sets). **Prefer `--partition`** — it parallelizes the triangulation *and* the interpolation. The `TBB=1` switch is provided for experimentation; the default builds are unaffected.
-
-> **Memory.** Each concurrently-running Lagrangian partition holds its own output grid, so peak memory ≈ (threads running at once) × per-partition grid × number of fields — bounded by the **thread** count, not the total partition count (`OMP_NUM_THREADS` caps it). To keep that affordable, each partition allocates only the **Eulerian bounding box of the cells it actually touches**, not the whole grid: on the pancake test a half-box Lagrangian partition occupies ~15 % of the grid, cutting measured peak RSS ~2.6× (4.16 → 1.58 GB at grid 192³, `--partition 2 2 2`, 8 threads) with bit-identical output. A partition whose Eulerian footprint folds or wraps across an axis keeps the full extent on that axis. Still, choose the partition/thread count from your core budget *and* available RAM.
-
-### Recommended settings and limitations
-**Grid resolution.** Choose `--grid` comparable to the particle resolution (≈ the cube root of the particle number). The unaveraged density is point-sampled at cell centres, so on caustic-rich fields the mass it integrates to depends on how the grid aligns with the (near-singular) caustics — on the Zel'dovich pancake the grid mass varies by ~±10 % between grid 64 / 96 / 128, and the measured multi-stream *fraction* is set by the grid (how many cells fall in the slab), not the particle count. The volume-averaged `density_a` (sub-sampled) is steadier and is the better choice when mass conservation matters; for a smooth field both converge.
-
-**Performance / averaging cost.** Runtime is dominated by the per-cell scatter, which grows with the number of grid points each Delaunay cell covers — i.e. with `--grid`. The volume-averaged `_a` fields sub-sample an `nSub³` grid inside every cell (`nSub=3`, so 27× the per-cell work), so request `_a` fields only when you need the volume average. Use `--partition` for parallelism (it scales with the partition count); keep the grid-to-particle ratio near 1 to avoid both empty cells (grid too fine) and washed-out caustics (grid too coarse).
-
-**Periodicity.** Use `--periodic` for periodic cosmological boxes. A genuinely **non-periodic finite cloud** (particles in vacuum) is also supported and mass-conserving: the density is normalized to the cloud's *Lagrangian* mean (`N·m/V_lagBox`, not the box volume) and the convex-hull surface cells are kept (density from their own Lagrangian/Eulerian volume ratio). On a centred clump this conserves mass to ~0.96–1.02 across grids (`tests/ps_nonperiodic_test.py`); before it recovered only ~20%. Two caveats: it assumes a roughly **convex, regular** Lagrangian particle distribution (the bounding box stands in for the convex hull, exact for a grid; hull cells across a concavity would bridge empty space — the standard DTFE convex-hull assumption), and you must not feed *periodic* data without `--periodic` (the wrapped positions then mishandle the boundary).
-
-**Dimensionality.** Validated in 3D (`NO_DIM=3`). The interpolation is written dimension-generically (it carries 2D branches) but 2D has not been exercised — treat 2D as untested.
-
-**Unsupported options.** Phase-space mode supports **regular-grid** interpolation only; redshift-cone grids and user-defined sampling points exit with an explanatory message.
-
-**Multi-stream semantics.** velocity, scalar and their gradients are the **mass-weighted mean over streams**, ⟨f⟩ = Σ ρ_s f_s / Σ ρ_s, which reduces to the single-stream value where `streams = 1`. Quantities derived from a mass-weighted multi-stream velocity gradient (divergence, shear, vorticity) are rigorous only in single-stream regions; for multi-stream kinematics use the stream count and the velocity dispersion.
-
-### Verifying the build (tests)
-Five self-contained tests exercise PS-DTFE on a synthetic Zel'dovich-pancake snapshot with genuine shell crossing. Each builds `PS-DTFE` (pass `--no-build` to reuse an existing build), generates the snapshot via [`tests/generate_ps_test_data.py`](tests/generate_ps_test_data.py), runs the executable, and checks the outputs; they require `python3` with `numpy` and `h5py`.
-
-* **Smoke test** — [`tests/ps_smoke_test.sh`](tests/ps_smoke_test.sh): the build runs and the density/stream outputs are finite, non-negative, roughly mass-conserving and multi-stream.
-* **Regression test** — [`tests/ps_regression_test.py`](tests/ps_regression_test.py): compares the output against the *analytic* 1-D pancake — three-stream volume fraction, Eulerian caustic positions, stream-count parity, hard mass conservation, and the **velocity dispersion** against the analytic three-stream value — and tracks behavioural metrics against a baseline in `tests/reference/` (`--update-baseline` to rewrite it).
-* **Parallel check** — [`tests/ps_parallel_check.sh`](tests/ps_parallel_check.sh): runs the same `--partition` problem at 1 thread and all cores and verifies the outputs agree (integer stream counts exactly; float fields within rounding), catching parallel data races.
-* **Scaling benchmark** — [`tests/ps_scaling_benchmark.sh`](tests/ps_scaling_benchmark.sh): a 1/2/4/8-thread speedup table that also fails if strong scaling regresses.
-* **Standard-DTFE cross-check** — [`tests/ps_standard_cross_check.py`](tests/ps_standard_cross_check.py): in single-stream regions PS-DTFE must agree with standard DTFE — velocity matches tightly, density to estimator accuracy.
-
-```bash
-tests/ps_regression_test.py            # the strictest physics check
-tests/ps_parallel_check.sh --no-build  # parallel == serial
-```
+Every field also has a volume-averaged _a form (density_a, velocity_a, dispersion_a, …) that sub-samples an nSub³ grid (nSub=3) inside each cell and writes the matching .a_* file (.a_den, .a_velDisp, …); .a_streams is the per-cell average stream count. The dispersion is the density-weighted covariance of the per-stream velocities: for each pair of spatial directions you weight every stream's velocity deviation from the local mean flow by that stream's density, sum over all streams, and normalise by the total stream density — equivalently, the density-weighted mean of the velocity-component products minus the product of the mean velocity components. It is approximately zero in cold, single-stream void interiors and large in multi-stream walls and filaments. In single-stream regions the velocity, gradient and dispersion reproduce the standard DTFE result, with the dispersion going to zero.
 
 
 ## Contributors

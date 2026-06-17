@@ -5,7 +5,7 @@ import matplotlib.colors as colors
 from scipy.ndimage import gaussian_filter
 from pathlib import Path
 
-BASE_DATA_DIR = "/Users/luukw/output/TNG50-3-Dark/snapdir_099"
+BASE_DATA_DIR = "/Users/luukw/output/TNG50-4-Dark/snapdir_000"
 OUTPUT_DIR = "python/figures/ps_dtfe"
 
 FIELD_RESOLUTION = 512
@@ -19,7 +19,7 @@ SLICE_PLANES_TO_PLOT = [0, 1, 2]
 PROCESS_DENSITY = True
 PROCESS_STREAMS = True
 
-GAUSSIAN_SMOOTHING_SIGMA = 5.0
+GAUSSIAN_SMOOTHING_SIGMA = 0.0
 DPI = 300
 
 SLICE_PLANES = {
