@@ -20,12 +20,7 @@
  *
  */
 
-/*!
-Here are the functions used for data input and output.
-To easily find how to read the input data go to the function:
-    
-
-*/
+/* Reads particle data and writes result fields, dispatching to a format-specific reader/writer by file-type code. */
 
 #include <iostream>
 #include <fstream>
@@ -47,19 +42,18 @@ namespace bfs=boost::filesystem;
 #include "message.h"
 
 
-// contains the definitions of some classes and fucntions used only for input and output purposes
 #include "io/input_output.h"
 
-// different data format readers and writters
-#include "io/gadget_reader_header.cc" 
-#include "io/gadget_reader_binary.cc"  // reader for binary Gadget files
-#include "io/gadget_reader_HDF5.cc" // reader for Gadget snapshots in HDF5 format
-#include "io/gadget_reader_HDF5_Cristian.cc" // reader for Gadget HDF5 files using Cristian's format
-#include "io/gadget_reader_MOG.cc"  // reader for Gadget snapshots and MOG forces into scalar field
-#include "io/hdf5_input_my_DESI.cc" // reader for some personal DESI particle data
-#include "io/binary_io.cc"      // writer for binary file format
-#include "io/text_io.cc"        // reader/writer for text files
-#include "io/my_io.cc"          // reader/writer for text files
+// data format readers and writers
+#include "io/gadget_reader_header.cc"
+#include "io/gadget_reader_binary.cc"  // binary Gadget files
+#include "io/gadget_reader_HDF5.cc" // Gadget snapshots in HDF5 format
+#include "io/gadget_reader_HDF5_Cristian.cc" // Gadget HDF5, Cristian's format
+#include "io/gadget_reader_MOG.cc"  // Gadget snapshots + MOG forces into scalar field
+#include "io/hdf5_input_my_DESI.cc" // personal DESI particle data
+#include "io/binary_io.cc"      // binary writer
+#include "io/text_io.cc"        // text reader/writer
+#include "io/my_io.cc"          // text reader/writer
 #include "io/density_file_io.cc"    // own output file format
 
 
@@ -77,38 +71,38 @@ void openOutputTextFile(std::fstream & outputFile,
 
 
 
-//! Functions for reading the input data
+// Functions for reading the input data
 
 typedef void (*FunctionReadInputData)(std::string, Read_data<Real> *, User_options *);
 
-/*! This function uses the 'inputFileType' entry in the userOptions class to decide on the function that will be used to read the input data. */
+// Pick the reader function for the given 'inputFileType'.
 FunctionReadInputData chooseInputDataReadFunction(int const inputFileType)
 {
     if ( inputFileType==101 )
-        return &readGadgetFile;    // Read the input data from a single/multiple Gadget snapshot file (works only for snapshots type 1 or 2). See the "src/io/gadget_reader.cc" for the definition of this function.
+        return &readGadgetFile;    // single/multiple Gadget snapshot, type 1 or 2
     if ( inputFileType==109 )
-        return &readGadgetFile_MOG;    // Read the input data from a single/multiple Gadget snapshot file (works only for snapshots type 1 or 2). Also reads modified gravity theory forces: the gravitational and fifth force. See the "src/io/gadget_reader_MOG.cc" for the definition of this function.
+        return &readGadgetFile_MOG;    // Gadget snapshot + modified-gravity (gravitational and fifth) forces
 #ifndef DOUBLE
 #ifdef HDF5
     else if ( inputFileType==105 )
-        return &HDF5_readGadgetFile;        // Read the input data from a HDF5 Gadget snapshot file. See the "src/io/gadget_reader_HDF5.cc" for the definition of this function.
+        return &HDF5_readGadgetFile;        // HDF5 Gadget snapshot
     else if ( inputFileType==106 )
-        return &HDF5_readGadgetFile_HI;     // Read the input HI data from a HDF5 Gadget snapshot file. See the "src/io/gadget_reader_HDF5.cc" for the definition of this function.
+        return &HDF5_readGadgetFile_HI;     // HI data from HDF5 Gadget snapshot
     else if ( inputFileType==107 )
-        return &HDF5_readData_DESI;         // Read the input data from a HDF5 file storing DESI particle data.
+        return &HDF5_readData_DESI;         // HDF5 DESI particle data
     else if ( inputFileType==108 )
-        return &HDF5_readGadgetFile_Cristian;     // Read the input HI data from a HDF5 Gadget snapshot file. See the "src/io/gadget_reader_HDF5_Cristian.cc" for the definition of this function.
+        return &HDF5_readGadgetFile_Cristian;     // HDF5 Gadget snapshot, Cristian's format
 #endif
     else if ( inputFileType==111 )
-        return &readTextFile;               // Read the input data from a text file. See the "src/io/text_io.cc" for the definition of this function.
+        return &readTextFile;               // text file
     else if ( inputFileType==112 )
-        return &readTextFile_positions;     // Read the input data from a text file. The text file has only particle positions. See the "src/io/text_io.cc" for the definition of this function.
+        return &readTextFile_positions;     // text file, positions only
     else if ( inputFileType==121 )
-        return &readBinaryFile;             // Define your custom function to read the input data. Do this in the "src/io/bynary_io.cc" file.
+        return &readBinaryFile;             // custom binary reader
     else if ( inputFileType==122 )
-        return &readBinaryFile_StructuredData;  // Function to read the input data. Defined in the "src/io/binary_io.cc" file.
+        return &readBinaryFile_StructuredData;  // structured-data binary reader
     else if ( inputFileType==131 )
-        return &readMyFile;                 // Define your custom function to read the input data. Do this in the "src/io/my_io.cc" file.
+        return &readMyFile;                 // custom reader (my_io.cc)
 #endif
     else
         throwError( "Unknow value for the 'inputFileType' argument in function 'chooseInputDataReadFunction'. The program could not recognize the input data file type." );
@@ -120,36 +114,35 @@ FunctionReadInputData chooseInputDataReadFunction(int const inputFileType)
 
 
 
-/*! This function reads the particle data used for the DTFE computation. */
+// Read the particle data used for the DTFE computation.
 void readInputData(std::vector<Particle_data> *p,
                    std::vector<Sample_point> *samplingCoordinates,
                    User_options *userOptions)
 {
-    std::string filename = userOptions->inputFilename;  // the name of the input file
-    Read_data<Real> readData; // will store the data read from the input file
-    
-    
-    // Read the data from the input file - see the function 'chooseInputDataReadFunction' that selects the input function used to read in the input data file
+    std::string filename = userOptions->inputFilename;
+    Read_data<Real> readData; // stores the data read from the input file
+
+
     FunctionReadInputData functionReadInputData = chooseInputDataReadFunction( userOptions->inputFileType );
     (*functionReadInputData)( filename, &readData, userOptions );
-    
-    
-    // 'userOptions->MpcValue' is the conversion factor from the units in the input data file to Mpc units - do the next computation only if userOptions->MpcValue!=1
+
+
+    // MpcValue is the conversion factor from input-file units to Mpc; rescale only if != 1
     if ( userOptions->MpcValue!=Real(1.) )
     {
         for (size_t i=0; i<userOptions->boxCoordinates.size(); ++i)
             userOptions->boxCoordinates[i] /= userOptions->MpcValue;
         
-        size_t noParticles = readData.noParticles();  // returns the number of particles
-        Real *positions = readData.position();  //returns pointer to array storing particle positions
+        size_t noParticles = readData.noParticles();
+        Real *positions = readData.position();
         for (size_t i=0; i<noParticles*NO_DIM; ++i)
             positions[i] /= userOptions->MpcValue;
-        
-        // if the user inserted user defined sampling points, divide the coordinates of those points by the normalization factor
+
+        // rescale any user-defined sampling points too
         if ( readData.noSamples()!=size_t(0) )
         {
-            Real *sampling = readData.sampling();  // returns pointer to user defined sampling coordinates
-            Real *delta = readData.delta();        // returns pointer to user defined sampling cell sizes
+            Real *sampling = readData.sampling();  // sampling coordinates
+            Real *delta = readData.delta();        // sampling cell sizes
             for (size_t i=0; i<readData.noSamples()*NO_DIM; ++i)
             {
                 sampling[i] /= userOptions->MpcValue;
@@ -159,9 +152,9 @@ void readInputData(std::vector<Particle_data> *p,
     }
     
     
-    // Handle Lagrangian positions for PS-DTFE
+    // PS-DTFE needs Lagrangian (initial-condition) positions
 #ifdef PHASE_SPACE
-    // If Lagrangian positions were read from the main file (InitialCoordinates dataset), apply MpcValue
+    // already read from the main file's InitialCoordinates dataset: just rescale
     if ( readData._lagrangianPositionPopulated and userOptions->MpcValue!=Real(1.) )
     {
         size_t noParticles2 = readData.noParticles();
@@ -170,7 +163,7 @@ void readInputData(std::vector<Particle_data> *p,
             lagPos[i] /= userOptions->MpcValue;
     }
 
-    // If Lagrangian positions not in main file, read from separate file with ID-based matching
+    // otherwise read from a separate IC file, matching by particle ID
     if ( not readData._lagrangianPositionPopulated )
     {
         if ( userOptions->lagrangianInputFilename.empty() )
@@ -180,7 +173,7 @@ void readInputData(std::vector<Particle_data> *p,
         MESSAGE::Message message( userOptions->verboseLevel );
         size_t const noParticles = readData.noParticles();
 
-        // Read header of Lagrangian file to get file count and particle numbers
+        // read Lagrangian file header for file count and particle numbers
         Gadget_header lagHeader;
         std::string lagFilename = userOptions->lagrangianInputFilename;
         std::string lagFirstFile = lagFilename;
@@ -195,7 +188,7 @@ void readInputData(std::vector<Particle_data> *p,
 
         int lagNumFiles = lagSingleFile ? 1 : lagHeader.num_files;
 
-        // Count total particles in Lagrangian file
+        // count total particles in the Lagrangian file
         size_t lagTotalParticles = 0;
         if (lagSingleFile)
         {
@@ -218,11 +211,10 @@ void readInputData(std::vector<Particle_data> *p,
         message << "\nReading Lagrangian positions from '" << userOptions->lagrangianInputFilename
                 << "' (" << lagTotalParticles << " particles, " << lagNumFiles << " file(s)) with ID matching...\n" << MESSAGE::Flush;
 
-        // Allocate arrays for Lagrangian file data
         std::vector<float> lagCoords(lagTotalParticles * NO_DIM);
         std::vector<uint64_t> lagIDs(lagTotalParticles);
 
-        // Read Coordinates and ParticleIDs from all Lagrangian file chunks
+        // read Coordinates and ParticleIDs from all file chunks
         size_t lagOffset = 0;
         for (int fi = 0; fi < lagNumFiles; ++fi)
         {
@@ -252,21 +244,18 @@ void readInputData(std::vector<Particle_data> *p,
             }
         }
 
-        // Match Lagrangian positions to main file particles by ID
+        // match Lagrangian positions to main-file particles by ID
         Real *lagPosOut = readData.lagrangianPosition();
 
-        // Check if Lagrangian IDs are contiguous (common for IC files: IDs = 1..N)
+        // contiguous IDs (IDs = 1..N) allow O(N) direct indexing instead of a sort
         uint64_t minID = *std::min_element(lagIDs.begin(), lagIDs.end());
         uint64_t maxID = *std::max_element(lagIDs.begin(), lagIDs.end());
 
         if (maxID - minID + 1 == lagTotalParticles)
         {
-            // Contiguous IDs — use direct array indexing (O(N), no sorting)
             message << "\t ID range is contiguous (" << minID << ".." << maxID << "), using direct indexing.\n" << MESSAGE::Flush;
 
-            // Reorder lagCoords so index [id - minID] gives the coordinates for that ID
-            // The IC file may already be in ID order, but we handle the general case
-            // by building a position lookup indexed by (id - minID)
+            // position lookup indexed by (id - minID); handles unordered IC files
             std::vector<float> lagByID(lagTotalParticles * NO_DIM);
             for (size_t i = 0; i < lagTotalParticles; ++i)
             {
@@ -275,7 +264,6 @@ void readInputData(std::vector<Particle_data> *p,
                     lagByID[slot * NO_DIM + d] = lagCoords[i * NO_DIM + d];
             }
 
-            // Map main file particles to their Lagrangian positions
             for (size_t i = 0; i < noParticles; ++i)
             {
                 uint64_t id = readData._particleIDs[i];
@@ -286,7 +274,7 @@ void readInputData(std::vector<Particle_data> *p,
         }
         else
         {
-            // Non-contiguous IDs — use sort-based matching (O(N log N))
+            // non-contiguous IDs: sort-based matching, O(N log N)
             message << "\t IDs are non-contiguous, using sort-based matching.\n" << MESSAGE::Flush;
 
             std::vector<size_t> lagSortIdx(lagTotalParticles);
@@ -307,7 +295,7 @@ void readInputData(std::vector<Particle_data> *p,
             }
         }
 
-        // Apply MpcValue conversion to Lagrangian positions
+        // rescale Lagrangian positions to Mpc
         if (userOptions->MpcValue != Real(1.))
         {
             for (size_t i = 0; i < noParticles * NO_DIM; ++i)
@@ -321,12 +309,11 @@ void readInputData(std::vector<Particle_data> *p,
 #endif
     }
 
-    // Final check
     if ( not readData._lagrangianPositionPopulated )
         throwError( "PS-DTFE mode requires Lagrangian positions but none were loaded." );
 #endif
 
-    // now store the data in the 'Particle_data list'. It also copies the user given sampling coordinates, if any - none in this case.
+    // store particles (and any user-given sampling coordinates) in the output lists
     readData.transferData( p, samplingCoordinates );
 }
 
@@ -338,22 +325,20 @@ void readInputData(std::vector<Particle_data> *p,
 
 
 
-//! Functions for writing the output data
+// Functions for writing the output data
 
 
-//! short class to easily change between writing the output to different file types while the program is running. The user can choose the output file type using the '--output' option.
+// Dispatches output writing to the format chosen via the '--output' option.
 class OutputData
 {
     public:
     int outputFileType;
-    
-    // class constructor - initializes the type of the output file
+
     OutputData(int fileType)
     {
         this->outputFileType = fileType;
     }
-    
-    // the function that calls the function doing the actual writing
+
     template <typename T>
     void write(T &dataToWrite,
                 std::string filename,
@@ -361,86 +346,104 @@ class OutputData
                 User_options const &userOptions)
     {
         if ( this->outputFileType==101 )
-            writeBinaryFile( dataToWrite, filename, variableName, userOptions );        // writes the data to a binary file (see "binary_io.cc" for function definition)
+            writeBinaryFile( dataToWrite, filename, variableName, userOptions );        // binary file
         else if ( this->outputFileType==111 )
-            writeTextFile( dataToWrite, filename, variableName, userOptions );          // writes the data to a text file (see "text_io.cc" for function definition)
+            writeTextFile( dataToWrite, filename, variableName, userOptions );          // text file
         else if ( this->outputFileType==112 )
-            writeTextFile_gridIndex( dataToWrite, filename, variableName, userOptions );// writes the data to a text file, but on each line writes also the coordinates of the grid cell corresponding to the result being written (see "text_io.cc" for function definition)
+            writeTextFile_gridIndex( dataToWrite, filename, variableName, userOptions );// text file, each line prefixed with grid-cell coordinates
         else if ( this->outputFileType==113 )
-            writeTextFile_samplingPosition( dataToWrite, filename, variableName, userOptions ); // writes the data to a text file, but on each line writes also the sampling point coordinates corresponding to the result being written  (see "text_io.cc" for function definition)
+            writeTextFile_samplingPosition( dataToWrite, filename, variableName, userOptions ); // text file, each line prefixed with sampling-point coordinates
         else if ( this->outputFileType==114 )
-            writeTextFile_redshiftConePosition( dataToWrite, filename, variableName, userOptions ); // writes the data to a text file, but on each line writes also the sampling point coordinates for a redshift cone grid  (see "text_io.cc" for function definition)
+            writeTextFile_redshiftConePosition( dataToWrite, filename, variableName, userOptions ); // text file, each line prefixed with redshift-cone coordinates
         else if ( this->outputFileType==121 )
-            writeMyFile( dataToWrite, filename, variableName, userOptions );   // the format that I use where it write to a binary file with a header that describes the data stored in it
+            writeMyFile( dataToWrite, filename, variableName, userOptions );   // binary with self-describing header
         else if ( this->outputFileType==100 )
-            writeSpecialFile( dataToWrite, filename, variableName, userOptions );   // the format that I use where it write to a binary file with a header that describes the data stored in it
+            writeSpecialFile( dataToWrite, filename, variableName, userOptions );   // binary with self-describing header
     }
 };
 
 
-/*! This function writes the output data to a file, each different 'variable' being written to a separate file. 
-You can modify this function as you please. */
+// Write the output data, each variable to a separate file.
 void writeOutputData(Quantities &uQuantities,
                      Quantities &aQuantities,
                      User_options const &userOptions)
 {
-    // select the file type for output
     OutputData output( userOptions.outputFileType );
-    
-    // output the desired quantities to file/files
-    // outputs the density
+
     if ( userOptions.uField.density )
         output.write( uQuantities.density, userOptions.outputFilename + ".den", "density", userOptions );
     if ( userOptions.aField.density )
         output.write( aQuantities.density, userOptions.outputFilename + ".a_den", "volume averaged density", userOptions );
-    
-    // outputs the velocity
+
     if ( userOptions.uField.velocity )
         output.write( uQuantities.velocity, userOptions.outputFilename + ".vel", "velocity", userOptions );
     if ( userOptions.aField.velocity )
         output.write( aQuantities.velocity, userOptions.outputFilename + ".a_vel", "volume averaged velocity", userOptions );
-    
-    // outputs the velocity gradient
+
     if ( userOptions.uField.velocity_gradient )
         output.write( uQuantities.velocity_gradient, userOptions.outputFilename + ".velGrad", "velocity gradient", userOptions );
     if ( userOptions.aField.velocity_gradient )
         output.write( aQuantities.velocity_gradient, userOptions.outputFilename + ".a_velGrad", "volume averaged velocity gradient", userOptions );
-    
-    // outputs the velocity divergence
+
     if ( userOptions.uField.velocity_divergence )
         output.write( uQuantities.velocity_divergence, userOptions.outputFilename + ".velDiv", "velocity divergence", userOptions );
     if ( userOptions.aField.velocity_divergence )
         output.write( aQuantities.velocity_divergence, userOptions.outputFilename + ".a_velDiv", "volume averaged velocity divergence", userOptions );
-    
-    // outputs the velocity shear
+
     if ( userOptions.uField.velocity_shear )
         output.write( uQuantities.velocity_shear, userOptions.outputFilename + ".velShear", "velocity shear", userOptions );
     if ( userOptions.aField.velocity_shear )
         output.write( aQuantities.velocity_shear, userOptions.outputFilename + ".a_velShear", "volume averaged velocity shear", userOptions );
-    
-    // outputs the velocity vorticity
+
     if ( userOptions.uField.velocity_vorticity )
         output.write( uQuantities.velocity_vorticity, userOptions.outputFilename + ".velVort", "velocity vorticity", userOptions );
     if ( userOptions.aField.velocity_vorticity )
         output.write( aQuantities.velocity_vorticity, userOptions.outputFilename + ".a_velVort", "volume averaged velocity vorticity", userOptions );
-    
-    // outputs the velocity standard deviation
+
     if ( userOptions.aField.velocity_std )
         output.write( aQuantities.velocity_std, userOptions.outputFilename + ".a_velStd", "volume averaged velocity standard deviation", userOptions );
-    
-    // outputs the scalar fields
+
+    // PS-DTFE velocity dispersion: full tensor sigma_ij to '.velDispTensor', trace sigma^2 to '.velDisp' (mass-weighted, ~0 single-stream).
+#ifdef PHASE_SPACE
+    {
+        // offset of diagonal element (i,i) in the upper-triangle row-major packing
+        size_t diag[NO_DIM];
+        for (int i=0, off=0; i<NO_DIM; off += (NO_DIM-i), ++i) diag[i] = size_t(off);
+        auto writeDispersion = [&](std::vector< Pvector<Real,noDispComp> > &tens,
+                                   std::string const &traceExt, std::string const &tensorExt,
+                                   std::string const &traceDesc, std::string const &tensorDesc)
+        {
+            if ( tens.empty() ) return;
+            std::vector<Real> trace( tens.size() );
+            for (size_t c=0; c<tens.size(); ++c)
+            {
+                Real t = Real(0.);
+                for (int i=0; i<NO_DIM; ++i) t += tens[c][ diag[i] ];
+                trace[c] = t;
+            }
+            output.write( trace, userOptions.outputFilename + traceExt, traceDesc, userOptions );
+            output.write( tens,  userOptions.outputFilename + tensorExt, tensorDesc, userOptions );
+        };
+        if ( userOptions.uField.velocity_dispersion )
+            writeDispersion( uQuantities.velocity_dispersion, ".velDisp", ".velDispTensor",
+                             "velocity dispersion (trace sigma^2)", "velocity dispersion tensor" );
+        if ( userOptions.aField.velocity_dispersion )
+            writeDispersion( aQuantities.velocity_dispersion, ".a_velDisp", ".a_velDispTensor",
+                             "volume averaged velocity dispersion (trace sigma^2)", "volume averaged velocity dispersion tensor" );
+    }
+#endif
+
     if ( userOptions.uField.scalar )
         output.write( uQuantities.scalar, userOptions.outputFilename + ".scalar", "scalar", userOptions );
     if ( userOptions.aField.scalar )
         output.write( aQuantities.scalar, userOptions.outputFilename + ".a_scalar", "volume averaged scalar", userOptions );
-    
-    // outputs the scalar fields gradient
+
     if ( userOptions.uField.scalar_gradient )
         output.write( uQuantities.scalar_gradient, userOptions.outputFilename + ".scalarGrad", "scalar gradient", userOptions );
     if ( userOptions.aField.scalar_gradient )
         output.write( aQuantities.scalar_gradient, userOptions.outputFilename + ".a_scalarGrad", "volume averaged scalar gradient", userOptions );
 
-    // outputs the T-web classification and eigenvalues
+    // T-web classification and eigenvalues
     if ( userOptions.uField.velocity_tweb )
     {
         output.write( uQuantities.velocity_tweb, userOptions.outputFilename + ".velTweb", "T-web classification", userOptions );
@@ -452,7 +455,7 @@ void writeOutputData(Quantities &uQuantities,
         output.write( aQuantities.velocity_tweb_eigenvalues, userOptions.outputFilename + ".a_velTwebEig", "volume averaged T-web eigenvalues", userOptions );
     }
 
-    // outputs the V-web classification and eigenvalues
+    // V-web classification and eigenvalues
     if ( userOptions.uField.velocity_vweb )
     {
         output.write( uQuantities.velocity_vweb, userOptions.outputFilename + ".velVweb", "V-web classification", userOptions );
@@ -464,10 +467,12 @@ void writeOutputData(Quantities &uQuantities,
         output.write( aQuantities.velocity_vweb_eigenvalues, userOptions.outputFilename + ".a_velVwebEig", "volume averaged V-web eigenvalues", userOptions );
     }
 
-    // outputs the stream count (PS-DTFE only)
+    // stream count (PS-DTFE only): per-cell for unaveraged fields, cell-averaged for '_a' fields.
 #ifdef PHASE_SPACE
     if ( not uQuantities.stream_count.empty() )
         output.write( uQuantities.stream_count, userOptions.outputFilename + ".streams", "stream count", userOptions );
+    if ( not aQuantities.stream_count.empty() )
+        output.write( aQuantities.stream_count, userOptions.outputFilename + ".a_streams", "averaged stream count", userOptions );
 #endif
 }
 

@@ -21,6 +21,8 @@
  */
 
 
+/* Public interface to the DTFE driver that interpolates the requested fields onto a grid. */
+
 #ifndef DTFE_HEADER
 #define DTFE_HEADER
 
@@ -32,7 +34,7 @@
 #include "quantities.h"
 
 
-// Computes the grid interpolation
+// Runs the full DTFE/PS-DTFE pipeline, filling uQuantities (sampled) and aQuantities (cell-averaged). Clears allParticles.
 void DTFE(std::vector<Particle_data> *allParticles,
           std::vector<Sample_point> &samples,
           User_options &userOptions,
@@ -41,9 +43,8 @@ void DTFE(std::vector<Particle_data> *allParticles,
 
 
 
-// section used if you need to access the Delaunay triangulations
+// Overload that also hands back the Delaunay triangulation.
 #ifdef TRIANGULATION
-// include the headers
 #if NO_DIM==2
 #include "CGAL_triangulation/CGAL_include_2D.h"
 #elif NO_DIM==3
@@ -51,7 +52,7 @@ void DTFE(std::vector<Particle_data> *allParticles,
 #endif
 #include "math_functions.h"
 
-// Computes the grid interpolation (no partition options available as well as no parallel threads)
+// As above but single-triangulation only (no --partition without --partNo); also returns delaunay_triangulation.
 void DTFE(std::vector<Particle_data> *allParticles,
           std::vector<Sample_point> &samples,
           User_options &userOptions,

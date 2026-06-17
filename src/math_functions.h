@@ -20,6 +20,8 @@
  *
  */
 
+/* Small dense linear-algebra helpers for NO_DIM-sized matrices: determinant, inverse, products, and simplex volume. */
+
 #ifndef MATH_FUNCTIONS_HEADER
 #define MATH_FUNCTIONS_HEADER
 
@@ -30,8 +32,7 @@
 #define REAL_PRECISSION 1.e-6
 
 
-/* Computes the determinant of an NxN matrix using Gaussian elimination
-   with partial pivoting. Works for any dimension. */
+// Determinant of an NxN matrix via Gaussian elimination with partial pivoting.
 inline double determinant(double matrix[][NO_DIM])
 {
     double temp[NO_DIM][NO_DIM];
@@ -42,7 +43,6 @@ inline double determinant(double matrix[][NO_DIM])
     double det = 1.0;
     for (int i=0; i<NO_DIM; ++i)
     {
-        // partial pivoting
         int maxRow = i;
         double maxVal = std::fabs(temp[i][i]);
         for (int k=i+1; k<NO_DIM; ++k)
@@ -69,9 +69,7 @@ inline double determinant(double matrix[][NO_DIM])
 }
 
 
-/* Computes the inverse of a 2x2 or 3x3 matrix using closed-form formulas
-   (Cramer's rule). Falls back to Gauss-Jordan for other dimensions.
-   Sets result to zero if the matrix is singular or near-singular. */
+// Matrix inverse: closed-form for 2x2/3x3, Gauss-Jordan otherwise; zero result if (near-)singular.
 inline void matrixInverse(double matrix[][NO_DIM],
                           Real result[][NO_DIM])
 {
@@ -88,7 +86,6 @@ inline void matrixInverse(double matrix[][NO_DIM],
     result[1][0] = Real(-matrix[1][0] * invDet);
     result[1][1] = Real( matrix[0][0] * invDet);
 #elif NO_DIM==3
-    // cofactors
     double c00 = matrix[1][1]*matrix[2][2] - matrix[1][2]*matrix[2][1];
     double c01 = matrix[1][2]*matrix[2][0] - matrix[1][0]*matrix[2][2];
     double c02 = matrix[1][0]*matrix[2][1] - matrix[1][1]*matrix[2][0];
@@ -111,7 +108,7 @@ inline void matrixInverse(double matrix[][NO_DIM],
     result[1][2] = Real((matrix[0][2]*matrix[1][0] - matrix[0][0]*matrix[1][2]) * invDet);
     result[2][2] = Real((matrix[0][0]*matrix[1][1] - matrix[0][1]*matrix[1][0]) * invDet);
 #else
-    // General case: Gauss-Jordan elimination with partial pivoting
+    // general case: Gauss-Jordan elimination with partial pivoting
     double aug[NO_DIM][2*NO_DIM];
     double normSum = 0.0;
     for (int i=0; i<NO_DIM; ++i)
@@ -154,8 +151,7 @@ inline void matrixInverse(double matrix[][NO_DIM],
 }
 
 
-/* Computes the matrix multiplication of two matrices: result = M1 * M2.
-   M1 is NO_DIM x NO_DIM, M2 is NO_DIM x N, result is NO_DIM x N. */
+// Matrix product result = M1 * M2 (M1 is NO_DIM x NO_DIM, M2 and result are NO_DIM x N).
 template <size_t N>
 inline void matrixMultiplication(Real M1[][NO_DIM],
                                  Real M2[][N],
@@ -170,8 +166,7 @@ inline void matrixMultiplication(Real M1[][NO_DIM],
         }
 }
 
-/* Computes the matrix-vector multiplication: result = M1 * M2.
-   M1 is NO_DIM x NO_DIM, M2 and result are NO_DIM vectors. */
+// Matrix-vector product result = M1 * M2 (M1 is NO_DIM x NO_DIM, M2 and result are NO_DIM vectors).
 inline void matrixMultiplication(Real M1[][NO_DIM],
                                  Real *M2,
                                  Real *result)
@@ -185,7 +180,7 @@ inline void matrixMultiplication(Real M1[][NO_DIM],
 }
 
 
-/* Computes the factorial of n. */
+// Factorial of n.
 inline double factorial(int n)
 {
     double result = 1.0;
@@ -194,8 +189,7 @@ inline double factorial(int n)
 }
 
 
-/* Computes the volume of a simplex from the vertex difference matrix.
-   Volume = |det(M)| / NO_DIM! */
+// Simplex volume from the vertex difference matrix: |det(M)| / NO_DIM!.
 inline Real simplexVolume(double posDiff[][NO_DIM])
 {
     return Real( std::fabs(determinant(posDiff)) / factorial(NO_DIM) );

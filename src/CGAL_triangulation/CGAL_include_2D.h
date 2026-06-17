@@ -20,11 +20,14 @@
  *
  */
 
+/* CGAL setup for the 2D build: pulls in the Delaunay headers and defines the kernel and triangulation
+   typedefs (DT, Point, Vertex_handle, ...) the rest of the code uses. */
+
 #include <CGAL/basic.h>
 #include <CGAL/Exact_predicates_inexact_constructions_kernel.h>
 #include <CGAL/Delaunay_triangulation_2.h>
 #include <CGAL/Triangulation_vertex_base_with_info_2.h>
-#include <CGAL/Timer.h>
+#include <CGAL/Real_timer.h>   // wall-clock timer, not CPU time (see CGAL_include_3D.h note)
 #include <CGAL/Cartesian.h>
 #include <CGAL/Bbox_2.h>
 #include <CGAL/spatial_sort.h>
@@ -42,22 +45,23 @@
 typedef boost::mt19937 base_generator_type;
 
 
-// structures used to keep track of each vertex data
+// per-vertex data attached to triangulation vertices
 #include "vertexData.h"
 
 
 typedef CGAL::Exact_predicates_inexact_constructions_kernel         K;
-typedef CGAL::Triangulation_vertex_base_with_info_2<vertexData, K>  Vb;
+typedef CGAL::Triangulation_vertex_base_with_info_2<vertexData, K>  Vb;    // vertex stores a vertexData payload
 typedef CGAL::Triangulation_data_structure_2<Vb>                    Tds;
 typedef CGAL::Delaunay_triangulation_2<K, Tds>                      DT;
 
+// 2D-to-generic aliases so the dimension-agnostic code can speak of "cells" in either build
 typedef DT::Point                   Point;
 typedef DT::Locate_type             Locate_type;
-typedef DT::Face_handle             Cell_handle;
+typedef DT::Face_handle             Cell_handle;        // a 2D face plays the role of a cell
 typedef DT::Face_iterator           Cell_iterator;
 typedef DT::Finite_faces_iterator   Finite_cells_iterator;
 typedef DT::Vertex_handle           Vertex_handle;
-typedef CGAL::Timer                 Timer;
+typedef CGAL::Real_timer            Timer;   // wall-clock seconds
 
 typedef CGAL::Cartesian<float>      K2;
 typedef K2::Point_2                 Point_22;

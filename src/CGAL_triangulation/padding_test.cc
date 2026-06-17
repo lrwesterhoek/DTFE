@@ -22,14 +22,14 @@
 
 
 #ifdef TEST_PADDING
-/* This file contains the functions used to test the padding efficiency.
-The following functions check if the interpolation values are affected by an incomplete Delaunay tesselation of the region of interest. In the case of density, this means that a Delaunay cell of interest has dummy points as vertices or as neighbors of the vertices.
-*/
+/* Padding-efficiency tests: flag grid cells whose interpolation is unreliable because the
+   Delaunay tessellation is incomplete (their cell has dummy vertices/neighbors). */
 #include <fstream>
 
 
 
-/* Inserts dummy points to test the efficiency of the padding. */
+// Inserts a sheet of dummy vertices on the padded-box boundary to probe tessellation completeness;
+// cells touching them mark the interior cells whose interpolation may be unreliable.
 void insertDummyTestParticles(DT &dt,
                             User_options &userOptions)
 {
@@ -37,9 +37,9 @@ void insertDummyTestParticles(DT &dt,
     MESSAGE::Message message( userOptions.verboseLevel );
     message << "Inserting dummy test points on the boundaries of the padded box to test for completness of the Delaunay tesselation inside the box of interest ... " << MESSAGE::Flush;
     Real nprt = (Real) dt.number_of_vertices();
-    size_t n = int( pow( nprt, 1./NO_DIM ) ) + 1.;    //number of dummy particles to be inserted along each direction
+    size_t n = int( pow( nprt, 1./NO_DIM ) ) + 1.;    // dummy points per direction (~one per mean inter-particle spacing)
     
-    Real dx[NO_DIM];  //keep track of grid spacing of dummy points along each direction
+    Real dx[NO_DIM];  // grid spacing of dummy points per direction
     for (size_t i=0; i<NO_DIM; ++i)
         dx[i] = (paddedBox[2*i+1] - paddedBox[2*i]) / (n-1);
     Real xMin[NO_DIM], xMax[NO_DIM];
@@ -82,19 +82,18 @@ void insertDummyTestParticles(DT &dt,
     message << "\tPercent of total points: " << 100.*((Real) dummyPoints.size())/nprt << "\n";
 
     message << "\tUpdating the triangulation.\n\tDone: " << MESSAGE::Flush;
-    
-    // sort the points to be spatially close - for faster insertion into the triangulation
-    size_t prev = 0, amount100 = 0, count = 0;    // variable to show the user about the progress of the computation
-    size_t const noPoints = dummyPoints.size();   // total number of dummy points
+
+    // spatial_sort so spatially close points insert near the previous one, speeding up point location
+    size_t prev = 0, amount100 = 0, count = 0;    // progress tracking
+    size_t const noPoints = dummyPoints.size();
     CGAL::spatial_sort( dummyPoints.begin(), dummyPoints.end() );
     vector<Point>::iterator it = dummyPoints.begin();
-    Vertex_handle vh = dt.nearest_vertex( *it );
+    Vertex_handle vh = dt.nearest_vertex( *it );    // seed the insertion hint
     for ( ; it!=dummyPoints.end(); ++it)
     {
-        vh = dt.insert( *it, vh );
-        vh->info().setDummy();
+        vh = dt.insert( *it, vh );      // reuse previous vertex as the location hint
+        vh->info().setDummy();          // tag so neighbouring cells can be flagged later
         
-        // show the progress of the computation
         amount100 = (100 * count++)/ noPoints;
         if (prev < amount100)
             message.updateProgress( ++prev );
@@ -106,7 +105,7 @@ void insertDummyTestParticles(DT &dt,
 
 
 
-/* Check if any of the vertices of a Delaunay cell has dummy neighbors. */
+// Returns true if any vertex of the cell has a dummy neighbour (its density estimate may be off).
 template <typename templateCell>
 inline bool hasDummyNeighbor(templateCell &cell)
 {
@@ -115,7 +114,7 @@ inline bool hasDummyNeighbor(templateCell &cell)
             return true;
     return false;
 }
-/* Check if any of the vertices of a Delaunay cell is a dummy test point. */
+// Returns true if any vertex of the cell is itself a dummy test point (all its fields may be off).
 template <typename templateCell>
 inline bool hasDummyVertex(templateCell &cell)
 {
@@ -124,14 +123,14 @@ inline bool hasDummyVertex(templateCell &cell)
             return true;
     return false;
 }
-/* Keep track of the cells that have wrong values of the density. */
+// Appends a flagged grid cell, skipping an immediate duplicate of the last entry (cheap run dedup).
 inline void updateDummyGridCells(size_t const gridIndex,
                                  vector<size_t> *dummyGridCells)
 {
     if ( dummyGridCells->empty() or gridIndex!=dummyGridCells->back() )
         dummyGridCells->push_back( gridIndex );
 }
-/* Checks if there are any cells which may have an error in the density estimation due to an incomplete Delaunay tesselation over the region of interest. */
+// Writes the flagged (incomplete-estimation) grid cells to a per-thread .badGridPoints file.
 void showCellsContainingDummyPoints(vector<size_t> *dummyGridCells,
                                     User_options &userOptions,
                                     string outputName,
@@ -147,10 +146,10 @@ void showCellsContainingDummyPoints(vector<size_t> *dummyGridCells,
         return;
     }
     if ( nGrid==NULL) nGrid = &(userOptions.gridSize[0]);
-    size_t const totalSize = (NO_DIM==2)? (nGrid[0]*nGrid[1]) : (nGrid[0]*nGrid[1]*nGrid[2]);  // the number of cell in the density grid
+    size_t const totalSize = (NO_DIM==2)? (nGrid[0]*nGrid[1]) : (nGrid[0]*nGrid[1]*nGrid[2]);  // total number of grid cells
     char threadId[100] = "";
     if ( userOptions.noProcessors!=1 ) snprintf( threadId, sizeof(threadId), "%d", userOptions.threadId );
-    string output = outputName + ".badGridPoints" + threadId;   // name of the output file
+    string output = outputName + ".badGridPoints" + threadId;
     
     sort( dummyGridCells->begin(), dummyGridCells->end() );
     vector<size_t>::iterator it = unique( dummyGridCells->begin(), dummyGridCells->end() );

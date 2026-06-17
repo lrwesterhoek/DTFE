@@ -22,7 +22,9 @@
 
 
 
-// reads the modified gravity forces
+/* Reads a Gadget snapshot together with the matching modified-gravity (MOG/GR) force file. */
+
+// Reads the modified-gravity forces for one file into the scalar block (defined below).
 void readForces_MOG(std::string fileName,
                     Read_data<Real> *readData,
                     User_options &userOptions,
@@ -32,29 +34,27 @@ void readForces_MOG(std::string fileName,
 
 
 
-/*! This function reads a Gadget snapshots saved in a single or multiple files.
- *  It also reads the GR and MOG forces from a separate file.
- * */
+// Reads a Gadget snapshot (single or multiple files) and the GR/MOG forces from a separate file.
 void readGadgetFile_MOG(std::string filename,
                         Read_data<Real> *readData,
                         User_options *userOptions)
 {
-    int gadgetFileType;     // stores the type of the gadget file (1 or 2)
-    int noBytesPos, noBytesVel;     // stores the data type used to write positions and velocities
-    bool swapEndian;        // true if need to swap the endianess of the data
-    size_t noParticles;     // total number of particles to be read from the file
-    Gadget_header gadgetHeader; // the gadget header for the first file
-    
-    
-    // get the input gadget data characteristics: file type, endianess, particle number and number of files. The following function also reserves memory for the positions, weights and velocity data (if requested so).
+    int gadgetFileType;     // gadget file format (1 or 2)
+    int noBytesPos, noBytesVel;     // bytes per value for positions and velocities (4=float, 8=double)
+    bool swapEndian;        // true if the data endianness must be swapped
+    size_t noParticles;     // total number of particles to read
+    Gadget_header gadgetHeader; // header of the first file
+
+
+    // determine file type, endianness, particle/file counts and reserve memory for the data
     initializeGadget( filename, readData, userOptions, &gadgetHeader, &gadgetFileType, &noBytesPos, &noBytesVel, &swapEndian, &noParticles );
-    
-    
+
+
     MESSAGE::Message message( userOptions->verboseLevel );
     std::string fileName = filename;
     std::string fileNameMOG;
-    
-    
+
+
     // reserve memory for the scalar particle data
     int noScalars = atoi( userOptions->additionalOptions[1].c_str() );
     if ( noScalars>0  and  noScalars<=noScalarComp )
@@ -66,28 +66,25 @@ void readGadgetFile_MOG(std::string filename,
     }
     
     
-    // read the data in each file
-    size_t numberParticlesRead  = 0;   // the total number of particles read after each file
-    size_t numberParticlesRead2 = 0;   // the total number of particles read after each file
-    
-    // iterate over all the files and read the data
+    size_t numberParticlesRead  = 0;   // running particle count from the snapshot reader
+    size_t numberParticlesRead2 = 0;   // running particle count from the force reader
+
     for (int i=0; i<gadgetHeader.num_files; ++i )
     {
         fileName = gadgetHeader.filename( filename, i );
         message << "Reading GADGET snapshot file '" << fileName << "' which is file " << i+1 << " of " << gadgetHeader.num_files << " files...\n" << MESSAGE::Flush;
 
-        // call the function that reads the data
         readGadgetData( fileName, readData, *userOptions, gadgetFileType, noBytesPos, noBytesVel, swapEndian, &numberParticlesRead );
-        
-        // read the forces from that file
+
+        // read the matching forces for this file
         fileNameMOG = gadgetHeader.filename( userOptions->additionalOptions[0], i+1 );
         size_t noParticlesThisFile = numberParticlesRead - numberParticlesRead2;
         if ( noScalars > 0 )
             readForces_MOG( fileNameMOG, readData, *userOptions, noParticlesThisFile, noScalars, &numberParticlesRead2 );
     }
-    
-    
-    // check if the data needs to be swapped
+
+
+    // swap endianness of all read data if needed
     if ( swapEndian )
     {
         if ( userOptions->readParticleData[0] )
@@ -114,8 +111,7 @@ void readGadgetFile_MOG(std::string filename,
 
 
 
-/*! This function reads the forces from a binary file. 
-*/
+// Reads the MOG/GR forces from a binary file into the scalar block.
 void readForces_MOG(std::string fileName,
                     Read_data<Real> *readData,
                     User_options &userOptions,
@@ -125,28 +121,27 @@ void readForces_MOG(std::string fileName,
 {
     MESSAGE::Message message( userOptions.verboseLevel );
     message << "\t reading force data from file '" << fileName << "' ... " << MESSAGE::Flush;
-    
-    // open the file
+
     std::fstream inputFile;
     openInputBinaryFile( inputFile, fileName );
     int buffer1, buffer2;
-    
-    
-    // read the data block
+
+
+    // read the data block, bracketed by matching record-size integers
     inputFile.read( reinterpret_cast<char *>(&buffer1), sizeof(buffer1) );
-    
+
     double *data = new double[ noParticlesThisFile * noScalars ];
     size_t readBytes = noParticlesThisFile * sizeof(double) * noScalars;
     inputFile.read( reinterpret_cast<char *>( data ), readBytes );
-    
+
     inputFile.read( reinterpret_cast<char *>(&buffer2), sizeof(buffer2) );
     if ( buffer1!=buffer2 )
         throwError( "The integers before and after the particle 'MOG forces' data block in the GADGET file '" + fileName + "' did not match. The GADGET snapshot file is corrupt." );
-    
-    
-    // copy the data to the scalar block
+
+
+    // copy into the scalar block (stride noScalarComp, only the first noScalars columns used)
     size_t alreadyRead = (*numberParticlesRead) * noScalarComp;
-    Real *scalar = &( readData->scalar()[ alreadyRead ] );  // pointer to the first place where to start writing
+    Real *scalar = &( readData->scalar()[ alreadyRead ] );
     for (size_t i=0; i<noParticlesThisFile; ++i)
         for (int j=0; j<noScalars; ++j)
             scalar[ i*noScalarComp + j ] = data[ i*noScalars + j ];

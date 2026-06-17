@@ -1,9 +1,3 @@
-"""
-PS-DTFE Field Visualization Tool
-
-Loads binary field data from PS-DTFE output (density, stream count) and creates
-2D slice visualizations across different planes.
-"""
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -11,31 +5,22 @@ import matplotlib.colors as colors
 from scipy.ndimage import gaussian_filter
 from pathlib import Path
 
-# ============================================================================
-# Configuration Section
-# ============================================================================
-
-BASE_DATA_DIR = "/Users/luukw/DTFE/output/TNG50-3-Dark/snapdir_099"
+BASE_DATA_DIR = "/Users/luukw/output/TNG50-3-Dark/snapdir_099"
 OUTPUT_DIR = "python/figures/ps_dtfe"
 
 FIELD_RESOLUTION = 512
-BOX_SIZE = 51.7  # Mpc
+BOX_SIZE = 51.7
 AXIS_UNITS = "Mpc"
 
 REDSHIFT = 0.00
 
-# Which slice planes to visualize? (0=YZ, 1=XZ, 2=XY)
 SLICE_PLANES_TO_PLOT = [0, 1, 2]
 
-# Which fields to process?
 PROCESS_DENSITY = True
 PROCESS_STREAMS = True
 
-# Visualization settings
 GAUSSIAN_SMOOTHING_SIGMA = 5.0
 DPI = 300
-
-# ============================================================================
 
 SLICE_PLANES = {
     0: {'name': 'yz_plane', 'axis_labels': ('Y', 'Z')},
@@ -43,12 +28,7 @@ SLICE_PLANES = {
     2: {'name': 'xy_plane', 'axis_labels': ('X', 'Y')}
 }
 
-# ============================================================================
-# File Loading
-# ============================================================================
-
 def load_binary_field(binary_file, field_shape, num_components=1, dtype=np.float32):
-    """Generic loader for binary field data."""
     data = np.fromfile(binary_file, dtype=dtype)
     expected_size = np.prod(field_shape) * num_components
 
@@ -69,27 +49,15 @@ def load_binary_field(binary_file, field_shape, num_components=1, dtype=np.float
     else:
         return data.reshape(field_shape + (num_components,))
 
-# ============================================================================
-# Slice Extraction
-# ============================================================================
-
 def extract_slice(field, slice_dim=2):
-    """Extract a 2D slice from a 3D field at the midpoint."""
     idx = field.shape[slice_dim] // 2
     slices = [slice(None)] * 3
     slices[slice_dim] = idx
     return field[tuple(slices)]
 
-# ============================================================================
-# Visualization Functions
-# ============================================================================
-
 def plot_density(density_field, slice_dim, box_size, redshift=None, save_path=None):
-    """Create a PS-DTFE density field visualization."""
     dens_slice = extract_slice(density_field, slice_dim).T
 
-    # PS-DTFE density can have zeros (no stream) and negatives shouldn't occur
-    # but handle gracefully
     positive = dens_slice[dens_slice > 0]
     if positive.size == 0:
         print(f"    Warning: No positive density values in slice (dim={slice_dim})")
@@ -130,7 +98,6 @@ def plot_density(density_field, slice_dim, box_size, redshift=None, save_path=No
 
 
 def plot_streams(stream_field, slice_dim, box_size, redshift=None, save_path=None):
-    """Create a stream count visualization."""
     stream_slice = extract_slice(stream_field, slice_dim).T
 
     max_streams = int(stream_slice.max())
@@ -141,7 +108,6 @@ def plot_streams(stream_field, slice_dim, box_size, redshift=None, save_path=Non
     fig, ax = plt.subplots(figsize=(8, 7))
 
     if max_streams <= 1:
-        # Binary: 0 or 1 stream
         cmap = plt.cm.viridis.copy()
         cmap.set_bad(cmap(0))
         im = ax.imshow(
@@ -150,7 +116,6 @@ def plot_streams(stream_field, slice_dim, box_size, redshift=None, save_path=Non
             vmin=0, vmax=1
         )
     else:
-        # Multi-stream: use log scale for better contrast
         cmap = plt.cm.inferno.copy()
         cmap.set_bad(cmap(0))
         cmap.set_under(cmap(0))
@@ -172,7 +137,6 @@ def plot_streams(stream_field, slice_dim, box_size, redshift=None, save_path=Non
     cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     cbar.set_label("Number of streams", fontsize=12)
 
-    # Print stream statistics
     nonzero = stream_slice[stream_slice > 0]
     multi = stream_slice[stream_slice > 1]
     total = stream_slice.size
@@ -196,7 +160,6 @@ def plot_streams(stream_field, slice_dim, box_size, redshift=None, save_path=Non
 
 def plot_density_comparison(density_field, stream_field, slice_dim, box_size,
                             redshift=None, save_path=None):
-    """Side-by-side density and stream count for a single slice."""
     dens_slice = extract_slice(density_field, slice_dim).T
     stream_slice = extract_slice(stream_field, slice_dim).T
 
@@ -209,7 +172,6 @@ def plot_density_comparison(density_field, stream_field, slice_dim, box_size,
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
     plane_info = SLICE_PLANES[slice_dim]
 
-    # Density panel
     cmap_dens = plt.cm.plasma.copy()
     cmap_dens.set_bad(cmap_dens(0))
     cmap_dens.set_under(cmap_dens(0))
@@ -224,7 +186,6 @@ def plot_density_comparison(density_field, stream_field, slice_dim, box_size,
     ax1.set_aspect('equal')
     fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04, label=f"Density [{AXIS_UNITS}$^{{-3}}$]")
 
-    # Stream count panel
     if max_streams > 1:
         cmap_str = plt.cm.inferno.copy()
         cmap_str.set_bad(cmap_str(0))
@@ -262,12 +223,7 @@ def plot_density_comparison(density_field, stream_field, slice_dim, box_size,
     else:
         plt.show()
 
-# ============================================================================
-# Main Processing
-# ============================================================================
-
 def main():
-    """Load PS-DTFE output and create visualizations."""
 
     data_dir = Path(BASE_DATA_DIR)
     field_shape = (FIELD_RESOLUTION, FIELD_RESOLUTION, FIELD_RESOLUTION)

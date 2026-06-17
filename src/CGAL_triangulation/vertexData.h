@@ -28,28 +28,27 @@
 #include "../particle_data.h"
 
 
-/* This class stores the properties of each delaunay triangulation vertex. These are the properties coming from the point/particle properties that the vertices represent (see the "particle_data.h" file) plus two additional bool variables. */
+/* Per-vertex Delaunay data: the particle properties the vertex represents (see "particle_data.h") plus the dummy flags below. */
 struct vertexData : public Data_structure
 {
     protected:
-    bool   dummy;         // true if the vertex is dummy test point - used to test padding efficiency
-    bool   dummyNeighbor; // true if the vertex has at least one dummy point as neighbor - used to test padding efficiency for density computations
+    bool   dummy;         // true if vertex is a dummy test point (padding-efficiency test)
+    bool   dummyNeighbor; // true if vertex has at least one dummy neighbor (padding test for density)
 #ifdef PHASE_SPACE
     Pvector<Real,NO_DIM> _eulerianPos; // Eulerian position (triangulation vertices store Lagrangian coords in PS-DTFE mode)
 #endif
 
 
     public:
-    // constructor
     vertexData(){ dummy=false; dummyNeighbor=false; }
-    
-    // Customizable function definition for the scalar data
+
+    // Returns the scalar field for this vertex; the single hook to customize what "scalar" means.
     inline Pvector<Real,noScalarComp> myScalar()
     {
         return scalar();
     }
-    
-    // copy the point/particle data from "Particle_data" to this class
+
+    // Copies a particle's fields into this vertex (and its Eulerian position in PS-DTFE mode).
     inline void setData(Particle_data &other)
     {
         weight() = other.weight();
@@ -66,15 +65,13 @@ struct vertexData : public Data_structure
     }
 
 #ifdef PHASE_SPACE
-    inline Pvector<Real,NO_DIM>& eulerianPosition() { return _eulerianPos; }
-    inline Real& eulerianPosition(int const i) { return _eulerianPos[i]; }
+    inline Pvector<Real,NO_DIM>& eulerianPosition() { return _eulerianPos; }      // full Eulerian position
+    inline Real& eulerianPosition(int const i) { return _eulerianPos[i]; }        // one Eulerian component
 #endif
-    //! see the "particle_data.h" file for the rest of functions that can access and modify the values in 'Data_structure'
-    
-    
-    // do not modify the following
-    inline void setDummy() { dummy=true; dummyNeighbor=true; setDensity(0.); }
-    inline void setDummyNeighbor() { dummyNeighbor=true; }
+    // remaining accessors for 'Data_structure' are in "particle_data.h"
+
+    inline void setDummy() { dummy=true; dummyNeighbor=true; setDensity(0.); }    // mark as a dummy test point
+    inline void setDummyNeighbor() { dummyNeighbor=true; }                        // mark as adjacent to a dummy
     inline bool isDummy() { return dummy; }
     inline bool hasDummyNeighbor() { return dummyNeighbor; }
 };

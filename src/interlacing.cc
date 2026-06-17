@@ -1,14 +1,6 @@
 /*
- *  Interlacing implementation using FFTW3.
- *
- *  Given two density grids (original and half-cell offset), this function:
- *  1. FFTs both grids (real-to-complex)
- *  2. Averages in Fourier space with phase correction:
- *     F_out(k) = 0.5 * (F1(k) + F2(k) * exp(-i * k . dx/2))
- *  3. IFFTs back to real space
- *
- *  The phase correction exp(-i * k . dx/2) accounts for the half-cell shift
- *  and is what cancels the leading-order aliasing.
+ *  Interlacing (FFTW3): F_out(k) = 0.5*(F1(k) + F2(k)*exp(-i*k.dx/2)) then IFFT back; the
+ *  phase term on the half-cell-offset grid cancels the leading-order aliasing.
  */
 
 #include "interlacing.h"
@@ -18,7 +10,7 @@
 
 #include <fftw3.h>
 
-// Use appropriate FFTW precision based on Real type
+// FFTW precision follows the Real type
 #ifdef DOUBLE
     #define FFTW_PLAN       fftw_plan
     #define FFTW_COMPLEX    fftw_complex
@@ -56,20 +48,18 @@ void applyInterlacing(std::vector<Real> &field1,
     size_t const N = static_cast<size_t>(Nx) * Ny * Nz;
     size_t const Ncomplex = static_cast<size_t>(Nx) * Ny * (Nz/2 + 1);
 
-    // Allocate FFTW arrays
     Real *in1 = FFTW_ALLOC_REAL(N);
     Real *in2 = FFTW_ALLOC_REAL(N);
     FFTW_COMPLEX *out1 = FFTW_ALLOC_COMPLEX(Ncomplex);
     FFTW_COMPLEX *out2 = FFTW_ALLOC_COMPLEX(Ncomplex);
 
-    // Copy data to FFTW arrays
     for (size_t i = 0; i < N; ++i)
     {
         in1[i] = field1[i];
         in2[i] = field2[i];
     }
 
-    // Create plans and execute forward FFTs
+    // forward FFT of both grids
     FFTW_PLAN plan_fwd1 = FFTW_PLAN_R2C(Nx, Ny, Nz, in1, out1, FFTW_ESTIMATE);
     FFTW_PLAN plan_fwd2 = FFTW_PLAN_R2C(Nx, Ny, Nz, in2, out2, FFTW_ESTIMATE);
     FFTW_EXECUTE(plan_fwd1);
@@ -77,19 +67,14 @@ void applyInterlacing(std::vector<Real> &field1,
     FFTW_DESTROY(plan_fwd1);
     FFTW_DESTROY(plan_fwd2);
 
-    // Average in Fourier space with phase correction
-    // The half-cell shift is dx/2 in each direction
-    // Phase = exp(-i * (kx*dx[0]/2 + ky*dx[1]/2 + kz*dx[2]/2))
-    // where kx = 2*pi*ix/Nx * 1/dx[0], etc.
-    // So kx*dx[0]/2 = pi*ix/Nx, simplifying to:
-    // Phase = exp(-i * pi * (ix/Nx + iy/Ny + iz/Nz))
+    // Average in Fourier space with the half-cell-shift phase correction.
+    // Phase = exp(-i*(kx*dx[0]/2 + ...)) with kx = 2*pi*ix/(Nx*dx[0]), so each term
+    // reduces to pi*ix/Nx: Phase = exp(-i*pi*(ix/Nx + iy/Ny + iz/Nz)).
     Real const pi = Real(M_PI);
 
     for (int ix = 0; ix < Nx; ++ix)
     {
         Real kx_phase = pi * Real(ix) / Real(Nx);
-        // Map to [-Nx/2, Nx/2) for the phase (doesn't affect the formula since exp is periodic)
-        // but we keep the standard form
 
         for (int iy = 0; iy < Ny; ++iy)
         {
@@ -101,7 +86,6 @@ void applyInterlacing(std::vector<Real> &field1,
 
                 size_t idx = static_cast<size_t>(ix) * Ny * (Nz/2 + 1) + iy * (Nz/2 + 1) + iz;
 
-                // Phase correction for half-cell shift
                 Real phase = -(kx_phase + ky_phase + kz_phase);
                 Real cos_p = std::cos(phase);
                 Real sin_p = std::sin(phase);
@@ -119,17 +103,16 @@ void applyInterlacing(std::vector<Real> &field1,
         }
     }
 
-    // Inverse FFT
+    // inverse FFT back to real space
     FFTW_PLAN plan_inv = FFTW_PLAN_C2R(Nx, Ny, Nz, out1, in1, FFTW_ESTIMATE);
     FFTW_EXECUTE(plan_inv);
     FFTW_DESTROY(plan_inv);
 
-    // Normalize (FFTW convention: c2r does not normalize)
+    // FFTW c2r does not normalize
     Real norm = Real(1.) / Real(N);
     for (size_t i = 0; i < N; ++i)
         field1[i] = in1[i] * norm;
 
-    // Clean up
     FFTW_FREE(in1);
     FFTW_FREE(in2);
     FFTW_FREE(out1);

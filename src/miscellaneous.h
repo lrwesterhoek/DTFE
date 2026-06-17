@@ -22,6 +22,8 @@
 
 
 
+/* General-purpose utilities: range/option consistency checks, array min/max, quicksort, and integer roots. */
+
 #ifndef MISCELLANEOUS_HEADER
 #define MISCELLANEOUS_HEADER
 
@@ -32,7 +34,7 @@
 
 
 
-/* Checks if a number is within a given interval. */
+// Error out unless minValue <= target <= maxValue.
 template <typename T1>
 void intervalCheck(T1 const target,
                    T1 const minValue, T1 const maxValue,
@@ -44,7 +46,7 @@ void intervalCheck(T1 const target,
         error << "Some program variable failed a consitency check. The variable " << errorMessage << " has the value " << target << ", but it should be between " << minValue << " to " << maxValue << " ." << MESSAGE::EndError;
     }
 }
-/* Checks if a number is >= than a lower bound. */
+// Error out unless target >= minValue.
 template <typename T1>
 void lowerBoundCheck(T1 const target,
                     T1 const minValue,
@@ -56,7 +58,7 @@ void lowerBoundCheck(T1 const target,
         error << "Some program variable failed a consitency check. The variable " << errorMessage << " has the value " << target << ", but it should be larger or equal than " << minValue << " ." << MESSAGE::EndError;
     }
 }
-/* Checks if a number is <= than an upper bound. */
+// Error out unless target <= maxValue.
 template <typename T1>
 void upperBoundCheck(T1 const target,
                     T1 const maxValue,
@@ -70,8 +72,8 @@ void upperBoundCheck(T1 const target,
 }
 
 
-// The following 4 functions can be use only in conjunction with the 'boost/program_options.hpp' library.
-/* Function used to check that 'opt1' and 'opt2' are not specified at the same time. */
+// The next 4 functions require the 'boost/program_options.hpp' library.
+// Error out if 'opt1' and 'opt2' are both specified.
 template <typename T>
 void conflicting_options(const T &vm,
                         const char* opt1, const char* opt2)
@@ -83,7 +85,7 @@ void conflicting_options(const T &vm,
     }
 }
 
-/* Function used to check that of 'for_what' is specified, then 'required_option' is specified too. */
+// Error out if 'for_what' is specified without 'required_option'.
 template <typename T>
 void option_dependency(const T &vm,
                         const char* for_what, const char* required_option)
@@ -97,7 +99,7 @@ void option_dependency(const T &vm,
 }
 
 
-/* Function used to check that 'opt1' is not supplied in the absence of 'opt2'. */
+// Error out if 'opt1' is supplied without 'opt2'.
 template <typename T>
 void superfluous_options(const T &vm,
                         const char* opt1, const char* opt2)
@@ -109,8 +111,7 @@ void superfluous_options(const T &vm,
             error << "The option '" << opt1 << "' can be used only in the presence of '" << opt2 << "'. It does not make sense to use '" << opt1 << "' otherwise!\n" << MESSAGE::EndError;
         }
 }
-/* Function used to check that 'opt1' is not supplied if 'optionsOn' is false.
-NOTE: 'OptionOn' should be true if one or several options were suplied. Give the name of the options in 'optionsName'. */
+// Error out if 'opt1' is supplied while 'optionsOn' is false; 'optionsName' names the required options.
 template <typename T>
 void superfluous_options(const T &vm,
                         const char* opt1,
@@ -128,7 +129,7 @@ void superfluous_options(const T &vm,
 
 
 
-/* Returns the minimum and maximum values of an array. */
+// Minimum and maximum values of an array.
 template <typename T, typename T_INT> inline T minimum(T *x, T_INT const size )
 {
     T temp = x[0];
@@ -149,59 +150,53 @@ template <typename T, typename T_INT> inline T maximum(T *x, T_INT const size )
 
 
 
-/* Quicksort algorithm for sorting an array in increasing order according to the elements. It sorts the array only between elements iMin to iMax.
-For further details see: http://en.wikipedia.org/wiki/Quicksort
-*/
+// In-place quicksort of values[iMin..iMax] in increasing order.
 template <typename T1, typename T2>
 void quicksort( T1 values[], T2 iMin, T2 iMax )
 {
-    if ( iMin>=iMax )   //condition to stop the iterative computation
+    if ( iMin>=iMax )
         return;
-    
-    T1 temp = values[iMax]; //the value against which we compare = the pivot
+
+    T1 temp = values[iMax]; // pivot
     T2 i = iMin, i1=iMin, i2=iMax;
     do
     {
-        if ( values[i]>temp )   //if value larger than pivot
+        if ( values[i]>temp )   // larger than pivot -> goes right
         {
-            if ( i==i1 )    //move value to the right of the pivot
+            if ( i==i1 )
                 values[i2] = values[i];
-            //now the value is already to the right of the pivot
             --i2;
             i = i2;
         }
         else
         {
-            if ( i==i2 )    //move value to the left of the pivot
+            if ( i==i2 )
                 values[i1] = values[i];
             ++i1;
             i = i1;
         }
     } while ( i1!=i2 );
-    
-    //now copy the pivot to i=i1=i2 since that array element is free
-    values[i] = temp;
-    
-    //we still have to order again the elements:
-    quicksort( values, iMin, i-1);    //at the left of the pivot
-    quicksort( values, i+1, iMax);    //at the right of the pivot
+
+    values[i] = temp;   // pivot lands at the free slot i==i1==i2
+
+    quicksort( values, iMin, i-1);
+    quicksort( values, i+1, iMax);
 }
 
 
-/* This function takes root "rootPower" from an integer type and returns also an integer type. If the input integer is input = result^rootPower, than it returns result, otherwise it terminates the program.
-*/
+// Integer rootPower-th root of input: returns result if input==result^rootPower, else terminates.
 template <typename T>
 T rootN(T const input,
         T const rootPower)
 {
     lowerBoundCheck( input, 1, "'input' in function 'rootN'" );
     lowerBoundCheck( rootPower, 0, "'rootPower' in function 'rootN'" );
-    
+
     T result;
-    double temp = pow( input-1., 1./rootPower ); //since pow returns a double, we take the root from 'input-1' to be sure that we get a double smaller than the integer we hope to find
-    result = T( temp ) + 1;	//returns integer part of temp + 1
-    
-    
+    double temp = pow( input-1., 1./rootPower ); // root of input-1 to stay just below the integer we seek (pow rounding)
+    result = T( temp ) + 1;	// integer part + 1
+
+
     // check that indeed input = result^rootPower
     T temp2 = 1;
     for (T i=0; i<rootPower; ++i)
@@ -216,19 +211,19 @@ T rootN(T const input,
     return T(0.);
 }
 
-/* This function checks if the root "rootPower" from an integer is an integer (returns true), otherwise returns false. */
+// True if the rootPower-th root of input is an integer.
 template <typename T>
 T isRootN(T const input,
         T const rootPower)
 {
     lowerBoundCheck( input, 1, "'input' in function 'rootN'" );
     lowerBoundCheck( rootPower, 0, "'rootPower' in function 'rootN'" );
-    
+
     T result;
-    double temp = pow( input-1., 1./rootPower ); //since pow returns a double, we take the root from 'input-1' to be sure that we get a double smaller than the integer we hope to find
-    result = T( temp ) + 1;	//returns integer part of temp + 1
-    
-    
+    double temp = pow( input-1., 1./rootPower ); // root of input-1 to stay just below the integer we seek (pow rounding)
+    result = T( temp ) + 1;	// integer part + 1
+
+
     // check that indeed input = result^rootPower
     T temp2 = 1;
     for (T i=0; i<rootPower; ++i)

@@ -20,6 +20,8 @@
  *
  */
 
+/* User_options implementation: defaults, command-line/config parsing, validation, and the run-configuration printout. */
+
 
 #include <fstream>
 #include <cstdio>
@@ -38,14 +40,14 @@ using namespace std;
 #define MPC_UNIT 1.
 #endif
 
-// class constructor
+// Initializes every option to its default before the command line/config overrides it.
 User_options::User_options()
 {
     periodic = false;
     boxCoordinates.assign(0.);
     userGivenBoxCoordinates = false;
-    inputFileType = INPUT_FILE_DEFAULT;     // the default input file - see makefile for definition
-    outputFileType = OUTPUT_FILE_DEFAULT;   // the default output file - see makefile for definition
+    inputFileType = INPUT_FILE_DEFAULT;     // default input file type (see Makefile)
+    outputFileType = OUTPUT_FILE_DEFAULT;   // default output file type (see Makefile)
     readParticleData.assign( 10, 0 );
     readParticleSpecies.assign( 10, 0 );
     readParticleData[0] = 1; readParticleData[1] = 1; readParticleData[2] = 1;
@@ -56,7 +58,8 @@ User_options::User_options()
     
     partitionOn = false;
     partNo = -1;
-    
+    maxConcurrent = 0;    // 0 = build as many concurrent triangulations as threads (no memory cap)
+
     paddingOn = false;
     paddingMpcOn = false;
     paddingParticles = Real(5.);
@@ -66,11 +69,13 @@ User_options::User_options()
     method = 1;
     noPoints = 100;
     noPointsOn = false;
+#ifdef PHASE_SPACE
+    psAvgSubsamples = 3;  // nSub for PS-DTFE '_a' fields (27 sub-points in 3D)
+#endif
     averageDensity = Real(-1.);
-    
-    // variables for light cone computation
+
     redshiftConeOn = false;
-    
+
     // additional options
     DTFE = true;
     NGP = false;
@@ -92,6 +97,12 @@ User_options::User_options()
     
     // internal variables
     paddedBox.assign(0.);
+#ifdef PHASE_SPACE
+    // these three are only set true for per-partition sub-calls in the PS-DTFE partition path
+    psSuppressGridStats = false;
+    psDeferNormalization = false;
+    psUseSubgrid = false;
+#endif
     userDefinedSampling = false;
     noProcessors = 1;
     totalTime = Real(0.);
@@ -100,16 +111,11 @@ User_options::User_options()
 
 
 
-/* Use the boost program options library to store the available user options.
-The options are stored in two different structures:
-    allOptions - stores all available options
-    visibleOptions - stores the options visible to the user - this will be printed via the help message
-*/
+// Register the available user options. allOptions = every option; visibleOptions = those shown in help.
 void User_options::addOptions(po::options_description &allOptions,
                               po::options_description &visibleOptions,
                               po::positional_options_description &p)
 {
-    // divide the options in several categories
     po::options_description mainOptions("Main options");
     mainOptions.add_options()
             ("help,h", "produce summary of help message. For more detailed help use the '--full_help' option.")
@@ -134,6 +140,9 @@ void User_options::addOptions(po::options_description &allOptions,
                     "  shear = \tcompute velocity shear at the sampling point position (use 'shear_a' to get the averaged velocity shear inside the sampling cell).\n"
                     "  vorticity = \tcompute velocity vorticity at the sampling point position (use 'vorticity_a' to get the averaged velocity vortivity inside the sampling cell).\n"
                     "  velocityStd_a = \tcompute velocity standard deviation inside the sampling cell (NOTE: there is no 'velocityStd' of this option and this option works only with averaging method 2 '--method 2').\n"
+#ifdef PHASE_SPACE
+                    "  dispersion = \t[PS-DTFE only] mass-weighted multi-stream velocity dispersion. Writes the trace sigma^2 = sum(rho_s |v_s-<v>|^2)/sum(rho_s) to '.velDisp' and the full symmetric tensor sigma_ij to '.velDispTensor'. ~0 in single-stream regions (cold void interiors), large in multi-stream regions (walls/filaments). Use 'dispersion_a' for the volume-averaged version.\n"
+#endif
 #endif
 #ifdef SCALAR
                     "  scalar = \tcompute scalar quantities at the sampling point position (use 'scalar_a' to get the averaged field components inside the sampling cell).\n"
@@ -155,8 +164,19 @@ void User_options::addOptions(po::options_description &allOptions,
     
     po::options_description partitionOptions("Partition options");
     partitionOptions.add_options()
-            ("partition", po::value< std::vector<size_t> >(&(this->partition))->multitoken(), "choose this option if the particle data is too large to compute the Delaunay triangulation for the full data at once. Specify here in how many parts to split the box along each direction (e.g. '--partition 3 3 3' splits the data in 27 chuncks).")
+            ("partition", po::value< std::vector<size_t> >(&(this->partition))->multitoken(), "choose this option if the particle data is too large to compute the Delaunay triangulation for the full data at once. Specify here in how many parts to split the box along each direction (e.g. '--partition 3 3 3' splits the data in 27 chuncks)."
+#ifdef PHASE_SPACE
+             " In PS-DTFE this also drives the OpenMP parallelism: partitions run in parallel (one triangulation per thread), so speedup scales up to the number of partitions. NOTE on memory: each Lagrangian partition writes the WHOLE Eulerian grid, so peak memory ~ (partitions running concurrently) x full grid x number of fields -- choose the partition count from your core budget AND available RAM."
+#endif
+             )
             ("partNo", po::value<int>(&(this->partNo)), "choose to compute the density only for this partition number (from 0 to 'maximum partitions'-1). This options is usefull if you would like to compute the density for a large particle number on several different machines at the same time - need to run the program on each machine independently.")
+            ("max-concurrent", po::value<int>(&(this->maxConcurrent))->default_value(0), "caps how many Delaunay triangulations are built AT ONCE, to bound peak memory on machines with less RAM (trades CPU cores for memory). Each concurrently-built triangulation is the dominant memory cost, so peak RAM ~ (concurrent triangulations) x per-triangulation size. 0 (default) uses all available threads."
+#ifdef PHASE_SPACE
+             " In PS-DTFE this limits how many Lagrangian partitions run in parallel (e.g. '--partition 4 4 4 --max-concurrent 4' builds at most 4 of the 64 partition triangulations simultaneously). Combine a FINER --partition (smaller per-triangulation size) with a SMALLER --max-concurrent to fit large grids in limited RAM."
+#else
+             " In standard DTFE this limits the concurrent spatial sub-triangulations inside the parallel interpolation; combine with --partition for serial, low-memory processing of very large data."
+#endif
+             )
             ;
     
     
@@ -184,6 +204,9 @@ void User_options::addOptions(po::options_description &allOptions,
                     "  3rd method: \t27 random points per grid cell.")
             ("density0", po::value<Real>(&averageDensity), "supply a value to be used to scale the density. If none is supplied, the average density will be used for this task.")
             ("seed", po::value<size_t>(&(this->randomSeed)), "integer value to be used for the random seed generator when interpolating to the grid using Monte Carlo methods. Generated randomly if not supplied by the user.")
+#ifdef PHASE_SPACE
+            ("avg-subsamples", po::value<int>(&(this->psAvgSubsamples))->default_value(3), "PS-DTFE only: linear sub-sample count nSub for the volume-averaged ('_a') fields. Each grid cell is volume-averaged over an nSub^3 regular sub-grid, so the '_a' interpolation cost scales as nSub^3 -- it is the dominant runtime cost. 3 (default) = 27 sub-points; 2 = 8 (~3.4x faster '_a' pass, slightly coarser average); 1 = cell-centre only (= the unaveraged value, no extra cost but no averaging benefit). Lower this to speed up runs dominated by the averaged-field pass.")
+#endif
             ;
     
     
@@ -266,13 +289,13 @@ void User_options::addOptions(po::options_description &allOptions,
     allOptions.add(additionalOptions);
     allOptions.add(hidden);
     
-    // now add the hidden options to 'positional_options_description'
+    // hidden options as positional arguments
     p.add( "inputFile", 1 );
     p.add( "outputFile", 1 );
 }
 
 
-//print help information to the user
+// Prints the detailed help (full option descriptions) and exits.
 void User_options::helpInformation( po::options_description &visibleOptions, char *progName )
 {
     MESSAGE::Message message( 3 );
@@ -282,9 +305,10 @@ void User_options::helpInformation( po::options_description &visibleOptions, cha
     message << visibleOptions << "\n" << MESSAGE::Flush;
     exit( EXIT_SUCCESS );
 }
+// Prints the summary help (short one-line option descriptions) and exits.
 void User_options::shortHelp( char *progName )
 {
-    Real temp;
+    Real temp;  // dummy bind target: shortHelp only displays option names/blurbs, never reads values
     po::options_description mainOptions("Main options");
     mainOptions.add_options()
             ("help,h", "produce this help message.")
@@ -326,6 +350,7 @@ void User_options::shortHelp( char *progName )
     partitionOptions.add_options()
             ("partition", po::value< Real >(&temp), "specify in how many parts to split the box along each direction.")
             ("partNo", po::value< Real >(&temp), "choose to compute the interpolation only for this partition number.")
+            ("max-concurrent", po::value< Real >(&temp), "cap how many Delaunay triangulations build at once to bound peak memory (0 = all threads).")
             ;
     po::options_description paddingOptions("Padding options");
     paddingOptions.add_options()
@@ -341,6 +366,9 @@ void User_options::shortHelp( char *progName )
             ("samples,s", po::value< Real >(&temp), "specify the number of MC sampling points for volume averaged interpolation.")
             ("density0", po::value< Real >(&temp), "value to scale the density [DEFAULT: use average density].")
             ("seed", po::value< Real >(&temp), "integer value used as seed for the random generator.")
+#ifdef PHASE_SPACE
+            ("avg-subsamples", po::value< Real >(&temp), "PS-DTFE: nSub for '_a' volume averaging (cost ~nSub^3; 3 default, 2 ~3.4x faster, 1 = no averaging).")
+#endif
             ;
     po::options_description redshiftConeOptions("Redshift cone options");
     redshiftConeOptions.add_options()
@@ -410,7 +438,7 @@ void User_options::shortHelp( char *progName )
 
 
 
-/* Print to the user what options the program will use. */
+// Print the options the program will use.
 void User_options::printOptions()
 {
     std::string uField;
@@ -468,8 +496,9 @@ void User_options::printOptions()
     
     
     MESSAGE::Message message( verboseLevel );
-    message << "RUNNING: " << this->programOptions << "\n\n";
-    message << "The program will interpolate to grid the chosen field using the DTFE method with the following input parameters:\n"
+    message << MESSAGE::banner("RUN CONFIGURATION");
+    message << MESSAGE::cBold() << "RUNNING: " << this->programOptions << MESSAGE::cReset() << "\n\n";
+    message << MESSAGE::cCyan() << "The program will interpolate to grid the chosen field using the DTFE method with the following input parameters:" << MESSAGE::cReset() << "\n"
             << "\t unaveraged field(s)    : " << uField << "\n"
             << "\t averaged field(s)      : " << aField << "\n"
             << "\t interpolation method   : " << interpolationMethod << "\n"
@@ -504,6 +533,8 @@ void User_options::printOptions()
         if ( this->partNo>=0 )
             message << "\t computing grid interpolation ONLY for data set " << partNo << " of the partitioned data\n";
     }
+    if ( this->maxConcurrent>0 )
+        message << "\t max concurrent triangs : " << this->maxConcurrent << "   (capping concurrent Delaunay triangulations to bound peak memory)\n";
     
     
     if ( not this->paddingLength.isNullBox() )
@@ -515,10 +546,13 @@ void User_options::printOptions()
     }
     else
         message << "\t number padding particles: " << this->paddingParticles << "\n";
+#ifndef PHASE_SPACE
+    // suppressed in PS-DTFE: no dummy-boundary-test particles, and it uses nSub^NO_DIM
+    // sub-grid averaging instead of the Monte-Carlo grid-cell averaging reported below
     if ( this->DTFE and this->testPaddedBoundaries )
         message << "\t the DTFE computation will add DUMMY TEST particles to test the efficiency of the padding\n";
-    
-    
+
+
     if ( this->aField.selected() and this->DTFE )
     {
         std::string averagingMethod;
@@ -533,6 +567,7 @@ void User_options::printOptions()
         if ( averageDensity>Real(0.) )
             message << "\t density scaling value  : " << averageDensity << "\n";
     }
+#endif
     
     
     if ( redshiftConeOn )
@@ -541,6 +576,12 @@ void User_options::printOptions()
     
 #ifdef PHASE_SPACE
     message << "\t PS-DTFE mode           : enabled (triangulation in Lagrangian space)\n";
+    if ( this->aField.selected() )
+    {
+        int nSubPts = 1;
+        for (int d=0; d<NO_DIM; ++d) nSubPts *= (this->psAvgSubsamples<1 ? 1 : this->psAvgSubsamples);
+        message << "\t avg sub-samples (nSub) : " << this->psAvgSubsamples << "   (each '_a' cell volume-averaged over nSub^" << NO_DIM << " = " << nSubPts << " points; this sets the dominant '_a' interpolation cost)\n";
+    }
     if ( not this->lagrangianInputFilename.empty() )
         message << "\t Lagrangian input file  : " << this->lagrangianInputFilename << "\n";
     else
@@ -565,13 +606,13 @@ void User_options::printOptions()
 
 
 
-/* Read the user supplied options and check that they satify some restrictions. */
+// Read the user-supplied options and check they satisfy the restrictions.
 void User_options::readOptions(int argc, char *argv[], bool getFileNames, bool showOptions)
 {
     po::options_description visibleOptions("Allowed options"), allOptions("All options");
     po::positional_options_description p;
-    
-    this->addOptions( allOptions, visibleOptions, p );  //read the options available to the program
+
+    this->addOptions( allOptions, visibleOptions, p );
     
     po::variables_map vm;
     MESSAGE::Message showMessage(3);
@@ -593,7 +634,6 @@ void User_options::readOptions(int argc, char *argv[], bool getFileNames, bool s
     
     if ( vm.count("config") )
     {
-        // read the options from the file
         ifstream ifs( configFilename.c_str() );
         if (!ifs)
             showMessage << "~~~ERROR~~~ Can not open the configuration file '" << configFilename << "'.\n";
@@ -624,9 +664,9 @@ void User_options::readOptions(int argc, char *argv[], bool getFileNames, bool s
         exit( EXIT_SUCCESS );
     
     if ( vm.count("help") )
-        this->shortHelp( argv[0] ); // print available options and exit
+        this->shortHelp( argv[0] );
     else if ( vm.count("full_help") )
-        this->helpInformation( visibleOptions, argv[0] ); // print available options and exit
+        this->helpInformation( visibleOptions, argv[0] );
     
     
     conflicting_options(vm, "SPH", "TSC");
@@ -656,17 +696,13 @@ void User_options::readOptions(int argc, char *argv[], bool getFileNames, bool s
     if ( vm.count("grid") )
     {
         int const temp = this->gridSize.size();
-        //printf("%zu\n", this->gridSize.at(0));
         if ( temp==1 ) {
-            //this->gridSize.assign( NO_DIM, this->gridSize.at(0) );
             this->gridSize = std::vector<size_t>(NO_DIM, this->gridSize.at(0));
-            //printf("%zu\n", this->gridSize[0]);
         } else if ( temp!=NO_DIM ) {
             throwError( "You can only insert 1 or ", NO_DIM, " values for the '-g [ --grid ]' option (e.g. '-g 256' or '-g 128 256 256')." );
         }
         for (size_t i=0; i<this->gridSize.size(); ++i) {
             lowerBoundCheck( this->gridSize[i], size_t(1), "the values of option '-g [ --grid ]'" );
-            //printf("%zu\n", this->gridSize[i]);
         }
     }
     if ( vm.count("box") )      // read the box coordinates
@@ -679,17 +715,17 @@ void User_options::readOptions(int argc, char *argv[], bool getFileNames, bool s
             if( boxCoordinates[2*i+1]<boxCoordinates[2*i]) throwError( "The right coordinate of the box encompasing the data along axis " , i+1, " (1=x, 2=y, 3=z) must be larger than the left coordinate of the box. This is not the case in the arguments supplied to '--box' option." );
         userGivenBoxCoordinates = true;
     }
-    if ( vm.count("input") )    // read the input file type, the particle data to read and the particle species to read
+    if ( vm.count("input") )    // file type, data blocks to read, and particle species to read
     {
         std::vector<int> temp = vm["input"].as< std::vector<int> >();
-        inputFileType = temp[0];    // the file type
-        if ( temp.size()>=2 )   // set what data blocks to read
+        inputFileType = temp[0];
+        if ( temp.size()>=2 )   // data blocks
             for (size_t i=0; i<readParticleData.size(); ++i)
             {
                 readParticleData[i] = temp[1] % 2;
                 temp[1] /= 2;
             }
-        if ( temp.size()>=3 )   // set what particle species to read
+        if ( temp.size()>=3 )   // particle species
             for (size_t i=0; i<readParticleSpecies.size(); ++i)
             {
                 readParticleSpecies[i] = temp[2] % 2;
@@ -706,8 +742,8 @@ void User_options::readOptions(int argc, char *argv[], bool getFileNames, bool s
         for (size_t i=0; i<vm["field"].as< std::vector<std::string> >().size(); ++i)
         {
             std::string field = vm["field"].as< std::vector<std::string> >().at(i);
-            bool uFieldOption = this->uField.updateChoices( field, "triangulation", "density", "velocity", "gradient", "divergence", "shear", "vorticity", "", "scalar", "scalarGradient", "tweb", "vweb" );
-            bool aFieldOption = this->aField.updateChoices( field, "", "density_a", "velocity_a", "gradient_a", "divergence_a", "shear_a", "vorticity_a",  "velocityStd_a", "scalar_a", "scalarGradient_a", "tweb_a", "vweb_a" );
+            bool uFieldOption = this->uField.updateChoices( field, "triangulation", "density", "velocity", "gradient", "divergence", "shear", "vorticity", "", "scalar", "scalarGradient", "tweb", "vweb", "dispersion" );
+            bool aFieldOption = this->aField.updateChoices( field, "", "density_a", "velocity_a", "gradient_a", "divergence_a", "shear_a", "vorticity_a",  "velocityStd_a", "scalar_a", "scalarGradient_a", "tweb_a", "vweb_a", "dispersion_a" );
             if ( not(uFieldOption or aFieldOption) ) throwError( "Unknown value '" + field + "' for the option '--field'." );
         }
     }
@@ -754,7 +790,7 @@ void User_options::readOptions(int argc, char *argv[], bool getFileNames, bool s
             temp2 *= this->partition[i];
         if ( vm.count("partNo") ) intervalCheck( this->partNo, 0, int(temp2-1), "'--partNo' program option" );
         
-        if ( temp2==1 ) //if no actual partition is done
+        if ( temp2==1 ) // no actual partition
             this->partitionOn = false;
     }
     
@@ -789,7 +825,7 @@ void User_options::readOptions(int argc, char *argv[], bool getFileNames, bool s
     if ( vm.count("noTest") ) this->testPaddedBoundaries = false;
     
     
-    // read the family averaging options
+    // read the averaging options
     intervalCheck( this->method, 1, 3, "'--method' can have only 3 values (from 1 to 3) since there are implemented only 3 methods for field averaging inside the sampling cell (see '--help' for additional details)" );
     if ( vm.count("samples") )
     {
@@ -797,9 +833,9 @@ void User_options::readOptions(int argc, char *argv[], bool getFileNames, bool s
         lowerBoundCheck( this->noPoints, 1, "value of the '-s' ['--samples'] option in the program command line options" );
     }
     else if ( this->method==2 )
-        this->noPoints = 20;  //default values for method 2
+        this->noPoints = 20;  // default for method 2
     else if ( this->method==3 )
-        this->noPoints = 27;  //default values for method 3
+        this->noPoints = 27;  // default for method 3
     if ( vm.count("density0") )
         lowerBoundCheck( averageDensity, Real(0.), "the value of '--density0'" );
     if ( vm.count("seed") )
@@ -826,7 +862,7 @@ void User_options::readOptions(int argc, char *argv[], bool getFileNames, bool s
             intervalCheck( redshiftCone[2], Real(0.), Real(180.), "3rd value of option '--redshiftCone'" );
             intervalCheck( redshiftCone[3], Real(0.), Real(180.), "4th value of option '--redshiftCone'" );
         }
-        Real tempRes = redshiftCone[2*(NO_DIM-1)+1] - redshiftCone[2*(NO_DIM-1)]; //(psi_max - psi_min)
+        Real tempRes = redshiftCone[2*(NO_DIM-1)+1] - redshiftCone[2*(NO_DIM-1)]; // psi_max - psi_min
         if ( tempRes>=Real(360.) ) throwError( "The 'psi' angle interval can strech at most 360 degrees." );
     }
     if ( vm.count("origin") )
@@ -862,8 +898,7 @@ void User_options::readOptions(int argc, char *argv[], bool getFileNames, bool s
     if ( vm.count("Voronoi") )
     {
         this->Voronoi = true;
-        // Voronoi goes through the DTFE pipeline (needs triangulation), so keep DTFE=true
-        // but force density-only output
+        // Voronoi uses the DTFE pipeline (needs triangulation) so keep DTFE=true, density-only output
         this->aField.density = true;
     }
     if ( vm.count("interlace") )
@@ -876,7 +911,7 @@ void User_options::readOptions(int argc, char *argv[], bool getFileNames, bool s
     if ( vm.count("approxPSD") )
     {
         this->approxPSD = true;
-        // Auto-enable scalar field output
+        // auto-enable scalar field output
         if ( not this->uField.scalar )
             this->uField.scalar = true;
     }
@@ -895,7 +930,7 @@ void User_options::readOptions(int argc, char *argv[], bool getFileNames, bool s
         size_t temp = vm["redshiftSpace"].as< std::vector<Real> >().size();
         if ( temp!=NO_DIM ) throwError( "The '--redshiftSpace' option must be followed by ", NO_DIM, " values which give the direction ", (NO_DIM==2 ? "(d1,d2)" : "(d1,d2,d3)" ), " of the vector used to transform from position-space to redshift-space."  );
         
-        //normalize the direction to a unitless vector
+        // normalize the direction to a unit vector
         Real length = transformToRedshiftSpace[0]*transformToRedshiftSpace[0] + transformToRedshiftSpace[1]*transformToRedshiftSpace[1];
         length += ( NO_DIM==2 ? 0 : transformToRedshiftSpace[2]*transformToRedshiftSpace[2] );
         length = std::sqrt( length );
@@ -915,7 +950,7 @@ void User_options::readOptions(int argc, char *argv[], bool getFileNames, bool s
         this->programOptions += string( argv[i] ) + " ";
     
     
-    // check that if some options are disabled during compilation, that the user did not insert them by mistake
+    // disable options that were turned off at compile time
 #ifndef TEST_PADDING
     this->testPaddedBoundaries = false;
 #endif
@@ -928,10 +963,10 @@ void User_options::readOptions(int argc, char *argv[], bool getFileNames, bool s
     this->aField.deselectScalar();
 #endif
     
-    // some special settings only for the TSC or SPH methods
+    // special settings for the NGP/CIC/TSC/PCS/SPH methods
     if ( this->NGP or this->CIC or this->TSC or this->PCS or this->SPH )
     {
-        // for CIC, TSC and SPH only one type of fields are available - the averaged ones
+        // these methods produce only cell-averaged fields, so promote each unaveraged request to its '_a' form
         if ( this->uField.density ) this->aField.density = true;
         if ( this->uField.velocity ) this->aField.velocity = true;
         if ( this->uField.velocity_gradient ) this->aField.velocity_gradient = true;
@@ -942,13 +977,13 @@ void User_options::readOptions(int argc, char *argv[], bool getFileNames, bool s
         if ( this->uField.scalar_gradient ) this->aField.scalar_gradient = true;
         this->uField = Field();
         
-        // switch gradient computations off for the TSC and SPH methods
+        // these methods cannot compute the velocity gradient
         if ( this->aField.velocity_gradient or this->aField.selectedVelocityDerivatives() )
         {
             MESSAGE::Warning warning( verboseLevel );
             warning << "The NGP, CIC, TSC, PCS or SPH grid interpolation methods do not have implemented a method for computing the velocity gradient. The velocity gradient will not be computed!" << MESSAGE::EndWarning;
             this->aField.velocity_gradient = false;
-            this->aField.deselectVelocityDerivatives(); // switches off the divergence, shear and vorticity computations
+            this->aField.deselectVelocityDerivatives(); // also turns off divergence, shear, vorticity
         }
         if ( this->aField.scalar_gradient )
         {
@@ -975,7 +1010,7 @@ void User_options::readOptions(int argc, char *argv[], bool getFileNames, bool s
 }
 
 
-/* Updates the values of the full box. */
+// Sets 'boxCoordinates' to newBox and recomputes the per-axis 'fullBoxOffset' and 'fullBoxLength'.
 void User_options::updateFullBox(Box &newBox)
 {
     boxCoordinates = newBox;
@@ -993,8 +1028,7 @@ void User_options::updateFullBox(Box &newBox)
 
 
 
-/* Updates some of the members of the class after reading the input data file.
-NOTE: This function does additional error checks on the values of the 'User_options' class members. */
+// After input is read: resolves box/grid/region/padding, applies method overrides, and error-checks the options.
 void User_options::updateEntries(size_t const noTotalParticles,
                                  bool userSampling)
 {
@@ -1011,16 +1045,14 @@ void User_options::updateEntries(size_t const noTotalParticles,
             lowerBoundCheck( this->gridSize[i], size_t(1), "the values of option '--grid'" );
     
     
-    // update some member values
-    // update 'paddedBox' and also 'fullBoxOffset' and 'fullBoxLength'
+    // update paddedBox, fullBoxOffset, fullBoxLength
     paddedBox = boxCoordinates;
-    this->updateFullBox( boxCoordinates );  //computes 'fullBoxOffset' and 'fullBoxLength'
-    
-    // update the 'paddingLength' values
+    this->updateFullBox( boxCoordinates );  // computes 'fullBoxOffset' and 'fullBoxLength'
+
     updatePadding( noTotalParticles );
-    
-    
-    // Set the 'region' variable
+
+
+    // set the 'region' variable
     if ( regionOn and not regionMpcOn )
     {
         for (size_t i=0; i<region.size(); ++i )
@@ -1076,7 +1108,7 @@ void User_options::updateEntries(size_t const noTotalParticles,
             intervalCheck( redshiftCone[2], Real(0.), Real(180.), "3rd value of option '--redshiftCone'" );
             intervalCheck( redshiftCone[3], Real(0.), Real(180.), "4th value of option '--redshiftCone'" );
         }
-        Real tempRes = redshiftCone[2*(NO_DIM-1)+1] - redshiftCone[2*(NO_DIM-1)]; //(psi_max - psi_min)
+        Real tempRes = redshiftCone[2*(NO_DIM-1)+1] - redshiftCone[2*(NO_DIM-1)]; // psi_max - psi_min
         if ( tempRes>=Real(360.) ) throwError( "The 'psi' angle interval can strech at most 360 degrees." );
         if ( originPosition.empty() or originPosition.size()!=NO_DIM ) throwError( "The vector 'User_options::originPosition' must have ", NO_DIM, " entries." );
     }
@@ -1084,7 +1116,7 @@ void User_options::updateEntries(size_t const noTotalParticles,
         intervalCheck( randomSample, Real(0.), Real(1.), "value of '--randomSample'" );
     
     
-    //check that for the equidistant points, the number of sample points is a perfect square/cube
+    // for equidistant points, the sample count must be a perfect square/cube
     if ( method==3 )
         rootN( noPoints, NO_DIM );
     
@@ -1101,7 +1133,7 @@ void User_options::updateEntries(size_t const noTotalParticles,
         throwError( "The number of components of the scalar values gradient must be the number of dimensions times the number of scalar components (which is ", noScalarComp*NO_DIM, " for the given parameters). Please check the value of the constant in file 'define.h'." );
     
     
-    // switch gradient computations off for the TSC and SPH methods
+    // these methods cannot compute gradients or scalar fields
     if ( NGP or CIC or TSC or PCS or SPH )
     {
         if ( aField.velocity_gradient or aField.selectedVelocityDerivatives() )
@@ -1130,29 +1162,30 @@ void User_options::updateEntries(size_t const noTotalParticles,
 
 
 
-/* Computes the values of the padding length. */
+// Resolves the per-axis padding length in Mpc from the particle count or a box-relative input.
 void User_options::updatePadding(size_t const noTotalParticles)
 {
     if ( paddingLength.isNullBox() )
     {
-        if ( paddingParticles<=Real(0.) )   // do not add padding
+        if ( paddingParticles<=Real(0.) )   // no padding requested
             paddingLength.assign( Real(0.) );
-        else        // add padding using the number of particles
+        else        // derive the padding from the requested particle-count per face
         {
-            if ( this->DTFE or this->SPH )    //padding for the DTFE and SPH methods
+            // DTFE/SPH: 'paddingParticles' grid spacings, scaled by the mean inter-particle distance
+            if ( this->DTFE or this->SPH )
                 for (int i=0; i<2*NO_DIM; ++i)
                     paddingLength[i] = paddingParticles / Real( pow(noTotalParticles,1./NO_DIM) ) * fullBoxLength[i%2];
-            else if ( this->TSC or this->NGP )
+            else if ( this->TSC or this->NGP )  // one grid cell suffices for these stencils
                 for (int i=0; i<2*NO_DIM; ++i)
                     paddingLength[i] = fullBoxLength[i%2] / gridSize[i%2];
-            else if ( this->CIC )
+            else if ( this->CIC )               // CIC needs no padding
                 for (int i=0; i<2*NO_DIM; ++i)
                     paddingLength[i] = 0.;
         }
         paddingOn = true;
         paddingMpcOn = true;
     }
-    else if ( paddingOn and not paddingMpcOn )
+    else if ( paddingOn and not paddingMpcOn )  // convert box-relative padding to Mpc
     {
         for (int i=0; i<2*NO_DIM; ++i)
             paddingLength[i] *= fullBoxLength[i%2];

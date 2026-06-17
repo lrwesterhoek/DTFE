@@ -23,19 +23,8 @@
 
 
 /*
-  This header contains the class which keeps track of all the possible different quantities that the DTFE interpolation to grid can compute:
-        density             - a 'Real' value
-        velocity            - a 'Pvector<Real,noVelComp>' value
-        velocity_gradient   - a 'Pvector<Real,noGradComp>' value
-        velocity_divergence - a 'Real' value
-        velocity_shear      - a 'Pvector<Real,noShearComp>' value
-        velocity_vorticity  - a 'Pvector<Real,noShearComp>' value
-        scalar              - a 'Pvector<Real,noScalarComp>' value
-        scalar_gradient     - a 'Pvector<Real,noScalarGradComp>' value
-
-NOTE: After computation the quantities will be stored in a vector, hence memory will be allocated only to the quantities that will be computed and not to all possible variables.
-NOTE 2: 'Pvector' stands for 'physical vector' and can be access as a normal array using the '[]' operator which takes values from 0 to N-1 (with N the number of components). Check the "Pvector.h" file for additional details and to see the matematical operations involving 'Pvector's.
-NOTE 3: The program constants 'noVelComp', 'noGradComp', etc ... are defined in  "define.h".
+  Holds every quantity the DTFE grid interpolation can compute, each in its own vector so memory
+  is allocated only for requested quantities. Pvector ("Pvector.h"); component counts in "define.h".
 */
 
 
@@ -52,35 +41,44 @@ NOTE 3: The program constants 'noVelComp', 'noGradComp', etc ... are defined in 
 
 
 
-/* This class keeps track of all the possible outcomes of the grid interpolation using the DTFE method. The results are stored in vectors, so memory is allocated only to the quantities that will be computed. */
+// Container for every interpolated grid field; each vector is allocated only when its field is requested.
 struct Quantities
 {
-    std::vector<Real>                         density;              // vector that stores the density interpolated to grid using the DTFE method
-    std::vector< Pvector<Real,noVelComp> >    velocity;             // vector that stores the velocity interpolated to grid using the DTFE method
-    std::vector< Pvector<Real,noGradComp> >   velocity_gradient;    // vector that stores the velocity gradient map using the DTFE method
-    std::vector<Real>                         velocity_divergence;  // vector that stores the velocity divergence map using the DTFE method
-    std::vector< Pvector<Real,noShearComp> >  velocity_shear;       // vector that stores the velocity shear map using the DTFE method
-    std::vector< Pvector<Real,noVortComp> >   velocity_vorticity;   // vector that stores the velocity vorticity map using the DTFE method
-    std::vector<Real>                         velocity_std;         // vector that stores the velocity standard deviation map using the DTFE method
-    std::vector< Pvector<Real,noScalarComp> > scalar;               // vector that stores a scalar field interpolated to grid using the DTFE method
-    std::vector< Pvector<Real,noScalarGradComp> > scalar_gradient;  // vector that stores the gradient of the scalar field map using the DTFE method
+    std::vector<Real>                         density;
+    std::vector< Pvector<Real,noVelComp> >    velocity;
+    std::vector< Pvector<Real,noGradComp> >   velocity_gradient;
+    std::vector<Real>                         velocity_divergence;
+    std::vector< Pvector<Real,noShearComp> >  velocity_shear;
+    std::vector< Pvector<Real,noVortComp> >   velocity_vorticity;
+    std::vector<Real>                         velocity_std;         // velocity standard deviation
+    std::vector< Pvector<Real,noDispComp> >   velocity_dispersion;  // dispersion tensor sigma_ij (symmetric, upper-triangle row-major; trace = dispersion scalar)
+    std::vector< Pvector<Real,noScalarComp> > scalar;
+    std::vector< Pvector<Real,noScalarGradComp> > scalar_gradient;
     std::vector<Real>                         velocity_tweb;        // T-web classification label (0=void, 1=wall, 2=filament, 3=node)
     std::vector< Pvector<Real,NO_DIM> >       velocity_tweb_eigenvalues; // T-web eigenvalues (sorted descending)
     std::vector<Real>                         velocity_vweb;        // V-web classification label (0=void, 1=wall, 2=filament, 3=node)
     std::vector< Pvector<Real,NO_DIM> >       velocity_vweb_eigenvalues; // V-web eigenvalues (sorted descending)
 #ifdef PHASE_SPACE
-    std::vector<Real>                         stream_count;       // vector that stores the number of streams at each grid point (PS-DTFE only)
+    std::vector<Real>                         stream_count;       // number of streams at each grid point
+    std::vector<Real>                         mass_weight;        // per-cell summed stream density sum(rho_s); internal to normalizePhaseSpace, never written out
+    // PS-DTFE partition sub-grid in global grid-cell units, so addFromSubgrid() can map cells back.
+    size_t ps_subOrigin[NO_DIM] = {0};
+    size_t ps_subDims[NO_DIM]   = {0};   // [0]==0 means "not a sub-grid" (vectors span the full grid)
 #endif
-        
-    //Functions - you need to modify the below function if you add aditional members to this class ( - this is the case to be able to use the 'partition' option)
+
+    // if you add members, update the functions below so the 'partition' option keeps working
     void copyFromSubgrid(Quantities const &subgridResults,
                         Field const &field,
                         std::vector<size_t> const &mainGrid,
                         std::vector<size_t> const &subgrid,
-                        std::vector<size_t> const &subgridOffset); // used to copy the results obtain on a subgrid using the option 'partion' to the results for the full grid
-    size_t size() const;	// returns the size of any non-empty object
-    void reserveMemory(size_t *gridSize, Field &field); // reserve memory for the main grid quantities when using the 'partition' option
-    void addFrom(Quantities const &other); // element-wise accumulate from another Quantities (for PS-DTFE partitioning)
+                        std::vector<size_t> const &subgridOffset); // copy subgrid ('partition') results into the full grid
+    size_t size() const;	// size of any non-empty member vector
+    void reserveMemory(size_t *gridSize, Field &field); // reserve main-grid memory for the 'partition' option
+    void addFrom(Quantities const &other); // element-wise accumulate from another Quantities (PS-DTFE partitioning)
+#ifdef PHASE_SPACE
+    void normalizePhaseSpace(Field const &field); // turn summed density-weighted moments into mass-weighted means (call once, after all partitions added)
+    void addFromSubgrid(Quantities const &other, size_t const *fullGrid); // like addFrom but 'other' stores only its Eulerian box; maps each cell into the full grid (dims fullGrid)
+#endif
 };
 
 

@@ -1,108 +1,72 @@
+#  DTFE / PS-DTFE — .gitignore
+
+#  Build output
 /o
+/o_ps
 DTFE
-/test
+PS-DTFE
+output/
 
-# Prerequisites
-*.d
-
-# Object files
+# compiled objects, libraries, shared objects, executables, debug symbols
 *.o
-*.ko
-*.obj
-*.elf
-
-# Linker output
-*.ilk
-*.map
-*.exp
-
-# Precompiled Headers
-*.gch
-*.pch
-
-# Libraries
-*.lib
 *.a
-*.la
-*.lo
-
-# Shared objects (inc. Windows DLLs)
-*.dll
 *.so
 *.so.*
 *.dylib
-
-# Executables
+*.dll
 *.exe
 *.out
 *.app
-*.i*86
-*.x86_64
-*.hex
-
-# Debug files
+*.d
+*.gch
+*.pch
 *.dSYM/
-*.su
-*.idb
-*.pdb
 
-# Kernel Module Compile Results
-*.mod*
-*.cmd
-.tmp_versions/
-modules.order
-Module.symvers
-Mkfile.old
-dkms.conf
+#  Python
+__pycache__/
+*.pyc
+python/figures/
+
+
 .DS_Store
-.idea/customTargets.xml
-.idea/editor.xml
-.idea/makefile.xml
-.idea/misc.xml
-.idea/vcs.xml
-.vscode/c_cpp_properties.json
-.vscode/settings.json
-.vscode/tasks.json
-demo/.DS_Store
-demo/examples/.DS_Store
-demo/examples/.idea/editor.xml
-demo/examples/.idea/misc.xml
-demo/examples/.idea/vcs.xml
-demo/examples/Makefile
-demo/visit_visualization.bov
-demo/visit_visualization.bov.txt
-.DS_Store
-demo/.DS_Store
-demo/examples/Makefile
-demo/visit_visualization.bov
-demo/visit_visualization.bov
-demo/examples/Makefile
-demo/.DS_Store
-.DS_Store
-*.hdf5
+.idea/
+.vscode/
+
+/tests/tmp/
+
+#  DTFE run logs and field outputs
+*.runlog
+*.den
+*.vel
+*.streams
 *.a_den
 *.a_vel
+*.a_streams
+*.velDisp
+*.a_velDisp
+*.velDispTensor
+*.a_velDispTensor
+*.a_velGrad
 *.a_velDiv
 *.a_velShear
-*.a_velGrad
 *.a_velVort
-*.png
-*.txt
-*.mp4
 *.a_velTweb
 *.a_velTwebEig
 *.a_velVweb
 *.a_velVwebEig
-output/TNG50-3-Dark/snapdir_099/cosmic_web_a_fields.badGridPoints0
-output/TNG50-3-Dark/snapdir_099/cosmic_web_a_fields.badGridPoints1
-output/TNG50-3-Dark/snapdir_099/cosmic_web_a_fields.badGridPoints2
-output/TNG50-3-Dark/snapdir_099/cosmic_web_a_fields.badGridPoints3
-output/TNG50-3-Dark/snapdir_099/cosmic_web_a_fields.badGridPoints4
-output/TNG50-3-Dark/snapdir_099/cosmic_web_a_fields.badGridPoints5
-output/TNG50-3-Dark/snapdir_099/cosmic_web_a_fields.badGridPoints6
-output/TNG50-3-Dark/snapdir_099/cosmic_web_a_fields.badGridPoints7
-output/TNG50-3-Dark/snapdir_099/cosmic_web_a_fields.badGridPoints8
-output/TNG50-3-Dark/snapdir_099/diagnose_artifacts.py
-output/TNG50-3-Dark/snapdir_099/ps_output.den
-output/TNG50-3-Dark/snapdir_099/ps_output.streams
-.DS_Store
+
+#  Generated media & data
+*.hdf5
+*.npz
+*.mp4
+*.png
+*.svg
+*.txt
+
+
+!change_log.txt
+!figures/*.png
+!demo/*.png
+!demo/example_input_data_from_text_file.txt
+/tests
+/python

@@ -21,6 +21,10 @@
  */
 
 
+/* Piecewise-Cubic-Spline (PCS) mass assignment: cubic (order-3) interpolation kernel spanning
+   4 cells per dimension. Inner particles scatter freely; boundary particles deposit only into in-grid cells. */
+
+
 #include <vector>
 #include <list>
 #include <string>
@@ -48,13 +52,13 @@ void PCS_interpolation_regular_grid(vector<Particle_data> &particles,
 
 
 
-/* This function interpolates the density and velocity to grid using the PCS (Piecewise Cubic Spline) method. */
+// PCS (Piecewise Cubic Spline) interpolation of density and velocity to a grid.
 void PCS_interpolation(vector<Particle_data> *particles,
                        vector<Sample_point> &samples,
                        User_options &userOptions,
                        Quantities *q)
 {
-    if ( samples.empty() and not userOptions.redshiftConeOn )  // interpolate using a regular cubic grid
+    if ( samples.empty() and not userOptions.redshiftConeOn )
         PCS_interpolation_regular_grid( *particles, userOptions, q );
     else
         throwError( "The PCS method can interpolate the fields only on a regular rectangular grid. No PCS interpolation methods are implemented for redshift cone coordinates or for user defined sample points." );
@@ -64,16 +68,9 @@ void PCS_interpolation(vector<Particle_data> *particles,
 
 
 
-/* PCS kernel weight function:
-   W(x) = (1/6)(4 - 6x^2 + 3|x|^3)   for 0 <= |x| < 1
-   W(x) = (1/6)(2 - |x|)^3            for 1 <= |x| < 2
-   W(x) = 0                            otherwise
-
-   The kernel extends over 4 cells per dimension (support radius = 2).
-   For a particle at distance 'temp' from the center of its nearest cell (temp in [-0.5, 0.5]):
-     cell offsets are: -1, 0, +1, +2  (relative to floor of particle position)
-     distances to cell centers: d0 = 1+s, d1 = s, d2 = 1-s, d3 = 2-s  where s = 0.5+temp
-*/
+// PCS worker on a regular grid: scatters each particle's mass and momentum, then divides momentum by
+// cell mass for velocity and normalizes density to the background mean. Kernel W(x) = (1/6)(4-6x^2+3|x|^3)
+// for |x|<1, (1/6)(2-|x|)^3 for 1<=|x|<2, else 0; support radius 2, so 4 cells per dimension.
 void PCS_interpolation_regular_grid(vector<Particle_data> &particles,
                                     User_options &userOptions,
                                     Quantities *q)
@@ -86,14 +83,13 @@ void PCS_interpolation_regular_grid(vector<Particle_data> &particles,
     t.restart();
 
 
-    // allocate memory for the results
     size_t reserveSize = 1;
     for (int d=0; d<NO_DIM; ++d) reserveSize *= nGrid[d];
     q->density.assign( reserveSize, Real(0.) );
     q->velocity.assign( reserveSize, Pvector<Real,noVelComp>::zero() );
 
 
-    // get the grid spacing and find the extended box of particles that give contribution in the region of interest
+    // grid spacing, plus inner/outer boxes selecting particles that contribute to the region
     Box box = userOptions.region,
         outerBox = userOptions.region,
         innerBox = userOptions.region;
@@ -110,21 +106,20 @@ void PCS_interpolation_regular_grid(vector<Particle_data> &particles,
     innerBox.addPadding( innerPadding );  // the contribution of particles in this box is limited to the region of interest
 
 
-    // find the particles in box 'box'
+    // inner particles contribute only inside the region; outer ones also outside, so cell validity is checked
     list< vectorIterator > innerParticles, outerParticles;
     for (vectorIterator it=particles.begin(); it!=particles.end(); ++it)
         if ( innerBox.isParticleInBox(*it) )
-            innerParticles.push_back( it );     // keep track of the particles that give contributions only inside the region of interest
+            innerParticles.push_back( it );
         else if ( outerBox.isParticleInBox(*it) )
-            outerParticles.push_back( it );     // these particles give contributions also outside the region of interest
+            outerParticles.push_back( it );
 
 
 
-    // loop over all the particles in the inner box
     for (list< vectorIterator >::iterator it=innerParticles.begin(); it!=innerParticles.end(); ++it)
     {
-        int cell[NO_DIM][4];    // the grid coordinates of the cells that get a contribution from the particle
-        Real weight[NO_DIM][4]; // the weight associated to the particle for each cell that it contributes to
+        int cell[NO_DIM][4];    // grid coords of the cells the particle contributes to
+        Real weight[NO_DIM][4]; // weight per contributing cell
         for (int j=0; j<NO_DIM; ++j)
         {
             Real temp = ( (*it)->position(j) - box[2*j] ) / dx[j];
@@ -133,14 +128,14 @@ void PCS_interpolation_regular_grid(vector<Particle_data> &particles,
             cell[j][2] = cell[j][1] + 1;
             cell[j][3] = cell[j][2] + 1;
 
-            temp -= cell[j][1] + 0.5; //this gives the distance of the particle with respect to the center of the density grid in which the particle is located
+            temp -= cell[j][1] + 0.5; // distance of particle from the center of its host cell
 
-            // compute distances to cell centers (all positive)
-            Real s = Real(0.5) + temp;   // s in [0, 1]
-            Real d0 = Real(1.) + s;      // in [1, 2]
-            Real d1 = s;                 // in [0, 1]
-            Real d2 = Real(1.) - s;      // in [0, 1]
-            Real d3 = Real(2.) - s;      // in [1, 2]
+            // distances to the 4 cell centers (all positive), s = 0.5 + temp
+            Real s = Real(0.5) + temp;
+            Real d0 = Real(1.) + s;
+            Real d1 = s;
+            Real d2 = Real(1.) - s;
+            Real d3 = Real(2.) - s;
 
             // PCS kernel weights
             Real one_sixth = Real(1.) / Real(6.);
@@ -150,7 +145,7 @@ void PCS_interpolation_regular_grid(vector<Particle_data> &particles,
             weight[j][3] = one_sixth * (Real(2.) - d3) * (Real(2.) - d3) * (Real(2.) - d3);
         }
 
-        // get the density contribution of the particle to the neighboring cells
+        // scatter the particle's contribution to its neighboring cells
         {
             size_t const noNeighbors = (NO_DIM==2 ? 16 : 64);
             for (size_t n=0; n<noNeighbors; ++n)
@@ -167,25 +162,25 @@ void PCS_interpolation_regular_grid(vector<Particle_data> &particles,
     }
 
 
-    // now loop over the particles on the boundary - must check that all neighbors are valid cells
+    // boundary particles: only valid (in-grid) cells get a contribution
     for (list< vectorIterator >::iterator it=outerParticles.begin(); it!=outerParticles.end(); ++it)
     {
-        int cell[NO_DIM][4];    // the grid coordinates of the cells that get a contribution from the particle
-        int cellCount[NO_DIM];  // counts how many valid cells are along each dimension that get contribution from the particle
+        int cell[NO_DIM][4];    // grid coords of the cells the particle contributes to
+        int cellCount[NO_DIM];  // number of valid cells per dimension
         for (int i=0; i<NO_DIM; ++i) cellCount[i] = 0;
-        Real weight[NO_DIM][4]; // the weight associated to the particle for each cell that it contributes to
+        Real weight[NO_DIM][4]; // weight per contributing cell
         for (int j=0; j<NO_DIM; ++j)
         {
             Real temp = ( (*it)->position(j) - box[2*j] ) / dx[j];
             int tempInt = int(floor( temp ));
-            temp -= tempInt + 0.5; //this gives the distance of the particle with respect to the center of the density grid in which the particle is located
+            temp -= tempInt + 0.5; // distance of particle from the center of its host cell
 
-            // compute distances to cell centers
-            Real s = Real(0.5) + temp;   // s in [0, 1]
-            Real d0 = Real(1.) + s;      // in [1, 2] — for cell tempInt-1
-            Real d1 = s;                 // in [0, 1] — for cell tempInt
-            Real d2 = Real(1.) - s;      // in [0, 1] — for cell tempInt+1
-            Real d3 = Real(2.) - s;      // in [1, 2] — for cell tempInt+2
+            // distances to cell centers, for cells tempInt-1, tempInt, tempInt+1, tempInt+2
+            Real s = Real(0.5) + temp;
+            Real d0 = Real(1.) + s;
+            Real d1 = s;
+            Real d2 = Real(1.) - s;
+            Real d3 = Real(2.) - s;
 
             Real one_sixth = Real(1.) / Real(6.);
             Real allWeights[4];
@@ -196,7 +191,7 @@ void PCS_interpolation_regular_grid(vector<Particle_data> &particles,
 
             int allCells[4] = { tempInt - 1, tempInt, tempInt + 1, tempInt + 2 };
 
-            // filter to valid cells only
+            // keep only in-grid cells
             int count = 0;
             for (int k=0; k<4; ++k)
             {
@@ -210,7 +205,7 @@ void PCS_interpolation_regular_grid(vector<Particle_data> &particles,
             cellCount[j] = count;
         }
 
-        // get the density contribution of the particle to the neighboring cells
+        // scatter the particle's contribution to its valid neighboring cells
         {
             int totalCount = 1;
             for (int d=0; d<NO_DIM; ++d) totalCount *= cellCount[d];
@@ -228,7 +223,7 @@ void PCS_interpolation_regular_grid(vector<Particle_data> &particles,
     }
 
 
-    // divide the momentum by the mass in the cells
+    // convert accumulated momentum to velocity by dividing by cell mass
     if ( userOptions.aField.velocity )
     {
         for (size_t i=0; i<reserveSize; ++i)
@@ -240,7 +235,7 @@ void PCS_interpolation_regular_grid(vector<Particle_data> &particles,
     else
         q->velocity.clear();
 
-    // normalize the density to average background density
+    // normalize the density to the average background density
     if ( userOptions.aField.density )
     {
         Real factor = Real( q->density.size() ) / box.volume() / userOptions.averageDensity;

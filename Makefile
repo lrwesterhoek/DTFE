@@ -221,7 +221,7 @@ ifneq ($(strip $(MPFR_PATH)),)
 endif
 ifneq ($(strip $(HDF5_PATH)),)
     INCLUDES += -I $(strip $(HDF5_PATH))/include
-    LIBRARIES += -L$(strip $(HDF5_PATH))/lib -lhdf5 -lhdf5_cpp
+    LIBRARIES += -L$(strip $(HDF5_PATH))/lib   # -lhdf5/-lhdf5_cpp added once via HDF5_LIBS (avoid duplicate-library linker warning)
     OPTIONS += -DHDF5
     OPTIONS_PS += -DHDF5
 endif
@@ -248,13 +248,53 @@ else
     DEBUG_FLAGS =
 endif
 
+# macOS SDK pinning: after an OS / Command-Line-Tools update the Homebrew clang
+# can derive a non-existent SDK (e.g. .../MacOSX26.sdk) and then fail on the
+# C/C++ standard headers (mbstate_t, wcschr, FP_NAN, ...). Detect an SDK that
+# actually exists and pass it explicitly as -isysroot (a command-line -isysroot
+# overrides clang's bad guess). Empty on Linux. Override with MACOS_SDK_OVERRIDE.
+MACOS_ISYSROOT =
+ifeq ($(PLATFORM),macos)
+    MACOS_SDK := $(or $(MACOS_SDK_OVERRIDE),$(shell s=$$(xcrun --show-sdk-path 2>/dev/null); \
+        if [ -z "$$s" ] || [ ! -d "$$s" ]; then \
+            s=$$(ls -d /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX*.sdk /Library/Developer/CommandLineTools/SDKs/MacOSX*.sdk 2>/dev/null | sort -V | tail -1); \
+        fi; \
+        [ -n "$$s" ] && [ -d "$$s" ] && printf '%s' "$$s"))
+    ifneq ($(strip $(MACOS_SDK)),)
+        MACOS_ISYSROOT := -isysroot $(MACOS_SDK)
+    endif
+endif
+
 # Minimal compiler flags (from original Makefile)
 # Additional warnings and quality flags can be enabled in the EXTRA_FLAGS section above
-COMPILE_FLAGS = $(BASE_CFLAGS) -std=c++17 -Wno-psabi -Wno-cpp -frounding-math $(DEBUG_FLAGS) $(EXTRA_FLAGS)
-COMPILE_FLAGS_PS = $(BASE_CFLAGS_PS) -std=c++17 -Wno-psabi -Wno-cpp -frounding-math $(DEBUG_FLAGS) $(EXTRA_FLAGS)
+# -Wno-deprecated-declarations: silences Boost.MultiArray's internal use of the
+# deprecated boost::array::assign() (third-party headers, not our code).
+COMPILE_FLAGS = $(BASE_CFLAGS) -std=c++17 -Wno-psabi -Wno-cpp -Wno-deprecated-declarations -frounding-math $(DEBUG_FLAGS) $(EXTRA_FLAGS) $(MACOS_ISYSROOT)
+COMPILE_FLAGS_PS = $(BASE_CFLAGS_PS) -std=c++17 -Wno-psabi -Wno-cpp -Wno-deprecated-declarations -frounding-math $(DEBUG_FLAGS) $(EXTRA_FLAGS) $(MACOS_ISYSROOT)
 LINK_FLAGS =
-BASE_LIBS = -lboost_thread -lboost_filesystem -lboost_program_options -lgsl -lgslcblas -lm -lgmp -lmpfr -lboost_system -lfftw3f -lfftw3
+# NOTE: -lboost_system was dropped: Boost.System is header-only since Boost 1.69,
+# so recent Homebrew/Boost no longer ship libboost_system ("library not found").
+BASE_LIBS = -lboost_thread -lboost_filesystem -lboost_program_options -lgsl -lgslcblas -lm -lgmp -lmpfr -lfftw3f -lfftw3
 HDF5_LIBS = -lhdf5 -lhdf5_cpp
+
+# Optional TBB-parallel Delaunay triangulation: `make PS-DTFE TBB=1` (or DTFE TBB=1).
+# Enables CGAL's parallel insertion (Parallel_tag data structure + lock grid) so the
+# single global tessellation (the no-`--partition` path) is built across cores.
+# Requires the 'tbb' package (macOS: `brew install tbb`). Toggling TBB on/off changes
+# the DT type, so do a clean rebuild (`make clean`) when switching. Override the TBB
+# location with TBB_PATH_OVERRIDE=/path.
+ifeq ($(TBB),1)
+    ifeq ($(PLATFORM),macos)
+        TBB_PATH := $(or $(TBB_PATH_OVERRIDE),$(BREW_PREFIX)/opt/tbb)
+    else
+        TBB_PATH := $(or $(TBB_PATH_OVERRIDE),/usr)
+    endif
+    OPTIONS    += -DPARALLEL_TRIANGULATION -DCGAL_LINKED_WITH_TBB
+    OPTIONS_PS += -DPARALLEL_TRIANGULATION -DCGAL_LINKED_WITH_TBB
+    INCLUDES   += -I $(TBB_PATH)/include
+    LIBRARIES  += -L$(TBB_PATH)/lib
+    BASE_LIBS  += -ltbb -ltbbmalloc
+endif
 
 # Platform-specific OpenMP settings only
 ifeq ($(PLATFORM),macos)
@@ -271,9 +311,9 @@ DTFE_INC = $(INCLUDES)
 
 # Linking
 ifeq ($(findstring -DHDF5,$(OPTIONS)),-DHDF5)
-    DTFE_LIB = $(LIBRARIES) $(BASE_LIBS) $(HDF5_LIBS) $(OPENMP_LIB)
+    DTFE_LIB = $(LIBRARIES) $(BASE_LIBS) $(HDF5_LIBS)   # OpenMP runtime auto-linked by -fopenmp; $(OPENMP_LIB) omitted to avoid duplicate-library warning
 else
-    DTFE_LIB = $(LIBRARIES) $(BASE_LIBS) $(OPENMP_LIB)
+    DTFE_LIB = $(LIBRARIES) $(BASE_LIBS)   # OpenMP runtime auto-linked by -fopenmp; $(OPENMP_LIB) omitted to avoid duplicate-library warning
 endif
 
 
@@ -344,7 +384,7 @@ $(OBJ_DIR)/random$(OBJ_EXT): $(SRC)/random.cc $(SRC)/define.h $(SRC)/user_option
 	$(CC) $(COMPILE_FLAGS) $(DTFE_INC) -o $@ -c $(SRC)/random.cc
 
 $(OBJ_DIR)/kdtree2$(OBJ_EXT): $(SRC)/kdtree/kdtree2.hpp $(SRC)/kdtree/kdtree2.cpp Makefile
-	$(CC) -O3 -ffast-math -fomit-frame-pointer $(DTFE_INC) -o $(OBJ_DIR)/kdtree2$(OBJ_EXT) -c $(SRC)/kdtree/kdtree2.cpp
+	$(CC) -O3 -ffast-math -fomit-frame-pointer -Wno-deprecated-declarations $(MACOS_ISYSROOT) $(DTFE_INC) -o $(OBJ_DIR)/kdtree2$(OBJ_EXT) -c $(SRC)/kdtree/kdtree2.cpp
 
 $(OBJ_DIR)/triangulation$(OBJ_EXT): $(addprefix $(SRC)/, $(TRIANG_SOURCES)) Makefile
 	$(CC) $(COMPILE_FLAGS) $(DTFE_INC) -o $(OBJ_DIR)/triangulation$(OBJ_EXT) -c $(SRC)/CGAL_triangulation/triangulation.cpp
@@ -413,7 +453,7 @@ $(OBJ_DIR_PS)/random$(OBJ_EXT): $(SRC)/random.cc $(SRC)/define.h $(SRC)/user_opt
 	$(CC) $(COMPILE_FLAGS_PS) $(DTFE_INC) -o $@ -c $(SRC)/random.cc
 
 $(OBJ_DIR_PS)/kdtree2$(OBJ_EXT): $(SRC)/kdtree/kdtree2.hpp $(SRC)/kdtree/kdtree2.cpp Makefile
-	$(CC) -O3 -ffast-math -fomit-frame-pointer $(DTFE_INC) -o $@ -c $(SRC)/kdtree/kdtree2.cpp
+	$(CC) -O3 -ffast-math -fomit-frame-pointer -Wno-deprecated-declarations $(MACOS_ISYSROOT) $(DTFE_INC) -o $@ -c $(SRC)/kdtree/kdtree2.cpp
 
 $(OBJ_DIR_PS)/triangulation$(OBJ_EXT): $(addprefix $(SRC)/, $(TRIANG_SOURCES)) Makefile
 	$(CC) $(COMPILE_FLAGS_PS) $(DTFE_INC) -o $@ -c $(SRC)/CGAL_triangulation/triangulation.cpp
@@ -439,7 +479,7 @@ TRIANG_CC_LIB_OBJS = $(OBJ_DIR)/unaveraged_interpolation_l$(OBJ_EXT) $(OBJ_DIR)/
 
 library: set_directories set_directories_2 $(addprefix $(SRC)/, $(LIB_FILES) ) copy_headers Makefile
 	$(CC) $(COMPILE_FLAGS) -fPIC $(DTFE_INC) -o $(OBJ_DIR)/DTFE_l$(OBJ_EXT) -c $(SRC)/DTFE.cpp
-	$(CC) -O3 -ffast-math -fomit-frame-pointer -fPIC $(DTFE_INC) -o $(OBJ_DIR)/kdtree2_l$(OBJ_EXT) -c $(SRC)/kdtree/kdtree2.cpp
+	$(CC) -O3 -ffast-math -fomit-frame-pointer -fPIC -Wno-deprecated-declarations $(MACOS_ISYSROOT) $(DTFE_INC) -o $(OBJ_DIR)/kdtree2_l$(OBJ_EXT) -c $(SRC)/kdtree/kdtree2.cpp
 	$(CC) $(COMPILE_FLAGS) -fPIC $(DTFE_INC) -o $(OBJ_DIR)/triangulation_l$(OBJ_EXT) -c $(SRC)/CGAL_triangulation/triangulation.cpp
 	$(CC) $(COMPILE_FLAGS) -fPIC $(DTFE_INC) -o $(OBJ_DIR)/unaveraged_interpolation_l$(OBJ_EXT) -c $(SRC)/CGAL_triangulation/unaveraged_interpolation.cc
 	$(CC) $(COMPILE_FLAGS) -fPIC $(DTFE_INC) -o $(OBJ_DIR)/averaged_interpolation_1_l$(OBJ_EXT) -c $(SRC)/CGAL_triangulation/averaged_interpolation_1.cc

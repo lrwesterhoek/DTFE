@@ -76,31 +76,22 @@ kdtree2::kdtree2(kdtree2_array& data_in,bool rearrange_in,int dim_in)
     N  ( data_in.shape()[0] ),
     dim( data_in.shape()[1] ),
     sort_results(false),
-    rearrange(rearrange_in), 
+    rearrange(rearrange_in),
     root(NULL),
     data(NULL),
     ind(N)
 {
-  //
-  // initialize the constant references using this unusual C++
-  // feature.
-  //
-  if (dim_in > 0) 
+  if (dim_in > 0)
     dim = dim_in;
-  
+
   build_tree();
 
   if (rearrange) {
-    // if we have a rearranged tree.
-    // allocate the memory for it. 
-//     printf("rearranging\n"); 
+    // permute the data into index order for cache-friendly searches
     rearranged_data.resize( extents[N][dim] );
-    
-    // permute the data for it.
     for (int i=0; i<N; i++) {
       for (int j=0; j<dim; j++) {
 	rearranged_data[i][j] = the_data[ind[i]][j];
-	// wouldn't F90 be nice here? 
       }
     }
     data = &rearranged_data;
@@ -122,39 +113,30 @@ void kdtree2::build_tree() {
 }
 
 kdtree2_node* kdtree2::build_tree_for_range(int l, int u, kdtree2_node* parent) {
-  // recursive function to build 
+  // recursively build the subtree covering indices [l, u]
   kdtree2_node* node = new kdtree2_node(dim);
-  // the newly created node. 
 
   if (u<l) {
-    return(NULL); // no data in this node. 
+    return(NULL); // no data in this node
   }
-      
+
 
   if ((u-l) <= bucketsize) {
-    // create a terminal node. 
-
-    // always compute true bounding box for terminal node. 
+    // terminal node: compute the true bounding box
     for (int i=0;i<dim;i++) {
       spread_in_coordinate(i,l,u,node->box[i]);
     }
-    
-    node->cut_dim = 0; 
+
+    node->cut_dim = 0;
     node->cut_val = 0.0;
     node->l = l;
     node->u = u;
     node->left = node->right = NULL;
-    
+
 
   } else {
-    //
-    // Compute an APPROXIMATE bounding box for this node.
-    // if parent == NULL, then this is the root node, and 
-    // we compute for all dimensions.
-    // Otherwise, we copy the bounding box from the parent for
-    // all coordinates except for the parent's cut dimension.  
-    // That, we recompute ourself.
-    //
+    // Approximate bounding box: at the root compute all dimensions; otherwise inherit the parent's
+    // box and only recompute the parent's cut dimension.
     int c = -1;
     float maxspread = 0.0;
     int m; 
@@ -172,15 +154,13 @@ kdtree2_node* kdtree2::build_tree_for_range(int l, int u, kdtree2_node* parent) 
       }
     }
 
-    // 
-    // now, c is the identity of which coordinate has the greatest spread
-    //
+    // c is now the coordinate with the greatest spread; cut on it
 
     if (false) {
       m = (l+u)/2;
-      select_on_coordinate(c,m,l,u);  
+      select_on_coordinate(c,m,l,u);
     } else {
-      float sum; 
+      float sum;
       float average;
 
       if (true) {
@@ -190,15 +170,14 @@ kdtree2_node* kdtree2::build_tree_for_range(int l, int u, kdtree2_node* parent) 
 	}
 	average = sum / static_cast<float> (u-l+1);
       } else {
-	// average of top and bottom nodes.
-	average = (node->box[c].upper + node->box[c].lower)*0.5; 
+	// alternative: midpoint of the node's box
+	average = (node->box[c].upper + node->box[c].lower)*0.5;
       }
-	
+
       m = select_on_coordinate_value(c,average,l,u);
     }
 
 
-    // move the indices around to cut on dim 'c'.
     node->cut_dim=c;
     node->l = l;
     node->u = u;
@@ -219,12 +198,8 @@ kdtree2_node* kdtree2::build_tree_for_range(int l, int u, kdtree2_node* parent) 
     } else {
       node->cut_val_right = node->right->box[c].lower;
       node->cut_val_left  = node->left->box[c].upper;
-      node->cut_val = (node->cut_val_left + node->cut_val_right) / 2.0; 
-      //
-      // now recompute true bounding box as union of subtree boxes.
-      // This is now faster having built the tree, being logarithmic in
-      // N, not linear as would be from naive method.
-      //
+      node->cut_val = (node->cut_val_left + node->cut_val_right) / 2.0;
+      // recompute the true bounding box as the union of the two subtree boxes
       for (int i=0; i<dim; i++) {
 	node->box[i].upper = max(node->left->box[i].upper,
 				 node->right->box[i].upper);
@@ -241,32 +216,28 @@ kdtree2_node* kdtree2::build_tree_for_range(int l, int u, kdtree2_node* parent) 
 
 void kdtree2:: spread_in_coordinate(int c, int l, int u, interval& interv)
 {
-  // return the minimum and maximum of the indexed data between l and u in
-  // smin_out and smax_out.
+  // store the min and max of coordinate c over the indexed data in [l, u] into interv
   float smin, smax;
   float lmin, lmax;
-  int i; 
+  int i;
 
   smin = the_data[ind[l]][c];
   smax = smin;
-  
 
-  // process two at a time.
+
+  // process two elements at a time
   for (i=l+2; i<= u; i+=2) {
     lmin = the_data[ind[i-1]] [c];
     lmax = the_data[ind[i]  ] [c];
 
     if (lmin > lmax) {
-      swap(lmin,lmax); 
-      //      float t = lmin;
-      //      lmin = lmax;
-      //      lmax = t;
+      swap(lmin,lmax);
     }
 
     if (smin > lmin) smin = lmin;
     if (smax <lmax) smax = lmax;
   }
-  // is there one more element? 
+  // handle a trailing odd element
   if (i == u+1) {
     float last = the_data[ind[u]] [c];
     if (smin>last) smin = last;
@@ -274,15 +245,11 @@ void kdtree2:: spread_in_coordinate(int c, int l, int u, interval& interv)
   }
   interv.lower = smin;
   interv.upper = smax;
-  //  printf("Spread in coordinate %d=[%f,%f]\n",c,smin,smax);
 }
 
 
 void kdtree2::select_on_coordinate(int c, int k, int l, int u) {
-  //
-  //  Move indices in ind[l..u] so that the elements in [l .. k] 
-  //  are less than the [k+1..u] elmeents, viewed across dimension 'c'. 
-  // 
+  // partition ind[l..u] so that ind[l..k] are <= ind[k+1..u] along dimension c
   while (l < u) {
     int t = ind[l];
     int m = l;
@@ -297,70 +264,33 @@ void kdtree2::select_on_coordinate(int c, int k, int l, int u) {
 
     if (m <= k) l = m+1;
     if (m >= k) u = m-1;
-  } // while loop
+  }
 }
 
 int kdtree2::select_on_coordinate_value(int c, float alpha, int l, int u) {
-  //
-  //  Move indices in ind[l..u] so that the elements in [l .. return]
-  //  are <= alpha, and hence are less than the [return+1..u]
-  //  elmeents, viewed across dimension 'c'.
-  // 
+  // partition ind[l..u] around alpha along dimension c; returns the index of the last element <= alpha
   int lb = l, ub = u;
 
   while (lb < ub) {
     if (the_data[ind[lb]][c] <= alpha) {
-      lb++; // good where it is.
+      lb++;
     } else {
-      swap(ind[lb],ind[ub]); 
+      swap(ind[lb],ind[ub]);
       ub--;
     }
   }
 
-  // here ub=lb
+  // here ub==lb
   if (the_data[ind[lb]][c] <= alpha)
     return(lb);
   else
     return(lb-1);
-  
+
 }
 
 
-// void kdtree2::dump_data() {
-//   int upper1, upper2;
-  
-//   upper1 = N;
-//   upper2 = dim;
 
-//   printf("Rearrange=%d\n",rearrange);
-//   printf("N=%d, dim=%d\n", upper1, upper2);
-//   for (int i=0; i<upper1; i++) {
-//     printf("the_data[%d][*]=",i); 
-//     for (int j=0; j<upper2; j++)
-//       printf("%f,",the_data[i][j]); 
-//     printf("\n"); 
-//   }
-//   for (int i=0; i<upper1; i++)
-//     printf("Indexes[%d]=%d\n",i,ind[i]); 
-//   for (int i=0; i<upper1; i++) {
-//     printf("data[%d][*]=",i); 
-//     for (int j=0; j<upper2; j++)
-//       printf("%f,",(*data)[i][j]); 
-//     printf("\n"); 
-//   }
-// }
-
-
-
-//
-// search record substructure
-//
-// one of these is created for each search.
-// this holds useful information  to be used
-// during the search
-
-
-
+// search record: per-search scratch state passed down the recursion
 static const float infinity = 1.0e38;
 
 class searchrecord {
@@ -430,25 +360,23 @@ void kdtree2::n_nearest(vector<float>& qv, int nn, kdtree2_result_vector& result
   root->search(sr); 
 
   if (sort_results) sort(result.begin(), result.end());
-  
-}
-// search for n nearest to a given query vector 'qv'.
 
-  
+}
+
+
+// n nearest neighbors around an existing data point idxin
 void kdtree2::n_nearest_around_point(int idxin, int correltime, int nn,
 				     kdtree2_result_vector& result) {
-  vector<float> qv(dim);  //  query vector
+  vector<float> qv(dim);  // query vector
 
-  result.clear(); 
+  result.clear();
 
   for (int i=0; i<dim; i++) {
-    qv[i] = the_data[idxin][i]; 
+    qv[i] = the_data[idxin][i];
   }
-  // copy the query vector.
-  
+
   {
     searchrecord sr(qv, *this, result);
-    // construct the search record.
     sr.centeridx = idxin;
     sr.correltime = correltime;
     sr.nn = nn; 
@@ -498,91 +426,75 @@ int kdtree2::r_count(vector<float>& qv, float r2) {
 
 void kdtree2::r_nearest_around_point(int idxin, int correltime, float r2,
 				     kdtree2_result_vector& result) {
-  vector<float> qv(dim);  //  query vector
+  vector<float> qv(dim);  // query vector
 
-  result.clear(); 
+  result.clear();
 
   for (int i=0; i<dim; i++) {
-    qv[i] = the_data[idxin][i]; 
+    qv[i] = the_data[idxin][i];
   }
-  // copy the query vector.
-  
+
   {
     searchrecord sr(qv, *this, result);
-    // construct the search record.
     sr.centeridx = idxin;
     sr.correltime = correltime;
-    sr.ballsize = r2; 
-    sr.nn = 0; 
-    root->search(sr); 
+    sr.ballsize = r2;
+    sr.nn = 0;
+    root->search(sr);
   }
 
   if (sort_results) sort(result.begin(), result.end());
-    
+
 }
 
 
-int kdtree2::r_count_around_point(int idxin, int correltime, float r2) 
+int kdtree2::r_count_around_point(int idxin, int correltime, float r2)
 {
-  vector<float> qv(dim);  //  query vector
+  vector<float> qv(dim);  // query vector
 
 
   for (int i=0; i<dim; i++) {
-    qv[i] = the_data[idxin][i]; 
+    qv[i] = the_data[idxin][i];
   }
-  // copy the query vector.
-  
+
   {
-    kdtree2_result_vector result; 
+    kdtree2_result_vector result;
     searchrecord sr(qv, *this, result);
-    // construct the search record.
     sr.centeridx = idxin;
     sr.correltime = correltime;
-    sr.ballsize = r2; 
-    sr.nn = 0; 
-    root->search(sr); 
+    sr.ballsize = r2;
+    sr.nn = 0;
+    root->search(sr);
     return(result.size());
   }
 
-  
+
 }
 
 
-// 
+//
 //        KDTREE2_NODE implementation
 //
 
-// constructor
-kdtree2_node::kdtree2_node(int dim) : box(dim) { 
-  left = right = NULL; 
-  //
-  // all other construction is handled for real in the 
-  // kdtree2 building operations.
-  // 
+// constructor (the rest of the construction happens during tree building)
+kdtree2_node::kdtree2_node(int dim) : box(dim) {
+  left = right = NULL;
 }
 
-// destructor
+// destructor (box members free themselves)
 kdtree2_node::~kdtree2_node() {
-  if (left != NULL) delete left; 
-  if (right != NULL) delete right; 
-  // maxbox and minbox 
-  // will be automatically deleted in their own destructors. 
+  if (left != NULL) delete left;
+  if (right != NULL) delete right;
 }
 
 
 void kdtree2_node::search(searchrecord& sr) {
-  // the core search routine.
-  // This uses true distance to bounding box as the
-  // criterion to search the secondary node. 
-  //
-  // This results in somewhat fewer searches of the secondary nodes
-  // than 'search', which uses the vdiff vector,  but as this
-  // takes more computational time, the overall performance may not
-  // be improved in actual run time. 
+  // Core recursive search: uses true distance to the bounding box to decide whether to descend
+  // into the farther child.
   //
 
   if ( (left == NULL) && (right == NULL)) {
-    // we are on a terminal node
+    // terminal node: nn==0 means fixed-radius search, else k-nearest
     if (sr.nn == 0) {
       process_terminal_node_fixedball(sr);
     } else {
@@ -592,8 +504,7 @@ void kdtree2_node::search(searchrecord& sr) {
     kdtree2_node *ncloser, *nfarther;
 
     float extra;
-    float qval = sr.qv[cut_dim]; 
-    // value of the wall boundary on the cut dimension. 
+    float qval = sr.qv[cut_dim];
     if (qval < cut_val) {
       ncloser = left;
       nfarther = right;
@@ -601,16 +512,16 @@ void kdtree2_node::search(searchrecord& sr) {
     } else {
       ncloser = right;
       nfarther = left;
-      extra = qval-cut_val_left; 
+      extra = qval-cut_val_left;
     };
 
     if (ncloser != NULL) ncloser->search(sr);
 
+    // descend into the farther child only if its box can hold a point within ballsize
     if ((nfarther != NULL) && (squared(extra) < sr.ballsize)) {
-      // first cut
       if (nfarther->box_in_search_range(sr)) {
-	nfarther->search(sr); 
-      }      
+	nfarther->search(sr);
+      }
     }
   }
 }
@@ -618,20 +529,16 @@ void kdtree2_node::search(searchrecord& sr) {
 
 inline float dis_from_bnd(float x, float amin, float amax) {
   if (x > amax) {
-    return(x-amax); 
+    return(x-amax);
   } else if (x < amin)
     return (amin-x);
   else
     return 0.0;
-  
+
 }
 
 inline bool kdtree2_node::box_in_search_range(searchrecord& sr) {
-  //
-  // does the bounding box, represented by minbox[*],maxbox[*]
-  // have any point which is within 'sr.ballsize' to 'sr.qv'??
-  //
- 
+  // true if any point of this node's bounding box is within sr.ballsize of sr.qv
   int dim = sr.dim;
   float dis2 =0.0; 
   float ballsize = sr.ballsize; 
@@ -681,17 +588,11 @@ void kdtree2_node::process_terminal_node(searchrecord& sr) {
 	}
       }
       if(early_exit) continue; // next iteration of mainloop
-      // why do we do things like this?  because if we take an early
-      // exit (due to distance being too large) which is common, then
-      // we need not read in the actual point index, thus saving main
-      // memory bandwidth.  If the distance to point is less than the
-      // ballsize, though, then we need the index.
-      //
+      // with rearranged data, accumulate distance before reading the index, so a common early exit
+      // (point too far) avoids the index lookup and saves memory bandwidth
       indexofi = sr.ind[i];
     } else {
-      // 
-      // but if we are not using the rearranged data, then
-      // we must always 
+      // without rearranged data the index is needed up front to address the point
       indexofi = sr.ind[i];
       early_exit = false;
       dis = 0.0;
@@ -706,33 +607,24 @@ void kdtree2_node::process_terminal_node(searchrecord& sr) {
     } // end if rearrange. 
     
     if (centeridx > 0) {
-      // we are doing decorrelation interval
-      if (abs(indexofi-centeridx) < correltime) continue; // skip this point. 
+      // decorrelation interval: skip points too close in index to the center
+      if (abs(indexofi-centeridx) < correltime) continue;
     }
 
-    // here the point must be added to the list.
-    //
-    // two choices for any point.  The list so far is either
-    // undersized, or it is not.
-    //
+    // add the point: push while the result list is undersized, otherwise replace the current max
     if (sr.result.size() < nn) {
       kdtree2_result e;
       e.idx = indexofi;
       e.dis = dis;
       sr.result.push_element_and_heapify(e); 
       if (debug) cout << "unilaterally pushed dis=" << dis;
-      if (sr.result.size() == nn) ballsize = sr.result.max_value();
-      // Set the ball radius to the largest on the list (maximum priority).
+      if (sr.result.size() == nn) ballsize = sr.result.max_value();  // shrink ball to current largest
       if (debug) {
 	cout << " ballsize = " << ballsize << "\n"; 
 	cout << "sr.result.size() = "  << sr.result.size() << '\n';
       }
     } else {
-      //
-      // if we get here then the current node, has a squared 
-      // distance smaller
-      // than the last on the list, and belongs on the list.
-      // 
+      // list is full and this point is closer than the current max, so it replaces it
       kdtree2_result e;
       e.idx = indexofi;
       e.dis = dis;
@@ -771,17 +663,11 @@ void kdtree2_node::process_terminal_node_fixedball(searchrecord& sr) {
 	}
       }
       if(early_exit) continue; // next iteration of mainloop
-      // why do we do things like this?  because if we take an early
-      // exit (due to distance being too large) which is common, then
-      // we need not read in the actual point index, thus saving main
-      // memory bandwidth.  If the distance to point is less than the
-      // ballsize, though, then we need the index.
-      //
+      // with rearranged data, accumulate distance before reading the index, so a common early exit
+      // (point too far) avoids the index lookup and saves memory bandwidth
       indexofi = sr.ind[i];
     } else {
-      // 
-      // but if we are not using the rearranged data, then
-      // we must always 
+      // without rearranged data the index is needed up front to address the point
       indexofi = sr.ind[i];
       early_exit = false;
       dis = 0.0;
@@ -796,8 +682,8 @@ void kdtree2_node::process_terminal_node_fixedball(searchrecord& sr) {
     } // end if rearrange. 
     
     if (centeridx > 0) {
-      // we are doing decorrelation interval
-      if (abs(indexofi-centeridx) < correltime) continue; // skip this point. 
+      // decorrelation interval: skip points too close in index to the center
+      if (abs(indexofi-centeridx) < correltime) continue;
     }
 
     {

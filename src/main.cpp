@@ -20,7 +20,12 @@
  *
  */
 
+/* Program entry point: reads options and input, runs the DTFE/PS-DTFE pipeline, writes output. */
+
 #include <vector>
+#include <iomanip>
+#include <chrono>           // total wall time for the run summary
+#include <sys/resource.h>   // getrusage -> peak RSS report
 
 #include "DTFE.h"
 #include "io/io.h"
@@ -29,40 +34,44 @@
 using namespace std;
 
 
+// Reads options/input, runs the interpolation (with optional interlacing), writes output, prints a run summary.
 int main( int argc, char *argv[] )
 {
-    User_options userOptions;		// stores the program options supplied by the user plus additional program wide constants
-    userOptions.readOptions( argc, argv );  // read the user supplied options
+    User_options userOptions;		// program options plus program-wide constants
+    userOptions.readOptions( argc, argv );
+
+    // wall-clock (not CPU) timer for the run summary, so it reflects elapsed time across all threads
+    auto const wallStart = std::chrono::steady_clock::now();
+    MESSAGE::Message phase( userOptions.verboseLevel );
 
 
 
-    // read the input data
-    vector<Particle_data> particles;	// vector that keeps track of particle positions and their data
-    vector<Sample_point> samplingCoordinates; // keep track of the sampling coordinates if the grid interpolation is done to a non-regular grid
-    readInputData( &particles, &samplingCoordinates, &userOptions ); // reads particle positions, non-regular sampling coordinates (if any). Can also set members of the 'User_options' class like the box dimensions or grid size.
+    phase << MESSAGE::banner("READING INPUT") << MESSAGE::Flush;
+    vector<Particle_data> particles;
+    vector<Sample_point> samplingCoordinates; // sampling coords for non-regular-grid interpolation
+    readInputData( &particles, &samplingCoordinates, &userOptions ); // may also set box dimensions / grid size
 
 
 
-    // compute the DTFE (with optional interlacing)
-    Quantities uQuantities;	// structure that will store the output quantities - i.e. the fields at the sampling points (NOTE: "uQuantities" stands for "unaveraged quantities" meaning that this fields were NOT averaged over the sampling cell)
-    Quantities aQuantities;     // structure that will store the volume averaged output quantities - i.e. the fields volume averaged over the sampling cells (NOTE: "aQuantities" stands for "averaged quantities")
+    Quantities uQuantities;	// unaveraged fields, sampled at the grid points
+    Quantities aQuantities;     // fields volume-averaged over each sampling cell
 
+    phase << MESSAGE::banner("DTFE COMPUTATION") << MESSAGE::Flush;
     if ( userOptions.interlace )
     {
-        // Interlacing: run interpolation twice (original + half-cell offset), average in Fourier space
+        // Interlacing: interpolate twice (original + half-cell offset), average in Fourier space.
         if ( !userOptions.periodic )
         {
             MESSAGE::Warning warning( userOptions.verboseLevel );
             warning << "Interlacing is designed for periodic boundary conditions. Results may be unreliable for non-periodic data." << MESSAGE::EndWarning;
         }
 
-        // Keep a copy of particles for the second pass (DTFE clears them)
+        // DTFE clears the particles, so keep a copy for the second (offset) pass
         vector<Particle_data> particlesCopy = particles;
 
-        // First pass: normal grid
         DTFE( &particles, samplingCoordinates, userOptions, &uQuantities, &aQuantities );
 
-        // Save the density from the first pass
+        // first-pass density; prefer the averaged field, fall back to the unaveraged one
         vector<Real> density1;
         if ( !aQuantities.density.empty() )
             density1 = aQuantities.density;
@@ -71,9 +80,9 @@ int main( int argc, char *argv[] )
 
         if ( !density1.empty() )
         {
-            // Second pass: shift box origin by half a cell
+            // second pass: shift the box origin by half a cell along every axis
             User_options shiftedOptions = userOptions;
-            shiftedOptions.interlace = false;  // prevent infinite recursion in case of future refactoring
+            shiftedOptions.interlace = false;  // guard against future re-entrant refactoring
             size_t const *nGrid = &(shiftedOptions.gridSize[0]);
             for (int d = 0; d < NO_DIM; ++d)
             {
@@ -85,10 +94,10 @@ int main( int argc, char *argv[] )
             Quantities uQ2, aQ2;
             DTFE( &particlesCopy, samplingCoordinates, shiftedOptions, &uQ2, &aQ2 );
 
-            // Get the density from the second pass
+            // second-pass density, matched to whichever field the first pass used
             vector<Real> &density2 = !aQ2.density.empty() ? aQ2.density : uQ2.density;
 
-            // Apply Fourier-space interlacing
+            // cell size per axis, needed for the half-cell phase shift in Fourier space
             Real dx[NO_DIM];
             for (int d = 0; d < NO_DIM; ++d)
                 dx[d] = (userOptions.region[2*d+1] - userOptions.region[2*d]) / nGrid[d];
@@ -98,7 +107,7 @@ int main( int argc, char *argv[] )
             applyInterlacing( density1, density2, nGrid, dx );
             message << "Done.\n" << MESSAGE::Flush;
 
-            // Store result back
+            // write the interlaced density back into whichever field held the first pass
             if ( !aQuantities.density.empty() )
                 aQuantities.density = density1;
             else
@@ -107,11 +116,35 @@ int main( int argc, char *argv[] )
     }
     else
     {
-        DTFE( &particles, samplingCoordinates, userOptions, &uQuantities, &aQuantities );  // this function deletes the information in 'particles'
+        DTFE( &particles, samplingCoordinates, userOptions, &uQuantities, &aQuantities );  // clears 'particles'
     }
 
 
 
-    // output the desired quantities to file/files
+    phase << MESSAGE::banner("WRITING OUTPUT") << MESSAGE::Flush;
     writeOutputData( uQuantities, aQuantities, userOptions );
+
+
+    // report peak RSS (to tune --max-concurrent / --partition to fit RAM) and total wall time
+    if ( userOptions.verboseLevel >= 1 )
+    {
+        double const wallSec = std::chrono::duration<double>( std::chrono::steady_clock::now() - wallStart ).count();
+        phase << MESSAGE::banner("SUMMARY");
+
+        // ru_maxrss units differ by platform (bytes on macOS, kilobytes on Linux); convert to GB accordingly
+        struct rusage ru;
+        if ( getrusage( RUSAGE_SELF, &ru ) == 0 )
+        {
+#ifdef __APPLE__
+            double const peakGB = double(ru.ru_maxrss) / (1024.0*1024.0*1024.0);  // ru_maxrss is BYTES on macOS
+#else
+            double const peakGB = double(ru.ru_maxrss) / (1024.0*1024.0);          // ru_maxrss is KILOBYTES on Linux
+#endif
+            std::cout << MESSAGE::cYellowD() << "   peak memory (RSS) : " << MESSAGE::cReset()
+                      << MESSAGE::cMagenta() << std::setprecision(4) << peakGB << " GB" << MESSAGE::cReset() << "\n" << std::flush;
+        }
+        std::cout << MESSAGE::cYellowD() << "   total wall time   : " << MESSAGE::cReset()
+                  << MESSAGE::cGreen() << MESSAGE::formatDuration(wallSec) << MESSAGE::cReset() << "\n"
+                  << MESSAGE::cCyan() << MESSAGE::hrule() << MESSAGE::cReset() << "\n" << std::flush;
+    }
 }

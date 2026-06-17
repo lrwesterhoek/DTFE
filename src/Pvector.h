@@ -22,26 +22,15 @@
 
 
 /*
-  This class implements a physical vector. The components of the vector can be access as the elements on an array (i.e. using []) with indices from 0 to N-1, where N is the number of components of the vector.
-The following mathematical operations are supported:
-        Pvector + Pvector       = vector addition
-        Pvector += Pvector      = vector addition with the left side of += (same as 'int i+= 2;')
-        Pvector - Pvector       = vector substraction
-        Pvector -= Pvector      = vector substraction
-        Pvector * scalar        = vector multiplication with scalar value
-        Pvector *= scalar       = vector multiplication with scalar value
-        Pvector / scalar        = vector division via scalar value
-        Pvector /= scalar       = vector division via scalar value
-
-        Pvector == Pvector      = check if the two vectors are the same (NOTE: doesnt not make sense for float and double since one should add a precision level - this is not included)
-        Pvector != Pvector      = not ( Pvector == Pvector )
-        zero()                  = returns a null vector (all entries are 0.)
+  Fixed-size physical vector of N components, indexed via [] (0..N-1). Supports +, +=, -, -=,
+  * and / by a scalar, ==, != and zero(). == is exact equality (no tolerance for float/double).
 */
 
 
 #ifndef PVECTOR_HEADER
 #define PVECTOR_HEADER
 
+// Fixed-size N-component vector of T with value semantics; the workhorse type for positions, velocities and tensors.
 template <typename T, size_t N>
 struct Pvector
 {
@@ -65,7 +54,6 @@ struct Pvector
         for (size_t i=0; i<N; ++i)
             x[i] = xVector[i]; }
 
-    /* Overload the [] operator. */
     T& operator[](size_t i)
     {
         return x[i];
@@ -142,6 +130,7 @@ struct Pvector
     }
 
 
+    // Returns an all-zero vector; handy as a fill value for std::vector::assign/resize.
     static Pvector zero()
     {
         Pvector<T,N> result;

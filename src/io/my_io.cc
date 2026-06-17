@@ -22,11 +22,11 @@
 
 
 
-/* You can use this file to easily customize the DTFE software data input/output. The functions below were left intentionally empty such that you can put your read/write to file code there. Use the rest of files in this directory for examples on how to read from / write to different types of files (I would recommend as starting point the "text_io.cc" file). */
+/* Stub for custom DTFE data input/output; fill in the functions below (see text_io.cc for examples). */
 
 
 
-/* Your custom functions for reading the input data. */
+// Stub for reading particles from a custom file format; fill in the marked sections.
 void readMyFile(std::string filename,
                 Read_data<Real> *readData,
                 User_options *userOptions)
@@ -64,7 +64,7 @@ void readMyFile(std::string filename,
 }
 
 
-/* Your custom function for writting the output data to a file. */
+// Stub for writing a scalar field to a custom file format; fill in the marked sections.
 void writeMyFile(std::vector<Real> &dataToWrite,
                  std::string filename,
                  std::string variableName,
@@ -86,6 +86,7 @@ void writeMyFile(std::vector<Real> &dataToWrite,
     outputFile.close();
     message << "Done.\n";
 }
+// Stub for writing a vector field (N components per point) to a custom file format; fill in the marked sections.
 template <size_t N>
 void writeMyFile(std::vector< Pvector<Real,N> > &dataToWrite,
                  std::string filename,

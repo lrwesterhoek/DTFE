@@ -21,6 +21,8 @@
  */
  
  
+// Helper macros for reading Gadget blocks: swap endianness when needed, read the record-size
+// delimiter, and verify the integers bracketing a block match (else the file is corrupt).
 #define SWAP_HEADER_ENDIANNESS(x1,x2,x3,x4) { if( x1 ) {BYTESWAP( x2 ); BYTESWAP( x3 ); x4.swapBytes();} }
 #define SWAP_ENDIANNESS(x1,x2,x3)           { if( x1 ) {BYTESWAP( x2 ); BYTESWAP( x3 );} }
 #define READ_DELIMETER \
@@ -33,7 +35,7 @@
         throwError( "The integers before and after the particle " field " data block in the GADGET file '" + fileName + "' did not match. The GADGET snapshot file is corrupt." )
 
 
-// Header structure for reading Gadget snapshots
+// The 256-byte Gadget snapshot header (standard layout), with helpers for file naming and endianness.
 struct Gadget_header
 {
     int      npart[6];
@@ -49,10 +51,10 @@ struct Gadget_header
     double   Omega0;
     double   OmegaLambda;
     double   HubbleParam;
-    char     fill[256- 6*4- 6*8- 2*8- 2*4- 6*4- 2*4 - 4*8];  /* fills to 256 Bytes */
+    char     fill[256- 6*4- 6*8- 2*8- 2*4- 6*4- 2*4 - 4*8];  // fills to 256 Bytes
 
 
-    // return the file name for a Gadget snapshot saved in single or multiple files - note that the name must contain a '%i' or '%s' character
+    // file name for snapshot file 'fileNumber'; fileRoot must contain a '%i' or '%s' for multiple files
     std::string filename(std::string fileRoot, int const fileNumber, bool checkFileExists=true )
     {
         char buf[500];
@@ -63,7 +65,7 @@ struct Gadget_header
         return fileName;
     }
 
-    // Function that prints the Gadget header.
+    // Prints the Gadget header contents to stdout.
     void print()
     {
         std::cout << "\nThe header of the Gadget file contains the following info:\n"
@@ -82,7 +84,7 @@ struct Gadget_header
             << "h            =  " << HubbleParam << "\n\n";
     }
 
-    // Swap endianness
+    // Swaps the endianness of every header field in place.
     void swapBytes()
     {
         ByteSwapArray( npart, 6 );
@@ -100,7 +102,8 @@ struct Gadget_header
         BYTESWAP( HubbleParam );
     }
 
-    // Checks for the type of the Gadget file -> can detected Gadget file type 1 & 2. Returns true if it could identify the gadget file type.
+    // Detect Gadget file format (1 or 2) from the first record-size integer; sets swapEndian if the
+    // value only matches after a byte swap. Returns false if neither format is recognized.
     bool detectSnapshotType(int const bufferValue,
                             int *gadgetFileType,
                             bool *swapEndian)
@@ -108,19 +111,19 @@ struct Gadget_header
         int buffer1 = bufferValue;
         *swapEndian = false;
 
-        if ( buffer1 == 8 )             // gadget file format 2
+        if ( buffer1 == 8 )             // format 2
             *gadgetFileType = 2;
-        else if ( buffer1 == 256 )      // gadget file format 1
+        else if ( buffer1 == 256 )      // format 1
             *gadgetFileType = 1;
-        else                            // check for swapped endianness
+        else                            // retry with swapped endianness
         {
             BYTESWAP( buffer1 );
             *swapEndian = true;
-            if ( buffer1 == 8 )         // gadget file format 2
+            if ( buffer1 == 8 )
                 *gadgetFileType = 2;
-            else if ( buffer1 == 256 )  // gadget file format 1
+            else if ( buffer1 == 256 )
                 *gadgetFileType = 1;
-            else                        // could not detect the file type
+            else
                 return false;
         }
         return true;

@@ -22,16 +22,12 @@
 
 
 /*
-    These classes implement messages for the user during the runtime of the program.
-    Depending on the 'verboseLevel', it does the following:
-        verboseLevel = 3 - prints all messages; including 'progressMessages'
-        verboseLevel = 2 - prints only user messages, warnings and errors
-        verboseLevel = 1 - prints only Warnings and Error messages
-        verboseLevel = 0 - prints only Error messages
-        
-NOTE: This class has been design such that the messages are sent as 'boots::tuple' of elements such that it can output complex messages. Example of usage:
-    Message m( verboseLevel );
-    m.error( make_tuple("Test number ", 10, ". Testing the message interface ", "etc...", ... ) );
+    Runtime user messages, filtered by 'verboseLevel':
+        3 - all messages, including progress
+        2 - user messages, warnings and errors
+        1 - warnings and errors only
+        0 - errors only
+    Messages are streamed with operator<<, e.g. Message m(level); m << "x = " << 10 << "\n";
 */
 
 
@@ -43,6 +39,7 @@ NOTE: This class has been design such that the messages are sent as 'boots::tupl
 #include <string>
 #include <sstream>
 #include <cstdlib>
+#include <unistd.h>   // isatty -> only colour a real terminal
 
 
 #define OUT std::cout
@@ -51,9 +48,56 @@ NOTE: This class has been design such that the messages are sent as 'boots::tupl
 namespace MESSAGE
 {
 
+// ANSI colours for the runtime log; emitted only when stdout is a real terminal and NO_COLOR is unset, so piped output stays clean.
+inline bool colorEnabled()
+{
+    static bool const enabled = ( isatty(STDOUT_FILENO)==1 ) && ( std::getenv("NO_COLOR")==nullptr );
+    return enabled;
+}
+inline char const* cRed()     { return colorEnabled() ? "\033[1;31m" : ""; }  // errors
+inline char const* cYellow()  { return colorEnabled() ? "\033[1;33m" : ""; }  // warnings
+inline char const* cGreen()   { return colorEnabled() ? "\033[1;32m" : ""; }  // timings / success / progress
+inline char const* cCyan()    { return colorEnabled() ? "\033[1;36m" : ""; }  // section banners / headers
+inline char const* cBlue()    { return colorEnabled() ? "\033[1;34m" : ""; }  // file paths / I/O
+inline char const* cMagenta() { return colorEnabled() ? "\033[1;35m" : ""; }  // physics results (density, streams, ...)
+inline char const* cYellowD() { return colorEnabled() ? "\033[33m"   : ""; }  // labels / keys (non-bold)
+inline char const* cDim()     { return colorEnabled() ? "\033[2m"    : ""; }  // separators / secondary
+inline char const* cBold()    { return colorEnabled() ? "\033[1m"    : ""; }
+inline char const* cReset()   { return colorEnabled() ? "\033[0m"    : ""; }
 
-/* Structure to let the program know the end of an error message.
-NOTE: Must be always called to stop the program. */
+// Horizontal rule of repeated character 'c'.
+inline std::string hrule( char c = '=', int width = 74 )
+{ return std::string( size_t(width<0?0:width), c ); }
+
+// Section banner: title centred between '=' rules (cyan+bold).
+inline std::string banner( std::string const &title )
+{
+    size_t const W = 74;
+    std::string t = "  " + title + "  ";
+    size_t const pad  = ( t.size() < W ) ? ( W - t.size() ) : size_t(0);
+    size_t const left = pad / 2;
+    std::ostringstream o;
+    o << "\n" << cCyan() << std::string(left,'=') << t << std::string(pad-left,'=')
+      << cReset() << "\n";
+    return o.str();
+}
+
+// Format a duration in seconds as "Hh Mm Ss" / "Mm Ss" / "Ss".
+inline std::string formatDuration( double seconds )
+{
+    if ( seconds < 0. ) seconds = 0.;
+    long s = long( seconds + 0.5 );
+    long const h = s/3600; s %= 3600;
+    long const m = s/60;   s %= 60;
+    std::ostringstream o;
+    if      ( h>0 ) o << h << "h " << m << "m " << s << "s";
+    else if ( m>0 ) o << m << "m " << s << "s";
+    else            o << s << "s";
+    return o.str();
+}
+
+
+// Sentinel ending an error message; printing it terminates the program (must be sent).
 struct EndErrorMessage
 {
     inline friend std::ostream& operator << (std::ostream& out, EndErrorMessage &end)
@@ -65,8 +109,7 @@ struct EndErrorMessage
 };
 
 
-/* Structure to let the program know the end of a warning message.
-NOTE: Can easily be modified to end the program - see class 'EndErrorMessage'. */
+// Sentinel ending a warning message.
 struct EndWarningMessage
 {
     inline friend std::ostream& operator << (std::ostream& out, EndWarningMessage &end)
@@ -77,7 +120,7 @@ struct EndWarningMessage
 };
 
 
-/* Flushes a message from the buffer. */
+// Flushes a message from the buffer.
 struct FlushMessage
 {
     inline friend std::ostream& operator << (std::ostream& out, FlushMessage &end)
@@ -89,14 +132,12 @@ struct FlushMessage
 
 
 
-/* Sends an error message to the user. This class will always send messages, indifferently of the value of the verbose level.
-NOTE: Must end the error message with 'EndError' or 'MESSAGE::EndErrorMessage' for the program to terminate. */
+// Error message; always printed. Must end with 'EndError' to terminate the program.
 struct Error
 {
-    int _verboseLevel;  //this has no effect on the class behavior, offered just for consistency
+    int _verboseLevel;  // unused; kept for consistency with the other message classes
     int iterationNo;
-    
-    // class constructors
+
     Error(void)
     {
         _verboseLevel = 0;
@@ -110,27 +151,23 @@ struct Error
         iterationNo = 0;
     }
     
-    // Show error message and stop program execution
-    //NOTE: Must end the error message with 'EndError' or 'MESSAGE::EndErrorMessage' for the program to terminate
     template <typename T>
     inline Error& operator << (T right)
     {
         if ( (iterationNo++)==0 )
-            OUT << "\n\n~~~ ERROR ~~~ ";
+            OUT << "\n\n" << cRed() << "~~~ ERROR ~~~ " << cReset();
         OUT << right;
         return *this;
     }
 };
 
 
-/* Sends a warning message to the user. This class will send messages only if verbose level >= 1.
-NOTE: Must end the warning message with 'EndWarning' or 'MESSAGE::EndWarningMessage' for the warning message to end accordingly. */
+// Warning message; printed only if verbose level >= 1. Must end with 'EndWarning'.
 struct Warning
 {
     int _verboseLevel;
     int iterationNo;
-    
-    // class constructor
+
     Warning(int const verboseLevel)
     {
         if ( verboseLevel<0 )
@@ -142,29 +179,26 @@ struct Warning
         iterationNo = 0;
     }
     
-    // Show warning message
-    // NOTE: Must end the warning message with 'EndWarning' or 'MESSAGE::EndWarningMessage' for the warning message to end accordingly.
     template <typename T>
     inline Warning& operator << (T right)
     {
         if ( _verboseLevel<1 )
             return *this;
         if ( (iterationNo++)==0 )
-            OUT << "\n\n~~~ WARNING ~~~ ";
+            OUT << "\n\n" << cYellow() << "~~~ WARNING ~~~ " << cReset();
         OUT << right;
         return *this;
     }
 };
 
 
-/* Sends a message to the user. */
+// Sends a message to the user; printed only if verbose level >= 2.
 struct Message
 {
     int _verboseLevel;
     int _percentangeDone;
     
     
-    // Class constructor
     Message(int const verboseLevel)
     {
         if ( verboseLevel<0 )
@@ -175,8 +209,7 @@ struct Message
         _verboseLevel = verboseLevel;
         _percentangeDone = 0;
     }
-    
-    // Overaloads the << which is used to send messages to the user
+
     template <typename T>
     inline Message& operator << (T right)
     {
@@ -185,7 +218,6 @@ struct Message
         return *this;
     }
     
-    // Show progress to the user
     inline void updateProgress(int const percentageDone)
     {
         if ( _verboseLevel<3 or _percentangeDone==percentageDone )
@@ -198,7 +230,7 @@ struct Message
 
 
 
-/* Prints to a string the components of an array/vector using the second string to separate the values. */
+// Prints array/vector elements to a string, joined by 'separation'.
 template <typename T>
 std::string printElements(T *ptr, size_t const size, std::string separation=" ")
 {
@@ -225,9 +257,7 @@ static const FlushMessage      Flush      = FlushMessage();
 
 
 
-//! Template functions for outputing errors
-/* Throw error and stop the program.
-NOTE: The function 'throwError' can take from 1 to 5 parameters, otherwise one will need to call directly the MESSAGE::Error class. */
+// Throw an error message (1 to 5 parts) and stop the program; for more parts use MESSAGE::Error directly.
 template <typename T1, typename T2, typename T3, typename T4, typename T5>
 void throwError(T1 message_1,
                 T2 message_2,

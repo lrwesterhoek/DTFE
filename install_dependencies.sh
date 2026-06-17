@@ -1,19 +1,13 @@
-# DTFE Dependency Installation Script
-# 
-# Automatically installs required dependencies for building DTFE
-# Supports: macOS (Intel/Apple Silicon), Ubuntu, Debian, Fedora, RHEL, CentOS, Arch, Manjaro
-#
+# Install DTFE build dependencies on macOS, Ubuntu/Debian, Fedora/RHEL/CentOS, Arch, openSUSE.
 
-set -e  # Exit on error
+set -e
 
-# Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# Print functions
 print_info() {
     echo -e "${BLUE}[INFO]${NC} $1"
 }
@@ -36,11 +30,9 @@ print_header() {
     echo -e "${BLUE}================================================${NC}\n"
 }
 
-# Detect OS and distribution
 detect_os() {
     if [[ "$OSTYPE" == "darwin"* ]]; then
         OS="macos"
-        # Detect architecture
         ARCH=$(uname -m)
         if [[ "$ARCH" == "arm64" ]]; then
             print_info "Detected: macOS (Apple Silicon)"
@@ -50,8 +42,7 @@ detect_os() {
     elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
         OS="linux"
         ARCH=$(uname -m)
-        
-        # Detect Linux distribution
+
         if [ -f /etc/os-release ]; then
             . /etc/os-release
             DISTRO=$ID
@@ -68,7 +59,7 @@ detect_os() {
     fi
 }
 
-# Check if running as root (we don't want this)
+# Refuse to run as root; sudo is requested per-command when needed.
 check_root() {
     if [[ $EUID -eq 0 ]]; then
         print_warning "This script should NOT be run as root/sudo"
@@ -81,7 +72,6 @@ check_root() {
     fi
 }
 
-# Install Homebrew on macOS
 install_homebrew() {
     if command -v brew &> /dev/null; then
         print_success "Homebrew is already installed"
@@ -90,8 +80,8 @@ install_homebrew() {
     
     print_info "Installing Homebrew..."
     /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-    
-    # Add Homebrew to PATH for Apple Silicon
+
+    # Apple Silicon installs to /opt/homebrew, which is not on PATH yet.
     if [[ "$ARCH" == "arm64" ]]; then
         if [[ -f /opt/homebrew/bin/brew ]]; then
             eval "$(/opt/homebrew/bin/brew shellenv)"
@@ -101,11 +91,9 @@ install_homebrew() {
     print_success "Homebrew installed successfully"
 }
 
-# Install dependencies on macOS
 install_macos() {
     print_header "Installing macOS Dependencies"
-    
-    # Check for Xcode Command Line Tools
+
     if ! xcode-select -p &> /dev/null; then
         print_info "Installing Xcode Command Line Tools..."
         xcode-select --install
@@ -116,16 +104,13 @@ install_macos() {
         print_success "Xcode Command Line Tools already installed"
     fi
     
-    # Install Homebrew if needed
     install_homebrew
-    
-    # Update Homebrew
+
     print_info "Updating Homebrew..."
     brew update
-    
-    # Install dependencies
+
     print_info "Installing DTFE dependencies..."
-    
+
     PACKAGES=(gsl boost cgal mpfr hdf5 gmp)
     
     for package in "${PACKAGES[@]}"; do
@@ -140,7 +125,6 @@ install_macos() {
     print_success "All dependencies installed successfully!"
 }
 
-# Install dependencies on Ubuntu/Debian
 install_ubuntu_debian() {
     print_header "Installing Ubuntu/Debian Dependencies"
     
@@ -162,11 +146,10 @@ install_ubuntu_debian() {
     print_success "All dependencies installed successfully!"
 }
 
-# Install dependencies on Fedora/RHEL/CentOS
 install_fedora_rhel() {
     print_header "Installing Fedora/RHEL/CentOS Dependencies"
-    
-    # Determine package manager (dnf for newer, yum for older)
+
+    # dnf on newer releases, yum on older.
     if command -v dnf &> /dev/null; then
         PKG_MGR="dnf"
     elif command -v yum &> /dev/null; then
@@ -193,7 +176,6 @@ install_fedora_rhel() {
     print_success "All dependencies installed successfully!"
 }
 
-# Install dependencies on Arch/Manjaro
 install_arch() {
     print_header "Installing Arch/Manjaro Dependencies"
     
@@ -213,7 +195,6 @@ install_arch() {
     print_success "All dependencies installed successfully!"
 }
 
-# Install dependencies on openSUSE
 install_opensuse() {
     print_header "Installing openSUSE Dependencies"
     
@@ -230,29 +211,25 @@ install_opensuse() {
     print_success "All dependencies installed successfully!"
 }
 
-# Verify installation
 verify_installation() {
     print_header "Verifying Installation"
-    
+
     local all_good=true
-    
-    # Check compiler
+
     if command -v g++ &> /dev/null || command -v clang++ &> /dev/null; then
         print_success "C++ compiler found"
     else
         print_error "No C++ compiler found"
         all_good=false
     fi
-    
-    # Check make
+
     if command -v make &> /dev/null; then
         print_success "Make utility found"
     else
         print_error "Make utility not found"
         all_good=false
     fi
-    
-    # For macOS, check specific packages
+
     if [[ "$OS" == "macos" ]]; then
         for package in gsl boost cgal mpfr hdf5 gmp; do
             if brew list "$package" &> /dev/null 2>&1; then
@@ -272,7 +249,6 @@ verify_installation() {
     fi
 }
 
-# Print next steps
 print_next_steps() {
     print_header "Next Steps"
     
@@ -290,17 +266,12 @@ print_next_steps() {
     echo ""
 }
 
-# Main installation function
 main() {
     print_header "DTFE Dependency Installer"
-    
-    # Detect OS
+
     detect_os
-    
-    # Check if running as root
     check_root
-    
-    # Install based on OS/distribution
+
     case "$OS" in
         macos)
             install_macos
@@ -327,15 +298,12 @@ main() {
             esac
             ;;
     esac
-    
-    # Verify installation
+
     echo ""
     verify_installation
-    
-    # Print next steps
+
     echo ""
     print_next_steps
 }
 
-# Run main function
 main

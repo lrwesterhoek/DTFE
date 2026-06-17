@@ -21,11 +21,14 @@
  */
 
 
+/* Volume-averaged grid interpolation, method 0 (= exact geometric intersection of each Delaunay
+   simplex with the grid cells). */
 #include "volume_split.h"
 
 
-/* Computes the contribution to the input variable for the grid cells given in 'indices'.  */
-/* Each entry of the array 'contributions' contains the first 2/3 entries the numbers that need to be multiplied with the gradient to give you the field while the last entry (NO_DIM) contains the intersection volume between the simplex and the grid cell. This needs to be multiplied with the value of the field corresponding to the base vertex of the Delaunay cell (e.g. density_base). */
+// Adds each simplex's density contribution to its intersecting grid cells. In every entry of
+// 'contributions' the first NO_DIM components are the field-weighted intersection moment and entry
+// NO_DIM is the intersection volume, so the result reconstructs the linear field over that volume.
 inline void distributeContributions(vector<size_t> &indices,
                                     vector< Pvector<Real,NO_DIM+1> > &contributions,
                                     std::vector<Real> *density,
@@ -45,6 +48,7 @@ inline void distributeContributions(vector<size_t> &indices,
         (*density)[index] += result;
     }
 }
+// Vector-field overload: distributes a multi-component field with its per-cell gradient the same way.
 template <size_t N1, size_t N2>
 inline void distributeContributions(vector<size_t> &indices,
                                     vector< Pvector<Real,NO_DIM+1> > &contributions,
@@ -66,7 +70,7 @@ inline void distributeContributions(vector<size_t> &indices,
         (*field)[index] += result;
     }
 }
-// the following function computes the average gradient - this is contant inside the Delaunay cell
+// Gradient overload: the gradient is constant inside a Delaunay simplex, so it just scales by volume.
 template <size_t N1>
 inline void distributeContributions(vector<size_t> &indices,
                                     vector< Pvector<Real,NO_DIM+1> > &contributions,
@@ -86,7 +90,7 @@ inline void distributeContributions(vector<size_t> &indices,
 
 
 
-/* Returns true if the Delaunay cell is outside the region of interest. */
+// Returns true if the Delaunay cell's bounding box lies entirely outside the region of interest.
 inline bool cellOutsideRegion(DT & dt,
                               Finite_cells_iterator &cell,
                               Bbox &fullBox)
@@ -98,20 +102,21 @@ inline bool cellOutsideRegion(DT & dt,
 #endif
 }
 
+// Returns true if the whole Delaunay cell fits inside one grid cell; also fills the base vertex's
+// grid cell and box-relative position.
 bool simplexInSingleCell(Finite_cells_iterator &cell,
                          Box &regionBox,
                          Real *dx,
                          int *baseGridCell,
                          Real *basePosition)
 {
-    // check if Delaunay cell is fully contained in the same grid cell
     Point base = cell->vertex(0)->point();
-    for (int i=0; i<NO_DIM; ++i)    // get base point positions in the grid cell it is contained
+    for (int i=0; i<NO_DIM; ++i)
     {
-        basePosition[i] = base[i] - regionBox[2*i]; //position of the base vertex
-        baseGridCell[i] = int( floor( (basePosition[i])/dx[i] ) ); //coordinates of grid cell that contains the base point
+        basePosition[i] = base[i] - regionBox[2*i]; // base vertex position relative to the box's lower corner
+        baseGridCell[i] = int( floor( (basePosition[i])/dx[i] ) ); // grid cell containing the base point
     }
-    Box gridCellBox;    // keep track of coordinates of the grid cell in which 'base' is
+    Box gridCellBox;    // coordinates of the grid cell containing 'base'
     for (int i=0; i<NO_DIM; ++i)
     {
         gridCellBox[2*i] = baseGridCell[i] * dx[i] + regionBox[2*i];
@@ -127,19 +132,16 @@ bool simplexInSingleCell(Finite_cells_iterator &cell,
 
 
 
-/* This function computes the field interpolation averaged over the sampling cell for each sampling point using a MC method over the cells of the Delaunay triangulation.
-The function takes the following parameters:
-    'dt' - the periodic Delaunay triangulation; with the density at the vertex points already computed
-    'userOptions' - structure which store the number of grid points along each axis, the number of random sample points in each tetrahedra. This structure also gives information about the size of the box along each axis. 
-    'quantities' - structure storing the vectors for the output fields on the grid
-*/
+// Volume-averaged grid interpolation (method 0): intersects each Delaunay simplex with the grid and
+// accumulates per-cell contributions, giving the exact geometric volume average. 'dt' carries vertex
+// densities; 'quantities' receives the output grid fields.
 void interpolateGrid_averaged_0(DT &dt,
                                 User_options &userOptions,
                                 Quantities *quantities)
 {
-    size_t *nGrid = &(userOptions.gridSize[0]); // size of the density grid along each axis
-    Box boxCoordinates = userOptions.region;    // the box coordinates in which the density is computed
-    vector<Real> boxLength, startPos;           // the size of the particle box of interest along each direction as well as the origin of the box
+    size_t *nGrid = &(userOptions.gridSize[0]); // grid size along each axis
+    Box boxCoordinates = userOptions.region;    // box region of interest
+    vector<Real> boxLength, startPos;           // box size and origin along each direction
     for (size_t i=0; i<NO_DIM; ++i)
     {
         boxLength.push_back( boxCoordinates[2*i+1]-boxCoordinates[2*i] );
@@ -152,25 +154,24 @@ void interpolateGrid_averaged_0(DT &dt,
 #endif
     
     
-    // define pointers to the vectors storing the output fields
+    // output field vectors
     Field field = userOptions.aField;
     std::vector<Real>                         *density = &(quantities->density);
     std::vector< Pvector<Real,noVelComp> >    *velocity = &(quantities->velocity);
     std::vector< Pvector<Real,noGradComp> >   *velocity_gradient = &(quantities->velocity_gradient);
     std::vector< Pvector<Real,noScalarComp> > *scalar = &(quantities->scalar);
     std::vector< Pvector<Real,noScalarGradComp> > *scalar_gradient = &(quantities->scalar_gradient);
-    
-    
-    // show a message to the user
-    MESSAGE::Message message( userOptions.verboseLevel );   // structure used to output messages to the user ( the higher the verboseLevel, the more messages will be showns (check 'message.h' for details) )
-    message << "\nComputing interpolation of the fields volume averaged over the sampling cell on a regular " 
-            << MESSAGE::printElements( nGrid, NO_DIM, "*" ) << " grid in the region " 
-            << boxCoordinates.print() 
-            << ". The volume average is computed using geometric intersections up to a precision of " << VOLUME_TOL << ".\n" 
+
+
+    MESSAGE::Message message( userOptions.verboseLevel );
+    message << "\nComputing interpolation of the fields volume averaged over the sampling cell on a regular "
+            << MESSAGE::printElements( nGrid, NO_DIM, "*" ) << " grid in the region "
+            << boxCoordinates.print()
+            << ". The volume average is computed using geometric intersections up to a precision of " << VOLUME_TOL << ".\n"
             << "\t Done: " << MESSAGE::Flush;
-    
-    
-    // Initialize the grid field values to 0
+
+
+    // zero-initialize all grid fields
     size_t const gridSize = (NO_DIM==2) ? nGrid[0]*nGrid[1] : nGrid[0]*nGrid[1]*nGrid[2];
     if ( field.density ) assingZeroValues<Real>( density, gridSize );
     if ( field.velocity ) assingZeroValues< Pvector<Real,noVelComp> >( velocity, gridSize );
@@ -182,36 +183,34 @@ void interpolateGrid_averaged_0(DT &dt,
         MESSAGE::Warning warning(userOptions.verboseLevel);
         warning << "You cannot use the averaging method 0 to compute the velocity standard deviation inside the grid cell. Please use the averaging method 2 '--method 2' (Monte Carlo sampling inside the grid cell) to compute the velocity standard deviation.\n" << MESSAGE::EndWarning;
     }
-    //checks that there are cells in the Delaunay triangulation, since otherwise there is no interpolation
+    // without cells there is nothing to interpolate
     if ( dt.number_of_vertices()<NO_DIM+1 )
     {
         MESSAGE::Warning warning(1);
         warning << "Because there are less than " << NO_DIM+1 << " vertices in the Delaunay triangulation there is no cell and hence there is no information that can be used to interpolate the fields to a grid. All field values will be initialized to 0.\n" << MESSAGE::EndWarning;
         return;
     }
-    
-    
-    
-    // temporary variables needed for the interpolation
+
+
+
     Real dx[NO_DIM];        // grid spacing along each axis
     for (size_t i=0; i<NO_DIM; ++i)
         dx[i] = boxLength[i] / nGrid[i];
-    Real const gridCellVolume = (NO_DIM==2) ? (dx[0]*dx[1]) : (dx[0]*dx[1]*dx[2]);    // the volume of a grid cell
+    Real const gridCellVolume = (NO_DIM==2) ? (dx[0]*dx[1]) : (dx[0]*dx[1]*dx[2]);
 #ifdef TEST_PADDING
-    vector<size_t> dummyGridCells_d; // instead of incompleteCells_d
-    vector<size_t> dummyGridCells;   // instead of incompleteCells  // keep track of grid cells where there is an error in the field (all fields except density) computation (because one of the vertices is a dummy point)
+    vector<size_t> dummyGridCells_d;
+    vector<size_t> dummyGridCells;
 #endif
-    
-    
-    // initialize the class that does the geometrical intersection by splitting the volume into triangles/tetrahedra
+
+
+    // geometric intersection helper (clips each simplex against the grid into sub-polytopes)
     VOLUME_SPLIT::VolumeSplit volSplit( &(startPos[0]), nGrid, dx );
-    VOLUME_SPLIT::Simplex     simplex;      // will store the simplex: triangle or tetrahedron
-    vector<size_t>            indices;      // stores the grid cell indices of the large grid that intersect the simplex
-    vector< Pvector<Real,NO_DIM+1> > contributions;    //stores the contribution of the simplex to each of the grid cells in indices
-    
-    
-    // iterate over all the cells of the Delaunay triangulation
-    size_t prev = 0, amount100 = 0, count = 0;    // variable to show the user about the progress of the computation
+    VOLUME_SPLIT::Simplex     simplex;      // triangle (2D) or tetrahedron (3D)
+    vector<size_t>            indices;      // grid cell indices intersecting the simplex
+    vector< Pvector<Real,NO_DIM+1> > contributions;    // per-cell volume + field moment of the simplex
+
+
+    size_t prev = 0, amount100 = 0, count = 0;
 #if NO_DIM==2
     size_t noTotalCells = dt.number_of_faces();
     for(Finite_cells_iterator itC = dt.finite_faces_begin(); itC!= dt.finite_faces_end(); ++itC)
@@ -220,28 +219,25 @@ void interpolateGrid_averaged_0(DT &dt,
     for(Finite_cells_iterator itC = dt.finite_cells_begin(); itC!= dt.finite_cells_end(); ++itC)
 #endif
     {
-        // show the progress of the computation
         amount100 = (100 * count++)/ noTotalCells;
         if (prev < amount100)
             message.updateProgress( ++prev );
-        
-        
-        // if tetrahedron outside the box of interest, continue to next cell
+
+
         if ( cellOutsideRegion( dt, itC, fullBox) )
             continue;
-        
-        
-        // compute the inverse position matrix of the Delaunay cell
-        Real posMatrixInverse[NO_DIM][NO_DIM];  //stores the inverse of the vertex position difference matrix
-        positionMatrix( itC, posMatrixInverse );    //returns 'posMatrixInverse'
-        Vertex_handle base = itC->vertex(0);    // stores the "base" vertex of the Delaunay cell
-        
-        
-        // using the volume splitting procedure to get the intersection of the tetrahedron with the grid
+
+
+        Real posMatrixInverse[NO_DIM][NO_DIM];  // inverse vertex position-difference matrix
+        positionMatrix( itC, posMatrixInverse );
+        Vertex_handle base = itC->vertex(0);
+
+
+        // clip this simplex against the grid to get its per-cell volumes and field moments
         simplex.assign( itC );
         volSplit.findIntersection( simplex, indices, contributions );
-        
-        // compute the gradients inside the simplex
+
+        // field gradients are constant inside a Delaunay simplex
         Real densGrad[NO_DIM];
         densityGrad( itC, posMatrixInverse, densGrad );
         if (field.density) distributeContributions( indices, contributions, density, base->info().density(), densGrad, base );
@@ -258,8 +254,7 @@ void interpolateGrid_averaged_0(DT &dt,
         if (field.scalar_gradient) distributeContributions( indices, contributions, scalar_gradient, scalarGradient(sGrad) );
 #endif
         
-        
-        // check if any of the cell vertices have dummy points as neighbors
+
 #ifdef TEST_PADDING
         bool dummyNeighbors = hasDummyNeighbor( itC );
         bool dummyVertices = hasDummyVertex( itC );
@@ -267,10 +262,10 @@ void interpolateGrid_averaged_0(DT &dt,
         if ( dummyVertices ) updateDummyGridCells( indices, &incompleteCells );
 #endif
     }
-    
-    
-    
-    // divide the values in each cell by the volume of each sampling cell to get the volume averaged field value at the sample point
+
+
+
+    // divide by grid-cell volume to turn accumulated contributions into volume averages
     if (field.density)
         for (vector<Real>::iterator it=density->begin(); it!=density->end(); ++it)
             *it /= gridCellVolume;
@@ -296,9 +291,9 @@ void interpolateGrid_averaged_0(DT &dt,
     
 #ifdef TEST_PADDING
     if (field.density)
-        showCellsContainingDummyPoints( &incompleteCells_d, userOptions, userOptions.outputFilename+"_density", "density" ); // check if there are any cells which may have an error in thedensity estimation due to an incomplete Delaunay tesselation over the region of interest
+        showCellsContainingDummyPoints( &incompleteCells_d, userOptions, userOptions.outputFilename+"_density", "density" ); // report cells whose density may be wrong (incomplete tessellation)
     if ( field.velocity or field.velocity_gradient or field.scalar or field.scalar_gradient )
-        showCellsContainingDummyPoints( &incompleteCells, userOptions, userOptions.outputFilename+"_fields", "fields" ); // check if there are any cells which may have an error in the fields estimation (all fields except density) due to an incomplete Delaunay tesselation over the region of interest
+        showCellsContainingDummyPoints( &incompleteCells, userOptions, userOptions.outputFilename+"_fields", "fields" ); // report cells whose other fields may be wrong (incomplete tessellation)
 #endif
 }
 

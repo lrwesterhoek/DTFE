@@ -1,7 +1,11 @@
+/* Umbrella header that pulls in the CGAL types and all shared triangulation/interpolation
+   helpers; every interpolation compilation unit includes this one file. */
+
 #ifndef TRIANGULATION_COMMON_HEADER
 #define TRIANGULATION_COMMON_HEADER
 
 #include "../define.h"
+// Pick the 2D or 3D CGAL triangulation types based on the compile-time dimension.
 #if NO_DIM==2
     #include "CGAL_include_2D.h"
 #elif NO_DIM==3

@@ -22,10 +22,8 @@
 
 
 
-/*!
-Defines a class that keeps track of the coordinates of a box.
-The box coordinates are stored in a vector using the sequance:
-        xMin, xMax, yMin, yMax, ...
+/*
+Axis-aligned box. Coordinates stored as: xMin, xMax, yMin, yMax, ...
 */
 
 #ifndef BOX_HEADER
@@ -42,12 +40,11 @@ The box coordinates are stored in a vector using the sequance:
 
 struct Box
 {
-    std::vector<Real> coords;    //the coordinates of the box as: xMin, xMax, yMin, yMax, ...
-    
-    //! Class functions
-    Box() {coords.assign( 2*NO_DIM, Real(0.) );}   // constructor
-    
-    // returns true if the particle is inside the box
+    std::vector<Real> coords;    // box coordinates as: xMin, xMax, yMin, yMax, ...
+
+    Box() {coords.assign( 2*NO_DIM, Real(0.) );}
+
+    // Returns true if the particle's Eulerian position lies inside the box.
     template <typename Particle> bool isParticleInBox(Particle &p) const
     {
         for (size_t i=0; i<NO_DIM; ++i)
@@ -56,7 +53,7 @@ struct Box
         return true;
     }
 #ifdef PHASE_SPACE
-    // returns true if the particle's Lagrangian position is inside the box
+    // Returns true if the particle's Lagrangian (initial) position lies inside the box.
     template <typename Particle> bool isParticleLagrangianInBox(Particle &p) const
     {
         for (size_t i=0; i<NO_DIM; ++i)
@@ -65,7 +62,7 @@ struct Box
         return true;
     }
 #endif
-    // returns true if the point is inside the box
+    // Returns true if the point lies inside the box.
     template <typename Point> bool isPointInBox(Point &p) const
     {
         for (size_t i=0; i<NO_DIM; ++i)
@@ -74,7 +71,7 @@ struct Box
         return true;
     }
     
-    // checks if second box is overlaping with this one
+    // Returns true if 'other' overlaps this box along every axis.
     bool isBoxOverlaping(Box const &other) const
     {
         for (size_t i=0; i<NO_DIM; ++i)
@@ -92,7 +89,7 @@ struct Box
         return false;
     }
     
-    // translates the box according to the offset
+    // Shifts the box by 'offset' along each axis.
     void translate(Real *offset)
     {
         for (size_t i=0; i<NO_DIM; ++i)
@@ -102,7 +99,7 @@ struct Box
         }
     }
     
-    // increase box size by padding[i] along each edge
+    // Grows the box outward by padding[2*i] on the low edge and padding[2*i+1] on the high edge of each axis.
     template <typename T>
     void addPadding(T padding)
     {
@@ -113,7 +110,7 @@ struct Box
         }
     }
     
-    // checks that this is a valid sub-box of a larger box (i.e. see exact requierments at function definition)
+    // Errors out unless this is a valid sub-box of mainBox: periodic allows edges up to one boxLength outside, non-periodic requires it to fit inside.
     void validSubBox(Box &mainBox, bool periodic) const
     {
         if (periodic)
@@ -139,7 +136,7 @@ struct Box
                 }
     }
     
-    // returns box volume
+    // Returns the box volume (product of edge lengths).
     Real volume() const
     {
         Real temp = 1.;
@@ -149,7 +146,7 @@ struct Box
         return temp;
     }
     
-    // outputs the box boundaries
+    // Returns the box boundaries as a printable "{[min,max],...}" string.
     std::string print() const
     {
         std::ostringstream buffer;
@@ -160,19 +157,19 @@ struct Box
         return buffer.str();
     }
     
-     // overload the [] operator - returns access to vector entries directly
+    // Direct access to coordinate entry i.
     Real& operator [](size_t const i)
     { return coords[i]; }
-    
-     // assigns a constant value to all the entries
+
+    // Assigns a constant value to all coordinate entries.
     void assign(Real const value)
     { coords.assign( 2*NO_DIM, value ); }
-    
-    // returns the number of coordinates
+
+    // Returns the number of stored coordinates (2*NO_DIM).
     size_t size() const
     { return coords.size();}
-    
-    // check if there are specified coordinates for the box (i.e. if box !=[0,0] )
+
+    // Returns true if no coordinates have been set (all entries are 0).
     bool isNullBox()
     {
         for (size_t i=0; i<coords.size(); ++i)

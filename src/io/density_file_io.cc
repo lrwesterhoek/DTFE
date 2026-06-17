@@ -23,14 +23,14 @@
 
 
 
-//! Define a header for the output file.
+/* Header struct stored at the start of a density output file, plus its read/write helpers. */
 
-// constants to keep track of how the density was computed
+// how the density was computed
 static size_t const DTFE_METHOD = 1;
 static size_t const TSC_METHOD = 2;
 static size_t const SPH_METHOD = 3;
 static size_t const UNKNOW_METHOD = -1;
-// constants to keep track what fields the file contains
+// which field the file contains
 static int const DENSITY_FILE = 1;
 static int const VELOCITY_FILE = 11;
 static int const VELOCITY_GRADIENT_FILE = 12;
@@ -43,39 +43,38 @@ static int const SCALAR_FIELD_GRADIENT_FILE = 21;
 static int const UNKNOW_FILE = -1;
 
 
-static int const fillSize = 1024 - 13*8 - 8*18 - 8*2;   //fill the header up to 1024 bytes
+static int const fillSize = 1024 - 13*8 - 8*18 - 8*2;   // pads the header to 1024 bytes
 
-// data structure that stores information in the header of a density file output
+// Fixed 1024-byte header written at the start of a density/field output file, describing the grid,
+// the field type, the box, and the source snapshot's cosmology.
 struct Density_header
 {
-    // Information about the density computations
-    size_t  gridSize[3];    // the size of the density grid along all 3D directions
-    size_t  totalGrid;      // the total size of the grid = gridSize[0]*gridSize[1]*gridSize[2]
-    int     fileType;       // keeps track of the field type stored in the file: DENSITY_FILE, VELOCITY_FILE, etc...
-    int     noDensityFiles; // the number of density files corresponding to this run
-    int     densityFileGrid[3];  // if density is saved within multiple files, each file stores only a patch of the full density (the patches are given by a regular grid with this variable giving the dimensions of that grid)
-    int     indexDensityFile;    // keeps track of this density file index compared to the rest for multiple files (this tells the program what region of the density is saved in this file)
-    double  box[6];         // keep track of the box coordinates in which the density was computed (xMin, xMax, yMin, yMax, zMin, zMax)
-    
-    
-    // the following are the same as for the gadget file header and are meant to store information about the input file used to compute the density
-    size_t   npartTotal[6];// gives the total number of particles in the gadget simulation for which we compute the density profile
-    double   mass[6];      // the mass of the particles in the N-body code
-    double   time;         // the expansion parameter 'a' of the snapshot file from which we computed the density
-    double   redshift;     // the corresponding redshift
-    double   BoxSize;      // the box size in kpc
+    size_t  gridSize[3];    // density grid dimensions along the 3 directions
+    size_t  totalGrid;      // total grid size = gridSize[0]*gridSize[1]*gridSize[2]
+    int     fileType;       // field type stored: DENSITY_FILE, VELOCITY_FILE, etc.
+    int     noDensityFiles; // number of density files for this run
+    int     densityFileGrid[3];  // when split across files, grid dimensions of the patch partition
+    int     indexDensityFile;    // this file's index in the partition (which region it holds)
+    double  box[6];         // box coordinates of the density (xMin, xMax, yMin, yMax, zMin, zMax)
+
+
+    // mirror of the gadget header: info about the input snapshot used to compute the density
+    size_t   npartTotal[6];// total number of particles in the gadget simulation
+    double   mass[6];      // particle masses in the N-body code
+    double   time;         // expansion parameter 'a' of the snapshot
+    double   redshift;     // corresponding redshift
+    double   BoxSize;      // box size in kpc
     double   Omega0;       // Omega_matter
     double   OmegaLambda;  // Omega_Lambda
-    double   HubbleParam;  // Hubble parameter h (where H=100 h km/s /Mpc )
-    
-    
-    // additional information about files
-    size_t  method;        // the method used to compute the density DTFE_METHOD, TSC_METHOD or SPH_METHOD
-    char    fill[fillSize];// fill to 1024 bytes - left 760 - used to keep track of information on how the file was obtained
-    size_t  FILE_ID;       // keep a unique id for this type of file
-    
-    
-    // constructor - initializes to 0 or to non-assigned value (=-1) 
+    double   HubbleParam;  // Hubble parameter h (H = 100 h km/s/Mpc)
+
+
+    size_t  method;        // density method: DTFE_METHOD, TSC_METHOD or SPH_METHOD
+    char    fill[fillSize];// pad to 1024 bytes; also stores the command line used to obtain the file
+    size_t  FILE_ID;       // unique id for this file type
+
+
+    // Initializes every field to 0 or to the not-assigned sentinel (-1).
     Density_header()
     {
         for (int i=0; i<3; ++i)
@@ -100,7 +99,7 @@ struct Density_header
         FILE_ID = 1;
     }
     
-    // print the content of the density header to the standard output
+    // Prints the header contents to stdout.
     void print()
     {
         std::string densityMethod = "unknown";
@@ -146,7 +145,7 @@ struct Density_header
             << "fill            = " << fill << "\n\n";
     }
     
-    // update entries in the header using the userOptions class
+    // Fills the header from the user options and the variable name (grid, box, method, file type).
     void updateDensityHeader(User_options userOptions, std::string variableName)
     {
         if ( userOptions.regionOn and not userOptions.regionMpcOn )
@@ -173,7 +172,7 @@ struct Density_header
 #endif
         this->totalGrid = this->gridSize[0]*this->gridSize[1]*this->gridSize[2];
         
-        // copy the program options used to get the data
+        // store the program options used to get the data in the fill block
         int commandLength = userOptions.programOptions.length();
         for (int i=0; i<userOptions.programOptions.length(); ++i)
             this->fill[i] = userOptions.programOptions[i];
@@ -182,16 +181,15 @@ struct Density_header
         this->fill[ commandLength+2 ] = ' ';
         this->fill[ commandLength+3 ] = ' ';
         for (int i=commandLength+4; i<fillSize; ++i)
-            this->fill[i] = '\0';   // initialize the other elements to empty
-        
-        // get details about the methods
+            this->fill[i] = '\0';
+
         if ( userOptions.partNo>=0 )
             this->indexDensityFile = userOptions.partNo;
         if ( userOptions.DTFE ) this->method = DTFE_METHOD;
         else if ( userOptions.TSC ) this->method = TSC_METHOD;
         else if ( userOptions.SPH ) this->method = SPH_METHOD;
-        
-        // get details about the output fields in the file
+
+        // Derive the file type from keywords in the variable name (order matters: check specific before generic).
         if ( variableName.find( "density" )!=std::string::npos ) this->fileType = DENSITY_FILE;
         else if ( variableName.find( "velocity gradient" )!=std::string::npos ) this->fileType = VELOCITY_GRADIENT_FILE;
         else if ( variableName.find( "velocity divergence" )!=std::string::npos ) this->fileType = VELOCITY_DIVERGENCE_FILE;
@@ -203,19 +201,18 @@ struct Density_header
         else if ( variableName.find( "scalar gradient" )!=std::string::npos ) this->fileType = SCALAR_FIELD_GRADIENT_FILE;
     }
     
-    // copy information from the gadget header
+    // Copies snapshot info (particle counts, masses, cosmology) from the input Gadget header into this header.
     void copyGadgetHeaderInfo(User_options userOptions)
     {
         Gadget_header gadgetHeader;
         std::string filename = gadgetHeader.filename( userOptions.inputFilename, 0, false );
-        if ( not bfs::exists(filename) ) return;    //file could not be found
-        
+        if ( not bfs::exists(filename) ) return;    // file could not be found
+
         if ( userOptions.inputFileType==101 or userOptions.inputFileType==102 )
         {
-            // open the first binary file for reading and read some of the overall characteristics
             std::fstream inputFile;
             openInputBinaryFile( inputFile, filename );
-            
+
             // read the header
             int buffer, gadgetFileType;
             bool swapEndian = false;
@@ -252,7 +249,7 @@ struct Density_header
 
 
 
-/*! Writes a binary density file - it has a custom header that keeps track of the data in the file. */
+// Writes a field to a binary file prefixed by a Density_header that records how the data was produced.
 template <typename T>
 void writeSpecialFile(T const &dataToWrite,
                         std::string filename,
@@ -267,30 +264,29 @@ void writeSpecialFile(T const &dataToWrite,
     
     MESSAGE::Message message( userOptions.verboseLevel );
     message << "Writing the " << variableName << " to the file '" << filename << "' ...  " << MESSAGE::Flush;
-    
-    // open the file
+
     std::fstream outputFile;
     openOutputBinaryFile( outputFile, filename );
-    
-    
+
+
     // write the header
     size_t buffer = sizeof( densityHeader );
     outputFile.write( reinterpret_cast<char *>(&buffer), sizeof(buffer) );
     outputFile.write( reinterpret_cast<char *>(&densityHeader), sizeof(densityHeader) );
     outputFile.write( reinterpret_cast<char *>(&buffer), sizeof(buffer) );
-    
-    // write the position of the particles
-    buffer = dataToWrite.size()*sizeof(dataToWrite[0]); //total number of data bytes written
+
+    // write the data, in blocks of at most 256^3 elements (a single huge write() can fail)
+    buffer = dataToWrite.size()*sizeof(dataToWrite[0]);
     outputFile.write( reinterpret_cast<char *>(&buffer), sizeof(buffer) );
-    size_t maxSize = 256*256*256;   //write at most 256^3 elements at once, otherwise the write function might fail
+    size_t maxSize = 256*256*256;
     size_t noRepeats = size_t( dataToWrite.size() / maxSize ), currentPosition = 0;
     size_t tempBuffer = maxSize * sizeof(dataToWrite[0]);
-    for (size_t i=0; i<noRepeats; ++i)  //write in blocks of 256^3 elements
+    for (size_t i=0; i<noRepeats; ++i)
     {
         outputFile.write( reinterpret_cast<char const *>(&(dataToWrite[currentPosition])), tempBuffer );
         currentPosition += maxSize;
     }
-    tempBuffer = (dataToWrite.size() - currentPosition) * sizeof(dataToWrite[0]);    // write everything else that is left
+    tempBuffer = (dataToWrite.size() - currentPosition) * sizeof(dataToWrite[0]);    // write the remainder
     outputFile.write( reinterpret_cast<char const *>(&(dataToWrite[currentPosition])), tempBuffer );
     outputFile.write( reinterpret_cast<char *>(&buffer), sizeof(buffer) );
     

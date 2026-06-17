@@ -1,9 +1,3 @@
-"""
-DTFE Field Visualization Tool
-
-Loads binary field data (density, velocity, divergence, shear) and creates
-2D slice visualizations across different planes.
-"""
 
 import os
 import numpy as np
@@ -12,19 +6,14 @@ import matplotlib.colors as colors
 from scipy.ndimage import gaussian_filter
 from pathlib import Path
 
-# ============================================================================
-# Configuration Section
-# ============================================================================
-
-BASE_DATA_DIR = "output/TNG50-3-Dark"
+BASE_DATA_DIR = "/Users/luukw/output/TNG50-3-Dark"
 OUTPUT_DIR = "python/figures/dtfe"
 
 FIELD_RESOLUTION = 512
-BOX_SIZE = 51.7  # Mpc
+BOX_SIZE = 51.7
 AXIS_UNITS = "Mpc"
 VELOCITY_UNITS = "km/s"
 
-# Snapshot to redshift mapping
 SNAPSHOT_TO_REDSHIFT = {
     '000': 20.05,
     '004': 10.00,
@@ -44,21 +33,16 @@ SNAPSHOT_TO_REDSHIFT = {
     '099': 0.00
 }
 
-# Which slice planes to visualize? (0=YZ, 1=XZ, 2=XY)
 SLICE_PLANES_TO_PLOT = [0, 1, 2]
 
-# Which fields to process?
 PROCESS_DENSITY = True
 PROCESS_VELOCITY = True
 PROCESS_DIVERGENCE = True
 PROCESS_SHEAR = True
 
-# Visualization settings
 GAUSSIAN_SMOOTHING_SIGMA = 0.0
 VELOCITY_QUIVER_STEP = 8
 DPI = 300
-
-# ============================================================================
 
 SLICE_PLANES = {
     0: {'name': 'yz_plane', 'axis_labels': ('Y', 'Z')},
@@ -66,15 +50,7 @@ SLICE_PLANES = {
     2: {'name': 'xy_plane', 'axis_labels': ('X', 'Y')}
 }
 
-# ============================================================================
-# File Loading Functions
-# ============================================================================
-
 def load_binary_field(binary_file, field_shape, num_components=1, dtype=np.float32):
-    """
-    Generic loader for binary field data.
-    Handles scalar and vector/tensor fields via num_components parameter.
-    """
     data = np.fromfile(binary_file, dtype=dtype)
     expected_size = np.prod(field_shape) * num_components
     
@@ -95,28 +71,22 @@ def load_binary_field(binary_file, field_shape, num_components=1, dtype=np.float
     else:
         return data.reshape(field_shape + (num_components,))
 
-# ============================================================================
-# Slice Extraction
-# ============================================================================
-
 def extract_slice(field, slice_dim=2):
-    """Extract a 2D slice from a 3D field at the midpoint."""
     idx = field.shape[slice_dim] // 2
     slices = [slice(None)] * 3
     slices[slice_dim] = idx
     return field[tuple(slices)]
 
 def extract_velocity_slice(velocity_field, slice_dim=2):
-    """Extract velocity components for a 2D slice."""
     idx = velocity_field.shape[slice_dim] // 2
     
-    if slice_dim == 0:  # YZ plane
+    if slice_dim == 0:
         slice_data = velocity_field[idx, :, :]
         U, V = slice_data[..., 1], slice_data[..., 2]
-    elif slice_dim == 1:  # XZ plane
+    elif slice_dim == 1:
         slice_data = velocity_field[:, idx, :]
         U, V = slice_data[..., 0], slice_data[..., 2]
-    else:  # XY plane
+    else:
         slice_data = velocity_field[:, :, idx]
         U, V = slice_data[..., 0], slice_data[..., 1]
     
@@ -124,12 +94,7 @@ def extract_velocity_slice(velocity_field, slice_dim=2):
     X, Y = np.meshgrid(np.arange(nx), np.arange(ny), indexing='xy')
     return X, Y, U, V
 
-# ============================================================================
-# Visualization Functions
-# ============================================================================
-
 def plot_density(density_field, slice_dim, box_size, redshift=None, save_path=None):
-    """Create a density field visualization."""
     dens_slice = extract_slice(density_field, slice_dim).T
     vmin = max(np.min(dens_slice[dens_slice > 0]), 1e-6)
     
@@ -164,7 +129,6 @@ def plot_density(density_field, slice_dim, box_size, redshift=None, save_path=No
 
 def plot_velocity(velocity_field, slice_dim, box_size, quiver_step, 
                  redshift=None, save_path=None):
-    """Create a velocity field visualization with arrows."""
     X, Y, U, V = extract_velocity_slice(velocity_field, slice_dim)
     U, V = U.T, V.T
     
@@ -213,7 +177,6 @@ def plot_velocity(velocity_field, slice_dim, box_size, quiver_step,
         plt.show()
 
 def plot_divergence(div_field, slice_dim, box_size, redshift=None, save_path=None):
-    """Create a velocity divergence visualization."""
     div_slice = extract_slice(div_field, slice_dim).T
     vmin, vmax = np.percentile(div_slice, [1, 99])
     
@@ -247,7 +210,6 @@ def plot_divergence(div_field, slice_dim, box_size, redshift=None, save_path=Non
         plt.show()
 
 def plot_shear(shear_field, slice_dim, box_size, redshift=None, save_path=None):
-    """Create a velocity shear magnitude visualization."""
     σ_xx = shear_field[..., 0]
     σ_xy = shear_field[..., 1]
     σ_xz = shear_field[..., 2]
@@ -292,13 +254,7 @@ def plot_shear(shear_field, slice_dim, box_size, redshift=None, save_path=None):
     else:
         plt.show()
 
-# ============================================================================
-# Main Processing
-# ============================================================================
-
 def process_snapshot(snapshot, redshift):
-    """Load field data and create visualizations for a single snapshot."""
-    
     print(f"\nProcessing snapshot {snapshot} (z={redshift:.2f})")
     
     snapshot_dir = Path(BASE_DATA_DIR) / f"snapdir_{snapshot}"
@@ -380,7 +336,6 @@ def process_snapshot(snapshot, redshift):
     return True
 
 def main():
-    """Process all configured snapshots."""
     
     fields_to_process = []
     if PROCESS_DENSITY: fields_to_process.append("density")

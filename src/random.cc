@@ -21,6 +21,9 @@
  */
 
 
+/* Random-sampling helpers: take a random subsample of the data, or generate a Poisson particle field. */
+
+
 #include <vector>
 
 #include "define.h"
@@ -36,7 +39,7 @@ typedef boost::mt19937 base_generator_type;
 typedef std::vector<Particle_data>::iterator   vectorIterator;
 
 
-/* This function selects from the input data a random subsample, with the subsample size given by 'User_options::randomSample'. */
+// Select a random subsample of the input data; fraction set by 'User_options::randomSample'.
 void randomSample(std::vector<Particle_data> particles,
                   std::vector<Particle_data> *subSample,
                   User_options userOptions )
@@ -65,7 +68,7 @@ void randomSample(std::vector<Particle_data> particles,
 
 
 
-/* This function generates random particles in a box of unit length. */
+// Generate a Poisson distribution of particles in a unit box.
 void randomParticles(std::vector<Particle_data> *particles,
                      User_options *userOptions )
 {

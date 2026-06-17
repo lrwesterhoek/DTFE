@@ -22,39 +22,37 @@
 
 
 
-/* This files defines 2 classes used for easy reading of the data from an input file.
- 
-It also defines 4 functions to open binary/text files for input/output. */
+/* Defines the classes used for reading data from an input file, plus 4 functions to open
+binary/text files for input/output. */
 
 #include <algorithm>
 
 
-// structure for pairs of pointer and bool used in structure 'Read_data'
+// Owning pointer + allocated flag for one Read_data array; frees its buffer on destruction.
 template <typename T>
 struct PairPtrBool
 {
     T *_ptr;
     bool _assigned;
-    
-    PairPtrBool()   //constructor - initializes everything to NULL and false
+
+    PairPtrBool()
     {
         _ptr = NULL;
         _assigned = false;
     }
-    ~PairPtrBool()  //destructor - frees memory if assigned
+    ~PairPtrBool()  // frees the buffer if it was allocated
     {
         if ( _assigned ) delete[] _ptr;
     }
-    
-    // assigns memory to the pointer
+
+    // Allocates 'size' items of 'dimensions' components each; enforces (via *expectedSize) that all
+    // Read_data arrays share the same item count.
     T* assignMemory(size_t const size,
                     size_t *expectedSize,
                     size_t dimensions,
                     std::string name)
     {
-        // if memory was already allocated, throw error
         if ( _assigned ) throwError( "When allocating memory for the variable 'Read_data::", name, "'. The memory was already allocated for the given variable." );
-        // if 'size'!='expected size'
         if ( size!=(*expectedSize) and (*expectedSize)!=size_t(0) )
         {
             MESSAGE::Error error;
@@ -65,11 +63,10 @@ struct PairPtrBool
         _assigned = true;
         return _ptr;
     }
-    
-    // returns a pointer to the data
+
+    // Returns the data pointer; throws if no memory was allocated.
     T* returnPointer(std::string name)
     {
-        // if memory wasn't already allocated, throw error
         if ( not _assigned ) throwError( "When returning pointer for the variable 'Read_data::", name, "'. There was no memory allocation for the given variable." );
         return _ptr;
     }
@@ -77,26 +74,26 @@ struct PairPtrBool
 
 
 
-// structure to transfer the read data between functions
+// Holds the raw particle and sampling-grid arrays read from disk, then hands them to the solver.
 template <typename T>
 struct Read_data
 {
-    size_t _noParticles; // stores the number of particles 
-    PairPtrBool<T>  _position;   // pointer to array storing the position data
-    PairPtrBool<T>  _velocity;   // pointer to array storing the velocity data
-    PairPtrBool<T>  _weight;     // pointer to array storing the weight data
-    PairPtrBool<T>  _scalar;     // pointer to array storing the scalar data
+    size_t _noParticles; // number of particles
+    PairPtrBool<T>  _position;   // position data
+    PairPtrBool<T>  _velocity;   // velocity data
+    PairPtrBool<T>  _weight;     // weight data
+    PairPtrBool<T>  _scalar;     // scalar data
 #ifdef PHASE_SPACE
-    PairPtrBool<T>  _lagrangianPosition; // pointer to array storing the Lagrangian (initial) position data
+    PairPtrBool<T>  _lagrangianPosition; // Lagrangian (initial) position data
     std::vector<uint64_t> _particleIDs;  // particle IDs for ID-based Lagrangian matching
     bool _lagrangianPositionPopulated;   // true if lag positions were actually read (not just allocated)
 #endif
-    
-    size_t _noSamples;   // stores the number of user given sample points (if any)
-    PairPtrBool<T>  _sampling;   // pointer to array storing the user given sampling grid points
-    PairPtrBool<T>  _delta;      // pointer to array storing the size of the user given sampling grids 
-    
-    
+
+    size_t _noSamples;   // number of user-given sample points (if any)
+    PairPtrBool<T>  _sampling;   // user-given sampling grid points
+    PairPtrBool<T>  _delta;      // cell sizes of the user-given sampling grid
+
+
     Read_data()
     {
         _noParticles = 0;
@@ -109,24 +106,24 @@ struct Read_data
     
     size_t noParticles() { return _noParticles;}
     size_t noSamples() { return _noSamples;}
-    
-     // return pointer to position data (valid only if assigned memory)
+
+    // no-arg overloads return the pointer (memory must already be allocated); the sized overloads
+    // allocate the memory and return the pointer
     T * position()
     { return _position.returnPointer("position"); }
-    // assign memory to store position data and return pointer to assigned memory
     T * position( size_t const noParticles)
     { return _position.assignMemory( noParticles, &_noParticles, NO_DIM, "position" ); }
-    
+
     T * velocity()
     { return _velocity.returnPointer("velocity"); }
     T * velocity( size_t const noParticles)
     { return _velocity.assignMemory( noParticles, &_noParticles, noVelComp, "velocity" ); }
-    
+
     T * weight()
     { return _weight.returnPointer("weight"); }
     T * weight( size_t const noParticles)
     { return _weight.assignMemory( noParticles, &_noParticles, 1, "weight" ); }
-    
+
     T * scalar()
     { return _scalar.returnPointer("scalar"); }
     T * scalar( size_t const noParticles)
@@ -143,18 +140,18 @@ struct Read_data
     { return _sampling.returnPointer("sampling"); }
     T * sampling( size_t const noSamples)
     { return _sampling.assignMemory( noSamples, &_noSamples, NO_DIM, "sampling" ); }
-    
+
     T * delta()
     { return _delta.returnPointer("delta"); }
-    T * delta( size_t const noSamples)  // assign memory to store delta for user given sampling points and return pointer to assigned memory
+    T * delta( size_t const noSamples)
     { return _delta.assignMemory( noSamples, &_noSamples, NO_DIM, "delta" ); }
-    
-    
-    // writes the data kept in pointers of this structure to a 'Particle_data' and 'Sample_point' vectors
+
+
+    // Repacks the flat arrays into 'Particle_data' / 'Sample_point' vectors (only arrays that were allocated).
     void transferData(std::vector<Particle_data> *p,
                       std::vector<Sample_point>  *s)
     {
-        // first write the particle data
+        // particle data: copy only the arrays that were actually allocated
         if ( _noParticles>size_t(0) )
         {
             p->clear();
@@ -162,25 +159,26 @@ struct Read_data
             for (size_t i=0; i<_noParticles; ++i)
             {
                 Particle_data temp;
-                if ( _position._assigned )   // copy positions if assigned
+                if ( _position._assigned )
                     for (size_t j=0; j<NO_DIM; ++j)
                         temp.position(j) = _position._ptr[NO_DIM*i+j];
-                if ( _velocity._assigned )   // copy velocities if assigned
+                if ( _velocity._assigned )
                     for (size_t j=0; j<noVelComp; ++j)
                         temp.velocity(j) = _velocity._ptr[noVelComp*i+j];
-                if ( _weight._assigned )   // copy weight if assigned
+                if ( _weight._assigned )
                     temp.weight() = _weight._ptr[i];
-                if ( _scalar._assigned )   // copy scalar fields if assigned
+                if ( _scalar._assigned )
                     for (size_t j=0; j<noScalarComp; ++j)
                         temp.scalar(j) = _scalar._ptr[noScalarComp*i+j];
 #ifdef PHASE_SPACE
-                if ( _lagrangianPosition._assigned )   // copy Lagrangian positions if assigned
+                if ( _lagrangianPosition._assigned )
                     for (size_t j=0; j<NO_DIM; ++j)
                         temp.lagrangianPosition(j) = _lagrangianPosition._ptr[NO_DIM*i+j];
 #endif
                 p->push_back( temp );
             }
         }
+        // sample points: copy only the arrays that were actually allocated
         if ( _noSamples>size_t(0) )
         {
             s->clear();
@@ -188,10 +186,10 @@ struct Read_data
             for (size_t i=0; i<_noSamples; ++i)
             {
                 Sample_point temp;
-                if ( _sampling._assigned )   // copy sample positions if assigned
+                if ( _sampling._assigned )
                     for (int j=0; j<NO_DIM; ++j)
                         temp.position(j) = _sampling._ptr[NO_DIM*i+j];
-                if ( _delta._assigned )      // copy grid point sizes if assigned
+                if ( _delta._assigned )
                     for (int j=0; j<NO_DIM; ++j)
                         temp.delta(j) = _delta._ptr[NO_DIM*i+j];
                 s->push_back( temp );
@@ -203,7 +201,7 @@ struct Read_data
 
 
 
-/* This function opens a binary file for input (to read from the file). It checks that the operation was done succesfully. */
+// Opens a binary file for input, exiting on failure.
 void openInputBinaryFile(std::fstream & inputFile,
                          std::string & fileName)
 {
@@ -216,7 +214,7 @@ void openInputBinaryFile(std::fstream & inputFile,
         exit( EXIT_FAILURE );
     }
 }
-/* This function opens a binary file for output (to write data to the file). It checks that the operation was done succesfully. */
+// Opens a binary file for output, exiting on failure.
 void openOutputBinaryFile(std::fstream & outputFile,
                           std::string & fileName)
 {
@@ -229,7 +227,7 @@ void openOutputBinaryFile(std::fstream & outputFile,
         exit( EXIT_FAILURE );
     }
 }
-/* This function opens a text file for input (to read from the file). It checks that the operation was done succesfully. */
+// Opens a text file for input, exiting on failure.
 void openInputTextFile(std::fstream & inputFile,
                        std::string & fileName)
 {
@@ -242,7 +240,7 @@ void openInputTextFile(std::fstream & inputFile,
         exit( EXIT_FAILURE );
     }
 }
-/* This function opens a text file for output (to write data to the file). It checks that the operation was done succesfully. */
+// Opens a text file for output, exiting on failure.
 void openOutputTextFile(std::fstream & outputFile,
                         std::string & fileName)
 {
@@ -257,7 +255,7 @@ void openOutputTextFile(std::fstream & outputFile,
 }
 
 
-/* This function check that the file operations (reading/writting to file) were execute correctly. */
+// Checks that the last file read/write succeeded (eof alone is not treated as an error).
 void checkFileOperations(std::fstream & file,
                          std::string operationName)
 {
@@ -266,12 +264,10 @@ void checkFileOperations(std::fstream & file,
         error << "The " << operationName << " file operation has failed. The function ios::bad() has return an error that can be due to the file not being open or if the device has no more writing space left." << MESSAGE::EndError;
     else if ( file.fail() )
         error << "The " << operationName << " file operation has failed. A format error has happened. There are two possible causes for the error: you were trying to read a number, but an alphabetical character was found or you got to the end of the file before being able to read all the data." << MESSAGE::EndError;
-//     else if ( file.eof() )
-//         error << "The " << operationName << " to/from file operation has failed. The file ended before all the data could be " << operationName << " to/from file." << MESSAGE::EndError;
 }
 
 
-// Function used to swap bytes between different endianness
+// Reverses 'n' bytes in place to convert a single value between endiannesses.
 inline void ByteSwap(unsigned char * b, int n)
 {
 	int i = 0;
@@ -282,6 +278,7 @@ inline void ByteSwap(unsigned char * b, int n)
 		i++, j--;
 	}
 }
+// Swaps the endianness of each of the 'elements' values in array 'x'.
 template <typename T>
 void ByteSwapArray(T *x, size_t const elements)
 {

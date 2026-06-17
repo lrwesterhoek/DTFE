@@ -23,13 +23,8 @@
 
 
 /*
-  This header contains 3 classes:
-        Data_structure - contains all the point/particle data with the exception of the position
-        Particle_data - contains the point/particle position plus the data fields given in "Data_structure"
-        Sample_point - contains a class to store sample points in case the user wants to interpolate the field at his choice of grid points
-See below before each class for additional information.
-
-NOTE: to add additional point/particle properties just modify the variable "noScalarComp".
+  Data_structure (particle data minus position), Particle_data (position + Data_structure),
+  Sample_point (user-supplied points to interpolate at). To add properties, modify "noScalarComp".
 */
 
 
@@ -42,22 +37,21 @@ NOTE: to add additional point/particle properties just modify the variable "noSc
 
 
 
-/* This class contains all the point/particle properties with the exception of the position vector.
-NOTE: The "particle data" was split in two such that the point properties (with the exception of the position) can be easily transferred to the vertices of the Delaunay triangulation. */
+// Particle properties except position; split off so they can be carried on the triangulation vertices.
 class Data_structure
 {
     protected:
-        Real                       _weight; // weight of each particle
-        Real                       _density;// the value of the density will be computed later using the DTFE density interpolation at each vertex position
+        Real                       _weight; // particle weight
+        Real                       _density;// filled later by DTFE interpolation at each vertex
 #ifdef VELOCITY
-    Pvector<Real,noVelComp>    _velocity;// stores particle's velocity NOTE: "Pvector" is a 1D array which behaves like a physical vector
+    Pvector<Real,noVelComp>    _velocity; // particle velocity
 #else
-    static Pvector<Real,noVelComp> _velocity;//this will be defined only once for all 'Data_structure' classes - so it takes no memory at all
+    static Pvector<Real,noVelComp> _velocity; // static: shared instance, no per-particle cost
 #endif
 #ifdef SCALAR
-    Pvector<Real,noScalarComp> _scalar; // this variable will store additional point/particle data - the size of these data can be change via the parameter "noScalarComp"
+    Pvector<Real,noScalarComp> _scalar; // extra particle data; size set by "noScalarComp"
 #else
-    static Pvector<Real,noScalarComp> _scalar;//this will be defined only once for all 'Data_structure' classes - so it takes no memory at all
+    static Pvector<Real,noScalarComp> _scalar; // static: shared instance, no per-particle cost
 #endif
     
     public:
@@ -73,17 +67,13 @@ class Data_structure
 #endif
     }
 
-    // functions to access the weight
     inline Real& weight() { return _weight;}
     inline void setWeight(Real const w) { _weight = w;}
-    // functions to access the density
     inline Real& density() { return _density;}
     inline void setDensity(Real const d) { _density = d;}
-    // functions to access the velocity and its components
     inline Pvector<Real,noVelComp>& velocity() { return _velocity;}
     inline Real& velocity(int const i) { return _velocity[i];}
     inline void setVelocity(Real * vel) { for(size_t j=0; j<noVelComp; ++j) _velocity[j] = vel[j];}
-    // functions to access the scalar data
     inline Pvector<Real,noScalarComp>& scalar() { return _scalar;}
     inline Real& scalar(int const i) { return _scalar[i];}
     inline void setScalar(Real * s) { for(size_t j=0; j<noScalarComp; ++j) _scalar[j] = s[j];}
@@ -91,13 +81,12 @@ class Data_structure
 
 
 
-/* This is the class that will be used to transfer the point/particle's position and data between the different functions (units) of the program.
-NOTE: Do not modify the name of the position variable from 'pos' since the program will not compile. */
+// Carries a particle's position and data between program units. Member must stay named 'pos' or it won't compile.
 struct Particle_data : public Data_structure
 {
-    Pvector<Real,NO_DIM>   pos;    // stores particle's Eulerian position
+    Pvector<Real,NO_DIM>   pos;    // Eulerian position
 #ifdef PHASE_SPACE
-    Pvector<Real,NO_DIM>   lagPos; // stores particle's Lagrangian (initial) position
+    Pvector<Real,NO_DIM>   lagPos; // Lagrangian (initial) position
 #endif
 
     inline Pvector<Real,NO_DIM>& position() { return pos;}
@@ -112,14 +101,11 @@ struct Particle_data : public Data_structure
 
 
 
-/* In case the user whishes to know the interpolated fields as specific locations that do not follow the patern available with the code (spatial grid and light cone grid), than he can supply the positions of the sample points that he is interested of. The two components are:
-        pos - the coordinates of the user-specified sample points
-        delta - the grid size along each dimension associated to the given sample point (this is needed only for density interpolation since one needs to average over the full grid cell to filter the Poisson noise)
-NOTE: For the case of density interpolation the user needs to supply also values for 'delta', otherwise this is not required. */
+// User-supplied sample point for interpolating fields at arbitrary locations.
 struct Sample_point
 {
-    Pvector<Real,NO_DIM>    pos;   // stores the sampling point position for non-uniform grids
-    Pvector<Real,NO_DIM>    _delta; // stores the size of the grid cell along each direction for the given sampling point - only for non-unifrom grids
+    Pvector<Real,NO_DIM>    pos;    // sample point position
+    Pvector<Real,NO_DIM>    _delta; // grid cell size per axis; density interpolation only (cell averaged to filter Poisson noise)
     
     inline Pvector<Real,NO_DIM>& position() { return pos;}
     inline Real& position(int const i) { return pos[i];}

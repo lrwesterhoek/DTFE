@@ -24,30 +24,35 @@
 #ifndef PARTICLE_DATA_TRAITS_HEADER
 #define PARTICLE_DATA_TRAITS_HEADER
 
+/* Comparator traits that let CGAL::spatial_sort order Particle_data directly, so positions and their
+   attached fields stay together when the triangulation is built. */
+
 #include "../define.h"
 #include "../particle_data.h"
 
 
 
-// In PS-DTFE mode, spatial sorting uses Lagrangian positions (which are the triangulation coordinates).
-// In standard mode, sorting uses Eulerian positions.
+// Spatial-sort key: Lagrangian positions in PS-DTFE mode (the triangulation coords), Eulerian otherwise.
 #ifdef PHASE_SPACE
 #define SORT_POS lagPos
 #else
 #define SORT_POS pos
 #endif
 
+// Orders two particles by the x component of the sort-key position.
 struct Particle_data_less_x
 {
     bool operator()(Particle_data p, Particle_data q) const
     { return (p.SORT_POS[0] < q.SORT_POS[0]); }
 };
+// Orders two particles by the y component of the sort-key position.
 struct Particle_data_less_y
 {
     bool operator()(Particle_data p, Particle_data q) const
     { return (p.SORT_POS[1] < q.SORT_POS[1]); }
 };
 #if NO_DIM==2
+// Bundles the per-axis comparators into the SortTraits_2 concept spatial_sort expects.
 struct Particle_data_sort_traits
 {
     typedef Particle_data Point_2;
@@ -62,12 +67,14 @@ struct Particle_data_sort_traits
 };
 
 #elif NO_DIM==3
+// Orders two particles by the z component of the sort-key position.
 struct Particle_data_less_z
 {
     bool operator()(Particle_data p, Particle_data q) const
     { return p.SORT_POS[2]<q.SORT_POS[2]; }
 };
 
+// Bundles the per-axis comparators into the SortTraits_3 concept spatial_sort expects.
 struct Particle_data_sort_traits
 {
     typedef Particle_data Point_3;
@@ -87,7 +94,7 @@ struct Particle_data_sort_traits
 
 #undef SORT_POS
 
-// Compares two particles to be able to sort them according to positions
+// Total ordering of particles by Eulerian position (x, then y, then z); used to detect duplicates.
 template <typename T>
 bool compareParticles(T p1, T p2)
 {
@@ -106,6 +113,7 @@ bool compareParticles(T p1, T p2)
 #endif
 }
 
+// Returns true if two particles share the exact same Eulerian position (coincident points).
 template <typename T>
 bool sameParticle(T p1, T p2)
 {

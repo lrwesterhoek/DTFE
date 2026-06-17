@@ -21,9 +21,12 @@
  *
  */
 
+/* Top-level DTFE driver: builds the Delaunay triangulation, estimates per-vertex
+   densities, and dispatches field interpolation (standard, Voronoi, or PS-DTFE). */
+
 #include "triangulation_common.h"
 
-// Forward declarations of functions defined in separate compilation units
+// Interpolation functions defined in separate compilation units.
 void interpolateGrid(DT &dt, User_options &userOptions, Quantities *quantities);
 void interpolateRedshiftCone(DT &dt, User_options &userOptions, Quantities *quantities);
 void interpolateUserSampling(DT &dt, vector<Sample_point> &samples, User_options &userOptions, Quantities *quantities);
@@ -33,7 +36,7 @@ void interpolateGrid_averaged_3(DT &dt, User_options &userOptions, Quantities *q
 void interpolateRedshiftCone_averaged_2(DT &dt, User_options &userOptions, Quantities *quantities);
 void interpolateUserSampling_averaged_2(DT &dt, vector<Sample_point> &samples, User_options &userOptions, Quantities *quantities);
 #ifdef PHASE_SPACE
-void interpolateGrid_phaseSpace(DT &dt, User_options &userOptions, Quantities *quantities);
+void interpolateGrid_phaseSpace(DT &dt, User_options &userOptions, Quantities *quantities, Field &field, int nSub);
 #endif
 
 
@@ -46,15 +49,8 @@ void vertexDensity(DT & dt,
 
 
 
-/* This function computes the grid density in a periodic cosmological box of size [0,1] on each axis. If a non-periodic box is used, than points can have coordinates outside the [0,1] box to give a full Delaunay triangulation cover of the box. 
-The function arguments are:
-        p - vector which stores the particle positions and properties
-        samples - vector storing the user defined sampling points, if any
-        userOptions - structure to keep track of user given options and parameters for the interpolation
-        uQuantities - struture that will hold the output fields, fields interpolated at the sampling points
-        aQuantities - struture that will hold the output volume averaged fields, fields volume averaged over the grid cell associated to each sampling point
-        dt - the CGAL Delaunay triangulation structure that stores the full triangulation of the point set
-*/
+// Builds the Delaunay triangulation, computes vertex densities, and interpolates the requested fields.
+// uQuantities = per-point (unaveraged) fields, aQuantities = cell-volume-averaged fields.
 void DTFE_interpolation(vector<Particle_data> *p,
                         vector<Sample_point> &samples,
                         User_options &userOptions,
@@ -62,24 +58,18 @@ void DTFE_interpolation(vector<Particle_data> *p,
                         Quantities *aQuantities,
                         DT &dt)
 {
-    // check that some conditions are satified (to don't get errors later on after all the heavy work was done)
     intervalCheck( userOptions.method, 1, 3, "'userOptions.method' in function 'DTFE_interpolation' must have values from 1 to 3");
     if ( userOptions.method==3 )
         rootN( userOptions.noPoints, NO_DIM );
-    
-    
-    // Compute the Delaunay triangulation
-    Timer t;     // construct a timer
+
+
+    Timer t;
     t.start();
-    delaunayTriangulation( &dt, p, userOptions.verboseLevel );   // compute the triangulation
+    delaunayTriangulation( &dt, p, userOptions.verboseLevel );
     printComputationTime( &t, &userOptions, "triangulation" );
-    p->clear();  // delete the vector storing the particle data - not needed anymore
-    
-    
-    // insert dummy points to test the padding
-    // Skip for PS-DTFE: the dummy points use paddedBox (Eulerian) coordinates,
-    // but the PS-DTFE triangulation is built in Lagrangian space. Inserting
-    // Eulerian-coordinate points into the Lagrangian triangulation corrupts it.
+    p->clear();  // data lives in the triangulation now; free the input array
+
+    // Skip the padding test under PS-DTFE: dummy points use Eulerian coords, which corrupt the Lagrangian triangulation.
 #if defined(TEST_PADDING) && !defined(PHASE_SPACE)
     if ( userOptions.testPaddedBoundaries )
     {
@@ -90,16 +80,12 @@ void DTFE_interpolation(vector<Particle_data> *p,
 #endif
     
     
-    // compute the density associated to each Delaunay triangulation vertex (to each particle)
     t.start();
     vertexDensity( dt, userOptions );
     printComputationTime( &t, &userOptions, "vertex density computation" );
 
 
-    // For approximate PSD: multiply f_i = rho_i * g_i at each vertex.
-    // At this point, vertex.density() = rho_i (spatial density from vertexDensity)
-    // and vertex.scalar(0) = g_i (velocity-space density from computeVelocitySpaceDensity,
-    // which was stored in the particle scalar field before setData() copied it to vertices).
+    // approxPSD: form the phase-space density f_i = rho_i (spatial density) * g_i (velocity-space density, in scalar(0)).
 #if defined(SCALAR) && !defined(PHASE_SPACE)
     if ( userOptions.approxPSD )
     {
@@ -120,8 +106,7 @@ void DTFE_interpolation(vector<Particle_data> *p,
 #endif
 
 
-    // Voronoi volume density: NGP assignment of vertex densities to grid
-    // Bypasses DTFE linear interpolation — gives piecewise-constant density field
+    // Voronoi: NGP-assign vertex densities to grid (piecewise-constant; bypasses DTFE linear interpolation)
     if ( userOptions.Voronoi )
     {
         MESSAGE::Message message( userOptions.verboseLevel );
@@ -168,25 +153,24 @@ void DTFE_interpolation(vector<Particle_data> *p,
             counts[index] += Real(1.);
         }
 
-        // Average density in cells with multiple particles
+        // Average the density where multiple particles fell in one cell.
         for (size_t i=0; i<reserveSize; ++i)
             if ( counts[i] > Real(0.) )
                 aQuantities->density[i] /= counts[i];
 
         printComputationTime( &t, &userOptions, "Voronoi NGP grid assignment" );
         message << "Done.\n" << MESSAGE::Flush;
-        return;  // skip DTFE linear interpolation
+        return;  // Voronoi path is complete; skip DTFE linear interpolation.
     }
 
 
-    // interpolate the required fields
-    if ( userOptions.uField.selected() )    // interpolate the fields at the sampling points
+    if ( userOptions.uField.selected() )    // unaveraged fields at the sampling points
     {
         t.start();
 #ifdef PHASE_SPACE
-        // PS-DTFE uses cell-iteration approach to handle multi-stream regions
+        // PS-DTFE iterates over cells to handle multi-stream regions
         if ( not userOptions.redshiftConeOn and not userOptions.userDefinedSampling )
-            interpolateGrid_phaseSpace( dt, userOptions, uQuantities );
+            interpolateGrid_phaseSpace( dt, userOptions, uQuantities, userOptions.uField, 1 );
         else
             throwError( "PS-DTFE currently only supports regular grid interpolation (no redshift cone or user-defined sampling)." );
 #else
@@ -197,15 +181,19 @@ void DTFE_interpolation(vector<Particle_data> *p,
         else if ( userOptions.userDefinedSampling )
             interpolateUserSampling( dt, samples, userOptions, uQuantities );
 #endif
-        printComputationTime( &t, &userOptions, "interpolation to sampling points" );
+        printComputationTime( &t, &userOptions, "field interpolation (per-point / unaveraged)" );
     }
     
-    if ( userOptions.aField.selected() )    // interpolate the fields volume averaged inside the grid cells
+    if ( userOptions.aField.selected() )    // fields volume-averaged inside the grid cells
     {
-#ifdef PHASE_SPACE
-        throwError( "PS-DTFE does not support averaged fields (_a suffix). Use unaveraged fields instead (e.g., 'density' instead of 'density_a')." );
-#endif
         t.start();
+#ifdef PHASE_SPACE
+        // PS-DTFE averaged fields: sub-sample each grid cell nSub^NO_DIM times (--avg-subsamples, default 3)
+        if ( not userOptions.redshiftConeOn and not userOptions.userDefinedSampling )
+            interpolateGrid_phaseSpace( dt, userOptions, aQuantities, userOptions.aField, userOptions.psAvgSubsamples );
+        else
+            throwError( "PS-DTFE averaged fields support only regular-grid interpolation (no redshift cone or user-defined sampling)." );
+#else
         if ( not userOptions.redshiftConeOn and not userOptions.userDefinedSampling )   // interpolate on a regular grid
         {
             if ( userOptions.method==1 )
@@ -228,45 +216,78 @@ void DTFE_interpolation(vector<Particle_data> *p,
                 interpolateUserSampling_averaged_2( dt, samples, userOptions, aQuantities );
             else throwError( "Unknown averaging method '", userOptions.method, "' when volume averaging the fields on a user defined grid. The only available user defined grid averaging method is '2'." );
         }
-        printComputationTime( &t, &userOptions, "interpolation to sampling points" );
+#endif
+        printComputationTime( &t, &userOptions, "field interpolation (volume-averaged '_a')" );
     }
 }
 
-// Accesses the above 'DTFE_interpolation', but without returning the Delaunay triangulation
+// Convenience overload for callers that do not need the Delaunay triangulation back.
 void DTFE_interpolation(vector<Particle_data> *p,
                         vector<Sample_point> &samples,
                         User_options &userOptions,
                         Quantities *uQuantities,
                         Quantities *aQuantities)
 {
-    DT dt;                // the triangulation
+    DT dt;
     DTFE_interpolation( p, samples, userOptions, uQuantities, aQuantities, dt );
 }
 
 
 
 
-/* Constructs the Delaunay triangulation using a set of points. */
+// Inserts every particle into the Delaunay triangulation. Under PS-DTFE the points are the
+// Lagrangian (initial-condition) coordinates; otherwise the Eulerian positions.
 void delaunayTriangulation(DT *dt,
                            vector<Particle_data> *p,
                            int const verboseLevel)
 {
-    // sort the particles to be spatially close - increase speed of Delaunay triangulation 
     MESSAGE::Message message( verboseLevel );
+
+#if defined(PARALLEL_TRIANGULATION) && NO_DIM==3
+    // TBB-parallel build (opt-in, TBB=1): parallel range insert needs Parallel_tag and a lock grid over the bounding box
+    message << "\nConstructing the Delaunay triangulation (parallel, TBB) ... " << MESSAGE::Flush;
+    double bb[2*NO_DIM];
+    for (int d = 0; d < NO_DIM; ++d) { bb[2*d] = 1.e300; bb[2*d+1] = -1.e300; }
+    std::vector< std::pair<Point, vertexData> > pts;
+    pts.reserve( p->size() );
+    for (vector<Particle_data>::iterator it = p->begin(); it != p->end(); ++it)
+    {
+#ifdef PHASE_SPACE
+        double c[NO_DIM] = { double(it->lagPos[0]), double(it->lagPos[1]), double(it->lagPos[2]) };
+#else
+        double c[NO_DIM] = { double(it->pos[0]), double(it->pos[1]), double(it->pos[2]) };
+#endif
+        vertexData info;
+        info.setData( *it );
+        pts.push_back( std::make_pair( Point(c[0], c[1], c[2]), info ) );
+        for (int d = 0; d < NO_DIM; ++d)
+        { if (c[d] < bb[2*d]) bb[2*d] = c[d]; if (c[d] > bb[2*d+1]) bb[2*d+1] = c[d]; }
+    }
+    // Pad the bbox so every point lies strictly inside the lock grid.
+    for (int d = 0; d < NO_DIM; ++d)
+    { double e = (bb[2*d+1]-bb[2*d])*1.e-3 + 1.e-9; bb[2*d] -= e; bb[2*d+1] += e; }
+    Bbox lockBox( bb[0], bb[2], bb[4], bb[1], bb[3], bb[5] );
+    DT::Lock_data_structure lock( lockBox, 50 );
+    dt->set_lock_data_structure( &lock );
+    dt->insert( pts.begin(), pts.end() );
+    dt->set_lock_data_structure( nullptr );   // lock grid is only needed during concurrent insertion
+    message << "Done.\n"
+        << "The triangulation has " << dt->number_of_vertices() << " points.\n" << MESSAGE::Flush;
+#else
+    // spatial_sort speeds up insertion by keeping consecutive points spatially close (better locality hints).
     message << "\nSorting the points to be spatially close yet randomly distributed ... " << MESSAGE::Flush;
     CGAL::spatial_sort( p->begin(), p->end(), Particle_data_sort_traits() );
     message << "Done.\n";
-    
-    
-    // construct the actual triangulation
+
+
     message << "Constructing the Delaunay triangulation.\n\t Done: " << MESSAGE::Flush;
-    size_t prev = 0, amount100 = 0, count = 0; // variable to show the user about the progress of the computation
+    size_t prev = 0, amount100 = 0, count = 0;
     size_t const noPoints = p->size();
-    Vertex_handle vh;     // vertex handle - points to each inserted point
+    Vertex_handle vh;
     for (vector<Particle_data>::iterator it=p->begin(); it!=p->end(); ++it)
     {
 #ifdef PHASE_SPACE
-        // In PS-DTFE mode, build triangulation in Lagrangian (initial condition) space
+        // PS-DTFE builds the triangulation in Lagrangian (initial-condition) space
 #if NO_DIM==2
         vh = dt->insert( Point(it->lagPos[0],it->lagPos[1]) );
 #elif NO_DIM==3
@@ -279,21 +300,22 @@ void delaunayTriangulation(DT *dt,
         vh = dt->insert( Point(it->pos[0],it->pos[1],it->pos[2]), vh );
 #endif
 #endif
-        vh->info().setData( *it );      // set vertex quantities
-        
-        // show the progress of the computation
+        vh->info().setData( *it );
+
         amount100 = (100 * count++)/ noPoints;
         if (prev < amount100)
             message.updateProgress( ++prev );
     }
-    
+
     message << "100\%.\n"
         << "The triangulation has " << dt->number_of_vertices() << " points.\n" << MESSAGE::Flush;
+#endif
 }
 
 
 
-/* The function computes the volume of all Delaunay tetrahedra for each vertex and than computes the density at each vertex as the inverse of the total tetrahedra volumes incident on the respective vertex. */
+// Estimates the density at each vertex. Standard DTFE: (mass-conservation factor) / total volume of
+// incident Delaunay cells. PS-DTFE: avgDensity * V_Lagrangian / V_Eulerian for the incident cells.
 void vertexDensity(DT & dt,
                   User_options &userOptions)
 {
@@ -314,10 +336,10 @@ void vertexDensity(DT & dt,
             vIT->info().setDensity( 0. );
     }
     
-    Real const factor = (NO_DIM+1.) / userOptions.averageDensity;  //factor to normalize the density to the average background density; NO_DIM+1 comes from the number of vertices of a Delaunay tetrahedra - needed for mass conservation
-    size_t const noVertices = dt.number_of_vertices();  // total number of finite vertices
+    Real const factor = (NO_DIM+1.) / userOptions.averageDensity;  // mass-conservation normalization; NO_DIM+1 = vertices per Delaunay cell
+    size_t const noVertices = dt.number_of_vertices();
 
-    // collect vertex handles for parallel processing (CGAL iterators are not random-access)
+    // Collect active vertex handles up front (CGAL iterators are not random-access).
     std::vector<Vertex_handle> vertexHandles;
     vertexHandles.reserve( noVertices );
     for (DT::Finite_vertices_iterator vIT = dt.finite_vertices_begin(); vIT != dt.finite_vertices_end(); ++vIT )
@@ -363,6 +385,7 @@ void vertexDensity(DT & dt,
             }
             else
             {
+                // An incident infinite cell means the vertex is on the convex hull: density is undefined.
                 vIT->info().setDummyNeighbor();
                 infinite_volume = true;
                 break;
@@ -393,10 +416,8 @@ void vertexDensity(DT & dt,
 
 
 #if defined(VELOCITY) && defined(SCALAR) && !defined(PHASE_SPACE)
-/* Compute velocity-space density g_i for each particle using a Delaunay
-   tessellation in velocity coordinates. The result is stored in the
-   scalar(0) field of each particle. Used by --approxPSD for approximate
-   phase-space density estimation: f_i = rho_i * g_i. */
+// Estimates each particle's velocity-space density g_i via a Delaunay tessellation in velocity
+// coordinates, storing it in scalar(0). Used by --approxPSD to form f_i = rho_i * g_i.
 void computeVelocitySpaceDensity(vector<Particle_data> &particles,
                                   User_options &userOptions)
 {
@@ -414,7 +435,7 @@ void computeVelocitySpaceDensity(vector<Particle_data> &particles,
         return;
     }
 
-    // 1. Compute velocity bounding box and total mass
+    // Velocity-space bounding box and total mass.
     Real vMin[NO_DIM], vMax[NO_DIM];
     for (int d = 0; d < NO_DIM; ++d)
     {
@@ -431,7 +452,7 @@ void computeVelocitySpaceDensity(vector<Particle_data> &particles,
             if (particles[i].velocity(d) > vMax[d]) vMax[d] = particles[i].velocity(d);
         }
     }
-    // Add small margin to avoid zero-volume box
+    // Pad the box with a small margin to avoid a zero-volume (degenerate) bounding box.
     for (int d = 0; d < NO_DIM; ++d)
     {
         Real range = vMax[d] - vMin[d];
@@ -450,7 +471,7 @@ void computeVelocitySpaceDensity(vector<Particle_data> &particles,
         message << "[" << vMin[d] << ", " << vMax[d] << "] ";
     message << "\n  Average velocity-space density: " << avgVelDensity << "\n" << MESSAGE::Flush;
 
-    // 2. Build Delaunay tessellation in velocity space
+    // Build the Delaunay tessellation in velocity space.
     DT velDT;
     std::vector<Vertex_handle> velVertices(N);
     Vertex_handle hint;
@@ -476,16 +497,13 @@ void computeVelocitySpaceDensity(vector<Particle_data> &particles,
     message << "100\%.\n  Velocity tessellation has " << velDT.number_of_vertices()
             << " vertices (from " << N << " particles).\n" << MESSAGE::Flush;
 
-    // 3. Compute velocity-space density at each vertex
-    // Use vertexDensity() with velocity-space normalization.
-    // The density formula ρ_i = weight_i * (D+1) / (avgDensity * V_i) gives
-    // the correct velocity-space density when avgDensity = totalMass / velBoxVol.
+    // Reusing vertexDensity yields the correct g_i once avgDensity is set to totalMass/velBoxVol.
     User_options velOpt = userOptions;
     velOpt.averageDensity = avgVelDensity;
     velOpt.verboseLevel = (userOptions.verboseLevel > 0) ? 1 : 0;
     vertexDensity(velDT, velOpt);
 
-    // 4. Copy g_i from velocity tessellation vertices to particle scalar field
+    // Copy g_i from the velocity-tessellation vertices back into each particle's scalar field.
     size_t nBoundary = 0;
     for (size_t i = 0; i < N; ++i)
     {
@@ -498,7 +516,6 @@ void computeVelocitySpaceDensity(vector<Particle_data> &particles,
         message << "  Note: " << nBoundary << " particles have g_i=0 (velocity convex hull).\n" << MESSAGE::Flush;
 
     message << "  Velocity-space tessellation complete.\n" << MESSAGE::Flush;
-    // velDT destroyed on scope exit, freeing memory
 }
 #endif
 

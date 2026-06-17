@@ -21,6 +21,10 @@
  */
 
 
+/* Nearest-Grid-Point (NGP) mass assignment: deposits each particle's mass and momentum
+   entirely into its host cell. Also provides NGP_particle_count for load balancing. */
+
+
 #include <vector>
 #include <list>
 #include <string>
@@ -48,13 +52,13 @@ void NGP_interpolation_regular_grid(vector<Particle_data> &particles,
 
 
 
-/* This function interpolates the density and velocity to grid using the NGP (cloud in cell) method. */
+// NGP (Nearest Grid Point) interpolation of density and velocity to a grid.
 void NGP_interpolation(vector<Particle_data> *particles,
                        vector<Sample_point> &samples,
                        User_options &userOptions,
                        Quantities *q)
 {
-    if ( samples.empty() and not userOptions.redshiftConeOn )  // interpolate using a regular cubic grid
+    if ( samples.empty() and not userOptions.redshiftConeOn )
         NGP_interpolation_regular_grid( *particles, userOptions, q );
     else
         throwError( "The NGP method can interpolate the fields only on a regular rectangular grid. No NGP interpolation methods are implemented for redshift cone coordinates or for user defined sample points." );
@@ -65,9 +69,8 @@ void NGP_interpolation(vector<Particle_data> *particles,
 
 
 
-/* This function uses the NGP method to interpolate quantities to a grid. It interpolates only the density and the velocity.
-NOTE: It does not interpolate the velocity to the grid, but in fact the momentum. The velocity is than obtained as the momentum in the cell divided by the mass in the grid cell.
-*/
+// NGP worker on a regular grid: assigns each particle to its nearest cell, accumulating mass and momentum,
+// then divides momentum by cell mass for velocity and normalizes density to the background mean.
 void NGP_interpolation_regular_grid(vector<Particle_data> &particles,
                                     User_options &userOptions,
                                     Quantities *q)
@@ -78,24 +81,22 @@ void NGP_interpolation_regular_grid(vector<Particle_data> &particles,
             << " on a " << MESSAGE::printElements( nGrid, NO_DIM, "*" ) << " grid ... " << MESSAGE::Flush;
     boost::timer t;
     t.restart();
-    
-    
-    // allocate memory for the results
+
+
     size_t reserveSize = 1;
     for (int d=0; d<NO_DIM; ++d) reserveSize *= nGrid[d];
     q->density.assign( reserveSize, Real(0.) );
     if ( userOptions.aField.velocity )
 		q->velocity.assign( reserveSize, Pvector<Real,noVelComp>::zero() );
-    
-    
-    // get the grid spacing
+
+
     Box box = userOptions.region;
     Real dx[NO_DIM];
     for (int i=0; i<NO_DIM; ++i)
         dx[i] = (box[2*i+1]-box[2*i]) / nGrid[i];
-    
-    
-    // find the particles in box 'box'
+
+
+    // assign each particle to its nearest grid cell
     for (vectorIterator it=particles.begin(); it!=particles.end(); ++it)
 	{
 		int cell[NO_DIM];
@@ -115,7 +116,7 @@ void NGP_interpolation_regular_grid(vector<Particle_data> &particles,
 	}
     
     
-    // divide the momentum by the mass in the cells
+    // convert accumulated momentum to velocity by dividing by cell mass
     if ( userOptions.aField.velocity )
         for (size_t i=0; i<reserveSize; ++i) {
             if ( q->density[i]!=Real(0.) ) {
@@ -124,8 +125,8 @@ void NGP_interpolation_regular_grid(vector<Particle_data> &particles,
                 q->velocity[i] = Pvector<Real,noVelComp>::zero();
             }
         }
-    
-    // normalize the density to average background density
+
+    // normalize the density to the average background density
     if ( userOptions.aField.density ) {
         Real factor = Real( q->density.size() ) / box.volume() / userOptions.averageDensity;
         for (vector<Real>::iterator it=q->density.begin(); it!=q->density.end(); ++it)
@@ -138,24 +139,21 @@ void NGP_interpolation_regular_grid(vector<Particle_data> &particles,
 }
 
 
-/* This function counts how many particles are in each cell of a grid using the NGP method. */
+// Count particles per grid cell (NGP assignment).
 void NGP_particle_count(vector<Particle_data> &particles,
                         size_t const *nGrid,
                         Box box,
                         vector<int> *counts)
 {
-    // allocate memory for the results
     size_t reserveSize = 1;
     for (int d=0; d<NO_DIM; ++d) reserveSize *= nGrid[d];
     counts->assign( reserveSize, int(0) );
 	
-    // get the grid spacing
     Real dx[NO_DIM];
     for (int i=0; i<NO_DIM; ++i)
         dx[i] = (box[2*i+1]-box[2*i]) / nGrid[i];
-    
-    
-    // find the particles in box 'box'
+
+
     for (vectorIterator it=particles.begin(); it!=particles.end(); ++it)
 	{
 		int cell[NO_DIM];

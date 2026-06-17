@@ -22,9 +22,7 @@
 
 
 
-/*!
-This header contains functions that will select the particles inside a sub-box of the main data box.
-*/
+/* Functions that select the particles inside a sub-box of the main data box. */
 
 
 
@@ -61,8 +59,7 @@ void insertParticlesInBox(std::vector<Particle_data> &p,
                         Real const offset[]);
 
 #ifdef PHASE_SPACE
-/* Finds all particles whose Lagrangian position is inside the padded box.
-   Used by PS-DTFE partitioning where partitions are defined in Lagrangian space. */
+// select particles whose Lagrangian position lies in the padded box (PS-DTFE partitions are Lagrangian)
 void findParticlesInBoxLagrangian(std::vector<Particle_data> &p,
                                   std::vector<Particle_data> *output,
                                   Box const &paddedBox,
@@ -86,12 +83,63 @@ void findParticlesInBoxLagrangian(std::vector<Particle_data> &p,
             << "\t Selected " << output->size() << " of " << p.size() << " particles ("
             << std::setprecision(4) << output->size()/float(p.size())*100. << "\%).\n" << MESSAGE::Flush;
 }
+
+
+// Like findParticlesInBoxLagrangian but generates periodic images on the fly (deferred copies, no whole-box
+// array); shifting lagPos and pos by the same eulerLen[] offset matches DTFE()'s global copy generator bit-for-bit.
+void findParticlesInBoxLagrangianPeriodic(std::vector<Particle_data> &p,
+                                          std::vector<Particle_data> *output,
+                                          Box const &paddedBox,
+                                          Real const eulerLen[],
+                                          bool const periodic,
+                                          int verboseLevel)
+{
+    MESSAGE::Message message( verboseLevel );
+    message << "Finding particles (with on-the-fly periodic images) with Lagrangian positions in box " << paddedBox.print() << " ... " << MESSAGE::Flush;
+    output->reserve( p.size() / 4 );  // rough estimate
+
+    size_t const noOffsets = periodic ? (NO_DIM==2 ? 9 : 27) : 1;
+    for (size_t n=0; n<noOffsets; ++n)
+    {
+        // periodic-image offset for this pass; applied identically to lagPos and pos so simplices keep correct geometry
+        Real off[NO_DIM];
+        if ( not periodic )
+            for (int d=0; d<NO_DIM; ++d) off[d] = Real(0.);
+        else
+        {
+            size_t rem = n;
+            for (int d=NO_DIM-1; d>=0; --d)
+            { off[d] = Real(int(rem%3) - 1) * eulerLen[d]; rem /= 3; }
+        }
+
+        for (vectorIterator it=p.begin(); it!=p.end(); ++it)
+        {
+            bool inside = true;
+            for (size_t i=0; i<NO_DIM; ++i)
+            {
+                Real const shiftedLag = it->lagPos[i] + off[i];
+                if ( shiftedLag<paddedBox.coords[2*i] or shiftedLag>paddedBox.coords[2*i+1] )
+                { inside = false; break; }
+            }
+            if (inside)
+            {
+                Particle_data copy = *it;
+                for (int d=0; d<NO_DIM; ++d)
+                { copy.lagPos[d] += off[d]; copy.pos[d] += off[d]; }
+                output->push_back( copy );
+            }
+        }
+    }
+
+    message << "Done.\n"
+            << "\t Selected " << output->size() << " particles (originals + periodic images) for this partition.\n" << MESSAGE::Flush;
+}
 #endif
 
 
 
 
-/* Prints the elapsed time and updates the 'totalTime' variable in User_options class. */
+// Prints the elapsed wall-clock time for a step and adds it to userOptions->totalTime.
 void printElapsedTime(boost::timer *t, User_options *userOptions,
                       std::string computationQuantityName)
 {
@@ -103,14 +151,14 @@ void printElapsedTime(boost::timer *t, User_options *userOptions,
 
 
 
-/* Finds all the particles inside a box. It outputs those particles in the vector 'output'. */
+// Selects all particles inside userOptions.paddedBox into 'output', picking up periodic images when periodic.
 void findParticlesInBox(std::vector<Particle_data> &p,
                         std::vector<Particle_data> *output,
                         User_options &userOptions)
 {
-    Box box = userOptions.paddedBox;          // the coordinates of the padded box
-    Box fullBox = userOptions.boxCoordinates; // the coordinates of the full box
-    Real boxLength[NO_DIM];                   // the length of the full box along each axis
+    Box box = userOptions.paddedBox;
+    Box fullBox = userOptions.boxCoordinates;
+    Real boxLength[NO_DIM];                   // full box length per axis
     for (size_t i=0; i<NO_DIM; ++i)
         boxLength[i] = fullBox[2*i+1] - fullBox[2*i];
     
@@ -120,16 +168,15 @@ void findParticlesInBox(std::vector<Particle_data> &p,
     size_t const reserveSize = size_t( p.size() * box.volume()/fullBox.volume() * 1.3 ); // reserve 120% of the average number of particles in the given volume
     output->reserve( reserveSize );
     
-    // if not a periodic box
     if ( not userOptions.periodic )
     {
         for (vectorIterator it=p.begin(); it!=p.end(); ++it)
             if ( box.isParticleInBox(*it) )
                 output->push_back( *it );
     }
-    else        //if periodic box
-    { 
-        // check if the padded box extends outside of the full particle data box, if so must include the additional particles also by periodically translating the particle positions
+    else
+    {
+        // padded box may extend outside the data box: also pick up particles via periodic translation
         size_t const noOffsets = (NO_DIM==2 ? 9:27);
         Real offset[noOffsets][NO_DIM];
         for (size_t n=0; n<noOffsets; ++n)
@@ -146,7 +193,7 @@ void findParticlesInBox(std::vector<Particle_data> &p,
         {
             Box newBox = box;
             newBox.translate( offset[n] );
-            if ( newBox.isBoxOverlaping(fullBox) )           // if translated box overlaps with initial full box = padded box intersect with the full box along the direction of translation
+            if ( newBox.isBoxOverlaping(fullBox) )           // only translations whose box overlaps the full box contribute particles
                 insertParticlesInBox( p, output, newBox, offset[n] );
         }
     }
@@ -157,7 +204,7 @@ void findParticlesInBox(std::vector<Particle_data> &p,
 
 
 
-/* Inserts all particles into "output" whose translated position by 'offset' are still inside the box of interest. */
+// Inserts into 'output' the particles that fall inside 'box' after translation by 'offset' (storing the shifted-back copy).
 void insertParticlesInBox(std::vector<Particle_data> &p,
                         std::vector<Particle_data> *output,
                         Box const &box,
@@ -168,7 +215,7 @@ void insertParticlesInBox(std::vector<Particle_data> &p,
         {
             Particle_data temp = *it;
             for (int j=0; j<NO_DIM; ++j)
-                temp.pos[j] -= offset[j];	// translating the sub box along the x-direction is similar to translating the full box along the opposite direction (-x)
+                temp.pos[j] -= offset[j];	// translating the sub-box by +offset is equivalent to translating the particle by -offset
             output->push_back( temp );
         }
 }
@@ -179,7 +226,7 @@ void NGP_particle_count(std::vector<Particle_data> &particles,
 						Box box,
                         std::vector<int> *counts);
 
-/* Computes the optimal split of an array into noPartitions partition such that all partitions have as close as possible the same number of particles.*/
+// Splits 'counts' into noPartitions contiguous ranges with as equal a particle load as possible; writes range edges to partitionIndices.
 void optimalSplit(std::vector<size_t> &counts,
 				  size_t const noPartitions,
 				  size_t *partitionIndices)
@@ -231,7 +278,7 @@ void optimalSplit(std::vector<size_t> &counts,
 }
 
 
-/* This function computes the optimal division of the box to minimize the load on each CPU. It counts how many particles are in the grid used to interpolate to grid and than divides the boxes along this grid lines to achieve optimal balance. */
+// Divides the box along interpolation-grid lines (x then y then z) to balance the particle load across CPUs.
 void optimalPartitionSplit(std::vector<Particle_data> &particles,
 						   User_options &userOptions,
 						   std::vector<size_t> const &partitionGrid,
@@ -274,7 +321,7 @@ void optimalPartitionSplit(std::vector<Particle_data> &particles,
 		std::vector<size_t> tempCounts;
 		tempCounts.assign( grid[0], size_t(0) );
 		
-		// project the grid along the x-direction
+		// project the counts onto the x-axis
 		for (int i1=0; i1<grid[0]; ++i1)
 			for (int i2=0; i2<grid[1]; ++i2)
 				for (int i3=0; i3<grid[2]; ++i3)
@@ -283,8 +330,8 @@ void optimalPartitionSplit(std::vector<Particle_data> &particles,
 					tempCounts[i1] += counts[index];
 				}
 		
-		// find the grid positions that split the x-coordinate most evenly
-		optimalSplit( tempCounts, partition[0], &(xSplitIndices[0]) );	// computes the optimal split of the box along the given direction
+		
+		optimalSplit( tempCounts, partition[0], &(xSplitIndices[0]) );	// split the x-axis evenly
 	}
 	else
 	{
@@ -313,7 +360,7 @@ void optimalPartitionSplit(std::vector<Particle_data> &particles,
 			std::vector<size_t> tempCounts;
 			tempCounts.assign( grid[1], size_t(0) );
 			
-			// project the grid along the x-direction
+			// project the counts onto the y-axis
 			for (int i1=xSplitIndices[i]; i1<xSplitIndices[i+1]; ++i1)
 				for (int i2=0; i2<grid[1]; ++i2)
 					for (int i3=0; i3<grid[2]; ++i3)
@@ -322,8 +369,8 @@ void optimalPartitionSplit(std::vector<Particle_data> &particles,
 						tempCounts[i2] += counts[index];
 					}
 			
-			// find the grid positions that split the x-coordinate most evenly
-			optimalSplit( tempCounts, partition[1], &(ySplitIndices[0]) );	// computes the optimal split of the box along the given direction
+			
+			optimalSplit( tempCounts, partition[1], &(ySplitIndices[0]) );	// split the y-axis evenly
 		}
 		else
 		{
@@ -353,7 +400,7 @@ void optimalPartitionSplit(std::vector<Particle_data> &particles,
 				std::vector<size_t> tempCounts;
 				tempCounts.assign( grid[2], size_t(0) );
 				
-				// project the grid along the x-direction
+				// project the counts onto the z-axis
 				for (int i1=xSplitIndices[i]; i1<xSplitIndices[i+1]; ++i1)
 					for (int i2=ySplitIndices[j]; i2<ySplitIndices[j+1]; ++i2)
 						for (int i3=0; i3<grid[2]; ++i3)
@@ -362,8 +409,8 @@ void optimalPartitionSplit(std::vector<Particle_data> &particles,
 							tempCounts[i3] += counts[index];
 						}
 				
-				// find the grid positions that split the x-coordinate most evenly
-				optimalSplit( tempCounts, partition[2], &(zSplitIndices[0]) );	// computes the optimal split of the box along the given direction
+				
+				optimalSplit( tempCounts, partition[2], &(zSplitIndices[0]) );	// split the z-axis evenly
 			}
 			else
 			{
@@ -380,19 +427,13 @@ void optimalPartitionSplit(std::vector<Particle_data> &particles,
 			}
 		}
 #endif
-	
-	
-/*	for (size_t i=0; i<noPartitions; ++i)
-	{
-		message << "\t" << i << "\n";
-		message << subgrid->at(i)[0] << "  " << subgrid->at(i)[1] << "  " << subgrid->at(i)[2] << "  " << subgrid->at(i)[3] << "  " << subgrid->at(i)[4] << "  " << subgrid->at(i)[5] << "\n";
-		message << subgridCoords->at(i)[0] << "  " << subgridCoords->at(i)[1] << "  " << subgridCoords->at(i)[2] << "  " << subgridCoords->at(i)[3] << "  " << subgridCoords->at(i)[4] << "  " << subgridCoords->at(i)[5] << "\n";
-	}*/
+
+
 	message << "Done.\n" << MESSAGE::Flush;
 }
 
 
-/* Copy the relevant sudgrid details to the User_options strcuture. */
+// Copies the selected partition's subgrid size and region into userOptions for this run.
 void copySubgridInformation(User_options *userOptions,
 							std::vector< std::vector<size_t> > &subgridList,
 							std::vector< Box > &subgridCoords)
@@ -402,7 +443,7 @@ void copySubgridInformation(User_options *userOptions,
 	userOptions->region = subgridCoords[userOptions->partNo];
 }
 
-/* Output the subgrid used for single partition computation. */
+// Prints the grid-index range covered by the selected partition.
 void subgrid(User_options &userOptions, std::vector< std::vector<size_t> > &subgrid)
 {
     MESSAGE::Message message( userOptions.verboseLevel );
@@ -413,7 +454,7 @@ void subgrid(User_options &userOptions, std::vector< std::vector<size_t> > &subg
 }
 
 
-/* The following function merges the field quantities computes on a subgrid (using the 'partition' option) to the quantities corresponding to the full simulation box. */
+// Merges a subgrid's field quantities ('--partition' option) into the full-box quantities, with size sanity checks.
 void copySubgridResultsToMain(Quantities const &subgridResults,
                               std::vector<size_t> const &mainGrid,
                               Field &field,
@@ -451,15 +492,14 @@ void copySubgridResultsToMain(Quantities const &subgridResults,
 
 
 
-/* Computes what is the averagy density in full simulation box. This quantity is to be used when computing the density of each vertex. */
+// Returns the mean mass density in the full simulation box, used as the reference for per-vertex density.
 Real averageDensity(std::vector<Particle_data> &p,
                     User_options const &userOptions)
 {
-    double totalMass = 0.;        // keeps track of the total mass in the full box
+    double totalMass = 0.;
     for (vectorIterator it=p.begin(); it!=p.end(); ++it)
         totalMass += it->weight();
-    
-    // Now the average expected weight in the box of interest is given by:
+
     Real averageDen = totalMass / userOptions.boxCoordinates.volume();
     MESSAGE::Message message( userOptions.verboseLevel );
     message << "Average density in the box: " << averageDen << "\n" << MESSAGE::Flush;
@@ -467,15 +507,14 @@ Real averageDensity(std::vector<Particle_data> &p,
 }
 
 
-/* This function computes the best possible parallel grid that can be used given the number of processors available.
-NOTE: The number of processors considered is only a multiple of 2 and 3's, otherwise it finds the multiple of 2's and 3's that is the closest to 'noAvailableProcessors'. */
+// Chooses the parallel partition grid for the available processors, using the largest 2^a*3^b <= noAvailableProcessors.
 void parallelGrid(size_t const noAvailableProcessors,
                   User_options const &userOptions,
                   size_t *grid)
 {
-    // In case the number of processors is not a multiple of 2's and 3's, find the maximum x2 and x3 such that n>=2^x2 and n>=3^x3
+    // largest x2, x3 with 2^x2 <= n and 3^x3 <= n
     size_t n = noAvailableProcessors;
-    int x2 = 0, x3 = 0; // number of 2 and 3 factors such that 2^x2 <= n < 2^(x2+1) and 3^x3 <= n < 3^(x3+1)
+    int x2 = 0, x3 = 0;
     
     while ( n/2!=0 )
     {
@@ -490,7 +529,7 @@ void parallelGrid(size_t const noAvailableProcessors,
     }
     n = noAvailableProcessors;
     
-    // now find the best combination of 2^j2 * 3^j3 < n but yet the closest approximation to n
+    // best 2^j2 * 3^j3 <= n closest to n
     size_t diff = n;
     int j2 = 0, j3 = 0;
     size_t nApprox = 1;
@@ -510,13 +549,11 @@ void parallelGrid(size_t const noAvailableProcessors,
         nApprox *= 2;
     }
     
-    // update x2 and x3 with the best choice found above
     x2 = j2;
     x3 = j3;
-    
-    
-    // now x2 and x3 gives the best approximation to 'noAvailableProcessors' such that 2^x2 * 3^x3 < noAvailableProcessors
-    // let us distribute the available 2's and 3's along the given dimensions such that the grid size is as uniform as possible along each direction (to minimize overlapping regions)
+
+
+    // distribute the 2's and 3's across axes as uniformly as possible to minimize overlapping regions
     for (int i=0; i<NO_DIM; ++i)
         grid[i] = 1;
     // first distribute the 3's
@@ -575,7 +612,7 @@ void parallelGrid(size_t const noAvailableProcessors,
 
 
 
-/* Since I couldn't find a method to measure the CPU time of each thread independently, I use this function to compute approximative values of what is the CPU time of each thread. */
+// Approximate per-thread CPU time (threads cannot be timed independently).
 void approximativeThreadTime(Real *processorTime,
                              int const noProcessors)
 {
@@ -596,89 +633,10 @@ void approximativeThreadTime(Real *processorTime,
         lastTotalTime = temp2;
     }
     
-    // write teh computed values to the output array
+    // write the computed values to the output array
     for (int i=0; i<noProcessors; ++i)
         processorTime[ temp[i].second ] = temp[i].first;
 }
 
 
 #endif
-
-
-
-
-// /* This function assigns the particles to a grid according to their position to find the best way to split the box when doing parallel computations to minimize the thread imbalance (such that all threads have similar number of particles). */
-// void splitBoxForParallelComputations(std::vector<Particle_data> &p,
-//                                      size_t *parallelGrid,
-//                                      User_options &userOptions,
-//                                      std::vector< std::vector<size_t> > splittedBoxIndices,
-//                                      int const verboseLevel,
-//                                      size_t const gSize = 128)
-// {
-//     size_t noSplits = (NO_DIM==2) ? parallelGrid[0]*parallelGrid[1] : parallelGrid[0]*parallelGrid[1]*parallelGrid[2];
-//     splittedBox.clear();
-//     for (size_t i=0; i<noSplits; ++i)
-//     {
-//         std::vector<Real> temp( 2*NO_DIM, Real(0.) );
-//         splittedBox.push_back( temp );
-//     }
-//     
-//     
-//     // assign the particles to a grid that will be used to divide the box in smaller equal particle number boxes
-//     Real *box = &(userOptions.region[0]);
-//     size_t gridSize = (NO_DIM==2) ? gSize*gSize : gSize*gSize*gSize;
-//     std::vector<size_t> particleGrid( gridSize, int(0) );
-//     size_t *g = &(particleGrid[0]);
-//     Real dx[NO_DIM];
-//     for (int i=0; i<NO_DIM; ++i)
-//         dx[i] = (box[2*i+1]-box[2*i]) / gSize;
-//     
-//     for (vectorIterator it=p.begin(); it!=p.end(); ++it)
-//     {
-//         size_t temp[NO_DIM];
-//         for (size_t j=0; j<NO_DIM; ++j)
-//             temp[j] = ( it->position(j) - box[2*j] ) / dx[j];
-// #if NO_DIM==2
-//         size_t index = temp[0]*gSize + temp[1];
-// #elif NO_DIM==3
-//         size_t index = temp[0]*gSize*gSize + temp[1]*gSize + temp[2];
-// #endif
-//         ++g[index];
-//     }
-//     
-//     
-//     // now compute the split box boundaries
-//     // split first along the x-direction
-//     if ( parallelGrid[0]!=size_t(1) )
-//     {
-//         size_t temp[gSize];
-//         // sum all the g-entries along the y and z regions
-//         for (size_t i=0; i<gSize; ++i)
-//         {
-//             temp[i] = 0;
-//             for (size_t i1=0; i1<gSize; ++i1)
-// #if NO_DIM==2
-//                 temp[i] += g[i*gSize+i1];
-// #elif NO_DIM==3
-//                 for (size_t i2=0; i2<gSize; ++i2)
-//                     temp[i] += g[i*gSize*gSize+i1*gSize+i2];
-// #endif
-//         }
-//         size_t sum = 0, expectedSum = size_t( p.size() / double(parallelGrid[0]) );
-//         for (size_t i=0; i<gSize; ++i)
-//         {
-//             if ( sum+temp[i]>=expectedSum ) //this is the grid point where the number of particles is 1/parallelGrid[0]
-//             {
-//                 if ( std::abs(expectedSum-sum)<abs(expectedSum-sum-temp[i]) )
-//                 {
-//                     
-//                 }
-//                 else
-//                 {
-//                     
-//                 }
-//             }
-//             else sum += temp[i];
-//         }
-//     }
-// }

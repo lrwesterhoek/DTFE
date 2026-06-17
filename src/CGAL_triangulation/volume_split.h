@@ -1,3 +1,6 @@
+/* Exact volume-averaging support: clips a Delaunay simplex against the grid walls and
+   accumulates each grid cell's enclosed sub-volume and volume-weighted centroid. */
+
 #ifndef VOLUME_SPLIT_HEADER
 #define VOLUME_SPLIT_HEADER
 
@@ -6,31 +9,34 @@
 
 
 #ifndef VOLUME_TOL
-    #define VOLUME_TOL Real(1.e-3)
+    #define VOLUME_TOL Real(1.e-3)   // default relative volume below which a fragment is accumulated as-is
 #endif
 
-#define NO_PAIRS ((NO_DIM+1)*NO_DIM/2)
+#define NO_PAIRS ((NO_DIM+1)*NO_DIM/2)   // number of edges (vertex pairs) of a simplex
 
 
 namespace VOLUME_SPLIT
 {
 
+// A simplex vertex in grid-cell coordinates, caching the grid-index bracket [nMin,nMax] per axis
+// so edge/grid-wall crossing tests are integer comparisons.
 struct Vertex
 {
     Pvector<Real,NO_DIM> coords;
-    Pvector<int,NO_DIM>  nMin;
-    Pvector<int,NO_DIM>  nMax;
-    
+    Pvector<int,NO_DIM>  nMin;   // floor grid index per axis (with tolerance)
+    Pvector<int,NO_DIM>  nMax;   // ceil grid index per axis (with tolerance)
+
     inline Real& operator[](int i)
     {
         return this->coords[i];
     }
-    
+
     static Vertex zero()
     {
         return Vertex();
     }
-    
+
+    // Refresh the [nMin,nMax] grid-index bracket for axis i from coordinate p, widened by tol.
     inline void update_nMinMax(int const i, Real const p, Real const tol)
     {
         this->nMin[i]  = (int) (p-tol);
@@ -41,23 +47,23 @@ struct Vertex
 
 
 
+// A triangle/tetrahedron (NO_DIM+1 vertices) being clipped against the grid.
 struct Simplex
 {
     std::vector< Vertex > pos;
-    Real vol;   // keeps the volume of the simplex
-    
+    Real vol;   // cached simplex volume
+
     Simplex()
     {
         pos.assign( NO_DIM+1, Vertex::zero() );
     }
-    
-    /* Overload the [] operator. */
+
     Vertex& operator[](int i)
     {
         return this->pos[i];
     }
-    
-    /* Assign a set of vertices. */
+
+    // Copy a Delaunay cell's vertex coordinates into this simplex.
     template <typename T>
     void assign(T const cell)
     {
@@ -65,8 +71,8 @@ struct Simplex
             for (int j=0; j<NO_DIM; ++j)
                 pos[i][j] = cell->vertex(i)->point()[j];
     }
-    
-    // returns the volume of a simplex
+
+    // Volume from the edge vectors relative to vertex 0.
     Real volume()
     {
         double posDiff[NO_DIM][NO_DIM];
@@ -75,8 +81,8 @@ struct Simplex
                 posDiff[i][j] = double(this->pos[i+1][j] - this->pos[0][j]);
         return simplexVolume(posDiff);
     }
-    
-    // returns the center of mass of the simplex
+
+    // Centroid (mean of the vertices) into cm.
     void massCenter(Vertex &cm)
     {
         for (int i=0; i<NO_DIM; ++i)
@@ -96,25 +102,26 @@ struct Simplex
 
 
 
+// Clips simplices against the grid and accumulates each cell's enclosed volume and weighted centroid.
 struct VolumeSplit
 {
-    // variable that remain the same for all simplices
-    Real start[NO_DIM];     // keeps the origin of the full grid
-    size_t  grid[NO_DIM];   // keeps the dimensions of the grid
-    Real dx[NO_DIM];        // the grid spoacing along each dimension
-    int  pairs[NO_PAIRS][2];// the posible permutations of vertice pair that give all the edges of the triangle/tetrahedron
-    Real tol;               // tolerance factor that deals with comparing real numbers
-    Real tolVolume;
-    Real cellVolume;        // the volume of a grid cell
-    
-    // variables that change with simplices
-    Real currentStart[NO_DIM];  // the origin of a new, smaller grid, that fully encompasses the current simplex
-    int  newGrid[NO_DIM];       // the dimensions of this new grid (it has the same dx as the main grid)
-    std::vector< Pvector<Real,NO_DIM+1> > *results;    //will store the contributions for each cell of the smaller grid
-    
-    std::vector< Simplex > simplices;
-    
-    
+    // Fixed for all simplices.
+    Real start[NO_DIM];     // origin of the full grid
+    size_t  grid[NO_DIM];   // dimensions of the full grid
+    Real dx[NO_DIM];        // grid spacing per dimension
+    int  pairs[NO_PAIRS][2];// vertex-pair permutations giving all edges of the triangle/tetrahedron
+    Real tol;               // tolerance for real-number comparisons
+    Real tolVolume;         // fragment volume below which recursion stops and the piece is accumulated
+    Real cellVolume;        // volume of one grid cell
+
+    // Reset per simplex.
+    Real currentStart[NO_DIM];  // origin of the small grid enclosing the current simplex
+    int  newGrid[NO_DIM];       // dimensions of that small grid (same dx as the main grid)
+    std::vector< Pvector<Real,NO_DIM+1> > *results;    // per-cell contributions of the small grid
+
+    std::vector< Simplex > simplices;   // pre-allocated work queue for the iterative split
+
+    // Sets up the grid geometry and precomputes the simplex edge list.
     VolumeSplit(Real *startPos, size_t *gridDims, Real *dxValues)
     {
         tol = Real(1.e-5);
@@ -142,14 +149,14 @@ struct VolumeSplit
     }
     
     
-    // sorts the edges (or pairs of points) in descending order of their lengths
+    // Orders the simplex edges (vertex pairs) by descending length into newPairs, so the longest
+    // edge (most likely to straddle a grid wall) is tested first.
     void sortPairs(Simplex &pos,
                    int pairs[NO_PAIRS][2],
                    int newPairs[NO_PAIRS][2])
     {
-        Real len[NO_PAIRS];     // variable that stores the length of each edge of the simplex
-        int  count[NO_PAIRS];   // variable to keep track of the position of the edge when edges are ordered in descending order of their lengths
-        // find the length of each edge
+        Real len[NO_PAIRS];     // squared length of each simplex edge
+        int  count[NO_PAIRS];   // rank of each edge in descending length order
         for (int i=0; i<NO_PAIRS; ++i)
         {
             len[i] = Real(0.);
@@ -161,21 +168,20 @@ struct VolumeSplit
             }
             count[i] = 0;
         }
-        // sort the edges according to their length
         for (int i=0; i<NO_PAIRS; ++i)
             for (int j=i+1; j<NO_PAIRS; ++j)
                 if ( len[i]>=len[j] )
                     count[j] += 1;
                 else
                     count[i] += 1;
-        // copy the edges according to the order stored in 'count'
+        // Scatter each edge into newPairs at its rank position.
         for (int i=0; i<NO_PAIRS; ++i)
             for (int j=0; j<2; ++j)
                newPairs[count[i]][j] = pairs[i][j];
     }
-    
-    
-    // returns the grid index for a cell of the small grid
+
+
+    // Flat small-grid index for integer cell coordinates n; -1 if outside the small grid.
     int index_smallGrid(int *n)
     {
         int result = 0;
@@ -186,8 +192,8 @@ struct VolumeSplit
         }
         return result;
     }
-    
-    // int returns the grid index of a point associated to the smaller grid
+
+    // Flat small-grid index of a point (truncates coordinates to the containing cell).
     int index_smallGrid(Vertex pos)
     {
         int n[NO_DIM];
@@ -197,64 +203,64 @@ struct VolumeSplit
     }
     
     
-    // computes the contribution of a simplex that is fully contained within a grid cell
+    // Accumulates a fully-contained simplex fragment into its grid cell: adds its volume and its
+    // volume-weighted centroid. Stores volume in slot [NO_DIM] and weighted position in slots [0..NO_DIM).
     void simplexContribution(Simplex &pos)
     {
         this->simplexContribution( pos, pos.volume() );
     }
     void simplexContribution(Simplex &pos, Real vol)
     {
-        // find the center of mass to know in which cell this simplex lies
+        // The centroid picks the cell the fragment is assigned to.
         Vertex cm;
         pos.massCenter( cm );
         int index = this->index_smallGrid( cm );
         if (index<0)
             return;
-        Real volume = vol * cellVolume;
-        
-        // store the values in the output matrix
+        Real volume = vol * cellVolume;   // convert grid-cell-unit volume back to physical units
+
         (*this->results)[index][NO_DIM] += volume;
         for (int i=0; i<NO_DIM; ++i)
             (*this->results)[index][i] += ( cm[i]*dx[i] + currentStart[i] ) * volume;
     }
-    
-    
-    // tests if the simplex intersects with the grid wall. If true, splits the simplex in 2, if false, calls 'simplexContribution' function.
+
+
+    // Recursive variant: split the simplex at the first crossed grid wall, else accumulate it.
     void simplexIteration(Simplex &pos, Real vol)
     {
         int sortedPairs[NO_PAIRS][2];
         this->sortPairs( pos, this->pairs, sortedPairs );
         
         
-        // check if the simplex splits into smaller units
+        // Find the first edge crossed by a grid wall; that edge defines where to split.
         for (int i=0; i<NO_PAIRS; ++i)
         {
-            int i1 = sortedPairs[i][0]; //label of 1st vertex
-            int i2 = sortedPairs[i][1]; //label of 2nd vertex
-            
-            // check intersection with x-axis, y-axis and z-axis for 3D case (only x- and y- for 2D)
+            int i1 = sortedPairs[i][0];
+            int i2 = sortedPairs[i][1];
+
+            // Does a grid wall on axis j separate this edge's endpoints?
             for (int j=0; j<NO_DIM; ++j)
             {
-                if ( pos[i1].nMin[j]>pos[i2].nMax[j] or pos[i1].nMax[j]<pos[i2].nMin[j] ) // this expression is true only where there is an intersection of the j-axis (0=x,1=y,2=z) with this edge
+                if ( pos[i1].nMin[j]>pos[i2].nMax[j] or pos[i1].nMax[j]<pos[i2].nMin[j] )
                 {
-                    int const j2 = (j+1) % NO_DIM;// j2=1 for x-axis, j2=2 for y-axis, j2=0 for z-axis
-                    int const j3 = (j+2) % NO_DIM;// j3=2 for x-axis, j3=0 for y-axis, j3=1 for z-axis
-                    
-                    // check wich vertex has the smaller coordinate, this determines the value of 'nMin'
+                    int const j2 = (j+1) % NO_DIM;// the other axes, by cyclic rotation of j
+                    int const j3 = (j+2) % NO_DIM;
+
+                    // Grid plane to split on: just above the lower of the two endpoints along axis j.
                     int nMin = pos[i1].nMax[j];
                     if ( pos[i1].nMin[j]>pos[i2].nMax[j] )
                         nMin = pos[i2].nMax[j];
-                    
-                    // get the slope of the edge along the j2 and j3 axes
-                    Real temp = pos[i1][j]-pos[i2][j];    // the difference in coordinates along the axis in question
+
+                    // Edge parameterized in j; slope/intercept give its j2,j3 coords at the split plane.
+                    Real temp = pos[i1][j]-pos[i2][j];
                     Real slope2 = (pos[i1][j2]-pos[i2][j2]) / temp;
                     Real constant2 = pos[i1][j2] - slope2*pos[i1][j];
 #if NO_DIM==3
                     Real slope3 = (pos[i1][j3]-pos[i2][j3]) / temp;
                     Real constant3 = pos[i1][j3] - slope3*pos[i1][j];
 #endif
-                    
-                    // get the new point along which to divide the simplex
+
+                    // Intersection point where the edge meets the grid plane j = nMin+1.
                     Vertex newPoint;
                     newPoint[j]  = Real(nMin+1);
                     newPoint[j2] = slope2*newPoint[j] + constant2;
@@ -266,18 +272,16 @@ struct VolumeSplit
                     newPoint.update_nMinMax( j3, newPoint[j3], this->tol );
 #endif
                     
-                    // reiterate over two new simplices
+                    // Split into two simplices at newPoint and recurse on each (or accumulate tiny ones).
                     Simplex pos2 = pos;
                     pos2[i2] = newPoint;
                     Real vol1 = pos2.volume();
-                    // do next step for first simplex
                     if ( vol1<this->tolVolume )
                         this->simplexContribution( pos, vol1 );
                     else
                         this->simplexIteration( pos2, vol1 );
-                    // do next step for second simplex
                     pos2[i1] = pos[i2];
-                    vol1 = vol - vol1;
+                    vol1 = vol - vol1;   // remaining fragment volume (total minus first piece)
                     if ( vol1<this->tolVolume )
                         this->simplexContribution( pos, vol1 );
                     else
@@ -287,18 +291,20 @@ struct VolumeSplit
             }
         }
         
-        // the simplex does not split any more, so compute it's contribution
+        // No grid wall crosses any edge: the simplex lies within one cell, so accumulate it.
         this->simplexContribution( pos, vol );
     }
-    
-    
+
+
+    // Iterative (explicit-stack) equivalent of simplexIteration, avoiding deep recursion: splits
+    // the queue of simplices until each fits in a single grid cell. Used by findIntersection.
     void simplexIteration2(Simplex &initSimplex, Real volPrev)
     {
         simplices[0] = initSimplex;
         int current = 0, total = 1;
         simplices[0].vol = volPrev;
-        
-        // loop until all simplices are fully contained in a single grid cell
+
+        // Process the work queue until every fragment fits inside a single grid cell.
         while ( true )
         {
             int sortedPairs[NO_PAIRS][2];
@@ -308,27 +314,27 @@ struct VolumeSplit
             bool simplexSplit = false;
             
             
-            // check if the simplex splits into smaller simplices
+            // Find the first edge crossed by a grid wall; that edge defines where to split.
             for (int i=0; i<NO_PAIRS; ++i)
             {
-                int i1 = sortedPairs[i][0]; //label of 1st vertex
-                int i2 = sortedPairs[i][1]; //label of 2nd vertex
-                
-                // check intersection with x-axis, y-axis and z-axis for 3D case (only x- and y- for 2D)
+                int i1 = sortedPairs[i][0];
+                int i2 = sortedPairs[i][1];
+
+                // Does a grid wall on axis j separate this edge's endpoints?
                 for (int j=0; j<NO_DIM; ++j)
                 {
-                    if ( (*pos)[i1].nMin[j]>(*pos)[i2].nMax[j] or (*pos)[i1].nMax[j]<(*pos)[i2].nMin[j] ) // this expression is true only where there is an intersection of the j-axis (0=x,1=y,2=z) with this edge
+                    if ( (*pos)[i1].nMin[j]>(*pos)[i2].nMax[j] or (*pos)[i1].nMax[j]<(*pos)[i2].nMin[j] )
                     {
-                        int const j2 = (j+1) % NO_DIM;// j2=1 for x-axis, j2=2 for y-axis, j2=0 for z-axis
-                        int const j3 = (j+2) % NO_DIM;// j3=2 for x-axis, j3=0 for y-axis, j3=1 for z-axis
-                        
-                        // check wich vertex has the smaller coordinate, this determines the value of 'nMin'
+                        int const j2 = (j+1) % NO_DIM;// the other axes, by cyclic rotation of j
+                        int const j3 = (j+2) % NO_DIM;
+
+                        // Grid plane to split on: just above the lower of the two endpoints along axis j.
                         int nMin = (*pos)[i1].nMax[j];
                         if ( (*pos)[i1].nMin[j]>(*pos)[i2].nMax[j] )
                             nMin = (*pos)[i2].nMax[j];
-                        
-                        // get the slope of the edge along the j2 and j3 axes
-                        Real temp = (*pos)[i1][j]-(*pos)[i2][j];    // the difference in coordinates along the axis in question
+
+                        // Edge parameterized in j; slope/intercept give its j2,j3 coords at the split plane.
+                        Real temp = (*pos)[i1][j]-(*pos)[i2][j];
                         Real slope2 = ((*pos)[i1][j2]-(*pos)[i2][j2]) / temp;
                         Real constant2 = (*pos)[i1][j2] - slope2*(*pos)[i1][j];
 #if NO_DIM==3
@@ -336,7 +342,7 @@ struct VolumeSplit
                         Real constant3 = (*pos)[i1][j3] - slope3*(*pos)[i1][j];
 #endif
                         
-                        // get the new point along which to divide the simplex
+                        // Intersection point where the edge meets the grid plane j = nMin+1.
                         Vertex newPoint;
                         newPoint[j]  = Real(nMin+1);
                         newPoint[j2] = slope2*newPoint[j] + constant2;
@@ -347,27 +353,23 @@ struct VolumeSplit
                         newPoint[j3] = slope3*newPoint[j] + constant3;
                         newPoint.update_nMinMax( j3, newPoint[j3], this->tol );
 #endif
-                        
-                        // reiterate over two new simplices
+
+                        // Split at newPoint: the new fragment goes on the queue, *pos keeps the rest.
                         simplices[total] = *pos;
                         simplices[total][i1] = newPoint;
                         simplices[total].vol = simplices[total].volume();
-                        // do next step for first simplex
                         (*pos)[i2] = newPoint;
                         pos->vol -= simplices[total].vol;
                         if ( pos->vol<this->tolVolume )
                         {
-                            this->simplexContribution( *pos, pos->vol ); // the simplex does not split any more, so compute it's contribution since below volume tolerance
+                            this->simplexContribution( *pos, pos->vol ); // below volume tolerance: accumulate
                             simplexFinished = true;
                         }
-                        // do next step for second simplex
                         if ( simplices[total].vol<this->tolVolume )
-                            this->simplexContribution( simplices[total], simplices[total].vol ); // the simplex does not split any more, so compute it's contribution since below volume tolerance
+                            this->simplexContribution( simplices[total], simplices[total].vol ); // below volume tolerance: accumulate
                         else
-                            ++total;    // added an additional simplex that needs to be split
-                        
-                        
-                        // continue to a different simplex since this one was split already
+                            ++total;    // queue the new simplex for further splitting
+
                         simplexSplit = true;
                         break;
                     }
@@ -375,20 +377,20 @@ struct VolumeSplit
                 if ( simplexSplit ) break;
             }
             
-            if ( not simplexSplit ) // the simplex does not split any more, so compute it's contribution
+            if ( not simplexSplit ) // no further split: accumulate this simplex
             {
                 this->simplexContribution( *pos, pos->vol );
                 simplexFinished = true;
             }
-            
-            if ( simplexFinished ) // go to the next simplex => increase current by 1
-                if ( ++current==total )   // there are no more simplices left
+
+            if ( simplexFinished )
+                if ( ++current==total )   // no simplices left
                     return;
         }
     }
     
     
-    // returns the grid index along a coordinate for the main grid
+    // Main-grid cell index of coordinate x along one axis (floor, including negative x).
     inline int mainGridIndex(Real const x, int const axis)
     {
         Real temp = (x - this->start[axis]) / this->dx[axis];
@@ -397,8 +399,9 @@ struct VolumeSplit
         else
             return int( temp ) - 1;
     }
-    
-    // finds the grid that fully encompasses the simplex
+
+    // Builds the smallest sub-grid enclosing the simplex, maps its cells to main-grid indices, and
+    // rescales the simplex coordinates into small-grid units (cells of size 1, origin at currentStart).
     void findBoundingGrid(Simplex &pos,
                           vector<size_t> &indices)
     {
@@ -409,7 +412,7 @@ struct VolumeSplit
             nMax[j] = nMin[j];
         }
         
-        // find the min and max extensions of the grid along each dimension
+        // Expand [nMin,nMax] per axis to cover every vertex.
         for (int i=1; i<NO_DIM+1; ++i)
             for (int j=0; j<NO_DIM; ++j)
             {
@@ -417,12 +420,12 @@ struct VolumeSplit
                 if (temp<nMin[j]) nMin[j] = temp;
                 if (temp>nMax[j]) nMax[j] = temp;
             }
-        
-        // add an extra cell for the upper bound
+
+        // Make the upper bound exclusive so the span covers the cell containing nMax.
         for (int j=0; j<NO_DIM; ++j)
             nMax[j] += 1;
-        
-        // initialize the new grid
+
+        // Set up the small grid: its origin, dimensions, and total cell count.
         int newSize = 1;
         for (int j=0; j<NO_DIM; ++j)
         {
@@ -431,7 +434,7 @@ struct VolumeSplit
             newSize *= this->newGrid[j];
         }
         
-        // compute the indices of the large grid corresponding to the smaller grid
+        // map each small-grid cell to its main-grid index (-1 if outside)
         indices.assign( newSize, size_t(-1) );
         for (size_t flatIdx=0; flatIdx<newSize; ++flatIdx)
         {
@@ -449,7 +452,7 @@ struct VolumeSplit
                 indices[flatIdx] = mainIdx;
         }
         
-        //change the vertex positions to the new start of the grid
+        // Rescale vertex coordinates into small-grid units (origin at currentStart, cell size 1).
         for (int i=0; i<NO_DIM+1; ++i)
             for (int j=0; j<NO_DIM; ++j)
             {
@@ -457,20 +460,20 @@ struct VolumeSplit
                 pos[i].update_nMinMax( j, pos[i][j], this->tol );
             }
     }
-    
-    
-    // this function takes care to initialize the computations for the start of each simplex
+
+
+    // Public entry point: clips one simplex across the grid, returning per-small-cell contributions
+    // and the small-cell -> main-grid index map. contributions[c] = (weighted centroid, volume).
     void findIntersection(Simplex &pos,
                           vector<size_t> &indices,
                           vector< Pvector<Real,NO_DIM+1> > &contributions)
     {
         this->results = &contributions;
-        
-        // find the size of the smallest grid that fully encompasses the input simplex
+
         this->findBoundingGrid( pos, indices );
         contributions.assign( indices.size(), Pvector<Real,NO_DIM+1>::zero() );
-        
-        // call the function that computes the volume intersection
+
+        // Scale the stop tolerance to the simplex size, with an absolute floor to bound recursion depth.
         Real vol = pos.volume();
         this->tolVolume = Real(1.)<vol ? VOLUME_TOL : VOLUME_TOL*vol;
         if ( this->tolVolume<Real(1.e-6) )  this->tolVolume = Real(1.e-6);

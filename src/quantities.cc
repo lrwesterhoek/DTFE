@@ -21,13 +21,16 @@
  */
 
 
+/* Quantities member functions: copy/accumulate field results across partitions and (PS-DTFE) turn
+   summed density-weighted moments into mass-weighted means. */
+
 #include "quantities.h"
 #include "message.h"
 
 
 
 
-/* This function copies one field of 'Quantities' at a time from the subgrid results to the main grid ones. */
+// Copies one Quantities field from the subgrid results into the matching block of the main grid.
 template<typename T>
 void copyField(T const &subgridResults,
                 T *mainGridResults,
@@ -69,8 +72,7 @@ void copyField(T const &subgridResults,
     }
 }
 
-/* Function used to copy the results obtain on a subgrid using the option 'partion' to the results for the full grid.
-NOTE: For additional details on how to compute the 'subgrid' and 'subgridOffset' check the function 'subgridAxesSize' in the file 'subpartition.h'. */
+// Copies '--partition' subgrid results into the full-grid results ('subgrid', 'subgridOffset' from subpartition.h).
 void Quantities::copyFromSubgrid(Quantities const &subgridResults,
                                  Field const &field,
                                  std::vector<size_t> const &mainGrid,
@@ -84,6 +86,7 @@ void Quantities::copyFromSubgrid(Quantities const &subgridResults,
     copyField( subgridResults.velocity_shear, &(this->velocity_shear), field.velocity_shear,  mainGrid, subgrid, subgridOffset );
     copyField( subgridResults.velocity_vorticity, &(this->velocity_vorticity), field.velocity_vorticity,  mainGrid, subgrid, subgridOffset );
     copyField( subgridResults.velocity_std, &(this->velocity_std), field.velocity_std,  mainGrid, subgrid, subgridOffset );
+    copyField( subgridResults.velocity_dispersion, &(this->velocity_dispersion), field.velocity_dispersion,  mainGrid, subgrid, subgridOffset );
     copyField( subgridResults.scalar, &(this->scalar), field.scalar,  mainGrid, subgrid, subgridOffset );
     copyField( subgridResults.scalar_gradient, &(this->scalar_gradient), field.scalar_gradient,  mainGrid, subgrid, subgridOffset );
     copyField( subgridResults.velocity_tweb, &(this->velocity_tweb), field.velocity_tweb,  mainGrid, subgrid, subgridOffset );
@@ -94,7 +97,7 @@ void Quantities::copyFromSubgrid(Quantities const &subgridResults,
 
 
 
-/* Compares the size of a vector with the expected size and outputs error if this is not the case. */
+// Errors out if 'object' is non-empty and its size differs from the running expected size; updates *expectedSize.
 template< typename T>
 void fieldSize(T const & object,
                 size_t *expectedSize)
@@ -108,8 +111,7 @@ void fieldSize(T const & object,
     }
 }
 
-/* Returns what is the size of any non-empty object.
-NOTE: All non-empty objects should have the same size. */
+// Returns the size of any non-empty member (all non-empty members share the same size).
 size_t Quantities::size() const
 {
     size_t temp = 0;
@@ -120,27 +122,34 @@ size_t Quantities::size() const
     fieldSize( this->velocity_shear, &temp );
     fieldSize( this->velocity_vorticity, &temp );
     fieldSize( this->velocity_std, &temp );
+    fieldSize( this->velocity_dispersion, &temp );
     fieldSize( this->scalar, &temp );
     fieldSize( this->scalar_gradient, &temp );
     fieldSize( this->velocity_tweb, &temp );
     fieldSize( this->velocity_tweb_eigenvalues, &temp );
     fieldSize( this->velocity_vweb, &temp );
     fieldSize( this->velocity_vweb_eigenvalues, &temp );
+#ifdef PHASE_SPACE
+    fieldSize( this->stream_count, &temp );
+    fieldSize( this->mass_weight, &temp );
+#endif
     return temp;
 }
 
 
-/* Element-wise accumulate: add values from 'other' into this Quantities.
-   Used by PS-DTFE partitioning where each partition writes to a full grid
-   and results are summed across partitions. */
+// Element-wise adds 'src' into 'dst'; used to sum PS-DTFE partition results across partitions.
 template<typename T>
 void addField(std::vector<T> const &src, std::vector<T> *dst)
 {
     if (src.empty()) return;
+    // Grow an unsized dst (zero-filled) so accumulation starts from zero.
+    if (dst->size() < src.size())
+        dst->resize(src.size(), T());
     for (size_t i = 0; i < src.size(); ++i)
         (*dst)[i] += src[i];
 }
 
+// Accumulates every field of 'other' into this object (PS-DTFE: one partition's results summed into the whole).
 void Quantities::addFrom(Quantities const &other)
 {
     addField(other.density, &this->density);
@@ -150,19 +159,98 @@ void Quantities::addFrom(Quantities const &other)
     addField(other.velocity_shear, &this->velocity_shear);
     addField(other.velocity_vorticity, &this->velocity_vorticity);
     addField(other.velocity_std, &this->velocity_std);
+    addField(other.velocity_dispersion, &this->velocity_dispersion);
     addField(other.scalar, &this->scalar);
     addField(other.scalar_gradient, &this->scalar_gradient);
-    // Note: T-web/V-web classification is computed post-interpolation, so these are unused here
-    // but included for completeness
+    // T-web/V-web labels are computed post-interpolation; only eigenvalues accumulate
     addField(other.velocity_tweb_eigenvalues, &this->velocity_tweb_eigenvalues);
     addField(other.velocity_vweb_eigenvalues, &this->velocity_vweb_eigenvalues);
 #ifdef PHASE_SPACE
     addField(other.stream_count, &this->stream_count);
+    addField(other.mass_weight, &this->mass_weight);
 #endif
 }
 
 
-/* This function reserves memory for the main grid quantities when using the 'partition' option. */
+#ifdef PHASE_SPACE
+// PS-DTFE partition path: partitions accumulate density-weighted moments sum(rho_s f_s) and per-cell
+// mass sum(rho_s); divide once here after all partitions are summed, since averaging is non-linear.
+void Quantities::normalizePhaseSpace(Field const &field)
+{
+    if ( this->mass_weight.empty() ) return;   // no mass-weighted field was deferred
+    size_t const n = this->mass_weight.size();
+    bool const haveVel = field.velocity || field.velocity_dispersion; // velocity holds sum(rho v)
+    for (size_t i = 0; i < n; ++i)
+    {
+        if ( this->mass_weight[i] <= Real(0.) ) continue;
+        Real const inv = Real(1.) / this->mass_weight[i];
+        if ( haveVel )                 this->velocity[i]          *= inv;   // <v> = sum(rho v)/sum(rho)
+        if ( field.velocity_gradient ) this->velocity_gradient[i] *= inv;
+        if ( field.scalar )            this->scalar[i]            *= inv;
+        if ( field.scalar_gradient )   this->scalar_gradient[i]   *= inv;
+        if ( field.velocity_dispersion )
+        {
+            // sigma_ij = <v_i v_j> - <v_i><v_j>, using the now-normalized <v>.
+            Pvector<Real,noVelComp> const &vbar = this->velocity[i];
+            size_t c = 0;
+            for (int a = 0; a < NO_DIM; ++a)
+                for (int b = a; b < NO_DIM; ++b)
+                {
+                    Real s = this->velocity_dispersion[i][c] * inv - vbar[a]*vbar[b];
+                    if ( a == b and s < Real(0.) ) s = Real(0.);   // variance: clamp FP-noise negatives
+                    this->velocity_dispersion[i][c] = s;
+                    ++c;
+                }
+        }
+    }
+}
+
+
+// Like addField, but 'src' is a sub-grid (dims m, global origin o) of the full grid 'full';
+// each cell is mapped to its global row-major index. o, m, full are in grid-cell units.
+template<typename T>
+void addFieldSubgrid(std::vector<T> const &src, std::vector<T> *dst,
+                     size_t const *o, size_t const *m, size_t const *full)
+{
+    if (src.empty()) return;
+    size_t fullTotal = 1; for (int d = 0; d < NO_DIM; ++d) fullTotal *= full[d];
+    if (dst->size() < fullTotal) dst->resize(fullTotal, T());
+    size_t subTotal = 1; for (int d = 0; d < NO_DIM; ++d) subTotal *= m[d];
+    for (size_t l = 0; l < subTotal; ++l)
+    {
+        size_t rem = l, c[NO_DIM];
+        for (int d = NO_DIM - 1; d >= 0; --d) { c[d] = rem % m[d]; rem /= m[d]; }   // local coords
+        size_t g = 0;
+        for (int d = 0; d < NO_DIM; ++d) g = g * full[d] + (c[d] + o[d]);           // global row-major flat
+        (*dst)[g] += src[l];
+    }
+}
+
+// Accumulates 'other' (which holds only its Eulerian sub-box) into the full grid, mapping each cell by global index.
+void Quantities::addFromSubgrid(Quantities const &other, size_t const *fullGrid)
+{
+    if (other.ps_subDims[0] == 0) { this->addFrom(other); return; }   // 'other' spans the full grid
+    size_t const *o = other.ps_subOrigin;
+    size_t const *m = other.ps_subDims;
+    addFieldSubgrid(other.density, &this->density, o, m, fullGrid);
+    addFieldSubgrid(other.velocity, &this->velocity, o, m, fullGrid);
+    addFieldSubgrid(other.velocity_gradient, &this->velocity_gradient, o, m, fullGrid);
+    addFieldSubgrid(other.velocity_divergence, &this->velocity_divergence, o, m, fullGrid);
+    addFieldSubgrid(other.velocity_shear, &this->velocity_shear, o, m, fullGrid);
+    addFieldSubgrid(other.velocity_vorticity, &this->velocity_vorticity, o, m, fullGrid);
+    addFieldSubgrid(other.velocity_std, &this->velocity_std, o, m, fullGrid);
+    addFieldSubgrid(other.velocity_dispersion, &this->velocity_dispersion, o, m, fullGrid);
+    addFieldSubgrid(other.scalar, &this->scalar, o, m, fullGrid);
+    addFieldSubgrid(other.scalar_gradient, &this->scalar_gradient, o, m, fullGrid);
+    addFieldSubgrid(other.velocity_tweb_eigenvalues, &this->velocity_tweb_eigenvalues, o, m, fullGrid);
+    addFieldSubgrid(other.velocity_vweb_eigenvalues, &this->velocity_vweb_eigenvalues, o, m, fullGrid);
+    addFieldSubgrid(other.stream_count, &this->stream_count, o, m, fullGrid);
+    addFieldSubgrid(other.mass_weight, &this->mass_weight, o, m, fullGrid);
+}
+#endif
+
+
+// Reserves and zero-fills main-grid memory for each requested quantity ('--partition' option).
 void Quantities::reserveMemory(size_t *gridSize, Field &field)
 {
     size_t totalSize = 1;
@@ -171,7 +259,7 @@ void Quantities::reserveMemory(size_t *gridSize, Field &field)
     
     if ( field.density )
         this->density.resize( totalSize, Real(0.) );
-    if ( field.velocity )
+    if ( field.velocity || field.velocity_dispersion )   // dispersion needs <v> too, so allocate velocity even if only dispersion is requested
         this->velocity.resize( totalSize, Pvector<Real,noVelComp>::zero() );
     if ( field.velocity_gradient )
         this->velocity_gradient.resize( totalSize, Pvector<Real,noGradComp>::zero() );
@@ -183,6 +271,8 @@ void Quantities::reserveMemory(size_t *gridSize, Field &field)
         this->velocity_vorticity.resize( totalSize, Pvector<Real,noVortComp>::zero() );
     if ( field.velocity_std )
         this->velocity_std.resize( totalSize, Real(0.) );
+    if ( field.velocity_dispersion )
+        this->velocity_dispersion.resize( totalSize, Pvector<Real,noDispComp>::zero() );
     if ( field.scalar )
         this->scalar.resize( totalSize, Pvector<Real,noScalarComp>::zero() );
     if ( field.scalar_gradient )

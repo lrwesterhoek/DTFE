@@ -22,21 +22,18 @@
 
 
 
-/* You can use this file to implement your own function (quantity) that you want to be volume averaged using the DTFE method. */
+/* User extension point: define your own quantity here for DTFE to interpolate/volume-average. */
 
 
 #ifdef SCALAR
 
-//uncommenting the following uses the function below to assign values to the variable 'scalar', values that will be volume averaged afterwards
+// Uncomment to route the 'scalar' field through personalizedFunction() below instead of the raw scalar.
 //#define MY_SCALAR
 
 
-/* This function takes as input the density value 'density', the density gradient 'densityGradient' (has NO_DIM components), the velocity 'velocity' (has NO_DIM components) and the velocity gradient 'velocityGradient' (has NO_DIM*NO_DIM components). Compute the new quantity you want and save it in the 'scalar' variable (remeber to choose the correct value for the '-DNO_SCALARS' macro in the Makefile since  'noScalarComp=NO_SCALARS').
-
-The density, density gradient, velocity and velocity gradient are the values of those quantities at the point 'pointPosition'.
-
-The program will then volume average the each component of the 'scalar' variable. You must run the program with the '--field scalar / scalar_a' options for this computation to take part. 
-*/
+// Computes a custom quantity at 'pointPosition' into 'scalar' (selected via '--field scalar / scalar_a').
+// Inputs are the cell-interpolated density, densityGradient, velocity, velocityGradient; set the scalar
+// component count with '-DNO_SCALARS' (noScalarComp) in the Makefile.
 void inline personalizedFunction(Point &pointPosition,
                                  Real density,
                                  Real *densityGradient,
@@ -44,10 +41,9 @@ void inline personalizedFunction(Point &pointPosition,
                                  Real velocityGradient[][noVelComp],
                                  Pvector<Real,noScalarComp> &scalar)
 {
-    /* example of possible text */
-    scalar[0] = density * densityGradient[1];   // density times the y-component of the density gradient
-    scalar[1] = densityGradient[2] * velocity[2]; // product of z-components of density gradient and velocity
-    // velocityGradient[i][j] - the entry (i,j) of the velocity gradient matrix = the derivative along direction i (0=x, 1=y, 2=z) of velocity component j (0=x, 1=y, 2=z)
+    // Example only; velocityGradient[i][j] = d(v_j)/d(x_i), axes 0=x, 1=y, 2=z.
+    scalar[0] = density * densityGradient[1];
+    scalar[1] = densityGradient[2] * velocity[2];
 }
 
 #endif

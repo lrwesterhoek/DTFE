@@ -1,19 +1,4 @@
 #!/usr/bin/env python3
-"""
-Integration tests for DTFE.
-
-Generates test particle data, runs the DTFE binary, and validates results.
-Tests focus on density estimation since the text input format (type 111)
-reads positions + weights (velocity/scalar reading is commented out in the source).
-
-Note: DTFE density output is normalized by the average density (totalMass/boxVolume),
-so a uniform distribution should give values near 1.0, not N/V.
-
-Usage:
-    python3 tests/run_tests.py                  # run all tests
-    python3 tests/run_tests.py --update-ref      # regenerate reference files
-    python3 tests/run_tests.py -v                # verbose output
-"""
 
 import argparse
 import math
@@ -39,7 +24,6 @@ def log(msg):
 
 
 def write_text_input(filepath, particles, box):
-    """Write a DTFE text input file (type 111: positions + weight)."""
     with open(filepath, "w") as f:
         f.write(f"{len(particles)}\n")
         f.write("  ".join(str(b) for b in box) + "\n")
@@ -48,7 +32,6 @@ def write_text_input(filepath, particles, box):
 
 
 def write_positions_input(filepath, particles, box):
-    """Write a DTFE text input file (type 112: positions only)."""
     with open(filepath, "w") as f:
         f.write(f"{len(particles)}\n")
         f.write("  ".join(str(b) for b in box) + "\n")
@@ -57,7 +40,6 @@ def write_positions_input(filepath, particles, box):
 
 
 def read_density_output(filepath):
-    """Read DTFE density output (one float per line)."""
     values = []
     with open(filepath) as f:
         for line in f:
@@ -69,7 +51,6 @@ def read_density_output(filepath):
 
 def run_dtfe(input_file, output_file, grid_size, input_type=111,
              output_type=111, field="density", extra_args=None):
-    """Run the DTFE binary and return (success, stdout+stderr)."""
     cmd = [
         DTFE_BIN, input_file, output_file,
         "-i", str(input_type),
@@ -115,12 +96,7 @@ def report(name, success, msg=""):
         print(f"  FAIL  {name}" + (f" -- {msg}" if msg else ""))
 
 
-# ---------------------------------------------------------------------------
-# Test data generators
-# ---------------------------------------------------------------------------
-
 def make_lattice_particles(n_per_dim, box_size, weight=1.0):
-    """Create particles on a regular lattice inside [0, box_size]^3."""
     particles = []
     spacing = box_size / n_per_dim
     offset = spacing / 2.0
@@ -135,7 +111,6 @@ def make_lattice_particles(n_per_dim, box_size, weight=1.0):
 
 
 def make_seeded_random_particles(n, box_size, weight=1.0, seed=42):
-    """Create reproducible pseudo-random particles using a simple LCG."""
     a, c, m = 1664525, 1013904223, 2**32
     state = seed
     particles = []
@@ -148,12 +123,7 @@ def make_seeded_random_particles(n, box_size, weight=1.0, seed=42):
     return particles
 
 
-# ---------------------------------------------------------------------------
-# Individual tests
-# ---------------------------------------------------------------------------
-
 def test_uniform_lattice_density(tmpdir):
-    """Particles on a regular lattice: DTFE normalized density should be near 1.0."""
     name = "uniform_lattice_density"
     n_per_dim = 6
     box_size = 10.0
@@ -180,11 +150,7 @@ def test_uniform_lattice_density(tmpdir):
     log(f"Min: {min_den:.6f}, Max: {max_den:.6f}")
 
     try:
-        # DTFE density is normalized, so mean should be near 1.0
-        # Boundary effects and padding reduce the effective mean, so allow wide tolerance
         assert_close(mean_den, 1.0, tol=0.6, msg="Mean normalized density")
-        # Check uniformity: inner cells should be close to 1.0
-        # (boundary cells will be lower due to padding effects)
         variance = sum((d - mean_den)**2 for d in density) / len(density)
         cv = math.sqrt(variance) / mean_den if mean_den > 0 else 0
         log(f"Coefficient of variation: {cv:.4f}")
@@ -196,8 +162,6 @@ def test_uniform_lattice_density(tmpdir):
 
 
 def test_weight_scaling_invariance(tmpdir):
-    """Doubling all weights should NOT change normalized density
-    (since averageDensity also doubles, cancelling out)."""
     name = "weight_scaling_invariance"
     box_size = 10.0
     particles_w1 = make_seeded_random_particles(200, box_size, weight=1.0)
@@ -234,14 +198,10 @@ def test_weight_scaling_invariance(tmpdir):
 
 
 def test_nonuniform_weight_effect(tmpdir):
-    """Particles with different weights: heavier particle should produce
-    higher density at its location than a lighter one at the same position."""
     name = "nonuniform_weight_effect"
     box_size = 10.0
 
-    # Base: uniform grid of particles, weight=1
     particles = make_lattice_particles(4, box_size, weight=1.0)
-    # Modify one particle (near center) to have very high weight
     heavy_idx = len(particles) // 2
     x, y, z, _ = particles[heavy_idx]
     particles[heavy_idx] = (x, y, z, 100.0)
@@ -260,7 +220,6 @@ def test_nonuniform_weight_effect(tmpdir):
         report(name, False, "No density output")
         return
 
-    # The heavy particle should create a density peak
     peak = max(density)
     mean = sum(density) / len(density)
     log(f"Peak density: {peak:.4f}, Mean: {mean:.4f}")
@@ -272,7 +231,6 @@ def test_nonuniform_weight_effect(tmpdir):
 
 
 def test_reproducibility(tmpdir):
-    """Running DTFE twice on the same input should produce identical output."""
     name = "reproducibility"
     box_size = 10.0
     particles = make_seeded_random_particles(200, box_size)
@@ -304,7 +262,6 @@ def test_reproducibility(tmpdir):
 
 
 def test_grid_resolution_convergence(tmpdir):
-    """Mean normalized density should converge as grid resolution increases."""
     name = "grid_resolution_convergence"
     box_size = 10.0
     particles = make_seeded_random_particles(500, box_size)
@@ -323,8 +280,6 @@ def test_grid_resolution_convergence(tmpdir):
         means[grid] = sum(density) / len(density)
         log(f"Grid {grid:2d}: mean density = {means[grid]:.6f}")
 
-    # Higher resolutions should converge: the difference between grid 16 and
-    # 32 should be smaller than between 4 and 8
     diff_low = abs(means[4] - means[8])
     diff_high = abs(means[16] - means[32])
     log(f"diff(4,8) = {diff_low:.6f}, diff(16,32) = {diff_high:.6f}")
@@ -337,12 +292,10 @@ def test_grid_resolution_convergence(tmpdir):
 
 
 def test_density_peak_location(tmpdir):
-    """A cluster of particles should produce a density peak at the cluster location."""
     name = "density_peak_location"
     box_size = 10.0
     grid_size = 10
 
-    # Background: sparse uniform particles
     particles = []
     spacing = box_size / 3
     for i in range(3):
@@ -352,7 +305,6 @@ def test_density_peak_location(tmpdir):
                     spacing * (i + 0.5), spacing * (j + 0.5),
                     spacing * (k + 0.5), 1.0))
 
-    # Cluster: many particles near (7.5, 7.5, 7.5)
     cluster_center = (7.5, 7.5, 7.5)
     state = 123
     a, c, m = 1664525, 1013904223, 2**32
@@ -397,7 +349,6 @@ def test_density_peak_location(tmpdir):
 
 
 def test_positions_only_input(tmpdir):
-    """Input type 112 (positions only) should work and produce density output."""
     name = "positions_only_input"
     box_size = 10.0
     n_per_dim = 4
@@ -439,7 +390,6 @@ def test_positions_only_input(tmpdir):
 
 
 def test_density_positivity(tmpdir):
-    """All DTFE density values should be non-negative."""
     name = "density_positivity"
     box_size = 10.0
     particles = make_seeded_random_particles(300, box_size, seed=99)
@@ -464,7 +414,6 @@ def test_density_positivity(tmpdir):
 
 
 def test_output_size_matches_grid(tmpdir):
-    """Output should have exactly grid^3 values."""
     name = "output_size_matches_grid"
     box_size = 10.0
     particles = make_seeded_random_particles(100, box_size)
@@ -489,7 +438,6 @@ def test_output_size_matches_grid(tmpdir):
 
 
 def test_regression(tmpdir, update_ref=False):
-    """Compare output against stored reference to detect regressions."""
     name = "regression"
     box_size = 10.0
     particles = make_seeded_random_particles(150, box_size, weight=1.0, seed=12345)
@@ -541,10 +489,6 @@ def test_regression(tmpdir, update_ref=False):
     else:
         report(name, True)
 
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 def main():
     global VERBOSE, PASSED, FAILED

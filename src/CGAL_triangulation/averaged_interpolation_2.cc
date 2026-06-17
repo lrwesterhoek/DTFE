@@ -21,31 +21,27 @@
  */
 
 
-/* This file contains most of the functions necessary to interpolate to grid volume averaged fields inside the sampling cell using averaging method 2 (= choose sampling points inside grid cell).
- NOTE: it also contains the function the interpolate using averaging method 3 - see end of the file.*/
+/* Volume-averaged grid interpolation, method 2 (= MC sample points chosen inside the
+   grid cell). Method 3 (equidistant sampling) is at the end of the file. */
 #include "triangulation_common.h"
 
 
 
-/* This function interpolates the fields to a uniform grid - it computes the volume averaged value of the fields within the grid cell. To compute the volume average in each grid cell it uses a Monte Carlo algorithm to sample 'noRandPoints' in each grid cell and take the average.
-The arguments are:
-    'dt' - the periodic Delaunay triangulation; with the density at the vertex points already computed
-    'userOptions' - structure which store the number of grid points along each axis and the number of random sample points in each grid cell. This structure also gives information about the size of the box along each axis.
-    'quantities' - structure storing the vectors for the output fields on the grid
-*/
+// Volume-averaged grid interpolation (method 2): averages the field over NN Monte Carlo points drawn
+// inside each grid cell. The only method that can also report the per-cell velocity standard deviation.
 void interpolateGrid_averaged_2(DT &dt,
                                 User_options &userOptions,
                                 Quantities *quantities)
 {
-    size_t *nGrid = &(userOptions.gridSize[0]); // size of the density grid along each axis
-    int const NN = userOptions.noPoints;        // number of random points in each grid cell used to compute the volume average
-    Box boxCoordinates = userOptions.region;    // the box coordinates in which the density is computed
-    vector<Real> boxLength;                     // the size of the particle box of interest along each direction
+    size_t *nGrid = &(userOptions.gridSize[0]); // grid size along each axis
+    int const NN = userOptions.noPoints;        // MC samples per grid cell
+    Box boxCoordinates = userOptions.region;    // box region of interest
+    vector<Real> boxLength;                     // box size along each direction
     for (size_t i=0; i<NO_DIM; ++i)
         boxLength.push_back( boxCoordinates[2*i+1]-boxCoordinates[2*i] );
-    
-    
-    // define pointers to the vectors storing the output fields
+
+
+    // output field vectors
     Field field = userOptions.aField;
     std::vector<Real>                         *density = &(quantities->density);
     std::vector< Pvector<Real,noVelComp> >    *velocity = &(quantities->velocity);
@@ -53,51 +49,48 @@ void interpolateGrid_averaged_2(DT &dt,
     std::vector<Real>                         *velocity_std = &(quantities->velocity_std);
     std::vector< Pvector<Real,noScalarComp> > *scalar = &(quantities->scalar);
     std::vector< Pvector<Real,noScalarGradComp> > *scalar_gradient = &(quantities->scalar_gradient);
-    
-    
-    // show a message to the user
-    MESSAGE::Message message( userOptions.verboseLevel );   // structure used to output messages to the user ( the higher the verboseLevel, the more messages will be showns (check 'message.h' for details) )
-    message << "\nComputing interpolation of the fields volume averaged over the sampling cell on a regular " 
-            << MESSAGE::printElements( nGrid, NO_DIM, "*" ) << " grid in the region " 
-            << boxCoordinates.print() 
+
+
+    MESSAGE::Message message( userOptions.verboseLevel );
+    message << "\nComputing interpolation of the fields volume averaged over the sampling cell on a regular "
+            << MESSAGE::printElements( nGrid, NO_DIM, "*" ) << " grid in the region "
+            << boxCoordinates.print()
             << ". The volume average is done using " << NN << " Monte Carlo samples in each grid cell.\n"
             << "\t Done: " << MESSAGE::Flush;
-    
-    
-    //reserve memory for the output fields
-    size_t reserveSize = (NO_DIM==2) ? nGrid[0]*nGrid[1] : nGrid[0]*nGrid[1]*nGrid[2];      // the number of cell in the grid
-    reserveMemory( density, reserveSize, field.density, dt, "density" );    // reserves memory for the density computations (if any) and initializes the density values to 0 if the Delaunay triangulation is not well defined
+
+
+    // reserve output fields (reserveMemory zero-fills if the triangulation is undefined)
+    size_t reserveSize = (NO_DIM==2) ? nGrid[0]*nGrid[1] : nGrid[0]*nGrid[1]*nGrid[2];
+    reserveMemory( density, reserveSize, field.density, dt, "density" );
     reserveMemory( velocity, reserveSize, field.velocity, dt, "velocity" );
     reserveMemory( velocity_gradient, reserveSize, field.velocity_gradient, dt, "velocity gradient" );
     reserveMemory( velocity_std, reserveSize, field.velocity_std, dt, "velocity standard deviation" );
     reserveMemory( scalar, reserveSize, field.scalar, dt, "scalar" );
     reserveMemory( scalar_gradient, reserveSize, field.scalar_gradient, dt, "scalar gradient" );
-    if ( dt.number_of_vertices()<NO_DIM+1 ) return;     // stop the computation if the Delaunay triangulation is not well defined
-    
-    
-    // temporary variables needed for the interpolation
-    Point samplePoint;      // the coordinates of the MC sampling point
+    if ( dt.number_of_vertices()<NO_DIM+1 ) return;     // no interpolation possible without cells
+
+
+    Point samplePoint;
     Real dx[NO_DIM];        // grid spacing along each axis
     for (size_t i=0; i<NO_DIM; ++i)
         dx[i] = boxLength[i] / nGrid[i];
-    
+
 #ifdef TEST_PADDING
-    vector<size_t> incompleteCells_d;// keep track of grid cells where there is an error in the density field computation (because one of the vertices is a dummy point)
-    vector<size_t> incompleteCells;  // keep track of grid cells where there is an error in the field (all fields except density) computation (because one of the vertices is a dummy point)
+    vector<size_t> incompleteCells_d;// grid cells with a dummy-point error in the density field
+    vector<size_t> incompleteCells;  // grid cells with a dummy-point error in the other fields
 #endif
-    int prev = 0, amount100 = 0;    // variable to show the user about the progress of the computation
-    
-    
-    // parameters for searching in the triangulation
+    int prev = 0, amount100 = 0;
+
+
+    // triangulation point-location state
     Locate_type lt;
     int li, lj;
     Cell_handle current, previous;
-    
-    
-    // the random number generator
+
+
     size_t seed = userOptions.randomSeed;
     if ( userOptions.partNo>=0 )
-        seed += 1000*userOptions.partNo; //change seed between different partition computations
+        seed += 1000*userOptions.partNo; // distinct seed per partition
     base_generator_type generator( seed );
     boost::uniform_real<> uni_dist(-0.5,0.5);
     boost::variate_generator<base_generator_type&, boost::uniform_real<> > uni(generator, uni_dist);
@@ -107,24 +100,23 @@ void interpolateGrid_averaged_2(DT &dt,
     Real x = boxCoordinates[0] + dx[0]/2.;
     for (size_t i=0; i<nGrid[0]; ++i)
     {
-        // print information to the user about the ongoing computation
         amount100 = (100 * i)/ nGrid[0];
         if (prev < amount100)
             message.updateProgress( ++prev );
-        
+
         Real y = boxCoordinates[2] + dx[1]/2.;
         for (size_t j=0; j<nGrid[1]; ++j)
         {
 #if NO_DIM==2
             previous = dt.locate( Point(x,y) , lt, li, previous );
-#elif NO_DIM==3     // add additional z-loop
+#elif NO_DIM==3
             Real z = boxCoordinates[4] + dx[2]/2.;
             for (size_t k=0; k<nGrid[2]; ++k)
             {
                 previous = dt.locate( Point(x,y,z) , lt, li, lj, previous );
 #endif
-                
-                // define some temporary variables used inside the MC loop
+
+                // MC-loop accumulators
                 bool dummyNeighbors = false, dummyVertices = false;
                 Real tempD = Real(0.);
 #ifdef VELOCITY
@@ -136,12 +128,14 @@ void interpolateGrid_averaged_2(DT &dt,
                 Pvector<Real,noScalarComp> tempS = Pvector<Real,noScalarComp>::zero();
                 Pvector<Real,noScalarGradComp> tempSG = Pvector<Real,noScalarGradComp>::zero();
 #endif
-                Cell_handle cachedCell;  // cache the last cell to avoid recomputing posMatrix
+                // cache the last located cell's inverse position matrix; consecutive samples in a
+                // grid cell often land in the same Delaunay cell, so this avoids re-inverting it
+                Cell_handle cachedCell;
                 Real cachedPosMatInv[NO_DIM][NO_DIM];
                 Vertex_handle cachedBase;
                 bool hasCachedCell = false;
 
-                for (int w=0; w<NN; ++w)        // the Monte Carlo loop over the random samples inside each grid cell
+                for (int w=0; w<NN; ++w)        // MC loop over random samples in this grid cell
                 {
 #if NO_DIM==2
                     samplePoint = Point( uni()*dx[0] + x, uni()*dx[1] + y );
@@ -152,15 +146,15 @@ void interpolateGrid_averaged_2(DT &dt,
 #endif
 
 #ifdef TEST_PADDING
-                    if ( hasDummyNeighbor( current ) ) dummyNeighbors = true; // if one of the vertices is or has dummy neighbors, keep track of this cell
-                    if ( hasDummyVertex( current ) ) dummyVertices = true; // if one of the vertices is a dummy test point, keep track of this cell
+                    if ( hasDummyNeighbor( current ) ) dummyNeighbors = true;
+                    if ( hasDummyVertex( current ) ) dummyVertices = true;
 #endif
 
-                    // check if cell is infinite (one of the vertices is virtual) - don't add anything
+                    // infinite cell (sample outside the convex hull) -> skip
                     if ( dt.is_infinite(current) )
                         continue;
 
-                    // reuse posMatrix if we're still in the same cell
+                    // reuse the cached inverse position matrix while still in the same cell
                     Real posMatrixInverse[NO_DIM][NO_DIM];
                     Vertex_handle base;
                     if ( hasCachedCell && current == cachedCell )
@@ -174,7 +168,6 @@ void interpolateGrid_averaged_2(DT &dt,
                     {
                         positionMatrix( current, posMatrixInverse );
                         base = current->vertex(0);
-                        // cache for next iteration
                         for (int r=0; r<NO_DIM; ++r)
                             for (int c=0; c<NO_DIM; ++c)
                                 cachedPosMatInv[r][c] = posMatrixInverse[r][c];
@@ -182,7 +175,7 @@ void interpolateGrid_averaged_2(DT &dt,
                         cachedCell = current;
                         hasCachedCell = true;
                     }
-                    samplePoint = relativeSamplePoint( base, samplePoint ); // now sample point stores the relative position of the sample point with respect to the base vertex
+                    samplePoint = relativeSamplePoint( base, samplePoint ); // relative to base vertex
                     
                     if (field.density)
                     {
@@ -214,9 +207,9 @@ void interpolateGrid_averaged_2(DT &dt,
                     }
 #endif
                 }
-                
-                
-                // update the field values
+
+
+                // average and store the field values
                 if (field.density) density->push_back( tempD/NN );
 #ifdef VELOCITY
                 if (field.velocity) velocity->push_back( tempV/NN );
@@ -227,17 +220,16 @@ void interpolateGrid_averaged_2(DT &dt,
                 if (field.scalar) scalar->push_back( tempS/NN );
                 if (field.scalar_gradient) scalar_gradient->push_back( tempSG/NN );
 #endif
-                
-                // keep track of the cell index if the computation is incomplete
+
 #ifdef TEST_PADDING
 #if NO_DIM==2
                 size_t k = 0;
 #endif
                 Real index = gridCellIndex( i,j,k, nGrid );
-                if ( dummyNeighbors ) updateDummyGridCells( index, &incompleteCells_d ); // if one of the vertices is or has dummy neighbors, keep track of this cell
-                if ( dummyVertices ) updateDummyGridCells( index, &incompleteCells ); // if one of the vertices is a dummy test point, keep track of this cell
+                if ( dummyNeighbors ) updateDummyGridCells( index, &incompleteCells_d ); // dummy neighbor -> flag for density
+                if ( dummyVertices ) updateDummyGridCells( index, &incompleteCells ); // dummy vertex -> flag for other fields
 #endif
-                
+
 #if NO_DIM==3     // end additional z-loop
                 z += dx[2];
             }
@@ -247,13 +239,13 @@ void interpolateGrid_averaged_2(DT &dt,
         x += dx[0];
     }
     message << "100%\n" << MESSAGE::Flush;
-    
-    
+
+
 #ifdef TEST_PADDING
     if (field.density)
-        showCellsContainingDummyPoints( &incompleteCells_d, userOptions, userOptions.outputFilename+"_density", "density" ); // check if there are any cells which may have an error in thedensity estimation due to an incomplete Delaunay tesselation over the region of interest
+        showCellsContainingDummyPoints( &incompleteCells_d, userOptions, userOptions.outputFilename+"_density", "density" ); // report cells whose density may be wrong (incomplete tessellation)
     if ( field.velocity or field.velocity_gradient or field.scalar or field.scalar_gradient )
-        showCellsContainingDummyPoints( &incompleteCells, userOptions, userOptions.outputFilename+"_fields", "fields" ); // check if there are any cells which may have an error in the fields estimation (all fields except density) due to an incomplete Delaunay tesselation over the region of interest
+        showCellsContainingDummyPoints( &incompleteCells, userOptions, userOptions.outputFilename+"_fields", "fields" ); // report cells whose other fields may be wrong (incomplete tessellation)
 #endif
 }
 
@@ -261,88 +253,79 @@ void interpolateGrid_averaged_2(DT &dt,
 
 
 
-/* This function interpolates the fields to a redshift cone grid (usefull for galaxy surveys) - it computes the volume averaged value of the fields within the grid cell. To compute the volume average in each grid cell it uses a Monte Carlo algorithm to sample 'noRandPoints' in each grid cell and take the average.
-The arguments are:
-    'dt' - the periodic Delaunay triangulation; with the density at the vertex points already computed
-    'userOptions' - structure which store the number of grid points along each axis and also gives information about the size of the box along each axis. It also contains information about what quantity/qunatities to compute. 
-    'quantities' - vectors storing the interpolated grid fields
-*/
+// Volume-averaged redshift-cone interpolation (method 2): MC sampling of NN points
+// inside each cone grid cell. Args as interpolateGrid_averaged_2, on a redshift-cone grid.
 void interpolateRedshiftCone_averaged_2(DT &dt,
                                         User_options &userOptions,
                                         Quantities *quantities)
 {
-    // define some variables for easy access of program wide variables
-    size_t *nGrid = &(userOptions.gridSize[0]); // size of the density grid along each axis
-    int const NN = userOptions.noPoints;        // number of random points in each grid cell used to compute the volume average
-    Box boxCoordinates = userOptions.redshiftCone;    // the box coordinates in which the density is computed
-    checkAngles( &(boxCoordinates[2]), (NO_DIM-1)*2 );// transform the angles from degrees to radians
+    size_t *nGrid = &(userOptions.gridSize[0]); // grid size along each axis
+    int const NN = userOptions.noPoints;        // MC samples per grid cell
+    Box boxCoordinates = userOptions.redshiftCone;    // redshift-cone region
+    checkAngles( &(boxCoordinates[2]), (NO_DIM-1)*2 );// angles degrees -> radians
     Real *origin = &(userOptions.originPosition[0]);
-    vector<Real> boxLength;                     // the size of the particle box of interest along each direction
+    vector<Real> boxLength;                     // box size along each direction
     for (size_t i=0; i<NO_DIM; ++i)
         boxLength.push_back( boxCoordinates[2*i+1]-boxCoordinates[2*i] );
-    
-    // define pointers to the vectors storing the output fields
+
+    // output field vectors
     Field field = userOptions.aField;
     std::vector<Real>                         *density = &(quantities->density);
     std::vector< Pvector<Real,noVelComp> >    *velocity = &(quantities->velocity);
     std::vector< Pvector<Real,noGradComp> >   *velocity_gradient = &(quantities->velocity_gradient);
     std::vector< Pvector<Real,noScalarComp> > *scalar = &(quantities->scalar);
     std::vector< Pvector<Real,noScalarGradComp> > *scalar_gradient = &(quantities->scalar_gradient);
-    
-    
-    // show a message to the user
-    MESSAGE::Message message( userOptions.verboseLevel );   // structure used to output messages to the user ( the higher the verboseLevel, the more messages will be showns (check 'message.h' for details) )
-    message << "Computing interpolation of the fields volume averaged over the sampling cell on a redshift cone grid with " << (NO_DIM==2 ? "r*psi": "r*theta*psi") << " = " << 
+
+
+    MESSAGE::Message message( userOptions.verboseLevel );
+    message << "Computing interpolation of the fields volume averaged over the sampling cell on a redshift cone grid with " << (NO_DIM==2 ? "r*psi": "r*theta*psi") << " = " <<
             MESSAGE::printElements( nGrid, NO_DIM, "*" ) << " bins in the region " << (NO_DIM==2 ? "{[r_min,r_max],[psi_min,psi_max]}" : "{[r_min,r_max],[theta_min,theta_max],[psi_min,psi_max]}") << " = " << userOptions.redshiftCone.print() << ".\n"
             << "\t Done:   " << MESSAGE::Flush;
-    
-    
-    //reserve memory for the output fields
-    size_t reserveSize = 1;                     // the number of cell in the grid
+
+
+    // reserve output fields (reserveMemory zero-fills if the triangulation is undefined)
+    size_t reserveSize = 1;
     for (size_t i=0; i<NO_DIM; ++i)
         reserveSize *= nGrid[i];
-    reserveMemory( density, reserveSize, field.density, dt, "density" );    // reserves memory for the density computations (if any) and initializes the density values to 0 if the Delaunay triangulation is not well defined
+    reserveMemory( density, reserveSize, field.density, dt, "density" );
     reserveMemory( velocity, reserveSize, field.velocity, dt, "velocity" );
     reserveMemory( velocity_gradient, reserveSize, field.velocity_gradient, dt, "velocity gradient" );
     reserveMemory( scalar, reserveSize, field.scalar, dt, "scalar" );
     reserveMemory( scalar_gradient, reserveSize, field.scalar_gradient, dt, "scalar gradient" );
-    if ( dt.number_of_vertices()<NO_DIM+1 ) return;     // stop the computation if the Delaunay triangulation is not well defined
-    
-    
-    
-    // temporary variables needed for the interpolation
-    Point samplePoint;      // the coordinates of the sampling point
+    if ( dt.number_of_vertices()<NO_DIM+1 ) return;     // no interpolation possible without cells
+
+
+
+    Point samplePoint;
     Real dx[NO_DIM];        // grid spacing along each axis
     for (size_t i=0; i<NO_DIM; ++i)
         dx[i] = boxLength[i] / nGrid[i];
-    
+
 #ifdef TEST_PADDING
-    vector<size_t> incompleteCells_d;// keep track of grid cells where there is an error in the density field computation (because one of the vertices is a dummy point)
-    vector<size_t> incompleteCells;  // keep track of grid cells where there is an error in the field (all fields except density) computation (because one of the vertices is a dummy point)
+    vector<size_t> incompleteCells_d;// grid cells with a dummy-point error in the density field
+    vector<size_t> incompleteCells;  // grid cells with a dummy-point error in the other fields
 #endif
-    int prev = 0, amount100 = 0;    // variable to show the user about the progress of the computation
-    
-    
-    // parameters for searching in the triangulation
+    int prev = 0, amount100 = 0;
+
+
+    // triangulation point-location state
     Locate_type lt;
     int li, lj;
     Cell_handle current, previous;
-    
-    
-    // the random number generator
+
+
     size_t seed = userOptions.randomSeed;
     if ( userOptions.partNo>=0 )
-        seed += 1000*userOptions.partNo; //change seed between different partition computations
+        seed += 1000*userOptions.partNo; // distinct seed per partition
     base_generator_type generator( seed );
     boost::uniform_real<> uni_dist(-0.5,0.5);
     boost::variate_generator<base_generator_type&, boost::uniform_real<> > uni(generator, uni_dist);
-    
-    
-    
+
+
+
     Real r = boxCoordinates[0] + dx[0]/2.;
     for (size_t i=0; i<nGrid[0]; ++i)
     {
-        // print information to the user about the ongoing computation
         amount100 = (100 * i)/ nGrid[0];
         if (prev < amount100)
             message.updateProgress( ++prev );
@@ -365,8 +348,8 @@ void interpolateRedshiftCone_averaged_2(DT &dt,
                 samplePoint = Point(tempX,tempY,tempZ);
                 previous = dt.locate( samplePoint, lt, li, lj, previous );
 #endif
-                
-                // define some temporary variables used inside the MC loop
+
+                // MC-loop accumulators
                 bool dummyNeighbors = false, dummyVertices = false;
                 Real tempD = Real(0.);
 #ifdef VELOCITY
@@ -382,9 +365,9 @@ void interpolateRedshiftCone_averaged_2(DT &dt,
                 Vertex_handle cachedBase2;
                 bool hasCachedCell2 = false;
 
-                for (int w=0; w<NN; ++w)        // the Monte Carlo loop over the random samples inside each grid cell
+                for (int w=0; w<NN; ++w)        // MC loop over random samples in this grid cell
                 {
-                    // get coordinates of the random sample point inside the grid cell and locate the Delaunay traingle/tetrahedron where the random point lies
+                    // random sample point in this cone grid cell, in Cartesian coords
 #if NO_DIM==2
                     Real tempR = r + uni()*dx[0];
                     Real tempTheta = theta + uni()*dx[1];
@@ -431,8 +414,8 @@ void interpolateRedshiftCone_averaged_2(DT &dt,
                         cachedCell2 = current;
                         hasCachedCell2 = true;
                     }
-                    samplePoint = relativeSamplePoint( base, samplePoint );
-                    
+                    samplePoint = relativeSamplePoint( base, samplePoint ); // relative to base vertex
+
                     if (field.density)
                     {
                         Real densGrad[NO_DIM];
@@ -464,7 +447,7 @@ void interpolateRedshiftCone_averaged_2(DT &dt,
                 }
                 
                 
-                // update the field values
+                // average and store the field values
                 if (field.density) density->push_back( tempD/NN );
 #ifdef VELOCITY
                 if (field.velocity) velocity->push_back( tempV/NN );
@@ -475,14 +458,13 @@ void interpolateRedshiftCone_averaged_2(DT &dt,
                 if (field.scalar_gradient) scalar_gradient->push_back( tempSG/NN );
 #endif
                 
-                // keep track of the cell index if the computation is incomplete
 #ifdef TEST_PADDING
 #if NO_DIM==2
                 size_t k = 0;
 #endif
                 Real index = gridCellIndex( i,j,k, nGrid );
-                if ( dummyNeighbors ) updateDummyGridCells( index, &incompleteCells_d ); // if one of the vertices is or has dummy neighbors, keep track of this cell
-                if ( dummyVertices ) updateDummyGridCells( index, &incompleteCells ); // if one of the vertices is a dummy test point, keep track of this cell
+                if ( dummyNeighbors ) updateDummyGridCells( index, &incompleteCells_d ); // dummy neighbor -> flag for density
+                if ( dummyVertices ) updateDummyGridCells( index, &incompleteCells ); // dummy vertex -> flag for other fields
 #endif
                 
 #if NO_DIM==3     // end additional z-loop
@@ -498,29 +480,25 @@ void interpolateRedshiftCone_averaged_2(DT &dt,
     
 #ifdef TEST_PADDING
     if (field.density)
-        showCellsContainingDummyPoints( &incompleteCells_d, userOptions, userOptions.outputFilename+"_density", "density" ); // check if there are any cells which may have an error in thedensity estimation due to an incomplete Delaunay tesselation over the region of interest
+        showCellsContainingDummyPoints( &incompleteCells_d, userOptions, userOptions.outputFilename+"_density", "density" ); // report cells whose density may be wrong (incomplete tessellation)
     if ( field.velocity or field.velocity_gradient or field.scalar or field.scalar_gradient )
-        showCellsContainingDummyPoints( &incompleteCells, userOptions, userOptions.outputFilename+"_fields", "fields" ); // check if there are any cells which may have an error in the fields estimation (all fields except density) due to an incomplete Delaunay tesselation over the region of interest
+        showCellsContainingDummyPoints( &incompleteCells, userOptions, userOptions.outputFilename+"_fields", "fields" ); // report cells whose other fields may be wrong (incomplete tessellation)
 #endif
 }
 
 
 
 
-/* This function interpolates the fields at user defined sampling points - it computes the volume averaged value of the fields within the grid cell. To compute the volume average in each grid cell it uses a Monte Carlo algorithm to sample 'noRandPoints' in each grid cell and take the average.
-The arguments are:
-    'dt' - the periodic Delaunay triangulation; with the density at the vertex points already computed
-    'userOptions' - structure which store the number of grid points along each axis and also gives information about the size of the box along each axis. It also contains information about what quantity/qunatities to compute. 
-    'quantities' - vectors storing the interpolated fields
-*/
+// Volume-averaged interpolation at user-defined sampling points (method 2): MC sampling
+// of NN points inside each sampling cell. Args as interpolateGrid_averaged_2, with 'samples'.
 void interpolateUserSampling_averaged_2(DT &dt,
                                         vector<Sample_point> &samples,
                                         User_options &userOptions,
                                         Quantities *quantities)
 {
-    int const NN = userOptions.noPoints;        // number of random points in each grid cell used to compute the volume average
-    
-    // define pointers to the vectors storing the output fields
+    int const NN = userOptions.noPoints;        // MC samples per grid cell
+
+    // output field vectors
     Field field = userOptions.aField;
     std::vector<Real>                         *density = &(quantities->density);
     std::vector< Pvector<Real,noVelComp> >    *velocity = &(quantities->velocity);
@@ -529,53 +507,49 @@ void interpolateUserSampling_averaged_2(DT &dt,
     std::vector< Pvector<Real,noScalarGradComp> > *scalar_gradient = &(quantities->scalar_gradient);
     
     
-    // show a message to the user
-    MESSAGE::Message message( userOptions.verboseLevel );   // structure used to output messages to the user ( the higher the verboseLevel, the more messages will be showns (check 'message.h' for details) )
+    MESSAGE::Message message( userOptions.verboseLevel );
     message << "Computing interpolation of the fields volume averaged over the sampling cell at user given sampling points in the region " << userOptions.region.print() << ".\n"
             << "\t Done:   " << MESSAGE::Flush;
-    
-    
-    //reserve size for the output fields
-    size_t reserveSize = samples.size();                   // the number of cell in the grid
-    reserveMemory( density, reserveSize, field.density, dt, "density" );    // reserves memory for the density computations (if any) and initializes the density values to 0 if the Delaunay triangulation is not well defined
+
+
+    // reserve output fields (reserveMemory zero-fills if the triangulation is undefined)
+    size_t reserveSize = samples.size();
+    reserveMemory( density, reserveSize, field.density, dt, "density" );
     reserveMemory( velocity, reserveSize, field.velocity, dt, "velocity" );
     reserveMemory( velocity_gradient, reserveSize, field.velocity_gradient, dt, "velocity gradient" );
     reserveMemory( scalar, reserveSize, field.scalar, dt, "scalar" );
     reserveMemory( scalar_gradient, reserveSize, field.scalar_gradient, dt, "scalar gradient" );
-    if ( dt.number_of_vertices()<NO_DIM+1 ) return;     // stop the computation if the Delaunay triangulation is not well defined
-    
-    
-    
-    // temporary variables needed for the interpolation
-    Point samplePoint;      // the coordinates of the sampling point
-    
+    if ( dt.number_of_vertices()<NO_DIM+1 ) return;     // no interpolation possible without cells
+
+
+
+    Point samplePoint;
+
 #ifdef TEST_PADDING
-    vector<size_t> incompleteCells_d;// keep track of grid cells where there is an error in the density field computation (because one of the vertices is a dummy point)
-    vector<size_t> incompleteCells;  // keep track of grid cells where there is an error in the field (all fields except density) computation (because one of the vertices is a dummy point)
+    vector<size_t> incompleteCells_d;// grid cells with a dummy-point error in the density field
+    vector<size_t> incompleteCells;  // grid cells with a dummy-point error in the other fields
 #endif
-    int prev = 0, amount100 = 0;    // variable to show the user about the progress of the computation
-    
-    
-    // parameters for searching in the triangulation
+    int prev = 0, amount100 = 0;
+
+
+    // triangulation point-location state
     Locate_type lt;
     int li, lj;
     Cell_handle current, previous;
-    
-    
-    // the random number generator
+
+
     size_t seed = userOptions.randomSeed;
     if ( userOptions.partNo>=0 )
-        seed += 1000*userOptions.partNo; //change seed between different partition computations
+        seed += 1000*userOptions.partNo; // distinct seed per partition
     base_generator_type generator( seed );
     boost::uniform_real<> uni_dist(-0.5,0.5);
     boost::variate_generator<base_generator_type&, boost::uniform_real<> > uni(generator, uni_dist);
-    
-    
-    
+
+
+
     size_t const noElements = samples.size();
     for (size_t i=0; i<noElements; ++i)
     {
-        // print information to the user about the ongoing computation
         amount100 = (100 * i)/ noElements;
         if (prev < amount100)
             message.updateProgress( ++prev );
@@ -595,7 +569,7 @@ void interpolateUserSampling_averaged_2(DT &dt,
         
         
         
-        // define some temporary variables used inside the MC loop
+        // MC-loop accumulators
         bool dummyNeighbors = false, dummyVertices = false;
         Real tempD = Real(0.);
 #ifdef VELOCITY
@@ -611,7 +585,7 @@ void interpolateUserSampling_averaged_2(DT &dt,
         Vertex_handle cachedBase3;
         bool hasCachedCell3 = false;
 
-        for (int w=0; w<NN; ++w)        // the Monte Carlo loop over the random samples inside each grid cell
+        for (int w=0; w<NN; ++w)        // MC loop over random samples in this sampling cell
         {
             Real tempX = samples[i].position(0) + uni()*samples[i].delta(0);
             Real tempY = samples[i].position(1) + uni()*samples[i].delta(1);
@@ -652,7 +626,7 @@ void interpolateUserSampling_averaged_2(DT &dt,
                 cachedCell3 = current;
                 hasCachedCell3 = true;
             }
-            samplePoint = relativeSamplePoint( base, samplePoint );
+            samplePoint = relativeSamplePoint( base, samplePoint ); // relative to base vertex
             
             if (field.density)
             {
@@ -685,7 +659,7 @@ void interpolateUserSampling_averaged_2(DT &dt,
         }
         
         
-        // update the field values
+        // average and store the field values
         if (field.density) density->push_back( tempD/NN );
 #ifdef VELOCITY
         if (field.velocity) velocity->push_back( tempV/NN );
@@ -696,10 +670,9 @@ void interpolateUserSampling_averaged_2(DT &dt,
         if (field.scalar_gradient) scalar_gradient->push_back( tempSG/NN );
 #endif
         
-        // keep track of the cell index if the computation is incomplete
 #ifdef TEST_PADDING
-        if ( dummyNeighbors ) updateDummyGridCells( i, &incompleteCells_d ); // if one of the vertices is or has dummy neighbors, keep track of this cell
-        if ( dummyVertices ) updateDummyGridCells( i, &incompleteCells ); // if one of the vertices is a dummy test point, keep track of this cell
+        if ( dummyNeighbors ) updateDummyGridCells( i, &incompleteCells_d ); // dummy neighbor -> flag for density
+        if ( dummyVertices ) updateDummyGridCells( i, &incompleteCells ); // dummy vertex -> flag for other fields
 #endif
     }
     message << "100%\n" << MESSAGE::Flush;
@@ -707,9 +680,9 @@ void interpolateUserSampling_averaged_2(DT &dt,
     
 #ifdef TEST_PADDING
     if (field.density)
-        showCellsContainingDummyPoints( &incompleteCells_d, userOptions, userOptions.outputFilename+"_density", "density" ); // check if there are any cells which may have an error in thedensity estimation due to an incomplete Delaunay tesselation over the region of interest
+        showCellsContainingDummyPoints( &incompleteCells_d, userOptions, userOptions.outputFilename+"_density", "density" ); // report cells whose density may be wrong (incomplete tessellation)
     if ( field.velocity or field.velocity_gradient or field.scalar or field.scalar_gradient )
-        showCellsContainingDummyPoints( &incompleteCells, userOptions, userOptions.outputFilename+"_fields", "fields" ); // check if there are any cells which may have an error in the fields estimation (all fields except density) due to an incomplete Delaunay tesselation over the region of interest
+        showCellsContainingDummyPoints( &incompleteCells, userOptions, userOptions.outputFilename+"_fields", "fields" ); // report cells whose other fields may be wrong (incomplete tessellation)
 #endif
 }
 
@@ -722,73 +695,67 @@ void interpolateUserSampling_averaged_2(DT &dt,
 
 
 
-/* This function interpolates the fields to a uniform grid - it computes the volume averaged value of the fields within the grid cell. To compute the volume average in each grid cell it uses equidistant sampling points to sample 'noRandPoints' in each grid cell and take the average.
-The arguments are:
-    'dt' - the periodic Delaunay triangulation; with the density at the vertex points already computed
-    'userOptions' - structure which store the number of grid points along each axis and the number of random sample points in each grid cell. This structure also gives information about the size of the box along each axis.
-    'quantities' - structure storing the vectors for the output fields on the grid
-*/
+// Volume-averaged grid interpolation (method 3): averages the field over NN equidistant (not random)
+// points laid out on a regular sub-grid inside each grid cell.
 void interpolateGrid_averaged_3(DT &dt,
                                 User_options &userOptions,
                                 Quantities *quantities)
 {
-    size_t *nGrid = &(userOptions.gridSize[0]); // size of the density grid along each axis
-    int const NN = userOptions.noPoints;        // number of equidistant points in each grid cell used to compute the volume average
-    int const n = rootN( NN, NO_DIM );          // number of equidistant sampling points along each axis
-    Box boxCoordinates = userOptions.region;    // the box coordinates in which the density is computed
-    vector<Real> boxLength;                     // the size of the particle box of interest along each direction
+    size_t *nGrid = &(userOptions.gridSize[0]); // grid size along each axis
+    int const NN = userOptions.noPoints;        // equidistant samples per grid cell
+    int const n = rootN( NN, NO_DIM );          // equidistant samples along each axis
+    Box boxCoordinates = userOptions.region;    // box region of interest
+    vector<Real> boxLength;                     // box size along each direction
     for (size_t i=0; i<NO_DIM; ++i)
         boxLength.push_back( boxCoordinates[2*i+1]-boxCoordinates[2*i] );
-    
-    
-    // define pointers to the vectors storing the output fields
+
+
+    // output field vectors
     Field field = userOptions.aField;
     std::vector<Real>                         *density = &(quantities->density);
     std::vector< Pvector<Real,noVelComp> >    *velocity = &(quantities->velocity);
     std::vector< Pvector<Real,noGradComp> >   *velocity_gradient = &(quantities->velocity_gradient);
     std::vector< Pvector<Real,noScalarComp> > *scalar = &(quantities->scalar);
     std::vector< Pvector<Real,noScalarGradComp> > *scalar_gradient = &(quantities->scalar_gradient);
-    
-    
-    // show a message to the user
-    MESSAGE::Message message( userOptions.verboseLevel );   // structure used to output messages to the user ( the higher the verboseLevel, the more messages will be showns (check 'message.h' for details) )
-    message << "\nComputing interpolation of the fields volume averaged over the sampling cell on a regular " 
-            << MESSAGE::printElements( nGrid, NO_DIM, "*" ) << " grid in the region " 
-            << boxCoordinates.print() 
+
+
+    MESSAGE::Message message( userOptions.verboseLevel );
+    message << "\nComputing interpolation of the fields volume averaged over the sampling cell on a regular "
+            << MESSAGE::printElements( nGrid, NO_DIM, "*" ) << " grid in the region "
+            << boxCoordinates.print()
             << ". The volume average is done using " << NN << " equidistant sampling points in each grid cell.\n"
             << "\t Done: " << MESSAGE::Flush;
-    
-    
-    //reserve memory for the output fields
-    size_t reserveSize = (NO_DIM==2) ? nGrid[0]*nGrid[1] : nGrid[0]*nGrid[1]*nGrid[2];      // the number of cell in the grid
-    reserveMemory( density, reserveSize, field.density, dt, "density" );    // reserves memory for the density computations (if any) and initializes the density values to 0 if the Delaunay triangulation is not well defined
+
+
+    // reserve output fields (reserveMemory zero-fills if the triangulation is undefined)
+    size_t reserveSize = (NO_DIM==2) ? nGrid[0]*nGrid[1] : nGrid[0]*nGrid[1]*nGrid[2];
+    reserveMemory( density, reserveSize, field.density, dt, "density" );
     reserveMemory( velocity, reserveSize, field.velocity, dt, "velocity" );
     reserveMemory( velocity_gradient, reserveSize, field.velocity_gradient, dt, "velocity gradient" );
     reserveMemory( scalar, reserveSize, field.scalar, dt, "scalar" );
     reserveMemory( scalar_gradient, reserveSize, field.scalar_gradient, dt, "scalar gradient" );
-    if ( dt.number_of_vertices()<NO_DIM+1 ) return;     // stop the computation if the Delaunay triangulation is not well defined
-    
-    
-    // temporary variables needed for the interpolation
-    Point samplePoint;      // the coordinates of the MC sampling point
+    if ( dt.number_of_vertices()<NO_DIM+1 ) return;     // no interpolation possible without cells
+
+
+    Point samplePoint;
     Real dx[NO_DIM];        // grid spacing along each axis
     for (size_t i=0; i<NO_DIM; ++i)
         dx[i] = boxLength[i] / nGrid[i];
-    
+
 #ifdef TEST_PADDING
-    vector<size_t> incompleteCells_d;// keep track of grid cells where there is an error in the density field computation (because one of the vertices is a dummy point)
-    vector<size_t> incompleteCells;  // keep track of grid cells where there is an error in the field (all fields except density) computation (because one of the vertices is a dummy point)
+    vector<size_t> incompleteCells_d;// grid cells with a dummy-point error in the density field
+    vector<size_t> incompleteCells;  // grid cells with a dummy-point error in the other fields
 #endif
-    int prev = 0, amount100 = 0;    // variable to show the user about the progress of the computation
-    
-    
-    // parameters for searching in the triangulation
+    int prev = 0, amount100 = 0;
+
+
+    // triangulation point-location state
     Locate_type lt;
     int li, lj;
     Cell_handle current, previous;
-    
-    
-    // sequence to store the equidistant sample positions with respect to center of grid cell
+
+
+    // equidistant sample offsets relative to the grid-cell center
     std::vector<Real> samplePosition_buf(NN * NO_DIM);
     Real (*samplePosition)[NO_DIM] = reinterpret_cast<Real(*)[NO_DIM]>(samplePosition_buf.data());
     for (int i1=0; i1<n; ++i1)
@@ -813,7 +780,6 @@ void interpolateGrid_averaged_3(DT &dt,
     Real x = boxCoordinates[0] + dx[0]/2.;
     for (size_t i=0; i<nGrid[0]; ++i)
     {
-        // print information to the user about the ongoing computation
         amount100 = (100 * i)/ nGrid[0];
         if (prev < amount100)
             message.updateProgress( ++prev );
@@ -831,7 +797,7 @@ void interpolateGrid_averaged_3(DT &dt,
 #endif
                 
                 
-                // define some temporary variables used inside the MC loop
+                // MC-loop accumulators
                 bool dummyNeighbors = false, dummyVertices = false;
                 Real tempD = Real(0.);
 #ifdef VELOCITY
@@ -847,7 +813,7 @@ void interpolateGrid_averaged_3(DT &dt,
                 Vertex_handle cachedBase4;
                 bool hasCachedCell4 = false;
 
-                for (int w=0; w<NN; ++w)        // the loop over the equidistant sample points inside each grid cell
+                for (int w=0; w<NN; ++w)        // loop over equidistant sample points in this grid cell
                 {
 #if NO_DIM==2
                     samplePoint = Point( x + samplePosition[w][0], y + samplePosition[w][1] );
@@ -885,8 +851,8 @@ void interpolateGrid_averaged_3(DT &dt,
                         cachedCell4 = current;
                         hasCachedCell4 = true;
                     }
-                    samplePoint = relativeSamplePoint( base, samplePoint );
-                    
+                    samplePoint = relativeSamplePoint( base, samplePoint ); // relative to base vertex
+
                     if (field.density)
                     {
                         Real densGrad[NO_DIM];
@@ -914,7 +880,7 @@ void interpolateGrid_averaged_3(DT &dt,
                 }
                 
                 
-                // update the field values
+                // average and store the field values
                 if (field.density) density->push_back( tempD/NN );
 #ifdef VELOCITY
                 if (field.velocity) velocity->push_back( tempV/NN );
@@ -925,14 +891,13 @@ void interpolateGrid_averaged_3(DT &dt,
                 if (field.scalar_gradient) scalar_gradient->push_back( tempSG/NN );
 #endif
                 
-                // keep track of the cell index if the computation is incomplete
 #ifdef TEST_PADDING
 #if NO_DIM==2
                 size_t k = 0;
 #endif
                 Real index = gridCellIndex( i,j,k, nGrid );
-                if ( dummyNeighbors ) updateDummyGridCells( index, &incompleteCells_d ); // if one of the vertices is or has dummy neighbors, keep track of this cell
-                if ( dummyVertices ) updateDummyGridCells( index, &incompleteCells ); // if one of the vertices is a dummy test point, keep track of this cell
+                if ( dummyNeighbors ) updateDummyGridCells( index, &incompleteCells_d ); // dummy neighbor -> flag for density
+                if ( dummyVertices ) updateDummyGridCells( index, &incompleteCells ); // dummy vertex -> flag for other fields
 #endif
                 
 #if NO_DIM==3     // end additional z-loop
@@ -948,9 +913,9 @@ void interpolateGrid_averaged_3(DT &dt,
     
 #ifdef TEST_PADDING
     if (field.density)
-        showCellsContainingDummyPoints( &incompleteCells_d, userOptions, userOptions.outputFilename+"_density", "density" ); // check if there are any cells which may have an error in thedensity estimation due to an incomplete Delaunay tesselation over the region of interest
+        showCellsContainingDummyPoints( &incompleteCells_d, userOptions, userOptions.outputFilename+"_density", "density" ); // report cells whose density may be wrong (incomplete tessellation)
     if ( field.velocity or field.velocity_gradient or field.scalar or field.scalar_gradient )
-        showCellsContainingDummyPoints( &incompleteCells, userOptions, userOptions.outputFilename+"_fields", "fields" ); // check if there are any cells which may have an error in the fields estimation (all fields except density) due to an incomplete Delaunay tesselation over the region of interest
+        showCellsContainingDummyPoints( &incompleteCells, userOptions, userOptions.outputFilename+"_fields", "fields" ); // report cells whose other fields may be wrong (incomplete tessellation)
 #endif
 }
 

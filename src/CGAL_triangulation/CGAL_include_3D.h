@@ -21,13 +21,16 @@
  */
 
 
+/* CGAL setup for the 3D build: pulls in the Delaunay headers and defines the kernel and triangulation
+   typedefs (DT, Point, Vertex_handle, ...) the rest of the code uses, with an optional TBB-parallel build. */
+
 #include <boost/multiprecision/gmp.hpp>
 
 #include <CGAL/basic.h>
 #include <CGAL/Exact_predicates_inexact_constructions_kernel.h>
 #include <CGAL/Delaunay_triangulation_3.h>
 #include <CGAL/Triangulation_vertex_base_with_info_3.h>
-#include <CGAL/Timer.h>
+#include <CGAL/Real_timer.h>   // wall-clock timer; not CGAL::Timer, whose CPU time sums across partition threads and overstates per-stage seconds
 #include <CGAL/Cartesian.h>
 #include <CGAL/Bbox_2.h>
 #include <CGAL/spatial_sort.h>
@@ -45,14 +48,24 @@
 typedef boost::mt19937 base_generator_type;
 
 
-// structures used to keep track of each vertex data
+// per-vertex data attached to triangulation vertices
 #include "vertexData.h"
 
 
 typedef CGAL::Exact_predicates_inexact_constructions_kernel         K;
-typedef CGAL::Triangulation_vertex_base_with_info_3<vertexData, K>  Vb;
+typedef CGAL::Triangulation_vertex_base_with_info_3<vertexData, K>  Vb;    // vertex stores a vertexData payload
+
+#ifdef PARALLEL_TRIANGULATION
+// TBB-parallel Delaunay build (opt-in: `make ... TBB=1`). Parallel_tag enables
+// parallel insert_with_info. Fast_location is dropped (sequential point-location
+// hierarchy); harmless since PS-DTFE iterates cells and never locates points.
+#include <CGAL/Triangulation_cell_base_3.h>
+typedef CGAL::Triangulation_data_structure_3<Vb, CGAL::Triangulation_cell_base_3<K>, CGAL::Parallel_tag> Tds;
+typedef CGAL::Delaunay_triangulation_3<K, Tds>                      DT;
+#else
 typedef CGAL::Triangulation_data_structure_3<Vb>                    Tds;
 typedef CGAL::Delaunay_triangulation_3<K, Tds, CGAL::Fast_location> DT;
+#endif
 
 typedef DT::Point                   Point;
 typedef DT::Locate_type             Locate_type;
@@ -60,7 +73,7 @@ typedef DT::Cell_handle             Cell_handle;
 typedef DT::Cell_iterator           Cell_iterator;
 typedef DT::Finite_cells_iterator   Finite_cells_iterator;
 typedef DT::Vertex_handle           Vertex_handle;
-typedef CGAL::Timer                 Timer;
+typedef CGAL::Real_timer            Timer;   // wall-clock seconds (see Real_timer.h note above)
 
 typedef CGAL::Cartesian<Real>       K2;
 typedef K2::Point_2                 Point_22;

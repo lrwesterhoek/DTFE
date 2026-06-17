@@ -21,31 +21,34 @@
  */
 
 
+/* Inline numeric helpers shared by the triangulation/interpolation code: timing, grid indexing,
+   angle normalization, simplex volumes, and (under PHASE_SPACE) Eulerian-simplex geometry. */
+
 #ifndef TRIANGULATION_MISCELLANEOUS_HEADER
 #define TRIANGULATION_MISCELLANEOUS_HEADER
 
 #include "../math_functions.h"
 
 
-/* Print information to the user about the amount of time taken. */
+// Report elapsed time for a computation stage.
 inline void printComputationTime(Timer *t, User_options *userOptions,
                                  string computationQuantityName)
 {
     t->stop();
     userOptions->totalTime += t->time();
     MESSAGE::Message message( userOptions->verboseLevel );
-    message << "  >>> Time: " << t->time()/userOptions->noProcessors << " sec. (" << computationQuantityName << ")\n" << MESSAGE::Flush;
+    // wall-clock timer: report seconds directly, must not divide by noProcessors
+    message << MESSAGE::cGreen() << "  >>> Time: " << t->time() << " sec. (" << computationQuantityName << ")" << MESSAGE::cReset() << "\n" << MESSAGE::Flush;
     t->reset();
 }
 
 
 
-/* matrixInverse and determinant are now defined in math_functions.h */
+// matrixInverse and determinant are defined in math_functions.h
 
 #ifdef PHASE_SPACE
-/* Computes the volume of a Delaunay cell's Eulerian (deformed) simplex.
-   In PS-DTFE mode, the triangulation is in Lagrangian space, but we need
-   the Eulerian volume for density estimation. */
+// Returns the volume of a cell's Eulerian (deformed) simplex. The triangulation lives in Lagrangian
+// space, but the density estimate needs the present-day Eulerian volume.
 inline Real eulerianVolume(const Cell_handle &cell)
 {
     double posDiff[NO_DIM][NO_DIM];
@@ -56,7 +59,7 @@ inline Real eulerianVolume(const Cell_handle &cell)
     return simplexVolume(posDiff);
 }
 
-/* Computes the Eulerian vertex position difference matrix for a given Delaunay cell. */
+// Inverse of the Eulerian vertex position difference matrix for a Delaunay cell.
 inline void eulerianPositionMatrix(Cell_handle &cell,
                                    Real posMatrixInverse[][NO_DIM])
 {
@@ -68,23 +71,18 @@ inline void eulerianPositionMatrix(Cell_handle &cell,
     matrixInverse(Ax, posMatrixInverse);
 }
 
-/* Tests if a point lies inside the Eulerian simplex of a cell.
-   Returns true and sets baryCoords if the point is inside.
-   baryCoords[i] = barycentric coordinate for vertex i+1 (vertex 0's coord = 1 - sum). */
+// Point-in-Eulerian-simplex test; sets baryCoords[i] for vertex i+1 (vertex 0's coord = 1 - sum).
 inline bool pointInEulerianSimplex(Cell_handle &cell,
                                    Real const *point,
                                    Real posMatrixInverse[][NO_DIM],
                                    Real *baryCoords)
 {
-    // Compute relative position: point - eulerianPos(vertex 0)
     Real rel[NO_DIM];
     for (int i = 0; i < NO_DIM; ++i)
         rel[i] = point[i] - cell->vertex(0)->info().eulerianPosition(i);
 
-    // Multiply by inverse position matrix to get barycentric coordinates
     matrixMultiplication(posMatrixInverse, rel, baryCoords);
 
-    // Check if all barycentric coords are non-negative and sum <= 1
     Real sum = 0.;
     for (int i = 0; i < NO_DIM; ++i)
     {
@@ -95,20 +93,19 @@ inline bool pointInEulerianSimplex(Cell_handle &cell,
 }
 #endif
 
-/* Computes the vertex position difference matrix for a given Delaunay cell. */
+// Vertex position difference matrix (each non-base vertex relative to vertex 0) for a Delaunay cell.
 inline void vertexPositionMatrix(Cell_handle &cell,
                                  Real vertexMatrix[][NO_DIM])
 {
     Point base = cell->vertex(0)->point();
-    // Now store in 'vertexMatrix' the vertices position with respect to the 'base' vertex
-    for (int v = 0; v<NO_DIM; ++v)	//loop over vertices != base
-        for (int i=0; i<NO_DIM; ++i)	//loop over spatial dimensions
+    for (int v = 0; v<NO_DIM; ++v)
+        for (int i=0; i<NO_DIM; ++i)
             vertexMatrix[v][i] = cell->vertex(v+1)->point()[i] - base[i];
 }
 
 
 
-/* Checks the number of vertices of the Delaunay triangulation. The interpolation computation cannot continue if there are no cellls, so it gives a warning message to the user and initializes all the values to 0. */
+// Fill a field with zero values (Pvector and scalar Real specializations).
 template <typename T> inline void assingZeroValues(vector<T> *quant, size_t const noElements )
 {
     quant->assign( noElements, T::zero() );
@@ -117,6 +114,7 @@ template <> inline void assingZeroValues<Real>(vector<Real> *quant, size_t const
 {
     quant->assign( noElements, Real(0.) );
 }
+// Returns true (and zeroes the field) if the triangulation has too few vertices to form any cell.
 template <typename T>
 inline bool isTriangulationIncomplete(DT &dt,
                                       size_t gridSize,
@@ -139,7 +137,7 @@ inline bool isTriangulationIncomplete(DT &dt,
 
 
 
-/* Reserves memory for an output field and initializes all the elements to 0 if the Delaunay traingulation is not defined. */
+// Reserve memory for an output field; zero it if the triangulation is undefined.
 template <typename T>
 inline void reserveMemory(T *fieldStorage,
                           size_t const gridSize,
@@ -158,14 +156,14 @@ inline void reserveMemory(T *fieldStorage,
 
 
 
-/* Checks the values of the angles to give correct interval values and transforms the angles from degrees to radians. */
+// Normalize angle limits to valid intervals and convert degrees to radians.
 inline void checkAngles(Real *angles,
                  size_t const size,
                  Real *offset = NULL)
 {
     if ( size!=2*(NO_DIM-1) ) throwError( "The function 'checkAngles' in 'density_interpolation.cc' must have the 2nd argument = ", 2*(NO_DIM-1), ", but now that argument is ", size, "." );
-    
-    // rescale the angles to the interval 0 - 360 (only psi) and theta in the interval -90 - 90
+
+    // Wrap psi (azimuth) into [0,360); theta (polar) must already lie in [0,180].
 #if NO_DIM==2
     angles[0] -= floor( angles[0]/Real(360.) ) * Real(360.);
     angles[1] -= floor( angles[1]/Real(360.) ) * Real(360.);
@@ -175,8 +173,8 @@ inline void checkAngles(Real *angles,
     angles[2] -= floor( angles[2]/Real(360.) ) * Real(360.);
     angles[3] -= floor( angles[3]/Real(360.) ) * Real(360.);
 #endif
-    
-    // if psi_min>psi_max => psi_max += 360
+
+    // If psi_min > psi_max the range wraps past 360; lift psi_max by +360 and record the offset.
     if ( offset!=NULL )
 {
     offset[0] = Real(0.);
@@ -191,16 +189,16 @@ inline void checkAngles(Real *angles,
         offset[1] = Real(2.*PI);
     }
 }
-    
-    
-    // transform the degrees to radians
+
+
+    // Convert all limits from degrees to radians.
     for (size_t i=0; i<size; ++i)
         angles[i] *= Real(PI/180.);
 }
 
 
 
-/* Computes the area/volume of a Delaunay triangle/tetrahedron in 2D/3D. */
+// Area (2D) or volume (3D) of a Delaunay triangle/tetrahedron.
 template <typename DTCell>
 inline Real volume(DT & dt,
                     DTCell &cell)
@@ -214,7 +212,7 @@ inline Real volume(DT & dt,
 
 
 
-/* Returns the index of the specified grid cell. */
+// Flattens multi-dimensional grid indices into a single row-major array index.
 template <typename T>
 inline size_t gridCellIndex(T index1, T index2, T index3,
                             T *totalGridSize)
@@ -237,7 +235,7 @@ inline size_t gridCellIndex(T *index,
 
 
 
-/* Returns the standard deviation of a set of numbers/vectors. */
+// Standard deviation of a set of numbers/vectors.
 template <typename T>
 inline T standardDeviation(T *data, size_t const size)
 {

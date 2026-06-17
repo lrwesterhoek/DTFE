@@ -20,26 +20,14 @@
  */
 
 
-// The following are the functions used to read an HDF5 gadget file
+/* Reader for DESI HDF5 matter snapshots (single common particle mass, "Matter" group layout). */
 #ifdef HDF5
 #include <H5Cpp.h>
 using namespace H5;
 
 
-//~ /*! Function to check if attribute exists. */
-//~ extern "C"
-//~ {
-    //~ bool doesAttributeExist(hid_t obj_id, const char* name)
-    //~ {
-        //~ return( H5Aexists( obj_id, name ) > 0 ? true : false );
-    //~ }
-//~ }
 
-
-
-/*! Return the file name for the input data saved in a single or in multiple files
- * NOTE:  that the name must contain a '%i' or '%s' character for multiple files
-*/
+// File name for input file 'fileNumber'; fileRoot must contain a '%i' or '%s' for multiple files.
 std::string HDF5_filename_DESI( std::string fileRoot, size_t fileNumber, bool checkFileExists=true )
     {
         char buf[500];
@@ -52,24 +40,21 @@ std::string HDF5_filename_DESI( std::string fileRoot, size_t fileNumber, bool ch
 
 
 
-/*! Reads some of the entries for the header of the HDF5 file.
-NOTE: it does not read all the entries, it only reads the particle number in the file, the mass, the box length and the number of files per snapshot. 
-*/
+// Reads selected header entries of the HDF5 file (particle number, mass, box length, number of files
+// per snapshot), not the full header.
 void HDF5_readHeader_DESI(std::string filename,
                            size_t *numParticles,
                            double *BoxSize,
                            size_t *numFiles,
                            double *particleMass)
 {
-    // the name of the HDF5 file
     const H5std_string FILE_NAME( filename );
-    
-    // open the HDF5 file and the header group
+
     H5File *file = new H5File( FILE_NAME, H5F_ACC_RDONLY, H5::FileAccPropList::DEFAULT );
     Group *group = new Group( file->openGroup("Header") );
-    
-    
-    // start reading one header attribute at a time
+
+
+    // read the header attributes one at a time
     std::string name( "NP.Matter" );
     if ( doesAttributeExist( group->getId(), name.c_str() ) )
         group->openAttribute( name.c_str() ).read( PredType::NATIVE_ULONG, numParticles );
@@ -90,16 +75,14 @@ void HDF5_readHeader_DESI(std::string filename,
         group->openAttribute( name.c_str() ).read( PredType::NATIVE_DOUBLE, BoxSize );
     
     std::cout << "The code read the following data  (number particles, particle mass, number of files, box size):  " <<  *numParticles << "  " << *particleMass << "  " << *numFiles << "  " << *BoxSize << "\n";
-    
-    // close the group and file
+
     delete group;
     delete file;
 }
 
 
 
-/*! Read the file header for and intialize some of the values in the userOptions class.
-*/
+// Reads the file header and initializes the corresponding userOptions values.
 void HDF5_initialize_DESI(std::string filename,
                            Read_data<float> *readData,
                            User_options *userOptions,
@@ -108,26 +91,24 @@ void HDF5_initialize_DESI(std::string filename,
 {
     MESSAGE::Message message( userOptions->verboseLevel );
     std::string fileName = filename;
-    // check to see if there is only one input file or several
-    if ( not bfs::exists(fileName) ) //if this is true, than the input is in several files
+    if ( not bfs::exists(fileName) ) // a missing root file means the input is split across several files
     {
         fileName = HDF5_filename_DESI( filename, 0 );
     }
-    
-    
-    // now read the actual values of the gadget header
+
+
     double BoxSize;
     double particleMass;
     HDF5_readHeader_DESI( fileName, noParticles, &BoxSize, numFiles, &particleMass );
-    
-    
-    // check if to set the box coordinates from the information in the header
+
+
+    // set the box coordinates from the header unless the user supplied them
     if ( not userOptions->userGivenBoxCoordinates )
     {
         for (size_t i=0; i<NO_DIM; ++i)
         {
-            userOptions->boxCoordinates[2*i]   = 0.;                // this is the left extension of the full box
-            userOptions->boxCoordinates[2*i+1] = BoxSize;           // right extension of the full box
+            userOptions->boxCoordinates[2*i]   = 0.;                // left edge of the full box
+            userOptions->boxCoordinates[2*i+1] = BoxSize;           // right edge of the full box
         }
     }
     else
@@ -137,26 +118,25 @@ void HDF5_initialize_DESI(std::string filename,
     
     // allocate memory for the particle data
     if ( userOptions->readParticleData[0] )
-        readData->position( *noParticles );  // particle positions
+        readData->position( *noParticles );
     if ( userOptions->readParticleData[1] )
     {
-        readData->weight( *noParticles );    // particle weights (weights = particle masses from the snapshot file)
-        float *weights = readData->weight();          // returns a pointer to the particle weights array
+        readData->weight( *noParticles );    // all particles share the same mass from the header
+        float *weights = readData->weight();
         for (size_t j=0; j<*noParticles; ++j)
             weights[j] = particleMass;
     }
 #ifdef VELOCITY
     if ( userOptions->readParticleData[2] )
-        readData->velocity( *noParticles );  // particle velocities
+        readData->velocity( *noParticles );
 #endif
-    // allocate memory for scalar quantities
 #ifdef SCALAR
     int noScalars = 0;
     for (size_t i=3; i<userOptions->readParticleData.size(); ++i)
         if ( userOptions->readParticleData[i] )
             noScalars += 1;
     if ( noScalars>0 )
-        readData->scalar( *noParticles );  // particle scalar quantity
+        readData->scalar( *noParticles );
 #endif
     
     
@@ -177,41 +157,38 @@ void HDF5_initialize_DESI(std::string filename,
 
 
 
-/*! Reads the DESI data from an single HDF5 file. This function should be called to do the actual data reading for snapshots saved in single or multiple files.
-*/
+// Reads the DESI data from single or multiple HDF5 files.
 void HDF5_readData_DESI(std::string filenameRoot,
                          Read_data<float> *readData,
                          User_options *userOptions)
 {
     MESSAGE::Message message( userOptions->verboseLevel );
-    
-    // initialize the input data arrays using the information in the header of the file
+
     size_t numParticles;
     size_t numFiles;
     HDF5_initialize_DESI( filenameRoot, readData, userOptions, &numParticles, &numFiles );
-    
-    
+
+
     size_t numParticlesRead = 0;
     size_t numParticlesRead2 = 0;
     for (size_t fileNumber=0; fileNumber<numFiles; ++fileNumber)
     {
         std::string filename = HDF5_filename_DESI( filenameRoot, fileNumber );
         message << "Reading file " << fileNumber << ": '" << filename << "'...\n";
-        
-        // open the HDF5 file
+
         const H5std_string FILE_NAME( filename );
         H5File *file = new H5File( FILE_NAME, H5F_ACC_RDONLY, H5::FileAccPropList::DEFAULT );
         Group *group;
         group = new Group( file->openGroup("Matter") );
-    
-    
+
+
         // read the coordinates
         if ( userOptions->readParticleData[0] )
         {
-            float *positions = readData->position();               // returns a pointer to the particle positions array
-            size_t dataOffset = numParticlesRead * NO_DIM;      // the offset in the positions array from where to start reading the new positions
+            float *positions = readData->position();
+            size_t dataOffset = numParticlesRead * NO_DIM;
             message << "\t reading the particles positions ... " << MESSAGE::Flush;
-            
+
             DataSet dataset = group->openDataSet("Position");
             DataSpace dataspace = dataset.getSpace();
             hsize_t dims_out[2];
@@ -226,24 +203,23 @@ void HDF5_readData_DESI(std::string filenameRoot,
         // read the velocities
         if ( userOptions->readParticleData[2] )
         {
-            float *velocities = readData->velocity();              // returns a pointer to the particle velocity array
-            size_t dataOffset = numParticlesRead * NO_DIM;      // the offset in the velocity array from where to start reading the new data
+            float *velocities = readData->velocity();
+            size_t dataOffset = numParticlesRead * NO_DIM;
             message << "\t reading the particles velocities ... " << MESSAGE::Flush;
 
             DataSet dataset = group->openDataSet("Velocities");
             DataSpace dataspace = dataset.getSpace();
             hsize_t dims_out[2];
             dataspace.getSimpleExtentDims( dims_out, NULL );
-            
+
             dataset.read( &(velocities[dataOffset]), PredType::NATIVE_FLOAT );
             numParticlesRead2 = numParticlesRead + (unsigned long)(dims_out[0]);
             message << (unsigned long)(dims_out[0]) << " particles ... Done\n";
         }
-        
-        
-        // update the number of particle read
+
+
         numParticlesRead = numParticlesRead2;
-        
+
         delete group;
         delete file;
     }

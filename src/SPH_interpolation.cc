@@ -21,12 +21,14 @@
  */
 
 
+/* Smoothed-Particle-Hydrodynamics (SPH) interpolation onto a regular grid, user sample points, or a
+   redshift cone. Uses an adaptive smoothing length (N-th neighbor) and a symmetric cubic-spline kernel. */
+
+
 #include <vector>
 #include <cmath>
 
-// the next line uses boost multi_array library
-#include "kdtree/kdtree2.hpp"
-// #include "kdtree/kdtree2.cpp"
+#include "kdtree/kdtree2.hpp"  // uses the boost multi_array library
 
 #include "define.h"
 #include "particle_data.h"
@@ -51,7 +53,7 @@ void SPH_interpolation(vector<Particle_data> &p,
 
 
 
-/* This function interpolates the density and velocity to grid using the SPH (smoothed particle hydrodynamics) method. */
+// SPH (smoothed particle hydrodynamics) interpolation: builds the grid sample points, then interpolates.
 void SPH_interpolation(vector<Particle_data> *particles,
                        vector<Sample_point> &samples,
                        User_options &userOptions,
@@ -78,7 +80,7 @@ void SPH_interpolation(vector<Particle_data> *particles,
     else if ( not userOptions.redshiftConeOn )     // sample points on a rectangular grid
     {
         size_t const *grid = &(userOptions.gridSize[0]);
-        Box box = userOptions.region;    // the box coordinates in which the density is computed
+        Box box = userOptions.region;
         Real y[NO_DIM];
         Real dy[NO_DIM];
         for (size_t i=0; i<NO_DIM; ++i)
@@ -92,10 +94,10 @@ void SPH_interpolation(vector<Particle_data> *particles,
                 gridPoints[flatIdx][j] = box[2*j] + (gridIdx[j]+0.5)*dy[j];
         }
     }
-    else if ( userOptions.redshiftConeOn )     //sample points on a light cone grid
+    else if ( userOptions.redshiftConeOn )     // sample points on a light cone grid
     {
         size_t const *grid = &(userOptions.gridSize[0]);
-        Box box = userOptions.redshiftCone;    // the box coordinates in which the density is computed
+        Box box = userOptions.redshiftCone;
         Real const *origin = &(userOptions.originPosition[0]);
         Real dx[NO_DIM];
         for (size_t i=0; i<NO_DIM; ++i)
@@ -129,14 +131,13 @@ void SPH_interpolation(vector<Particle_data> *particles,
     
     
     
-    // now interpolate the results to a grid
     SPH_interpolation( *particles, userOptions, gridPoints, totalGrid, q );
     particles->clear();
 }
 
 
 
-/* Computes the values of the SPH smoothing kernel (except the h^-2 (in 2D) and h^-3 (in 3D) normalizeation factor). */
+// SPH smoothing kernel value, without the h^-2 (2D) / h^-3 (3D) normalization factor.
 Real SPH_smoothingKernel(Real x)
 {
 #if NO_DIM==2
@@ -156,7 +157,7 @@ Real SPH_smoothingKernel(Real x)
         return Real(0.);
 }
 
-/* Computes the derivative of the SPH smoothing kernel (except the h^-2 (in 2D) and h^-3 (in 3D) normalizeation factor). */
+// SPH smoothing kernel derivative, without the h^-2 (2D) / h^-3 (3D) normalization factor.
 Real SPH_smoothingKernelDerivative(Real x)
 {
 #if NO_DIM==2
@@ -177,7 +178,7 @@ Real SPH_smoothingKernelDerivative(Real x)
 }
 
 
-/* Function that returns the constant in front of W(r,h), constant that depends only on h. */
+// Normalization constant in front of W(r,h); depends only on h.
 inline Real hFactor(Real h)
 {
     Real result = Real(1.);
@@ -186,12 +187,7 @@ inline Real hFactor(Real h)
 }
 
 
-/* This function computes the derivative of a vector in the SPH method. 
-It returns:
-    1/2 m W_deriv(r,h) * vec * \vec{r}/r
-where:
-    factor = 1/2 m W_deriv(r,h) .
-*/
+// SPH vector derivative: factor * vec * (r_vec/r), with factor = 1/2 m W_deriv(r,h).
 template <typename T, size_t Nvector, size_t Nderiv>
 Pvector<T,Nderiv> getSPH_derivative(T const factor,
                                     Pvector<T,Nvector> &vec,
@@ -224,18 +220,11 @@ Pvector<T,Nderiv> getSPH_derivative(T const factor,
 
 
 
-/* This function uses the SPH method to interpolate quantities to a grid.
-NOTE: The algorithm implemented here is described at: http://ciera.northwestern.edu/StarCrash/manual/html/node7.html
-It has the following steps:
-    
-    1) Loop over all particles - for each particle (here denoted by i) define h_i=R/2 where R is the distance to the N-th closest neighbor. Within the same loop assign the W(r_ij,h_i) part of the contribution to the particle density of neighbor j. (The full expression for density is: \rho = \sum_j m_j 1/2 [W(r_ij,h_i) + W(r_ij,h_j)]. )
-    
-    2) Loop over all the density grid points and assign a smoothing length to each cell (h_cell=R/2 where R is the sphere in which we find the N-th closest particle neighbors). Use this loop to also add the first part of the SPH smoothing kernel (similar to above).
-    
-    3) Loop again over all particles to assign the 2nd part of the smoothing kernel to the grid quantity. This can be done via two methods:
-        - for a regular grid, loop over all the grid points that are with r<h_i for particle i.
-        - construct a tree from the grid point distribution and use tree searching algorithms to find all the grid points with h_i distance from particle i.
-*/
+// SPH interpolation to a grid. Density uses the symmetric kernel
+// rho = sum_j m_j (1/2)[W(r_ij,h_i) + W(r_ij,h_j)], h = R/2 (R = distance to N-th neighbor).
+// Steps: (1) per-particle h and density, (2) per-grid-point h and the W(.,h_grid) half,
+// (3) scatter the W(.,h_i) half from each particle to nearby grid points via a kdtree.
+// Algorithm: http://ciera.northwestern.edu/StarCrash/manual/html/node7.html
 void SPH_interpolation(vector<Particle_data> &p,
                         User_options &userOptions,
                         kdtree2_array &gridPoints,
@@ -252,7 +241,6 @@ void SPH_interpolation(vector<Particle_data> &p,
         message << "The interpolation takes place inside the spherical coordinates " << userOptions.region.print() << " on a " << MESSAGE::printElements( userOptions.gridSize, "*" ) << " grid:\n" << MESSAGE::Flush;
     
     
-    // first construct the kdtree
     message << "Computing the kdtree for the SPH interpolation ... " << MESSAGE::Flush;
     boost::timer t;
     t.restart();
@@ -283,24 +271,23 @@ void SPH_interpolation(vector<Particle_data> &p,
     // find the smoothing length and SPH density associated to each particle
     message << "Computing the smoothing scale and density at each particle position.\n\tDone:  " << MESSAGE::Flush;
     t.restart();
-    kdtree2_result_vector result;   //stores the result of the nearest neighbors
+    kdtree2_result_vector result;   // nearest-neighbor query results
     int N = int( userOptions.SPH_neighbors );
-    std::vector<Real> smoothingLength( noParticles, Real(0.) ); // stores the smoothing length for each particle
-    std::vector<Real> density( noParticles, Real(0.) );         // stores the density at each particle position
+    std::vector<Real> smoothingLength( noParticles, Real(0.) ); // smoothing length per particle
+    std::vector<Real> density( noParticles, Real(0.) );         // density at each particle position
     Real *h = &(smoothingLength[0]);
     Real *d = &(density[0]);
     size_t prev = 0, amount100 = 0;
-    // first find the smoothing length and density associated to each particle
     for (size_t i=0; i<noParticles; ++i)
     {
         amount100 = (100 * i)/ noParticles;
         if (prev < amount100)
             message.updateProgress( ++prev );
-        
-        tree->n_nearest_around_point(i,0,N,result); // returns the neighbors in ascending order according to the distance they are at
-        h[i] = Real(std::sqrt( result[N-1].dis ) / 2.); // choose h such that within 2h there are N neighbors
-        
-        // get the contribution of this particle to the other particles' density - use only the W(r.h_i) part, not the full W_ij
+
+        tree->n_nearest_around_point(i,0,N,result); // neighbors in ascending distance order
+        h[i] = Real(std::sqrt( result[N-1].dis ) / 2.); // h chosen so 2h contains N neighbors
+
+        // add only the W(r,h_i) half of the symmetric kernel here
         Real const c1 = hFactor(h[i]);
         for (size_t j=0; j<result.size(); ++j)
         {
@@ -317,18 +304,16 @@ void SPH_interpolation(vector<Particle_data> &p,
     
     
     
-    // computes the quantities of interest at grid points
     message << "Computing the interpolated fields on the grid.\n\tDone:  " << MESSAGE::Flush;
     t.restart();
-    // reserve memory for the output
-    q->density.reserve( totalGrid );    //always need memory for the density
+    q->density.reserve( totalGrid );    // density is always needed
     if ( userOptions.aField.velocity ) q->velocity.reserve( totalGrid );
     if ( userOptions.aField.velocity_gradient ) q->velocity_gradient.reserve( totalGrid );
     if ( userOptions.aField.scalar ) q->scalar.reserve( totalGrid );
     if ( userOptions.aField.scalar_gradient ) q->scalar_gradient.reserve( totalGrid );
     
     
-    // Compute the grid smoothing scale and the 1st contribution to the grid interpolated quantities (the W(r_ij,h_i) part)
+    // per-grid-point smoothing scale + the W(.,h_grid) half of the kernel
     std::vector<float> y( NO_DIM, float(0.) );
     prev = 0; amount100 = 0;
     for (size_t i=0; i<totalGrid; ++i)
@@ -343,49 +328,38 @@ void SPH_interpolation(vector<Particle_data> &p,
         Real const tempH = Real(std::sqrt( result[N-1].dis ) / 2.);
         Real const c1 = hFactor(tempH);
         
-        // temporary variable for the different quantities that are computed
+        // accumulators for the different quantities
         Real resDens = Real(0.);
         Pvector<Real,noVelComp> resVel = Pvector<Real,noVelComp>::zero();
         Pvector<Real,noScalarComp> resIntensive = Pvector<Real,noScalarComp>::zero();
         Pvector<Real,noScalarComp> resExtensive = Pvector<Real,noScalarComp>::zero();
-//         Pvector<Real,noGradComp> resVelGrad = Pvector<Real,noGradComp>::zero();
-//         Pvector<Real,noScalarGradComp> resGradIntensive = Pvector<Real,noScalarGradComp>::zero();
-//         Pvector<Real,noScalarGradComp> resGradExtensive = Pvector<Real,noScalarGradComp>::zero();
-        
+
         for (size_t j=0; j<result.size(); ++j)
         {
             int const id = result[j].idx;
             Real tempR = std::sqrt( result[j].dis );
             int bin1 = int( tempR / (tempH*dx));
-            
+
             Real temp1 = Real(0.5) * p[id].weight() * c1*W[bin1];
             resDens += temp1;
             resVel += p[id].velocity() * temp1;
             resIntensive += p[id].scalar() * temp1;
             resExtensive += p[id].scalar() * temp1 / d[id];
-            
-//             Real temp2 = Real(0.5) * p[id].weight() * c1/tempH*W_deriv[bin1];
-//             resVelGrad += getSPH_derivative<Real,noVelComp,NO_DIM*noVelComp>( temp2, p[id].velocity(), &(y[0]), &(p[id].position()[0]) );
-//             resGradIntensive += getSPH_derivative<Real,noScalarComp,NO_DIM*noScalarComp>( temp2, p[id].scalar(), &(y[0]), &(p[id].position()[0]) );
-//             resGradExtensive += resGradIntensive / d[id];
         }
-        
+
         q->density.push_back( resDens );
         if ( userOptions.aField.velocity ) q->velocity.push_back( resVel );
-//         if ( userOptions.field.velocity_gradient ) q->velocity_gradient.push_back( resVelGrad );
         if ( userOptions.extensive )
         {
             if ( userOptions.aField.scalar ) q->scalar.push_back( resExtensive );
-//             if ( userOptions.field.scalar_gradient ) q->scalar_gradient.push_back( resGradExtensive );
         }
         else
         {
             if ( userOptions.aField.scalar ) q->scalar.push_back( resIntensive );
-//             if ( userOptions.field.scalar_gradient ) q->scalar_gradient.push_back( resGradIntensive );
         }
     }
-    
-    // compute the grid points tree
+
+    // build the kdtree over the grid points
     delete tree;
     tree = new kdtree2( gridPoints, false );
     tree->sort_results = true;
@@ -398,8 +372,8 @@ void SPH_interpolation(vector<Particle_data> &p,
         for (size_t j=0; j<NO_DIM; ++j)
             y[j] = p[i].position(j);
         Real const distance = Real(4.) * h[i]*h[i]; //(2h)^2
-        tree->r_nearest( y, distance, result );    //now locate all the grid points within the smoothing radius of the given particle
-        
+        tree->r_nearest( y, distance, result );    // grid points within the particle's smoothing radius
+
         Real const c1 = Real(0.5) * p[i].weight() * hFactor(h[i]);
         for (size_t j=0; j<result.size(); ++j)
         {
@@ -409,44 +383,34 @@ void SPH_interpolation(vector<Particle_data> &p,
                 y2[i1] = gridPoints[id][i1];
             Real tempR = std::sqrt( result[j].dis );
             int bin1 = int( tempR / (h[i]*dx));
-            
+
             Real temp1 = c1*W[bin1];
-//            Real temp2 = c1/h[i]*W_deriv[bin1];
             q->density[id] += temp1;
             if ( userOptions.aField.velocity ) q->velocity[id] += p[i].velocity() * temp1;
-//             if ( userOptions.field.velocity_gradient ) q->velocity_gradient[id] += getSPH_derivative<Real,noVelComp,NO_DIM*noVelComp>( temp2, p[i].velocity(), y2, &(y[0]) );
             if ( userOptions.extensive )
             {
                 if ( userOptions.aField.scalar ) q->scalar[id] += p[i].scalar() * temp1;
-//                 if ( userOptions.field.scalar_gradient ) q->scalar_gradient[id] += getSPH_derivative<Real,noScalarComp,NO_DIM*noScalarComp>( temp2, p[i].scalar(), y2, &(y[0]) );
             }
             else
             {
                 if ( userOptions.aField.scalar ) q->scalar[id] += p[i].scalar() * temp1 / d[i];
-//                 if ( userOptions.field.scalar_gradient ) q->scalar_gradient[id] += getSPH_derivative<Real,noScalarComp,NO_DIM*noScalarComp>( temp2/d[i], p[i].scalar(), y2, &(y[0]) );
             }
         }
     }
     delete tree;
-    
-    
-    // if compute velocity, divide by density at grid cell
+
+
+    // velocity = accumulated momentum / cell density
     if ( userOptions.aField.velocity )
         for (size_t i=0; i<totalGrid; ++i)
             q->velocity[i] /= q->density[i];
-//     if ( userOptions.field.velocity_gradient )
-//         for (size_t i=0; i<totalGrid; ++i)
-//             q->velocity_gradient[i] /= q->density[i];
-    
-    // if compute scalar field and sclara field is intensive, divide by density at grid cell
+
+    // intensive scalar field: divide by cell density
     if ( userOptions.aField.scalar and not userOptions.extensive )
         for (size_t i=0; i<totalGrid; ++i)
             q->scalar[i] /= q->density[i];
-//     if ( userOptions.field.scalar_gradient and not userOptions.extensive )
-//         for (size_t i=0; i<totalGrid; ++i)
-//             q->scalar_gradient[i] /= q->density[i];
-    
-    // if density computation - multiply the density by the normalization factor
+
+    // density: apply the normalization factor
     if ( userOptions.aField.density )
     {
         Real factor = Real( 1. / userOptions.averageDensity );    //normalization factor for the density
@@ -459,172 +423,4 @@ void SPH_interpolation(vector<Particle_data> &p,
     message << "100%\n" << MESSAGE::Flush;
     printElapsedTime( &t, &userOptions, "SPH grid interpolation" );
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-// /* This function uses the SPH method to interpolate quantities to a grid.
-// NOTE: this is an incomplete implementation of the SPH method.
-// */
-// void SPH_interpolation_regular_grid(vector<Particle_data> &p,
-//                                     User_options &userOptions,
-//                                     Quantities *q)
-// {
-//     MESSAGE::Message message(userOptions.verboseLevel);
-//     message << "\nInterpolating the fields to a grid using the SPH method with " << userOptions.SPH_neighbors << " neighbors. The interpolation takes place inside the box of coordinates " << userOptions.region.print() << " on a " << MESSAGE::printElements( userOptions.gridSize, "*" ) << " grid ... " << MESSAGE::Flush;
-//     
-//     
-//     // first construct the kdtree
-//     size_t const noParticles = p.size();
-//     kdtree2_array dataPoints(extents[noParticles][NO_DIM]);
-//     for (size_t i=0; i<noParticles; ++i)
-//         for (size_t j=0; j<NO_DIM; ++j)
-//             dataPoints[i][j] = p[i].position(j);
-//     kdtree2* tree;
-//     tree = new kdtree2( dataPoints, true );
-//     tree->sort_results = true;
-//     
-//     
-//     // construct a table with the values of the smoothing kernel
-//     int const NTable = 1000;
-//     Real dx = Real( 2. / NTable);
-//     Real W[NTable+1];
-//     for (int i=0; i<=NTable; ++i)
-//         W[i] = SPH_smoothingKernel( dx*(i+0.5) );
-//     
-//     
-//     message << "\nComputing the smoothing scale and density at each particle position.\n\tDone:  " << MESSAGE::Flush;
-//     boost::timer t;
-//     t.restart();
-//     // find the smoothing length and SPH density associated to each particle
-//     kdtree2_result_vector result;   //stores the result of the nearest neighbors
-//     int N = int( userOptions.SPH_neighbors );
-//     std::vector<Real> smoothingLength( noParticles, Real(0.) ); // stores the smoothing length for each particle
-//     std::vector<Real> density( noParticles, Real(0.) );         // stores the density at each particle position
-//     Real *h = &(smoothingLength[0]);
-//     Real *d = &(density[0]);
-//     size_t prev = 0, amount100 = 0;
-//     // first find the smoothing length associated to each particle
-//     for (size_t i=0; i<noParticles; ++i)
-//     {
-//         amount100 = (50 * i)/ noParticles;
-//         if (prev < amount100)
-//             message.updateProgress( ++prev );
-//         
-//         tree->n_nearest_around_point(i,0,N,result); // returns the neighbors in ascending order according to the distance they are at
-//         h[i] = Real(std::sqrt( result[N-1].dis ) / 2.); // choose h such that within 2h there are N neighbors
-//     }
-//     // find the density at each particle position
-//     for (size_t i=0; i<noParticles; ++i)
-//     {
-//         amount100 = 50 + (50 * i)/ noParticles;
-//         if (prev < amount100)
-//             message.updateProgress( ++prev );
-//         
-//         tree->n_nearest_around_point(i,0,N,result);
-//         Real const c1 = hFactor(h[i]);
-//         for (size_t j=0; j<result.size(); ++j)
-//         {
-//             Real const c2 = hFactor(h[j]);
-//             
-//             Real const temp = std::sqrt( result[j].dis );
-//             int const id = result[j].idx;
-//             int bin1 = int( temp / (h[i]*dx));
-//             if ( bin1>NTable ) bin1 = NTable;   // if this is true, than 'W[bin1]=0', but also 'W[NTable]=0', hence we can have 'bin1=NTable'
-//             int bin2 = int( temp / (h[id]*dx));
-//             if ( bin2>NTable ) bin2 = NTable;
-//             
-//             d[i] += Real(0.5) * p[id].weight() * (c1*W[bin1] + c2*W[bin2]);
-//         }
-//     }
-//     message << "100%\n" << MESSAGE::Flush;
-//     printElapsedTime( &t, &userOptions, "SPH particle density" );
-//     
-//     
-//     message << "Computing the interpolated fields on the grid.\n\tDone:  " << MESSAGE::Flush;
-//     t.restart();
-//     // computes the quantities of interest at grid points
-//     size_t const *grid = &(userOptions.gridSize[0]);
-//     Box box = userOptions.region;    // the box coordinates in which the density is computed
-//     std::vector<float> y( NO_DIM, float(0.) );
-//     Real dy[NO_DIM];
-//     for (size_t i=0; i<NO_DIM; ++i)
-//         dy[i] = (box[2*i+1] - box[2*i]) / grid[i];
-//     // reserve memory for the output
-//     size_t totalGrid = (NO_DIM==2) ? grid[0]*grid[1] : grid[0]*grid[1]*grid[2];
-//     if ( userOptions.field.density ) q->density.reserve( totalGrid );
-//     if ( userOptions.field.velocity ) q->velocity.reserve( totalGrid );
-//     if ( userOptions.field.scalar ) q->scalar.reserve( totalGrid );
-//     Real factor = Real( 1. / userOptions.averageDensity );    //normalization factor for the density
-//     
-//     prev = 0; amount100 = 0;
-//     y[0] = 0.5*dy[0];
-//     for (size_t i1=0; i1<grid[0]; ++i1)
-//     {
-//         amount100 = (100 * i1)/ grid[0];
-//         if (prev < amount100)
-//             message.updateProgress( ++prev );
-//         
-//         y[1] = 0.5*dy[1];
-//         for (size_t i2=0; i2<grid[1]; ++i2)
-//         {
-// #if NO_DIM==3
-//             y[2] = 0.5*dy[2];
-//             for (size_t i3=0; i3<grid[2]; ++i3)
-//             {
-// #endif
-//                 tree->n_nearest( y, N, result );
-//                 Real const tempH = Real(std::sqrt( result[N-1].dis ) / 2.);
-//                 Real const c1 = hFactor(tempH);
-//                 // temporary variable for the different quantities that are computed
-//                 Real resDens = Real(0.);
-//                 Pvector<Real,noVelComp> resVel = Pvector<Real,noVelComp>::zero();
-//                 Pvector<Real,noScalarComp> resIntensive = Pvector<Real,noScalarComp>::zero();
-//                 Pvector<Real,noScalarComp> resExtensive = Pvector<Real,noScalarComp>::zero();
-//                 
-//                 for (size_t j=0; j<result.size(); ++j)
-//                 {
-//                     int const id = result[j].idx;
-//                     Real const c2 = hFactor(h[id]);
-//             
-//                     Real temp = std::sqrt( result[j].dis );
-//                     int bin1 = int( temp / (tempH*dx));
-//                     if ( bin1>NTable ) bin1 = NTable;
-//                     int bin2 = int( temp / (h[id]*dx));
-//                     if ( bin2>NTable ) bin2 = NTable;
-//                     
-//                     temp = Real(0.5) * p[id].weight() * (c1*W[bin1] + c2*W[bin2]);
-//                     resDens += temp;
-//                     resVel += p[id].velocity() * temp;
-//                     resIntensive += p[id].scalar() * temp;
-//                     resExtensive += p[id].scalar() * temp / d[id];
-//                 }
-//                 
-//                 if ( userOptions.field.density ) q->density.push_back( resDens * factor );
-//                 if ( userOptions.field.velocity ) q->velocity.push_back( resVel / resDens );
-//                 if ( userOptions.field.scalar and userOptions.extensive ) q->scalar.push_back( resExtensive );
-//                 else if ( userOptions.field.scalar ) q->scalar.push_back( resIntensive / resDens );
-//                 
-// #if NO_DIM==3
-//                 y[2] += dy[2];
-//             }
-// #endif
-//             y[1] += dy[1];
-//         }
-//         y[0] += dy[0];
-//     }
-//     message << "100%\n" << MESSAGE::Flush;
-//     printElapsedTime( &t, &userOptions, "SPH grid interpolation" );
-// }
-
 

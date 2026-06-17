@@ -14,12 +14,11 @@ class HDF5TreeWidget(QtWidgets.QTreeWidget):
         self.populate_tree()
 
     def populate_tree(self):
-        # Recursively add groups and datasets as tree items.
         def add_items(parent_item, h5node):
             for key in h5node:
                 child = h5node[key]
                 item = QtWidgets.QTreeWidgetItem([key])
-                item.h5node = child  # attach the h5py object to the tree item
+                item.h5node = child
                 parent_item.addChild(item)
                 if isinstance(child, h5py.Group):
                     add_items(item, child)
@@ -29,7 +28,6 @@ class HDF5TreeWidget(QtWidgets.QTreeWidget):
         item = self.currentItem()
         if item and isinstance(item.h5node, h5py.Dataset):
             data = item.h5node[()]
-            # Visualize based on dataset dimensionality
             if data.ndim == 1:
                 plt.figure()
                 plt.plot(data)
@@ -47,7 +45,6 @@ class HDF5TreeWidget(QtWidgets.QTreeWidget):
                 QtWidgets.QMessageBox.information(
                     self, "Visualization", "Datasets with >2 dimensions are not supported."
                 )
-        # Continue with normal behavior.
         super().mouseDoubleClickEvent(event)
 
 class HDF5Viewer(QtWidgets.QMainWindow):
@@ -64,8 +61,7 @@ class HDF5Viewer(QtWidgets.QMainWindow):
         self.setCentralWidget(self.tree)
 
 def main():
-    # Set the path to your HDF5 file here.
-    file_path = 'output/Illustris-3/snapdir_135/combined.hdf5'  
+    file_path = 'output/Illustris-3/snapdir_135/combined.hdf5'
     app = QtWidgets.QApplication(sys.argv)
     viewer = HDF5Viewer(file_path)
     viewer.show()
