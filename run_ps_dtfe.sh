@@ -4,17 +4,17 @@
 
 SNAPSHOTS=(99)
 
-GRID_SIZE=256
+GRID_SIZE=512
 PADDING=25
 PARTITION="2 2 2"          # Lagrangian-partition grid; coarser = fewer seams but larger per-partition triangulation
-MAX_CONCURRENT=0           # cap on concurrent triangulations (0 = all cores); peak RAM ~ fixed + cap x per-triangulation, verify via "Peak memory (RSS)" line
-AVG_SUBSAMPLES=1           # nSub^3 sub-points for the '_a' fields; dominant runtime cost (~nSub^3), 1 = no averaging
+MAX_CONCURRENT=1           # cap on concurrent triangulations (0 = all cores); peak RAM ~ fixed + cap x per-triangulation, verify via "Peak memory (RSS)" line
+AVG_SUBSAMPLES=3   # nSub^3 sub-points for the '_a' fields; dominant runtime cost (~nSub^3), 1 = no averaging. Override per run: AVG_SUBSAMPLES=1 ./run_ps_dtfe.sh
 MPC_UNIT=1000              # length of 1 Mpc in the input's units (1000 for ckpc/h)
 THREADS=""                 # cap OpenMP threads globally; empty = all cores
 
 DATA_DIR="/Users/luukw/output/TNG50-4-Dark"
 INPUT_SUBDIR="snapdir"
-OUTPUT_PREFIX="ps_output"   # outputs written to <snapdir>/ps_output.*
+OUTPUT_PREFIX="ps_output"   # -> <snapdir>/ps_output_nsubN.* so different nSub runs sit side by side instead of clobbering
 
 # Lagrangian positions, matched to present-day Coordinates by ParticleID. Must be in the
 # SAME units as the snapshots (combined_*.hdf5 are h-removed ckpc, so the IC was rescaled
@@ -24,8 +24,9 @@ LAGRANGIAN_INPUT="${DATA_DIR}/combined_ics.hdf5"
 
 # Phase-space fields; '.streams' is always written, each field also gets a '_a' (averaged) form.
 # divergence/shear/vorticity are rigorous only where streams==1; for multi-stream kinematics
-# use 'dispersion' + the stream count.
-FIELDS="density velocity dispersion density_a velocity_a dispersion_a"
+# use 'dispersion' + the stream count. tweb/vweb classify the cosmic web from the velocity
+# gradient (density-weighted across streams), so they inherit the same single-stream caveat.
+FIELDS="density velocity dispersion tweb vweb density_a velocity_a dispersion_a tweb_a vweb_a"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR" || exit 1

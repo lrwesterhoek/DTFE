@@ -307,6 +307,21 @@ else ifeq ($(PLATFORM),linux)
     OPENMP_LIB = -lgomp
 endif
 
+# Native-CPU tuning: let the compiler vectorise/schedule the interpolation hot loop for
+# this exact chip. Pure tuning -- no -ffast-math, so FP results stay bit-identical to a
+# generic build (safe for comparing runs). Override with ARCH_FLAGS=..., disable with ARCH_FLAGS=
+ifeq ($(PLATFORM),macos)
+    ifeq ($(ARCH),arm64)
+        ARCH_FLAGS ?= -mcpu=native
+    else
+        ARCH_FLAGS ?= -march=native
+    endif
+else
+    ARCH_FLAGS ?= -march=native
+endif
+COMPILE_FLAGS    += $(ARCH_FLAGS)
+COMPILE_FLAGS_PS += $(ARCH_FLAGS)
+
 DTFE_INC = $(INCLUDES)
 
 # Linking
