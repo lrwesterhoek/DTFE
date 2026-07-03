@@ -58,39 +58,10 @@ inline Real eulerianVolume(const Cell_handle &cell)
                           - double(cell->vertex(0)->info().eulerianPosition(i));
     return simplexVolume(posDiff);
 }
-
-// Inverse of the Eulerian vertex position difference matrix for a Delaunay cell.
-inline void eulerianPositionMatrix(Cell_handle &cell,
-                                   Real posMatrixInverse[][NO_DIM])
-{
-    double Ax[NO_DIM][NO_DIM];
-    for (int v = 0; v < NO_DIM; ++v)
-        for (int i = 0; i < NO_DIM; ++i)
-            Ax[v][i] = double(cell->vertex(v+1)->info().eulerianPosition(i))
-                      - double(cell->vertex(0)->info().eulerianPosition(i));
-    matrixInverse(Ax, posMatrixInverse);
-}
-
-// Point-in-Eulerian-simplex test; sets baryCoords[i] for vertex i+1 (vertex 0's coord = 1 - sum).
-inline bool pointInEulerianSimplex(Cell_handle &cell,
-                                   Real const *point,
-                                   Real posMatrixInverse[][NO_DIM],
-                                   Real *baryCoords)
-{
-    Real rel[NO_DIM];
-    for (int i = 0; i < NO_DIM; ++i)
-        rel[i] = point[i] - cell->vertex(0)->info().eulerianPosition(i);
-
-    matrixMultiplication(posMatrixInverse, rel, baryCoords);
-
-    Real sum = 0.;
-    for (int i = 0; i < NO_DIM; ++i)
-    {
-        if (baryCoords[i] < Real(-1.e-6)) return false;
-        sum += baryCoords[i];
-    }
-    return (sum <= Real(1. + 1.e-6));
-}
+// NOTE: the per-cell Eulerian edge-matrix inverse and point-in-simplex test used by PS-DTFE live
+// inline in ps_interpolation.cc (interpolateGrid_phaseSpace), which correctly transposes the inverse
+// for the barycentric coordinates. A previous standalone pointInEulerianSimplex/eulerianPositionMatrix
+// pair here used the NON-transposed product (incorrect) and had no call sites; removed to avoid reuse.
 #endif
 
 // Vertex position difference matrix (each non-base vertex relative to vertex 0) for a Delaunay cell.

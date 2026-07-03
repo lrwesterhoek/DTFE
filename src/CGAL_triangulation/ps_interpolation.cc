@@ -11,6 +11,10 @@
 
 #include "triangulation_common.h"
 
+#if defined(PS_METAL) && NO_DIM==3
+#include "ps_metal_host.h"   // GPU deposit (METAL=1 builds); CPU deposit remains the fallback
+#endif
+
 
 /* Interpolates fields onto a regular grid via PS-DTFE: scatters each finite cell's
    contribution to overlapping grid points so multi-stream regions are handled.
@@ -33,6 +37,8 @@ void interpolateGrid_phaseSpace(DT &dt,
     Real dx[NO_DIM];
     for (int d = 0; d < NO_DIM; ++d)
         dx[d] = (boxCoordinates[2*d+1] - boxCoordinates[2*d]) / nGrid[d];
+    Real cellVolume = Real(1.);
+    for (int d = 0; d < NO_DIM; ++d) cellVolume *= dx[d];
 
     size_t totalGrid = 1;
     for (int d = 0; d < NO_DIM; ++d) totalGrid *= nGrid[d];
@@ -132,6 +138,9 @@ void interpolateGrid_phaseSpace(DT &dt,
     // Per-grid-point count of overlapping streams (diagnostic; reported as the stream_count field).
     std::vector<int> streamCount(totalGrid, 0);
 
+    // Count of cells dropped because their Eulerian simplex is non-invertible (see the check below).
+    size_t nDegenerateInverse = 0;
+
     // multi-stream velocity/scalar = mass-weighted mean sum(rho_s f_s)/sum(rho_s): accumulate
     // density-weighted moments + mass weight sum(rho_s). Serial path normalizes at function end;
     // psDeferNormalization leaves moments un-normalized so they sum linearly across partitions
@@ -145,11 +154,162 @@ void interpolateGrid_phaseSpace(DT &dt,
     std::vector<Real> massWeight;
     if ( needWeight ) massWeight.assign(totalGrid, Real(0.));
 
+    // Reusable per-tetrahedron scratch for the mass-conserving deposit (see the cell loop): the flat
+    // grid index and Eulerian offset (rel = samplePos - vertex0) of every in-simplex sample point.
+    std::vector<size_t> insideFlat;
+    std::vector<Real>   insideRel;   // insideFlat.size() * NO_DIM, row-major per sample
+
     if ( not userOptions.psSuppressGridStats )
         message << "\nPS-DTFE: Interpolating fields to grid by iterating over all Delaunay cells ...\n" << MESSAGE::Flush;
 
+    // GPU deposit (--ps-metal, METAL=1 builds): extract flat per-tet arrays with EXACTLY the CPU
+    // loop's filters, dispatch metal/ps_deposit.metal::depositFields (validated to mirror the CPU
+    // scatter incl. the partition sub-grid), and copy the moment grids back. Any failure (no
+    // device, kernel compile, buffer alloc) falls back to the CPU loop below with a warning.
+    bool metalDeposited = false;
+#if defined(PS_METAL) && NO_DIM==3
+    bool tryMetal = userOptions.psUseMetal;
+#ifdef SCALAR
+    if ( tryMetal && (field.scalar || field.scalar_gradient) )
+    {
+        MESSAGE::Warning warning( userOptions.verboseLevel );
+        warning << "--ps-metal does not support the scalar fields; using the CPU deposit for this pass.\n" << MESSAGE::EndWarning;
+        tryMetal = false;
+    }
+#endif
+    if ( tryMetal )
+    {
+        std::vector<float> tetVerts, tetVels, tetMasses;
+        tetVerts.reserve( cellHandles.size()*12 );
+        tetVels.reserve( cellHandles.size()*12 );
+        tetMasses.reserve( cellHandles.size() );
+        for (size_t ci = 0; ci < cellHandles.size(); ++ci)
+        {
+            Cell_handle cell = cellHandles[ci];
+#ifdef TEST_PADDING
+            { bool dummy=false; for (int v=0;v<=NO_DIM;++v) if (cell->vertex(v)->info().isDummy()){dummy=true;break;} if (dummy) continue; }
+#endif
+            if ( !userOptions.lagrangianRegion.isNullBox() )
+            {
+                double cen[NO_DIM]; for (int d=0;d<NO_DIM;++d) cen[d]=0.;
+                for (int v=0;v<=NO_DIM;++v) for (int d=0;d<NO_DIM;++d) cen[d]+=double(cell->vertex(v)->point()[d]);
+                bool owned=true;
+                for (int d=0;d<NO_DIM;++d){ cen[d]/=double(NO_DIM+1); if (cen[d]<userOptions.lagrangianRegion[2*d]||cen[d]>=userOptions.lagrangianRegion[2*d+1]){owned=false;break;} }
+                if (!owned) continue;
+            }
+            { bool bad=false; for (int v=0;v<=NO_DIM;++v) if (cell->vertex(v)->info().density()<=Real(0.)){bad=true;break;} if (bad && userOptions.periodic) continue; }
+            Real ep[NO_DIM+1][NO_DIM];
+            for (int v=0;v<=NO_DIM;++v) for (int d=0;d<NO_DIM;++d) ep[v][d]=cell->vertex(v)->info().eulerianPosition(d);
+            if ( userOptions.periodic )
+            {
+                Real boxLen[NO_DIM]; for (int d=0;d<NO_DIM;++d) boxLen[d]=boxCoordinates[2*d+1]-boxCoordinates[2*d];
+                for (int v=1;v<=NO_DIM;++v) for (int d=0;d<NO_DIM;++d){ Real diff=ep[v][d]-ep[0][d]; if(diff>boxLen[d]*Real(0.5))ep[v][d]-=boxLen[d]; if(diff<-boxLen[d]*Real(0.5))ep[v][d]+=boxLen[d]; }
+            }
+            double Ax[NO_DIM][NO_DIM];
+            for (int v=0;v<NO_DIM;++v) for (int i=0;i<NO_DIM;++i) Ax[v][i]=double(ep[v+1][i])-double(ep[0][i]);
+            { double avgEdge2=0.; for(int v=0;v<NO_DIM;++v){double l2=0.;for(int i=0;i<NO_DIM;++i)l2+=Ax[v][i]*Ax[v][i];avgEdge2+=l2;} avgEdge2/=NO_DIM; double edgeScale=avgEdge2*std::sqrt(avgEdge2); if (std::fabs(determinant(Ax)) < 1.e-6*edgeScale) continue; }
+            {
+                Real inv[NO_DIM][NO_DIM]; matrixInverse(Ax,inv);
+                bool zero=true; for (int a=0;a<NO_DIM&&zero;++a) for (int b=0;b<NO_DIM;++b) if (inv[a][b]!=Real(0.)){zero=false;break;}
+                if (zero) { ++nDegenerateInverse; continue; }
+            }
+            double Lag[NO_DIM][NO_DIM];
+            for (int v=0;v<NO_DIM;++v) for (int i=0;i<NO_DIM;++i) Lag[v][i]=double(cell->vertex(v+1)->point()[i])-double(cell->vertex(0)->point()[i]);
+            float tm = float( double(userOptions.averageDensity)*std::fabs(determinant(Lag))/factorial(NO_DIM) );
+            if (tm<=0.f) continue;
+            for (int v=0;v<=NO_DIM;++v) for (int d=0;d<NO_DIM;++d) tetVerts.push_back(float(ep[v][d]));
+            for (int v=0;v<=NO_DIM;++v) for (size_t j=0;j<noVelComp;++j) tetVels.push_back(float(cell->vertex(v)->info().velocity(j)));
+            tetMasses.push_back(tm);
+        }
+
+        // Sort tetrahedra by grid-footprint cost before dispatch. A GPU chunk finishes when its
+        // SLOWEST thread finishes: one stretched void tet (spanning thousands of grid cells) mixed
+        // among cheap halo tets leaves most of the GPU idle until the chunk boundary -- measured as
+        // a ~5x underutilization on real data with watchdog-safe short chunks. Cost-ordering makes
+        // every chunk's threads uniformly sized, so all GPU cores stay busy, and the adaptive
+        // chunk-size controller tracks a smooth monotone cost curve instead of a noisy mix.
+        {
+            size_t const nT = tetMasses.size();
+            std::vector< std::pair<float,uint32_t> > order(nT);
+            for (size_t t = 0; t < nT; ++t)
+            {
+                float lo[3], hi[3];
+                for (int d = 0; d < 3; ++d) { lo[d] = tetVerts[t*12+d]; hi[d] = lo[d]; }
+                for (int v = 1; v < 4; ++v)
+                    for (int d = 0; d < 3; ++d)
+                    {
+                        float const cc = tetVerts[t*12+v*3+d];
+                        if (cc < lo[d]) lo[d] = cc;
+                        if (cc > hi[d]) hi[d] = cc;
+                    }
+                float cells = 1.f;
+                for (int d = 0; d < 3; ++d)
+                    cells *= (hi[d]-lo[d]) / float(dx[d]) + (nSub > 1 ? 3.f : 1.f);
+                order[t] = std::make_pair(cells, uint32_t(t));
+            }
+            std::sort(order.begin(), order.end());
+            std::vector<float> sv(nT*12), su(nT*12), sm(nT);
+            for (size_t i = 0; i < nT; ++i)
+            {
+                size_t const src = order[i].second;
+                for (int k = 0; k < 12; ++k) { sv[i*12+k] = tetVerts[src*12+k]; su[i*12+k] = tetVels[src*12+k]; }
+                sm[i] = tetMasses[src];
+            }
+            tetVerts.swap(sv);
+            tetVels.swap(su);
+            tetMasses.swap(sm);
+        }
+
+        double bl[3]  = { double(boxCoordinates[0]), double(boxCoordinates[2]), double(boxCoordinates[4]) };
+        double dxv[3] = { double(dx[0]), double(dx[1]), double(dx[2]) };
+        PSMetalGrids gpuOut;
+        std::string metalErr;
+        if ( psMetalDepositFields(tetVerts, tetVels, tetMasses, bl, dxv,
+                                  nGrid, subOrigin, subDims, nSub,
+                                  userOptions.periodic, gpuOut, metalErr) )
+        {
+            if ( not userOptions.psSuppressGridStats )
+                message << "PS-DTFE: Metal GPU deposit (" << psMetalDeviceName() << "), "
+                        << tetMasses.size() << " tetrahedra.\n" << MESSAGE::Flush;
+            for (size_t i = 0; i < totalGrid; ++i)
+            {
+                if (field.density) quantities->density[i] = Real(gpuOut.mass[i]);
+                if (needWeight)    massWeight[i]          = Real(gpuOut.mass[i]);
+                if (haveVel)
+                    for (size_t j = 0; j < noVelComp; ++j)
+                        quantities->velocity[i][j] = Real(gpuOut.mom[i*3+j]);
+                if (field.velocity_gradient)
+                    for (size_t q = 0; q < noGradComp; ++q)
+                        quantities->velocity_gradient[i][q] = Real(gpuOut.grad[i*9+q]);
+                if (field.velocity_dispersion)
+                    for (size_t cc = 0; cc < noDispComp; ++cc)
+                        quantities->velocity_dispersion[i][cc] = Real(gpuOut.m2[i*6+cc]);
+                streamCount[i] = int(gpuOut.streams[i]);
+            }
+            metalDeposited = true;
+        }
+        else
+        {
+            MESSAGE::Warning warning( userOptions.verboseLevel );
+            warning << "PS-DTFE Metal deposit unavailable (" << metalErr << "); using the CPU deposit.\n" << MESSAGE::EndWarning;
+        }
+    }
+#else
+    if ( userOptions.psUseMetal )
+    {
+        static bool warned = false;
+        if ( !warned )
+        {
+            warned = true;
+            MESSAGE::Warning warning( userOptions.verboseLevel );
+            warning << "--ps-metal requested but this binary was built without METAL=1 (or NO_DIM!=3); using the CPU deposit.\n" << MESSAGE::EndWarning;
+        }
+    }
+#endif // PS_METAL
+
     // per-cell scatter is serial; parallelism is one level up over Lagrangian partitions
     // (DTFE.cpp). A per-cell OpenMP scatter was memory-bandwidth bound and gave no speedup.
+    if ( !metalDeposited )
     for (size_t ci = 0; ci < cellHandles.size(); ++ci)
     {
         Cell_handle cell = cellHandles[ci];
@@ -247,18 +407,43 @@ void interpolateGrid_phaseSpace(DT &dt,
         Real posMatInv[NO_DIM][NO_DIM];
         matrixInverse(Ax, posMatInv);
 
-        // non-periodic hull cell density: rho = avgDensity * |det(Lag edges)|/|det(Eul edges)| (simplex factors cancel)
-        Real rhoCell = Real(0.);
-        if (useVolumeRatioDensity)
+        // matrixInverse() returns the ALL-ZERO matrix for a (near-)singular Eulerian simplex (|det|
+        // below REAL_PRECISSION). A zero inverse makes every barycentric coordinate below exactly 0,
+        // which the point-in-simplex test then reads as "inside" for EVERY grid point in the cell's
+        // bounding box -- so the cell floods its whole axis-aligned bbox. That is the source of the
+        // grid-aligned "square" artefacts: worst at caustics (flat, collapsed cells cluster there) and
+        // amplified by sub-sampling (nSub>1 puts more sample points inside the bbox, so the averaged
+        // '_a' fields look even worse and their mean density is inflated). A collapsed cell has no
+        // reliable Eulerian volume, so drop it; an adjacent non-degenerate stream covers the region.
+        // NOTE: this must stay consistent with matrixInverse()'s degeneracy criterion -- the earlier
+        // relative determinant pre-filter alone does NOT catch every cell that matrixInverse() zeroes.
+        {
+            bool singularInverse = true;
+            for (int a = 0; a < NO_DIM && singularInverse; ++a)
+                for (int b = 0; b < NO_DIM; ++b)
+                    if (posMatInv[a][b] != Real(0.)) { singularInverse = false; break; }
+            if (singularInverse) { ++nDegenerateInverse; continue; }
+        }
+
+        // PS-DTFE per-tetrahedron MASS (Abel/Hahn/Shandarin tetrahedra method): each Lagrangian flow
+        // element carries a constant mass m = averageDensity * V_lag, conserved as it maps to its
+        // present-day Eulerian simplex (Eulerian volume V_eul). We deposit this finite MASS onto the
+        // grid (mass-conserving; see the scatter below), instead of painting the per-tetrahedron
+        // density rho = m / V_eul at grid points: at a caustic V_eul -> 0 so rho -> ~1e7, and
+        // point-sampling that density either misses the thin simplex (mass undercounted) or splats
+        // ~1e7 over a whole grid cell (the grid-aligned "square" over-densities, worse under
+        // sub-sampling because more sample points fall in the cell). Depositing m is exact at any nSub.
+        Real tetMass;
         {
             double Lag[NO_DIM][NO_DIM];
             for (int v = 0; v < NO_DIM; ++v)
                 for (int i = 0; i < NO_DIM; ++i)
                     Lag[v][i] = double(cell->vertex(v+1)->point()[i]) - double(cell->vertex(0)->point()[i]);
             double absDetLag = std::fabs(determinant(Lag));
-            rhoCell = Real( double(userOptions.averageDensity) * absDetLag / cellAbsDet );
-            if (rhoCell < Real(0.)) rhoCell = Real(0.);
+            tetMass = Real( double(userOptions.averageDensity) * absDetLag / factorial(NO_DIM) );  // = rho_bar * V_lag
+            if (tetMass < Real(0.)) tetMass = Real(0.);
         }
+        (void)useVolumeRatioDensity;   // retained above only to drop/flag hull cells
 
         // Eulerian bounding box of this cell (from the wrapped positions).
         Real eMin[NO_DIM], eMax[NO_DIM];
@@ -291,14 +476,8 @@ void interpolateGrid_phaseSpace(DT &dt,
         }
         if (outsideGrid) { continue; }
 
-        // Constant density gradient across this linear cell (from wrapped Eulerian positions).
-        Real densGrad[NO_DIM];
-        {
-            Real dens[NO_DIM];
-            for (int i = 0; i < NO_DIM; ++i)
-                dens[i] = cell->vertex(i+1)->info().density() - cell->vertex(0)->info().density();
-            matrixMultiplication(posMatInv, dens, densGrad);
-        }
+        // (density is deposited as the per-tetrahedron mass tetMass computed above; no per-vertex
+        //  density gradient is needed for the scatter.)
 
         // Constant velocity gradient (also needed to evaluate the per-stream velocity for the dispersion).
         Real velGrad[NO_DIM][noVelComp];
@@ -325,27 +504,32 @@ void interpolateGrid_phaseSpace(DT &dt,
         }
 #endif
 
+        // ===================== Mass-conserving deposit of this tetrahedron =====================
+        // PASS 1: gather every sub-sample point (nSub^NO_DIM per grid cell in the Eulerian bbox) that
+        // lies inside the Eulerian simplex, recording its grid cell (flatIdx) and offset rel from
+        // vertex 0. Sub-sampling probes the simplex volume uniformly.
+        insideFlat.clear();
+        insideRel.clear();
 #if NO_DIM==2
         for (int gi = iMin[0]; gi < iMax[0]; ++gi)
         for (int gj = iMin[1]; gj < iMax[1]; ++gj)
         {
-            // Wrap grid indices into [0,nGrid) for periodic boxes.
             int wgi = userOptions.periodic ? ((gi % (int)nGrid[0] + (int)nGrid[0]) % (int)nGrid[0]) : gi;
             int wgj = userOptions.periodic ? ((gj % (int)nGrid[1] + (int)nGrid[1]) % (int)nGrid[1]) : gj;
             int gridIdx[2] = {wgi, wgj};
+            int rawIdx[2]  = {gi, gj};
 #elif NO_DIM==3
         for (int gi = iMin[0]; gi < iMax[0]; ++gi)
         for (int gj = iMin[1]; gj < iMax[1]; ++gj)
         for (int gk = iMin[2]; gk < iMax[2]; ++gk)
         {
-            // Wrap grid indices into [0,nGrid) for periodic boxes.
             int wgi = userOptions.periodic ? ((gi % (int)nGrid[0] + (int)nGrid[0]) % (int)nGrid[0]) : gi;
             int wgj = userOptions.periodic ? ((gj % (int)nGrid[1] + (int)nGrid[1]) % (int)nGrid[1]) : gj;
             int wgk = userOptions.periodic ? ((gk % (int)nGrid[2] + (int)nGrid[2]) % (int)nGrid[2]) : gk;
             int gridIdx[3] = {wgi, wgj, wgk};
+            int rawIdx[3]  = {gi, gj, gk};
 #endif
-
-            // flat index within this partition's sub-grid; inSub guard is defensive
+            // flat index within this partition's sub-grid; inSub guard skips cells outside it.
             size_t flatIdx = 0;
             bool inSub = true;
             for (int d = 0; d < NO_DIM; ++d)
@@ -356,15 +540,6 @@ void interpolateGrid_phaseSpace(DT &dt,
             }
             if (!inSub) continue;
 
-            // Unwrapped raw index, used for the sample position so it stays consistent with this
-            // cell's wrapped Eulerian coordinates.
-#if NO_DIM==2
-            int rawIdx[2] = {gi, gj};
-#elif NO_DIM==3
-            int rawIdx[3] = {gi, gj, gk};
-#endif
-            // Sub-sample the grid cell on an nSub^NO_DIM grid (cell centre when nSub==1); density and
-            // stream count are divided by nSamplesPerCell afterwards to form the cell average.
             for (size_t sIdx = 0; sIdx < nSamplesPerCell; ++sIdx)
             {
                 Real gridPos[NO_DIM];
@@ -377,46 +552,88 @@ void interpolateGrid_phaseSpace(DT &dt,
                     gridPos[d] = boxCoordinates[2*d] + (rawIdx[d] + frac) * dx[d];
                 }
 
-            // Point-in-Eulerian-simplex test, relative to (wrapped) vertex 0.
-            Real rel[NO_DIM];
-            for (int d = 0; d < NO_DIM; ++d)
-                rel[d] = gridPos[d] - eulerPos[0][d];
-            // Ax stores edges as rows, so bary = (Ax^-1)^T * rel: transpose posMatInv here
-            // (gradients below correctly use posMatInv directly)
-            Real baryCoords[NO_DIM];
-            for (int v = 0; v < NO_DIM; ++v)
-            {
-                baryCoords[v] = Real(0.);
+                // Point-in-Eulerian-simplex test, relative to (wrapped) vertex 0. Ax stores edges as
+                // rows, so bary = (Ax^-1)^T * rel: transpose posMatInv here (gradients use it directly).
+                Real rel[NO_DIM];
+                for (int d = 0; d < NO_DIM; ++d)
+                    rel[d] = gridPos[d] - eulerPos[0][d];
+                Real baryCoords[NO_DIM];
+                for (int v = 0; v < NO_DIM; ++v)
+                {
+                    baryCoords[v] = Real(0.);
+                    for (int i = 0; i < NO_DIM; ++i)
+                        baryCoords[v] += posMatInv[i][v] * rel[i];
+                }
+                Real sum = 0.;
+                bool inside = true;
                 for (int i = 0; i < NO_DIM; ++i)
-                    baryCoords[v] += posMatInv[i][v] * rel[i];
-            }
-            Real sum = 0.;
-            bool inside = true;
-            for (int i = 0; i < NO_DIM; ++i)
-            {
-                if (baryCoords[i] < Real(-1.e-6)) { inside = false; break; }
-                sum += baryCoords[i];
-            }
-            if (!inside || sum > Real(1. + 1.e-6)) continue;
+                {
+                    if (baryCoords[i] < Real(-1.e-6)) { inside = false; break; }
+                    sum += baryCoords[i];
+                }
+                if (!inside || sum > Real(1. + 1.e-6)) continue;
 
-            // stream density at this grid point (clamped >=0); doubles as the mass weight.
-            // Non-periodic hull cells use the constant cell density rhoCell.
-            Real densVal;
-            if (useVolumeRatioDensity)
-                densVal = rhoCell;
+                insideFlat.push_back(flatIdx);
+                for (int d = 0; d < NO_DIM; ++d) insideRel.push_back(rel[d]);
+            }
+        }
+
+        // Fallback: a simplex smaller than the sub-sample spacing may catch no interior point. Deposit
+        // its whole mass at the centroid's cell (the centroid is always inside) so no mass is ever lost
+        // -- this is what makes even nSub==1 mass-conserving (no thin-stream undercount).
+        bool useCentroid = false;
+        size_t centroidFlat = 0;
+        Real   centroidRel[NO_DIM];
+        if (insideFlat.empty())
+        {
+            Real centroid[NO_DIM];
+            for (int d = 0; d < NO_DIM; ++d)
+            {
+                centroid[d] = Real(0.);
+                for (int v = 0; v <= NO_DIM; ++v) centroid[d] += eulerPos[v][d];
+                centroid[d] /= Real(NO_DIM + 1);
+            }
+            bool cValid = true;
+            size_t f = 0;
+            for (int d = 0; d < NO_DIM; ++d)
+            {
+                int raw = int(floor((centroid[d] - boxCoordinates[2*d]) / dx[d]));
+                int w = userOptions.periodic ? ((raw % (int)nGrid[d] + (int)nGrid[d]) % (int)nGrid[d]) : raw;
+                long loc = (long)w - (long)subOrigin[d];
+                if (w < 0 || w >= (int)nGrid[d] || loc < 0 || loc >= (long)subDims[d]) { cValid = false; break; }
+                f = f * subDims[d] + (size_t)loc;
+            }
+            if (!cValid) { continue; }   // simplex centroid outside this grid/partition region: drop it
+            useCentroid = true;
+            centroidFlat = f;
+            for (int d = 0; d < NO_DIM; ++d) centroidRel[d] = centroid[d] - eulerPos[0][d];
+        }
+
+        // PASS 2: split tetMass equally among the interior samples and deposit. Equal shares reproduce
+        // the mass distribution across the cells the simplex covers; the total is exactly tetMass at any
+        // nSub and for any V_eul, so no cell can receive more than the tetrahedron's mass.
+        size_t const nInside = useCentroid ? size_t(1) : insideFlat.size();
+        Real   const massShare = tetMass / Real(nInside);
+        for (size_t s = 0; s < nInside; ++s)
+        {
+            size_t flatIdx;
+            Real rel[NO_DIM];
+            if (useCentroid)
+            {
+                flatIdx = centroidFlat;
+                for (int d = 0; d < NO_DIM; ++d) rel[d] = centroidRel[d];
+            }
             else
             {
-                densVal = cell->vertex(0)->info().density();
-                for (int d = 0; d < NO_DIM; ++d)
-                    densVal += rel[d] * densGrad[d];
+                flatIdx = insideFlat[s];
+                for (int d = 0; d < NO_DIM; ++d) rel[d] = insideRel[s*NO_DIM + d];
             }
-            if (densVal < Real(0.)) densVal = Real(0.);
 
-            // Scatter this stream's contribution into the output grids.
-            if (field.density) quantities->density[flatIdx] += densVal;
-            if (needWeight)    massWeight[flatIdx]          += densVal;
+            // density accumulates MASS here; it is divided by the cell volume once at the end.
+            if (field.density) quantities->density[flatIdx] += massShare;
+            if (needWeight)    massWeight[flatIdx]          += massShare;
 
-            // Velocity moment sum(rho_s*v_s); also evaluated when dispersion is requested (it needs <v>).
+            // Mass-weighted velocity moment sum(m_s v_s); also needed for the dispersion (uses <v>).
             Pvector<Real,noVelComp> velVal;
             if (haveVel)
             {
@@ -424,27 +641,26 @@ void interpolateGrid_phaseSpace(DT &dt,
                 for (int i = 0; i < NO_DIM; ++i)
                     for (size_t j = 0; j < noVelComp; ++j)
                         velVal[j] += velGrad[i][j] * rel[i];
-                quantities->velocity[flatIdx] += velVal * densVal;
+                quantities->velocity[flatIdx] += velVal * massShare;
             }
 
-            // Velocity-gradient moment sum(rho_s * grad v_s) (density-weighted).
             if (field.velocity_gradient)
             {
                 Pvector<Real,noGradComp> grad;
                 for (size_t j = 0; j < noVelComp; ++j)
                     for (int i = 0; i < NO_DIM; ++i)
                         grad[j*NO_DIM+i] = velGrad[i][j];
-                quantities->velocity_gradient[flatIdx] += grad * densVal;
+                quantities->velocity_gradient[flatIdx] += grad * massShare;
             }
 
-            // velocity dispersion: density-weighted second moment sum(rho_s v_i v_j)
-            // (upper triangle). After normalization -> sigma_ij = <v_i v_j> - <v_i><v_j>.
+            // velocity dispersion: mass-weighted second moment sum(m_s v_i v_j) (upper triangle).
+            // After normalization -> sigma_ij = <v_i v_j> - <v_i><v_j>.
             if (field.velocity_dispersion)
             {
                 size_t c = 0;
                 for (int i = 0; i < NO_DIM; ++i)
                     for (int j = i; j < NO_DIM; ++j)
-                        quantities->velocity_dispersion[flatIdx][c++] += densVal * velVal[i] * velVal[j];
+                        quantities->velocity_dispersion[flatIdx][c++] += massShare * velVal[i] * velVal[j];
             }
 
 #ifdef SCALAR
@@ -454,7 +670,7 @@ void interpolateGrid_phaseSpace(DT &dt,
                 for (int i = 0; i < NO_DIM; ++i)
                     for (size_t j = 0; j < noScalarComp; ++j)
                         scalarVal[j] += sGrad[i][j] * rel[i];
-                quantities->scalar[flatIdx] += scalarVal * densVal;
+                quantities->scalar[flatIdx] += scalarVal * massShare;
             }
             if (field.scalar_gradient)
             {
@@ -462,24 +678,30 @@ void interpolateGrid_phaseSpace(DT &dt,
                 for (size_t j = 0; j < noScalarComp; ++j)
                     for (int i = 0; i < NO_DIM; ++i)
                         sgrad[j*NO_DIM+i] = sGrad[i][j];
-                quantities->scalar_gradient[flatIdx] += sgrad * densVal;
+                quantities->scalar_gradient[flatIdx] += sgrad * massShare;
             }
 #endif
 
             streamCount[flatIdx]++;
-            }   // end grid-cell sub-sample loop
         }
     }   // end cell loop
 
     if ( not userOptions.psSuppressGridStats )
+    {
         message << "Done.\n" << MESSAGE::Flush;
+        if ( nDegenerateInverse > 0 )
+            message << "PS-DTFE: dropped " << nDegenerateInverse
+                    << " degenerate (non-invertible) Eulerian cells.\n" << MESSAGE::Flush;
+    }
 
-    // average density and stream count over sub-samples (no-op when nSub==1); velocity/scalar
-    // are mass-weighted means so the 1/nSamples factor cancels (not rescaled)
+    // density accumulated MASS (sum of per-tetrahedron mass shares); convert to a density by dividing
+    // by the grid-cell volume. This is exactly mass-conserving: sum(density)*V_cell = total mass, so
+    // the box-mean density equals averageDensity for any nSub. Stream count is averaged over the
+    // nSub^NO_DIM sub-samples below; velocity/scalar are mass-weighted means (normalized by massWeight).
     Real const invSamples = Real(1.) / Real(nSamplesPerCell);
     if ( field.density )
         for (size_t i = 0; i < totalGrid; ++i)
-            quantities->density[i] *= invSamples;
+            quantities->density[i] /= cellVolume;
 
     // turn density-weighted moments into mass-weighted means sum(rho_s f_s)/sum(rho_s). Serial: here.
     // deferNorm: hand un-normalized moments + weight to the caller, which sums across partitions and

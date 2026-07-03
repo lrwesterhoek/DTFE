@@ -169,6 +169,31 @@ OPTIONS = $(OPTIONS_COMMON)
 # PS-DTFE build: includes PHASE_SPACE flag (triangulates in Lagrangian space, multi-stream regions)
 OPTIONS_PS = $(OPTIONS_COMMON) -DPHASE_SPACE
 
+# PS-DTFE Metal GPU deposit (macOS/Apple Silicon only): build with 'make PS-DTFE METAL=1' and run
+# with '--ps-metal'. Compiles src/CGAL_triangulation/ps_metal_host.cc against the vendored
+# third_party/metal-cpp headers and embeds metal/ps_deposit.metal (runtime-compiled once).
+ifeq ($(METAL),1)
+OPTIONS_PS += -DPS_METAL
+PS_METAL_OBJS = $(OBJ_DIR_PS)/ps_metal_host$(OBJ_EXT)
+PS_METAL_LIBS = -framework Metal -framework Foundation
+else
+PS_METAL_OBJS =
+PS_METAL_LIBS =
+endif
+
+# A PS build must never mix -DPS_METAL and plain objects (an incremental 'make PS-DTFE' after a
+# METAL=1 build -- or vice versa -- would silently produce a binary whose components disagree about
+# PS_METAL). The mode is stamped in o_ps; when it changes, all PS objects are wiped first.
+PS_METAL_MODE = $(if $(filter 1,$(METAL)),on,off)
+.PHONY: ps_metal_mode_check
+ps_metal_mode_check:
+	@$(MKDIR_P) $(OBJ_DIR_PS)
+	@if [ ! -f $(OBJ_DIR_PS)/.metal_mode_$(PS_METAL_MODE) ]; then \
+		echo ">> PS build mode is now METAL=$(PS_METAL_MODE); wiping o_ps to avoid mixed objects"; \
+		rm -f $(OBJ_DIR_PS)/*$(OBJ_EXT) $(OBJ_DIR_PS)/ps_deposit_msl.h $(OBJ_DIR_PS)/.metal_mode_*; \
+		touch $(OBJ_DIR_PS)/.metal_mode_$(PS_METAL_MODE); \
+	fi
+
 #------------------------ options usefull when using DTFE as a library
 # uncomment the line to get access to a function that returns the Delaunay triangulation of the point set
 OPTIONS_COMMON += -DTRIANGULATION
@@ -425,8 +450,8 @@ PS_DTFE_CC_OBJS = $(OBJ_DIR_PS)/user_options$(OBJ_EXT) $(OBJ_DIR_PS)/quantities$
 PS_DTFE_IO_OBJS = $(OBJ_DIR_PS)/input_output$(OBJ_EXT)
 PS_DTFE_TRIANG_OBJS = $(OBJ_DIR_PS)/unaveraged_interpolation$(OBJ_EXT) $(OBJ_DIR_PS)/averaged_interpolation_1$(OBJ_EXT) $(OBJ_DIR_PS)/averaged_interpolation_2$(OBJ_EXT) $(OBJ_DIR_PS)/ps_interpolation$(OBJ_EXT)
 
-PS-DTFE: set_directories_ps $(OBJ_DIR_PS)/DTFE$(OBJ_EXT) $(OBJ_DIR_PS)/triangulation$(OBJ_EXT) $(OBJ_DIR_PS)/main$(OBJ_EXT) $(OBJ_DIR_PS)/kdtree2$(OBJ_EXT) $(PS_DTFE_CC_OBJS) $(PS_DTFE_IO_OBJS) $(PS_DTFE_TRIANG_OBJS) Makefile
-	$(CC) $(COMPILE_FLAGS_PS) $(OBJ_DIR_PS)/DTFE$(OBJ_EXT) $(OBJ_DIR_PS)/triangulation$(OBJ_EXT) $(OBJ_DIR_PS)/main$(OBJ_EXT) $(OBJ_DIR_PS)/kdtree2$(OBJ_EXT) $(PS_DTFE_CC_OBJS) $(PS_DTFE_IO_OBJS) $(PS_DTFE_TRIANG_OBJS) $(DTFE_LIB) -o $(BIN_DIR)/PS-DTFE$(EXE_EXT)
+PS-DTFE: ps_metal_mode_check set_directories_ps $(OBJ_DIR_PS)/DTFE$(OBJ_EXT) $(OBJ_DIR_PS)/triangulation$(OBJ_EXT) $(OBJ_DIR_PS)/main$(OBJ_EXT) $(OBJ_DIR_PS)/kdtree2$(OBJ_EXT) $(PS_DTFE_CC_OBJS) $(PS_DTFE_IO_OBJS) $(PS_DTFE_TRIANG_OBJS) $(PS_METAL_OBJS) Makefile
+	$(CC) $(COMPILE_FLAGS_PS) $(OBJ_DIR_PS)/DTFE$(OBJ_EXT) $(OBJ_DIR_PS)/triangulation$(OBJ_EXT) $(OBJ_DIR_PS)/main$(OBJ_EXT) $(OBJ_DIR_PS)/kdtree2$(OBJ_EXT) $(PS_DTFE_CC_OBJS) $(PS_DTFE_IO_OBJS) $(PS_DTFE_TRIANG_OBJS) $(PS_METAL_OBJS) $(DTFE_LIB) $(PS_METAL_LIBS) -o $(BIN_DIR)/PS-DTFE$(EXE_EXT)
 
 set_directories_ps:
 	@$(MKDIR_P) $(OBJ_DIR_PS)
@@ -482,8 +507,19 @@ $(OBJ_DIR_PS)/averaged_interpolation_1$(OBJ_EXT): $(SRC)/CGAL_triangulation/aver
 $(OBJ_DIR_PS)/averaged_interpolation_2$(OBJ_EXT): $(SRC)/CGAL_triangulation/averaged_interpolation_2.cc $(addprefix $(SRC)/, $(TRIANG_HEADERS)) Makefile
 	$(CC) $(COMPILE_FLAGS_PS) $(DTFE_INC) -o $@ -c $(SRC)/CGAL_triangulation/averaged_interpolation_2.cc
 
-$(OBJ_DIR_PS)/ps_interpolation$(OBJ_EXT): $(SRC)/CGAL_triangulation/ps_interpolation.cc $(addprefix $(SRC)/, $(TRIANG_HEADERS)) Makefile
+$(OBJ_DIR_PS)/ps_interpolation$(OBJ_EXT): $(SRC)/CGAL_triangulation/ps_interpolation.cc $(SRC)/CGAL_triangulation/ps_metal_host.h $(addprefix $(SRC)/, $(TRIANG_HEADERS)) Makefile
 	$(CC) $(COMPILE_FLAGS_PS) $(DTFE_INC) -o $@ -c $(SRC)/CGAL_triangulation/ps_interpolation.cc
+
+# Metal GPU deposit host (METAL=1 only). The kernel source is embedded via a generated header so
+# the binary needs no runtime file lookup; Metal compiles it once per process.
+$(OBJ_DIR_PS)/ps_deposit_msl.h: metal/ps_deposit.metal Makefile
+	@$(MKDIR_P) $(OBJ_DIR_PS)
+	printf 'static const char PS_DEPOSIT_MSL[] = R"MSL(\n' > $@
+	cat metal/ps_deposit.metal >> $@
+	printf '\n)MSL";\n' >> $@
+
+$(OBJ_DIR_PS)/ps_metal_host$(OBJ_EXT): $(SRC)/CGAL_triangulation/ps_metal_host.cc $(SRC)/CGAL_triangulation/ps_metal_host.h $(OBJ_DIR_PS)/ps_deposit_msl.h Makefile
+	$(CC) $(COMPILE_FLAGS_PS) -I third_party/metal-cpp -I $(OBJ_DIR_PS) -o $@ -c $(SRC)/CGAL_triangulation/ps_metal_host.cc
 
 
 ############################# Shared library build ##################################

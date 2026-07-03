@@ -926,17 +926,34 @@ int classifyWeb(Pvector<Real,NO_DIM> const &eigenvalues, Real lambda_th)
 }
 
 
-// T-web/V-web classification from the velocity gradient tensor. T-web uses the symmetrized
-// gradient T_ij = -(1/H0)(dv_i/dx_j + dv_j/dx_i)/2, V-web the shear Sigma_ij = -(1/(2 H0))(dv_i/dx_j + dv_j/dx_i);
-// identical up to a factor of 2 the eigenvalue threshold absorbs.
+// V-web classification from the velocity shear tensor Sigma_ij = -(1/(2 H0))(dv_i/dx_j + dv_j/dx_i)
+// (Hoffman et al. 2012). NOTE: this function previously also emitted a "T-web" computed from the
+// SAME symmetrized velocity gradient -- algebraically identical to the V-web (the outputs were
+// byte-identical), i.e. not a T-web at all. The physical T-web classifies the TIDAL tensor of the
+// gravitational potential (Poisson-solved from the density grid) and is pure grid post-processing:
+// it now lives in python/compute_tweb.py. Requesting 'tweb' here warns and is ignored.
 void computeWebClassification(Field &fields,
                                int const verboseLevel,
                                Real lambda_th,
                                Real hubbleParam,
                                Quantities *q)
 {
+    if ( fields.velocity_tweb )
+    {
+        static bool warned = false;
+        if ( !warned )
+        {
+            warned = true;
+            MESSAGE::Warning warning( verboseLevel );
+            warning << "The 'tweb' field was removed: the velocity-gradient \"T-web\" duplicated the "
+                       "V-web exactly. Compute the true tidal-tensor T-web from the density grid with "
+                       "python/compute_tweb.py; the V-web ('vweb'/'vweb_a') remains available here.\n"
+                    << MESSAGE::EndWarning;
+        }
+        fields.velocity_tweb = false;   // skip downstream allocation checks and file output
+    }
     if ( q->velocity_gradient.empty() ) return;
-    if ( not fields.velocity_tweb and not fields.velocity_vweb ) return;
+    if ( not fields.velocity_vweb ) return;
 
     // normalize the gradient by H0 = 100 h km/s/Mpc so the threshold lambda_th is dimensionless
     Real H0_norm = Real(1.);
@@ -945,31 +962,7 @@ void computeWebClassification(Field &fields,
 
     size_t const N = q->velocity_gradient.size();
 
-    if ( fields.velocity_tweb )
-    {
-        q->velocity_tweb.reserve( N );
-        q->velocity_tweb_eigenvalues.reserve( N );
-        for (size_t i=0; i<N; ++i)
-        {
-            Pvector<Real,noGradComp> &g = q->velocity_gradient[i];
-            Real norm = Real(-1.) / H0_norm;
-            Real s00 = norm * g[0*NO_DIM+0];
-            Real s11 = norm * g[1*NO_DIM+1];
-            Real s01 = norm * (g[0*NO_DIM+1] + g[1*NO_DIM+0]) / Real(2.);
-#if NO_DIM == 3
-            Real s22 = norm * g[2*NO_DIM+2];
-            Real s02 = norm * (g[0*NO_DIM+2] + g[2*NO_DIM+0]) / Real(2.);
-            Real s12 = norm * (g[1*NO_DIM+2] + g[2*NO_DIM+1]) / Real(2.);
-            Pvector<Real,NO_DIM> eig = symmetricEigenvalues3x3(s00, s01, s02, s11, s12, s22);
-#elif NO_DIM == 2
-            Pvector<Real,NO_DIM> eig = symmetricEigenvalues3x3(s00, s01, Real(0.), s11, Real(0.), Real(0.));
-#endif
-            q->velocity_tweb_eigenvalues.push_back( eig );
-            q->velocity_tweb.push_back( Real(classifyWeb(eig, lambda_th)) );
-        }
-    }
-
-    // V-web: shear tensor Sigma_ij (the T-web tensor without the 1/2 factor; threshold absorbs the difference)
+    // V-web: shear tensor Sigma_ij
     if ( fields.velocity_vweb )
     {
         q->velocity_vweb.reserve( N );

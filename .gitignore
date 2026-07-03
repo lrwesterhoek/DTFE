@@ -70,3 +70,9 @@ python/figures/
 !demo/example_input_data_from_text_file.txt
 /tests
 /python
+third_party/
+
+# Metal prototype build artifacts
+metal/deposit_prototype
+metal/*.metallib
+metal/*.air

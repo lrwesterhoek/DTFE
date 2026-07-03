@@ -7,10 +7,13 @@ SNAPSHOTS=(99)
 GRID_SIZE=512
 PADDING=25
 PARTITION="2 2 2"          # Lagrangian-partition grid; coarser = fewer seams but larger per-partition triangulation
-MAX_CONCURRENT=1           # cap on concurrent triangulations (0 = all cores); peak RAM ~ fixed + cap x per-triangulation, verify via "Peak memory (RSS)" line
+MAX_CONCURRENT=2           # cap on concurrent partitions (0 = all cores); peak RAM ~ fixed + cap x per-triangulation, verify via "Peak memory (RSS)" line.
+                           # 2 pipelines CPU and GPU under --ps-metal: one partition triangulates on CPU while the other runs its
+                           # GPU deposit (the Metal host serializes GPU access internally). Drop to 1 if RSS approaches ~56 GB.
 AVG_SUBSAMPLES=3   # nSub^3 sub-points for the '_a' fields; dominant runtime cost (~nSub^3), 1 = no averaging. Override per run: AVG_SUBSAMPLES=1 ./run_ps_dtfe.sh
 MPC_UNIT=1000              # length of 1 Mpc in the input's units (1000 for ckpc/h)
 THREADS=""                 # cap OpenMP threads globally; empty = all cores
+PS_METAL="${PS_METAL:-0}"  # 1 = run the deposit on the Apple GPU (--ps-metal; needs 'make PS-DTFE METAL=1')
 
 DATA_DIR="/Users/luukw/output/TNG50-4-Dark"
 INPUT_SUBDIR="snapdir"
@@ -23,10 +26,16 @@ OUTPUT_PREFIX="ps_output"   # -> <snapdir>/ps_output_nsubN.* so different nSub r
 LAGRANGIAN_INPUT="${DATA_DIR}/combined_ics.hdf5"
 
 # Phase-space fields; '.streams' is always written, each field also gets a '_a' (averaged) form.
+# Both forms are mass-conserving (each tetrahedron deposits its full mass onto the grid). The '_a'
+# fields resolve each grid cell with an nSub^3 sub-sample grid (AVG_SUBSAMPLES, default 3), so they
+# are smoother / better resolved at caustics -- prefer them for science plots. The plain fields use a
+# single sample per cell (coarser, but the same conserved quantity).
 # divergence/shear/vorticity are rigorous only where streams==1; for multi-stream kinematics
-# use 'dispersion' + the stream count. tweb/vweb classify the cosmic web from the velocity
-# gradient (density-weighted across streams), so they inherit the same single-stream caveat.
-FIELDS="density velocity dispersion tweb vweb density_a velocity_a dispersion_a tweb_a vweb_a"
+# use 'dispersion_a' + the stream count. vweb classifies the cosmic web from the velocity
+# gradient (density-weighted across streams), so it inherits the same single-stream caveat.
+# NOTE: 'tweb_a' was removed from the C++ (it duplicated the V-web); the true tidal-tensor T-web
+# is computed afterwards from the density grid: python3 python/compute_tweb.py
+FIELDS="density_a velocity_a dispersion_a vweb_a"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR" || exit 1
@@ -62,6 +71,10 @@ for i in "${SNAPSHOTS[@]}"; do
         continue
     fi
 
+    # GPU deposit toggle (PS_METAL=1 ./run_ps_dtfe.sh); ignored with a warning on non-METAL builds.
+    metal_args=()
+    [ "${PS_METAL}" = "1" ] && metal_args=(--ps-metal)
+
     # Separate Lagrangian input, unless InitialCoordinates is in the snapshot (empty here).
     lag_args=()
     if [ -n "${LAGRANGIAN_INPUT}" ]; then
@@ -87,6 +100,7 @@ for i in "${SNAPSHOTS[@]}"; do
         --input 105 \
         --MpcUnit ${MPC_UNIT} \
         --field ${FIELDS} \
+        "${metal_args[@]}" \
         "${lag_args[@]}" 2>&1 | tee "${run_log}"
     rc=${PIPESTATUS[0]}
 

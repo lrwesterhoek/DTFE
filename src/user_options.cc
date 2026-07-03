@@ -71,6 +71,7 @@ User_options::User_options()
     noPointsOn = false;
 #ifdef PHASE_SPACE
     psAvgSubsamples = 3;  // nSub for PS-DTFE '_a' fields (27 sub-points in 3D)
+    psUseMetal = false;   // GPU deposit off unless --ps-metal is given (requires METAL=1 build)
 #endif
     averageDensity = Real(-1.);
 
@@ -149,7 +150,7 @@ void User_options::addOptions(po::options_description &allOptions,
                     "  scalarGradient = \tcompute the gradient of the scalar quantities at the sampling point position (use 'scalarGradient_a' to get the averaged field gradient inside the sampling cell).\n"
 #endif
 #ifdef VELOCITY
-                    "  tweb = \tT-web cosmic web classification (0=void, 1=wall, 2=filament, 3=node) from tidal tensor eigenvalues (use 'tweb_a' for volume averaged). Also outputs eigenvalues.\n"
+                    "  tweb = \tREMOVED (was a duplicate of vweb): the true tidal-tensor T-web is computed from the density grid by python/compute_tweb.py. Requesting it warns and is ignored.\n"
                     "  vweb = \tV-web cosmic web classification (0=void, 1=wall, 2=filament, 3=node) from velocity shear tensor eigenvalues (use 'vweb_a' for volume averaged). Also outputs eigenvalues.\n"
 #endif
             );
@@ -206,6 +207,7 @@ void User_options::addOptions(po::options_description &allOptions,
             ("seed", po::value<size_t>(&(this->randomSeed)), "integer value to be used for the random seed generator when interpolating to the grid using Monte Carlo methods. Generated randomly if not supplied by the user.")
 #ifdef PHASE_SPACE
             ("avg-subsamples", po::value<int>(&(this->psAvgSubsamples))->default_value(3), "PS-DTFE only: linear sub-sample count nSub for the volume-averaged ('_a') fields. Each grid cell is volume-averaged over an nSub^3 regular sub-grid, so the '_a' interpolation cost scales as nSub^3 -- it is the dominant runtime cost. 3 (default) = 27 sub-points; 2 = 8 (~3.4x faster '_a' pass, slightly coarser average); 1 = cell-centre only (= the unaveraged value, no extra cost but no averaging benefit). Lower this to speed up runs dominated by the averaged-field pass.")
+            ("ps-metal", po::bool_switch(&(this->psUseMetal)), "PS-DTFE only: run the grid deposit (the dominant cost) on the Apple GPU via Metal. Requires a binary built with 'make PS-DTFE METAL=1'; otherwise the option is ignored with a warning and the CPU deposit is used. Results match the CPU deposit to float rounding (atomic summation order).")
 #endif
             ;
     
@@ -337,7 +339,7 @@ void User_options::shortHelp( char *progName )
                     "  scalarGradient = \tnon-averaged gradient of the scalar quantities (use 'scalarGradient_a' to get the volume averaged value).\n"
 #endif
 #ifdef VELOCITY
-                    "  tweb = \tT-web cosmic web classification from tidal tensor eigenvalues (use 'tweb_a' for volume averaged).\n"
+                    "  tweb = \tREMOVED (duplicated vweb); use python/compute_tweb.py on the density grid instead.\n"
                     "  vweb = \tV-web cosmic web classification from velocity shear tensor eigenvalues (use 'vweb_a' for volume averaged).\n"
 #endif
             );
@@ -581,6 +583,12 @@ void User_options::printOptions()
         int nSubPts = 1;
         for (int d=0; d<NO_DIM; ++d) nSubPts *= (this->psAvgSubsamples<1 ? 1 : this->psAvgSubsamples);
         message << "\t avg sub-samples (nSub) : " << this->psAvgSubsamples << "   (each '_a' cell volume-averaged over nSub^" << NO_DIM << " = " << nSubPts << " points; this sets the dominant '_a' interpolation cost)\n";
+        if ( this->psUseMetal )
+#ifdef PS_METAL
+            message << "\t PS deposit             : Metal GPU (--ps-metal)\n";
+#else
+            message << "\t PS deposit             : CPU (--ps-metal given but this binary was built without METAL=1; falling back)\n";
+#endif
     }
     if ( not this->lagrangianInputFilename.empty() )
         message << "\t Lagrangian input file  : " << this->lagrangianInputFilename << "\n";

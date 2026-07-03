@@ -154,6 +154,7 @@ struct User_options
     bool   noPointsOn;    // true if the user specified the number of sampling points
 #ifdef PHASE_SPACE
     int    psAvgSubsamples; // PS-DTFE: linear sub-sample count nSub for '_a' fields (nSub^NO_DIM sub-grid per cell, cost ~nSub^NO_DIM); 3 = 27 sub-points (default), 1 = cell-centre.
+    bool   psUseMetal;      // PS-DTFE: run the grid deposit on the Apple GPU (Metal); needs a METAL=1 build (else falls back to the CPU deposit with a warning).
 #endif
     Real   averageDensity;// density normalization (computed as the box average if not given)
     size_t randomSeed;    // random seed for the Monte Carlo interpolation
