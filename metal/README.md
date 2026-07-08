@@ -83,10 +83,11 @@ data-parallel over ~10M tetrahedra and dominates the runtime — the right GPU t
 
 Build with `make PS-DTFE METAL=1`, run with `--ps-metal`. Pieces:
 
-- `src/CGAL_triangulation/ps_metal_host.{h,cc}` — metal-cpp host (singleton device/pipeline; the
-  kernel source is embedded at build time via the generated `o_ps/ps_deposit_msl.h` and compiled
-  once per process). Compiled only when `METAL=1` (`-DPS_METAL`); links `-framework Metal
-  -framework Foundation`.
+- `src/CGAL_triangulation/ps_metal_host.cc` — metal-cpp host implementing the backend-neutral
+  `gpu_host.h` interface (singleton device/pipeline; the kernel source is embedded at build time
+  via the generated `o_ps/ps_deposit_msl.h` and compiled once per process). Compiled only when
+  `METAL=1` (which defines `-DPS_GPU`); links `-framework Metal -framework Foundation`.
+  On Linux the same interface is implemented by `ps_gpu_cuda.cu` (CUDA=1 / HIP=1).
 - `interpolateGrid_phaseSpace` (ps_interpolation.cc) extracts flat per-tet arrays (min-image-wrapped
   Eulerian vertices, vertex velocities, tet mass ρ̄·V_lag) with **exactly the CPU loop's filters**
   (ownership, hull, degeneracy), dispatches `depositFields`, and copies the moment grids back; the
@@ -113,16 +114,18 @@ kernel's float chain — noise-level physics.
   re-zeros the grids and redoes the whole partition with 4× shorter buffers and wider gaps (logged
   to stderr), then the CPU deposit takes over. Running with the display idle/locked avoids the
   watchdog entirely.
-- **No mixed builds**: the PS build mode (METAL on/off) is stamped in `o_ps/`; changing it wipes all
-  PS objects, so an incremental rebuild can never mix `-DPS_METAL` and plain objects (which would
-  produce a binary that half-believes it has Metal support).
+- **No mixed builds**: the PS build GPU mode (metal/cuda/hip/off) is stamped in `o_ps/`; changing
+  it wipes all PS objects, so an incremental rebuild can never mix `-DPS_GPU` and plain objects
+  (which would produce a binary that half-believes it has GPU support). `o_ps/.build_mode` records
+  the mode's make argument so tests can rebuild without downgrading the binary.
 
 - **Full GPU utilization**: a chunk finishes when its slowest thread finishes, so mixing one
   stretched void tet (thousands of cells) with cheap halo tets idles most cores at every chunk
   boundary (~5× waste). The extraction therefore **cost-sorts** tets by grid footprint before
   dispatch — every chunk gets uniformly-sized work.
 - **CPU ∥ GPU pipelining**: the partition loop is OpenMP over partitions; `--max-concurrent 2`
-  (now the `run_ps_dtfe.sh` default) lets one partition triangulate on the CPU while another runs
+  (what the binary's auto-tuner targets under `--ps-metal` when memory allows; set
+  `MAX_CONCURRENT` to override) lets one partition triangulate on the CPU while another runs
   its GPU deposit (the Metal host mutex serializes GPU access). Measured steady-state:
   ~4–4.5 min per 512³ nSub=3 all-fields partition, ~45 min per full 8-partition run
   (vs ~13 min/partition unsorted-serialized, ~28 min/partition CPU-only).
