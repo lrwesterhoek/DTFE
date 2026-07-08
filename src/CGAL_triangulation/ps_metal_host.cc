@@ -1,7 +1,8 @@
-/* Metal host for the PS-DTFE deposit (see ps_metal_host.h). Owns the metal-cpp implementation
-   symbols for the whole binary; compiled only when METAL=1 (-DPS_METAL). The kernel source is
-   embedded at build time (o_ps/ps_deposit_msl.h, generated from metal/ps_deposit.metal) and
-   runtime-compiled once per process; the pipeline state is cached. */
+/* Metal backend of the PS-DTFE GPU deposit (implements gpu_host.h). Owns the metal-cpp
+   implementation symbols for the whole binary; compiled only when METAL=1 (which defines
+   PS_GPU for the callers). The kernel source is embedded at build time (o_ps/ps_deposit_msl.h,
+   generated from metal/ps_deposit.metal) and runtime-compiled once per process; the pipeline
+   state is cached. */
 
 #define NS_PRIVATE_IMPLEMENTATION
 #define MTL_PRIVATE_IMPLEMENTATION
@@ -16,8 +17,9 @@
 #include <mutex>
 #include <unistd.h>
 
-#include "ps_metal_host.h"
+#include "gpu_host.h"
 #include "ps_deposit_msl.h"   // generated: static const char PS_DEPOSIT_MSL[]
+#include "../message.h"       // ANSI colour helpers only (retry warning below)
 
 namespace {
 
@@ -82,7 +84,9 @@ Ctx& ctx()
 } // namespace
 
 
-std::string psMetalDeviceName()
+std::string gpuBackendName() { return "Metal"; }
+
+std::string gpuDeviceName()
 {
     std::lock_guard<std::mutex> lock(ctxMutex());
     Ctx& c = ctx();
@@ -90,13 +94,13 @@ std::string psMetalDeviceName()
 }
 
 
-bool psMetalDepositFields(const std::vector<float>& verts,
-                          const std::vector<float>& vels,
-                          const std::vector<float>& masses,
+bool psGpuDepositFields(std::vector<float>& verts,
+                          std::vector<float>& vels,
+                          std::vector<float>& masses,
                           const double boxLo[3], const double dx[3],
                           const size_t nGrid[3], const size_t subOrigin[3], const size_t subDims[3],
                           int nSub, bool periodic,
-                          PSMetalGrids& out, std::string& err)
+                          PSGpuGrids& out, std::string& err)
 {
     std::lock_guard<std::mutex> lock(ctxMutex());   // serialize dispatches (single queue)
     Ctx& c = ctx();
@@ -125,9 +129,17 @@ bool psMetalDepositFields(const std::vector<float>& verts,
 
     NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
 
+    // newBuffer(ptr,...) copies the host array into the MTL buffer; free each host array
+    // IMMEDIATELY so at most one array is double-held at a time (instead of all three, a
+    // multi-GB difference per partition at production scale). On failure the CPU fallback
+    // re-deposits from the triangulation, never from these arrays.
+    size_t const nTetTotal = masses.size();
     MTL::Buffer* bV = c.dev->newBuffer(verts.data(),  verts.size()  * sizeof(float), MTL::ResourceStorageModeShared);
+    std::vector<float>().swap(verts);
     MTL::Buffer* bU = c.dev->newBuffer(vels.data(),   vels.size()   * sizeof(float), MTL::ResourceStorageModeShared);
+    std::vector<float>().swap(vels);
     MTL::Buffer* bM = c.dev->newBuffer(masses.data(), masses.size() * sizeof(float), MTL::ResourceStorageModeShared);
+    std::vector<float>().swap(masses);
     MTL::Buffer* bP = c.dev->newBuffer(&P, sizeof(P), MTL::ResourceStorageModeShared);
     auto zeroBuf = [&](size_t bytes) {
         MTL::Buffer* b = c.dev->newBuffer(bytes, MTL::ResourceStorageModeShared);
@@ -169,7 +181,6 @@ bool psMetalDepositFields(const std::vector<float>& verts,
 
     NS::UInteger tg = c.pso->maxTotalThreadsPerThreadgroup();
     if (tg > 256) tg = 256;
-    size_t const nTetTotal = masses.size();
     int const maxAttempts = 3;
     bool success = false;
     std::string lastErr;
@@ -238,9 +249,10 @@ bool psMetalDepositFields(const std::vector<float>& verts,
             baseChunk = std::max(baseChunk / 2, MIN_CHUNK);
             if (attempt + 1 < maxAttempts)
             {
-                fprintf(stderr, "PS-DTFE Metal: %s -- retrying the partition deposit from scratch "
-                                "(attempt %d/%d, target %.0f ms buffers, %.0f ms gaps)\n",
-                        lastErr.c_str(), attempt + 2, maxAttempts, targetSec*1e3, gapUs/1e3);
+                fprintf(stderr, "%sPS-DTFE Metal: %s -- retrying the partition deposit from scratch "
+                                "(attempt %d/%d, target %.0f ms buffers, %.0f ms gaps)%s\n",
+                        MESSAGE::cYellow(), lastErr.c_str(), attempt + 2, maxAttempts,
+                        targetSec*1e3, gapUs/1e3, MESSAGE::cReset());
                 sleep(2);   // let the system settle before hammering the GPU again
             }
         }

@@ -48,12 +48,8 @@ namespace bfs=boost::filesystem;
 #include "io/gadget_reader_header.cc"
 #include "io/gadget_reader_binary.cc"  // binary Gadget files
 #include "io/gadget_reader_HDF5.cc" // Gadget snapshots in HDF5 format
-#include "io/gadget_reader_HDF5_Cristian.cc" // Gadget HDF5, Cristian's format
-#include "io/gadget_reader_MOG.cc"  // Gadget snapshots + MOG forces into scalar field
-#include "io/hdf5_input_my_DESI.cc" // personal DESI particle data
 #include "io/binary_io.cc"      // binary writer
 #include "io/text_io.cc"        // text reader/writer
-#include "io/my_io.cc"          // text reader/writer
 #include "io/density_file_io.cc"    // own output file format
 
 
@@ -80,18 +76,12 @@ FunctionReadInputData chooseInputDataReadFunction(int const inputFileType)
 {
     if ( inputFileType==101 )
         return &readGadgetFile;    // single/multiple Gadget snapshot, type 1 or 2
-    if ( inputFileType==109 )
-        return &readGadgetFile_MOG;    // Gadget snapshot + modified-gravity (gravitational and fifth) forces
 #ifndef DOUBLE
 #ifdef HDF5
     else if ( inputFileType==105 )
         return &HDF5_readGadgetFile;        // HDF5 Gadget snapshot
     else if ( inputFileType==106 )
         return &HDF5_readGadgetFile_HI;     // HI data from HDF5 Gadget snapshot
-    else if ( inputFileType==107 )
-        return &HDF5_readData_DESI;         // HDF5 DESI particle data
-    else if ( inputFileType==108 )
-        return &HDF5_readGadgetFile_Cristian;     // HDF5 Gadget snapshot, Cristian's format
 #endif
     else if ( inputFileType==111 )
         return &readTextFile;               // text file
@@ -101,8 +91,6 @@ FunctionReadInputData chooseInputDataReadFunction(int const inputFileType)
         return &readBinaryFile;             // custom binary reader
     else if ( inputFileType==122 )
         return &readBinaryFile_StructuredData;  // structured-data binary reader
-    else if ( inputFileType==131 )
-        return &readMyFile;                 // custom reader (my_io.cc)
 #endif
     else
         throwError( "Unknow value for the 'inputFileType' argument in function 'chooseInputDataReadFunction'. The program could not recognize the input data file type." );
@@ -208,8 +196,9 @@ void readInputData(std::vector<Particle_data> *p,
         if (lagTotalParticles != noParticles)
             throwError( "Particle count mismatch: main file has ", noParticles, " particles, Lagrangian file has ", lagTotalParticles, "." );
 
-        message << "\nReading Lagrangian positions from '" << userOptions->lagrangianInputFilename
-                << "' (" << lagTotalParticles << " particles, " << lagNumFiles << " file(s)) with ID matching...\n" << MESSAGE::Flush;
+        message << "\nReading Lagrangian positions from '" << MESSAGE::cBlue() << userOptions->lagrangianInputFilename
+                << MESSAGE::cReset() << "' (" << MESSAGE::cMagenta() << lagTotalParticles << MESSAGE::cReset()
+                << " particles, " << lagNumFiles << " file(s)) with ID matching...\n" << MESSAGE::Flush;
 
         std::vector<float> lagCoords(lagTotalParticles * NO_DIM);
         std::vector<uint64_t> lagIDs(lagTotalParticles);
@@ -253,7 +242,8 @@ void readInputData(std::vector<Particle_data> *p,
 
         if (maxID - minID + 1 == lagTotalParticles)
         {
-            message << "\t ID range is contiguous (" << minID << ".." << maxID << "), using direct indexing.\n" << MESSAGE::Flush;
+            message << "\t ID range is contiguous (" << MESSAGE::cMagenta() << minID << ".." << maxID
+                    << MESSAGE::cReset() << "), using direct indexing.\n" << MESSAGE::Flush;
 
             // position lookup indexed by (id - minID); handles unordered IC files
             std::vector<float> lagByID(lagTotalParticles * NO_DIM);
@@ -263,6 +253,10 @@ void readInputData(std::vector<Particle_data> *p,
                 for (int d = 0; d < NO_DIM; ++d)
                     lagByID[slot * NO_DIM + d] = lagCoords[i * NO_DIM + d];
             }
+            // the raw chunk arrays are dead once the by-ID table exists; free them before the
+            // matching loop (20 B/particle transient, ~5 GB at TNG300-3 scale)
+            std::vector<float>().swap(lagCoords);
+            std::vector<uint64_t>().swap(lagIDs);
 
             for (size_t i = 0; i < noParticles; ++i)
             {
@@ -303,7 +297,7 @@ void readInputData(std::vector<Particle_data> *p,
         }
 
         readData._lagrangianPositionPopulated = true;
-        message << "\t Lagrangian position matching complete.\n" << MESSAGE::Flush;
+        message << "\t " << MESSAGE::cGreen() << "Lagrangian position matching complete." << MESSAGE::cReset() << "\n" << MESSAGE::Flush;
 #else
         throwError( "The '--lagrangianInput' option requires HDF5 support. Please compile with -DHDF5." );
 #endif
@@ -355,8 +349,6 @@ class OutputData
             writeTextFile_samplingPosition( dataToWrite, filename, variableName, userOptions ); // text file, each line prefixed with sampling-point coordinates
         else if ( this->outputFileType==114 )
             writeTextFile_redshiftConePosition( dataToWrite, filename, variableName, userOptions ); // text file, each line prefixed with redshift-cone coordinates
-        else if ( this->outputFileType==121 )
-            writeMyFile( dataToWrite, filename, variableName, userOptions );   // binary with self-describing header
         else if ( this->outputFileType==100 )
             writeSpecialFile( dataToWrite, filename, variableName, userOptions );   // binary with self-describing header
     }
@@ -446,13 +438,13 @@ void writeOutputData(Quantities &uQuantities,
     // T-web classification and eigenvalues
     if ( userOptions.uField.velocity_tweb )
     {
-        output.write( uQuantities.velocity_tweb, userOptions.outputFilename + ".velTweb", "T-web classification", userOptions );
-        output.write( uQuantities.velocity_tweb_eigenvalues, userOptions.outputFilename + ".velTwebEig", "T-web eigenvalues", userOptions );
+        output.write( uQuantities.velocity_tweb, userOptions.outputFilename + ".tweb", "T-web classification", userOptions );
+        output.write( uQuantities.velocity_tweb_eigenvalues, userOptions.outputFilename + ".twebEig", "T-web eigenvalues", userOptions );
     }
     if ( userOptions.aField.velocity_tweb )
     {
-        output.write( aQuantities.velocity_tweb, userOptions.outputFilename + ".a_velTweb", "volume averaged T-web classification", userOptions );
-        output.write( aQuantities.velocity_tweb_eigenvalues, userOptions.outputFilename + ".a_velTwebEig", "volume averaged T-web eigenvalues", userOptions );
+        output.write( aQuantities.velocity_tweb, userOptions.outputFilename + ".a_tweb", "volume averaged T-web classification", userOptions );
+        output.write( aQuantities.velocity_tweb_eigenvalues, userOptions.outputFilename + ".a_twebEig", "volume averaged T-web eigenvalues", userOptions );
     }
 
     // V-web classification and eigenvalues

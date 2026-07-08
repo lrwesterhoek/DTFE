@@ -121,8 +121,26 @@ sudo pacman -S base-devel gsl boost cgal mpfr hdf5 gmp
 
 3. **Build the main executable:**
    ```bash
-   make DTFE
+   make DTFE               # CPU interpolation
+   make DTFE METAL=1       # + GPU '_a' interpolation, Apple Silicon (macOS; Metal)
+   make DTFE CUDA=1        # + GPU '_a' interpolation, NVIDIA (Linux; needs nvcc, CUDA_PATH=/usr/local/cuda)
+   make DTFE HIP=1         # + GPU '_a' interpolation, AMD (Linux; needs ROCm hipcc, ROCM_PATH=/opt/rocm)
    ```
+   **HIP note:** when building on a machine that cannot see the target GPU (login nodes,
+   containers), pass the target architecture explicitly — HIP binaries are arch-specific:
+   `make DTFE HIP=1 GPU_ARCH=gfx90a` (find it with `rocminfo | grep gfx`; several targets can
+   be given as `GPU_ARCH="gfx90a gfx942"`). For CUDA, `GPU_ARCH=sm_86` is optional (nvcc's
+   default PTX is forward-portable; setting it just skips the first-launch JIT).
+   Any GPU build enables the `--gpu` flag (`--metal` is a legacy synonym), which moves the
+   method-1 volume-averaged (`_a`) grid interpolation to the GPU with automatic CPU
+   fallback. All backends implement the same kernel (Metal: `metal/dtfe_deposit.metal`,
+   runtime-compiled from headers vendored in `third_party/metal-cpp/`; CUDA/HIP: the
+   single-source `src/CGAL_triangulation/dtfe_gpu_cuda.cu`, compiled ahead of time), and
+   results match the CPU interpolation to float rounding (validated by
+   `tests/dtfe_metal_check.sh` — on Linux: `GPU_BUILD=CUDA=1 tests/dtfe_metal_check.sh`).
+   Unaveraged fields and methods 2/3 always run on the CPU. Switching build modes wipes
+   `o/` automatically so objects from different modes are never mixed; the current mode is
+   recorded in `o/.build_mode`.
 
 4. **Build the shared library:**
    ```bash
@@ -182,9 +200,12 @@ PS-DTFE is selected by the `-DPHASE_SPACE` compile flag, which switches the tria
 
 ### Building
 ```bash
-make PS-DTFE
+make PS-DTFE            # CPU deposit
+make PS-DTFE METAL=1    # + GPU deposit, Apple Silicon (macOS; Metal)
+make PS-DTFE CUDA=1     # + GPU deposit, NVIDIA (Linux; needs nvcc)
+make PS-DTFE HIP=1      # + GPU deposit, AMD (Linux; needs ROCm hipcc)
 ```
-This produces a `PS-DTFE` executable (object files are placed in `o_ps/` to avoid clashing with the standard `o/` build). It needs the same dependencies as `make DTFE`, plus **HDF5** — PS-DTFE input is HDF5-only (see below). The `-DPHASE_SPACE` flag is set automatically by this target; do not add it to the standard `DTFE` build.
+This produces a `PS-DTFE` executable (object files are placed in `o_ps/` to avoid clashing with the standard `o/` build). It needs the same dependencies as `make DTFE`, plus **HDF5** — PS-DTFE input is HDF5-only (see below). The `-DPHASE_SPACE` flag is set automatically by this target; do not add it to the standard `DTFE` build. Any GPU build enables `--ps-gpu` (`--ps-metal` is a legacy synonym), which moves the grid deposit to the GPU with automatic CPU fallback. The Metal backend embeds and runtime-compiles `metal/ps_deposit.metal` (headers vendored in `third_party/metal-cpp/`); CUDA/HIP compile the single-source `src/CGAL_triangulation/ps_gpu_cuda.cu` ahead of time — same kernel algorithm, same CPU-parity contract on every backend.
 
 ### Input data
 PS-DTFE needs **two positions per particle**: the Eulerian (present-day) position and the Lagrangian (initial-condition) position. Both are read from Gadget-HDF5 files (input type `105`):
@@ -211,9 +232,59 @@ The outputs are raw binary, one value per grid cell (row-major, single precision
 | `gradient` | `.velGrad` | 9 | mass-weighted velocity gradient ∂v_i/∂x_j |
 | `dispersion` | `.velDisp`, `.velDispTensor` | 1, 6 | velocity dispersion: trace σ² ("temperature") and full symmetric tensor σ_ij |
 | `scalar` | `.scalar` | `NO_SCALARS` | mass-weighted scalar field(s) |
+| `tweb` | `.velTweb`, `.velTwebEig` | 1, 3 | T-web cosmic-web label (0=void, 1=wall, 2=filament, 3=node) from the tidal tensor (FFT Poisson solve of the density grid) and its eigenvalues |
+| `vweb` | `.velVweb`, `.velVwebEig` | 1, 3 | V-web label from the velocity shear tensor and its eigenvalues (threshold `--lambda_th`, default 0.3) |
 | _(always)_ | `.streams` | 1 | number of streams per cell (1 single-stream, ≥3 in a caustic) |
 
-Every field also has a volume-averaged _a form (density_a, velocity_a, dispersion_a, …) that sub-samples an nSub³ grid (nSub=3) inside each cell and writes the matching .a_* file (.a_den, .a_velDisp, …); .a_streams is the per-cell average stream count. The dispersion is the density-weighted covariance of the per-stream velocities: for each pair of spatial directions you weight every stream's velocity deviation from the local mean flow by that stream's density, sum over all streams, and normalise by the total stream density — equivalently, the density-weighted mean of the velocity-component products minus the product of the mean velocity components. It is approximately zero in cold, single-stream void interiors and large in multi-stream walls and filaments. In single-stream regions the velocity, gradient and dispersion reproduce the standard DTFE result, with the dispersion going to zero.
+Every field also has a volume-averaged _a form (density_a, velocity_a, dispersion_a, …) that sub-samples an nSub³ grid (nSub=3, `--avg-subsamples`) inside each cell and writes the matching .a_* file (.a_den, .a_velDisp, …); .a_streams is the per-cell average stream count. The dispersion is the density-weighted covariance of the per-stream velocities: for each pair of spatial directions you weight every stream's velocity deviation from the local mean flow by that stream's density, sum over all streams, and normalise by the total stream density — equivalently, the density-weighted mean of the velocity-component products minus the product of the mean velocity components. It is approximately zero in cold, single-stream void interiors and large in multi-stream walls and filaments. In single-stream regions the velocity, gradient and dispersion reproduce the standard DTFE result, with the dispersion going to zero.
+
+### Memory: `--partition` and `--max-concurrent` (auto-tuned by default)
+When neither flag is given, **the binary picks both automatically** once the input is read, from the particle count, grid size, requested fields and the machine's physical RAM and cores (it prints an `AUTO-TUNE:` line with the chosen values and the predicted peak RSS; `DTFE_RAM_GB` overrides the detected RAM). Explicit flags always win, and small inputs (default: below 2×10⁶ particles, `DTFE_AUTO_MINN`) keep the historical single-domain behavior. Both run scripts defer to auto mode unless `PARTITION` / `MAX_CONCURRENT` env vars are set.
+
+The model behind the tuner: large runs are bounded by the per-partition CGAL triangulation (~0.65 KB per padded vertex; the Lagrangian padding multiplies particle counts by ~4x) plus the global field grids. PS-DTFE partitions **Lagrangian** space with `--partition X Y Z` and caps concurrent partition pipelines with `--max-concurrent N`; peak RSS ≈ globals + N × (per-partition triangulation + sub-grids). Manual reference points (what auto should land near): a 512³ grid with the default field set fits TNG50-4 (2e7 particles) at `--partition 2 2 2 --max-concurrent 2` in ≲30 GB, and TNG300-3 (2.4e8 particles) at `--partition 5 5 5 --max-concurrent 2` in ~40 GB. The `run_ps_dtfe.sh` runlog reports the measured peak RSS after every run, closing the loop on the prediction.
+
+
+## Batch scripts and configuration
+
+Shared defaults (data root, simulation, snapshot list, grid size, padding) live in [config.sh](config.sh), sourced by all three workflow scripts and overridable per run via flags or environment variables (`DTFE_DATA_ROOT`, `DTFE_SIM` — also honoured by the Python side):
+
+```bash
+./download_snapshots.sh -s TNG50-4-Dark 99      # fetch TNG snapshot chunks
+./download_snapshots.sh -c -s TNG50-4-Dark 99   # FoF/Subfind group catalogs
+./download_snapshots.sh -t -s TNG50-4-Dark      # SubLink merger trees (whole simulation)
+python3 python/merge_HDF5.py ...                # merge chunks into combined_NNN.hdf5
+./run_dtfe.sh [-d DATA_DIR] [-g GRID] [-m] [snap ...]    # standard DTFE batch (-m = GPU '_a' interpolation)
+./run_ps_dtfe.sh [-d DATA_DIR] [-g GRID] [-n NSUB] [-m] [snap ...]   # PS-DTFE batch (-m = GPU deposit)
+```
+
+The TNG API key is read from `-k`, the `TNG_API_KEY` env var, or `~/.tng_api_key` (recommended:
+`echo "<key>" > ~/.tng_api_key && chmod 600 ~/.tng_api_key` — outside the repo, never committed).
+
+`run_ps_dtfe.sh` logs each run to `<snapdir>/ps_output.runlog` (ANSI-stripped) and prints wall time and peak memory. Terminal colours survive the log pipe via `CLICOLOR_FORCE` (respecting `NO_COLOR`).
+
+
+## Python analysis pipeline
+
+`python/` contains the thesis analysis stack, built around the `dtfelib` package:
+* `dtfelib.io.FieldSet` — uniform loader for DTFE and PS-DTFE outputs (units, naming, averaged/raw).
+* `dtfelib.cli` — shared CLI (`--sim`, `--snap`, `--method`, `--smooth`, …) used by every script in `python/plot/`.
+* `python/plot/*.py` — one figure family per script (density/web maps, eigenvalues, correlations, void shapes, …).
+* `dtfelib.trees` / `dtfelib.groupcat` / `dtfelib.environment` — SubLink merger trees (main branches, descendants, max-past-mass merger ratios), FoF/Subfind particle membership + shape tensors, and field sampling at halo positions. `python/plot/plot_halo_tracking.py` combines them: size/shape/orientation/mergers plus the DTFE **or** PS-DTFE density and web-class environment along each halo's history.
+* `dtfelib.voids` + `python/plot/plot_void_tracking.py` — VOID evolution: voids found as minima of the smoothed density contrast at the reference snapshot are given an identity across time by their merger-tree tracer subhalos (median periodic displacement moves the centre), and their size (semi-axes, R_eff), BBKS shape (e, p) and major-axis orientation are re-measured from the DTFE or PS-DTFE field at every snapshot with grids on disk.
+* `python/plot/plot_void_population.py` — the population view: counts, R_eff / e / p / central-δ medians, bands and distributions for ALL voids per snapshot (same catalogs and sample cuts as the correlation analyses), for either estimator.
+* `python/pipeline.py`, `compute_all.py`, `run_all.py` — batch analysis drivers; `python/config.py` holds simulation constants and adapts to the active simulation (`DTFE_SIM` / `--sim`; box sizes pinned for TNG50-3/50-4/300-3, read from headers for new simulations).
+
+
+## Tests
+
+```bash
+tests/ps_smoke_test.sh          # build + Zel'dovich pancake sanity check (~1 min)
+python3 tests/ps_regression_test.py   # physics metrics vs tests/reference baseline
+tests/ps_parallel_check.sh      # serial vs partitioned/parallel agreement
+python3 tests/run_tests.py      # standard-DTFE regression
+tests/dtfe_metal_check.sh       # standard-DTFE CPU vs --gpu parity (builds the current GPU mode; GPU_BUILD=CUDA=1 on Linux/NVIDIA)
+python3 tests/py_dtfelib_test.py  # python stack: SubLink invariants, sampling, void tracking
+```
 
 
 ## Contributors

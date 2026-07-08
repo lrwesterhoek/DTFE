@@ -49,9 +49,18 @@ namespace MESSAGE
 {
 
 // ANSI colours for the runtime log; emitted only when stdout is a real terminal and NO_COLOR is unset, so piped output stays clean.
+// CLICOLOR_FORCE (non-empty, not "0") forces colours through pipes -- run_ps_dtfe.sh sets it so colours survive its 'tee' runlog pipe.
 inline bool colorEnabled()
 {
-    static bool const enabled = ( isatty(STDOUT_FILENO)==1 ) && ( std::getenv("NO_COLOR")==nullptr );
+    static bool const enabled = []()
+    {
+        if ( std::getenv("NO_COLOR")!=nullptr )
+            return false;
+        char const *force = std::getenv("CLICOLOR_FORCE");
+        if ( force!=nullptr and force[0]!='\0' and not (force[0]=='0' and force[1]=='\0') )
+            return true;
+        return isatty(STDOUT_FILENO)==1;
+    }();
     return enabled;
 }
 inline char const* cRed()     { return colorEnabled() ? "\033[1;31m" : ""; }  // errors

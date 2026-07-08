@@ -70,6 +70,17 @@ struct PairPtrBool
         if ( not _assigned ) throwError( "When returning pointer for the variable 'Read_data::", name, "'. There was no memory allocation for the given variable." );
         return _ptr;
     }
+
+    // Frees the buffer early (transferData releases each flat array right after repacking it).
+    void release()
+    {
+        if ( _assigned )
+        {
+            delete[] _ptr;
+            _ptr = NULL;
+            _assigned = false;
+        }
+    }
 };
 
 
@@ -151,32 +162,54 @@ struct Read_data
     void transferData(std::vector<Particle_data> *p,
                       std::vector<Sample_point>  *s)
     {
-        // particle data: copy only the arrays that were actually allocated
+        // particle data: repack per ARRAY and release each flat array as soon as it is copied,
+        // so the load-phase transient is the Particle_data vector plus the arrays not yet
+        // copied instead of the vector plus ALL of them (this transient bounds the largest
+        // simulation that fits in RAM; see the memory model in auto_tune.h)
         if ( _noParticles>size_t(0) )
         {
-            p->clear();
-            p->reserve( _noParticles );
-            for (size_t i=0; i<_noParticles; ++i)
-            {
-                Particle_data temp;
-                if ( _position._assigned )
-                    for (size_t j=0; j<NO_DIM; ++j)
-                        temp.position(j) = _position._ptr[NO_DIM*i+j];
-                if ( _velocity._assigned )
-                    for (size_t j=0; j<noVelComp; ++j)
-                        temp.velocity(j) = _velocity._ptr[noVelComp*i+j];
-                if ( _weight._assigned )
-                    temp.weight() = _weight._ptr[i];
-                if ( _scalar._assigned )
-                    for (size_t j=0; j<noScalarComp; ++j)
-                        temp.scalar(j) = _scalar._ptr[noScalarComp*i+j];
 #ifdef PHASE_SPACE
-                if ( _lagrangianPosition._assigned )
-                    for (size_t j=0; j<NO_DIM; ++j)
-                        temp.lagrangianPosition(j) = _lagrangianPosition._ptr[NO_DIM*i+j];
+            // particle IDs were only needed for the Lagrangian matching, which already ran
+            std::vector<uint64_t>().swap( _particleIDs );
 #endif
-                p->push_back( temp );
+            p->clear();
+            p->resize( _noParticles );
+            if ( _position._assigned )
+            {
+                for (size_t i=0; i<_noParticles; ++i)
+                    for (size_t j=0; j<NO_DIM; ++j)
+                        (*p)[i].position(j) = _position._ptr[NO_DIM*i+j];
+                _position.release();
             }
+            if ( _velocity._assigned )
+            {
+                for (size_t i=0; i<_noParticles; ++i)
+                    for (size_t j=0; j<noVelComp; ++j)
+                        (*p)[i].velocity(j) = _velocity._ptr[noVelComp*i+j];
+                _velocity.release();
+            }
+            if ( _weight._assigned )
+            {
+                for (size_t i=0; i<_noParticles; ++i)
+                    (*p)[i].weight() = _weight._ptr[i];
+                _weight.release();
+            }
+            if ( _scalar._assigned )
+            {
+                for (size_t i=0; i<_noParticles; ++i)
+                    for (size_t j=0; j<noScalarComp; ++j)
+                        (*p)[i].scalar(j) = _scalar._ptr[noScalarComp*i+j];
+                _scalar.release();
+            }
+#ifdef PHASE_SPACE
+            if ( _lagrangianPosition._assigned )
+            {
+                for (size_t i=0; i<_noParticles; ++i)
+                    for (size_t j=0; j<NO_DIM; ++j)
+                        (*p)[i].lagrangianPosition(j) = _lagrangianPosition._ptr[NO_DIM*i+j];
+                _lagrangianPosition.release();
+            }
+#endif
         }
         // sample points: copy only the arrays that were actually allocated
         if ( _noSamples>size_t(0) )

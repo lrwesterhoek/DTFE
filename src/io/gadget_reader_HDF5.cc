@@ -148,7 +148,7 @@ void HDF5_readGadgetData(std::string filename,
 
             dataOffset += gadgetHeader.npart[type] * NO_DIM;
         }
-        message << "Done\n";
+        message << MESSAGE::cGreen() << "Done" << MESSAGE::cReset() << "\n";
     }
 
 
@@ -180,7 +180,7 @@ void HDF5_readGadgetData(std::string filename,
             }
             dataOffset += gadgetHeader.npart[type];
         }
-        message << "Done\n";
+        message << MESSAGE::cGreen() << "Done" << MESSAGE::cReset() << "\n";
     }
 
 
@@ -204,7 +204,7 @@ void HDF5_readGadgetData(std::string filename,
 
             dataOffset += gadgetHeader.npart[type] * NO_DIM;
         }
-        message << "Done\n";
+        message << MESSAGE::cGreen() << "Done" << MESSAGE::cReset() << "\n";
     }
 
 
@@ -225,7 +225,7 @@ void HDF5_readGadgetData(std::string filename,
             delete group;
             dataOffset += gadgetHeader.npart[type];
         }
-        message << "Done\n";
+        message << MESSAGE::cGreen() << "Done" << MESSAGE::cReset() << "\n";
     }
 
     // InitialCoordinates may be absent if Lagrangian positions come from a separate --lagrangianInput file
@@ -256,7 +256,7 @@ void HDF5_readGadgetData(std::string filename,
         }
         if (success)
         {
-            message << "\t reading the Lagrangian positions ... Done\n" << MESSAGE::Flush;
+            message << "\t reading the Lagrangian positions ... " << MESSAGE::cGreen() << "Done" << MESSAGE::cReset() << "\n" << MESSAGE::Flush;
             readData->_lagrangianPositionPopulated = true;
         }
     }
@@ -286,7 +286,7 @@ void HDF5_readGadgetData(std::string filename,
 
         delete[] tempData;
         noScalarsRead += 1;
-        message << "Done\n";
+        message << MESSAGE::cGreen() << "Done" << MESSAGE::cReset() << "\n";
     }
 
 
@@ -321,7 +321,10 @@ void HDF5_countGadgetParticleNumber(std::string filenameRoot,
     }
     
     MESSAGE::Message message( verboseLevel );
-    message << "The data is in " << noFiles << " files and contains the following number of particles: " << numberTotalParticles[0] << " + "  << numberTotalParticles[1] << " + "  << numberTotalParticles[2] << " + "  << numberTotalParticles[3] << " + "  << numberTotalParticles[4] << " + "  << numberTotalParticles[5] << " .\n" << MESSAGE::Flush;
+    message << "The data is in " << MESSAGE::cMagenta() << noFiles << MESSAGE::cReset()
+            << " files and contains the following number of particles: " << MESSAGE::cMagenta()
+            << numberTotalParticles[0] << " + "  << numberTotalParticles[1] << " + "  << numberTotalParticles[2] << " + "  << numberTotalParticles[3] << " + "  << numberTotalParticles[4] << " + "  << numberTotalParticles[5]
+            << MESSAGE::cReset() << " .\n" << MESSAGE::Flush;
 }
 
 
@@ -394,7 +397,10 @@ void HDF5_initializeGadget(std::string filename,
             numberTotalParticles[i] = 0;
         *noParticles += numberTotalParticles[i];
     }
-    message << "Reading " << *noParticles << " particle data from the input file. These particles are made from the particle species: " << numberTotalParticles[0] << " + "  << numberTotalParticles[1] << " + "  << numberTotalParticles[2] << " + "  << numberTotalParticles[3] << " + "  << numberTotalParticles[4] << " + "  << numberTotalParticles[5] << " .\n" << MESSAGE::Flush;
+    message << "Reading " << MESSAGE::cMagenta() << *noParticles << MESSAGE::cReset()
+            << " particle data from the input file. These particles are made from the particle species: "
+            << MESSAGE::cMagenta() << numberTotalParticles[0] << " + "  << numberTotalParticles[1] << " + "  << numberTotalParticles[2] << " + "  << numberTotalParticles[3] << " + "  << numberTotalParticles[4] << " + "  << numberTotalParticles[5]
+            << MESSAGE::cReset() << " .\n" << MESSAGE::Flush;
     
     
     
@@ -457,7 +463,8 @@ void HDF5_readGadgetFile(std::string filename,
     for (int i=0; i<gadgetHeader.num_files; ++i)
     {
         fileName = gadgetHeader.filename( filename, i );
-        message << "Reading GADGET snapshot file '" << fileName << "' which is file " << i+1 << " of " << gadgetHeader.num_files << " files...\n" << MESSAGE::Flush;
+        message << "Reading GADGET snapshot file '" << MESSAGE::cBlue() << fileName << MESSAGE::cReset()
+                << "' which is file " << i+1 << " of " << gadgetHeader.num_files << " files...\n" << MESSAGE::Flush;
 
         HDF5_readGadgetData( fileName, readData, *userOptions, i, &numberParticlesRead );
     }
@@ -514,7 +521,7 @@ void HDF5_readGadgetData_HI(std::string filename,
 
             dataOffset += gadgetHeader.npart[type] * NO_DIM;
         }
-        message << "Done\n";
+        message << MESSAGE::cGreen() << "Done" << MESSAGE::cReset() << "\n";
     }
 
 
@@ -546,7 +553,7 @@ void HDF5_readGadgetData_HI(std::string filename,
             }
             dataOffset += gadgetHeader.npart[type];
         }
-        message << "Done\n";
+        message << MESSAGE::cGreen() << "Done" << MESSAGE::cReset() << "\n";
     }
 
 
@@ -585,7 +592,7 @@ void HDF5_readGadgetData_HI(std::string filename,
         delete[] hydrogenMassFraction;
         delete[] molecularMassFraction;
         delete[] hydrogenOneFraction;
-        message << "Done\n";
+        message << MESSAGE::cGreen() << "Done" << MESSAGE::cReset() << "\n";
     }
     
     
@@ -609,7 +616,7 @@ void HDF5_readGadgetData_HI(std::string filename,
 
             dataOffset += gadgetHeader.npart[type] * NO_DIM;
         }
-        message << "Done\n";
+        message << MESSAGE::cGreen() << "Done" << MESSAGE::cReset() << "\n";
     }
 
 
@@ -637,7 +644,7 @@ void HDF5_readGadgetData_HI(std::string filename,
 
         delete[] tempData;
         noScalarsRead += 1;
-        message << "Done\n";
+        message << MESSAGE::cGreen() << "Done" << MESSAGE::cReset() << "\n";
     }
 
 

@@ -28,6 +28,16 @@
 #include <stdio.h>
 #include <gsl/gsl_qrng.h>
 
+// GPU deposit (METAL=1/CUDA=1/HIP=1 builds, 3D only); the CPU loop below remains the fallback. MY_SCALAR
+// evaluates arbitrary user C++ per sample, which cannot run on the GPU.
+#if defined(DTFE_GPU) && NO_DIM==3 && !defined(MY_SCALAR)
+#define DTFE_GPU_ACTIVE
+#include <cstdint>
+#include <algorithm>
+#include <utility>
+#include "gpu_host.h"
+#endif
+
 
 
 // Fills 'arraySize' quasi-random (Sobol) barycentric coordinates inside the unit simplex; samples in
@@ -262,9 +272,211 @@ void interpolateGrid_averaged_1(DT &dt,
     std::vector<Real> quasiRandomNumbers_buf(maxNN * NO_DIM);
     Real (*quasiRandomNumbers)[NO_DIM] = reinterpret_cast<Real(*)[NO_DIM]>(quasiRandomNumbers_buf.data());
     quasiRandomSequence( quasiRandomNumbers, maxNN );
-    
-    
-    
+
+
+    // GPU deposit (--metal / --gpu, GPU builds): extract flat per-tetrahedron arrays using the CPU
+    // loop's own helpers (classification, sample counts, volumes -- so both paths make identical
+    // decisions), dispatch metal/dtfe_deposit.metal::depositAveraged1, and copy the grids back.
+    // Any failure (no device, kernel compile, buffer alloc) falls back to the CPU loop below.
+    bool metalDeposited = false;
+#ifdef DTFE_GPU_ACTIVE
+    bool tryMetal = userOptions.useMetal;
+#ifdef SCALAR
+    if ( tryMetal and (field.scalar or field.scalar_gradient) )
+    {
+        MESSAGE::Warning warning( userOptions.verboseLevel );
+        warning << "--metal does not support the scalar fields; using the CPU interpolation for this pass.\n" << MESSAGE::EndWarning;
+        tryMetal = false;
+    }
+#endif
+    // the single-cell fast path ships 32-bit flat grid indices to the GPU
+    if ( tryMetal and gridSize > size_t(UINT32_MAX) )
+    {
+        MESSAGE::Warning warning( userOptions.verboseLevel );
+        warning << "--metal does not support more than 2^32 grid cells; using the CPU interpolation.\n" << MESSAGE::EndWarning;
+        tryMetal = false;
+    }
+    if ( tryMetal )
+    {
+        bool const fDen = field.density;
+        bool fVel = false, fGrad = false;
+#ifdef VELOCITY
+        fVel  = field.velocity;
+        fGrad = field.velocity_gradient;
+#endif
+        bool const needVel = fVel or fGrad;
+
+        // reserve for all finite cells (upper bound; a counting pre-pass would cost a full extra
+        // CGAL cell walk, which measured comparably to the whole extraction -- the padded fraction
+        // outside the region is small for standard-DTFE partitions, unlike the PS Lagrangian ones)
+        size_t const nKept = dt.number_of_finite_cells();
+
+        std::vector<float>    tetVerts, tetDens, tetVels, tetVols;
+        std::vector<uint32_t> tetCnts, tetFlats;
+        tetVerts.reserve( nKept*12 );
+        tetDens.reserve( nKept*4 );
+        if ( needVel ) tetVels.reserve( nKept*12 );
+        tetVols.reserve( nKept );
+        tetCnts.reserve( nKept );
+        tetFlats.reserve( nKept );
+
+        for (Finite_cells_iterator itC = dt.finite_cells_begin(); itC != dt.finite_cells_end(); ++itC)
+        {
+            if ( cellOutsideRegion(dt, itC, fullBox) )
+                continue;
+
+            double vertexMatrix[NO_DIM][NO_DIM];
+            int baseGridCell[NO_DIM];
+            Real basePosition[NO_DIM];
+            int cellPosition = checkCellPosition( itC, boxCoordinates, dx, vertexMatrix, baseGridCell, basePosition );
+            Real cellVolume = volume( dt, itC );
+
+            size_t index;
+            uint32_t cnt = 0, flat = 0;
+            if ( cellPosition==SINGLE_GRID_CELL and isGridCellIndex( baseGridCell, nGrid, &index ) )
+                flat = uint32_t(index);   // cnt 0 = deposit the centroid value at 'flat'
+            else
+            {
+                size_t const tempInt = size_t(NN*cellVolume/gridCellVolume) + 1;
+                cnt = uint32_t( (cellVolume/gridCellVolume>minRatio) ? (tempInt>maxNN ? maxNN:tempInt) : minNN );
+            }
+
+            // vertex positions relative to the region's lower corner (subtracted in double, so
+            // the narrowed floats match the CPU's Real basePosition exactly)
+            for (int v=0; v<NO_DIM+1; ++v)
+                for (int d=0; d<NO_DIM; ++d)
+                    tetVerts.push_back( float( double(itC->vertex(v)->point()[d]) - double(boxCoordinates[2*d]) ) );
+            for (int v=0; v<NO_DIM+1; ++v)
+                tetDens.push_back( float(itC->vertex(v)->info().density()) );
+#ifdef VELOCITY
+            if ( needVel )
+                for (int v=0; v<NO_DIM+1; ++v)
+                    for (size_t j=0; j<noVelComp; ++j)
+                        tetVels.push_back( float(itC->vertex(v)->info().velocity(j)) );
+#endif
+            tetVols.push_back( float(cellVolume) );
+            tetCnts.push_back( cnt );
+            tetFlats.push_back( flat );
+
+#ifdef TEST_PADDING
+            // the GPU deposits this tetrahedron's field values; replicate only the dummy-cell
+            // REPORTING here (dummy tetrahedra live near the padded boundary, so this is cheap)
+            bool dummyNeighbors = hasDummyNeighbor( itC );
+            bool dummyVertices = hasDummyVertex( itC );
+            if ( dummyNeighbors or dummyVertices )
+            {
+                if ( cnt==0 )
+                {
+                    if ( dummyNeighbors ) updateDummyGridCells( size_t(flat), &incompleteCells_d );
+                    if ( dummyVertices ) updateDummyGridCells( size_t(flat), &incompleteCells );
+                }
+                else
+                {
+                    std::vector<Point> randomPoints(cnt);
+                    quasiRandomPointsInCell( vertexMatrix, cnt, quasiRandomNumbers, randomPoints.data() );
+                    for (size_t i=0; i<cnt; ++i)
+                        if ( isGridCellIndex( nGrid, dx, randomPoints[i], basePosition, &index ) )
+                        {
+                            if ( dummyNeighbors ) updateDummyGridCells( index, &incompleteCells_d );
+                            if ( dummyVertices ) updateDummyGridCells( index, &incompleteCells );
+                        }
+                }
+            }
+#endif
+        }
+
+        // Sort tetrahedra by sample count before dispatch. A GPU chunk finishes when its SLOWEST
+        // thread finishes: one huge void tet (thousands of samples) mixed among single-cell halo
+        // tets leaves most of the GPU idle until the chunk boundary (measured ~5x underutilization
+        // for the PS deposit). Cost-ordering makes every chunk's threads uniformly sized; the
+        // permutation is applied one array at a time so only a single extra copy is alive at once.
+        {
+            size_t const nT = tetCnts.size();
+            std::vector< std::pair<uint32_t,uint32_t> > order(nT);
+            for (size_t t=0; t<nT; ++t)
+                order[t] = std::make_pair( tetCnts[t], uint32_t(t) );
+            std::sort( order.begin(), order.end() );
+            {
+                std::vector<float> sv(nT*12);
+                for (size_t i=0; i<nT; ++i)
+                { size_t const src = order[i].second; for (int k=0; k<12; ++k) sv[i*12+k] = tetVerts[src*12+k]; }
+                tetVerts.swap(sv);
+            }
+            {
+                std::vector<float> sd(nT*4);
+                for (size_t i=0; i<nT; ++i)
+                { size_t const src = order[i].second; for (int k=0; k<4; ++k) sd[i*4+k] = tetDens[src*4+k]; }
+                tetDens.swap(sd);
+            }
+            if ( needVel )
+            {
+                std::vector<float> su(nT*12);
+                for (size_t i=0; i<nT; ++i)
+                { size_t const src = order[i].second; for (int k=0; k<12; ++k) su[i*12+k] = tetVels[src*12+k]; }
+                tetVels.swap(su);
+            }
+            {
+                std::vector<float> so(nT);
+                for (size_t i=0; i<nT; ++i) so[i] = tetVols[order[i].second];
+                tetVols.swap(so);
+            }
+            {
+                std::vector<uint32_t> sc(nT);
+                for (size_t i=0; i<nT; ++i) sc[i] = tetCnts[order[i].second];
+                tetCnts.swap(sc);
+            }
+            {
+                std::vector<uint32_t> sf(nT);
+                for (size_t i=0; i<nT; ++i) sf[i] = tetFlats[order[i].second];
+                tetFlats.swap(sf);
+            }
+        }
+
+        std::vector<float> sobolTable( quasiRandomNumbers_buf.begin(), quasiRandomNumbers_buf.end() );
+        double dxv[3] = { double(dx[0]), double(dx[1]), double(dx[2]) };
+        size_t const nTetsDeposited = tetCnts.size();   // the deposit call consumes (frees) the arrays
+        DTFEGpuGrids gpuOut;
+        std::string metalErr;
+        message << gpuBackendName() << " GPU (" << gpuDeviceName() << ", " << nTetsDeposited << " tetrahedra) ... " << MESSAGE::Flush;
+        if ( dtfeGpuDepositAveraged1( tetVerts, tetDens, tetVels, tetVols, tetCnts, tetFlats,
+                                        sobolTable, dxv, nGrid, fDen, fVel, fGrad, gpuOut, metalErr ) )
+        {
+            for (size_t i=0; i<gridSize; ++i)
+            {
+                if (fDen) (*density)[i] = Real(gpuOut.density[i]);
+#ifdef VELOCITY
+                if (fVel)
+                    for (size_t j=0; j<noVelComp; ++j)
+                        (*velocity)[i][j] = Real(gpuOut.velocity[i*3+j]);
+                if (fGrad)
+                    for (size_t q=0; q<noGradComp; ++q)
+                        (*velocity_gradient)[i][q] = Real(gpuOut.grad[i*9+q]);
+#endif
+            }
+            metalDeposited = true;
+        }
+        else
+        {
+            MESSAGE::Warning warning( userOptions.verboseLevel );
+            warning << "DTFE Metal deposit unavailable (" << metalErr << "); using the CPU interpolation.\n" << MESSAGE::EndWarning;
+        }
+    }
+#else
+    if ( userOptions.useMetal )
+    {
+        static bool warned = false;
+        if ( !warned )
+        {
+            warned = true;
+            MESSAGE::Warning warning( userOptions.verboseLevel );
+            warning << "--gpu/--metal requested but this binary was built without GPU support (rebuild with METAL=1, CUDA=1 or HIP=1; or NO_DIM!=3 / MY_SCALAR); using the CPU interpolation.\n" << MESSAGE::EndWarning;
+        }
+    }
+#endif // DTFE_GPU_ACTIVE
+
+
+    if ( not metalDeposited )
+    {
     size_t prev = 0, amount100 = 0, count = 0;
 #if NO_DIM==2
     size_t noTotalCells = dt.number_of_faces();
@@ -373,9 +585,10 @@ void interpolateGrid_averaged_1(DT &dt,
 #endif
         }
     }
-    
-    
-    
+    }   // end of the CPU interpolation (skipped when the Metal deposit succeeded)
+
+
+
     // divide by grid-cell volume to turn accumulated contributions into volume averages
     if (field.density)
         for (vector<Real>::iterator it=density->begin(); it!=density->end(); ++it)

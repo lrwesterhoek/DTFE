@@ -67,7 +67,7 @@ void DTFE_interpolation(vector<Particle_data> *p,
     t.start();
     delaunayTriangulation( &dt, p, userOptions.verboseLevel );
     printComputationTime( &t, &userOptions, "triangulation" );
-    p->clear();  // data lives in the triangulation now; free the input array
+    vector<Particle_data>().swap(*p);  // data lives in the triangulation now; swap-with-empty actually frees the input array (clear() keeps capacity)
 
     // Skip the padding test under PS-DTFE: dummy points use Eulerian coords, which corrupt the Lagrangian triangulation.
 #if defined(TEST_PADDING) && !defined(PHASE_SPACE)

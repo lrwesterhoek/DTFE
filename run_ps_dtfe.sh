@@ -1,23 +1,52 @@
 #!/usr/bin/env bash
 # Phase-Space DTFE counterpart of run_dtfe.sh: tessellates in Lagrangian space, so each
 # particle needs Eulerian Coordinates plus a Lagrangian position. HDF5-only (input 105).
+# Shared defaults (DATA_ROOT, SIMULATION, SNAPSHOTS, GRID_SIZE, PADDING) live in config.sh.
+#
+# Usage:
+#   ./run_ps_dtfe.sh [-d DATA_DIR] [-s SIMULATION] [-g GRID_SIZE] [-n AVG_SUBSAMPLES] [-m] [snapshot ...]
+#     -m   run the deposit on the Apple GPU (same as PS_METAL=1; needs 'make PS-DTFE METAL=1')
 
-SNAPSHOTS=(99)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/config.sh"
 
-GRID_SIZE=512
-PADDING=25
-PARTITION="2 2 2"          # Lagrangian-partition grid; coarser = fewer seams but larger per-partition triangulation
-MAX_CONCURRENT=2           # cap on concurrent partitions (0 = all cores); peak RAM ~ fixed + cap x per-triangulation, verify via "Peak memory (RSS)" line.
-                           # 2 pipelines CPU and GPU under --ps-metal: one partition triangulates on CPU while the other runs its
-                           # GPU deposit (the Metal host serializes GPU access internally). Drop to 1 if RSS approaches ~56 GB.
-AVG_SUBSAMPLES=3   # nSub^3 sub-points for the '_a' fields; dominant runtime cost (~nSub^3), 1 = no averaging. Override per run: AVG_SUBSAMPLES=1 ./run_ps_dtfe.sh
+PARTITION="${PARTITION:-}"        # Lagrangian-partition grid. EMPTY (default) = the binary AUTO-TUNES the split
+                           # from the particle count, grid, fields and available RAM/cores (see the AUTO-TUNE
+                           # line it prints). Set to override, e.g. PARTITION="5 5 5"; manual reference points:
+                           # 5 5 5 fits TNG300-3-Dark (2.4e8 particles) at MAX_CONCURRENT=2 in ~40 GB,
+                           # 2 2 2 suits small sims like TNG50-4 (fewer partition overheads = faster).
+MAX_CONCURRENT="${MAX_CONCURRENT:-}"  # cap on concurrent partitions. EMPTY (default) = auto-tuned together with the
+                           # partition split; set to override (0 = all cores). Peak RAM ~ fixed + cap x
+                           # per-triangulation, verify via the "Peak memory (RSS)" line after each run.
+AVG_SUBSAMPLES="${AVG_SUBSAMPLES:-3}"   # nSub^3 sub-points for the '_a' fields; dominant runtime cost (~nSub^3), 1 = no averaging. Override: -n 1 or AVG_SUBSAMPLES=1
 MPC_UNIT=1000              # length of 1 Mpc in the input's units (1000 for ckpc/h)
-THREADS=""                 # cap OpenMP threads globally; empty = all cores
+THREADS="${THREADS:-}"     # cap OpenMP threads globally; empty = all cores
 PS_METAL="${PS_METAL:-0}"  # 1 = run the deposit on the Apple GPU (--ps-metal; needs 'make PS-DTFE METAL=1')
 
-DATA_DIR="/Users/luukw/output/TNG50-4-Dark"
-INPUT_SUBDIR="snapdir"
+DATA_DIR=""                # default: $DATA_ROOT/$SIMULATION (config.sh); override with -d
 OUTPUT_PREFIX="ps_output"   # -> <snapdir>/ps_output_nsubN.* so different nSub runs sit side by side instead of clobbering
+
+usage() { echo "Usage: $0 [-d DATA_DIR] [-s SIMULATION] [-g GRID_SIZE] [-n AVG_SUBSAMPLES] [-m] [snapshot ...]"; }
+
+while getopts "d:s:g:n:mh" opt; do
+    case "$opt" in
+        d) DATA_DIR="$OPTARG" ;;
+        s) SIMULATION="$OPTARG" ;;
+        g) GRID_SIZE="$OPTARG" ;;
+        n) AVG_SUBSAMPLES="$OPTARG" ;;
+        m) PS_METAL=1 ;;
+        h) usage; exit 0 ;;
+        *) usage; exit 1 ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+# Any remaining positional arguments override the default snapshot list.
+if [ "$#" -gt 0 ]; then
+    SNAPSHOTS=("$@")
+fi
+
+[ -z "${DATA_DIR}" ] && DATA_DIR="${DATA_ROOT}/${SIMULATION}"
 
 # Lagrangian positions, matched to present-day Coordinates by ParticleID. Must be in the
 # SAME units as the snapshots (combined_*.hdf5 are h-removed ckpc, so the IC was rescaled
@@ -33,11 +62,13 @@ LAGRANGIAN_INPUT="${DATA_DIR}/combined_ics.hdf5"
 # divergence/shear/vorticity are rigorous only where streams==1; for multi-stream kinematics
 # use 'dispersion_a' + the stream count. vweb classifies the cosmic web from the velocity
 # gradient (density-weighted across streams), so it inherits the same single-stream caveat.
-# NOTE: 'tweb_a' was removed from the C++ (it duplicated the V-web); the true tidal-tensor T-web
-# is computed afterwards from the density grid: python3 python/compute_tweb.py
-FIELDS="density_a velocity_a dispersion_a vweb_a"
+# tweb = T-web from the TIDAL tensor (FFT Poisson solve of the RAW density grid, in C++); vweb =
+# V-web from the multi-stream velocity shear. LAMBDA_TH is the eigenvalue threshold for BOTH webs
+# (dimensionless; literature ~0.2-0.4 -- NOTE: runs before 2026-07-03 used the old default 0.0).
+# The binary applies NO smoothing anywhere; smoothing is a plot-time choice in plot_PS_DTFE.py.
+LAMBDA_TH="${LAMBDA_TH:-0.3}"
+FIELDS="density_a velocity_a dispersion_a"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR" || exit 1
 
 if [ ! -x "./PS-DTFE" ]; then
@@ -53,7 +84,7 @@ fi
 
 echo "Starting PS-DTFE processing..."
 echo "Data directory: ${DATA_DIR}"
-echo "Grid size: ${GRID_SIZE}   Partition: [${PARTITION}]   Fields: ${FIELDS}"
+echo "Grid size: ${GRID_SIZE}   Partition: [${PARTITION:-auto}]   Fields: ${FIELDS}"
 echo ""
 
 for i in "${SNAPSHOTS[@]}"; do
@@ -87,28 +118,40 @@ for i in "${SNAPSHOTS[@]}"; do
     fi
 
     # /usr/bin/time -l captures peak memory (verifies MAX_CONCURRENT fits RAM) and wall time.
+    # The tee pipe hides the terminal from the binary's isatty() check, so force colours through
+    # it (CLICOLOR_FORCE, honoured by message.h) -- but only when this script itself runs on a
+    # terminal, keeping cron/CI output clean. The runlog is de-ANSI'd after the run.
+    [ -t 1 ] && export CLICOLOR_FORCE=1
     echo "  Running PS-DTFE on ${input_file}..."
     run_log="${input_dir}/${OUTPUT_PREFIX}.runlog"
     SECONDS=0
+    # pass --partition/--max-concurrent only when set; otherwise the binary auto-tunes them
+    part_args=()
+    [ -n "${PARTITION}" ] && part_args+=(--partition ${PARTITION})
+    [ -n "${MAX_CONCURRENT}" ] && part_args+=(--max-concurrent "${MAX_CONCURRENT}")
+
     /usr/bin/time -l ./PS-DTFE "${input_file}" "${output_root}" \
         --grid ${GRID_SIZE} \
         --padding ${PADDING} \
         --periodic \
-        --partition ${PARTITION} \
-        --max-concurrent ${MAX_CONCURRENT} \
+        ${part_args[@]+"${part_args[@]}"} \
         --avg-subsamples ${AVG_SUBSAMPLES} \
         --input 105 \
         --MpcUnit ${MPC_UNIT} \
         --field ${FIELDS} \
+        --lambda_th ${LAMBDA_TH} \
         "${metal_args[@]}" \
         "${lag_args[@]}" 2>&1 | tee "${run_log}"
     rc=${PIPESTATUS[0]}
+
+    # strip ANSI colour codes from the saved log so it stays grep-able
+    sed -E -i '' $'s/\033\\[[0-9;]*m//g' "${run_log}"
 
     # macOS /usr/bin/time -l prints "<bytes>  maximum resident set size".
     peak_bytes=$(awk '/maximum resident set size/{print $1; exit}' "${run_log}")
     if [ -n "${peak_bytes}" ]; then
         peak_gb=$(awk -v b="${peak_bytes}" 'BEGIN{printf "%.1f", b/1073741824}')
-        echo "  Peak memory (RSS): ${peak_gb} GB   (target < ~56 GB on 64 GB; if higher, lower MAX_CONCURRENT)"
+        echo "  Peak memory (RSS): ${peak_gb} GB   (target < ~56 GB on 64 GB; if higher, set MAX_CONCURRENT=1 to override the auto choice)"
     fi
     echo "  Wall time: $((SECONDS/60)) min $((SECONDS%60)) s"
 

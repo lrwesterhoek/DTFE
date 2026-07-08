@@ -11,8 +11,8 @@
 
 #include "triangulation_common.h"
 
-#if defined(PS_METAL) && NO_DIM==3
-#include "ps_metal_host.h"   // GPU deposit (METAL=1 builds); CPU deposit remains the fallback
+#if defined(PS_GPU) && NO_DIM==3
+#include "gpu_host.h"   // GPU deposit (METAL=1/CUDA=1/HIP=1 builds); CPU deposit remains the fallback
 #endif
 
 
@@ -64,8 +64,13 @@ void interpolateGrid_phaseSpace(DT &dt,
     // so the box covers every written cell); an axis reaching both ends stays full. off -> full grid.
     size_t subOrigin[NO_DIM], subDims[NO_DIM];
     for (int d = 0; d < NO_DIM; ++d) { subOrigin[d] = 0; subDims[d] = nGrid[d]; }
+    // cells surviving the dummy/ownership/degeneracy filters, counted by the subgrid pass below;
+    // used to right-size the Metal tet arrays (reserving for ALL cells over-allocates ~4x, since
+    // most padded-partition cells are filtered out). Upper bound when the pass does not run.
+    size_t psKeptCells = cellHandles.size();
     if ( userOptions.psUseSubgrid )
     {
+        psKeptCells = 0;
         std::vector<char> touched[NO_DIM];
         for (int d = 0; d < NO_DIM; ++d) touched[d].assign(nGrid[d], char(0));
         for (size_t ci = 0; ci < cellHandles.size(); ++ci)
@@ -93,6 +98,7 @@ void interpolateGrid_phaseSpace(DT &dt,
             double Ax2[NO_DIM][NO_DIM];
             for (int v=0;v<NO_DIM;++v) for (int i=0;i<NO_DIM;++i) Ax2[v][i]=double(ep[v+1][i])-double(ep[0][i]);
             { double avgEdge2=0.; for(int v=0;v<NO_DIM;++v){double l2=0.;for(int i=0;i<NO_DIM;++i)l2+=Ax2[v][i]*Ax2[v][i];avgEdge2+=l2;} avgEdge2/=NO_DIM; double edgeScale=avgEdge2*std::sqrt(avgEdge2); if (std::fabs(determinant(Ax2)) < 1.e-6*edgeScale) continue; }
+            ++psKeptCells;
             Real eLo[NO_DIM],eHi[NO_DIM];
             for (int d=0;d<NO_DIM;++d){eLo[d]=ep[0][d];eHi[d]=ep[0][d];}
             for (int v=1;v<=NO_DIM;++v) for (int d=0;d<NO_DIM;++d){ if(ep[v][d]<eLo[d])eLo[d]=ep[v][d]; if(ep[v][d]>eHi[d])eHi[d]=ep[v][d]; }
@@ -160,14 +166,15 @@ void interpolateGrid_phaseSpace(DT &dt,
     std::vector<Real>   insideRel;   // insideFlat.size() * NO_DIM, row-major per sample
 
     if ( not userOptions.psSuppressGridStats )
-        message << "\nPS-DTFE: Interpolating fields to grid by iterating over all Delaunay cells ...\n" << MESSAGE::Flush;
+        message << "\n" << MESSAGE::cBold() << "PS-DTFE:" << MESSAGE::cReset()
+                << " Interpolating fields to grid by iterating over all Delaunay cells ...\n" << MESSAGE::Flush;
 
-    // GPU deposit (--ps-metal, METAL=1 builds): extract flat per-tet arrays with EXACTLY the CPU
+    // GPU deposit (--ps-metal / --ps-gpu, GPU builds): extract flat per-tet arrays with EXACTLY the CPU
     // loop's filters, dispatch metal/ps_deposit.metal::depositFields (validated to mirror the CPU
     // scatter incl. the partition sub-grid), and copy the moment grids back. Any failure (no
     // device, kernel compile, buffer alloc) falls back to the CPU loop below with a warning.
     bool metalDeposited = false;
-#if defined(PS_METAL) && NO_DIM==3
+#if defined(PS_GPU) && NO_DIM==3
     bool tryMetal = userOptions.psUseMetal;
 #ifdef SCALAR
     if ( tryMetal && (field.scalar || field.scalar_gradient) )
@@ -179,10 +186,12 @@ void interpolateGrid_phaseSpace(DT &dt,
 #endif
     if ( tryMetal )
     {
+        // reserve for the cells that survive the filters (counted by the subgrid pass), not all
+        // finite cells -- the padded-partition majority is filtered out (~4x over-allocation)
         std::vector<float> tetVerts, tetVels, tetMasses;
-        tetVerts.reserve( cellHandles.size()*12 );
-        tetVels.reserve( cellHandles.size()*12 );
-        tetMasses.reserve( cellHandles.size() );
+        tetVerts.reserve( psKeptCells*12 );
+        tetVels.reserve( psKeptCells*12 );
+        tetMasses.reserve( psKeptCells );
         for (size_t ci = 0; ci < cellHandles.size(); ++ci)
         {
             Cell_handle cell = cellHandles[ci];
@@ -248,29 +257,40 @@ void interpolateGrid_phaseSpace(DT &dt,
                 order[t] = std::make_pair(cells, uint32_t(t));
             }
             std::sort(order.begin(), order.end());
-            std::vector<float> sv(nT*12), su(nT*12), sm(nT);
-            for (size_t i = 0; i < nT; ++i)
+            // gather one array at a time so only a single extra copy is alive at once
             {
-                size_t const src = order[i].second;
-                for (int k = 0; k < 12; ++k) { sv[i*12+k] = tetVerts[src*12+k]; su[i*12+k] = tetVels[src*12+k]; }
-                sm[i] = tetMasses[src];
+                std::vector<float> sv(nT*12);
+                for (size_t i = 0; i < nT; ++i)
+                { size_t const src = order[i].second; for (int k = 0; k < 12; ++k) sv[i*12+k] = tetVerts[src*12+k]; }
+                tetVerts.swap(sv);
             }
-            tetVerts.swap(sv);
-            tetVels.swap(su);
-            tetMasses.swap(sm);
+            {
+                std::vector<float> su(nT*12);
+                for (size_t i = 0; i < nT; ++i)
+                { size_t const src = order[i].second; for (int k = 0; k < 12; ++k) su[i*12+k] = tetVels[src*12+k]; }
+                tetVels.swap(su);
+            }
+            {
+                std::vector<float> sm(nT);
+                for (size_t i = 0; i < nT; ++i)
+                    sm[i] = tetMasses[order[i].second];
+                tetMasses.swap(sm);
+            }
         }
 
         double bl[3]  = { double(boxCoordinates[0]), double(boxCoordinates[2]), double(boxCoordinates[4]) };
         double dxv[3] = { double(dx[0]), double(dx[1]), double(dx[2]) };
-        PSMetalGrids gpuOut;
+        size_t const nTetsDeposited = tetMasses.size();   // psGpuDepositFields consumes (frees) the arrays
+        PSGpuGrids gpuOut;
         std::string metalErr;
-        if ( psMetalDepositFields(tetVerts, tetVels, tetMasses, bl, dxv,
+        if ( psGpuDepositFields(tetVerts, tetVels, tetMasses, bl, dxv,
                                   nGrid, subOrigin, subDims, nSub,
                                   userOptions.periodic, gpuOut, metalErr) )
         {
             if ( not userOptions.psSuppressGridStats )
-                message << "PS-DTFE: Metal GPU deposit (" << psMetalDeviceName() << "), "
-                        << tetMasses.size() << " tetrahedra.\n" << MESSAGE::Flush;
+                message << MESSAGE::cBold() << "PS-DTFE:" << MESSAGE::cReset() << " " << gpuBackendName() << " GPU deposit ("
+                        << MESSAGE::cMagenta() << gpuDeviceName() << MESSAGE::cReset() << "), "
+                        << MESSAGE::cMagenta() << nTetsDeposited << MESSAGE::cReset() << " tetrahedra.\n" << MESSAGE::Flush;
             for (size_t i = 0; i < totalGrid; ++i)
             {
                 if (field.density) quantities->density[i] = Real(gpuOut.mass[i]);
@@ -291,7 +311,7 @@ void interpolateGrid_phaseSpace(DT &dt,
         else
         {
             MESSAGE::Warning warning( userOptions.verboseLevel );
-            warning << "PS-DTFE Metal deposit unavailable (" << metalErr << "); using the CPU deposit.\n" << MESSAGE::EndWarning;
+            warning << "PS-DTFE GPU deposit unavailable (" << metalErr << "); using the CPU deposit.\n" << MESSAGE::EndWarning;
         }
     }
 #else
@@ -302,10 +322,10 @@ void interpolateGrid_phaseSpace(DT &dt,
         {
             warned = true;
             MESSAGE::Warning warning( userOptions.verboseLevel );
-            warning << "--ps-metal requested but this binary was built without METAL=1 (or NO_DIM!=3); using the CPU deposit.\n" << MESSAGE::EndWarning;
+            warning << "--ps-gpu/--ps-metal requested but this binary was built without GPU support (rebuild with METAL=1, CUDA=1 or HIP=1; or NO_DIM!=3); using the CPU deposit.\n" << MESSAGE::EndWarning;
         }
     }
-#endif // PS_METAL
+#endif // PS_GPU
 
     // per-cell scatter is serial; parallelism is one level up over Lagrangian partitions
     // (DTFE.cpp). A per-cell OpenMP scatter was memory-bandwidth bound and gave no speedup.
@@ -688,9 +708,10 @@ void interpolateGrid_phaseSpace(DT &dt,
 
     if ( not userOptions.psSuppressGridStats )
     {
-        message << "Done.\n" << MESSAGE::Flush;
+        message << MESSAGE::cGreen() << "Done.\n" << MESSAGE::cReset() << MESSAGE::Flush;
         if ( nDegenerateInverse > 0 )
-            message << "PS-DTFE: dropped " << nDegenerateInverse
+            message << MESSAGE::cBold() << "PS-DTFE:" << MESSAGE::cReset() << " dropped "
+                    << MESSAGE::cMagenta() << nDegenerateInverse << MESSAGE::cReset()
                     << " degenerate (non-invertible) Eulerian cells.\n" << MESSAGE::Flush;
     }
 
@@ -752,11 +773,13 @@ void interpolateGrid_phaseSpace(DT &dt,
             if (streamCount[i] > (int)nSamplesPerCell) multiStreamCells++;  // cell average > 1
             if (streamCount[i] > 0) coveredCells++;
         }
-        message << "PS-DTFE: Max streams at a grid point: " << maxStreams
-                << ", grid points with multi-stream: " << multiStreamCells
-                << " (" << (100.*multiStreamCells/totalGrid) << "\%)\n" << MESSAGE::Flush;
-        message << "PS-DTFE: grid coverage: " << coveredCells << "/" << totalGrid
-                << " (" << (100.*coveredCells/totalGrid) << "\%)"
+        message << MESSAGE::cBold() << "PS-DTFE:" << MESSAGE::cReset() << " Max streams at a grid point: "
+                << MESSAGE::cMagenta() << maxStreams << MESSAGE::cReset()
+                << ", grid points with multi-stream: " << MESSAGE::cMagenta() << multiStreamCells
+                << " (" << (100.*multiStreamCells/totalGrid) << "\%)" << MESSAGE::cReset() << "\n" << MESSAGE::Flush;
+        message << MESSAGE::cBold() << "PS-DTFE:" << MESSAGE::cReset() << " grid coverage: "
+                << MESSAGE::cMagenta() << coveredCells << "/" << totalGrid
+                << " (" << (100.*coveredCells/totalGrid) << "\%)" << MESSAGE::cReset()
                 << ( coveredCells < totalGrid ?
                      "  -- uncovered cells suggest insufficient padding or a grid finer than the tessellation" : "" )
                 << "\n" << MESSAGE::Flush;

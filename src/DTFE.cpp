@@ -29,6 +29,7 @@
     #include <omp.h>
 #endif
 #include <boost/math/special_functions/fpclassify.hpp>
+#include <fftw3.h>   // T-web tidal tensor (FFT Poisson solve of the density grid)
 
 
 #include "define.h"
@@ -38,6 +39,7 @@
 #include "subpartition.h"
 #include "miscellaneous.h"
 #include "message.h"
+#include "auto_tune.h"
 
 
 using namespace std;
@@ -59,12 +61,17 @@ void computeDivergenceShearVorticity(Field &fields,
                                      int const verboseLevel,
                                      Quantities *quantities);
 
-// Derives T-web and/or V-web cosmic-web classification from the velocity gradient.
+// Derives the V-web cosmic-web classification from the velocity gradient.
 void computeWebClassification(Field &fields,
                                int const verboseLevel,
                                Real lambda_th,
                                Real hubbleParam,
                                Quantities *q);
+
+// Derives the T-web classification from the tidal tensor of the DENSITY grid (FFT Poisson).
+void computeTidalWebClassification(Field &fields,
+                                   User_options const &userOptions,
+                                   Quantities *q);
 
 // Builds the velocity-space DTFE density g_i used by the approximate phase-space density (--approxPSD).
 #if defined(VELOCITY) && defined(SCALAR) && !defined(PHASE_SPACE)
@@ -106,6 +113,17 @@ DTFE_State DTFE_setup(vector<Particle_data> *allParticles,
     if ( userOptions.averageDensity<0. )
         userOptions.averageDensity = averageDensity( *particlePointer, userOptions );
 
+    // auto-select --partition / --max-concurrent from the data and machine when not user-given
+    {
+        bool gpuActive = false;
+#if defined(PS_GPU)
+        gpuActive = userOptions.psUseMetal;
+#elif defined(DTFE_GPU)
+        gpuActive = userOptions.useMetal;
+#endif
+        autoTunePartitioning( userOptions, particlePointer->size(), not samples.empty(), gpuActive );
+    }
+
     // velocity derivatives are computed from the gradient afterwards, so request the gradient now
     // and defer the derived quantities to the post-processing step
     state.options = userOptions;
@@ -119,6 +137,13 @@ DTFE_State DTFE_setup(vector<Particle_data> *allParticles,
         state.options.aField.velocity_gradient = true;
         state.options.aField.deselectVelocityDerivatives();
     }
+
+    // the T-web is computed from the density grid (tidal tensor): make sure density is interpolated.
+    // Drop the tweb flag itself from the internal copy -- the interpolation never fills the T-web
+    // grids, so keeping it only makes reserveMemory pre-allocate them (16 B/cell) during the
+    // partition loop; computeTidalWebClassification() re-creates them from the summed density.
+    if ( userOptions.uField.velocity_tweb ) { state.options.uField.density = true; state.options.uField.velocity_tweb = false; }
+    if ( userOptions.aField.velocity_tweb ) { state.options.aField.density = true; state.options.aField.velocity_tweb = false; }
 
     // restrict the data to the user-defined region (plus padding) and treat it as a standalone non-periodic box
     if ( userOptions.regionOn )
@@ -248,8 +273,9 @@ void DTFE(vector<Particle_data> *allParticles,
             {
                 state.options.averageDensity = Real( totalMass / vLag );
                 MESSAGE::Message msg( userOptions.verboseLevel );
-                msg << "PS-DTFE (non-periodic): density normalized to the Lagrangian cloud density "
-                       "N*m/V_lagBox = " << state.options.averageDensity << ".\n" << MESSAGE::Flush;
+                msg << MESSAGE::cBold() << "PS-DTFE (non-periodic):" << MESSAGE::cReset()
+                    << " density normalized to the Lagrangian cloud density N*m/V_lagBox = "
+                    << MESSAGE::cMagenta() << state.options.averageDensity << MESSAGE::cReset() << ".\n" << MESSAGE::Flush;
             }
         }
     }
@@ -313,7 +339,8 @@ void DTFE(vector<Particle_data> *allParticles,
                 state.particles[i].pos[d] = state.particles[i].lagPos[d] + s;
             }
 
-        msg << "PS-DTFE: Unwrapped Eulerian positions (displacements within [-L/2, L/2]).\n" << MESSAGE::Flush;
+        msg << MESSAGE::cBold() << "PS-DTFE:" << MESSAGE::cReset()
+            << " Unwrapped Eulerian positions (displacements within [-L/2, L/2]).\n" << MESSAGE::Flush;
 
         hasLagrangianPeriodicCopies = true;
 
@@ -374,14 +401,19 @@ void DTFE(vector<Particle_data> *allParticles,
                 }
             }
 
-            msg << "PS-DTFE: Lagrangian bounding box = " << lagBoxGlobal.print() << "\n"
-                << "PS-DTFE: Added " << (state.particles.size() - noOriginal)
-                << " Lagrangian periodic copies (" << noOriginal << " original particles).\n" << MESSAGE::Flush;
+            msg << MESSAGE::cBold() << "PS-DTFE:" << MESSAGE::cReset() << " Lagrangian bounding box = "
+                << MESSAGE::cMagenta() << lagBoxGlobal.print() << MESSAGE::cReset() << "\n"
+                << MESSAGE::cBold() << "PS-DTFE:" << MESSAGE::cReset() << " Added "
+                << MESSAGE::cMagenta() << (state.particles.size() - noOriginal) << MESSAGE::cReset()
+                << " Lagrangian periodic copies (" << MESSAGE::cMagenta() << noOriginal << MESSAGE::cReset()
+                << " original particles).\n" << MESSAGE::Flush;
         }
         else
         {
-            msg << "PS-DTFE: Lagrangian bounding box = " << lagBoxGlobal.print() << "\n"
-                << "PS-DTFE: periodic copies are generated per-partition (deferred) to keep peak memory low.\n" << MESSAGE::Flush;
+            msg << MESSAGE::cBold() << "PS-DTFE:" << MESSAGE::cReset() << " Lagrangian bounding box = "
+                << MESSAGE::cMagenta() << lagBoxGlobal.print() << MESSAGE::cReset() << "\n"
+                << MESSAGE::cBold() << "PS-DTFE:" << MESSAGE::cReset()
+                << " periodic copies are generated per-partition (deferred) to keep peak memory low.\n" << MESSAGE::Flush;
         }
 
         // primary periodic box: centroid ownership check keeps one image of each cell and
@@ -399,8 +431,10 @@ void DTFE(vector<Particle_data> *allParticles,
         for (int d=0; d<NO_DIM; ++d)
             totalPartitions *= state.options.partition[d];
         MESSAGE::Message message( userOptions.verboseLevel );
-        message << "\nPS-DTFE: Lagrangian-space partitioning with " << totalPartitions
-                << " partitions [" << MESSAGE::printElements( userOptions.partition, "," ) << "].\n" << MESSAGE::Flush;
+        message << "\n" << MESSAGE::cBold() << "PS-DTFE:" << MESSAGE::cReset()
+                << " Lagrangian-space partitioning with " << MESSAGE::cMagenta() << totalPartitions
+                << " partitions [" << MESSAGE::printElements( userOptions.partition, "," ) << "]"
+                << MESSAGE::cReset() << ".\n" << MESSAGE::Flush;
 
         // reuse the Lagrangian bounding box computed before periodic copies, else recompute it here
         Box lagBox;
@@ -429,7 +463,8 @@ void DTFE(vector<Particle_data> *allParticles,
                 lagBox[2*d+1] += eps;
             }
         }
-        message << "PS-DTFE: Lagrangian bounding box = " << lagBox.print() << "\n" << MESSAGE::Flush;
+        message << MESSAGE::cBold() << "PS-DTFE:" << MESSAGE::cReset() << " Lagrangian bounding box = "
+                << MESSAGE::cMagenta() << lagBox.print() << MESSAGE::cReset() << "\n" << MESSAGE::Flush;
 
         Real lagLen[NO_DIM];
         for (int d=0; d<NO_DIM; ++d)
@@ -485,7 +520,8 @@ void DTFE(vector<Particle_data> *allParticles,
         if ( userOptions.maxConcurrent > 0 and userOptions.maxConcurrent < psConcurrency )
             psConcurrency = userOptions.maxConcurrent;
         if ( psConcurrency < 1 ) psConcurrency = 1;
-        message << "PS-DTFE: building up to " << psConcurrency << " partition triangulation(s) concurrently"
+        message << MESSAGE::cBold() << "PS-DTFE:" << MESSAGE::cReset() << " building up to "
+                << MESSAGE::cMagenta() << psConcurrency << MESSAGE::cReset() << " partition triangulation(s) concurrently"
                 << ( userOptions.maxConcurrent > 0 ? " (--max-concurrent)" : "" ) << ".\n" << MESSAGE::Flush;
 
         // progress + ETA; updated only in the critical section below so it is race-free
@@ -514,6 +550,15 @@ void DTFE(vector<Particle_data> *allParticles,
             {
                 lagRegion[2*d]   = lagBox[2*d] + lagLen[d] * idx[d] / partGrid[d];
                 lagRegion[2*d+1] = lagBox[2*d] + lagLen[d] * (idx[d]+1) / partGrid[d];
+                // periodic: the partition regions must tile one full PERIOD, not just the
+                // particle bounding box. Image tets can have Lagrangian centroids in the gap
+                // between lagBox and the periodic box (half a lattice spacing for cell-centred
+                // ICs); with the tiling anchored to lagBox they are owned by NO partition and
+                // their mass is silently dropped (uncovered Eulerian slabs at the box edges).
+                // Anchoring the first partition's lower edge one period below the last
+                // partition's upper edge keeps the tiling exclusive AND exhaustive mod L.
+                if (hasLagrangianPeriodicCopies && idx[d] == 0)
+                    lagRegion[2*d] = lagBox[2*d+1] - eulerLenArr[d];
             }
 
             Box lagPadded = lagRegion;
@@ -574,6 +619,10 @@ void DTFE(vector<Particle_data> *allParticles,
                      << MESSAGE::cReset() << "\n" << MESSAGE::Flush;
             }
         }
+
+        // every partition copied its own particles (tempPart); the global array is not needed by
+        // the normalization, post-processing or write phases -- free its ~48 B/particle now
+        std::vector<Particle_data>().swap( state.particles );
 
         // fields were summed as density-weighted moments; normalize once now so cells drawing
         // streams from several partitions (multi-stream regions) come out correct
@@ -663,6 +712,9 @@ void DTFE(vector<Particle_data> *allParticles,
                     << ( done<totalPartitions ? ", ETA ~" + MESSAGE::formatDuration(eta) : ", done" )
                     << MESSAGE::cReset() << "\n" << MESSAGE::Flush;
         }
+
+        // each partition copied its own particles; the global array is dead weight from here on
+        std::vector<Particle_data>().swap( state.particles );
     }
     else
     {
@@ -676,6 +728,8 @@ void DTFE(vector<Particle_data> *allParticles,
     computeDivergenceShearVorticity( userOptions.aField, userOptions.verboseLevel, aQuantities );
     computeWebClassification( userOptions.uField, userOptions.verboseLevel, userOptions.lambda_th, userOptions.hubbleParam, uQuantities );
     computeWebClassification( userOptions.aField, userOptions.verboseLevel, userOptions.lambda_th, userOptions.hubbleParam, aQuantities );
+    computeTidalWebClassification( userOptions.uField, userOptions, uQuantities );
+    computeTidalWebClassification( userOptions.aField, userOptions, aQuantities );
 }
 
 
@@ -929,29 +983,14 @@ int classifyWeb(Pvector<Real,NO_DIM> const &eigenvalues, Real lambda_th)
 // V-web classification from the velocity shear tensor Sigma_ij = -(1/(2 H0))(dv_i/dx_j + dv_j/dx_i)
 // (Hoffman et al. 2012). NOTE: this function previously also emitted a "T-web" computed from the
 // SAME symmetrized velocity gradient -- algebraically identical to the V-web (the outputs were
-// byte-identical), i.e. not a T-web at all. The physical T-web classifies the TIDAL tensor of the
-// gravitational potential (Poisson-solved from the density grid) and is pure grid post-processing:
-// it now lives in python/compute_tweb.py. Requesting 'tweb' here warns and is ignored.
+// byte-identical), i.e. not a T-web at all. The physical T-web (tidal tensor of the potential,
+// Poisson-solved from the density grid) is computed by computeTidalWebClassification below.
 void computeWebClassification(Field &fields,
                                int const verboseLevel,
                                Real lambda_th,
                                Real hubbleParam,
                                Quantities *q)
 {
-    if ( fields.velocity_tweb )
-    {
-        static bool warned = false;
-        if ( !warned )
-        {
-            warned = true;
-            MESSAGE::Warning warning( verboseLevel );
-            warning << "The 'tweb' field was removed: the velocity-gradient \"T-web\" duplicated the "
-                       "V-web exactly. Compute the true tidal-tensor T-web from the density grid with "
-                       "python/compute_tweb.py; the V-web ('vweb'/'vweb_a') remains available here.\n"
-                    << MESSAGE::EndWarning;
-        }
-        fields.velocity_tweb = false;   // skip downstream allocation checks and file output
-    }
     if ( q->velocity_gradient.empty() ) return;
     if ( not fields.velocity_vweb ) return;
 
@@ -987,9 +1026,158 @@ void computeWebClassification(Field &fields,
         }
     }
 
-    // free the gradient once the web classification no longer needs it
+    // free the gradient once the web classification no longer needs it; swap-with-empty because
+    // clear() keeps the capacity resident (36 B/cell -- ~4.8 GB at 512^3)
     if ( not fields.velocity_gradient )
-        q->velocity_gradient.clear();
+        std::vector< Pvector<Real,noGradComp> >().swap( q->velocity_gradient );
+}
+
+
+// T-web classification from the TIDAL tensor of the gravitational potential (Hahn et al. 2007;
+// Forero-Romero et al. 2009), Poisson-solved from the density grid by FFT. Dimensionless
+// convention: T_ij = F^-1[ (k_i k_j / k^2) delta_hat ] so that tr T = delta exactly and
+// lambda_th is dimensionless (literature thresholds ~0.2-0.4 apply directly; the same
+// convention was validated against an independent Python implementation, trace identity ~1e-6).
+// Computed from the RAW density grid -- NO smoothing here by design (the binary outputs raw
+// fields only; smoothing is a plot-time choice in python/plot_PS_DTFE.py). Note the labels are
+// therefore sensitive to FFT ringing from point-like halo density spikes; labels are categorical,
+// so a smoothed CLASSIFICATION (not just a smoothed picture) requires re-deriving the tensor from
+// a smoothed density, i.e. a rerun. Periodic, 3D, full-box grids only; assumes cubic grid cells
+// (k ratios use per-cell wavenumbers). Runs on the merged full grid after normalization, so it is
+// independent of the partition path.
+void computeTidalWebClassification(Field &fields,
+                                   User_options const &userOptions,
+                                   Quantities *q)
+{
+    if ( not fields.velocity_tweb ) return;
+
+#if NO_DIM == 3
+    MESSAGE::Message message( userOptions.verboseLevel );
+
+    auto skip = [&](char const* why)
+    {
+        MESSAGE::Warning warning( userOptions.verboseLevel );
+        warning << "Skipping the T-web: " << why << "\n" << MESSAGE::EndWarning;
+        fields.velocity_tweb = false;   // writer then skips the (empty) T-web output
+    };
+
+    if ( not userOptions.periodic ) { skip("the tidal tensor is FFT-Poisson-solved, which needs a periodic box."); return; }
+    size_t const nx = userOptions.gridSize[0], ny = userOptions.gridSize[1], nz = userOptions.gridSize[2];
+    size_t const N  = nx * ny * nz;
+    if ( q->density.size() != N ) { skip("it needs the density field on the full grid (select 'density'/'density_a' too)."); return; }
+
+    auto const tidalStart = std::chrono::steady_clock::now();
+    message << "\nComputing the T-web from the tidal tensor of the raw density grid (lambda_th = "
+            << userOptions.lambda_th << ") ... " << MESSAGE::Flush;
+
+    // density contrast (double precision for the FFT chain)
+    double mean = 0.;
+    for (size_t i = 0; i < N; ++i) mean += double(q->density[i]);
+    mean /= double(N);
+    if ( mean <= 0. ) { skip("the density grid has non-positive mean."); return; }
+
+    std::vector<double> work(N);
+    for (size_t i = 0; i < N; ++i) work[i] = double(q->density[i]) / mean - 1.;
+
+    size_t const nzh = nz/2 + 1;
+    fftw_complex* deltaK = fftw_alloc_complex(nx * ny * nzh);
+    fftw_complex* tensK  = fftw_alloc_complex(nx * ny * nzh);
+    if ( !deltaK || !tensK )
+    {
+        if (deltaK) fftw_free(deltaK);
+        if (tensK)  fftw_free(tensK);
+        skip("FFT buffer allocation failed.");
+        return;
+    }
+    fftw_plan planF = fftw_plan_dft_r2c_3d(int(nx), int(ny), int(nz), work.data(), deltaK, FFTW_ESTIMATE);
+    fftw_execute(planF);
+    fftw_destroy_plan(planF);
+
+    // per-cell angular wavenumbers k_d = 2 pi m_d / n_d (signed m); ratios k_i k_j / k^2 are the
+    // dimensionless tidal kernel, and the Gaussian smoothing sigma is naturally in grid cells.
+    // The Nyquist SIGN matters for the cross terms (k_a k_b flips with it): full axes treat the
+    // Nyquist mode as negative (numpy fftfreq convention) and the rfft half-axis as positive
+    // (numpy rfftfreq), matching the validated Python reference implementation exactly.
+    auto kFull = [](size_t idx, size_t n) -> double
+    {
+        long m = long(idx);
+        if ( m > (long(n) - 1) / 2 ) m -= long(n);
+        return 2. * M_PI * double(m) / double(n);
+    };
+    auto kHalf = [](size_t idx, size_t n) -> double
+    {
+        return 2. * M_PI * double(idx) / double(n);
+    };
+
+    double const invN   = 1. / double(N);   // FFTW round trip is unnormalized
+    static int const PAIRS[6][2] = { {0,0}, {0,1}, {0,2}, {1,1}, {1,2}, {2,2} };
+    std::vector<Real> tens[6];
+
+    fftw_plan planB = fftw_plan_dft_c2r_3d(int(nx), int(ny), int(nz), tensK, work.data(), FFTW_ESTIMATE);
+    for (int c = 0; c < 6; ++c)
+    {
+        int const a = PAIRS[c][0], b = PAIRS[c][1];
+#ifdef OPEN_MP
+        #pragma omp parallel for
+#endif
+        for (size_t ix = 0; ix < nx; ++ix)
+        {
+            double const kv[1] = { kFull(ix, nx) };
+            for (size_t iy = 0; iy < ny; ++iy)
+            {
+                double const ky = kFull(iy, ny);
+                for (size_t iz = 0; iz < nzh; ++iz)
+                {
+                    double const kz = kHalf(iz, nz);
+                    double const k[3] = { kv[0], ky, kz };
+                    double const k2 = k[0]*k[0] + k[1]*k[1] + k[2]*k[2];
+                    size_t const idx = (ix * ny + iy) * nzh + iz;
+                    if ( k2 == 0. ) { tensK[idx][0] = 0.; tensK[idx][1] = 0.; continue; }
+                    double const f = (k[a] * k[b] / k2) * invN;
+                    tensK[idx][0] = f * deltaK[idx][0];
+                    tensK[idx][1] = f * deltaK[idx][1];
+                }
+            }
+        }
+        fftw_execute(planB);          // -> work (real tensor component)
+        tens[c].resize(N);
+        for (size_t i = 0; i < N; ++i) tens[c][i] = Real(work[i]);
+    }
+    fftw_destroy_plan(planB);
+    fftw_free(deltaK);
+    fftw_free(tensK);
+    work.clear(); work.shrink_to_fit();
+
+    // eigenvalues (descending) and classification
+    q->velocity_tweb.assign(N, Real(0.));
+    q->velocity_tweb_eigenvalues.assign(N, Pvector<Real,NO_DIM>::zero());
+    size_t counts[4] = {0, 0, 0, 0};
+#ifdef OPEN_MP
+    #pragma omp parallel for reduction(+:counts[:4])
+#endif
+    for (size_t i = 0; i < N; ++i)
+    {
+        Pvector<Real,NO_DIM> eig = symmetricEigenvalues3x3( tens[0][i], tens[1][i], tens[2][i],
+                                                            tens[3][i], tens[4][i], tens[5][i] );
+        q->velocity_tweb_eigenvalues[i] = eig;
+        int const label = classifyWeb( eig, userOptions.lambda_th );
+        q->velocity_tweb[i] = Real(label);
+        counts[label] += 1;
+    }
+
+    message << "Done.\n";
+    static char const* NAMES[4] = { "void", "wall", "filament", "node" };
+    message << "T-web volume fractions:";
+    for (int l = 0; l < 4; ++l)
+        message << "  " << NAMES[l] << " = " << (100. * double(counts[l]) / double(N)) << "\%";
+    message << "\n";
+    message << "  >>> Time: " << std::chrono::duration<double>(std::chrono::steady_clock::now() - tidalStart).count()
+            << " sec. (T-web tidal tensor)\n" << MESSAGE::Flush;
+#else
+    MESSAGE::Warning warning( userOptions.verboseLevel );
+    warning << "The T-web is implemented for 3D only; skipping.\n" << MESSAGE::EndWarning;
+    fields.velocity_tweb = false;
+#endif
 }
 
 
@@ -1021,9 +1209,11 @@ void computeDivergenceShearVorticity(Field &fields,
             q->velocity_vorticity.push_back( velocityVorticity(*it) );
     }
     
-    // free the gradient unless the gradient itself or the web classification still needs it
-    if ( not fields.velocity_gradient and not fields.velocity_tweb and not fields.velocity_vweb )
-        q->velocity_gradient.clear();
+    // free the gradient unless the gradient itself or the V-web classification still needs it
+    // (the T-web is computed from the density grid, never the gradient); swap-with-empty
+    // because clear() keeps the capacity resident
+    if ( not fields.velocity_gradient and not fields.velocity_vweb )
+        std::vector< Pvector<Real,noGradComp> >().swap( q->velocity_gradient );
 }
 
 
@@ -1078,6 +1268,8 @@ void DTFE(vector<Particle_data> *allParticles,
     computeDivergenceShearVorticity( userOptions.aField, userOptions.verboseLevel, aQuantities );
     computeWebClassification( userOptions.uField, userOptions.verboseLevel, userOptions.lambda_th, userOptions.hubbleParam, uQuantities );
     computeWebClassification( userOptions.aField, userOptions.verboseLevel, userOptions.lambda_th, userOptions.hubbleParam, aQuantities );
+    computeTidalWebClassification( userOptions.uField, userOptions, uQuantities );
+    computeTidalWebClassification( userOptions.aField, userOptions, aQuantities );
 }
 #endif
 

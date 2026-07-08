@@ -203,6 +203,9 @@ void Quantities::normalizePhaseSpace(Field const &field)
                 }
         }
     }
+
+    // mass_weight is internal to this normalization and never written out -- release it for real
+    std::vector<Real>().swap( this->mass_weight );
 }
 
 

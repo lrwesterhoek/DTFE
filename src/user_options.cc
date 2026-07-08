@@ -59,6 +59,7 @@ User_options::User_options()
     partitionOn = false;
     partNo = -1;
     maxConcurrent = 0;    // 0 = build as many concurrent triangulations as threads (no memory cap)
+    maxConcurrentOn = false;  // when neither --partition nor --max-concurrent is given, the auto-tuner picks them (auto_tune.h)
 
     paddingOn = false;
     paddingMpcOn = false;
@@ -69,9 +70,11 @@ User_options::User_options()
     method = 1;
     noPoints = 100;
     noPointsOn = false;
+    useMetal = false;     // GPU interpolation off unless --gpu/--metal is given (requires a GPU build)
+    gpuAlias = false;
 #ifdef PHASE_SPACE
     psAvgSubsamples = 3;  // nSub for PS-DTFE '_a' fields (27 sub-points in 3D)
-    psUseMetal = false;   // GPU deposit off unless --ps-metal is given (requires METAL=1 build)
+    psUseMetal = false;   // GPU deposit off unless --ps-gpu/--ps-metal is given (requires a GPU build)
 #endif
     averageDensity = Real(-1.);
 
@@ -150,7 +153,7 @@ void User_options::addOptions(po::options_description &allOptions,
                     "  scalarGradient = \tcompute the gradient of the scalar quantities at the sampling point position (use 'scalarGradient_a' to get the averaged field gradient inside the sampling cell).\n"
 #endif
 #ifdef VELOCITY
-                    "  tweb = \tREMOVED (was a duplicate of vweb): the true tidal-tensor T-web is computed from the density grid by python/compute_tweb.py. Requesting it warns and is ignored.\n"
+                    "  tweb = \tT-web cosmic web classification (0=void, 1=wall, 2=filament, 3=node) from the eigenvalues of the tidal tensor, FFT-Poisson-solved from the DENSITY grid (use 'tweb_a' for the volume-averaged density). Also outputs the eigenvalues. Requires the density field (enabled automatically), a periodic box, and 3D. Computed from the RAW density grid -- any smoothing is a plot-time choice in python (plot_PS_DTFE.py). See also --lambda_th.\n"
                     "  vweb = \tV-web cosmic web classification (0=void, 1=wall, 2=filament, 3=node) from velocity shear tensor eigenvalues (use 'vweb_a' for volume averaged). Also outputs eigenvalues.\n"
 #endif
             );
@@ -165,13 +168,13 @@ void User_options::addOptions(po::options_description &allOptions,
     
     po::options_description partitionOptions("Partition options");
     partitionOptions.add_options()
-            ("partition", po::value< std::vector<size_t> >(&(this->partition))->multitoken(), "choose this option if the particle data is too large to compute the Delaunay triangulation for the full data at once. Specify here in how many parts to split the box along each direction (e.g. '--partition 3 3 3' splits the data in 27 chuncks)."
+            ("partition", po::value< std::vector<size_t> >(&(this->partition))->multitoken(), "choose this option if the particle data is too large to compute the Delaunay triangulation for the full data at once. Specify here in how many parts to split the box along each direction (e.g. '--partition 3 3 3' splits the data in 27 chuncks). If NOT given, the program AUTO-SELECTS the split from the particle count, grid, requested fields and the machine's RAM/cores once the input is read (DTFE_RAM_GB env overrides the detected RAM)."
 #ifdef PHASE_SPACE
              " In PS-DTFE this also drives the OpenMP parallelism: partitions run in parallel (one triangulation per thread), so speedup scales up to the number of partitions. NOTE on memory: each Lagrangian partition writes the WHOLE Eulerian grid, so peak memory ~ (partitions running concurrently) x full grid x number of fields -- choose the partition count from your core budget AND available RAM."
 #endif
              )
             ("partNo", po::value<int>(&(this->partNo)), "choose to compute the density only for this partition number (from 0 to 'maximum partitions'-1). This options is usefull if you would like to compute the density for a large particle number on several different machines at the same time - need to run the program on each machine independently.")
-            ("max-concurrent", po::value<int>(&(this->maxConcurrent))->default_value(0), "caps how many Delaunay triangulations are built AT ONCE, to bound peak memory on machines with less RAM (trades CPU cores for memory). Each concurrently-built triangulation is the dominant memory cost, so peak RAM ~ (concurrent triangulations) x per-triangulation size. 0 (default) uses all available threads."
+            ("max-concurrent", po::value<int>(&(this->maxConcurrent))->default_value(0), "caps how many Delaunay triangulations are built AT ONCE, to bound peak memory on machines with less RAM (trades CPU cores for memory). Each concurrently-built triangulation is the dominant memory cost, so peak RAM ~ (concurrent triangulations) x per-triangulation size. '0' uses all available threads. If NOT given, the program AUTO-SELECTS the cap together with the partition split (see '--partition')."
 #ifdef PHASE_SPACE
              " In PS-DTFE this limits how many Lagrangian partitions run in parallel (e.g. '--partition 4 4 4 --max-concurrent 4' builds at most 4 of the 64 partition triangulations simultaneously). Combine a FINER --partition (smaller per-triangulation size) with a SMALLER --max-concurrent to fit large grids in limited RAM."
 #else
@@ -205,9 +208,14 @@ void User_options::addOptions(po::options_description &allOptions,
                     "  3rd method: \t27 random points per grid cell.")
             ("density0", po::value<Real>(&averageDensity), "supply a value to be used to scale the density. If none is supplied, the average density will be used for this task.")
             ("seed", po::value<size_t>(&(this->randomSeed)), "integer value to be used for the random seed generator when interpolating to the grid using Monte Carlo methods. Generated randomly if not supplied by the user.")
+#ifndef PHASE_SPACE
+            ("gpu", po::bool_switch(&(this->gpuAlias)), "standard DTFE only: run the volume-averaged ('_a', method 1) grid interpolation on the GPU. Requires a GPU build: 'make DTFE METAL=1' (macOS), 'make DTFE CUDA=1' (Linux/NVIDIA) or 'make DTFE HIP=1' (Linux/AMD ROCm); otherwise the option is ignored with a warning and the CPU interpolation is used. Results match the CPU interpolation to float rounding (atomic summation order). Unaveraged fields and methods 2/3 always use the CPU.")
+            ("metal", po::bool_switch(&(this->useMetal)), "same as '--gpu' (legacy name from the original Metal backend).")
+#endif
 #ifdef PHASE_SPACE
+            ("ps-gpu", po::bool_switch(&(this->gpuAlias)), "PS-DTFE only: run the grid deposit (the dominant cost) on the GPU. Requires a GPU build: 'make PS-DTFE METAL=1' (macOS), CUDA=1 (Linux/NVIDIA) or HIP=1 (Linux/AMD ROCm); otherwise the option is ignored with a warning and the CPU deposit is used. Results match the CPU deposit to float rounding (atomic summation order).")
             ("avg-subsamples", po::value<int>(&(this->psAvgSubsamples))->default_value(3), "PS-DTFE only: linear sub-sample count nSub for the volume-averaged ('_a') fields. Each grid cell is volume-averaged over an nSub^3 regular sub-grid, so the '_a' interpolation cost scales as nSub^3 -- it is the dominant runtime cost. 3 (default) = 27 sub-points; 2 = 8 (~3.4x faster '_a' pass, slightly coarser average); 1 = cell-centre only (= the unaveraged value, no extra cost but no averaging benefit). Lower this to speed up runs dominated by the averaged-field pass.")
-            ("ps-metal", po::bool_switch(&(this->psUseMetal)), "PS-DTFE only: run the grid deposit (the dominant cost) on the Apple GPU via Metal. Requires a binary built with 'make PS-DTFE METAL=1'; otherwise the option is ignored with a warning and the CPU deposit is used. Results match the CPU deposit to float rounding (atomic summation order).")
+            ("ps-metal", po::bool_switch(&(this->psUseMetal)), "same as '--ps-gpu' (legacy name from the original Metal backend).")
 #endif
             ;
     
@@ -339,7 +347,7 @@ void User_options::shortHelp( char *progName )
                     "  scalarGradient = \tnon-averaged gradient of the scalar quantities (use 'scalarGradient_a' to get the volume averaged value).\n"
 #endif
 #ifdef VELOCITY
-                    "  tweb = \tREMOVED (duplicated vweb); use python/compute_tweb.py on the density grid instead.\n"
+                    "  tweb = \tT-web classification from the tidal tensor of the density grid (use 'tweb_a' for volume averaged).\n"
                     "  vweb = \tV-web cosmic web classification from velocity shear tensor eigenvalues (use 'vweb_a' for volume averaged).\n"
 #endif
             );
@@ -537,6 +545,8 @@ void User_options::printOptions()
     }
     if ( this->maxConcurrent>0 )
         message << "\t max concurrent triangs : " << this->maxConcurrent << "   (capping concurrent Delaunay triangulations to bound peak memory)\n";
+    if ( not this->partitionOn and not this->maxConcurrentOn and this->partNo<0 and not this->redshiftConeOn )
+        message << "\t partition/concurrency  : auto (chosen from the data size, grid, fields and available RAM once the input is read; pass --partition / --max-concurrent to override)\n";
     
     
     if ( not this->paddingLength.isNullBox() )
@@ -568,6 +578,12 @@ void User_options::printOptions()
             message << "\t random generator seed  : " << this->randomSeed << "\n";
         if ( averageDensity>Real(0.) )
             message << "\t density scaling value  : " << averageDensity << "\n";
+        if ( this->useMetal )
+#ifdef DTFE_GPU
+            message << "\t '_a' interpolation     : " GPU_BACKEND_NAME " GPU (--gpu)\n";
+#else
+            message << "\t '_a' interpolation     : CPU (--gpu/--metal given but this binary was built without GPU support; falling back)\n";
+#endif
     }
 #endif
     
@@ -584,10 +600,10 @@ void User_options::printOptions()
         for (int d=0; d<NO_DIM; ++d) nSubPts *= (this->psAvgSubsamples<1 ? 1 : this->psAvgSubsamples);
         message << "\t avg sub-samples (nSub) : " << this->psAvgSubsamples << "   (each '_a' cell volume-averaged over nSub^" << NO_DIM << " = " << nSubPts << " points; this sets the dominant '_a' interpolation cost)\n";
         if ( this->psUseMetal )
-#ifdef PS_METAL
-            message << "\t PS deposit             : Metal GPU (--ps-metal)\n";
+#ifdef PS_GPU
+            message << "\t PS deposit             : " GPU_BACKEND_NAME " GPU (--ps-gpu)\n";
 #else
-            message << "\t PS deposit             : CPU (--ps-metal given but this binary was built without METAL=1; falling back)\n";
+            message << "\t PS deposit             : CPU (--ps-gpu/--ps-metal given but this binary was built without GPU support; falling back)\n";
 #endif
     }
     if ( not this->lagrangianInputFilename.empty() )
@@ -782,7 +798,20 @@ void User_options::readOptions(int argc, char *argv[], bool getFileNames, bool s
     }
     
     
+    // fold the backend-neutral GPU switch into the legacy member ('--gpu' == '--metal',
+    // '--ps-gpu' == '--ps-metal'; two bool_switches cannot share one address in boost)
+    if ( this->gpuAlias )
+    {
+#ifdef PHASE_SPACE
+        this->psUseMetal = true;
+#else
+        this->useMetal = true;
+#endif
+    }
+
     // read the partition options
+    if ( vm.count("max-concurrent") and not vm["max-concurrent"].defaulted() )
+        this->maxConcurrentOn = true;   // user gave it (possibly 0 = uncapped); auto-tuner must not touch it
     if ( vm.count("partition") )
     {
         this->partitionOn = true;
@@ -835,6 +864,11 @@ void User_options::readOptions(int argc, char *argv[], bool getFileNames, bool s
     
     // read the averaging options
     intervalCheck( this->method, 1, 3, "'--method' can have only 3 values (from 1 to 3) since there are implemented only 3 methods for field averaging inside the sampling cell (see '--help' for additional details)" );
+    if ( this->useMetal and this->method!=1 )
+    {
+        MESSAGE::Warning warning( this->verboseLevel );
+        warning << "--gpu/--metal accelerates only the method-1 ('--method 1') volume-averaged interpolation; method " << this->method << " will run on the CPU.\n" << MESSAGE::EndWarning;
+    }
     if ( vm.count("samples") )
     {
         this->noPointsOn = true;

@@ -88,10 +88,12 @@ struct Field
     { return ( density or velocity or velocity_gradient or velocity_divergence or velocity_shear or velocity_vorticity or velocity_std or velocity_dispersion or scalar or scalar_gradient or velocity_tweb or velocity_vweb ); }
 
     // True if any field derived from the velocity gradient (divergence/shear/vorticity/web) is selected.
+    // NOTE: velocity_tweb is NOT here -- the T-web is computed from the DENSITY grid (tidal
+    // tensor via FFT Poisson), not from the velocity gradient, so it must not force the gradient.
     bool selectedVelocityDerivatives()
-    { return ( velocity_divergence or velocity_shear or velocity_vorticity or velocity_tweb or velocity_vweb ); }
+    { return ( velocity_divergence or velocity_shear or velocity_vorticity or velocity_vweb ); }
     void deselectVelocityDerivatives()
-    { velocity_divergence = false; velocity_shear = false; velocity_vorticity = false; velocity_tweb = false; velocity_vweb = false; }
+    { velocity_divergence = false; velocity_shear = false; velocity_vorticity = false; velocity_vweb = false; }
     // True if any velocity-related field is selected.
     bool selectedVelocity()
     { return ( velocity or velocity_gradient or velocity_divergence or velocity_shear or velocity_vorticity or velocity_std or velocity_dispersion or velocity_tweb or velocity_vweb ); }
@@ -134,6 +136,7 @@ struct User_options
     std::vector<size_t> partition;// grid along which to split the particle data so the Delaunay triangulation runs on parts (time/memory)
     int    partNo;        // which partition the program should output (index in 'fileGrid')
     int    maxConcurrent; // cap on concurrently-built Delaunay triangulations (peak RAM ~ concurrency x per-triangulation); 0 = all threads. PS-DTFE: concurrent Lagrangian partitions; standard DTFE: concurrent spatial sub-triangulations.
+    bool   maxConcurrentOn; // true if the user gave --max-concurrent explicitly (0 is both the default and a legal value, so presence must be tracked separately for the auto-tuner)
     
     
     bool   paddingOn;     // true if a padding value is set
@@ -152,9 +155,11 @@ struct User_options
     int    method;        // volume-averaging method
     int    noPoints;      // sample points per grid cell for the average
     bool   noPointsOn;    // true if the user specified the number of sampling points
+    bool   useMetal;      // standard DTFE: run the method-1 '_a' interpolation on the GPU; needs a GPU build (METAL=1/CUDA=1/HIP=1, else falls back to the CPU loop with a warning). Set by --gpu or its legacy alias --metal.
+    bool   gpuAlias;      // scratch for the backend-neutral --gpu/--ps-gpu switches; OR-ed into useMetal/psUseMetal after parsing (two bool_switches cannot share one address)
 #ifdef PHASE_SPACE
     int    psAvgSubsamples; // PS-DTFE: linear sub-sample count nSub for '_a' fields (nSub^NO_DIM sub-grid per cell, cost ~nSub^NO_DIM); 3 = 27 sub-points (default), 1 = cell-centre.
-    bool   psUseMetal;      // PS-DTFE: run the grid deposit on the Apple GPU (Metal); needs a METAL=1 build (else falls back to the CPU deposit with a warning).
+    bool   psUseMetal;      // PS-DTFE: run the grid deposit on the GPU; needs a GPU build (METAL=1/CUDA=1/HIP=1, else falls back to the CPU deposit with a warning). Set by --ps-gpu or its legacy alias --ps-metal.
 #endif
     Real   averageDensity;// density normalization (computed as the box average if not given)
     size_t randomSeed;    // random seed for the Monte Carlo interpolation
