@@ -1,3 +1,14 @@
+"""Merge per-snapshot TNG chunk files into a single h-free combined_NNN.hdf5.
+
+Coordinates and the header BoxSize are divided by h (ckpc/h -> ckpc); everything else is
+copied as-is. h is read from the input file's HubbleParam header (fallback: --hubble).
+
+Usage:
+    python3 merge_HDF5.py                                   # defaults below
+    python3 merge_HDF5.py -d /path/to/TNG50-4-Dark 8 17 33  # merge snapshots 8, 17, 33
+"""
+
+import argparse
 
 import h5py
 import numpy as np
@@ -8,7 +19,7 @@ SNAPSHOT_NUMBERS = [99]
 
 NUM_SUBFILES = 4
 
-BASE_DIR = "/Users/luukw/output/TNG50-4-Dark"
+BASE_DIR = "/Users/luukw/output/TNG300-3-Dark"
 
 SINGLE_FILES = [
 ]
@@ -173,24 +184,42 @@ def convert_single_file(input_path, h_value, datasets_info):
 
 
 def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("snapshots", type=int, nargs="*", default=None,
+                    help=f"snapshot numbers to merge (default: {SNAPSHOT_NUMBERS})")
+    ap.add_argument("-d", "--data-dir", default=BASE_DIR,
+                    help=f"simulation directory holding snapdir_NNN/ (default: {BASE_DIR})")
+    ap.add_argument("-n", "--num-subfiles", type=int, default=NUM_SUBFILES,
+                    help=f"chunk files per snapshot (default: {NUM_SUBFILES})")
+    ap.add_argument("--hubble", type=float, default=H_VALUE,
+                    help=f"fallback h if the file header lacks HubbleParam (default: {H_VALUE})")
+    args = ap.parse_args()
+    snapshots = args.snapshots if args.snapshots else SNAPSHOT_NUMBERS
+
     print("\nHDF5 Snapshot Merger")
-    print(f"Base directory: {BASE_DIR}")
-    print(f"Snapshots to process: {SNAPSHOT_NUMBERS}")
+    print(f"Base directory: {args.data_dir}")
+    print(f"Snapshots to process: {snapshots}")
     print(f"Single files to convert: {SINGLE_FILES}")
 
-    for snapshot_num in SNAPSHOT_NUMBERS:
+    for snapshot_num in snapshots:
+        # h from the data itself when available; the CLI value is only a fallback
+        first = Path(args.data_dir) / f"snapdir_{snapshot_num:03d}" / f"snap_{snapshot_num:03d}.0.hdf5"
+        h_value = args.hubble
+        if first.exists():
+            with h5py.File(first, "r") as f:
+                h_value = float(f["Header"].attrs.get("HubbleParam", args.hubble))
         merge_snapshot_files(
             snapshot_num,
-            NUM_SUBFILES,
-            BASE_DIR,
-            H_VALUE,
+            args.num_subfiles,
+            args.data_dir,
+            h_value,
             DATASETS_INFO
         )
 
     for single_file in SINGLE_FILES:
         convert_single_file(
-            Path(BASE_DIR) / single_file,
-            H_VALUE,
+            Path(args.data_dir) / single_file,
+            args.hubble,
             DATASETS_INFO
         )
 

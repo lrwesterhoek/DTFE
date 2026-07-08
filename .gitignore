@@ -77,3 +77,4 @@ python/cache/
 metal/deposit_prototype
 metal/*.metallib
 metal/*.air
+*.py
