@@ -6,6 +6,7 @@
 DTFE
 PS-DTFE
 output/
+/DTFE_include/   # header-copy artifact of 'make library' (copy_headers)
 
 # compiled objects, libraries, shared objects, executables, debug symbols
 *.o
@@ -25,7 +26,9 @@ output/
 #  Python
 __pycache__/
 *.pyc
+/tests
 python/figures/
+python/cache/
 
 
 .DS_Store
@@ -68,9 +71,7 @@ python/figures/
 !figures/*.png
 !demo/*.png
 !demo/example_input_data_from_text_file.txt
-/tests
-/python
-third_party/
+!tests/reference/*.txt
 
 # Metal prototype build artifacts
 metal/deposit_prototype
