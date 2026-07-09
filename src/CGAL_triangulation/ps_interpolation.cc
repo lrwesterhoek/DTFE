@@ -716,13 +716,19 @@ void interpolateGrid_phaseSpace(DT &dt,
     }
 
     // density accumulated MASS (sum of per-tetrahedron mass shares); convert to a density by dividing
-    // by the grid-cell volume. This is exactly mass-conserving: sum(density)*V_cell = total mass, so
-    // the box-mean density equals averageDensity for any nSub. Stream count is averaged over the
-    // nSub^NO_DIM sub-samples below; velocity/scalar are mass-weighted means (normalized by massWeight).
+    // by the grid-cell volume, then normalize by averageDensity so the written field is rho/rho_bar
+    // (mean-normalized "density contrast + 1", the SAME convention as standard DTFE -- since
+    // 2026-07: older outputs stored the physical mass density; dtfelib.FieldSet detects both).
+    // Mass conservation makes the box mean exactly 1 for any nSub. Stream count is averaged over
+    // the nSub^NO_DIM sub-samples below; velocity/scalar are mass-weighted means (by massWeight).
     Real const invSamples = Real(1.) / Real(nSamplesPerCell);
     if ( field.density )
+    {
+        Real const invRhoBar = userOptions.averageDensity > Real(0.)
+                             ? Real(1.) / userOptions.averageDensity : Real(1.);
         for (size_t i = 0; i < totalGrid; ++i)
-            quantities->density[i] /= cellVolume;
+            quantities->density[i] *= invRhoBar / cellVolume;
+    }
 
     // turn density-weighted moments into mass-weighted means sum(rho_s f_s)/sum(rho_s). Serial: here.
     // deferNorm: hand un-normalized moments + weight to the caller, which sums across partitions and

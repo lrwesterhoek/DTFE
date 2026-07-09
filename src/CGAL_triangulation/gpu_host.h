@@ -2,7 +2,6 @@
    implements it per binary, selected at build time:
 
      make <target> METAL=1   macOS/Apple Silicon  (ps_metal_host.cc / dtfe_metal_host.cc,
-                             kernels in metal/*.metal, runtime-compiled)
      make <target> CUDA=1    Linux/NVIDIA         (ps_gpu_cuda.cu / dtfe_gpu_cuda.cu via nvcc)
      make <target> HIP=1     Linux/AMD ROCm       (same .cu sources via hipcc; the sources
                              use a small cuda-vs-hip macro shim and compile for both)
