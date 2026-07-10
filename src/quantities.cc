@@ -175,15 +175,23 @@ void Quantities::addFrom(Quantities const &other)
 #ifdef PHASE_SPACE
 // PS-DTFE partition path: partitions accumulate density-weighted moments sum(rho_s f_s) and per-cell
 // mass sum(rho_s); divide once here after all partitions are summed, since averaging is non-linear.
-void Quantities::normalizePhaseSpace(Field const &field)
+// The weight is either the explicit mass_weight grid, or -- when the density field was selected and
+// the partitions aliased the weight to it -- reconstructed as density * weightFromDensityScale
+// (= density * cellVolume * averageDensity, undoing the rho/rho_bar conversion; saves 4 B/cell).
+void Quantities::normalizePhaseSpace(Field const &field, Real const weightFromDensityScale)
 {
-    if ( this->mass_weight.empty() ) return;   // no mass-weighted field was deferred
-    size_t const n = this->mass_weight.size();
+    bool const fromDensity = this->mass_weight.empty();
+    if ( fromDensity and (weightFromDensityScale <= Real(0.) or this->density.empty()) )
+        return;   // no mass-weighted field was deferred (or nothing to reconstruct it from)
+    size_t const n = fromDensity ? this->density.size() : this->mass_weight.size();
     bool const haveVel = field.velocity || field.velocity_dispersion; // velocity holds sum(rho v)
+    if ( haveVel and this->velocity.empty() )
+        return;   // no weighted moments were accumulated (e.g. density-only field selection)
     for (size_t i = 0; i < n; ++i)
     {
-        if ( this->mass_weight[i] <= Real(0.) ) continue;
-        Real const inv = Real(1.) / this->mass_weight[i];
+        Real const w = fromDensity ? this->density[i] * weightFromDensityScale : this->mass_weight[i];
+        if ( w <= Real(0.) ) continue;
+        Real const inv = Real(1.) / w;
         if ( haveVel )                 this->velocity[i]          *= inv;   // <v> = sum(rho v)/sum(rho)
         if ( field.velocity_gradient ) this->velocity_gradient[i] *= inv;
         if ( field.scalar )            this->scalar[i]            *= inv;

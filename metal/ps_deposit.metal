@@ -25,6 +25,18 @@ struct DepositParams {
     // Only depositFields honours these; depositDensity is full-grid (prototype use).
     int   subOrigin[3];
     int   subDims[3];
+    // Field flags: which moment grids this run actually needs. When a flag is 0 the host binds
+    // a 4-byte dummy buffer for that grid and the kernel never touches it (mass and streams are
+    // always deposited). fVel = velocity or dispersion selected (mom), fDisp = dispersion (m2,
+    // 24 B per cell), fGrad = velocity gradient (grad, 36 B per cell). Only depositFields
+    // honours these; depositDensity deposits mass only.
+    int   fVel;
+    int   fDisp;
+    int   fGrad;
+    // --ps-linear-deposit: weight the interior samples by the DTFE-interpolated linear density
+    // (from the per-tet vertex densities in buffer 9), renormalized per tet so the deposited
+    // total still equals the tet mass exactly. 0 = uniform equal shares (buffer 9 is a dummy).
+    int   fLinear;
     uint  nTet;
 };
 
@@ -54,6 +66,13 @@ static inline bool inverse3(thread const float A[3][3], thread float inv[3][3]) 
 
 static inline int wrapIdx(int g, int n) { return ((g % n) + n) % n; }
 
+// --ps-linear-deposit sample weight: linear density at offset rel from vertex 0, clamped >= 0
+// (the +-1e-6 barycentric tolerance can graze negative).
+static inline float linearWeight(thread const float rel[3], float d0, thread const float dG[3]) {
+    float w = d0 + dG[0]*rel[0] + dG[1]*rel[1] + dG[2]*rel[2];
+    return w < 0.0f ? 0.0f : w;
+}
+
 // Sub-sample position for local sample index s (base-nSub digits) in cell (raw) along axis dd.
 static inline float samplePos(uint s, int dd, int nSub, thread const int raw[3], constant DepositParams& P) {
     uint rem = s;
@@ -80,25 +99,32 @@ struct FieldGrids {
 
 static inline void depositSample(thread const FieldGrids& G, uint flat,
                                  thread const float rel[3], float w,
-                                 thread const float u0[3], thread const float vG[3][3])
+                                 thread const float u0[3], thread const float vG[3][3],
+                                 bool fVel, bool fDisp, bool fGrad)
 {
     // moment-grid offsets in 64-bit: flat*9 overflows 32-bit uint for grids >= ~782^3
     // (production supports those via size_t), silently scattering atomics to low addresses.
     ulong base = ulong(flat);
     atomic_fetch_add_explicit(&G.mass[flat], w, memory_order_relaxed);
-    float vv[3];
-    for (int j=0; j<3; ++j) {
-        vv[j]=u0[j];
-        for (int i=0;i<3;++i) vv[j]+=vG[i][j]*rel[i];
-        atomic_fetch_add_explicit(&G.mom[base*3ul+ulong(j)], vv[j]*w, memory_order_relaxed);
+    if (fVel || fDisp) {
+        float vv[3];
+        for (int j=0; j<3; ++j) {
+            vv[j]=u0[j];
+            for (int i=0;i<3;++i) vv[j]+=vG[i][j]*rel[i];
+            if (fVel)
+                atomic_fetch_add_explicit(&G.mom[base*3ul+ulong(j)], vv[j]*w, memory_order_relaxed);
+        }
+        if (fDisp) {
+            ulong c=0;
+            for (int i=0;i<3;++i)
+                for (int j=i;j<3;++j)
+                    atomic_fetch_add_explicit(&G.m2[base*6ul + c++], w*vv[i]*vv[j], memory_order_relaxed);
+        }
     }
-    ulong c=0;
-    for (int i=0;i<3;++i)
-        for (int j=i;j<3;++j)
-            atomic_fetch_add_explicit(&G.m2[base*6ul + c++], w*vv[i]*vv[j], memory_order_relaxed);
-    for (int j=0;j<3;++j)
-        for (int i=0;i<3;++i)
-            atomic_fetch_add_explicit(&G.grad[base*9ul + ulong(j*3+i)], vG[i][j]*w, memory_order_relaxed);
+    if (fGrad)
+        for (int j=0;j<3;++j)
+            for (int i=0;i<3;++i)
+                atomic_fetch_add_explicit(&G.grad[base*9ul + ulong(j*3+i)], vG[i][j]*w, memory_order_relaxed);
     atomic_fetch_add_explicit(&G.streams[flat], 1u, memory_order_relaxed);
 }
 
@@ -112,6 +138,7 @@ kernel void depositFields(
     device atomic_float*       gradGrid [[buffer(6)]],
     device atomic_uint*        strGrid  [[buffer(7)]],
     constant DepositParams&    P        [[buffer(8)]],
+    device const float*        dens     [[buffer(9)]],  // nTet * 4 vertex densities (fLinear; else dummy)
     uint tid [[thread_position_in_grid]])
 {
     if (tid >= P.nTet) return;
@@ -137,10 +164,15 @@ kernel void depositFields(
     float posInv[3][3];
     if (!inverse3(Ax, posInv)) return;
 
-    // constant per-tet velocity gradient: vG = posInv * (u_{k+1}-u_0)
-    float u0[3] = { vels[tid*12+0], vels[tid*12+1], vels[tid*12+2] };
-    float vG[3][3];
-    {
+    // constant per-tet velocity gradient vG = posInv * (u_{k+1}-u_0); skipped entirely (and
+    // the vels buffer never read -- it may be a 4-byte dummy) when no velocity-derived grid
+    // is requested (fVel, fDisp and fGrad all 0, i.e. a density-only run)
+    bool const fVel = P.fVel != 0, fDisp = P.fDisp != 0, fGrad = P.fGrad != 0;
+    bool const needsVel = fVel || fDisp || fGrad;
+    float u0[3] = { 0.0f, 0.0f, 0.0f };
+    float vG[3][3] = { {0.0f,0.0f,0.0f}, {0.0f,0.0f,0.0f}, {0.0f,0.0f,0.0f} };
+    if (needsVel) {
+        for (int j=0;j<3;++j) u0[j] = vels[tid*12+j];
         float dV[3][3];
         for (int e=0;e<3;++e)
             for (int j=0;j<3;++j)
@@ -153,6 +185,17 @@ kernel void depositFields(
     }
 
     FieldGrids G { massGrid, momGrid, m2Grid, gradGrid, strGrid };
+
+    // --ps-linear-deposit: constant density gradient across the tet (same affine convention
+    // as vG above); the vertex densities arrive per tet in the dens buffer.
+    bool const fLinear = P.fLinear != 0;
+    float d0 = 0.0f, dG[3] = {0.0f, 0.0f, 0.0f};
+    if (fLinear) {
+        d0 = dens[tid*4+0];
+        float dd0[3];
+        for (int e=0;e<3;++e) dd0[e] = dens[tid*4+e+1] - d0;
+        for (int i=0;i<3;++i) { float s=0.0f; for (int k=0;k<3;++k) s+=posInv[i][k]*dd0[k]; dG[i]=s; }
+    }
 
     float3 lo = min(min(v0,v1), min(v2,v3));
     float3 hi = max(max(v0,v1), max(v2,v3));
@@ -167,10 +210,13 @@ kernel void depositFields(
     int nSub = P.nSub;
     uint nSamp = uint(nSub)*uint(nSub)*uint(nSub);
 
-    // Two identical passes over (cell, sample): pass 0 counts N, pass 1 deposits m/N. The cell's
-    // wrap + sub-grid mapping is resolved BEFORE the sample loop (like the CPU inSub guard), so N
-    // counts exactly the samples that pass 1 deposits -- no mass is ever lost to invalid cells.
+    // Two identical passes over (cell, sample): pass 0 counts N (and, for the linear deposit,
+    // sums the sample weights), pass 1 deposits m/N -- or m*w/sumW when fLinear, which totals
+    // exactly m as well. The cell's wrap + sub-grid mapping is resolved BEFORE the sample loop
+    // (like the CPU inSub guard), so N counts exactly the samples that pass 1 deposits -- no
+    // mass is ever lost to invalid cells.
     uint N = 0;
+    float sumW = 0.0f;
     float share = 0.0f;
     for (int pass=0; pass<2; ++pass) {
         if (pass==1) {
@@ -198,8 +244,15 @@ kernel void depositFields(
                     if (bc<-1.0e-6f){inside=false;break;} sum+=bc;
                 }
                 if (inside && sum<=1.0f+1.0e-6f) {
-                    if (pass==0) N++;
-                    else         depositSample(G, flat, rel, share, u0, vG);
+                    if (pass==0) {
+                        N++;
+                        if (fLinear) sumW += linearWeight(rel, d0, dG);
+                    } else {
+                        float w = share;
+                        if (fLinear && sumW > 0.0f)
+                            w = m * linearWeight(rel, d0, dG) / sumW;
+                        depositSample(G, flat, rel, w, u0, vG, fVel, fDisp, fGrad);
+                    }
                 }
             }
         }
@@ -217,7 +270,7 @@ kernel void depositFields(
         }
         uint flat=(uint(loc[0])*uint(P.subDims[1])+uint(loc[1]))*uint(P.subDims[2])+uint(loc[2]);
         float crel[3]={cen.x-v0.x, cen.y-v0.y, cen.z-v0.z};
-        depositSample(G, flat, crel, m, u0, vG);
+        depositSample(G, flat, crel, m, u0, vG, fVel, fDisp, fGrad);
     }
 }
 

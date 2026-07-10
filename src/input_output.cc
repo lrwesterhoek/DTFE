@@ -40,6 +40,7 @@ namespace bfs=boost::filesystem;
 #include "quantities.h"
 #include "user_options.h"
 #include "message.h"
+#include "ps_point_eval.h"
 
 
 #include "io/input_output.h"
@@ -212,7 +213,7 @@ void readInputData(std::vector<Particle_data> *p,
             Gadget_header chunkHeader;
             HDF5_readGadgetHeader(fn, &chunkHeader);
 
-            H5::H5File lagFile( fn.c_str(), H5F_ACC_RDONLY, H5::FileAccPropList::DEFAULT );
+            H5::H5File lagFile( fn.c_str(), H5F_ACC_RDONLY );
 
             for (int type = 0; type < 6; ++type)
             {
@@ -465,6 +466,9 @@ void writeOutputData(Quantities &uQuantities,
         output.write( uQuantities.stream_count, userOptions.outputFilename + ".streams", "stream count", userOptions );
     if ( not aQuantities.stream_count.empty() )
         output.write( aQuantities.stream_count, userOptions.outputFilename + ".a_streams", "averaged stream count", userOptions );
+
+    // arbitrary-point evaluation outputs ('<root>.pts_*'; no-op unless --sample-points was given)
+    psPointEvalWriteOutputs( userOptions );
 #endif
 }
 

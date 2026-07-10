@@ -31,31 +31,42 @@ std::string gpuDeviceName();
 
 
 // ---------------------------------------------------------------- PS-DTFE deposit
-// Output grids, all sized to the partition sub-grid (subDims product = subTotal).
+// Output grids, all sized to the partition sub-grid (subDims product = subTotal). Only the
+// grids selected by the fVel/fDisp/fGrad flags are allocated (mom/m2/grad stay EMPTY when
+// their flag is off -- the m2 and grad grids alone are 24+36 B per sub-grid cell); mass and
+// streams are always produced.
 struct PSGpuGrids
 {
     std::vector<float>    mass;     // subTotal      accumulated MASS (density = mass / cellVolume)
-    std::vector<float>    mom;      // subTotal*3    mass-weighted velocity moment  [i*3+j]
-    std::vector<float>    m2;       // subTotal*6    mass-weighted 2nd moment, upper triangle [i*6+c]
-    std::vector<float>    grad;     // subTotal*9    mass-weighted velocity-gradient moment [i*9+j*3+i']
+    std::vector<float>    mom;      // subTotal*3    mass-weighted velocity moment  [i*3+j]   (fVel)
+    std::vector<float>    m2;       // subTotal*6    mass-weighted 2nd moment, upper triangle [i*6+c] (fDisp)
+    std::vector<float>    grad;     // subTotal*9    mass-weighted velocity-gradient moment [i*9+j*3+i'] (fGrad)
     std::vector<uint32_t> streams;  // subTotal      interior-sample count (streams = count / nSub^3)
 };
 
 // Runs the mass-conserving tetrahedral deposit on the default GPU device. Vertices must
 // already be min-image-wrapped relative to vertex 0 (as in the CPU deposit). Thread-safe
 // (serialized on one device queue/stream).
+// fVel = velocity moments needed (velocity or dispersion selected), fDisp = second moments
+// (dispersion), fGrad = velocity-gradient moments; unselected grids are neither allocated on
+// the device (4-byte dummies) nor on the host. 'vels' may be EMPTY when all three are off.
+// fLinear (--ps-linear-deposit) weights the interior samples by the linear density built
+// from the per-tet vertex densities in 'dens' (nTet*4; may be EMPTY when fLinear is off),
+// renormalized per tet so the deposited total still equals the tet mass exactly.
 // Returns false with 'err' set if there is no device / setup fails; outputs untouched in
 // that case, zeroed otherwise.
-// CONSUMES verts/vels/masses (several GB per partition at scale): Metal frees each one
+// CONSUMES verts/vels/masses/dens (several GB per partition at scale): Metal frees each one
 // right after copying it into unified memory; CUDA/HIP stream them to the device in
 // chunks and free them when the dispatch loop ends. Either way they may be empty when the
 // call returns -- the CPU fallback deposits from the triangulation, not from these arrays.
 bool psGpuDepositFields(std::vector<float>& verts,   // nTet*12: 4 wrapped Eulerian vertices
-                        std::vector<float>& vels,    // nTet*12: 4 vertex velocities
+                        std::vector<float>& vels,    // nTet*12: 4 vertex velocities (empty if unused)
                         std::vector<float>& masses,  // nTet: tet mass rho_bar * V_lag
+                        std::vector<float>& dens,    // nTet*4: vertex densities (empty unless fLinear)
                         const double boxLo[3], const double dx[3],
                         const size_t nGrid[3], const size_t subOrigin[3], const size_t subDims[3],
                         int nSub, bool periodic,
+                        bool fVel, bool fDisp, bool fGrad, bool fLinear,
                         PSGpuGrids& out, std::string& err);
 
 

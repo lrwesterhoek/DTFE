@@ -32,6 +32,10 @@ struct DepositParams {           // must match the MSL struct byte-for-byte
     int32_t  periodic;
     int32_t  subOrigin[3];       // used by depositFields only; depositDensity is full-grid
     int32_t  subDims[3];
+    int32_t  fVel;                  // field flags (see metal/ps_deposit.metal); the harness
+    int32_t  fDisp;                 // exercises all moment grids, so they are always 1 here
+    int32_t  fGrad;
+    int32_t  fLinear;               // 0 = uniform shares (the harness references)
     uint32_t nTet;
 };
 
@@ -118,7 +122,7 @@ int main(int argc, char** argv){
     DepositParams P{};
     for(int i=0;i<3;++i){P.boxLo[i]=0.0f; P.nGrid[i]=32; P.subOrigin[i]=0; P.subDims[i]=32;}
     float box=10.0f; for(int i=0;i<3;++i)P.dx[i]=box/P.nGrid[i];
-    P.nSub=3; P.periodic=1;
+    P.nSub=3; P.periodic=1; P.fVel=1; P.fDisp=1; P.fGrad=1; P.fLinear=0;
     const uint32_t nTet = (argc>2)? uint32_t(std::stoul(argv[2])) : 20000u; P.nTet=nTet;
     const size_t nCell=size_t(P.nGrid[0])*P.nGrid[1]*P.nGrid[2];
     float cellVol=P.dx[0]*P.dx[1]*P.dx[2];

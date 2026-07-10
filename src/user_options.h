@@ -160,6 +160,10 @@ struct User_options
 #ifdef PHASE_SPACE
     int    psAvgSubsamples; // PS-DTFE: linear sub-sample count nSub for '_a' fields (nSub^NO_DIM sub-grid per cell, cost ~nSub^NO_DIM); 3 = 27 sub-points (default), 1 = cell-centre.
     bool   psUseMetal;      // PS-DTFE: run the grid deposit on the GPU; needs a GPU build (METAL=1/CUDA=1/HIP=1, else falls back to the CPU deposit with a warning). Set by --ps-gpu or its legacy alias --ps-metal.
+    std::string psSamplePointsFile;    // PS-DTFE --sample-points: file with arbitrary Eulerian evaluation points (empty = mode off); see ps_point_eval.h
+    bool   psPerStream;                // PS-DTFE --per-stream: also write every stream's density+velocity per sample point (ragged layout)
+    bool   psStreamDensityGeometric;   // PS-DTFE --ps-stream-density: true = 'geometric' (m_tet/V_eul, matches the mass-conserving deposit), false = 'dtfe' (vertex-density interpolation, matches the Feldbrugge reference; DEFAULT)
+    bool   psLinearDeposit;            // PS-DTFE --ps-linear-deposit: weight each tetrahedron's interior samples by the DTFE-interpolated linear density (renormalized per tet, so the deposited total still equals the tet mass EXACTLY) instead of equal shares
 #endif
     Real   averageDensity;// density normalization (computed as the box average if not given)
     size_t randomSeed;    // random seed for the Monte Carlo interpolation
@@ -199,6 +203,7 @@ struct User_options
     // set during runtime, not from the command line
 #ifdef PHASE_SPACE
     Box    lagrangianRegion; // unpadded Lagrangian partition region (PS-DTFE cell ownership check)
+    bool   psMayClearDT;     // set by the DTFE_interpolation overload that OWNS its triangulation: the last interpolateGrid_phaseSpace call may clear the DT right after its deposit (frees ~650 B/vertex before the merge phase). Never set when the caller keeps the triangulation (TRIANGULATION library API).
     bool   psSuppressGridStats; // PS-DTFE partition path: silence per-partition coverage/stream stats (each covers ~1/Npart of the grid); aggregate reported once after the loop
     bool   psUseSubgrid;        // PS-DTFE partition path: allocate only each partition's Eulerian bounding box, mapped back via addFromSubgrid -> lower peak memory
     bool   psDeferNormalization; // PS-DTFE partition path: keep fields as density-weighted moments (no per-partition normalize) so they sum linearly and normalize once afterwards; correct for multi-stream cells spanning partitions

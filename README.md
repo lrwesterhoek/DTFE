@@ -61,6 +61,26 @@ For detailed information about the DTFE method see [Schaap and van de Weygaert (
 
 ## Installation and Building
 
+### Quick install
+
+**One command, any platform** — installs missing dependencies, wipes the build, and recompiles both binaries with the best backend for the machine (macOS/Apple Silicon → Metal GPU; Linux with `nvcc`/`hipcc` → CUDA/HIP; otherwise CPU):
+
+```bash
+./install.sh          # add --cpu to force CPU-only, --no-deps to skip package installation
+```
+
+Per-platform equivalents (details in the sections below):
+
+| Platform | Commands |
+|----------|----------|
+| **macOS** (Homebrew) | `brew install gsl boost cgal mpfr gmp hdf5 fftw llvm libomp && make DTFE METAL=1 && make PS-DTFE METAL=1` |
+| **Ubuntu/Debian** | `sudo apt-get install build-essential libgsl-dev libboost-all-dev libcgal-dev libmpfr-dev libhdf5-dev libgmp-dev libfftw3-dev && make DTFE && make PS-DTFE` |
+| **Docker** (Linux image) | `docker build -t dtfe .` — builds both binaries CPU-only and runs the fast test battery as a build sanity stage; `--build-arg GPU=cuda` additionally compile-checks the CUDA backend on an `nvidia/cuda` base image (running it still needs an NVIDIA GPU + `docker run --gpus all`) |
+
+**Docker is not the macOS path**: a container is a Linux VM even on a Mac, so it can never build or run the Metal backend — use `./install.sh` (or the brew line) for native macOS binaries, and Docker only to produce Linux/cluster images.
+
+Run `make deps-check` at any time to verify every required header is present — it prints the exact `brew install` / `apt-get install` command for anything missing, instead of a long compile dying on a cryptic missing-header error.
+
 ### Supported Platforms
 - **macOS** (Intel and Apple Silicon)
 - **Linux** (Ubuntu, Debian, Fedora, CentOS, RHEL, and other distributions)
@@ -80,30 +100,40 @@ For detailed information about the DTFE method see [Schaap and van de Weygaert (
 
 3. **Install dependencies:**
    ```bash
-   brew install gsl boost cgal mpfr hdf5 gmp
+   brew install gsl boost cgal mpfr gmp hdf5 fftw
    ```
 
 #### Linux (Ubuntu/Debian)
 ```bash
 sudo apt-get update
 sudo apt-get install build-essential
-sudo apt-get install libgsl-dev libboost-all-dev libcgal-dev libmpfr-dev libhdf5-dev libgmp-dev
+sudo apt-get install libgsl-dev libboost-all-dev libcgal-dev libmpfr-dev libhdf5-dev libgmp-dev libfftw3-dev
 ```
+(The Makefile automatically picks up Debian/Ubuntu's HDF5 serial sub-directory, `/usr/include/hdf5/serial`.)
 
 #### Linux (Fedora/RHEL/CentOS)
 ```bash
 # For Fedora
 sudo dnf groupinstall "Development Tools"
-sudo dnf install gsl-devel boost-devel CGAL-devel mpfr-devel hdf5-devel gmp-devel
+sudo dnf install gsl-devel boost-devel CGAL-devel mpfr-devel hdf5-devel gmp-devel fftw-devel
 
 # For older RHEL/CentOS
 sudo yum groupinstall "Development Tools"
-sudo yum install gsl-devel boost-devel CGAL-devel mpfr-devel hdf5-devel gmp-devel
+sudo yum install gsl-devel boost-devel CGAL-devel mpfr-devel hdf5-devel gmp-devel fftw-devel
 ```
 
 #### Linux (Arch/Manjaro)
 ```bash
-sudo pacman -S base-devel gsl boost cgal mpfr hdf5 gmp
+sudo pacman -S base-devel gsl boost cgal mpfr hdf5 gmp fftw
+```
+
+#### Docker
+The repository root ships a [Dockerfile](Dockerfile) (Ubuntu 24.04) that installs the packages above, builds **both** binaries CPU-only, and runs `tests/run_tests.py` + `tests/ps_smoke_test.sh` as a build sanity stage:
+```bash
+docker build -t dtfe .                            # CPU-only
+docker build -t dtfe-cuda --build-arg GPU=cuda .  # + CUDA backend (compile-check; nvidia/cuda devel base)
+docker run --rm -v $PWD/data:/data dtfe /opt/dtfe/PS-DTFE /data/snap.hdf5 /data/out \
+    --grid 128 --periodic --field density --MpcUnit 1
 ```
 
 ### Quick Start
@@ -114,9 +144,10 @@ sudo pacman -S base-devel gsl boost cgal mpfr hdf5 gmp
    cd DTFE
    ```
 
-2. **Test platform detection:**
+2. **Check the toolchain and dependencies:**
    ```bash
-   make test-platform
+   make deps-check       # verifies every required header; prints install commands for anything missing
+   make test-platform    # shows the detected platform/compiler/paths
    ```
 
 3. **Build the main executable:**
@@ -238,10 +269,50 @@ The outputs are raw binary, one value per grid cell (row-major, single precision
 
 Every field also has a volume-averaged _a form (density_a, velocity_a, dispersion_a, …) that sub-samples an nSub³ grid (nSub=3, `--avg-subsamples`) inside each cell and writes the matching .a_* file (.a_den, .a_velDisp, …); .a_streams is the per-cell average stream count. The dispersion is the density-weighted covariance of the per-stream velocities: for each pair of spatial directions you weight every stream's velocity deviation from the local mean flow by that stream's density, sum over all streams, and normalise by the total stream density — equivalently, the density-weighted mean of the velocity-component products minus the product of the mean velocity components. It is approximately zero in cold, single-stream void interiors and large in multi-stream walls and filaments. In single-stream regions the velocity, gradient and dispersion reproduce the standard DTFE result, with the dispersion going to zero.
 
+### Point evaluation (`--sample-points`)
+
+Besides the regular grid, PS-DTFE can evaluate the multi-stream fields at **arbitrary Eulerian points** (halo centres, void centres, random sight-lines, …):
+
+```bash
+./PS-DTFE snapshot.hdf5 output_root --grid 32 --periodic --field density \
+    --sample-points points.txt [--per-stream] [--ps-stream-density dtfe|geometric]
+```
+
+* **Input**: a text file with one `x y z` per line, or a raw binary file of float64 triplets (N×3, row-major, native/little-endian, no header) — auto-detected. Coordinates are in the box coordinate system (same units as `--box`, i.e. Mpc after `--MpcUnit`); under `--periodic` they are wrapped into the box. Point evaluation runs **alongside** the grid interpolation, so pass a small `--grid` (e.g. `-g 32`) when only point values are wanted.
+* **Outputs** (raw binary, native little-endian, in the input point order):
+
+  | file | type × comps | meaning |
+  |------|--------------|---------|
+  | `.pts_den` | float64 × 1 | total density Σ_s ρ_s over the streams at the point, in ρ/ρ̄ units (same normalization as `.den`) |
+  | `.pts_vel` | float64 × 3 | density-weighted mean velocity ⟨v⟩ = Σ ρ_s v_s / Σ ρ_s |
+  | `.pts_velDisp` | float64 × 6 | velocity dispersion tensor σ_ij (upper triangle row-major: xx xy xz yy yz zz); exactly 0 for single-stream points |
+  | `.pts_streams` | int32 × 1 | stream count (number of Eulerian tetrahedra containing the point) |
+
+* **`--per-stream`** additionally writes every stream's own density and velocity in a ragged layout: `.pts_stream_offsets` (uint64, N+1 entries; point *i* owns records `[off[i], off[i+1])`) and `.pts_stream_records` (float64 × 4 per record: density, vx, vy, vz), with each point's streams sorted by density, descending.
+* **`--ps-stream-density`** selects the per-stream density estimator (it also weights the mean velocity and dispersion):
+  * `dtfe` (default) — linear interpolation of the Lagrangian-vertex DTFE densities inside each stream's tetrahedron. This matches the `PhaseSpaceDTFE` class of the method authors' reference implementation ([github.com/jfeldbrugge/PS-DTFE](https://github.com/jfeldbrugge/PS-DTFE), `Python/density.py`); the field is continuous within each stream but not exactly mass-conserving.
+  * `geometric` — the constant per-tetrahedron density m_tet/V_eul = ρ̄·V_lag/V_eul (the reference code's `PhaseSpace` class). This is the density whose (cell-averaged, mass-conserving) rendering the PS-DTFE grid deposit produces; it is discontinuous across tetrahedra but integrates to the exact mass.
+
+  In smooth single-stream regions the two agree to a few percent; they differ most near caustics.
+* The evaluation is CPU-only and double precision, uses the same cell filters and ±1e-6 barycentric tolerance as the grid deposit, and works under any `--partition` split (auto-tuned or explicit): stream contributions accumulate across the Lagrangian partitions and are reduced once, in deterministic (sorted) order, so the outputs are independent of the partition/thread schedule. Validated by `tests/ps_point_eval_check.sh`.
+
+### Linear-within-stream deposit (`--ps-linear-deposit`)
+
+By default the mass-conserving grid deposit spreads each tetrahedron's mass **uniformly** over its interior sub-samples. With `--ps-linear-deposit` the samples are instead weighted by the DTFE-interpolated **linear density profile** inside the tetrahedron, and the weights are **renormalized per tetrahedron** so the deposited total still equals the tetrahedron's mass exactly — mass conservation (the fix for the historical caustic "square" artefacts) is untouched, only the sub-tetrahedron mass distribution changes. The two variants produce identical `.streams`, identical grid means, and differ smoothly (percent-level in single-stream regions, most visibly where tetrahedra span several cells). Works with the CPU deposit and all GPU backends (`--ps-gpu`); validated by `tests/ps_linear_deposit_check.sh`.
+
 ### Memory: `--partition` and `--max-concurrent` (auto-tuned by default)
 When neither flag is given, **the binary picks both automatically** once the input is read, from the particle count, grid size, requested fields and the machine's physical RAM and cores (it prints an `AUTO-TUNE:` line with the chosen values and the predicted peak RSS; `DTFE_RAM_GB` overrides the detected RAM). Explicit flags always win, and small inputs (default: below 2×10⁶ particles, `DTFE_AUTO_MINN`) keep the historical single-domain behavior. Both run scripts defer to auto mode unless `PARTITION` / `MAX_CONCURRENT` env vars are set.
 
 The model behind the tuner: large runs are bounded by the per-partition CGAL triangulation (~0.65 KB per padded vertex; the Lagrangian padding multiplies particle counts by ~4x) plus the global field grids. PS-DTFE partitions **Lagrangian** space with `--partition X Y Z` and caps concurrent partition pipelines with `--max-concurrent N`; peak RSS ≈ globals + N × (per-partition triangulation + sub-grids). Manual reference points (what auto should land near): a 512³ grid with the default field set fits TNG50-4 (2e7 particles) at `--partition 2 2 2 --max-concurrent 2` in ≲30 GB, and TNG300-3 (2.4e8 particles) at `--partition 5 5 5 --max-concurrent 2` in ~40 GB. The `run_ps_dtfe.sh` runlog reports the measured peak RSS after every run, closing the loop on the prediction.
+
+Memory reductions (July 2026, all validated bit-or-tolerance-identical by the test battery):
+* each partition's **triangulation is freed right after its deposit** (its last read), instead of at partition scope end — the ~0.65 KB/vertex no longer coexists with the merge phase;
+* the GPU deposit **allocates only the requested moment grids** (the second-moment and gradient grids are 24+36 B/cell of sub-grid, host- and device-side) and skips extracting the per-tet velocity array on density-only runs;
+* the `mass_weight` normalization grid (4 B/cell) **aliases the density accumulator** whenever the density field is selected;
+* the GPU extraction cost-sort permutes its tet arrays **in place** (no transient gather copy);
+* the per-partition cell-handle vector is gone (cells stream directly off the CGAL iterator).
+
+Measured on a synthetic 96³-particle box, 256³ grid, `--partition 2 2 2 --max-concurrent 2` (M1 Max): CPU run with density+velocity+dispersion 3.21 → 2.77 GB peak RSS; GPU (`--ps-gpu`) run with density+velocity 6.32 → 2.89 GB.
 
 
 ## Batch scripts and configuration
@@ -281,10 +352,14 @@ The TNG API key is read from `-k`, the `TNG_API_KEY` env var, or `~/.tng_api_key
 tests/ps_smoke_test.sh          # build + Zel'dovich pancake sanity check (~1 min)
 python3 tests/ps_regression_test.py   # physics metrics vs tests/reference baseline
 tests/ps_parallel_check.sh      # serial vs partitioned/parallel agreement
+tests/ps_point_eval_check.sh    # --sample-points point evaluation vs deposit/analytics
+tests/ps_linear_deposit_check.sh # --ps-linear-deposit mass conservation + A/B smoothness
 python3 tests/run_tests.py      # standard-DTFE regression
 tests/dtfe_metal_check.sh       # standard-DTFE CPU vs --gpu parity (builds the current GPU mode; GPU_BUILD=CUDA=1 on Linux/NVIDIA)
 python3 tests/py_dtfelib_test.py  # python stack: SubLink invariants, sampling, void tracking
 ```
+
+A minimal GitHub Actions workflow (Linux CPU build + `run_tests.py` + `ps_smoke_test.sh`) ships **disabled** as [.github/workflows/ci.yml.disabled](.github/workflows/ci.yml.disabled) — rename it to `ci.yml` to enable. It is deliberately a single fast job (an earlier, broader cross-platform workflow was removed on purpose). Note that `tests/` is currently git-ignored, so enabling CI also requires tracking the test scripts it calls.
 
 
 ## Contributors

@@ -44,6 +44,10 @@ struct DepositParams {              // must match the MSL struct byte-for-byte
     int32_t  periodic;
     int32_t  subOrigin[3];          // partition sub-grid box (full grid: origin 0, dims = nGrid)
     int32_t  subDims[3];
+    int32_t  fVel;                  // field flags (see metal/ps_deposit.metal); the harness
+    int32_t  fDisp;                 // exercises all moment grids, so they are always 1 here
+    int32_t  fGrad;
+    int32_t  fLinear;               // 0 = uniform shares (the harness references)
     uint32_t nTet;
 };
 
@@ -217,11 +221,13 @@ struct Gpu {
 
         MTL::CommandBuffer* cb=q->commandBuffer();
         MTL::ComputeCommandEncoder* e=cb->computeCommandEncoder();
+        MTL::Buffer* bD=zbuf(4);   // dens dummy (fLinear=0 in this harness)
         if (fields){
             e->setComputePipelineState(psoFld);
             e->setBuffer(bV,0,0); e->setBuffer(bU,0,1); e->setBuffer(bM,0,2);
             e->setBuffer(bMass,0,3); e->setBuffer(bMom,0,4); e->setBuffer(bM2,0,5);
             e->setBuffer(bG,0,6); e->setBuffer(bS,0,7); e->setBuffer(bP,0,8);
+            e->setBuffer(bD,0,9);
         } else {
             e->setComputePipelineState(psoDen);
             e->setBuffer(bV,0,0); e->setBuffer(bM,0,1); e->setBuffer(bMass,0,2); e->setBuffer(bP,0,3);
@@ -255,7 +261,7 @@ static char detail[512];
 // ------------------------------------------------------------------ tests
 static void makeParams(DepositParams& P,int n,float box,int nSub,int periodic){
     for(int i=0;i<3;++i){P.boxLo[i]=0.f;P.nGrid[i]=n;P.dx[i]=box/n;P.subOrigin[i]=0;P.subDims[i]=n;}
-    P.nSub=nSub;P.periodic=periodic;P.nTet=0;
+    P.nSub=nSub;P.periodic=periodic;P.fVel=1;P.fDisp=1;P.fGrad=1;P.fLinear=0;P.nTet=0;
 }
 static std::vector<float> linVel(const std::vector<float>& verts){
     // simple linear velocity field v = (2x - y, 0.5z, -x + y) at each vertex

@@ -101,6 +101,12 @@ else ifeq ($(PLATFORM),linux)
     HDF5_PATH  = /usr
     GMP_PATH = /usr
     FFTW_PATH = /usr
+    # Debian/Ubuntu put the serial HDF5 headers and libraries in a sub-directory that is NOT
+    # on the default search path (libhdf5-dev installs to /usr/include/hdf5/serial), so a
+    # plain -I/usr/include build dies on '#include <H5Cpp.h>'. Pick the sub-directory up
+    # automatically when it exists (harmless elsewhere).
+    HDF5_EXTRA_INC := $(firstword $(wildcard /usr/include/hdf5/serial))
+    HDF5_EXTRA_LIB := $(firstword $(wildcard /usr/lib/*/hdf5/serial))
     CC := $(shell which g++ 2>/dev/null || which clang++ 2>/dev/null || echo "g++")
 endif
 
@@ -329,6 +335,12 @@ endif
 ifneq ($(strip $(HDF5_PATH)),)
     INCLUDES += -I $(strip $(HDF5_PATH))/include
     LIBRARIES += -L$(strip $(HDF5_PATH))/lib   # -lhdf5/-lhdf5_cpp added once via HDF5_LIBS (avoid duplicate-library linker warning)
+    ifneq ($(strip $(HDF5_EXTRA_INC)),)
+        INCLUDES += -I $(strip $(HDF5_EXTRA_INC))
+    endif
+    ifneq ($(strip $(HDF5_EXTRA_LIB)),)
+        LIBRARIES += -L$(strip $(HDF5_EXTRA_LIB))
+    endif
     OPTIONS += -DHDF5
     OPTIONS_PS += -DHDF5
 endif
@@ -441,12 +453,12 @@ endif
 
 IO_SOURCES = $(addprefix io/, input_output.h gadget_reader_header.cc gadget_reader_binary.cc gadget_reader_HDF5.cc text_io.cc binary_io.cc)
 MAIN_SOURCES = main.cpp DTFE.h message.h user_options.h io/io.h interlacing.h
-IO_CC_SOURCES = input_output.cc $(IO_SOURCES) user_options.h define.h quantities.h message.h particle_data.h box.h
-DTFE_SOURCES = DTFE.cpp define.h particle_data.h user_options.h box.h quantities.h subpartition.h interpolations.h kdtree/kdtree2.hpp Pvector.h message.h miscellaneous.h auto_tune.h
+IO_CC_SOURCES = input_output.cc $(IO_SOURCES) user_options.h define.h quantities.h message.h particle_data.h box.h ps_point_eval.h
+DTFE_SOURCES = DTFE.cpp define.h particle_data.h user_options.h box.h quantities.h subpartition.h interpolations.h kdtree/kdtree2.hpp Pvector.h message.h miscellaneous.h auto_tune.h ps_point_eval.h
 DTFE_CC_SOURCES = user_options.cc quantities.cc NGP_interpolation.cc CIC_interpolation.cc TSC_interpolation.cc PCS_interpolation.cc SPH_interpolation.cc interlacing.cc random.cc
-TRIANG_HEADERS = $(addprefix CGAL_triangulation/, triangulation_common.h triangulation_miscellaneous.h field_computation.h padding_test.h my_function.h CGAL_include_2D.h CGAL_include_3D.h vertexData.h particle_data_traits.h) define.h particle_data.h user_options.h box.h quantities.h Pvector.h message.h math_functions.h miscellaneous.h
+TRIANG_HEADERS = $(addprefix CGAL_triangulation/, triangulation_common.h triangulation_miscellaneous.h field_computation.h padding_test.h my_function.h CGAL_include_2D.h CGAL_include_3D.h vertexData.h particle_data_traits.h) define.h particle_data.h user_options.h box.h quantities.h Pvector.h message.h math_functions.h miscellaneous.h ps_point_eval.h
 TRIANG_SOURCES = $(addprefix CGAL_triangulation/, triangulation.cpp) $(TRIANG_HEADERS)
-TRIANG_CC_SOURCES = $(addprefix CGAL_triangulation/, unaveraged_interpolation.cc averaged_interpolation_1.cc averaged_interpolation_2.cc ps_interpolation.cc)
+TRIANG_CC_SOURCES = $(addprefix CGAL_triangulation/, unaveraged_interpolation.cc averaged_interpolation_1.cc averaged_interpolation_2.cc ps_interpolation.cc ps_point_eval.cc)
 
 ALL_FILES = $(DTFE_SOURCES) $(DTFE_CC_SOURCES) $(TRIANG_SOURCES) $(MAIN_SOURCES) kdtree/kdtree2.hpp kdtree/kdtree2.cpp
 LIB_FILES = $(DTFE_SOURCES) $(DTFE_CC_SOURCES) $(TRIANG_SOURCES)
@@ -463,7 +475,7 @@ HEADERS_2 = $(addprefix CGAL_triangulation/, CGAL_include_2D.h CGAL_include_3D.h
 
 DTFE_CC_OBJS = $(OBJ_DIR)/user_options$(OBJ_EXT) $(OBJ_DIR)/quantities$(OBJ_EXT) $(OBJ_DIR)/NGP_interpolation$(OBJ_EXT) $(OBJ_DIR)/CIC_interpolation$(OBJ_EXT) $(OBJ_DIR)/TSC_interpolation$(OBJ_EXT) $(OBJ_DIR)/PCS_interpolation$(OBJ_EXT) $(OBJ_DIR)/SPH_interpolation$(OBJ_EXT) $(OBJ_DIR)/interlacing$(OBJ_EXT) $(OBJ_DIR)/random$(OBJ_EXT)
 IO_CC_OBJS = $(OBJ_DIR)/input_output$(OBJ_EXT)
-TRIANG_CC_OBJS = $(OBJ_DIR)/unaveraged_interpolation$(OBJ_EXT) $(OBJ_DIR)/averaged_interpolation_1$(OBJ_EXT) $(OBJ_DIR)/averaged_interpolation_2$(OBJ_EXT) $(OBJ_DIR)/ps_interpolation$(OBJ_EXT)
+TRIANG_CC_OBJS = $(OBJ_DIR)/unaveraged_interpolation$(OBJ_EXT) $(OBJ_DIR)/averaged_interpolation_1$(OBJ_EXT) $(OBJ_DIR)/averaged_interpolation_2$(OBJ_EXT) $(OBJ_DIR)/ps_interpolation$(OBJ_EXT) $(OBJ_DIR)/ps_point_eval$(OBJ_EXT)
 
 # The mode check must FINISH before any object/header rule starts: under -j its wipe runs
 # concurrently with sibling prerequisites and can delete files mid-recipe (observed: the
@@ -530,6 +542,9 @@ $(OBJ_DIR)/averaged_interpolation_2$(OBJ_EXT): $(SRC)/CGAL_triangulation/average
 $(OBJ_DIR)/ps_interpolation$(OBJ_EXT): $(SRC)/CGAL_triangulation/ps_interpolation.cc $(addprefix $(SRC)/, $(TRIANG_HEADERS)) Makefile
 	$(CC) $(COMPILE_FLAGS) $(DTFE_INC) -o $@ -c $(SRC)/CGAL_triangulation/ps_interpolation.cc
 
+$(OBJ_DIR)/ps_point_eval$(OBJ_EXT): $(SRC)/CGAL_triangulation/ps_point_eval.cc $(addprefix $(SRC)/, $(TRIANG_HEADERS)) Makefile
+	$(CC) $(COMPILE_FLAGS) $(DTFE_INC) -o $@ -c $(SRC)/CGAL_triangulation/ps_point_eval.cc
+
 
 ############################# PS-DTFE build (with PHASE_SPACE) ##################################
 # Produces PS-DTFE binary that uses Lagrangian-space triangulation (phase-space DTFE)
@@ -537,7 +552,7 @@ $(OBJ_DIR)/ps_interpolation$(OBJ_EXT): $(SRC)/CGAL_triangulation/ps_interpolatio
 
 PS_DTFE_CC_OBJS = $(OBJ_DIR_PS)/user_options$(OBJ_EXT) $(OBJ_DIR_PS)/quantities$(OBJ_EXT) $(OBJ_DIR_PS)/NGP_interpolation$(OBJ_EXT) $(OBJ_DIR_PS)/CIC_interpolation$(OBJ_EXT) $(OBJ_DIR_PS)/TSC_interpolation$(OBJ_EXT) $(OBJ_DIR_PS)/PCS_interpolation$(OBJ_EXT) $(OBJ_DIR_PS)/SPH_interpolation$(OBJ_EXT) $(OBJ_DIR_PS)/interlacing$(OBJ_EXT) $(OBJ_DIR_PS)/random$(OBJ_EXT)
 PS_DTFE_IO_OBJS = $(OBJ_DIR_PS)/input_output$(OBJ_EXT)
-PS_DTFE_TRIANG_OBJS = $(OBJ_DIR_PS)/unaveraged_interpolation$(OBJ_EXT) $(OBJ_DIR_PS)/averaged_interpolation_1$(OBJ_EXT) $(OBJ_DIR_PS)/averaged_interpolation_2$(OBJ_EXT) $(OBJ_DIR_PS)/ps_interpolation$(OBJ_EXT)
+PS_DTFE_TRIANG_OBJS = $(OBJ_DIR_PS)/unaveraged_interpolation$(OBJ_EXT) $(OBJ_DIR_PS)/averaged_interpolation_1$(OBJ_EXT) $(OBJ_DIR_PS)/averaged_interpolation_2$(OBJ_EXT) $(OBJ_DIR_PS)/ps_interpolation$(OBJ_EXT) $(OBJ_DIR_PS)/ps_point_eval$(OBJ_EXT)
 
 # Same wipe-vs-build serialization as the DTFE target above.
 PS-DTFE: ps_gpu_mode_check
@@ -603,6 +618,9 @@ $(OBJ_DIR_PS)/averaged_interpolation_2$(OBJ_EXT): $(SRC)/CGAL_triangulation/aver
 $(OBJ_DIR_PS)/ps_interpolation$(OBJ_EXT): $(SRC)/CGAL_triangulation/ps_interpolation.cc $(SRC)/CGAL_triangulation/gpu_host.h $(addprefix $(SRC)/, $(TRIANG_HEADERS)) Makefile
 	$(CC) $(COMPILE_FLAGS_PS) $(DTFE_INC) -o $@ -c $(SRC)/CGAL_triangulation/ps_interpolation.cc
 
+$(OBJ_DIR_PS)/ps_point_eval$(OBJ_EXT): $(SRC)/CGAL_triangulation/ps_point_eval.cc $(addprefix $(SRC)/, $(TRIANG_HEADERS)) Makefile
+	$(CC) $(COMPILE_FLAGS_PS) $(DTFE_INC) -o $@ -c $(SRC)/CGAL_triangulation/ps_point_eval.cc
+
 # Metal GPU deposit host (METAL=1 only). The kernel source is embedded via a generated header so
 # the binary needs no runtime file lookup; Metal compiles it once per process.
 $(OBJ_DIR_PS)/ps_deposit_msl.h: metal/ps_deposit.metal Makefile
@@ -638,7 +656,7 @@ $(OBJ_DIR)/dtfe_gpu_cuda$(OBJ_EXT): $(SRC)/CGAL_triangulation/dtfe_gpu_cuda.cu $
 
 DTFE_CC_LIB_OBJS = $(OBJ_DIR)/user_options_l$(OBJ_EXT) $(OBJ_DIR)/quantities_l$(OBJ_EXT) $(OBJ_DIR)/NGP_interpolation_l$(OBJ_EXT) $(OBJ_DIR)/CIC_interpolation_l$(OBJ_EXT) $(OBJ_DIR)/TSC_interpolation_l$(OBJ_EXT) $(OBJ_DIR)/PCS_interpolation_l$(OBJ_EXT) $(OBJ_DIR)/SPH_interpolation_l$(OBJ_EXT) $(OBJ_DIR)/interlacing_l$(OBJ_EXT) $(OBJ_DIR)/random_l$(OBJ_EXT)
 IO_CC_LIB_OBJS = $(OBJ_DIR)/input_output_l$(OBJ_EXT)
-TRIANG_CC_LIB_OBJS = $(OBJ_DIR)/unaveraged_interpolation_l$(OBJ_EXT) $(OBJ_DIR)/averaged_interpolation_1_l$(OBJ_EXT) $(OBJ_DIR)/averaged_interpolation_2_l$(OBJ_EXT) $(OBJ_DIR)/ps_interpolation_l$(OBJ_EXT)
+TRIANG_CC_LIB_OBJS = $(OBJ_DIR)/unaveraged_interpolation_l$(OBJ_EXT) $(OBJ_DIR)/averaged_interpolation_1_l$(OBJ_EXT) $(OBJ_DIR)/averaged_interpolation_2_l$(OBJ_EXT) $(OBJ_DIR)/ps_interpolation_l$(OBJ_EXT) $(OBJ_DIR)/ps_point_eval_l$(OBJ_EXT)
 
 # Same wipe-vs-build serialization as the DTFE target (the library shares $(OBJ_DIR)).
 library: dtfe_gpu_mode_check
@@ -652,6 +670,7 @@ library-build: set_directories set_directories_2 $(addprefix $(SRC)/, $(LIB_FILE
 	$(CC) $(COMPILE_FLAGS) -fPIC $(DTFE_INC) -o $(OBJ_DIR)/averaged_interpolation_1_l$(OBJ_EXT) -c $(SRC)/CGAL_triangulation/averaged_interpolation_1.cc
 	$(CC) $(COMPILE_FLAGS) -fPIC $(DTFE_INC) -o $(OBJ_DIR)/averaged_interpolation_2_l$(OBJ_EXT) -c $(SRC)/CGAL_triangulation/averaged_interpolation_2.cc
 	$(CC) $(COMPILE_FLAGS) -fPIC $(DTFE_INC) -o $(OBJ_DIR)/ps_interpolation_l$(OBJ_EXT) -c $(SRC)/CGAL_triangulation/ps_interpolation.cc
+	$(CC) $(COMPILE_FLAGS) -fPIC $(DTFE_INC) -o $(OBJ_DIR)/ps_point_eval_l$(OBJ_EXT) -c $(SRC)/CGAL_triangulation/ps_point_eval.cc
 	$(CC) $(COMPILE_FLAGS) -fPIC $(DTFE_INC) -o $(OBJ_DIR)/input_output_l$(OBJ_EXT) -c $(SRC)/input_output.cc
 	$(CC) $(COMPILE_FLAGS) -fPIC $(DTFE_INC) -o $(OBJ_DIR)/user_options_l$(OBJ_EXT) -c $(SRC)/user_options.cc
 	$(CC) $(COMPILE_FLAGS) -fPIC $(DTFE_INC) -o $(OBJ_DIR)/quantities_l$(OBJ_EXT) -c $(SRC)/quantities.cc
@@ -667,6 +686,52 @@ library-build: set_directories set_directories_2 $(addprefix $(SRC)/, $(LIB_FILE
 
 clean:
 	$(RM_RF) $(BIN_DIR)/DTFE$(EXE_EXT) $(BIN_DIR)/PS-DTFE$(EXE_EXT) $(OBJ_DIR)/*$(OBJ_EXT) $(OBJ_DIR_PS)/*$(OBJ_EXT) $(LIB_DIR)/*DTFE$(SHARED_EXT)
+
+# ---- deps-check: verify the required headers/libraries exist BEFORE a long compile dies
+# mid-build with a cryptic missing-header error, and print the per-platform install command
+# for anything missing. Each spec is header:name:brew-package:apt-package; the header is
+# searched in every -I directory this Makefile will pass to the compiler.
+DEPS_SPECS = \
+	gsl/gsl_math.h:GSL:gsl:libgsl-dev \
+	boost/program_options.hpp:Boost:boost:libboost-all-dev \
+	CGAL/version.h:CGAL:cgal:libcgal-dev \
+	gmp.h:GMP:gmp:libgmp-dev \
+	mpfr.h:MPFR:mpfr:libmpfr-dev \
+	H5Cpp.h:HDF5-C++:hdf5:libhdf5-dev \
+	fftw3.h:FFTW3:fftw:libfftw3-dev
+
+.PHONY: deps-check
+deps-check:
+	@echo ">> checking build dependencies (compiler: $(CC))"
+	@command -v $(firstword $(CC)) >/dev/null 2>&1 \
+		|| { echo "  MISSING  C++ compiler '$(CC)' (macOS: xcode-select --install && brew install llvm libomp; Linux: install g++)"; exit 1; }
+	@missing_brew=""; missing_apt=""; fail=0; \
+	incdirs="$(subst -I ,,$(INCLUDES)) /usr/include /usr/local/include /usr/include/*-linux-gnu"; \
+	for spec in $(DEPS_SPECS); do \
+		hdr=$$(echo "$$spec" | cut -d':' -f1); \
+		name=$$(echo "$$spec" | cut -d':' -f2); \
+		brewpkg=$$(echo "$$spec" | cut -d':' -f3); \
+		aptpkg=$$(echo "$$spec" | cut -d':' -f4); \
+		found=""; \
+		for inc in $$incdirs; do \
+			if [ -e "$$inc/$$hdr" ]; then found="$$inc/$$hdr"; break; fi; \
+		done; \
+		if [ -n "$$found" ]; then \
+			printf '   OK       %-12s %s\n' "$$name" "$$found"; \
+		else \
+			printf '   MISSING  %-12s (header %s not found on the include path)\n' "$$name" "$$hdr"; \
+			fail=1; missing_brew="$$missing_brew $$brewpkg"; missing_apt="$$missing_apt $$aptpkg"; \
+		fi; \
+	done; \
+	if [ "$$fail" -eq 1 ]; then \
+		echo ""; \
+		echo ">> missing dependencies -- install them with:"; \
+		echo "   macOS (Homebrew):  brew install$$missing_brew"; \
+		echo "   Ubuntu/Debian:     sudo apt-get install$$missing_apt"; \
+		echo "   Fedora/RHEL:       see the README 'Prerequisites' section"; \
+		exit 1; \
+	fi; \
+	echo ">> all build dependencies found"
 
 # Platform detection test (useful for debugging)
 test-platform:

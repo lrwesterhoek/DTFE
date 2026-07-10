@@ -111,7 +111,9 @@ install_macos() {
 
     print_info "Installing DTFE dependencies..."
 
-    PACKAGES=(gsl boost cgal mpfr hdf5 gmp)
+    # fftw: T-web tidal-tensor FFT; llvm + libomp: the Makefile prefers Homebrew clang++
+    # (Apple's clang has no bundled OpenMP runtime, so a plain CLT setup fails on -fopenmp)
+    PACKAGES=(gsl boost cgal mpfr hdf5 gmp fftw llvm libomp)
     
     for package in "${PACKAGES[@]}"; do
         if brew list "$package" &> /dev/null; then
@@ -141,7 +143,8 @@ install_ubuntu_debian() {
         libcgal-dev \
         libmpfr-dev \
         libhdf5-dev \
-        libgmp-dev
+        libgmp-dev \
+        libfftw3-dev
     
     print_success "All dependencies installed successfully!"
 }
@@ -171,7 +174,8 @@ install_fedora_rhel() {
         CGAL-devel \
         mpfr-devel \
         hdf5-devel \
-        gmp-devel
+        gmp-devel \
+        fftw-devel
     
     print_success "All dependencies installed successfully!"
 }
@@ -190,7 +194,8 @@ install_arch() {
         cgal \
         mpfr \
         hdf5 \
-        gmp
+        gmp \
+        fftw
     
     print_success "All dependencies installed successfully!"
 }
@@ -206,7 +211,8 @@ install_opensuse() {
         cgal-devel \
         mpfr-devel \
         hdf5-devel \
-        gmp-devel
+        gmp-devel \
+        fftw3-devel
     
     print_success "All dependencies installed successfully!"
 }
@@ -231,7 +237,7 @@ verify_installation() {
     fi
 
     if [[ "$OS" == "macos" ]]; then
-        for package in gsl boost cgal mpfr hdf5 gmp; do
+        for package in gsl boost cgal mpfr hdf5 gmp fftw; do
             if brew list "$package" &> /dev/null 2>&1; then
                 print_success "$package is installed"
             else

@@ -47,7 +47,7 @@ void HDF5_readGadgetHeader(std::string filename,
 {
     const H5std_string FILE_NAME( filename );
 
-    H5File *file = new H5File( FILE_NAME, H5F_ACC_RDONLY, H5::FileAccPropList::DEFAULT );
+    H5File *file = new H5File( FILE_NAME, H5F_ACC_RDONLY );
     Group *group = new Group( file->openGroup("/Header") );
 
 
@@ -124,7 +124,7 @@ void HDF5_readGadgetData(std::string filename,
 
 
     const H5std_string FILE_NAME( filename );
-    H5File *file = new H5File( FILE_NAME, H5F_ACC_RDONLY, H5::FileAccPropList::DEFAULT );
+    H5File *file = new H5File( FILE_NAME, H5F_ACC_RDONLY );
     Group *group;
 
 
@@ -496,9 +496,9 @@ void HDF5_readGadgetData_HI(std::string filename,
             gadgetHeader.npart[i] = 0;
 
 
-    H5File *file = new H5File( filename.c_str(), H5F_ACC_RDONLY, H5::FileAccPropList::DEFAULT );   // gas data
+    H5File *file = new H5File( filename.c_str(), H5F_ACC_RDONLY );   // gas data
     Group *group;
-    H5File *file2 = new H5File( h1FileName.c_str(), H5F_ACC_RDONLY, H5::FileAccPropList::DEFAULT ); // HI fraction
+    H5File *file2 = new H5File( h1FileName.c_str(), H5F_ACC_RDONLY ); // HI fraction
 
 
     // read the coordinates

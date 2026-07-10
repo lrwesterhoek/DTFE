@@ -1,0 +1,23 @@
+# keep the docker build context small and NEVER ship host-compiled artifacts into the
+# image (stale .o files / mode stamps from another OS would corrupt the in-image build)
+.git
+.github/
+Dockerfile
+o/
+o_ps/
+DTFE
+PS-DTFE
+libDTFE.*
+DTFE_include/
+tests/tmp/
+tests/__pycache__/
+metal/*.air
+metal/*.metallib
+metal/deposit_prototype
+metal/validate_deposit
+third_party/
+figures/
+documentation/
+demo/
+*.hdf5
+*.runlog

@@ -19,7 +19,7 @@ SNAPSHOT_NUMBERS = [99]
 
 NUM_SUBFILES = 4
 
-BASE_DIR = "/Users/luukw/output/TNG300-3-Dark"
+BASE_DIR = "/Users/luukw/output/TNG100-3-Dark"
 
 SINGLE_FILES = [
 ]

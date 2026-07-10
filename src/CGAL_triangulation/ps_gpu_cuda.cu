@@ -35,6 +35,15 @@ struct PSDepositParams
     int      periodic;
     int      subOrigin[3];
     int      subDims[3];
+    // field flags, mirroring the Metal DepositParams: when 0 the corresponding moment grid
+    // is a 4-byte dummy the kernel never touches (mass and streams are always deposited).
+    // fVel = velocity moments (velocity or dispersion selected), fDisp = second moments
+    // (24 B per cell), fGrad = velocity-gradient moments (36 B per cell). fLinear =
+    // --ps-linear-deposit (density-weighted, per-tet-renormalized sample shares).
+    int      fVel;
+    int      fDisp;
+    int      fGrad;
+    int      fLinear;
     unsigned nTet;
 };
 
@@ -66,6 +75,14 @@ __device__ inline bool inverse3(const float A[3][3], float inv[3][3])
 
 __device__ inline int wrapIdx(int g, int n) { return ((g % n) + n) % n; }
 
+// --ps-linear-deposit sample weight: linear density at offset rel from vertex 0, clamped >= 0
+// (the +-1e-6 barycentric tolerance can graze negative).
+__device__ inline float linearWeight(const float rel[3], float d0, const float dG[3])
+{
+    float w = d0 + dG[0]*rel[0] + dG[1]*rel[1] + dG[2]*rel[2];
+    return w < 0.0f ? 0.0f : w;
+}
+
 // Sub-sample position for local sample index s (base-nSub digits) in cell 'raw' along axis dd.
 __device__ inline float samplePos(unsigned s, int dd, int nSub, const int raw[3], const PSDepositParams& P)
 {
@@ -79,28 +96,38 @@ __device__ inline float samplePos(unsigned s, int dd, int nSub, const int raw[3]
 __device__ inline void depositSample(float* mass, float* mom, float* m2, float* grad,
                                      unsigned* streams, unsigned flat,
                                      const float rel[3], float w,
-                                     const float u0[3], const float vG[3][3])
+                                     const float u0[3], const float vG[3][3],
+                                     bool fVel, bool fDisp, bool fGrad)
 {
     unsigned long long base = flat;
     atomicAdd(&mass[flat], w);
-    float vv[3];
-    for (int j=0; j<3; ++j)
+    if (fVel || fDisp)
     {
-        vv[j] = u0[j];
-        for (int i=0; i<3; ++i) vv[j] += vG[i][j]*rel[i];
-        atomicAdd(&mom[base*3ull + (unsigned long long)j], vv[j]*w);
+        float vv[3];
+        for (int j=0; j<3; ++j)
+        {
+            vv[j] = u0[j];
+            for (int i=0; i<3; ++i) vv[j] += vG[i][j]*rel[i];
+            if (fVel)
+                atomicAdd(&mom[base*3ull + (unsigned long long)j], vv[j]*w);
+        }
+        if (fDisp)
+        {
+            unsigned long long c = 0;
+            for (int i=0; i<3; ++i)
+                for (int j=i; j<3; ++j)
+                    atomicAdd(&m2[base*6ull + c++], w*vv[i]*vv[j]);
+        }
     }
-    unsigned long long c = 0;
-    for (int i=0; i<3; ++i)
-        for (int j=i; j<3; ++j)
-            atomicAdd(&m2[base*6ull + c++], w*vv[i]*vv[j]);
-    for (int j=0; j<3; ++j)
-        for (int i=0; i<3; ++i)
-            atomicAdd(&grad[base*9ull + (unsigned long long)(j*3+i)], vG[i][j]*w);
+    if (fGrad)
+        for (int j=0; j<3; ++j)
+            for (int i=0; i<3; ++i)
+                atomicAdd(&grad[base*9ull + (unsigned long long)(j*3+i)], vG[i][j]*w);
     atomicAdd(&streams[flat], 1u);
 }
 
 __global__ void psDepositFieldsKernel(const float* verts, const float* vels, const float* masses,
+                                      const float* dens,
                                       float* massGrid, float* momGrid, float* m2Grid, float* gradGrid,
                                       unsigned* strGrid, PSDepositParams P)
 {
@@ -127,10 +154,16 @@ __global__ void psDepositFieldsKernel(const float* verts, const float* vels, con
     float posInv[3][3];
     if (!inverse3(Ax, posInv)) return;
 
-    // constant per-tet velocity gradient: vG = posInv * (u_{k+1}-u_0)
-    float u0[3] = { vels[tid*12+0], vels[tid*12+1], vels[tid*12+2] };
-    float vG[3][3];
+    // constant per-tet velocity gradient vG = posInv * (u_{k+1}-u_0); skipped entirely (and
+    // the vels buffer never read -- it may be a 4-byte dummy) when no velocity-derived grid
+    // is requested (fVel, fDisp and fGrad all 0, i.e. a density-only run)
+    bool const fVel = P.fVel != 0, fDisp = P.fDisp != 0, fGrad = P.fGrad != 0;
+    bool const needsVel = fVel || fDisp || fGrad;
+    float u0[3] = { 0.0f, 0.0f, 0.0f };
+    float vG[3][3] = { {0.0f,0.0f,0.0f}, {0.0f,0.0f,0.0f}, {0.0f,0.0f,0.0f} };
+    if (needsVel)
     {
+        for (int j=0; j<3; ++j) u0[j] = vels[tid*12+j];
         float dV[3][3];
         for (int e=0; e<3; ++e)
             for (int j=0; j<3; ++j)
@@ -142,6 +175,23 @@ __global__ void psDepositFieldsKernel(const float* verts, const float* vels, con
                 for (int k=0; k<3; ++k) s += posInv[i][k]*dV[k][j];
                 vG[i][j] = s;
             }
+    }
+
+    // --ps-linear-deposit: constant density gradient across the tet (same affine convention
+    // as vG above); the vertex densities arrive per tet in the dens buffer.
+    bool const fLinear = P.fLinear != 0;
+    float d0 = 0.0f, dG[3] = {0.0f, 0.0f, 0.0f};
+    if (fLinear)
+    {
+        d0 = dens[tid*4+0];
+        float dd0[3];
+        for (int e=0; e<3; ++e) dd0[e] = dens[tid*4+e+1] - d0;
+        for (int i=0; i<3; ++i)
+        {
+            float s = 0.0f;
+            for (int k=0; k<3; ++k) s += posInv[i][k]*dd0[k];
+            dG[i] = s;
+        }
     }
 
     // Eulerian bbox -> raw cell range (+/-1 margin when sub-sampling; clamp only non-periodic)
@@ -158,10 +208,13 @@ __global__ void psDepositFieldsKernel(const float* verts, const float* vels, con
     int nSub = P.nSub;
     unsigned nSamp = unsigned(nSub)*unsigned(nSub)*unsigned(nSub);
 
-    // Two identical passes over (cell, sample): pass 0 counts N, pass 1 deposits m/N. The cell's
-    // wrap + sub-grid mapping is resolved BEFORE the sample loop (like the CPU inSub guard), so N
-    // counts exactly the samples that pass 1 deposits -- no mass is ever lost to invalid cells.
+    // Two identical passes over (cell, sample): pass 0 counts N (and, for the linear deposit,
+    // sums the sample weights), pass 1 deposits m/N -- or m*w/sumW when fLinear, which totals
+    // exactly m as well. The cell's wrap + sub-grid mapping is resolved BEFORE the sample loop
+    // (like the CPU inSub guard), so N counts exactly the samples that pass 1 deposits -- no
+    // mass is ever lost to invalid cells.
     unsigned N = 0;
+    float sumW = 0.0f;
     float share = 0.0f;
     for (int pass=0; pass<2; ++pass)
     {
@@ -197,8 +250,18 @@ __global__ void psDepositFieldsKernel(const float* verts, const float* vels, con
                 }
                 if (inside && sum<=1.0f+1.0e-6f)
                 {
-                    if (pass==0) N++;
-                    else         depositSample(massGrid,momGrid,m2Grid,gradGrid,strGrid, flat, rel, share, u0, vG);
+                    if (pass==0)
+                    {
+                        N++;
+                        if (fLinear) sumW += linearWeight(rel, d0, dG);
+                    }
+                    else
+                    {
+                        float w = share;
+                        if (fLinear && sumW > 0.0f)
+                            w = m * linearWeight(rel, d0, dG) / sumW;
+                        depositSample(massGrid,momGrid,m2Grid,gradGrid,strGrid, flat, rel, w, u0, vG, fVel, fDisp, fGrad);
+                    }
                 }
             }
         }
@@ -219,7 +282,7 @@ __global__ void psDepositFieldsKernel(const float* verts, const float* vels, con
         }
         unsigned flat = (unsigned(loc[0])*unsigned(P.subDims[1])+unsigned(loc[1]))*unsigned(P.subDims[2])+unsigned(loc[2]);
         for (int dd=0; dd<3; ++dd) crel[dd] = cen[dd]-v0[dd];
-        depositSample(massGrid,momGrid,m2Grid,gradGrid,strGrid, flat, crel, m, u0, vG);
+        depositSample(massGrid,momGrid,m2Grid,gradGrid,strGrid, flat, crel, m, u0, vG, fVel, fDisp, fGrad);
     }
 }
 
@@ -265,20 +328,28 @@ std::string gpuDeviceName()
 bool psGpuDepositFields(std::vector<float>& verts,
                         std::vector<float>& vels,
                         std::vector<float>& masses,
+                        std::vector<float>& dens,
                         const double boxLo[3], const double dx[3],
                         const size_t nGrid[3], const size_t subOrigin[3], const size_t subDims[3],
                         int nSub, bool periodic,
+                        bool fVel, bool fDisp, bool fGrad, bool fLinear,
                         PSGpuGrids& out, std::string& err)
 {
     std::lock_guard<std::mutex> lock(ctxMutex());   // serialize dispatches (single device)
     Ctx& c = ctx();
     if (!c.ready) { err = c.err; return false; }
 
+    // only the requested moment grids are allocated, host- and device-side: the m2 (24 B/cell)
+    // and grad (36 B/cell) grids dominate the deposit's footprint and most runs need neither
     size_t const nCell = subDims[0] * subDims[1] * subDims[2];
+    size_t const momBytes  = fVel  ? nCell * 12 : 4;
+    size_t const m2Bytes   = fDisp ? nCell * 24 : 4;
+    size_t const gradBytes = fGrad ? nCell * 36 : 4;
+    bool const needsVel = fVel || fDisp || fGrad;
     out.mass.assign(nCell, 0.f);
-    out.mom.assign(nCell * 3, 0.f);
-    out.m2.assign(nCell * 6, 0.f);
-    out.grad.assign(nCell * 9, 0.f);
+    out.mom.assign(fVel ? nCell * 3 : 0, 0.f);
+    out.m2.assign(fDisp ? nCell * 6 : 0, 0.f);
+    out.grad.assign(fGrad ? nCell * 9 : 0, 0.f);
     out.streams.assign(nCell, 0u);
     if (masses.empty()) return true;    // nothing to deposit (empty partition)
 
@@ -294,6 +365,11 @@ bool psGpuDepositFields(std::vector<float>& verts,
     }
     P.nSub     = nSub < 1 ? 1 : nSub;
     P.periodic = periodic ? 1 : 0;
+    P.fVel     = fVel  ? 1 : 0;
+    P.fDisp    = fDisp ? 1 : 0;
+    P.fGrad    = fGrad ? 1 : 0;
+    P.fLinear  = (fLinear && !dens.empty()) ? 1 : 0;
+    bool const useLin = P.fLinear != 0;
 
     size_t const nTetTotal = masses.size();
 
@@ -303,14 +379,14 @@ bool psGpuDepositFields(std::vector<float>& verts,
     if (const char* env = getenv("PS_GPU_CHUNK"))
     { long v = atol(env); if (v > 0) chunk = size_t(v); }
     if (chunk > nTetTotal) chunk = nTetTotal;
-    size_t const outBytes = nCell * (4 + 12 + 24 + 36 + 4);
+    size_t const outBytes = nCell * (4 + 4) + momBytes + m2Bytes + gradBytes;
     size_t const slack = size_t(64) << 20;
     size_t freeB = 0, totalB = 0;
     if (gpuMemGetInfo(&freeB, &totalB) == gpuSuccess)
     {
-        while (chunk > 50000 && outBytes + chunk*25*sizeof(float) + slack > freeB)
+        while (chunk > 50000 && outBytes + chunk*29*sizeof(float) + slack > freeB)
             chunk /= 2;
-        if (outBytes + chunk*25*sizeof(float) + slack > freeB)
+        if (outBytes + chunk*29*sizeof(float) + slack > freeB)
         {
             err = "insufficient GPU memory for the output grids (need > " +
                   std::to_string((outBytes+slack)>>20) + " MB free)";
@@ -318,26 +394,27 @@ bool psGpuDepositFields(std::vector<float>& verts,
         }
     }
 
-    float *dV=nullptr, *dU=nullptr, *dM=nullptr, *dMass=nullptr, *dMom=nullptr, *dM2=nullptr, *dGrad=nullptr;
+    float *dV=nullptr, *dU=nullptr, *dM=nullptr, *dD=nullptr, *dMass=nullptr, *dMom=nullptr, *dM2=nullptr, *dGrad=nullptr;
     unsigned *dStr=nullptr;
     auto freeAll = [&]()
     {
-        for (void* p : { (void*)dV,(void*)dU,(void*)dM,(void*)dMass,(void*)dMom,(void*)dM2,(void*)dGrad,(void*)dStr })
+        for (void* p : { (void*)dV,(void*)dU,(void*)dM,(void*)dD,(void*)dMass,(void*)dMom,(void*)dM2,(void*)dGrad,(void*)dStr })
             if (p) gpuFree(p);
     };
 
     bool ok = gpuCheck(gpuMalloc((void**)&dV,   chunk*12*sizeof(float)), "gpuMalloc verts",  err)
-          &&  gpuCheck(gpuMalloc((void**)&dU,   chunk*12*sizeof(float)), "gpuMalloc vels",   err)
+          &&  gpuCheck(gpuMalloc((void**)&dU,   needsVel ? chunk*12*sizeof(float) : 4), "gpuMalloc vels", err)
+          &&  gpuCheck(gpuMalloc((void**)&dD,   useLin ? chunk*4*sizeof(float) : 4), "gpuMalloc dens", err)
           &&  gpuCheck(gpuMalloc((void**)&dM,   chunk*sizeof(float)),    "gpuMalloc masses", err)
           &&  gpuCheck(gpuMalloc((void**)&dMass, nCell*4),  "gpuMalloc mass grid", err)
-          &&  gpuCheck(gpuMalloc((void**)&dMom,  nCell*12), "gpuMalloc mom grid",  err)
-          &&  gpuCheck(gpuMalloc((void**)&dM2,   nCell*24), "gpuMalloc m2 grid",   err)
-          &&  gpuCheck(gpuMalloc((void**)&dGrad, nCell*36), "gpuMalloc grad grid", err)
+          &&  gpuCheck(gpuMalloc((void**)&dMom,  momBytes),  "gpuMalloc mom grid",  err)
+          &&  gpuCheck(gpuMalloc((void**)&dM2,   m2Bytes),   "gpuMalloc m2 grid",   err)
+          &&  gpuCheck(gpuMalloc((void**)&dGrad, gradBytes), "gpuMalloc grad grid", err)
           &&  gpuCheck(gpuMalloc((void**)&dStr,  nCell*4),  "gpuMalloc streams",   err)
           &&  gpuCheck(gpuMemset(dMass, 0, nCell*4),  "gpuMemset mass", err)
-          &&  gpuCheck(gpuMemset(dMom,  0, nCell*12), "gpuMemset mom",  err)
-          &&  gpuCheck(gpuMemset(dM2,   0, nCell*24), "gpuMemset m2",   err)
-          &&  gpuCheck(gpuMemset(dGrad, 0, nCell*36), "gpuMemset grad", err)
+          &&  gpuCheck(gpuMemset(dMom,  0, momBytes),  "gpuMemset mom",  err)
+          &&  gpuCheck(gpuMemset(dM2,   0, m2Bytes),   "gpuMemset m2",   err)
+          &&  gpuCheck(gpuMemset(dGrad, 0, gradBytes), "gpuMemset grad", err)
           &&  gpuCheck(gpuMemset(dStr,  0, nCell*4),  "gpuMemset streams", err);
 
     int const tpb = 256;
@@ -346,10 +423,11 @@ bool psGpuDepositFields(std::vector<float>& verts,
         unsigned const n = unsigned(std::min(chunk, nTetTotal - start));
         P.nTet = n;
         ok = gpuCheck(gpuMemcpy(dV, verts.data()  + start*12, size_t(n)*12*sizeof(float), gpuMemcpyHostToDevice), "copy verts",  err)
-         &&  gpuCheck(gpuMemcpy(dU, vels.data()   + start*12, size_t(n)*12*sizeof(float), gpuMemcpyHostToDevice), "copy vels",   err)
+         &&  (!needsVel || gpuCheck(gpuMemcpy(dU, vels.data() + start*12, size_t(n)*12*sizeof(float), gpuMemcpyHostToDevice), "copy vels", err))
+         &&  (!useLin   || gpuCheck(gpuMemcpy(dD, dens.data() + start*4,  size_t(n)*4*sizeof(float),  gpuMemcpyHostToDevice), "copy dens", err))
          &&  gpuCheck(gpuMemcpy(dM, masses.data() + start,    size_t(n)*sizeof(float),    gpuMemcpyHostToDevice), "copy masses", err);
         if (!ok) break;
-        psDepositFieldsKernel<<< (n + tpb - 1)/tpb, tpb >>>(dV, dU, dM, dMass, dMom, dM2, dGrad, dStr, P);
+        psDepositFieldsKernel<<< (n + tpb - 1)/tpb, tpb >>>(dV, dU, dM, dD, dMass, dMom, dM2, dGrad, dStr, P);
         ok = gpuCheck(gpuGetLastError(), "kernel launch", err)
          &&  gpuCheck(gpuDeviceSynchronize(), "kernel execution", err);
     }
@@ -358,12 +436,13 @@ bool psGpuDepositFields(std::vector<float>& verts,
     std::vector<float>().swap(verts);
     std::vector<float>().swap(vels);
     std::vector<float>().swap(masses);
+    std::vector<float>().swap(dens);
 
     if (ok)
         ok = gpuCheck(gpuMemcpy(out.mass.data(),    dMass, nCell*4,  gpuMemcpyDeviceToHost), "copy mass back",    err)
-         &&  gpuCheck(gpuMemcpy(out.mom.data(),     dMom,  nCell*12, gpuMemcpyDeviceToHost), "copy mom back",     err)
-         &&  gpuCheck(gpuMemcpy(out.m2.data(),      dM2,   nCell*24, gpuMemcpyDeviceToHost), "copy m2 back",      err)
-         &&  gpuCheck(gpuMemcpy(out.grad.data(),    dGrad, nCell*36, gpuMemcpyDeviceToHost), "copy grad back",    err)
+         &&  (!fVel  || gpuCheck(gpuMemcpy(out.mom.data(),  dMom,  nCell*12, gpuMemcpyDeviceToHost), "copy mom back",  err))
+         &&  (!fDisp || gpuCheck(gpuMemcpy(out.m2.data(),   dM2,   nCell*24, gpuMemcpyDeviceToHost), "copy m2 back",   err))
+         &&  (!fGrad || gpuCheck(gpuMemcpy(out.grad.data(), dGrad, nCell*36, gpuMemcpyDeviceToHost), "copy grad back", err))
          &&  gpuCheck(gpuMemcpy(out.streams.data(), dStr,  nCell*4,  gpuMemcpyDeviceToHost), "copy streams back", err);
 
     freeAll();

@@ -89,7 +89,16 @@ inline double autoTuneBytesPerCell(Field &f, bool const phaseSpace)
     if ( f.scalar_gradient ) b += noScalarGradComp*R;
     if ( f.velocity_tweb ) b += R + 3.*R;                          // web label + eigenvalues
     if ( f.velocity_vweb ) b += R + 3.*R;
-    if ( phaseSpace ) b += R + R;                                  // stream_count + mass_weight
+    if ( phaseSpace )
+    {
+        b += R;                                                    // stream_count
+        // mass_weight is a separate grid only when weighted fields are selected WITHOUT the
+        // density field (with density it aliases the density accumulator; 2026-07 change)
+        bool const weighted = f.velocity or f.velocity_gradient or f.velocity_dispersion
+                              or f.velocity_divergence or f.velocity_shear or f.velocity_vorticity
+                              or f.velocity_vweb or f.scalar or f.scalar_gradient;
+        if ( weighted and not f.density ) b += R;
+    }
     return b;
 }
 
@@ -149,6 +158,17 @@ inline void autoTunePartitioning(User_options &u,
     double const partBytes = double(sizeof(Particle_data));
     double const fixed = partBytes*N + gridTotal*bCell;    // originals + full-grid accumulators
 
+    // which per-tet/per-cell GPU-deposit pieces this field selection actually needs
+    // (2026-07: unselected moment grids are no longer allocated, and the tet velocity
+    // array is only extracted when a velocity-derived grid is requested). The velocity
+    // derivatives (divergence etc.) are folded into the gradient AFTER auto-tune runs,
+    // so count them here as gradient requests.
+    bool const psVel  = u.uField.velocity or u.uField.velocity_dispersion
+                        or u.aField.velocity or u.aField.velocity_dispersion;
+    bool const psDisp = u.uField.velocity_dispersion or u.aField.velocity_dispersion;
+    bool const psGrad = u.uField.velocity_gradient or u.uField.selectedVelocityDerivatives()
+                        or u.aField.velocity_gradient or u.aField.selectedVelocityDerivatives();
+
     // per-partition bytes for an n^3 Lagrangian split
     auto partitionBytes = [&](int n) -> double
     {
@@ -162,7 +182,14 @@ inline void autoTunePartitioning(User_options &u,
         for (int d=0; d<NO_DIM; ++d)
             subCells *= double(u.gridSize[d])/double(n) + 40.;       // psUseSubgrid crop + slop
         if ( metalActive )
-            m += 200.*6.77*nOwn + 160.*subCells;    // flat tet arrays (transient) + PSGpuGrids host+GPU
+        {
+            // flat tet arrays (verts 48 + masses 4 B/tet, + vels 48 when velocity-derived
+            // grids are requested; the cost-sort permutes IN PLACE since 2026-07, so no
+            // gather copy) + the PSGpuGrids host and device copies of the selected grids
+            double const perTet = (52. + (psVel or psDisp or psGrad ? 48. : 0.)) * 1.3;   // + allocator slack
+            double const gridB  = 8. + (psVel ? 12. : 0.) + (psDisp ? 24. : 0.) + (psGrad ? 36. : 0.);
+            m += perTet*6.77*nOwn + 2.*gridB*subCells;
+        }
         else
             m += 52.*subCells;                      // CPU deposit sub-grids
         return m;

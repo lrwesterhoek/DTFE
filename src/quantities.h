@@ -76,7 +76,12 @@ struct Quantities
     void reserveMemory(size_t *gridSize, Field &field); // reserve main-grid memory for the 'partition' option
     void addFrom(Quantities const &other); // element-wise accumulate from another Quantities (PS-DTFE partitioning)
 #ifdef PHASE_SPACE
-    void normalizePhaseSpace(Field const &field); // turn summed density-weighted moments into mass-weighted means (call once, after all partitions added)
+    // Turn summed density-weighted moments into mass-weighted means (call once, after all
+    // partitions added). When the partitions aliased the weight to the density grid (density
+    // field selected -> no mass_weight was filled), pass weightFromDensityScale =
+    // cellVolume * averageDensity so the per-cell mass is reconstructed from the summed
+    // (rho/rho_bar) density; 0 keeps the historical mass_weight-only behaviour.
+    void normalizePhaseSpace(Field const &field, Real const weightFromDensityScale = Real(0.));
     void addFromSubgrid(Quantities const &other, size_t const *fullGrid); // like addFrom but 'other' stores only its Eulerian box; maps each cell into the full grid (dims fullGrid)
 #endif
 };

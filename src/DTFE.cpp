@@ -40,6 +40,7 @@
 #include "miscellaneous.h"
 #include "message.h"
 #include "auto_tune.h"
+#include "ps_point_eval.h"
 
 
 using namespace std;
@@ -423,6 +424,14 @@ void DTFE(vector<Particle_data> *allParticles,
 #endif
 
 #ifdef PHASE_SPACE
+    // arbitrary-point evaluation (--sample-points): load the query points and build their
+    // bucket index once, now that region/periodic/averageDensity are final. Each partition
+    // below then contributes its streams; psPointEvalFinalize() reduces them at the end.
+    if ( not state.options.psSamplePointsFile.empty() )
+        psPointEvalInit( state.options );
+#endif
+
+#ifdef PHASE_SPACE
     if ( userOptions.partitionOn and userOptions.partNo<0 )
     {
         // PS-DTFE partitions in Lagrangian space (Eulerian partitioning fails because Lagrangian cells
@@ -625,9 +634,17 @@ void DTFE(vector<Particle_data> *allParticles,
         std::vector<Particle_data>().swap( state.particles );
 
         // fields were summed as density-weighted moments; normalize once now so cells drawing
-        // streams from several partitions (multi-stream regions) come out correct
-        uQuantities->normalizePhaseSpace( state.options.uField );
-        aQuantities->normalizePhaseSpace( state.options.aField );
+        // streams from several partitions (multi-stream regions) come out correct. When the
+        // density field is selected the partitions alias the weight to the density grid, so
+        // pass the scale that turns the summed rho/rho_bar back into the per-cell mass.
+        {
+            Real cellVolume = Real(1.);
+            for (int d = 0; d < NO_DIM; ++d)
+                cellVolume *= (state.options.region[2*d+1] - state.options.region[2*d]) / Real(state.options.gridSize[d]);
+            Real const weightScale = cellVolume * state.options.averageDensity;
+            uQuantities->normalizePhaseSpace( state.options.uField, weightScale );
+            aQuantities->normalizePhaseSpace( state.options.aField, weightScale );
+        }
 
         // aggregate coverage / stream statistics over all partitions from the summed grid
         // (per-partition figures were suppressed as misleading); prefer the unaveraged
@@ -722,6 +739,13 @@ void DTFE(vector<Particle_data> *allParticles,
         DTFE_preparePadding( state, userOptions );
         DTFE_parallel( &state.particles, samples, state.options, uQuantities, aQuantities );
     }
+
+#ifdef PHASE_SPACE
+    // all partitions (or the single triangulation) have contributed their streams: reduce the
+    // per-point records to the final density/velocity/dispersion/stream-count outputs
+    if ( psPointEvalActive() )
+        psPointEvalFinalize( state.options );
+#endif
 
     // post-processing: derive velocity divergence/shear/vorticity and cosmic-web labels from the gradient
     computeDivergenceShearVorticity( userOptions.uField, userOptions.verboseLevel, uQuantities );

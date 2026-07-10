@@ -36,7 +36,11 @@ void interpolateGrid_averaged_3(DT &dt, User_options &userOptions, Quantities *q
 void interpolateRedshiftCone_averaged_2(DT &dt, User_options &userOptions, Quantities *quantities);
 void interpolateUserSampling_averaged_2(DT &dt, vector<Sample_point> &samples, User_options &userOptions, Quantities *quantities);
 #ifdef PHASE_SPACE
-void interpolateGrid_phaseSpace(DT &dt, User_options &userOptions, Quantities *quantities, Field &field, int nSub);
+// mayClearDT: this call is the triangulation's LAST use and dt is internally owned -> the
+// deposit may free it early (right after its last read) instead of at partition scope end.
+void interpolateGrid_phaseSpace(DT &dt, User_options &userOptions, Quantities *quantities, Field &field, int nSub, bool mayClearDT = false);
+#include "../ps_point_eval.h"
+void interpolatePoints_phaseSpace(DT &dt, User_options &userOptions);   // ps_point_eval.cc
 #endif
 
 
@@ -106,6 +110,18 @@ void DTFE_interpolation(vector<Particle_data> *p,
 #endif
 
 
+#ifdef PHASE_SPACE
+    // arbitrary-point evaluation (--sample-points): collect this triangulation's stream
+    // contributions for every query point; results accumulate across the Lagrangian
+    // partitions and are reduced once by psPointEvalFinalize() (called from DTFE()).
+    if ( psPointEvalActive() )
+    {
+        t.start();
+        interpolatePoints_phaseSpace( dt, userOptions );
+        printComputationTime( &t, &userOptions, "point evaluation (--sample-points)" );
+    }
+#endif
+
     // Voronoi: NGP-assign vertex densities to grid (piecewise-constant; bypasses DTFE linear interpolation)
     if ( userOptions.Voronoi )
     {
@@ -168,9 +184,11 @@ void DTFE_interpolation(vector<Particle_data> *p,
     {
         t.start();
 #ifdef PHASE_SPACE
-        // PS-DTFE iterates over cells to handle multi-stream regions
+        // PS-DTFE iterates over cells to handle multi-stream regions; the triangulation may
+        // be torn down after the LAST of the (up to two) grid passes when dt is internally owned
         if ( not userOptions.redshiftConeOn and not userOptions.userDefinedSampling )
-            interpolateGrid_phaseSpace( dt, userOptions, uQuantities, userOptions.uField, 1 );
+            interpolateGrid_phaseSpace( dt, userOptions, uQuantities, userOptions.uField, 1,
+                                        userOptions.psMayClearDT and not userOptions.aField.selected() );
         else
             throwError( "PS-DTFE currently only supports regular grid interpolation (no redshift cone or user-defined sampling)." );
 #else
@@ -190,7 +208,8 @@ void DTFE_interpolation(vector<Particle_data> *p,
 #ifdef PHASE_SPACE
         // PS-DTFE averaged fields: sub-sample each grid cell nSub^NO_DIM times (--avg-subsamples, default 3)
         if ( not userOptions.redshiftConeOn and not userOptions.userDefinedSampling )
-            interpolateGrid_phaseSpace( dt, userOptions, aQuantities, userOptions.aField, userOptions.psAvgSubsamples );
+            interpolateGrid_phaseSpace( dt, userOptions, aQuantities, userOptions.aField, userOptions.psAvgSubsamples,
+                                        userOptions.psMayClearDT );
         else
             throwError( "PS-DTFE averaged fields support only regular-grid interpolation (no redshift cone or user-defined sampling)." );
 #else
@@ -229,6 +248,12 @@ void DTFE_interpolation(vector<Particle_data> *p,
                         Quantities *aQuantities)
 {
     DT dt;
+#ifdef PHASE_SPACE
+    // dt is owned here, so the last PS grid pass may clear it right after its deposit --
+    // that frees the triangulation (~650 B/vertex) during the stats/merge phase instead of
+    // holding it until this scope ends (~5 GB per concurrent partition at production scale)
+    userOptions.psMayClearDT = true;
+#endif
     DTFE_interpolation( p, samples, userOptions, uQuantities, aQuantities, dt );
 }
 
