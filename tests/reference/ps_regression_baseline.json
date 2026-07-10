@@ -1,0 +1,10 @@
+{
+  "mass_ratio": 1.0,
+  "multistream_fraction": 0.1667,
+  "max_streams": 4,
+  "coverage": 1.0,
+  "slab_stream_median": 3,
+  "void_stream_median": 1,
+  "max_vx": 2466.3,
+  "slab_dispersion": 2732219.62
+}

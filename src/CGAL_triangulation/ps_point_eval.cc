@@ -287,101 +287,15 @@ void interpolatePoints_phaseSpace(DT &dt, User_options &userOptions)
     {
         Cell_handle cell = itC;
 
-        // ---- the CPU grid deposit's filters, verbatim (see interpolateGrid_phaseSpace) ----
-#ifdef TEST_PADDING
-        // Skip cells touching a dummy padding vertex.
-        bool hasDummy = false;
-        for (int v = 0; v <= NO_DIM; ++v)
-            if (cell->vertex(v)->info().isDummy()) { hasDummy = true; break; }
-        if (hasDummy) { continue; }
-#endif
-
-        // Lagrangian-partition ownership by centroid: tiles without double-counting.
-        if ( !userOptions.lagrangianRegion.isNullBox() )
-        {
-            double cen[NO_DIM];
-            for (int d = 0; d < NO_DIM; ++d) cen[d] = 0.;
-            for (int v = 0; v <= NO_DIM; ++v)
-                for (int d = 0; d < NO_DIM; ++d)
-                    cen[d] += double(cell->vertex(v)->point()[d]);
-            bool owned = true;
-            for (int d = 0; d < NO_DIM; ++d)
-            {
-                cen[d] /= double(NO_DIM + 1);
-                if ( cen[d] < userOptions.lagrangianRegion[2*d] || cen[d] >= userOptions.lagrangianRegion[2*d+1] )
-                { owned = false; break; }
-            }
-            if (!owned) { continue; }
-        }
-
-        // zero/negative-density vertex: periodic -> hull artefact, drop; non-periodic -> real
-        // cloud surface, use the constant volume-ratio density for the 'dtfe' variant too.
-        bool useVolumeRatioDensity = false;
-        {
-            bool hasBadVertex = false;
-            for (int v = 0; v <= NO_DIM; ++v)
-                if (cell->vertex(v)->info().density() <= Real(0.)) { hasBadVertex = true; break; }
-            if (hasBadVertex)
-            {
-                if ( userOptions.periodic ) { continue; }
-                useVolumeRatioDensity = true;
-            }
-        }
-
-        // Eulerian vertex positions with the deposit's minimum-image wrap (Real arithmetic,
-        // so borderline cells classify identically to the grid path).
-        Real eulerPos[NO_DIM+1][NO_DIM];
-        for (int v = 0; v <= NO_DIM; ++v)
-            for (int d = 0; d < NO_DIM; ++d)
-                eulerPos[v][d] = cell->vertex(v)->info().eulerianPosition(d);
-
-        if ( userOptions.periodic )
-        {
-            Real boxLen[NO_DIM];
-            for (int d = 0; d < NO_DIM; ++d)
-                boxLen[d] = boxCoordinates[2*d+1] - boxCoordinates[2*d];
-
-            for (int v = 1; v <= NO_DIM; ++v)
-                for (int d = 0; d < NO_DIM; ++d)
-                {
-                    Real diff = eulerPos[v][d] - eulerPos[0][d];
-                    if (diff >  boxLen[d] * Real(0.5)) eulerPos[v][d] -= boxLen[d];
-                    if (diff < -boxLen[d] * Real(0.5)) eulerPos[v][d] += boxLen[d];
-                }
-        }
-
-        double Ax[NO_DIM][NO_DIM];
-        for (int v = 0; v < NO_DIM; ++v)
-            for (int i = 0; i < NO_DIM; ++i)
-                Ax[v][i] = double(eulerPos[v+1][i]) - double(eulerPos[0][i]);
-
-        double const cellAbsDet = std::fabs( determinant(Ax) );
-
-        double const DEGENERATE_DET_TOL = 1.e-6;
-        {
-            double avgEdge2 = 0.;
-            for (int v = 0; v < NO_DIM; ++v)
-            {
-                double len2 = 0.;
-                for (int i = 0; i < NO_DIM; ++i)
-                    len2 += Ax[v][i] * Ax[v][i];
-                avgEdge2 += len2;
-            }
-            avgEdge2 /= NO_DIM;
-            double edgeScale = avgEdge2 * std::sqrt(avgEdge2);
-            if (cellAbsDet < DEGENERATE_DET_TOL * edgeScale) { continue; }
-        }
-
-        {
-            Real posMatInv[NO_DIM][NO_DIM];
-            matrixInverse(Ax, posMatInv);
-            bool singularInverse = true;
-            for (int a = 0; a < NO_DIM && singularInverse; ++a)
-                for (int b = 0; b < NO_DIM; ++b)
-                    if (posMatInv[a][b] != Real(0.)) { singularInverse = false; break; }
-            if (singularInverse) { continue; }
-        }
-        // ---- end of the shared filter chain ----
+        // The CPU grid deposit's filter chain, shared via ps_cell_filter.h (Real/double
+        // arithmetic identical to the grid path, so borderline cells classify identically).
+        PSCellGeometry geo;
+        if ( !psFilterCell(cell, userOptions, boxCoordinates, true, NULL, geo) )
+            continue;
+        bool const useVolumeRatioDensity = geo.useVolumeRatioDensity;
+        Real (&eulerPos)[NO_DIM+1][NO_DIM] = geo.eulerPos;
+        double (&Ax)[NO_DIM][NO_DIM] = geo.Ax;
+        double const cellAbsDet = geo.cellAbsDet;
 
         // double-precision inverse for the evaluation (same zero criterion as above)
         double inv[NO_DIM][NO_DIM];

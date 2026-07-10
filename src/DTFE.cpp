@@ -74,6 +74,20 @@ void computeTidalWebClassification(Field &fields,
                                    User_options const &userOptions,
                                    Quantities *q);
 
+// Post-processing shared by both DTFE() overloads: derive velocity divergence/shear/vorticity
+// and the V-web / T-web labels for the unaveraged and averaged quantities.
+void postProcessWebFields(User_options &userOptions,
+                          Quantities *uQuantities,
+                          Quantities *aQuantities)
+{
+    computeDivergenceShearVorticity( userOptions.uField, userOptions.verboseLevel, uQuantities );
+    computeDivergenceShearVorticity( userOptions.aField, userOptions.verboseLevel, aQuantities );
+    computeWebClassification( userOptions.uField, userOptions.verboseLevel, userOptions.lambda_th, userOptions.hubbleParam, uQuantities );
+    computeWebClassification( userOptions.aField, userOptions.verboseLevel, userOptions.lambda_th, userOptions.hubbleParam, aQuantities );
+    computeTidalWebClassification( userOptions.uField, userOptions, uQuantities );
+    computeTidalWebClassification( userOptions.aField, userOptions, aQuantities );
+}
+
 // Builds the velocity-space DTFE density g_i used by the approximate phase-space density (--approxPSD).
 #if defined(VELOCITY) && defined(SCALAR) && !defined(PHASE_SPACE)
 extern void computeVelocitySpaceDensity(vector<Particle_data> &particles,
@@ -86,6 +100,33 @@ struct DTFE_State {
     vector<Particle_data> particles;
     User_options options;
 };
+
+#ifdef PHASE_SPACE
+// Global Lagrangian bounding box (min/max of lagPos over all particles) with a tiny
+// relative margin so boundary particles are strictly inside.
+static void computeLagrangianBoundingBox(vector<Particle_data> const &particles,
+                                         Box &lagBox)
+{
+    for (int d=0; d<NO_DIM; ++d)
+    {
+        lagBox[2*d]   = particles[0].lagPos[d];
+        lagBox[2*d+1] = particles[0].lagPos[d];
+    }
+    for (size_t i=1; i<particles.size(); ++i)
+        for (int d=0; d<NO_DIM; ++d)
+        {
+            if (particles[i].lagPos[d] < lagBox[2*d])   lagBox[2*d]   = particles[i].lagPos[d];
+            if (particles[i].lagPos[d] > lagBox[2*d+1]) lagBox[2*d+1] = particles[i].lagPos[d];
+        }
+    // tiny margin to include boundary particles
+    for (int d=0; d<NO_DIM; ++d)
+    {
+        Real eps = (lagBox[2*d+1] - lagBox[2*d]) * Real(1.e-6);
+        lagBox[2*d]   -= eps;
+        lagBox[2*d+1] += eps;
+    }
+}
+#endif
 
 
 // Common DTFE setup: optional random/subsampled particles, consistency checks, velocity-derivative
@@ -284,25 +325,7 @@ void DTFE(vector<Particle_data> *allParticles,
     {
         MESSAGE::Message msg( userOptions.verboseLevel );
 
-        // global Lagrangian bounding box (min/max of lagPos over all particles)
-        for (int d=0; d<NO_DIM; ++d)
-        {
-            lagBoxGlobal[2*d]   = state.particles[0].lagPos[d];
-            lagBoxGlobal[2*d+1] = state.particles[0].lagPos[d];
-        }
-        for (size_t i=1; i<state.particles.size(); ++i)
-            for (int d=0; d<NO_DIM; ++d)
-            {
-                if (state.particles[i].lagPos[d] < lagBoxGlobal[2*d])   lagBoxGlobal[2*d]   = state.particles[i].lagPos[d];
-                if (state.particles[i].lagPos[d] > lagBoxGlobal[2*d+1]) lagBoxGlobal[2*d+1] = state.particles[i].lagPos[d];
-            }
-        // tiny margin to include boundary particles
-        for (int d=0; d<NO_DIM; ++d)
-        {
-            Real eps = (lagBoxGlobal[2*d+1] - lagBoxGlobal[2*d]) * Real(1.e-6);
-            lagBoxGlobal[2*d]   -= eps;
-            lagBoxGlobal[2*d+1] += eps;
-        }
+        computeLagrangianBoundingBox( state.particles, lagBoxGlobal );
 
         // Eulerian box length per axis, used both for unwrapping and for shifting periodic copies
         Real eulerLen[NO_DIM];
@@ -448,30 +471,9 @@ void DTFE(vector<Particle_data> *allParticles,
         // reuse the Lagrangian bounding box computed before periodic copies, else recompute it here
         Box lagBox;
         if (!lagBoxGlobal.isNullBox())
-        {
             lagBox = lagBoxGlobal;
-        }
         else
-        {
-            for (int d=0; d<NO_DIM; ++d)
-            {
-                lagBox[2*d]   = state.particles[0].lagPos[d];
-                lagBox[2*d+1] = state.particles[0].lagPos[d];
-            }
-            for (size_t i=1; i<state.particles.size(); ++i)
-                for (int d=0; d<NO_DIM; ++d)
-                {
-                    if (state.particles[i].lagPos[d] < lagBox[2*d])   lagBox[2*d]   = state.particles[i].lagPos[d];
-                    if (state.particles[i].lagPos[d] > lagBox[2*d+1]) lagBox[2*d+1] = state.particles[i].lagPos[d];
-                }
-            // tiny margin to include boundary particles
-            for (int d=0; d<NO_DIM; ++d)
-            {
-                Real eps = (lagBox[2*d+1] - lagBox[2*d]) * Real(1.e-6);
-                lagBox[2*d]   -= eps;
-                lagBox[2*d+1] += eps;
-            }
-        }
+            computeLagrangianBoundingBox( state.particles, lagBox );
         message << MESSAGE::cBold() << "PS-DTFE:" << MESSAGE::cReset() << " Lagrangian bounding box = "
                 << MESSAGE::cMagenta() << lagBox.print() << MESSAGE::cReset() << "\n" << MESSAGE::Flush;
 
@@ -748,12 +750,7 @@ void DTFE(vector<Particle_data> *allParticles,
 #endif
 
     // post-processing: derive velocity divergence/shear/vorticity and cosmic-web labels from the gradient
-    computeDivergenceShearVorticity( userOptions.uField, userOptions.verboseLevel, uQuantities );
-    computeDivergenceShearVorticity( userOptions.aField, userOptions.verboseLevel, aQuantities );
-    computeWebClassification( userOptions.uField, userOptions.verboseLevel, userOptions.lambda_th, userOptions.hubbleParam, uQuantities );
-    computeWebClassification( userOptions.aField, userOptions.verboseLevel, userOptions.lambda_th, userOptions.hubbleParam, aQuantities );
-    computeTidalWebClassification( userOptions.uField, userOptions, uQuantities );
-    computeTidalWebClassification( userOptions.aField, userOptions, aQuantities );
+    postProcessWebFields( userOptions, uQuantities, aQuantities );
 }
 
 
@@ -1005,10 +1002,8 @@ int classifyWeb(Pvector<Real,NO_DIM> const &eigenvalues, Real lambda_th)
 
 
 // V-web classification from the velocity shear tensor Sigma_ij = -(1/(2 H0))(dv_i/dx_j + dv_j/dx_i)
-// (Hoffman et al. 2012). NOTE: this function previously also emitted a "T-web" computed from the
-// SAME symmetrized velocity gradient -- algebraically identical to the V-web (the outputs were
-// byte-identical), i.e. not a T-web at all. The physical T-web (tidal tensor of the potential,
-// Poisson-solved from the density grid) is computed by computeTidalWebClassification below.
+// (Hoffman et al. 2012). The physical T-web (tidal tensor of the potential, Poisson-solved from
+// the density grid) is computed by computeTidalWebClassification below.
 void computeWebClassification(Field &fields,
                                int const verboseLevel,
                                Real lambda_th,
@@ -1288,12 +1283,7 @@ void DTFE(vector<Particle_data> *allParticles,
         DTFE_interpolation( &state.particles, samples, state.options, uQuantities, aQuantities, delaunay_triangulation );
     }
 
-    computeDivergenceShearVorticity( userOptions.uField, userOptions.verboseLevel, uQuantities );
-    computeDivergenceShearVorticity( userOptions.aField, userOptions.verboseLevel, aQuantities );
-    computeWebClassification( userOptions.uField, userOptions.verboseLevel, userOptions.lambda_th, userOptions.hubbleParam, uQuantities );
-    computeWebClassification( userOptions.aField, userOptions.verboseLevel, userOptions.lambda_th, userOptions.hubbleParam, aQuantities );
-    computeTidalWebClassification( userOptions.uField, userOptions, uQuantities );
-    computeTidalWebClassification( userOptions.aField, userOptions, aQuantities );
+    postProcessWebFields( userOptions, uQuantities, aQuantities );
 }
 #endif
 

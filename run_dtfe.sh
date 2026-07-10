@@ -57,10 +57,8 @@ echo "Grid size: ${GRID_SIZE}"
 echo ""
 
 for i in "${SNAPSHOTS[@]}"; do
-    # Format snapshot number with leading zeros
     n_str=$(printf "%03d" "$i")
 
-    # Define paths
     input_dir="${DATA_DIR}/${INPUT_SUBDIR}_${n_str}"
     input_file="${input_dir}/combined_${n_str}.hdf5"
     # output prefix: files land as <snapdir>/output.a_den etc. (the 'dtfe' convention in dtfelib)
@@ -68,7 +66,6 @@ for i in "${SNAPSHOTS[@]}"; do
 
     echo "Processing snapshot ${n_str}..."
 
-    # Check if input file exists
     if [ ! -f "${input_file}" ]; then
         echo "  Warning: Input file not found: ${input_file}"
         echo "  Skipping snapshot ${n_str}"
@@ -84,7 +81,6 @@ for i in "${SNAPSHOTS[@]}"; do
     [ -n "${PARTITION}" ] && part_args+=(--partition ${PARTITION})
     [ -n "${MAX_CONCURRENT}" ] && part_args+=(--max-concurrent "${MAX_CONCURRENT}")
 
-    # Run DTFE
     echo "  Running DTFE on ${input_file}..."
     ./DTFE "${input_file}" "${output_root}" \
         --grid ${GRID_SIZE} \

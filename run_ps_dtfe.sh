@@ -50,7 +50,7 @@ fi
 
 # Lagrangian positions, matched to present-day Coordinates by ParticleID. Must be in the
 # SAME units as the snapshots (combined_*.hdf5 are h-removed ckpc, so the IC was rescaled
-# by 1/h via tools/convert_ic_units). Do NOT reconstruct the grid from ParticleID: TNG IDs
+# by 1/h via python/tools/convert_ic_units.py). Do NOT reconstruct the grid from ParticleID: TNG IDs
 # are Peano-Hilbert ordered, so id->(ix,iy,iz) is wrong.
 LAGRANGIAN_INPUT="${DATA_DIR}/combined_ics.hdf5"
 

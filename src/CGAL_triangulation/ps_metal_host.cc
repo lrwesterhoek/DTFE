@@ -18,27 +18,13 @@
 #include <unistd.h>
 
 #include "gpu_host.h"
+#include "ps_deposit_params.h"
 #include "ps_deposit_msl.h"   // generated: static const char PS_DEPOSIT_MSL[]
 #include "../message.h"       // ANSI colour helpers only (retry warning below)
 
 namespace {
 
-// must match the MSL DepositParams byte-for-byte
-struct DepositParams
-{
-    float    boxLo[3];
-    float    dx[3];
-    int32_t  nGrid[3];
-    int32_t  nSub;
-    int32_t  periodic;
-    int32_t  subOrigin[3];
-    int32_t  subDims[3];
-    int32_t  fVel;      // deposit velocity moments (velocity or dispersion selected)
-    int32_t  fDisp;     // deposit second moments (dispersion selected; 24 B per cell)
-    int32_t  fGrad;     // deposit velocity-gradient moments (36 B per cell)
-    int32_t  fLinear;   // --ps-linear-deposit: density-weighted (renormalized) sample shares
-    uint32_t nTet;
-};
+using DepositParams = PSDepositParams;   // shared host struct (ps_deposit_params.h)
 
 struct Ctx
 {
@@ -182,7 +168,7 @@ bool psGpuDepositFields(std::vector<float>& verts,
     }
 
     // Dispatch in CHUNKS of tetrahedra, one short command buffer each, FULLY SERIALIZED with a
-    // small host-side gap between buffers. Rationale (learned the hard way):
+    // small host-side gap between buffers. Why chunk + gaps:
     //  - one monolithic buffer runs minutes -> killed by the macOS GPU watchdog ("Impacting
     //    Interactivity") when the display needs the GPU;
     //  - keeping buffers back-to-back (pipelined) sustains 100% GPU queue pressure and gets killed

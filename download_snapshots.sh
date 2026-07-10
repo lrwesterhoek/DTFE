@@ -9,7 +9,7 @@
 #                          particle-based shape/orientation; trees themselves are separate)
 #
 # Usage:
-#   ./download_snapshots.sh [-k API_KEY] [-c] [-d DATA_DIR] [-s SIMULATION] [snapshot ...]
+#   ./download_snapshots.sh [-k API_KEY] [-c|-t] [-d DATA_DIR] [-s SIMULATION] [snapshot ...]
 #
 # Examples:
 #   ./download_snapshots.sh -c -s TNG50-3-Dark            # groupcats for the default ladder

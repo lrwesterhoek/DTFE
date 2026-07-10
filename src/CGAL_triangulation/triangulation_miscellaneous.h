@@ -59,9 +59,8 @@ inline Real eulerianVolume(const Cell_handle &cell)
     return simplexVolume(posDiff);
 }
 // NOTE: the per-cell Eulerian edge-matrix inverse and point-in-simplex test used by PS-DTFE live
-// inline in ps_interpolation.cc (interpolateGrid_phaseSpace), which correctly transposes the inverse
-// for the barycentric coordinates. A previous standalone pointInEulerianSimplex/eulerianPositionMatrix
-// pair here used the NON-transposed product (incorrect) and had no call sites; removed to avoid reuse.
+// inline in ps_interpolation.cc (interpolateGrid_phaseSpace), which transposes the inverse for the
+// barycentric coordinates.
 #endif
 
 // Vertex position difference matrix (each non-base vertex relative to vertex 0) for a Delaunay cell.

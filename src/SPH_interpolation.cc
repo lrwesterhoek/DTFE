@@ -187,39 +187,6 @@ inline Real hFactor(Real h)
 }
 
 
-// SPH vector derivative: factor * vec * (r_vec/r), with factor = 1/2 m W_deriv(r,h).
-template <typename T, size_t Nvector, size_t Nderiv>
-Pvector<T,Nderiv> getSPH_derivative(T const factor,
-                                    Pvector<T,Nvector> &vec,
-                                    T *pos1,
-                                    T *pos2)
-{
-    Pvector<T,Nderiv> result;
-    T vecR[NO_DIM], res1 = T(0.), res2 = T(0.);
-    for (int i=0; i<NO_DIM; ++i)
-    {
-        vecR[i] = pos1[i] - pos2[i];
-        res1 += pos1[i]*pos1[i];
-        res2 += vecR[i]*vecR[i];
-    }
-    
-    T res = std::sqrt( res2 );
-    if ( res2/res1<T(1.e-6) )   // if res2==0
-        for (int i=0; i<NO_DIM; ++i)
-            vecR[i] = T(0.);
-    else
-        for (int i=0; i<NO_DIM; ++i)
-            vecR[i] /= res;
-        
-    for (int i=0; i<Nvector; ++i)
-        for (int j=0; j<NO_DIM; ++j)
-            result[i*NO_DIM+j] = factor * vec[i] * vecR[j];
-    return result;
-}
-
-
-
-
 // SPH interpolation to a grid. Density uses the symmetric kernel
 // rho = sum_j m_j (1/2)[W(r_ij,h_i) + W(r_ij,h_j)], h = R/2 (R = distance to N-th neighbor).
 // Steps: (1) per-particle h and density, (2) per-grid-point h and the W(.,h_grid) half,
@@ -308,9 +275,7 @@ void SPH_interpolation(vector<Particle_data> &p,
     t.restart();
     q->density.reserve( totalGrid );    // density is always needed
     if ( userOptions.aField.velocity ) q->velocity.reserve( totalGrid );
-    if ( userOptions.aField.velocity_gradient ) q->velocity_gradient.reserve( totalGrid );
     if ( userOptions.aField.scalar ) q->scalar.reserve( totalGrid );
-    if ( userOptions.aField.scalar_gradient ) q->scalar_gradient.reserve( totalGrid );
     
     
     // per-grid-point smoothing scale + the W(.,h_grid) half of the kernel

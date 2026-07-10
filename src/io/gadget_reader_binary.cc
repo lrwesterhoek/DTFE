@@ -112,34 +112,10 @@ void initializeGadget(std::string filename,
         thisNoParts += gadgetHeader->npart[i];
     *noBytesPos = buffer3 / (3*thisNoParts);
     *noBytesVel = buffer4 / (3*thisNoParts);
-    std::cout << "!!!! Number of bytes for position and velocity data: " << *noBytesPos << " and  " << *noBytesVel << ", respectively.\n" << std::flush;
 
 
-    // set the box coordinates from the header unless the user supplied them
-    if ( not userOptions->userGivenBoxCoordinates )
-    {
-        for (size_t i=0; i<NO_DIM; ++i)
-        {
-            userOptions->boxCoordinates[2*i] = 0.;                    // left edge of the full box
-            userOptions->boxCoordinates[2*i+1] = gadgetHeader->BoxSize;// right edge of the full box
-        }
-    }
-    else
-        message << "The box coordinates were set by the user using the program options. The program will keep this values and will NOT use the box length information from the Gadget file!" << MESSAGE::Flush;
-
-    // set HubbleParam from header if unset; used only for T-web/V-web normalization, so announce only then
-    if ( userOptions->hubbleParam < Real(0.) && gadgetHeader->HubbleParam > 0. )
-    {
-        userOptions->hubbleParam = Real(gadgetHeader->HubbleParam);
-        if ( userOptions->uField.velocity_tweb or userOptions->uField.velocity_vweb
-          or userOptions->aField.velocity_tweb or userOptions->aField.velocity_vweb )
-            message << "Using HubbleParam = " << userOptions->hubbleParam << " from file header for T-web/V-web normalization.\n" << MESSAGE::Flush;
-    }
-#ifdef WOJTEK
-    if ( userOptions->additionalOptions.size()!=0 ) // if an option was inserted
-        gadgetHeader->num_files = atoi( userOptions->additionalOptions[0].c_str() );
-    gadgetHeader->print();
-#endif
+    // box coordinates + HubbleParam defaults from the header (shared, gadget_reader_header.cc)
+    gadgetHeaderDefaults( gadgetHeader, userOptions, message );
 
 
     // total number of particles across the file(s)

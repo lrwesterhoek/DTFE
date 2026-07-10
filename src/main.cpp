@@ -20,8 +20,6 @@
  *
  */
 
-/* Program entry point: reads options and input, runs the DTFE/PS-DTFE pipeline, writes output. */
-
 #include <vector>
 #include <iomanip>
 #include <chrono>           // total wall time for the run summary

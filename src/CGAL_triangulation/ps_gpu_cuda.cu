@@ -23,29 +23,9 @@
 
 #include "gpu_host.h"
 #include "gpu_cuda_compat.h"
+#include "ps_deposit_params.h"   // shared host struct (PSDepositParams)
 
 namespace {
-
-struct PSDepositParams
-{
-    float    boxLo[3];
-    float    dx[3];
-    int      nGrid[3];
-    int      nSub;
-    int      periodic;
-    int      subOrigin[3];
-    int      subDims[3];
-    // field flags, mirroring the Metal DepositParams: when 0 the corresponding moment grid
-    // is a 4-byte dummy the kernel never touches (mass and streams are always deposited).
-    // fVel = velocity moments (velocity or dispersion selected), fDisp = second moments
-    // (24 B per cell), fGrad = velocity-gradient moments (36 B per cell). fLinear =
-    // --ps-linear-deposit (density-weighted, per-tet-renormalized sample shares).
-    int      fVel;
-    int      fDisp;
-    int      fGrad;
-    int      fLinear;
-    unsigned nTet;
-};
 
 __device__ inline float det3(const float A[3][3])
 {

@@ -1,1 +1,3 @@
-For install information check the documentation in './documentation/'.
+For install information see README.md ("Installation and Building"), or run './install.sh'
+for a one-command build. The PDFs in './documentation/' cover the original DTFE code and
+predate this fork's build system (GPU backends, PS-DTFE, install scripts).

@@ -13,7 +13,6 @@ tests/tmp/
 tests/__pycache__/
 metal/*.air
 metal/*.metallib
-metal/deposit_prototype
 metal/validate_deposit
 third_party/
 figures/

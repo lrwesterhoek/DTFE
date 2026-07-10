@@ -3,8 +3,8 @@
 #  Build output
 /o
 /o_ps
-DTFE
-PS-DTFE
+/DTFE
+/PS-DTFE
 output/
 /DTFE_include/   # header-copy artifact of 'make library' (copy_headers)
 
@@ -23,31 +23,40 @@ output/
 *.pch
 *.dSYM/
 
-#  Python
+#  Python bytecode and pipeline outputs
 __pycache__/
 *.pyc
-/tests
 python/figures/
 python/cache/
 
-
+#  OS / IDE
 .DS_Store
 .idea/
 .vscode/
 
-/tests/tmp/
+#  Test scratch outputs (regenerable; the tracked baselines live in tests/reference/)
+tests/tmp/
 
 #  DTFE run logs and field outputs
 *.runlog
 *.den
 *.vel
 *.streams
+*.scalar
+*.velDisp
+*.velDispTensor
+*.velGrad
+*.velDiv
+*.velShear
+*.velVort
+*.velTweb
+*.velTwebEig
+*.velVweb
+*.velVwebEig
 *.a_den
 *.a_vel
 *.a_streams
-*.velDisp
 *.a_velDisp
-*.velDispTensor
 *.a_velDispTensor
 *.a_velGrad
 *.a_velDiv
@@ -57,24 +66,22 @@ python/cache/
 *.a_velTwebEig
 *.a_velVweb
 *.a_velVwebEig
+*.pts_den
+*.pts_vel
+*.pts_velDisp
+*.pts_streams
+*.pts_stream_offsets
+*.pts_stream_records
 
-#  Generated media & data
+#  Generated data & media
 *.hdf5
 *.npz
 *.mp4
-*.png
-*.svg
-*.txt
 
-
-!change_log.txt
-!figures/*.png
-!demo/*.png
-!demo/example_input_data_from_text_file.txt
-!tests/reference/*.txt
-
-# Metal prototype build artifacts
-metal/deposit_prototype
+#  Metal build artifacts
 metal/*.metallib
 metal/*.air
-*.py
+metal/validate_deposit
+
+#  Generated analysis-figure directories (tracked PNGs at figures/ top level stay)
+figures/*/

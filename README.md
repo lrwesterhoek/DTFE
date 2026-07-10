@@ -100,7 +100,7 @@ Run `make deps-check` at any time to verify every required header is present —
 
 3. **Install dependencies:**
    ```bash
-   brew install gsl boost cgal mpfr gmp hdf5 fftw
+   brew install gsl boost cgal mpfr gmp hdf5 fftw llvm libomp
    ```
 
 #### Linux (Ubuntu/Debian)
@@ -305,16 +305,6 @@ When neither flag is given, **the binary picks both automatically** once the inp
 
 The model behind the tuner: large runs are bounded by the per-partition CGAL triangulation (~0.65 KB per padded vertex; the Lagrangian padding multiplies particle counts by ~4x) plus the global field grids. PS-DTFE partitions **Lagrangian** space with `--partition X Y Z` and caps concurrent partition pipelines with `--max-concurrent N`; peak RSS ≈ globals + N × (per-partition triangulation + sub-grids). Manual reference points (what auto should land near): a 512³ grid with the default field set fits TNG50-4 (2e7 particles) at `--partition 2 2 2 --max-concurrent 2` in ≲30 GB, and TNG300-3 (2.4e8 particles) at `--partition 5 5 5 --max-concurrent 2` in ~40 GB. The `run_ps_dtfe.sh` runlog reports the measured peak RSS after every run, closing the loop on the prediction.
 
-Memory reductions (July 2026, all validated bit-or-tolerance-identical by the test battery):
-* each partition's **triangulation is freed right after its deposit** (its last read), instead of at partition scope end — the ~0.65 KB/vertex no longer coexists with the merge phase;
-* the GPU deposit **allocates only the requested moment grids** (the second-moment and gradient grids are 24+36 B/cell of sub-grid, host- and device-side) and skips extracting the per-tet velocity array on density-only runs;
-* the `mass_weight` normalization grid (4 B/cell) **aliases the density accumulator** whenever the density field is selected;
-* the GPU extraction cost-sort permutes its tet arrays **in place** (no transient gather copy);
-* the per-partition cell-handle vector is gone (cells stream directly off the CGAL iterator).
-
-Measured on a synthetic 96³-particle box, 256³ grid, `--partition 2 2 2 --max-concurrent 2` (M1 Max): CPU run with density+velocity+dispersion 3.21 → 2.77 GB peak RSS; GPU (`--ps-gpu`) run with density+velocity 6.32 → 2.89 GB.
-
-
 ## Batch scripts and configuration
 
 Shared defaults (data root, simulation, snapshot list, grid size, padding) live in [config.sh](config.sh), sourced by all three workflow scripts and overridable per run via flags or environment variables (`DTFE_DATA_ROOT`, `DTFE_SIM` — also honoured by the Python side):
@@ -323,7 +313,7 @@ Shared defaults (data root, simulation, snapshot list, grid size, padding) live 
 ./download_snapshots.sh -s TNG50-4-Dark 99      # fetch TNG snapshot chunks
 ./download_snapshots.sh -c -s TNG50-4-Dark 99   # FoF/Subfind group catalogs
 ./download_snapshots.sh -t -s TNG50-4-Dark      # SubLink merger trees (whole simulation)
-python3 python/merge_HDF5.py ...                # merge chunks into combined_NNN.hdf5
+python3 python/tools/merge_HDF5.py ...                # merge chunks into combined_NNN.hdf5
 ./run_dtfe.sh [-d DATA_DIR] [-g GRID] [-m] [snap ...]    # standard DTFE batch (-m = GPU '_a' interpolation)
 ./run_ps_dtfe.sh [-d DATA_DIR] [-g GRID] [-n NSUB] [-m] [snap ...]   # PS-DTFE batch (-m = GPU deposit)
 ```
@@ -343,7 +333,8 @@ The TNG API key is read from `-k`, the `TNG_API_KEY` env var, or `~/.tng_api_key
 * `dtfelib.trees` / `dtfelib.groupcat` / `dtfelib.environment` — SubLink merger trees (main branches, descendants, max-past-mass merger ratios), FoF/Subfind particle membership + shape tensors, and field sampling at halo positions. `python/plot/plot_halo_tracking.py` combines them: size/shape/orientation/mergers plus the DTFE **or** PS-DTFE density and web-class environment along each halo's history.
 * `dtfelib.voids` + `python/plot/plot_void_tracking.py` — VOID evolution: voids found as minima of the smoothed density contrast at the reference snapshot are given an identity across time by their merger-tree tracer subhalos (median periodic displacement moves the centre), and their size (semi-axes, R_eff), BBKS shape (e, p) and major-axis orientation are re-measured from the DTFE or PS-DTFE field at every snapshot with grids on disk.
 * `python/plot/plot_void_population.py` — the population view: counts, R_eff / e / p / central-δ medians, bands and distributions for ALL voids per snapshot (same catalogs and sample cuts as the correlation analyses), for either estimator.
-* `python/pipeline.py`, `compute_all.py`, `run_all.py` — batch analysis drivers; `python/config.py` holds simulation constants and adapts to the active simulation (`DTFE_SIM` / `--sim`; box sizes pinned for TNG50-3/50-4/300-3, read from headers for new simulations).
+* `dtfelib.pipeline` — the derived-product engine (smoothed delta, Hessian, void catalogs, critical points, per-parameter caches); `dtfelib.fields` / `dtfelib.figures` — grid-field utilities and figure styling/output.
+* `python/analyze.py` — the batch driver: `analyze.py check | compute | plot | all`; `python/config.py` holds simulation constants and adapts to the active simulation (`DTFE_SIM` / `--sim`; box sizes pinned for TNG50-3/50-4/300-3, read from headers for new simulations); `python/selftest.py` smoke-tests the whole stack on synthetic data in a sandbox.
 
 
 ## Tests
@@ -357,9 +348,14 @@ tests/ps_linear_deposit_check.sh # --ps-linear-deposit mass conservation + A/B s
 python3 tests/run_tests.py      # standard-DTFE regression
 tests/dtfe_metal_check.sh       # standard-DTFE CPU vs --gpu parity (builds the current GPU mode; GPU_BUILD=CUDA=1 on Linux/NVIDIA)
 python3 tests/py_dtfelib_test.py  # python stack: SubLink invariants, sampling, void tracking
+python3 tests/ps_3d_test.py     # 3D crossed Zel'dovich waves: stream counts in {1,3,9,27}
+python3 tests/ps_convergence_test.py  # single-stream density -> analytic profile as N grows
+python3 tests/ps_nonperiodic_test.py  # finite cloud in vacuum: mass conservation without --periodic
+python3 tests/ps_standard_cross_check.py  # PS-DTFE vs standard DTFE where streams == 1
+tests/ps_scaling_benchmark.sh   # strong-scaling guard (fails if the partition loop serializes)
 ```
 
-A minimal GitHub Actions workflow (Linux CPU build + `run_tests.py` + `ps_smoke_test.sh`) ships **disabled** as [.github/workflows/ci.yml.disabled](.github/workflows/ci.yml.disabled) — rename it to `ci.yml` to enable. It is deliberately a single fast job (an earlier, broader cross-platform workflow was removed on purpose). Note that `tests/` is currently git-ignored, so enabling CI also requires tracking the test scripts it calls.
+A minimal GitHub Actions workflow (Linux CPU build + `run_tests.py` + `ps_smoke_test.sh`) ships **disabled** as [.github/workflows/ci.yml.disabled](.github/workflows/ci.yml.disabled) — rename it to `ci.yml` to enable. It is deliberately a single fast job (an earlier, broader cross-platform workflow was removed on purpose).
 
 
 ## Contributors

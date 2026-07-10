@@ -332,7 +332,6 @@ void User_options::shortHelp( char *progName )
     mainOptions.add_options()
             ("help,h", "produce this help message.")
             ("full_help", "produce detailed help message.")
-            //("grid,g", po::value< Real >(&temp), "specify grid size along each direction.")
             ("grid,g", po::value< std::vector<size_t> >(&(this->gridSize))->multitoken(), "specify grid size along each direction.")
             ("box", po::value< Real >(&temp), "specify the coordinates of the box encompasing all the particles.")
             ("input,i", po::value< std::vector<int> >()->multitoken(), "give the type of the input file, which data to read and for which particle species. See full help for details.")
@@ -504,7 +503,7 @@ void User_options::printOptions()
     
     std::string inFileType = "unknown";
     if ( this->inputFileType==101 ) inFileType = "Gadget multiple files";
-    else if ( this->inputFileType==101 ) inFileType = "Gadget single file";
+    else if ( this->inputFileType==102 ) inFileType = "Gadget single file";
     else if ( this->inputFileType==105 ) inFileType = "Gadget HDF5 file/files";
     else if ( this->inputFileType==111 ) inFileType = "text file with positions (first 3 columns and weights in 4th column)";
     

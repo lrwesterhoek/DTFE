@@ -795,9 +795,9 @@ void interpolateGrid_averaged_3(DT &dt,
             {
                 previous = dt.locate( Point(x,y,z) , lt, li, lj, previous );
 #endif
-                
-                
-                // MC-loop accumulators
+
+
+                // per-cell accumulators
                 bool dummyNeighbors = false, dummyVertices = false;
                 Real tempD = Real(0.);
 #ifdef VELOCITY

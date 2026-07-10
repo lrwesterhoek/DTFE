@@ -59,34 +59,9 @@ void insertParticlesInBox(std::vector<Particle_data> &p,
                         Real const offset[]);
 
 #ifdef PHASE_SPACE
-// select particles whose Lagrangian position lies in the padded box (PS-DTFE partitions are Lagrangian)
-void findParticlesInBoxLagrangian(std::vector<Particle_data> &p,
-                                  std::vector<Particle_data> *output,
-                                  Box const &paddedBox,
-                                  int verboseLevel)
-{
-    MESSAGE::Message message( verboseLevel );
-    message << "Finding particles with Lagrangian positions in box " << paddedBox.print() << " ... " << MESSAGE::Flush;
-    output->reserve( p.size() / 4 );  // rough estimate
-
-    for (vectorIterator it=p.begin(); it!=p.end(); ++it)
-    {
-        bool inside = true;
-        for (size_t i=0; i<NO_DIM; ++i)
-            if ( it->lagPos[i]<paddedBox.coords[2*i] or it->lagPos[i]>paddedBox.coords[2*i+1] )
-            { inside = false; break; }
-        if (inside)
-            output->push_back( *it );
-    }
-
-    message << "Done.\n"
-            << "\t Selected " << output->size() << " of " << p.size() << " particles ("
-            << std::setprecision(4) << output->size()/float(p.size())*100. << "\%).\n" << MESSAGE::Flush;
-}
-
-
-// Like findParticlesInBoxLagrangian but generates periodic images on the fly (deferred copies, no whole-box
-// array); shifting lagPos and pos by the same eulerLen[] offset matches DTFE()'s global copy generator bit-for-bit.
+// Select particles whose Lagrangian position lies in the padded box (PS-DTFE partitions are Lagrangian),
+// generating periodic images on the fly (deferred copies, no whole-box array); shifting lagPos and pos
+// by the same eulerLen[] offset matches DTFE()'s global copy generator bit-for-bit.
 void findParticlesInBoxLagrangianPeriodic(std::vector<Particle_data> &p,
                                           std::vector<Particle_data> *output,
                                           Box const &paddedBox,

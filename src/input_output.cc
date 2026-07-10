@@ -313,13 +313,6 @@ void readInputData(std::vector<Particle_data> *p,
 }
 
 
-
-
-
-
-
-
-
 // Functions for writing the output data
 
 
@@ -471,23 +464,3 @@ void writeOutputData(Quantities &uQuantities,
     psPointEvalWriteOutputs( userOptions );
 #endif
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

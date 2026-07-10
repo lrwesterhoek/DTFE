@@ -31,12 +31,7 @@ def write_text_input(filepath, particles, box):
             f.write("  ".join(str(v) for v in p) + "\n")
 
 
-def write_positions_input(filepath, particles, box):
-    with open(filepath, "w") as f:
-        f.write(f"{len(particles)}\n")
-        f.write("  ".join(str(b) for b in box) + "\n")
-        for p in particles:
-            f.write("  ".join(str(v) for v in p) + "\n")
+write_positions_input = write_text_input    # identical serialization (positions-only rows)
 
 
 def read_density_output(filepath):

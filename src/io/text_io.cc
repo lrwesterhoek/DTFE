@@ -59,13 +59,7 @@ void readTextFile(std::string filename,
     {
         for (int j=0; j<NO_DIM; ++j)
             inputFile >> positions[NO_DIM*i+j];
-        // read velocities
-//         for (int j=0; j<noVelComp; ++j)
-//             inputFile >> velocities[noVelComp*i+j];
         inputFile >> weights[i];
-        // read scalar components (needs noScalarComp==1, else a runtime error or wrong read)
-//         for (int j=0; j<noScalarComp; ++j)
-//             inputFile >> scalars[noScalarComp*i+j];
     }
 
     checkFileOperations( inputFile, "read from" );
@@ -103,67 +97,6 @@ void readTextFile_positions(std::string filename,
     inputFile.close();
     message << "Done.\n";
 }
-
-
-
-// Example reader for particle positions plus user-defined sampling points (the grid where output
-// fields get interpolated). The sampling-point file name is passed via the "--options" program option.
-void readTextFile_userDefinedSampling(std::string filename,
-                                      Read_data<Real> *readData,
-                                      User_options *userOptions)
-{
-    // part 1: read the particle positions from the input file
-    MESSAGE::Message message( userOptions->verboseLevel );
-    message << "Reading the particle position data from the text file '" << filename << "' ... " << MESSAGE::Flush;
-    std::fstream inputFile;
-    openInputTextFile( inputFile, filename );
-
-    // line 1: particle count; line 2: box coordinates
-    size_t noParticles;
-    inputFile >> noParticles;
-    for (int i=0; i<2*NO_DIM; ++i)
-        inputFile >> userOptions->boxCoordinates[i];
-
-    // assumes each particle line is: posX, posY, posZ
-    Real *positions = readData->position(noParticles);
-
-    for (int i=0; i<noParticles; ++i)
-    {
-        for (int j=0; j<NO_DIM; ++j)
-            inputFile >> positions[NO_DIM*i+j];
-    }
-
-    checkFileOperations( inputFile, "read from" );
-    inputFile.close();
-    message << "Done.\n";
-
-
-    // part 2: read the user-defined sampling points from a second file (its name is in additionalOptions[0])
-     message << "Reading the user defined sampling points from the text file '" << filename << "' ... " << MESSAGE::Flush;
-    std::string filename2 = userOptions->additionalOptions[0];
-    openInputTextFile( inputFile, filename2 );
-
-    // expected format: line 1 = number of sampling points; each other line = X, Y, Z, dX, dY, dZ
-    // where (X,Y,Z) is the cell center and (dX,dY,dZ) its size (only needed for volume-averaged output)
-    size_t noSamplingPoints;
-    inputFile >> noSamplingPoints;
-
-    Real *samples = readData->sampling(noSamplingPoints);  // sampling point coordinates
-    Real *delta = readData->delta(noSamplingPoints);       // cell size per sampling point
-
-    for (int i=0; i<noSamplingPoints; ++i)
-    {
-        for (int j=0; j<NO_DIM; ++j)
-            inputFile >> samples[NO_DIM*i+j];
-        for (int j=0; j<NO_DIM; ++j)
-            inputFile >> delta[NO_DIM*i+j];
-    }
-
-    checkFileOperations( inputFile, "read from" );
-    inputFile.close();
-    message << "Done.\n";
-}
-
 
 
 
@@ -297,7 +230,7 @@ void writeTextFile_samplingPosition(std::vector<Real> &dataToWrite,
     message << "Writing the " << variableName << " to the text file '" << filename << "' ...  " << MESSAGE::Flush;
     
     if ( userOptions.userDefinedSampling or userOptions.redshiftConeOn )
-        throwError( "You cannot use the function 'writeTextFile_samplingPosition' to write the data to a text file when using redshift cone or user defined coordinates since teh sampling coordinates are incorrect in this case." );
+        throwError( "You cannot use the function 'writeTextFile_samplingPosition' to write the data to a text file when using redshift cone or user defined coordinates since the sampling coordinates are incorrect in this case." );
 
 
     std::fstream outputFile;
@@ -335,7 +268,7 @@ void writeTextFile_samplingPosition(std::vector< Pvector<T,N> > &dataToWrite,
     message << "Writing the " << variableName << " to the text file '" << filename << "' ...  " << MESSAGE::Flush;
     
     if ( userOptions.userDefinedSampling or userOptions.redshiftConeOn )
-        throwError( "You cannot use the function 'writeTextFile_samplingPosition' to write the data to a text file when using redshift cone or user defined coordinates since teh sampling coordinates are incorrect in this case." );
+        throwError( "You cannot use the function 'writeTextFile_samplingPosition' to write the data to a text file when using redshift cone or user defined coordinates since the sampling coordinates are incorrect in this case." );
 
 
     std::fstream outputFile;

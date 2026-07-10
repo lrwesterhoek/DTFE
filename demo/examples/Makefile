@@ -1,119 +1,75 @@
-# Makefile for compiling the DTFE code on Linux systems
+# Standalone example: access the Delaunay tessellation via the DTFE() library call.
+#
+# STATUS: UNMAINTAINED. main_particle_density.cpp targets the 2011 upstream API
+# (vertexPositionMatrix free function, User_options::field, the old DTFE()/
+# writeOutputData signatures) and no longer compiles against the current sources.
+# The Makefile below is updated to the current build layout, so only the example
+# code itself needs porting to revive it.
+#
+# Builds against the shared library produced by `make library` at the repo root
+# (run automatically as a prerequisite). The OPTIONS block below MUST match the
+# root Makefile's OPTIONS_COMMON (they set the data-structure layout, so a
+# mismatch gives silent ABI corruption, not a link error).
+#
+#   make            # builds ../../libDTFE and then DTFE_particle_density
 
+ROOT = ../..
 
-# Path to the GSL, Boost C++ and CGAL libraries - must be set by user (only if they aren't installed in the default system path); C++ compiler - preferably a version that supports OpenMP
-GSL_PATH   = /opt/homebrew/opt/gsl
-BOOST_PATH = /opt/homebrew/opt/boost
-CGAL_PATH  = /opt/homebrew/opt/cgal
-CC = /opt/homebrew/opt/llvm/bin/clang++
-
-
-# paths to where to put the object files and the executables files. If you build the DTFE library than you also need to specify the directory where to put the library and the directory where to copy the header files needed by the library (choose an empty directory for the header files).
-OBJ_DIR = ./o
-BIN_DIR = ./
-LIB_DIR = ./
-INC_DIR = ./DTFE_include
-
-
-# Choose the compiler directives
-OPTIONS = 
-#------------------------ set the number of spatial dimensions (2 or 3 dimensions)
-OPTIONS += -DNO_DIM=3 
-#------------------------ set type of variables - float (comment the next line) or double (uncomment the next line)
-# OPTIONS += -DDOUBLE 
-#------------------------ set which quantities can be computed (can save memory by leaving some out)
-# do compute velocity and velocity related components 
-OPTIONS += -DVELOCITY 
-# do compute scalar fields
-OPTIONS += -DSCALAR 
-# number of scalar fields
-OPTIONS += -DNO_SCALARS=1 
-#------------------------ additional compiler options
-# enable to check if the padding gives a complete Delaunay Tesselation of the region of interest
-# OPTIONS += -DTEST_PADDING 
-# enable this option if to use OpenMP (share the workload between CPU cores sharing the same RAM)
-OPTIONS += -DOPEN_MP 
-# enable this if the input data is not in Mpc units (value=what is 1 MPc in the units of the data - in this example the data is in kpc)
-OPTIONS += -DMPC_UNIT=1. 
-#------------------------ options usefull when using DTFE as a library
-# uncomment the line to get access to a function that returns the Delaunay triangulation of the point set
-# OPTIONS += -DTRIANGULATION 
-
-
-#------------------------ compiler directive that affect only the help messages when using the '-h / --help' option (it does not affect the program in any other way)- if the option is uncommented, than it will show that set of options
-OPTIONS += -DFIELD_OPTIONS 
-OPTIONS += -DREGION_OPTIONS 
-# OPTIONS += -DPARTITION_OPTIONS 
-# OPTIONS += -DPADDING_OPTIONS 
-OPTIONS += -DDENSITY_OPTIONS 
-# OPTIONS += -DREDSHIFT_CONE_OPTIONS 
-OPTIONS += -DADDITIONAL_OPTIONS 
-
-
-
-
-
-
-
-###############  DO NOT MODIFY BELOW THIS LINE  ###########################
-# do not modify below this line
-SRC = ../../src
-
-INCLUDES = 
-LIBRARIES = 
-
-ifneq ($(strip $(GSL_PATH)),)
-	INCLUDES += -I/$(GSL_PATH)/include 
-	LIBRARIES += -L/$(GSL_PATH)/lib 
-endif
-ifneq ($(strip $(BOOST_PATH)),)
-	INCLUDES += -I/$(BOOST_PATH)/include 
-	LIBRARIES += -L/$(BOOST_PATH)/lib 
-endif
-ifneq ($(strip $(CGAL_PATH)),)
-	INCLUDES += -I/$(CGAL_PATH)/include 
-	LIBRARIES += -L/$(CGAL_PATH)/lib 
+# Platform paths: reuse the same defaults as the root Makefile (Homebrew on macOS, /usr on Linux)
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+    ARCH := $(shell uname -m)
+    ifeq ($(ARCH),arm64)
+        BREW_PREFIX = /opt/homebrew
+    else
+        BREW_PREFIX = /usr/local
+    endif
+    GSL_PATH   = $(BREW_PREFIX)/opt/gsl
+    BOOST_PATH = $(BREW_PREFIX)/opt/boost
+    CGAL_PATH  = $(BREW_PREFIX)/opt/cgal
+    GMP_PATH   = $(BREW_PREFIX)/opt/gmp
+    MPFR_PATH  = $(BREW_PREFIX)/opt/mpfr
+    CC := $(shell which $(BREW_PREFIX)/opt/llvm/bin/clang++ 2>/dev/null || which clang++ 2>/dev/null || echo "clang++")
+    OPENMP_FLAG = -fopenmp=libomp
+else
+    GSL_PATH   = /usr
+    BOOST_PATH = /usr
+    CGAL_PATH  = /usr
+    GMP_PATH   = /usr
+    MPFR_PATH  = /usr
+    CC := $(shell which g++ 2>/dev/null || echo "g++")
+    OPENMP_FLAG = -fopenmp
 endif
 
-COMPILE_FLAGS = -frounding-math -O3 -fopenmp -DNDEBUG $(OPTIONS)
-DTFE_INC = $(INCLUDES)
-DTFE_LIB = -rdynamic $(LIBRARIES) -lCGAL -lboost_thread -lboost_filesystem -lboost_program_options -lgsl -lgslcblas -lm
+# ---- MUST match the root Makefile's OPTIONS_COMMON ----
+OPTIONS  = -DNO_DIM=3
+OPTIONS += -DVELOCITY
+OPTIONS += -DSCALAR
+OPTIONS += -DNO_SCALARS=1
+OPTIONS += -DINPUT_FILE_DEFAULT=105
+OPTIONS += -DMPC_UNIT=1000
+OPTIONS += -DOUTPUT_FILE_DEFAULT=101
+OPTIONS += -DOPEN_MP
+OPTIONS += -DTEST_PADDING
+OPTIONS += -DREDSHIFT_SPACE
+OPTIONS += -DTRIANGULATION
+OPTIONS += -DBOOST_TIMER_ENABLE_DEPRECATED
+OPTIONS += -DBOOST_ALLOW_DEPRECATED_HEADERS
 
+INCLUDES  = -I $(GSL_PATH)/include -I $(BOOST_PATH)/include -I $(CGAL_PATH)/include \
+            -I $(GMP_PATH)/include -I $(MPFR_PATH)/include
+LIBRARIES = -L$(GSL_PATH)/lib -L$(BOOST_PATH)/lib -L$(CGAL_PATH)/lib \
+            -L$(GMP_PATH)/lib -L$(MPFR_PATH)/lib
 
+COMPILE_FLAGS = -O3 -std=c++17 -frounding-math -Wno-deprecated-declarations $(OPENMP_FLAG) -DNDEBUG $(OPTIONS)
+LIBS = -L$(ROOT) -lDTFE $(LIBRARIES) -lboost_thread -lboost_filesystem -lboost_program_options \
+       -lgsl -lgslcblas -lm -lgmp -lmpfr
 
-
-MAIN_SOURCES = DTFE.h input_output.cc input_output.h message.h math_functions.h
-DTFE_SOURCES = DTFE.cpp define.h particle_data.h user_options.h box.h quantities.h user_options.cc quantities.cc subpartition.h random.cc TSC_interpolation.cc SPH_interpolation.cc kdtree/kdtree2.hpp Pvector.h message.h
-TRIANG_SOURCES = triangulation_interpolation.cpp define.h CGAL_include_2D.h CGAL_include_3D.h vertexData.h particle_data.h particle_data_traits.h user_options.h box.h quantities.h density_interpolation.cc velocity_interpolation.cc scalar_interpolation.cc Pvector.h message.h
-
-FILES = DTFE.h DTFE.cpp triangulation_interpolation.cpp density_interpolation.cc velocity_interpolation.cc CGAL_include_2D.h  CGAL_include_3D.h scalar_interpolation.cc define.h CGAL_include_3D.h vertexData.h particle_data.h particle_data_traits.h user_options.h user_options.cc box.h quantities.h subpartition.h quantities.cc Pvector.h message.h TSC_interpolation.cc SPH_interpolation.cc random.cc kdtree/kdtree2.hpp kdtree/kdtree2.cpp
-
-
-DTFE_particle_density: set_directories $(OBJ_DIR)/DTFE.o $(OBJ_DIR)/triangulation_interpolation.o $(OBJ_DIR)/main_particle_density.o $(OBJ_DIR)/kdtree2.o Makefile
-	$(CC) $(COMPILE_FLAGS) $(OBJ_DIR)/DTFE.o $(OBJ_DIR)/triangulation_interpolation.o $(OBJ_DIR)/main_particle_density.o $(OBJ_DIR)/kdtree2.o $(DTFE_LIB) -o $(BIN_DIR)/DTFE_particle_density
-
-
-$(OBJ_DIR)/main_particle_density.o: $(addprefix $(SRC)/, $(MAIN_SOURCES)) main_particle_density.cpp Makefile
-	$(CC) $(COMPILE_FLAGS) $(DTFE_INC) -o $(OBJ_DIR)/main_particle_density.o -c main_particle_density.cpp
-
-$(OBJ_DIR)/DTFE.o: $(addprefix $(SRC)/, $(DTFE_SOURCES)) Makefile
-	$(CC) $(COMPILE_FLAGS) $(DTFE_INC) -o $(OBJ_DIR)/DTFE.o -c $(SRC)/DTFE.cpp
-
-$(OBJ_DIR)/kdtree2.o: $(SRC)/kdtree/kdtree2.hpp $(SRC)/kdtree/kdtree2.cpp Makefile
-	$(CC) -O3 -ffast-math -fomit-frame-pointer $(BOOST_INC) -o $(OBJ_DIR)/kdtree2.o -c $(SRC)/kdtree/kdtree2.cpp
-
-$(OBJ_DIR)/triangulation_interpolation.o: $(addprefix $(SRC)/, $(TRIANG_SOURCES)) Makefile
-	$(CC) $(COMPILE_FLAGS) $(DTFE_INC) -o $(OBJ_DIR)/triangulation_interpolation.o -c $(SRC)/triangulation_interpolation.cpp
-
+DTFE_particle_density: main_particle_density.cpp
+	$(MAKE) -C $(ROOT) library
+	$(CC) $(COMPILE_FLAGS) $(INCLUDES) main_particle_density.cpp $(LIBS) -o DTFE_particle_density
 
 clean:
-	rm -f $(BIN_DIR)/DTFE_particle_density $(OBJ_DIR)/*.o
+	rm -f DTFE_particle_density
 
-
-set_directories:
-	@ if !( test -d $(OBJ_DIR) ); \
-	then mkdir $(OBJ_DIR); \
-	fi
-	@ if !( test -d $(BIN_DIR) ); \
-	then mkdir $(BIN_DIR); \
-	fi
+.PHONY: clean

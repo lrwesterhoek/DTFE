@@ -29,7 +29,7 @@
 static size_t const DTFE_METHOD = 1;
 static size_t const TSC_METHOD = 2;
 static size_t const SPH_METHOD = 3;
-static size_t const UNKNOW_METHOD = -1;
+static size_t const UNKNOWN_METHOD = -1;
 // which field the file contains
 static int const DENSITY_FILE = 1;
 static int const VELOCITY_FILE = 11;
@@ -40,7 +40,7 @@ static int const VELOCITY_VORTICITY_FILE = 15;
 static int const VELOCITY_STD_FILE = 16;
 static int const SCALAR_FIELD_FILE = 20;
 static int const SCALAR_FIELD_GRADIENT_FILE = 21;
-static int const UNKNOW_FILE = -1;
+static int const UNKNOWN_FILE = -1;
 
 
 static int const fillSize = 1024 - 13*8 - 8*18 - 8*2;   // pads the header to 1024 bytes
@@ -83,7 +83,7 @@ struct Density_header
             densityFileGrid[i] = 1;
         }
         totalGrid = size_t(0);
-        fileType = UNKNOW_FILE;
+        fileType = UNKNOWN_FILE;
         noDensityFiles = 1;
         indexDensityFile = -1;
         for (int i=0; i<6; ++i)
@@ -95,7 +95,7 @@ struct Density_header
         time = -1.; redshift = -1.;
         BoxSize = -1.; Omega0 = -1.; OmegaLambda = -1.; HubbleParam = -1.;
     
-        method = UNKNOW_METHOD;
+        method = UNKNOWN_METHOD;
         FILE_ID = 1;
     }
     

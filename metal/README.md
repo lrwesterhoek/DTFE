@@ -4,7 +4,7 @@ Offloads the PS-DTFE grid **deposit** (the dominant cost, ~28 min/partition at n
 GPU via **metal-cpp**, validated against the CPU path and analytic references.
 
 Two kernels in `ps_deposit.metal`:
-- `depositDensity` — mass only (the original prototype kernel).
+- `depositDensity` — mass only.
 - `depositFields` — mass + velocity moment + dispersion second moment (upper-triangle σ_ij) +
   velocity-gradient moment + stream count, all mass-share weighted exactly like
   `interpolateGrid_phaseSpace` in `src/CGAL_triangulation/ps_interpolation.cc`.
@@ -15,12 +15,11 @@ Two kernels in `ps_deposit.metal`:
 | file | role |
 |---|---|
 | `ps_deposit.metal` | Metal compute kernels: one thread per tetrahedron, mass-conserving deposit with `atomic_float` scatter. Mirrors `src/CGAL_triangulation/ps_interpolation.cc`. |
-| `validate_deposit.cpp` | Correctness harness: 17 tests — analytic edge cases, nSub sweep, determinism, random stress CPU-vs-GPU on every grid, and a sheared Zel'dovich pancake against an EXACT piecewise-linear pushforward reference (see below). `DENSITY_ONLY=1` gates to the density kernel; `BENCH=1` adds a 1M-tet timing; `DUMP_PROFILES=1` prints per-bin profiles. |
-| `deposit_prototype.cpp` | Original density-only host + timing comparison. |
-| `build_prototype.sh` | Offline-compiles the kernels to `ps_deposit.metallib` and builds both hosts. |
+| `validate_deposit.cpp` | Correctness harness (T1–T10): analytic edge cases, nSub sweep, determinism, random stress CPU-vs-GPU on every grid, analytic velocity-field checks, partition sub-grid support, and a sheared Zel'dovich pancake against an EXACT piecewise-linear pushforward reference (see below). `DENSITY_ONLY=1` gates to the density kernel; `BENCH=1` adds a 1M-tet timing; `DUMP_PROFILES=1` prints per-bin profiles. |
+| `build_prototype.sh` | Offline-compiles the kernels to `ps_deposit.metallib` and builds the harness. |
 | `ps_deposit.metallib` | Offline-compiled kernels; hosts load it if present, else runtime-compile the `.metal`. Git-ignored. |
 
-Dependency: **metal-cpp** headers, vendored (git-ignored) at `third_party/metal-cpp` — copied from
+Dependency: **metal-cpp** headers, vendored at `third_party/metal-cpp` — copied from
 the Game Porting Toolkit volume (`/Volumes/Game Porting Toolkit/metal-cpp`). Metal-cpp is header-only
 and standalone; the GPTK volume is only where they were found.
 
@@ -28,22 +27,14 @@ and standalone; the GPTK volume is only where they were found.
 
 ```
 bash metal/build_prototype.sh
-./metal/deposit_prototype metal/ps_deposit.metal [nTet]
+./metal/validate_deposit
 ```
 
-## Validation results (Apple M1 Max, Metal 3) — 19/19 tests pass
+## Validation results (Apple M1 Max, Metal 3) — all T1–T10 pass
 
 Analytic velocity plumbing (T9): a constant field is reproduced exactly (v̄ ≡ v0 to 5e-6, σ ≡ 0,
 gradient ≡ 0) and a linear field v = Gx recovers grad/W == G to 2e-5 in every covered cell
 (well-conditioned tets; near-degenerate conditioning is covered by CPU-parity instead).
-
-An adversarial 4-lens / 2-skeptic review workflow (22 agents) audited the kernels and this harness:
-4 confirmed findings, all fixed — 64-bit moment-grid indexing (32-bit `flat*9` wrapped silently at
-grids ≥ ~782³), a T2 that never actually reached the centroid fallback it claimed to test (tet sat
-exactly on a sub-sample point; now off-lattice and asserts streams==1), and the missing analytic
-velocity checks (now T9). Notable refuted-by-design caveats: zero-mass tets are skipped (production
-deposits them with weight 0 into stream counts — irrelevant for physical masses), and the float32
-raw-second-moment σ cancellation is inherited from production by design.
 
 Edge cases (analytic): tet-in-one-cell mass placement, tiny-tet centroid fallback, periodic-wrap
 shift equivalence (bit-exact), degenerate-tet drop, nSub∈{1..4} mass conservation (ratio 1.0000000),
@@ -147,4 +138,7 @@ kernel's float chain — noise-level physics.
   gradient 9 + streams 1). Fits M1 Max 64 GB unified memory; use the partition sub-grid (integration
   step 3) to shrink it.
 - The m2 accumulator sums w·v_i·v_j in float32 (v ~ 10³ km/s ⇒ terms ~10⁶·w); fine at current scales
-  (validated to 1e-7 vs CPU float), but consider Kahan or fixed-point if grids get much hotter.
+  (validated to 1e-7 vs CPU float), but consider Kahan or fixed-point if grids get much hotter. The
+  raw-second-moment σ cancellation this implies is inherited from the production CPU path by design.
+- The harness skips zero-mass tets (production deposits them with weight 0 into stream counts —
+  irrelevant for physical masses).

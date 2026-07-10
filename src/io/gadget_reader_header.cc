@@ -130,3 +130,33 @@ struct Gadget_header
     }
 };
 
+
+
+// Post-header setup shared by the binary and HDF5 Gadget initializers: default the box
+// coordinates from the header unless the user supplied them, and take HubbleParam from the
+// header when unset (used only for T-web/V-web normalization, so announce only then).
+void gadgetHeaderDefaults(Gadget_header *gadgetHeader,
+                          User_options *userOptions,
+                          MESSAGE::Message &message)
+{
+    // set the box coordinates from the header unless the user supplied them
+    if ( not userOptions->userGivenBoxCoordinates )
+    {
+        for (size_t i=0; i<NO_DIM; ++i)
+        {
+            userOptions->boxCoordinates[2*i] = 0.;                    // left edge of the full box
+            userOptions->boxCoordinates[2*i+1] = gadgetHeader->BoxSize;// right edge of the full box
+        }
+    }
+    else
+        message << "The box coordinates were set by the user using the program options. The program will keep this values and will NOT use the box length information from the Gadget file!" << MESSAGE::Flush;
+
+    // set HubbleParam from header if unset; used only for T-web/V-web normalization, so announce only then
+    if ( userOptions->hubbleParam < Real(0.) && gadgetHeader->HubbleParam > 0. )
+    {
+        userOptions->hubbleParam = Real(gadgetHeader->HubbleParam);
+        if ( userOptions->uField.velocity_tweb or userOptions->uField.velocity_vweb
+          or userOptions->aField.velocity_tweb or userOptions->aField.velocity_vweb )
+            message << "Using HubbleParam = " << userOptions->hubbleParam << " from file header for T-web/V-web normalization.\n" << MESSAGE::Flush;
+    }
+}

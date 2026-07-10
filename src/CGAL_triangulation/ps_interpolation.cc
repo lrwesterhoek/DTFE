@@ -82,28 +82,9 @@ void interpolateGrid_phaseSpace(DT &dt,
         PS_FOREACH_FINITE_CELL
         {
             Cell_handle cell = itC;
-#ifdef TEST_PADDING
-            { bool dummy=false; for (int v=0;v<=NO_DIM;++v) if (cell->vertex(v)->info().isDummy()){dummy=true;break;} if (dummy) continue; }
-#endif
-            if ( !userOptions.lagrangianRegion.isNullBox() )
-            {
-                double cen[NO_DIM]; for (int d=0;d<NO_DIM;++d) cen[d]=0.;
-                for (int v=0;v<=NO_DIM;++v) for (int d=0;d<NO_DIM;++d) cen[d]+=double(cell->vertex(v)->point()[d]);
-                bool owned=true;
-                for (int d=0;d<NO_DIM;++d){ cen[d]/=double(NO_DIM+1); if (cen[d]<userOptions.lagrangianRegion[2*d]||cen[d]>=userOptions.lagrangianRegion[2*d+1]){owned=false;break;} }
-                if (!owned) continue;
-            }
-            { bool bad=false; for (int v=0;v<=NO_DIM;++v) if (cell->vertex(v)->info().density()<=Real(0.)){bad=true;break;} if (bad && userOptions.periodic) continue; }   // non-periodic keeps hull cells (volume-ratio density)
-            Real ep[NO_DIM+1][NO_DIM];
-            for (int v=0;v<=NO_DIM;++v) for (int d=0;d<NO_DIM;++d) ep[v][d]=cell->vertex(v)->info().eulerianPosition(d);
-            if ( userOptions.periodic )
-            {
-                Real boxLen[NO_DIM]; for (int d=0;d<NO_DIM;++d) boxLen[d]=boxCoordinates[2*d+1]-boxCoordinates[2*d];
-                for (int v=1;v<=NO_DIM;++v) for (int d=0;d<NO_DIM;++d){ Real diff=ep[v][d]-ep[0][d]; if(diff>boxLen[d]*Real(0.5))ep[v][d]-=boxLen[d]; if(diff<-boxLen[d]*Real(0.5))ep[v][d]+=boxLen[d]; }
-            }
-            double Ax2[NO_DIM][NO_DIM];
-            for (int v=0;v<NO_DIM;++v) for (int i=0;i<NO_DIM;++i) Ax2[v][i]=double(ep[v+1][i])-double(ep[0][i]);
-            { double avgEdge2=0.; for(int v=0;v<NO_DIM;++v){double l2=0.;for(int i=0;i<NO_DIM;++i)l2+=Ax2[v][i]*Ax2[v][i];avgEdge2+=l2;} avgEdge2/=NO_DIM; double edgeScale=avgEdge2*std::sqrt(avgEdge2); if (std::fabs(determinant(Ax2)) < 1.e-6*edgeScale) continue; }
+            PSCellGeometry geo;   // dummy/ownership/hull/degeneracy filters (no inverse check here)
+            if ( !psFilterCell(cell, userOptions, boxCoordinates, false, NULL, geo) ) continue;
+            Real (&ep)[NO_DIM+1][NO_DIM] = geo.eulerPos;
             ++psKeptCells;
             Real eLo[NO_DIM],eHi[NO_DIM];
             for (int d=0;d<NO_DIM;++d){eLo[d]=ep[0][d];eHi[d]=ep[0][d];}
@@ -222,34 +203,10 @@ void interpolateGrid_phaseSpace(DT &dt,
         PS_FOREACH_FINITE_CELL
         {
             Cell_handle cell = itC;
-#ifdef TEST_PADDING
-            { bool dummy=false; for (int v=0;v<=NO_DIM;++v) if (cell->vertex(v)->info().isDummy()){dummy=true;break;} if (dummy) continue; }
-#endif
-            if ( !userOptions.lagrangianRegion.isNullBox() )
-            {
-                double cen[NO_DIM]; for (int d=0;d<NO_DIM;++d) cen[d]=0.;
-                for (int v=0;v<=NO_DIM;++v) for (int d=0;d<NO_DIM;++d) cen[d]+=double(cell->vertex(v)->point()[d]);
-                bool owned=true;
-                for (int d=0;d<NO_DIM;++d){ cen[d]/=double(NO_DIM+1); if (cen[d]<userOptions.lagrangianRegion[2*d]||cen[d]>=userOptions.lagrangianRegion[2*d+1]){owned=false;break;} }
-                if (!owned) continue;
-            }
-            bool hadBadVertex = false;
-            { bool bad=false; for (int v=0;v<=NO_DIM;++v) if (cell->vertex(v)->info().density()<=Real(0.)){bad=true;break;} if (bad && userOptions.periodic) continue; hadBadVertex = bad; }
-            Real ep[NO_DIM+1][NO_DIM];
-            for (int v=0;v<=NO_DIM;++v) for (int d=0;d<NO_DIM;++d) ep[v][d]=cell->vertex(v)->info().eulerianPosition(d);
-            if ( userOptions.periodic )
-            {
-                Real boxLen[NO_DIM]; for (int d=0;d<NO_DIM;++d) boxLen[d]=boxCoordinates[2*d+1]-boxCoordinates[2*d];
-                for (int v=1;v<=NO_DIM;++v) for (int d=0;d<NO_DIM;++d){ Real diff=ep[v][d]-ep[0][d]; if(diff>boxLen[d]*Real(0.5))ep[v][d]-=boxLen[d]; if(diff<-boxLen[d]*Real(0.5))ep[v][d]+=boxLen[d]; }
-            }
-            double Ax[NO_DIM][NO_DIM];
-            for (int v=0;v<NO_DIM;++v) for (int i=0;i<NO_DIM;++i) Ax[v][i]=double(ep[v+1][i])-double(ep[0][i]);
-            { double avgEdge2=0.; for(int v=0;v<NO_DIM;++v){double l2=0.;for(int i=0;i<NO_DIM;++i)l2+=Ax[v][i]*Ax[v][i];avgEdge2+=l2;} avgEdge2/=NO_DIM; double edgeScale=avgEdge2*std::sqrt(avgEdge2); if (std::fabs(determinant(Ax)) < 1.e-6*edgeScale) continue; }
-            {
-                Real inv[NO_DIM][NO_DIM]; matrixInverse(Ax,inv);
-                bool zero=true; for (int a=0;a<NO_DIM&&zero;++a) for (int b=0;b<NO_DIM;++b) if (inv[a][b]!=Real(0.)){zero=false;break;}
-                if (zero) { ++nDegenerateInverse; continue; }
-            }
+            PSCellGeometry geo;   // the CPU loop's filters, including the zero-inverse check
+            if ( !psFilterCell(cell, userOptions, boxCoordinates, true, &nDegenerateInverse, geo) ) continue;
+            bool const hadBadVertex = geo.useVolumeRatioDensity;
+            Real (&ep)[NO_DIM+1][NO_DIM] = geo.eulerPos;
             double Lag[NO_DIM][NO_DIM];
             for (int v=0;v<NO_DIM;++v) for (int i=0;i<NO_DIM;++i) Lag[v][i]=double(cell->vertex(v+1)->point()[i])-double(cell->vertex(0)->point()[i]);
             float tm = float( double(userOptions.averageDensity)*std::fabs(determinant(Lag))/factorial(NO_DIM) );
@@ -382,123 +339,20 @@ void interpolateGrid_phaseSpace(DT &dt,
     }
 #endif // PS_GPU
 
-    // per-cell scatter is serial; parallelism is one level up over Lagrangian partitions
-    // (DTFE.cpp). A per-cell OpenMP scatter was memory-bandwidth bound and gave no speedup.
+    // per-cell scatter is serial; parallelism is one level up over Lagrangian partitions (DTFE.cpp)
     if ( !metalDeposited )
     PS_FOREACH_FINITE_CELL
     {
         Cell_handle cell = itC;
 
-#ifdef TEST_PADDING
-        // Skip cells touching a dummy padding vertex.
-        bool hasDummy = false;
-        for (int v = 0; v <= NO_DIM; ++v)
-            if (cell->vertex(v)->info().isDummy()) { hasDummy = true; break; }
-        if (hasDummy) { continue; }
-#endif
-
-        // Lagrangian-partition ownership: padding zones overlap, so keep a cell only if its
-        // Lagrangian centroid (not an arbitrary vertex) lies in the primary box -> tiles without double-counting
-        if ( !userOptions.lagrangianRegion.isNullBox() )
-        {
-            double cen[NO_DIM];
-            for (int d = 0; d < NO_DIM; ++d) cen[d] = 0.;
-            for (int v = 0; v <= NO_DIM; ++v)
-                for (int d = 0; d < NO_DIM; ++d)
-                    cen[d] += double(cell->vertex(v)->point()[d]);
-            bool owned = true;
-            for (int d = 0; d < NO_DIM; ++d)
-            {
-                cen[d] /= double(NO_DIM + 1);
-                if ( cen[d] < userOptions.lagrangianRegion[2*d] || cen[d] >= userOptions.lagrangianRegion[2*d+1] )
-                { owned = false; break; }
-            }
-            if (!owned) { continue; }
-        }
-
-        // zero/negative-density vertex sits on the Lagrangian convex hull. Periodic: artefact, drop the
-        // cell. Non-periodic: real cloud surface, give it a constant volume-ratio density (avgDensity * V_Lag/V_Eul).
-        bool useVolumeRatioDensity = false;
-        {
-            bool hasBadVertex = false;
-            for (int v = 0; v <= NO_DIM; ++v)
-                if (cell->vertex(v)->info().density() <= Real(0.)) { hasBadVertex = true; break; }
-            if (hasBadVertex)
-            {
-                if ( userOptions.periodic ) { continue; }
-                useVolumeRatioDensity = true;
-            }
-        }
-
-        // Gather the Eulerian vertex positions; the minimum-image convention (below) keeps boundary
-        // cells from spuriously spanning the whole periodic box.
-        Real eulerPos[NO_DIM+1][NO_DIM];
-        for (int v = 0; v <= NO_DIM; ++v)
-            for (int d = 0; d < NO_DIM; ++d)
-                eulerPos[v][d] = cell->vertex(v)->info().eulerianPosition(d);
-
-        if ( userOptions.periodic )
-        {
-            Real boxLen[NO_DIM];
-            for (int d = 0; d < NO_DIM; ++d)
-                boxLen[d] = boxCoordinates[2*d+1] - boxCoordinates[2*d];
-
-            // Wrap vertices 1..NO_DIM to their nearest image of vertex 0.
-            for (int v = 1; v <= NO_DIM; ++v)
-                for (int d = 0; d < NO_DIM; ++d)
-                {
-                    Real diff = eulerPos[v][d] - eulerPos[0][d];
-                    if (diff >  boxLen[d] * Real(0.5)) eulerPos[v][d] -= boxLen[d];
-                    if (diff < -boxLen[d] * Real(0.5)) eulerPos[v][d] += boxLen[d];
-                }
-        }
-
-        // Eulerian edge matrix (rows = vertices 1..NO_DIM relative to vertex 0, possibly wrapped).
-        double Ax[NO_DIM][NO_DIM];
-        for (int v = 0; v < NO_DIM; ++v)
-            for (int i = 0; i < NO_DIM; ++i)
-                Ax[v][i] = double(eulerPos[v+1][i]) - double(eulerPos[0][i]);
-
-        double cellDet = determinant(Ax);
-        double cellAbsDet = std::fabs(cellDet);
-
-        // drop only degenerate cells (near-zero Eulerian volume -> divergent 1/volume density).
-        // |det| < tol*(mean edge)^3 is resolution-independent; caustics stay well above it.
-        double const DEGENERATE_DET_TOL = 1.e-6;
-        {
-            double avgEdge2 = 0.;
-            for (int v = 0; v < NO_DIM; ++v)
-            {
-                double len2 = 0.;
-                for (int i = 0; i < NO_DIM; ++i)
-                    len2 += Ax[v][i] * Ax[v][i];
-                avgEdge2 += len2;
-            }
-            avgEdge2 /= NO_DIM;
-            double edgeScale = avgEdge2 * std::sqrt(avgEdge2); // avgEdge^3
-            if (cellAbsDet < DEGENERATE_DET_TOL * edgeScale) { continue; }
-        }
-
-        Real posMatInv[NO_DIM][NO_DIM];
-        matrixInverse(Ax, posMatInv);
-
-        // matrixInverse() returns the ALL-ZERO matrix for a (near-)singular Eulerian simplex (|det|
-        // below REAL_PRECISSION). A zero inverse makes every barycentric coordinate below exactly 0,
-        // which the point-in-simplex test then reads as "inside" for EVERY grid point in the cell's
-        // bounding box -- so the cell floods its whole axis-aligned bbox. That is the source of the
-        // grid-aligned "square" artefacts: worst at caustics (flat, collapsed cells cluster there) and
-        // amplified by sub-sampling (nSub>1 puts more sample points inside the bbox, so the averaged
-        // '_a' fields look even worse and their mean density is inflated). A collapsed cell has no
-        // reliable Eulerian volume, so drop it; an adjacent non-degenerate stream covers the region.
-        // NOTE: this must stay consistent with matrixInverse()'s degeneracy criterion -- the earlier
-        // relative determinant pre-filter alone does NOT catch every cell that matrixInverse() zeroes.
-        {
-            bool singularInverse = true;
-            for (int a = 0; a < NO_DIM && singularInverse; ++a)
-                for (int b = 0; b < NO_DIM; ++b)
-                    if (posMatInv[a][b] != Real(0.)) { singularInverse = false; break; }
-            if (singularInverse) { ++nDegenerateInverse; continue; }
-        }
+        // Shared filter chain (ps_cell_filter.h): dummy-vertex skip, Lagrangian-centroid
+        // ownership, hull handling, minimum-image wrap, degeneracy + zero-inverse checks.
+        PSCellGeometry geo;
+        if ( !psFilterCell(cell, userOptions, boxCoordinates, true, &nDegenerateInverse, geo) )
+            continue;
+        bool const useVolumeRatioDensity = geo.useVolumeRatioDensity;
+        Real (&eulerPos)[NO_DIM+1][NO_DIM] = geo.eulerPos;
+        Real (&posMatInv)[NO_DIM][NO_DIM] = geo.posMatInv;
 
         // PS-DTFE per-tetrahedron MASS (Abel/Hahn/Shandarin tetrahedra method): each Lagrangian flow
         // element carries a constant mass m = averageDensity * V_lag, conserved as it maps to its
@@ -518,7 +372,6 @@ void interpolateGrid_phaseSpace(DT &dt,
             tetMass = Real( double(userOptions.averageDensity) * absDetLag / factorial(NO_DIM) );  // = rho_bar * V_lag
             if (tetMass < Real(0.)) tetMass = Real(0.);
         }
-        (void)useVolumeRatioDensity;   // retained above only to drop/flag hull cells
 
         // Eulerian bounding box of this cell (from the wrapped positions).
         Real eMin[NO_DIM], eMax[NO_DIM];
@@ -871,8 +724,7 @@ void interpolateGrid_phaseSpace(DT &dt,
 
     // density accumulated MASS (sum of per-tetrahedron mass shares); convert to a density by dividing
     // by the grid-cell volume, then normalize by averageDensity so the written field is rho/rho_bar
-    // (mean-normalized "density contrast + 1", the SAME convention as standard DTFE -- since
-    // 2026-07: older outputs stored the physical mass density; dtfelib.FieldSet detects both).
+    // (mean-normalized "density contrast + 1", the SAME convention as standard DTFE).
     // Mass conservation makes the box mean exactly 1 for any nSub. Stream count is averaged over
     // the nSub^NO_DIM sub-samples below.
     if ( field.density )

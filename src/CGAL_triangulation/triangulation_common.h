@@ -26,5 +26,6 @@ using namespace std;
 #include "my_function.h"
 #include "padding_test.h"
 #include "field_computation.h"
+#include "ps_cell_filter.h"
 
 #endif

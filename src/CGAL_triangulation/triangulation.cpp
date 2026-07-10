@@ -350,15 +350,12 @@ void vertexDensity(DT & dt,
     {
         MESSAGE::Error error;
         error << "The member 'averageDensity' of class 'User_options' must be positive since it represents the average density. Error found in function 'vertexDensity'." << MESSAGE::EndError;
-        printf("%f\n", userOptions.averageDensity);
     }
     if ( dt.number_of_vertices()<NO_DIM+1 )
     {
         MESSAGE::Warning warning(1);
         warning << "Because there are less than " << NO_DIM+1 << " vertices in the Delaunay triangulation there is no cell and hence there is no information that can be used to compute the density associated to each vertex. All vertex density values will be initialized to 0.\n" << MESSAGE::EndWarning;
         return;
-        for (DT::Finite_vertices_iterator vIT = dt.finite_vertices_begin(); vIT != dt.finite_vertices_end(); ++vIT )
-            vIT->info().setDensity( 0. );
     }
     
     Real const factor = (NO_DIM+1.) / userOptions.averageDensity;  // mass-conservation normalization; NO_DIM+1 = vertices per Delaunay cell

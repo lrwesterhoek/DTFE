@@ -13,6 +13,9 @@
 //        mass conservation, full-coverage, density & stream-count profiles vs ANALYTIC
 //        solution of z = q + A sin(kq), dispersion invariants (sigma_xx=sigma_yy=0 for
 //        z-only flow; single-stream sigma_zz ~ 0 at nSub=1), CPU vs GPU on all fields.
+//    T9  analytic velocity-field checks: constant field reproduced exactly; linear field
+//        v = Gx recovers the gradient in every covered cell
+//    T10 partition sub-grid support (subOrigin/subDims deposit window)
 //
 //  Field tests run when the 'depositFields' kernel exists in the library; density-only
 //  parity runs against 'depositDensity' otherwise (Phase A gate).
@@ -36,20 +39,8 @@
 #include <random>
 #include <algorithm>
 
-struct DepositParams {              // must match the MSL struct byte-for-byte
-    float    boxLo[3];
-    float    dx[3];
-    int32_t  nGrid[3];
-    int32_t  nSub;
-    int32_t  periodic;
-    int32_t  subOrigin[3];          // partition sub-grid box (full grid: origin 0, dims = nGrid)
-    int32_t  subDims[3];
-    int32_t  fVel;                  // field flags (see metal/ps_deposit.metal); the harness
-    int32_t  fDisp;                 // exercises all moment grids, so they are always 1 here
-    int32_t  fGrad;
-    int32_t  fLinear;               // 0 = uniform shares (the harness references)
-    uint32_t nTet;
-};
+#include "../src/CGAL_triangulation/ps_deposit_params.h"
+using DepositParams = PSDepositParams;   // shared host struct; the harness sets all field flags to 1
 
 static int  g_pass = 0, g_fail = 0;
 static void verdict(const char* name, bool ok, const char* detail) {

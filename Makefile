@@ -506,13 +506,13 @@ $(OBJ_DIR)/quantities$(OBJ_EXT): $(SRC)/quantities.cc $(SRC)/quantities.h $(SRC)
 $(OBJ_DIR)/NGP_interpolation$(OBJ_EXT): $(SRC)/NGP_interpolation.cc $(SRC)/interpolations.h $(SRC)/define.h Makefile
 	$(CC) $(COMPILE_FLAGS) $(DTFE_INC) -o $@ -c $(SRC)/NGP_interpolation.cc
 
-$(OBJ_DIR)/CIC_interpolation$(OBJ_EXT): $(SRC)/CIC_interpolation.cc $(SRC)/interpolations.h $(SRC)/define.h Makefile
+$(OBJ_DIR)/CIC_interpolation$(OBJ_EXT): $(SRC)/CIC_interpolation.cc $(SRC)/interpolations.h $(SRC)/define.h $(SRC)/grid_deposit_engine.h Makefile
 	$(CC) $(COMPILE_FLAGS) $(DTFE_INC) -o $@ -c $(SRC)/CIC_interpolation.cc
 
-$(OBJ_DIR)/TSC_interpolation$(OBJ_EXT): $(SRC)/TSC_interpolation.cc $(SRC)/interpolations.h $(SRC)/define.h Makefile
+$(OBJ_DIR)/TSC_interpolation$(OBJ_EXT): $(SRC)/TSC_interpolation.cc $(SRC)/interpolations.h $(SRC)/define.h $(SRC)/grid_deposit_engine.h Makefile
 	$(CC) $(COMPILE_FLAGS) $(DTFE_INC) -o $@ -c $(SRC)/TSC_interpolation.cc
 
-$(OBJ_DIR)/PCS_interpolation$(OBJ_EXT): $(SRC)/PCS_interpolation.cc $(SRC)/interpolations.h $(SRC)/define.h Makefile
+$(OBJ_DIR)/PCS_interpolation$(OBJ_EXT): $(SRC)/PCS_interpolation.cc $(SRC)/interpolations.h $(SRC)/define.h $(SRC)/grid_deposit_engine.h Makefile
 	$(CC) $(COMPILE_FLAGS) $(DTFE_INC) -o $@ -c $(SRC)/PCS_interpolation.cc
 
 $(OBJ_DIR)/interlacing$(OBJ_EXT): $(SRC)/interlacing.cc $(SRC)/interlacing.h $(SRC)/define.h Makefile
@@ -582,13 +582,13 @@ $(OBJ_DIR_PS)/quantities$(OBJ_EXT): $(SRC)/quantities.cc $(SRC)/quantities.h $(S
 $(OBJ_DIR_PS)/NGP_interpolation$(OBJ_EXT): $(SRC)/NGP_interpolation.cc $(SRC)/interpolations.h $(SRC)/define.h Makefile
 	$(CC) $(COMPILE_FLAGS_PS) $(DTFE_INC) -o $@ -c $(SRC)/NGP_interpolation.cc
 
-$(OBJ_DIR_PS)/CIC_interpolation$(OBJ_EXT): $(SRC)/CIC_interpolation.cc $(SRC)/interpolations.h $(SRC)/define.h Makefile
+$(OBJ_DIR_PS)/CIC_interpolation$(OBJ_EXT): $(SRC)/CIC_interpolation.cc $(SRC)/interpolations.h $(SRC)/define.h $(SRC)/grid_deposit_engine.h Makefile
 	$(CC) $(COMPILE_FLAGS_PS) $(DTFE_INC) -o $@ -c $(SRC)/CIC_interpolation.cc
 
-$(OBJ_DIR_PS)/TSC_interpolation$(OBJ_EXT): $(SRC)/TSC_interpolation.cc $(SRC)/interpolations.h $(SRC)/define.h Makefile
+$(OBJ_DIR_PS)/TSC_interpolation$(OBJ_EXT): $(SRC)/TSC_interpolation.cc $(SRC)/interpolations.h $(SRC)/define.h $(SRC)/grid_deposit_engine.h Makefile
 	$(CC) $(COMPILE_FLAGS_PS) $(DTFE_INC) -o $@ -c $(SRC)/TSC_interpolation.cc
 
-$(OBJ_DIR_PS)/PCS_interpolation$(OBJ_EXT): $(SRC)/PCS_interpolation.cc $(SRC)/interpolations.h $(SRC)/define.h Makefile
+$(OBJ_DIR_PS)/PCS_interpolation$(OBJ_EXT): $(SRC)/PCS_interpolation.cc $(SRC)/interpolations.h $(SRC)/define.h $(SRC)/grid_deposit_engine.h Makefile
 	$(CC) $(COMPILE_FLAGS_PS) $(DTFE_INC) -o $@ -c $(SRC)/PCS_interpolation.cc
 
 $(OBJ_DIR_PS)/interlacing$(OBJ_EXT): $(SRC)/interlacing.cc $(SRC)/interlacing.h $(SRC)/define.h Makefile
@@ -628,7 +628,7 @@ $(OBJ_DIR_PS)/ps_deposit_msl.h: metal/ps_deposit.metal Makefile
 	{ printf 'static const char PS_DEPOSIT_MSL[] = R"MSL(\n'; cat metal/ps_deposit.metal; printf '\n)MSL";\n'; } > $@.tmp
 	mv $@.tmp $@
 
-$(OBJ_DIR_PS)/ps_metal_host$(OBJ_EXT): $(SRC)/CGAL_triangulation/ps_metal_host.cc $(SRC)/CGAL_triangulation/gpu_host.h $(OBJ_DIR_PS)/ps_deposit_msl.h Makefile
+$(OBJ_DIR_PS)/ps_metal_host$(OBJ_EXT): $(SRC)/CGAL_triangulation/ps_metal_host.cc $(SRC)/CGAL_triangulation/gpu_host.h $(SRC)/CGAL_triangulation/ps_deposit_params.h $(OBJ_DIR_PS)/ps_deposit_msl.h Makefile
 	$(CC) $(COMPILE_FLAGS_PS) -I third_party/metal-cpp -I $(OBJ_DIR_PS) -o $@ -c $(SRC)/CGAL_triangulation/ps_metal_host.cc
 
 # Standard-DTFE Metal deposit host (METAL=1 only), same embedding scheme in $(OBJ_DIR).
@@ -645,7 +645,7 @@ $(OBJ_DIR)/dtfe_metal_host_l$(OBJ_EXT): $(SRC)/CGAL_triangulation/dtfe_metal_hos
 
 # CUDA/HIP GPU deposit hosts (CUDA=1 via nvcc, HIP=1 via hipcc): single-source .cu files,
 # kernels compiled ahead of time (no vendored SDK -- the CUDA toolkit / ROCm provide headers).
-$(OBJ_DIR_PS)/ps_gpu_cuda$(OBJ_EXT): $(SRC)/CGAL_triangulation/ps_gpu_cuda.cu $(SRC)/CGAL_triangulation/gpu_host.h $(SRC)/CGAL_triangulation/gpu_cuda_compat.h Makefile
+$(OBJ_DIR_PS)/ps_gpu_cuda$(OBJ_EXT): $(SRC)/CGAL_triangulation/ps_gpu_cuda.cu $(SRC)/CGAL_triangulation/gpu_host.h $(SRC)/CGAL_triangulation/gpu_cuda_compat.h $(SRC)/CGAL_triangulation/ps_deposit_params.h Makefile
 	$(GPUXX) $(GPUXX_FLAGS) -o $@ -c $(SRC)/CGAL_triangulation/ps_gpu_cuda.cu
 
 $(OBJ_DIR)/dtfe_gpu_cuda$(OBJ_EXT): $(SRC)/CGAL_triangulation/dtfe_gpu_cuda.cu $(SRC)/CGAL_triangulation/gpu_host.h $(SRC)/CGAL_triangulation/gpu_cuda_compat.h Makefile
