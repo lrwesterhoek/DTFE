@@ -36,11 +36,16 @@ struct vertexData : public Data_structure
     bool   dummyNeighbor; // true if vertex has at least one dummy neighbor (padding test for density)
 #ifdef PHASE_SPACE
     Pvector<Real,NO_DIM> _eulerianPos; // Eulerian position (triangulation vertices store Lagrangian coords in PS-DTFE mode)
+    uint64_t _particleID;              // snapshot ParticleID (stream identities, --per-stream-ids); +8 B/vertex, see auto_tune.h
 #endif
 
 
     public:
-    vertexData(){ dummy=false; dummyNeighbor=false; }
+    vertexData(){ dummy=false; dummyNeighbor=false;
+#ifdef PHASE_SPACE
+        _particleID=0;
+#endif
+    }
 
     // Returns the scalar field for this vertex; the single hook to customize what "scalar" means.
     inline Pvector<Real,noScalarComp> myScalar()
@@ -61,12 +66,14 @@ struct vertexData : public Data_structure
 #endif
 #ifdef PHASE_SPACE
         _eulerianPos = other.position();
+        _particleID = other.particleID();
 #endif
     }
 
 #ifdef PHASE_SPACE
     inline Pvector<Real,NO_DIM>& eulerianPosition() { return _eulerianPos; }      // full Eulerian position
     inline Real& eulerianPosition(int const i) { return _eulerianPos[i]; }        // one Eulerian component
+    inline uint64_t particleID() { return _particleID; }                          // snapshot ParticleID (0 if the reader has none)
 #endif
     // remaining accessors for 'Data_structure' are in "particle_data.h"
 

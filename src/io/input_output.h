@@ -168,12 +168,16 @@ struct Read_data
         // simulation that fits in RAM; see the memory model in auto_tune.h)
         if ( _noParticles>size_t(0) )
         {
-#ifdef PHASE_SPACE
-            // particle IDs were only needed for the Lagrangian matching, which already ran
-            std::vector<uint64_t>().swap( _particleIDs );
-#endif
             p->clear();
             p->resize( _noParticles );
+#ifdef PHASE_SPACE
+            // keep the IDs on the particles (stream identities, --per-stream-ids); empty for
+            // readers that do not provide IDs -> the particles keep their 0 default
+            if ( _particleIDs.size() == _noParticles )
+                for (size_t i=0; i<_noParticles; ++i)
+                    (*p)[i].particleID() = _particleIDs[i];
+            std::vector<uint64_t>().swap( _particleIDs );
+#endif
             if ( _position._assigned )
             {
                 for (size_t i=0; i<_noParticles; ++i)

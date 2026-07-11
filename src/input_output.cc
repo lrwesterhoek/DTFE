@@ -29,6 +29,7 @@
 #include <cstdlib>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <numeric>
 #include <vector>
 #include <string>
@@ -103,6 +104,44 @@ FunctionReadInputData chooseInputDataReadFunction(int const inputFileType)
 
 
 
+// The quickstart footgun: the build's default input type is 105 (Gadget HDF5, Makefile
+// INPUT_FILE_DEFAULT), but a plain binary Gadget snapshot (type 101, e.g. demo/z0_64.gadget)
+// is not an HDF5 file, so the HDF5 open used to die with an opaque H5 exception. A real HDF5
+// file always begins with the 8-byte HDF5 signature; a binary Gadget file begins with a
+// Fortran record marker (256 for type 1, 8 for type 2, either endianness). Redirect exactly
+// that case to the binary Gadget reader; anything else keeps the requested type.
+static int sniffGadgetBinaryInput(std::string const &filename, int const inputFileType,
+                                  int const verboseLevel)
+{
+    if ( inputFileType != 105 )
+        return inputFileType;
+    std::ifstream file( filename.c_str(), std::ios::binary );
+    if ( not file )
+        return inputFileType;   // missing file / multi-file basename: the HDF5 reader resolves it
+    unsigned char head[8] = {0};
+    file.read( reinterpret_cast<char *>(head), sizeof(head) );
+    if ( not file )
+        return inputFileType;
+    static unsigned char const hdf5Magic[8] = { 0x89, 'H', 'D', 'F', '\r', '\n', 0x1a, '\n' };
+    if ( std::memcmp(head, hdf5Magic, sizeof(hdf5Magic)) == 0 )
+        return inputFileType;
+    uint32_t marker;
+    std::memcpy( &marker, head, sizeof(marker) );
+    uint32_t const swapped = ((marker >> 24) & 0xffu) | ((marker >> 8) & 0xff00u)
+                             | ((marker << 8) & 0xff0000u) | (marker << 24);
+    if ( marker == 256u || marker == 8u || swapped == 256u || swapped == 8u )
+    {
+        MESSAGE::Message message( verboseLevel );
+        message << MESSAGE::cYellow() << "NOTE: '" << filename << "' is not an HDF5 file but "
+                "starts with a Gadget record marker; reading it as a binary Gadget snapshot "
+                "(--input 101). Pass '--input' explicitly to override." << MESSAGE::cReset()
+                << "\n" << MESSAGE::Flush;
+        return 101;
+    }
+    return inputFileType;
+}
+
+
 // Read the particle data used for the DTFE computation.
 void readInputData(std::vector<Particle_data> *p,
                    std::vector<Sample_point> *samplingCoordinates,
@@ -112,7 +151,9 @@ void readInputData(std::vector<Particle_data> *p,
     Read_data<Real> readData; // stores the data read from the input file
 
 
-    FunctionReadInputData functionReadInputData = chooseInputDataReadFunction( userOptions->inputFileType );
+    int const inputFileType = sniffGadgetBinaryInput( filename, userOptions->inputFileType,
+                                                      userOptions->verboseLevel );
+    FunctionReadInputData functionReadInputData = chooseInputDataReadFunction( inputFileType );
     (*functionReadInputData)( filename, &readData, userOptions );
 
 

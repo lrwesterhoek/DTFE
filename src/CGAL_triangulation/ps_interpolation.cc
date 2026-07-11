@@ -5,8 +5,9 @@
 #ifdef PHASE_SPACE
 
 // PS-DTFE is validated only in 3D; the NO_DIM==2 path compiles but is untested.
+// (#pragma message, not #warning: the build's global -Wno-cpp silences #warning directives)
 #if NO_DIM==2
-#warning "PS-DTFE (PHASE_SPACE) is not validated for NO_DIM==2; the 2D path is untested."
+#pragma message "PS-DTFE (PHASE_SPACE) is not validated for NO_DIM==2; the 2D path is untested."
 #endif
 
 #include "triangulation_common.h"

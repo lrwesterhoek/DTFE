@@ -25,6 +25,15 @@
 #     densities == total; sorted descending; offsets consistent; 'dtfe' vs 'geometric' agree
 #     to ~5% in smooth single-stream regions).
 #  E) Text and binary sample-point inputs give byte-identical outputs.
+#  F) --per-stream-ids (when the binary supports it): adding the flag leaves every existing
+#     output byte-identical; '.pts_stream_ids' has sum(streams) records of 4 ascending
+#     uint64 snapshot ParticleIDs and is byte-identical between serial and --partition 2 2 2
+#     (the id quadruple is sorted, so it is orientation- and partition-invariant).
+#  G) --pts-den-grad (when the binary supports it): adding the flag leaves every existing
+#     output byte-identical; on a jitter-free pancake (density varies only along x) the
+#     transverse gradients vanish, grad_x matches a central finite difference of '.pts_den'
+#     at x +- eps probe points away from the caustics, the per-point gradient equals the sum
+#     of its per-stream gradients, and serial vs --partition 2 2 2 agree to float rounding.
 #
 # Usage:
 #   tests/ps_point_eval_check.sh              # build, run, check
@@ -47,8 +56,11 @@ TMP="${SCRIPT_DIR}/tmp"; mkdir -p "${TMP}"
 # input/point file names must NOT share a prefix with the output roots (rm -f "<root>".*)
 SNAP_UNI="${TMP}/ppe_input_uniform.hdf5"
 SNAP_PAN="${TMP}/ppe_input_pancake.hdf5"
+SNAP_PAN0="${TMP}/ppe_input_pancake0.hdf5"
 PTS_BIN="${TMP}/ppe_input_centers.bin"
 PTS_TXT="${TMP}/ppe_input_centers.txt"
+PTS_FD="${TMP}/ppe_input_fdprobes.bin"
+SEL_FD="${TMP}/ppe_input_fdsel.txt"
 
 echo "============================================================"
 echo " PS-DTFE point-evaluation check   N=${N}^3  grid=${GRID}^3"
@@ -120,12 +132,86 @@ for ext in .pts_den .pts_vel .pts_velDisp .pts_streams .pts_stream_offsets .pts_
 done
 echo "   OK"
 
+# --per-stream-ids section, gated so the script still runs against binaries predating the flag
+# (capture first: 'grep -q' would SIGPIPE the binary and trip pipefail)
+HAVE_IDS=0
+FULL_HELP="$("${BIN}" --full_help 2>/dev/null || true)"
+if grep -q -- '--per-stream-ids' <<<"${FULL_HELP}"; then
+    HAVE_IDS=1
+    echo ">> run 7: pancake, serial, 'geometric', --per-stream-ids (implies --per-stream)"
+    run "${TMP}/ppe_pan_ids" "${SNAP_PAN}" --periodic \
+        --sample-points "${PTS_BIN}" --per-stream-ids --ps-stream-density geometric
+    echo ">> run 8: pancake, --partition 2 2 2, 'geometric', --per-stream-ids"
+    run "${TMP}/ppe_pan_ids_par" "${SNAP_PAN}" --periodic --partition 2 2 2 \
+        --sample-points "${PTS_BIN}" --per-stream-ids --ps-stream-density geometric
+    echo ">> (F) --per-stream-ids leaves the existing outputs byte-identical"
+    for ext in .pts_den .pts_vel .pts_velDisp .pts_streams .pts_stream_offsets .pts_stream_records; do
+        cmp -s "${TMP}/ppe_pan_ser${ext}" "${TMP}/ppe_pan_ids${ext}" \
+            || { echo "FAIL: ${ext} changed when --per-stream-ids was added"; exit 1; }
+    done
+    echo "   OK"
+else
+    echo ">> (F) skipped: this PS-DTFE binary has no --per-stream-ids"
+fi
+
+# --pts-den-grad section, gated like (F)
+HAVE_GRAD=0
+if grep -q -- '--pts-den-grad' <<<"${FULL_HELP}"; then
+    HAVE_GRAD=1
+    # jitter-free pancake: the density varies only along x, so the transverse gradient
+    # components must vanish (the Lagrangian lattice is y/z-translation-invariant)
+    "${PY}" "${SCRIPT_DIR}/generate_ps_test_data.py" --out "${SNAP_PAN0}" --n "${N}" --box "${BOX}" \
+        --amplitude-factor 1.8 --jitter-frac 0 >/dev/null
+    echo ">> run 9: jitter-free pancake, serial, 'dtfe', --per-stream --pts-den-grad"
+    run "${TMP}/ppe_grad_ser" "${SNAP_PAN0}" --periodic \
+        --sample-points "${PTS_BIN}" --per-stream --pts-den-grad
+    echo ">> run 10: jitter-free pancake, --partition 2 2 2, 'dtfe', --per-stream --pts-den-grad"
+    run "${TMP}/ppe_grad_par" "${SNAP_PAN0}" --periodic --partition 2 2 2 \
+        --sample-points "${PTS_BIN}" --per-stream --pts-den-grad
+    echo ">> run 11: jitter-free pancake, serial, 'dtfe', --per-stream (no gradient flag)"
+    run "${TMP}/ppe_grad_off" "${SNAP_PAN0}" --periodic \
+        --sample-points "${PTS_BIN}" --per-stream
+    echo ">> (G) --pts-den-grad leaves the existing outputs byte-identical"
+    for ext in .pts_den .pts_vel .pts_velDisp .pts_streams .pts_stream_offsets .pts_stream_records; do
+        cmp -s "${TMP}/ppe_grad_off${ext}" "${TMP}/ppe_grad_ser${ext}" \
+            || { echo "FAIL: ${ext} changed when --pts-den-grad was added"; exit 1; }
+    done
+    echo "   OK"
+    # finite-difference probes: single-stream cell centres away from the caustics, x +- eps
+    "${PY}" - "${TMP}" "${GRID}" "${BOX}" "${PTS_FD}" "${SEL_FD}" <<'PY'
+import sys
+import numpy as np
+tmp, grid, box, fdbin, fdsel = sys.argv[1], int(sys.argv[2]), float(sys.argv[3]), sys.argv[4], sys.argv[5]
+ncell = grid ** 3
+st = np.fromfile(f"{tmp}/ppe_grad_ser.pts_streams", dtype=np.int32)
+grad = np.fromfile(f"{tmp}/ppe_grad_ser.pts_denGrad").reshape(-1, 3)
+c = (np.arange(grid) + 0.5) * box / grid
+x, y, z = np.meshgrid(c, c, c, indexing="ij")
+pts = np.stack([x.ravel(), y.ravel(), z.ravel()], axis=1)
+gx = np.abs(grad[:, 0])
+# single-stream, meaningful slope (above-median |grad_x|), keep a deterministic subset
+cand = np.where((st == 1) & (gx > np.median(gx[st == 1])))[0][::997][:40]
+eps = 0.02 * box / grid
+probes = np.empty((2 * cand.size, 3))
+probes[0::2] = pts[cand]; probes[0::2, 0] -= eps
+probes[1::2] = pts[cand]; probes[1::2, 0] += eps
+probes.astype(np.float64).tofile(fdbin)
+np.savetxt(fdsel, np.column_stack([cand, np.full(cand.size, eps)]), fmt="%.17g")
+PY
+    echo ">> run 12: jitter-free pancake, serial, FD probe points"
+    run "${TMP}/ppe_grad_fd" "${SNAP_PAN0}" --periodic --sample-points "${PTS_FD}"
+else
+    echo ">> (G) skipped: this PS-DTFE binary has no --pts-den-grad"
+fi
+
 echo ">> checking the numbers ..."
-"${PY}" - "${TMP}" "${GRID}" <<'PY'
+"${PY}" - "${TMP}" "${GRID}" "${HAVE_IDS}" "${HAVE_GRAD}" <<'PY'
 import sys
 import numpy as np
 
 tmp, grid = sys.argv[1], int(sys.argv[2])
+have_ids = len(sys.argv) > 3 and sys.argv[3] == "1"
+have_grad = len(sys.argv) > 4 and sys.argv[4] == "1"
 ncell = grid ** 3
 fails = []
 
@@ -239,6 +325,65 @@ r = den_bb[mask] / np.maximum(den[mask], 1e-12)
 q5, q95 = np.percentile(r, [5, 95])
 check("D5 dtfe vs geometric agree in smooth regions", 0.8 < q5 and q95 < 1.25,
       f"single-stream b/a ratio 5-95% = [{q5:.3f}, {q95:.3f}], median {np.median(r):.3f}")
+
+# ---------- (F) --per-stream-ids: stream identities ----------
+if have_ids:
+    import h5py
+    ids_s = np.fromfile(f"{tmp}/ppe_pan_ids.pts_stream_ids", dtype=np.uint64).reshape(-1, 4)
+    ids_p = np.fromfile(f"{tmp}/ppe_pan_ids_par.pts_stream_ids", dtype=np.uint64).reshape(-1, 4)
+    st_i = np.fromfile(f"{tmp}/ppe_pan_ids.pts_streams", dtype=np.int32)
+    check("F1 ids record count == sum(streams)", ids_s.shape[0] == st_i.sum(),
+          f"{ids_s.shape[0]} records vs {st_i.sum()} streams")
+    check("F2 id quadruples ascending (4 distinct vertices)",
+          bool((np.diff(ids_s.astype(np.int64), axis=1) > 0).all()), "")
+    if ids_s.shape == ids_p.shape:
+        check("F3 serial vs partition ids identical", bool(np.array_equal(ids_s, ids_p)), "")
+    else:
+        check("F3 serial vs partition ids identical", False,
+              f"record counts differ: {ids_s.shape[0]} vs {ids_p.shape[0]}")
+    with h5py.File(f"{tmp}/ppe_input_pancake.hdf5", "r") as f:
+        snap_ids = f["PartType1/ParticleIDs"][:]
+    check("F4 every id is a snapshot ParticleID",
+          bool(np.isin(ids_s.ravel(), snap_ids).all()), f"{ids_s.size} ids checked")
+
+# ---------- (G) --pts-den-grad: density gradients ----------
+if have_grad:
+    grad = np.fromfile(f"{tmp}/ppe_grad_ser.pts_denGrad").reshape(-1, 3)
+    _, _, _, st_g = load_pts(f"{tmp}/ppe_grad_ser")
+    off_g, rec_g = load_ragged(f"{tmp}/ppe_grad_ser")
+    sgrad = np.fromfile(f"{tmp}/ppe_grad_ser.pts_stream_dengrad").reshape(-1, 3)
+    check("G1 gradient layout", grad.shape[0] == ncell and sgrad.shape[0] == rec_g.shape[0],
+          f"{grad.shape[0]} points, {sgrad.shape[0]} stream records")
+    # jitter-free pancake: density is a function of x only -> transverse components vanish up
+    # to float32 vertex-density rounding (measured ~1e-6 of the grad_x scale; 3x headroom)
+    m1 = st_g == 1
+    gxs = np.abs(grad[m1, 0]).max()
+    tr = np.abs(grad[m1, 1:]).max()
+    check("G2 transverse gradient vanishes (1D pancake)", tr < 3e-6 * gxs,
+          f"max|grad_yz| = {tr:.3e} vs 3e-6 * max|grad_x| = {3e-6 * gxs:.3e}")
+    # per-point gradient == sum of its per-stream gradients (same reduction, same order)
+    gsum = np.zeros((ncell, 3))
+    nzg = np.diff(off_g) > 0
+    for d in range(3):
+        gsum[nzg, d] = np.add.reduceat(sgrad[:, d], off_g[:-1][nzg])
+    check("G3 per-stream gradients sum to total", np.abs(gsum - grad).max() < 1e-9 * max(gxs, 1.0),
+          f"max diff = {np.abs(gsum - grad).max():.3e}")
+    # partition consistency (float level, as C2-C4)
+    grad_p = np.fromfile(f"{tmp}/ppe_grad_par.pts_denGrad").reshape(-1, 3)
+    _, _, _, st_gp = load_pts(f"{tmp}/ppe_grad_par")
+    same_g = st_g == st_gp
+    dgp = np.abs(grad[same_g] - grad_p[same_g]).max() / (np.abs(grad).max() + 1e-30)
+    check("G4 partition gradient (float level)", dgp < 1e-5, f"max rel = {dgp:.3e}")
+    # central finite difference of .pts_den at x +- eps vs grad_x, away from caustics
+    sel = np.loadtxt(f"{tmp}/ppe_input_fdsel.txt").reshape(-1, 2)
+    idx, eps = sel[:, 0].astype(int), sel[0, 1]
+    fden = np.fromfile(f"{tmp}/ppe_grad_fd.pts_den")
+    fst = np.fromfile(f"{tmp}/ppe_grad_fd.pts_streams", dtype=np.int32)
+    fd = (fden[1::2] - fden[0::2]) / (2 * eps)
+    ok = (fst[0::2] == 1) & (fst[1::2] == 1)      # both probes single-stream
+    rel = np.abs(fd[ok] - grad[idx[ok], 0]) / (np.abs(grad[idx[ok], 0]) + 1e-12)
+    check("G5 grad_x matches central FD of .pts_den", np.median(rel) < 0.02 and np.percentile(rel, 90) < 0.05,
+          f"{ok.sum()}/{idx.size} probes, median rel = {np.median(rel):.2e}, p90 = {np.percentile(rel, 90):.2e}")
 
 print("-" * 60)
 if fails:

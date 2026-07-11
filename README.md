@@ -9,7 +9,7 @@ The code was written with the purpose of analysing cosmological simulations and 
 
 The code was designed using a modular philosophy and with a wide set of features that can easily be selected using the different program options. The DTFE code is also written using OpenMP directives which allow it to run in parallel on shared-memory architectures.
 
-The code comes with a complete [documentation](documentation/DTFE_user_guide.pdf) and with a multitude of examples that detail the program features. A test dataset and analysis of the code output is given in the [demo directory](demo).
+The code comes with a complete [documentation](documentation/DTFE_user_guide.pdf) and with a multitude of examples that detail the program features. A test dataset and analysis of the code output is given in the [demo directory](demo): `./DTFE demo/z0_64.gadget out --grid 64 --field density` works out of the box (the binary Gadget file is auto-detected even though the build's default input type is HDF5; equivalent to passing `--input 101`). Note the demo file's velocity block was corrupted when it was created — its record markers are inconsistent (handled with a warning) and its contents are junk, so use it for density/position demos only.
 
 The public release of the code is summarised in the arxiv publication [Cautun et al. (2011)](https://ui.adsabs.harvard.edu/abs/2011arXiv1105.0370C/abstract) and it is based on the method paper [Schaap and van de Weygaert (2000)](https://ui.adsabs.harvard.edu/abs/2000A%26A...363L..29S/abstract).
 
@@ -289,6 +289,8 @@ Besides the regular grid, PS-DTFE can evaluate the multi-stream fields at **arbi
   | `.pts_streams` | int32 × 1 | stream count (number of Eulerian tetrahedra containing the point) |
 
 * **`--per-stream`** additionally writes every stream's own density and velocity in a ragged layout: `.pts_stream_offsets` (uint64, N+1 entries; point *i* owns records `[off[i], off[i+1])`) and `.pts_stream_records` (float64 × 4 per record: density, vx, vy, vz), with each point's streams sorted by density, descending.
+* **`--per-stream-ids`** (implies `--per-stream`) also writes each stream's **identity** — the ParticleIDs of the 4 Lagrangian vertices of its tetrahedron — as `.pts_stream_ids` (uint64 × 4 per record, same ragged layout/order as `.pts_stream_records`). Each quadruple is sorted ascending, so it is orientation-independent and byte-identical under any `--partition` split; the same physical stream evaluated at different points (or in different runs) always carries the same quadruple. Needs an input reader that provides ParticleIDs (Gadget HDF5, type 105); readers without IDs write 0s.
+* **`--pts-den-grad`** also writes the density **gradient** at each point: `.pts_denGrad` (float64 × 3 per point) = ∇(ρ/ρ̄) in 1/Mpc — the sum over the point's streams of each stream's constant linear-profile gradient ∇ρ_s (the linear-interpolation coefficient vector of the `dtfe` estimator inside the tetrahedron). With `--per-stream` it additionally writes `.pts_stream_dengrad` (float64 × 3 per record, same ragged order as `.pts_stream_records`). The gradient always belongs to the **dtfe** estimator: under `--ps-stream-density geometric` the per-stream density is piecewise constant (zero gradient almost everywhere), so the dtfe-profile gradient — well-defined from the vertex densities — is still what is emitted; hull cells with the constant volume-ratio density contribute 0.
 * **`--ps-stream-density`** selects the per-stream density estimator (it also weights the mean velocity and dispersion):
   * `dtfe` (default) — linear interpolation of the Lagrangian-vertex DTFE densities inside each stream's tetrahedron. This matches the `PhaseSpaceDTFE` class of the method authors' reference implementation ([github.com/jfeldbrugge/PS-DTFE](https://github.com/jfeldbrugge/PS-DTFE), `Python/density.py`); the field is continuous within each stream but not exactly mass-conserving.
   * `geometric` — the constant per-tetrahedron density m_tet/V_eul = ρ̄·V_lag/V_eul (the reference code's `PhaseSpace` class). This is the density whose (cell-averaged, mass-conserving) rendering the PS-DTFE grid deposit produces; it is discontinuous across tetrahedra but integrates to the exact mass.
@@ -327,7 +329,7 @@ The TNG API key is read from `-k`, the `TNG_API_KEY` env var, or `~/.tng_api_key
 ## Python analysis pipeline
 
 `python/` contains the thesis analysis stack, built around the `dtfelib` package:
-* `dtfelib.io.FieldSet` — uniform loader for DTFE and PS-DTFE outputs (units, naming, averaged/raw).
+* `dtfelib.io.FieldSet` — uniform loader for DTFE and PS-DTFE outputs (units, naming, averaged/raw); `velocity_single_stream()` returns the velocity with NaN outside single-stream (stream count ≠ 1) regions — PS-DTFE only.
 * `dtfelib.cli` — shared CLI (`--sim`, `--snap`, `--method`, `--smooth`, …) used by every script in `python/plot/`.
 * `python/plot/*.py` — one figure family per script (density/web maps, eigenvalues, correlations, void shapes, …).
 * `dtfelib.trees` / `dtfelib.groupcat` / `dtfelib.environment` — SubLink merger trees (main branches, descendants, max-past-mass merger ratios), FoF/Subfind particle membership + shape tensors, and field sampling at halo positions. `python/plot/plot_halo_tracking.py` combines them: size/shape/orientation/mergers plus the DTFE **or** PS-DTFE density and web-class environment along each halo's history.
@@ -355,7 +357,7 @@ python3 tests/ps_standard_cross_check.py  # PS-DTFE vs standard DTFE where strea
 tests/ps_scaling_benchmark.sh   # strong-scaling guard (fails if the partition loop serializes)
 ```
 
-A minimal GitHub Actions workflow (Linux CPU build + `run_tests.py` + `ps_smoke_test.sh`) ships **disabled** as [.github/workflows/ci.yml.disabled](.github/workflows/ci.yml.disabled) — rename it to `ci.yml` to enable. It is deliberately a single fast job (an earlier, broader cross-platform workflow was removed on purpose).
+GitHub Actions CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs two jobs: the fast Linux CPU build + `run_tests.py` + `ps_smoke_test.sh` (deliberately a single small job — an earlier, broader cross-platform workflow was removed on purpose), and **cuda-compile**, a `docker build --build-arg GPU=cuda` compile check of the CUDA GPU backend (nvcc needs no GPU at build time). The latter is the only place the CUDA/HIP sources are ever compiled, so a failure there means the GPU backends rotted against a shared-header change.
 
 
 ## Contributors

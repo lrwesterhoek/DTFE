@@ -162,6 +162,8 @@ struct User_options
     bool   psUseMetal;      // PS-DTFE: run the grid deposit on the GPU; needs a GPU build (METAL=1/CUDA=1/HIP=1, else falls back to the CPU deposit with a warning). Set by --ps-gpu or its legacy alias --ps-metal.
     std::string psSamplePointsFile;    // PS-DTFE --sample-points: file with arbitrary Eulerian evaluation points (empty = mode off); see ps_point_eval.h
     bool   psPerStream;                // PS-DTFE --per-stream: also write every stream's density+velocity per sample point (ragged layout)
+    bool   psPerStreamIds;             // PS-DTFE --per-stream-ids: also write each stream's identity = its 4 Lagrangian-vertex ParticleIDs, sorted (implies --per-stream)
+    bool   psPtsDenGrad;               // PS-DTFE --pts-den-grad: also write the 'dtfe'-profile density gradient at each sample point (float64 x3; + ragged per-stream file with --per-stream)
     bool   psStreamDensityGeometric;   // PS-DTFE --ps-stream-density: true = 'geometric' (m_tet/V_eul, matches the mass-conserving deposit), false = 'dtfe' (vertex-density interpolation, matches the Feldbrugge reference; DEFAULT)
     bool   psLinearDeposit;            // PS-DTFE --ps-linear-deposit: weight each tetrahedron's interior samples by the DTFE-interpolated linear density (renormalized per tet, so the deposited total still equals the tet mass EXACTLY) instead of equal shares
 #endif

@@ -6,8 +6,9 @@ Two tiers:
     tracking across the box wrap, catalog matching.
   * DATA-BACKED (run when the simulation data is on disk, else skipped with a note):
     SubLink invariants on the real TNG50-3-Dark trees -- branch monotonicity, the
-    contiguous-row arithmetic, merger-event descendant links -- and the Subfind
-    group-membership invariant behind subhalo_particle_range.
+    contiguous-row arithmetic, merger-event descendant links -- the Subfind
+    group-membership invariant behind subhalo_particle_range, and the FieldSet
+    single-stream velocity mask on the TNG50-4-Dark raw PS grids.
 
 Usage:  python3 tests/py_dtfelib_test.py            (exit 0 = pass)
 """
@@ -88,6 +89,86 @@ def t_match_catalog_void():
     assert j == 2, (j, d)
     j, _ = match_catalog_void(cat, np.array([0.5, 0.5, 0.5]), 256, 0.01)         # nothing near
     assert j is None
+
+
+def t_shape_estimators():
+    """Vectorized BBKS/ellipsoid-fit estimators must reproduce the original per-void
+    loops bit-for-bit: NaN rows (trace/lambda1 thresholds, sanity gate), ELLIPSOID_CUTS
+    gating, the |lambda| argsort tie order, and the exact float32 roundings."""
+    from dtfelib import fields, pipeline
+
+    def ref_shapes(eigenvalues):        # the pre-vectorization loop, verbatim
+        n = len(eigenvalues)
+        axis_ratios = np.zeros((n, 2))
+        bbks = np.zeros((n, 2))
+        for i, evals in enumerate(eigenvalues):
+            l1, l2, l3 = np.sort(evals)
+            tr = l1 + l2 + l3
+            bbks[i] = [(l3 - l1) / (2 * tr), (l1 - 2 * l2 + l3) / (2 * tr)] \
+                if tr > 1e-12 else [np.nan, np.nan]
+            if l1 <= 1e-12:
+                axis_ratios[i] = [np.nan, np.nan]
+                continue
+            a, b, c = 1.0 / np.sqrt(l1), 1.0 / np.sqrt(l2), 1.0 / np.sqrt(l3)
+            b_a, c_a = b / a, c / a
+            axis_ratios[i] = [b_a, c_a] if (0 <= c_a <= b_a <= 1.0) else [np.nan, np.nan]
+        return axis_ratios, bbks
+
+    def ref_fits(coords, evals, evecs):  # the pre-vectorization loop around ellipsoid_fit_one
+        cell, cuts = pipeline.config.CELL_SIZE, pipeline.config.ELLIPSOID_CUTS
+        n = len(coords)
+        out = {"well_resolved": np.zeros(n, bool),
+               "semi_axes": np.zeros((n, 3), np.float32),
+               "orientations": np.zeros((n, 3, 3), np.float32),
+               "fit_ellipticity": np.zeros(n, np.float32),
+               "fit_prolateness": np.zeros(n, np.float32),
+               "positions_mpc": coords.astype(np.float32) * cell}
+        for i in range(n):
+            fit = pipeline.ellipsoid_fit_one(evals[i], evecs[i], cell)
+            if fit is None:
+                continue
+            axes = fit["semi_axes"]
+            if axes.min() < cuts["min_axis_mpc"] or axes.max() > cuts["max_axis_mpc"]:
+                continue
+            if axes[0] / axes[2] > cuts["max_axis_ratio"]:
+                continue
+            out["well_resolved"][i] = True
+            out["semi_axes"][i] = axes
+            out["orientations"][i] = fit["orientation"]
+            out["fit_ellipticity"][i] = fit["ell"]
+            out["fit_prolateness"][i] = fit["prol"]
+        return out
+
+    cell = pipeline.config.CELL_SIZE
+    rng = np.random.default_rng(5)
+    crafted = np.array([
+        [0.0, 0.0, 0.0],            # zero trace -> NaN bbks
+        [-1.0, -2.0, -3.0],         # negative trace -> NaN bbks
+        [1e-13, 0.5, 1.0],          # lambda1 <= 1e-12: bbks valid, ratios NaN
+        [2.0, -2.0, 3.0],           # |lambda| tie -> argsort tie order must match
+        [5e-11, 1.0, 2.0],          # |ev| < 1e-10 -> ellipsoid fit degenerate
+        [1.0, 1.0, 1.0],            # sphere
+        [1e-6, 1e-6, 1e6],          # extreme ratio
+    ])
+    guaranteed_pass = (2.0 * cell / np.array([[1.0, 2.0, 3.0], [2.0, 2.5, 3.0]])) ** 2
+    ev64 = np.vstack([rng.normal(0.0, 1.0, (200, 3)), crafted, guaranteed_pass])
+    for ev in (ev64, ev64.astype(np.float32)):
+        got = fields.calculate_shape_parameters(list(ev))
+        ref_ar, ref_bbks = ref_shapes(list(ev))
+        assert np.array_equal(got["axis_ratios"], ref_ar, equal_nan=True), "axis_ratios drifted"
+        assert np.array_equal(got["bbks_params"], ref_bbks, equal_nan=True), "bbks_params drifted"
+
+        n = len(ev)
+        coords = rng.integers(0, 64, (n, 3))
+        evecs = rng.normal(0.0, 1.0, (n, 3, 3)).astype(ev.dtype)
+        got_f = pipeline._ellipsoid_fits(coords, ev, evecs)
+        ref_f = ref_fits(coords, ev, evecs)
+        for k in ref_f:
+            assert np.array_equal(got_f[k], ref_f[k]), f"_ellipsoid_fits[{k}] drifted"
+        assert got_f["well_resolved"].any() and not got_f["well_resolved"].all()
+
+    empty = fields.calculate_shape_parameters([])
+    assert empty["axis_ratios"].shape == (0, 2) and empty["bbks_params"].shape == (0, 2)
 
 
 # ---------------------------------------------------------------- data-backed: trees
@@ -172,6 +253,28 @@ def t_environment_box():
     assert abs(box - 35000.0) < 1.0, f"TNG50 raw box must be 35000 ckpc/h, got {box}"
 
 
+def t_velocity_single_stream():
+    """NaN-mask semantics of FieldSet.velocity_single_stream on real raw PS grids
+    (TNG50-4-Dark: the raw integer streams grid gives the crisp streams != 1 mask)."""
+    from dtfelib.cli import DATA_ROOT
+    from dtfelib.io import FieldSet
+    snapdir = Path(DATA_ROOT) / "TNG50-4-Dark" / "snapdir_099"
+    fs = FieldSet(snapdir, method="ps", averaged=False)
+    st = fs.load("streams")
+    v = fs.load("velocity")
+    v1 = fs.velocity_single_stream()
+    multi = st != 1
+    assert 0 < multi.mean() < 1, f"trivial mask ({multi.mean():.0%} multi-stream)"
+    assert np.isnan(v1[multi]).all(), "multi-stream cells must be NaN"
+    assert np.array_equal(v1[~multi], v[~multi]), "single-stream velocities must be untouched"
+    try:
+        FieldSet(snapdir, method="dtfe").velocity_single_stream()
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("method='dtfe' must raise ValueError")
+
+
 def main():
     print("=" * 60)
     print(" dtfelib merger-tree / void-tracking tests")
@@ -181,6 +284,7 @@ def main():
     check("periodic helpers", t_periodic_helpers)
     check("track_center across box wrap", t_track_center_wrap)
     check("match_catalog_void (periodic)", t_match_catalog_void)
+    check("shape estimators: vectorized == loop reference", t_shape_estimators)
     print(f"data-backed ({SIM}):")
     check("main_branch invariants", t_main_branch_invariants)
     check("descendant_branch inverse walk", t_descendant_inverse)
@@ -188,6 +292,7 @@ def main():
     check("mergers_along_branch API", t_mergers_api)
     check("groupcat membership + particle ranges", t_groupcat_membership)
     check("environment box frame", t_environment_box)
+    check("FieldSet velocity_single_stream (TNG50-4-Dark)", t_velocity_single_stream)
     print("-" * 60)
     print(f"RESULT: {len(PASS)} passed, {len(FAIL)} failed, {len(SKIP)} skipped")
     return 1 if FAIL else 0

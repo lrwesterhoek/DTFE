@@ -189,6 +189,9 @@ def ellipsoid_fit_one(evals, evecs, cell):
 
 
 def _ellipsoid_fits(coords, evals, evecs):
+    # Batched twin of ellipsoid_fit_one (same formulas, thresholds and argsort tie order --
+    # keep them in lockstep) + the ELLIPSOID_CUTS resolution gate, vectorized over voids.
+    # Bit-equivalence with the per-void path is covered by tests/py_dtfelib_test.py.
     cell = config.CELL_SIZE
     cuts = config.ELLIPSOID_CUTS
     n = len(coords)
@@ -198,20 +201,27 @@ def _ellipsoid_fits(coords, evals, evecs):
     ell = np.zeros(n, dtype=np.float32)
     prol = np.zeros(n, dtype=np.float32)
 
-    for i in range(n):
-        fit = ellipsoid_fit_one(evals[i], evecs[i], cell)
-        if fit is None:
-            continue
-        axes = fit['semi_axes']
-        if axes.min() < cuts['min_axis_mpc'] or axes.max() > cuts['max_axis_mpc']:
-            continue
-        if axes[0] / axes[2] > cuts['max_axis_ratio']:
-            continue
-        valid[i] = True
-        semi_axes[i] = axes
-        orient[i] = fit['orientation']
-        ell[i] = fit['ell']
-        prol[i] = fit['prol']
+    if n:
+        ev = np.asarray(evals, dtype=np.float64).reshape(n, 3)
+        ev_abs = np.abs(ev) + 1e-12
+        order = np.argsort(ev_abs, axis=1)
+        axes = 2.0 * cell / np.sqrt(np.take_along_axis(ev_abs, order, axis=1))
+        ok = (~(np.abs(ev) < 1e-10).any(axis=1)
+              & ~(axes.min(axis=1) < cuts['min_axis_mpc'])
+              & ~(axes.max(axis=1) > cuts['max_axis_mpc'])
+              & ~(axes[:, 0] / axes[:, 2] > cuts['max_axis_ratio']))
+        idx = np.where(ok)[0]
+        valid[idx] = True
+        semi_axes[idx] = axes[idx]
+        orient[idx] = np.take_along_axis(np.asarray(evecs).reshape(n, 3, 3),
+                                         order[:, None, :], axis=2)[idx]
+        a, b, c = axes[idx, 0], axes[idx, 1], axes[idx, 2]
+        ell[idx] = 1 - c / a
+        d2 = a * a - c * c
+        p = np.zeros(idx.size)
+        pm = d2 > 1e-12
+        p[pm] = (a * a - b * b)[pm] / d2[pm]
+        prol[idx] = p
 
     return {
         'well_resolved': valid,

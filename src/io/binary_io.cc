@@ -38,28 +38,30 @@ void readBinaryFile(std::string filename,
     openInputBinaryFile( inputFile, filename );
 
 
-    // read the number of particles and the box coordinates
+    // read the number of particles and the box coordinates (the whole 2*NO_DIM-float box,
+    // not just its first value -- a short read here also misaligned every block after it)
     int noParticles;
     float boxCoordinates[2*NO_DIM];
     inputFile.read( reinterpret_cast<char *>(&noParticles), sizeof(noParticles) );
-    inputFile.read( reinterpret_cast<char *>(boxCoordinates), sizeof(float) );
+    inputFile.read( reinterpret_cast<char *>(boxCoordinates), sizeof(float) * 2*NO_DIM );
     for (size_t i=0; i<2*NO_DIM; ++i)
         userOptions->boxCoordinates[i] = boxCoordinates[i];
 
 
-    Real *positions = readData->position(noParticles);
-    readData->weight(noParticles);    // weights = particle masses
-    readData->velocity(noParticles);
+    // the file stores float32, so the raw reads below require a single-precision build (Real == float)
+    Real *positions  = readData->position(noParticles);
+    Real *weights    = readData->weight(noParticles);    // weights = particle masses
+    Real *velocities = readData->velocity(noParticles);
 
 
     size_t dataSize = noParticles * sizeof(float) * NO_DIM;
     inputFile.read( reinterpret_cast<char *>(positions), dataSize );
 
     dataSize = noParticles * sizeof(float);
-    inputFile.read( reinterpret_cast<char *>(positions), dataSize );
+    inputFile.read( reinterpret_cast<char *>(weights), dataSize );
 
     dataSize = noParticles * sizeof(float) * NO_DIM;
-    inputFile.read( reinterpret_cast<char *>(positions), dataSize );
+    inputFile.read( reinterpret_cast<char *>(velocities), dataSize );
 
     checkFileOperations( inputFile, "read from" );
     inputFile.close();

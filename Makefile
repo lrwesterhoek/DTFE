@@ -265,7 +265,7 @@ ps_gpu_mode_check:
 	@$(MKDIR_P) $(OBJ_DIR_PS)
 	@if [ ! -f $(OBJ_DIR_PS)/.gpu_mode_$(GPU_MODE) ]; then \
 		echo ">> PS build GPU mode is now '$(GPU_MODE)'; wiping $(OBJ_DIR_PS) to avoid mixed objects"; \
-		rm -f $(OBJ_DIR_PS)/*$(OBJ_EXT) $(OBJ_DIR_PS)/ps_deposit_msl.h $(OBJ_DIR_PS)/.gpu_mode_* $(OBJ_DIR_PS)/.metal_mode_* $(OBJ_DIR_PS)/.build_mode; \
+		rm -f $(OBJ_DIR_PS)/*$(OBJ_EXT) $(OBJ_DIR_PS)/*.d $(OBJ_DIR_PS)/ps_deposit_msl.h $(OBJ_DIR_PS)/.gpu_mode_* $(OBJ_DIR_PS)/.metal_mode_* $(OBJ_DIR_PS)/.build_mode; \
 		touch $(OBJ_DIR_PS)/.gpu_mode_$(GPU_MODE); \
 		printf '%s' "$(GPU_BUILD_ARG)" > $(OBJ_DIR_PS)/.build_mode; \
 	fi
@@ -277,7 +277,7 @@ dtfe_gpu_mode_check:
 	@$(MKDIR_P) $(OBJ_DIR)
 	@if [ ! -f $(OBJ_DIR)/.gpu_mode_$(GPU_MODE) ]; then \
 		echo ">> DTFE build GPU mode is now '$(GPU_MODE)'; wiping $(OBJ_DIR) to avoid mixed objects"; \
-		rm -f $(OBJ_DIR)/*$(OBJ_EXT) $(OBJ_DIR)/dtfe_deposit_msl.h $(OBJ_DIR)/.gpu_mode_* $(OBJ_DIR)/.metal_mode_* $(OBJ_DIR)/.build_mode; \
+		rm -f $(OBJ_DIR)/*$(OBJ_EXT) $(OBJ_DIR)/*.d $(OBJ_DIR)/dtfe_deposit_msl.h $(OBJ_DIR)/.gpu_mode_* $(OBJ_DIR)/.metal_mode_* $(OBJ_DIR)/.build_mode; \
 		touch $(OBJ_DIR)/.gpu_mode_$(GPU_MODE); \
 		printf '%s' "$(GPU_BUILD_ARG)" > $(OBJ_DIR)/.build_mode; \
 	fi
@@ -388,8 +388,13 @@ endif
 # Additional warnings and quality flags can be enabled in the EXTRA_FLAGS section above
 # -Wno-deprecated-declarations: silences Boost.MultiArray's internal use of the
 # deprecated boost::array::assign() (third-party headers, not our code).
-COMPILE_FLAGS = $(BASE_CFLAGS) -std=c++17 -Wno-psabi -Wno-cpp -Wno-deprecated-declarations -frounding-math $(DEBUG_FLAGS) $(EXTRA_FLAGS) $(MACOS_ISYSROOT)
-COMPILE_FLAGS_PS = $(BASE_CFLAGS_PS) -std=c++17 -Wno-psabi -Wno-cpp -Wno-deprecated-declarations -frounding-math $(DEBUG_FLAGS) $(EXTRA_FLAGS) $(MACOS_ISYSROOT)
+# -MMD -MP: every compile also writes a .d makefile next to its object with the REAL include
+# graph (-MP adds phony targets so a deleted header cannot strand a stale .d). The .d files are
+# pulled in by the -include lines below the object-list macros; they supplement the hand-written
+# prerequisite lists (which are correct but incomplete), so header edits rebuild every affected
+# object without a clean.
+COMPILE_FLAGS = $(BASE_CFLAGS) -std=c++17 -Wno-psabi -Wno-cpp -Wno-deprecated-declarations -frounding-math -MMD -MP $(DEBUG_FLAGS) $(EXTRA_FLAGS) $(MACOS_ISYSROOT)
+COMPILE_FLAGS_PS = $(BASE_CFLAGS_PS) -std=c++17 -Wno-psabi -Wno-cpp -Wno-deprecated-declarations -frounding-math -MMD -MP $(DEBUG_FLAGS) $(EXTRA_FLAGS) $(MACOS_ISYSROOT)
 LINK_FLAGS =
 # NOTE: -lboost_system was dropped: Boost.System is header-only since Boost 1.69,
 # so recent Homebrew/Boost no longer ship libboost_system ("library not found").
@@ -466,6 +471,11 @@ LIB_FILES = $(DTFE_SOURCES) $(DTFE_CC_SOURCES) $(TRIANG_SOURCES)
 HEADERS_1 = DTFE.h define.h user_options.h particle_data.h quantities.h Pvector.h math_functions.h  message.h box.h miscellaneous.h interpolations.h
 HEADERS_2 = $(addprefix CGAL_triangulation/, CGAL_include_2D.h CGAL_include_3D.h vertexData.h particle_data_traits.h)
 
+# compiler-generated header dependencies (see -MMD -MP at COMPILE_FLAGS); wildcard expands to
+# nothing on a fresh checkout / after clean, so missing .d files never break the build
+-include $(wildcard $(OBJ_DIR)/*.d)
+-include $(wildcard $(OBJ_DIR_PS)/*.d)
+
 # Declare phony targets
 .PHONY: DTFE PS-DTFE library DTFE-build PS-DTFE-build library-build clean test-platform copy_headers set_directories set_directories_ps set_directories_2
 
@@ -525,7 +535,7 @@ $(OBJ_DIR)/random$(OBJ_EXT): $(SRC)/random.cc $(SRC)/define.h $(SRC)/user_option
 	$(CC) $(COMPILE_FLAGS) $(DTFE_INC) -o $@ -c $(SRC)/random.cc
 
 $(OBJ_DIR)/kdtree2$(OBJ_EXT): $(SRC)/kdtree/kdtree2.hpp $(SRC)/kdtree/kdtree2.cpp Makefile
-	$(CC) -O3 -ffast-math -fomit-frame-pointer -Wno-deprecated-declarations $(MACOS_ISYSROOT) $(DTFE_INC) -o $(OBJ_DIR)/kdtree2$(OBJ_EXT) -c $(SRC)/kdtree/kdtree2.cpp
+	$(CC) -O3 -ffast-math -fomit-frame-pointer -Wno-deprecated-declarations -MMD -MP $(MACOS_ISYSROOT) $(DTFE_INC) -o $(OBJ_DIR)/kdtree2$(OBJ_EXT) -c $(SRC)/kdtree/kdtree2.cpp
 
 $(OBJ_DIR)/triangulation$(OBJ_EXT): $(addprefix $(SRC)/, $(TRIANG_SOURCES)) Makefile
 	$(CC) $(COMPILE_FLAGS) $(DTFE_INC) -o $(OBJ_DIR)/triangulation$(OBJ_EXT) -c $(SRC)/CGAL_triangulation/triangulation.cpp
@@ -601,7 +611,7 @@ $(OBJ_DIR_PS)/random$(OBJ_EXT): $(SRC)/random.cc $(SRC)/define.h $(SRC)/user_opt
 	$(CC) $(COMPILE_FLAGS_PS) $(DTFE_INC) -o $@ -c $(SRC)/random.cc
 
 $(OBJ_DIR_PS)/kdtree2$(OBJ_EXT): $(SRC)/kdtree/kdtree2.hpp $(SRC)/kdtree/kdtree2.cpp Makefile
-	$(CC) -O3 -ffast-math -fomit-frame-pointer -Wno-deprecated-declarations $(MACOS_ISYSROOT) $(DTFE_INC) -o $@ -c $(SRC)/kdtree/kdtree2.cpp
+	$(CC) -O3 -ffast-math -fomit-frame-pointer -Wno-deprecated-declarations -MMD -MP $(MACOS_ISYSROOT) $(DTFE_INC) -o $@ -c $(SRC)/kdtree/kdtree2.cpp
 
 $(OBJ_DIR_PS)/triangulation$(OBJ_EXT): $(addprefix $(SRC)/, $(TRIANG_SOURCES)) Makefile
 	$(CC) $(COMPILE_FLAGS_PS) $(DTFE_INC) -o $@ -c $(SRC)/CGAL_triangulation/triangulation.cpp
@@ -664,7 +674,7 @@ library: dtfe_gpu_mode_check
 
 library-build: set_directories set_directories_2 $(addprefix $(SRC)/, $(LIB_FILES) ) copy_headers $(DTFE_GPU_L_OBJS) Makefile
 	$(CC) $(COMPILE_FLAGS) -fPIC $(DTFE_INC) -o $(OBJ_DIR)/DTFE_l$(OBJ_EXT) -c $(SRC)/DTFE.cpp
-	$(CC) -O3 -ffast-math -fomit-frame-pointer -fPIC -Wno-deprecated-declarations $(MACOS_ISYSROOT) $(DTFE_INC) -o $(OBJ_DIR)/kdtree2_l$(OBJ_EXT) -c $(SRC)/kdtree/kdtree2.cpp
+	$(CC) -O3 -ffast-math -fomit-frame-pointer -fPIC -Wno-deprecated-declarations -MMD -MP $(MACOS_ISYSROOT) $(DTFE_INC) -o $(OBJ_DIR)/kdtree2_l$(OBJ_EXT) -c $(SRC)/kdtree/kdtree2.cpp
 	$(CC) $(COMPILE_FLAGS) -fPIC $(DTFE_INC) -o $(OBJ_DIR)/triangulation_l$(OBJ_EXT) -c $(SRC)/CGAL_triangulation/triangulation.cpp
 	$(CC) $(COMPILE_FLAGS) -fPIC $(DTFE_INC) -o $(OBJ_DIR)/unaveraged_interpolation_l$(OBJ_EXT) -c $(SRC)/CGAL_triangulation/unaveraged_interpolation.cc
 	$(CC) $(COMPILE_FLAGS) -fPIC $(DTFE_INC) -o $(OBJ_DIR)/averaged_interpolation_1_l$(OBJ_EXT) -c $(SRC)/CGAL_triangulation/averaged_interpolation_1.cc
@@ -685,7 +695,7 @@ library-build: set_directories set_directories_2 $(addprefix $(SRC)/, $(LIB_FILE
 
 
 clean:
-	$(RM_RF) $(BIN_DIR)/DTFE$(EXE_EXT) $(BIN_DIR)/PS-DTFE$(EXE_EXT) $(OBJ_DIR)/*$(OBJ_EXT) $(OBJ_DIR_PS)/*$(OBJ_EXT) $(LIB_DIR)/*DTFE$(SHARED_EXT)
+	$(RM_RF) $(BIN_DIR)/DTFE$(EXE_EXT) $(BIN_DIR)/PS-DTFE$(EXE_EXT) $(OBJ_DIR)/*$(OBJ_EXT) $(OBJ_DIR_PS)/*$(OBJ_EXT) $(OBJ_DIR)/*.d $(OBJ_DIR_PS)/*.d $(LIB_DIR)/*DTFE$(SHARED_EXT)
 
 # ---- deps-check: verify the required headers/libraries exist BEFORE a long compile dies
 # mid-build with a cryptic missing-header error, and print the per-platform install command

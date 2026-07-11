@@ -154,7 +154,7 @@ inline void autoTunePartitioning(User_options &u,
     if ( N < minN )
         return;     // single domain always fits at this size
 
-    double const kDT = 650.;                        // bytes/vertex: 96 + 6.77 cells x 72 B + allocator slack
+    double const kDT = 658.;                        // bytes/vertex: 104 (incl. the uint64 ParticleID) + 6.77 cells x 72 B + allocator slack
     double const partBytes = double(sizeof(Particle_data));
     double const fixed = partBytes*N + gridTotal*bCell;    // originals + full-grid accumulators
 

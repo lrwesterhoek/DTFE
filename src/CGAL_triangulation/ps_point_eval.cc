@@ -5,7 +5,12 @@
    cell maps to a (possibly folded) Eulerian tetrahedron, and a query point receives one
    stream per tetrahedron that contains it. Per point we report the total density, the
    density-weighted mean velocity, the velocity dispersion tensor and the stream count;
-   --per-stream additionally records every stream's own density and velocity.
+   --per-stream additionally records every stream's own density and velocity, and
+   --per-stream-ids each stream's identity (the sorted Lagrangian-vertex ParticleIDs).
+   --pts-den-grad adds the density gradient: per stream the constant gradient of the linear
+   'dtfe' profile (regardless of --ps-stream-density -- the geometric density is piecewise
+   constant, so the dtfe-profile gradient is the only well-defined one), per point the sum
+   over its streams.
 
    Per-stream density comes in two variants (--ps-stream-density):
      'dtfe'      (default) linear interpolation of the Lagrangian-vertex DTFE densities
@@ -56,6 +61,8 @@ struct StreamRec
     double denGeo;              // 'geometric': rho_bar * V_lag / V_eul, constant per tet
     double denDtfe;             // 'dtfe': vertex densities linearly interpolated at the point
     double vel[noVelComp];      // velocity linearly interpolated at the point
+    double grad[NO_DIM];        // constant 'dtfe' density-profile gradient of the tet (--pts-den-grad; 0 otherwise)
+    uint64_t ids[NO_DIM+1];     // sorted Lagrangian-vertex ParticleIDs (--per-stream-ids; all 0 otherwise)
 };
 
 struct Context
@@ -63,6 +70,8 @@ struct Context
     bool   active = false;
     bool   finalized = false;
     bool   perStream = false;
+    bool   perStreamIds = false;
+    bool   ptsDenGrad = false;
     bool   useGeometric = false;    // variant used for totals, weights and per-stream output
     bool   periodic = false;
     double rhoBar = 1.;             // output densities are rho/rhoBar (grid convention)
@@ -87,6 +96,9 @@ struct Context
     std::vector<int32_t>  outStreams;    // N
     std::vector<uint64_t> outOffsets;    // N+1 (only with --per-stream)
     std::vector<double>   outRecords;    // 4 per stream: density, vx, vy, vz
+    std::vector<uint64_t> outIds;        // NO_DIM+1 per stream (only with --per-stream-ids)
+    std::vector<double>   outDenGrad;    // 3N (only with --pts-den-grad)
+    std::vector<double>   outRecGrad;    // 3 per stream (only with --pts-den-grad + --per-stream)
 };
 
 static Context g_ctx;
@@ -193,6 +205,8 @@ void psPointEvalInit(User_options &userOptions)
 
     g_ctx = Context();  // re-arm cleanly (defensive; DTFE() runs once per process)
     g_ctx.perStream    = userOptions.psPerStream;
+    g_ctx.perStreamIds = userOptions.psPerStreamIds;
+    g_ctx.ptsDenGrad   = userOptions.psPtsDenGrad;
     g_ctx.useGeometric = userOptions.psStreamDensityGeometric;
     g_ctx.periodic     = userOptions.periodic;
     g_ctx.rhoBar       = double( userOptions.averageDensity );
@@ -264,7 +278,9 @@ void psPointEvalInit(User_options &userOptions)
             << " sample points from '" << MESSAGE::cBlue() << userOptions.psSamplePointsFile
             << MESSAGE::cReset() << "' (per-stream density: "
             << MESSAGE::cMagenta() << (g_ctx.useGeometric ? "geometric" : "dtfe") << MESSAGE::cReset()
-            << (g_ctx.perStream ? ", writing per-stream records" : "") << ").\n" << MESSAGE::Flush;
+            << (g_ctx.perStream ? ", writing per-stream records" : "")
+            << (g_ctx.perStreamIds ? " + stream ids" : "")
+            << (g_ctx.ptsDenGrad ? ", writing density gradients" : "") << ").\n" << MESSAGE::Flush;
 }
 
 
@@ -355,6 +371,28 @@ void interpolatePoints_phaseSpace(DT &dt, User_options &userOptions)
 
         StreamRec rec;
         rec.denGeo = denGeo;
+        for (int v = 0; v <= NO_DIM; ++v)
+            rec.ids[v] = 0;
+        if ( g_ctx.perStreamIds )
+        {
+            // sorted ascending: the quadruple is orientation-independent, and identical for the
+            // original cell and any periodic image (copies keep the original's ParticleID)
+            for (int v = 0; v <= NO_DIM; ++v)
+                rec.ids[v] = cell->vertex(v)->info().particleID();
+            std::sort( rec.ids, rec.ids + NO_DIM + 1 );
+        }
+        for (int i = 0; i < NO_DIM; ++i)
+            rec.grad[i] = 0.;
+        if ( g_ctx.ptsDenGrad && !useVolumeRatioDensity )
+        {
+            // constant 'dtfe' gradient of this stream: rho(p) = rho_0 + grad . (p - x_0) with
+            // bary = (Ax^-1)^T rel  =>  grad_i = sum_v inv[i][v] (rho_{v+1} - rho_0) -- the same
+            // affine convention as the linear deposit's denGrad (ps_interpolation.cc). Hull
+            // cells (volume-ratio density) have a constant profile: gradient stays 0.
+            for (int i = 0; i < NO_DIM; ++i)
+                for (int v = 0; v < NO_DIM; ++v)
+                    rec.grad[i] += inv[i][v] * (rho[v+1] - rho[0]);
+        }
 
         for (int bi = bLo[0]; bi <= bHi[0]; ++bi)
         for (int bj = bLo[1]; bj <= bHi[1]; ++bj)
@@ -452,7 +490,11 @@ void psPointEvalFinalize(User_options const &userOptions)
         if (a.denDtfe != b.denDtfe) return a.denDtfe > b.denDtfe;
         for (size_t j = 0; j < noVelComp; ++j)
             if (a.vel[j] != b.vel[j]) return a.vel[j] < b.vel[j];
-        return false;
+        for (int i = 0; i < NO_DIM; ++i)        // all 0 unless --pts-den-grad
+            if (a.grad[i] != b.grad[i]) return a.grad[i] < b.grad[i];
+        for (int v = 0; v <= NO_DIM; ++v)       // all 0 unless --per-stream-ids; only breaks exact
+            if (a.ids[v] != b.ids[v]) return a.ids[v] < b.ids[v];   // den+vel ties, so the ids file
+        return false;                                               // is partition-invariant too
     };
 
     g_ctx.outDen.assign( N, 0. );
@@ -466,7 +508,13 @@ void psPointEvalFinalize(User_options const &userOptions)
     {
         g_ctx.outOffsets.assign( N + 1, 0 );
         g_ctx.outRecords.reserve( totalStreams * (1 + noVelComp) );
+        if ( g_ctx.perStreamIds )
+            g_ctx.outIds.reserve( totalStreams * (NO_DIM + 1) );
+        if ( g_ctx.ptsDenGrad )
+            g_ctx.outRecGrad.reserve( totalStreams * NO_DIM );
     }
+    if ( g_ctx.ptsDenGrad )
+        g_ctx.outDenGrad.assign( N * NO_DIM, 0. );
 
     size_t covered = 0, multi = 0;
     size_t maxStreams = 0;
@@ -496,6 +544,17 @@ void psPointEvalFinalize(User_options const &userOptions)
                     mom2[c++] += den * recs[s].vel[a] * recs[s].vel[b];
         }
         g_ctx.outDen[i] = W * invRhoBar;
+        if ( g_ctx.ptsDenGrad )
+        {
+            // gradient of the total ('dtfe') density: sum of the streams' constant gradients,
+            // accumulated in the same sorted order as the moments (deterministic across splits)
+            double gsum[NO_DIM] = {0.};
+            for (size_t s = 0; s < nS; ++s)
+                for (int d = 0; d < NO_DIM; ++d)
+                    gsum[d] += recs[s].grad[d];
+            for (int d = 0; d < NO_DIM; ++d)
+                g_ctx.outDenGrad[i*NO_DIM + d] = gsum[d] * invRhoBar;
+        }
         if ( W > 0. )
         {
             double const invW = 1. / W;
@@ -525,6 +584,12 @@ void psPointEvalFinalize(User_options const &userOptions)
                 g_ctx.outRecords.push_back( (geo ? recs[s].denGeo : recs[s].denDtfe) * invRhoBar );
                 for (size_t j = 0; j < noVelComp; ++j)
                     g_ctx.outRecords.push_back( recs[s].vel[j] );
+                if ( g_ctx.perStreamIds )
+                    for (int v = 0; v <= NO_DIM; ++v)
+                        g_ctx.outIds.push_back( recs[s].ids[v] );
+                if ( g_ctx.ptsDenGrad )
+                    for (int d = 0; d < NO_DIM; ++d)
+                        g_ctx.outRecGrad.push_back( recs[s].grad[d] * invRhoBar );
             }
             g_ctx.outOffsets[i+1] = uint64_t( g_ctx.outOffsets[i] ) + uint64_t( nS );
         }
@@ -575,6 +640,9 @@ void psPointEvalWriteOutputs(User_options const &userOptions)
               "point velocity dispersion tensors (float64 x 6, xx xy xz yy yz zz)" );
     writeRaw( ".pts_streams", g_ctx.outStreams.data(), g_ctx.outStreams.size() * sizeof(int32_t),
               "point stream counts (int32)" );
+    if ( g_ctx.ptsDenGrad )
+        writeRaw( ".pts_denGrad", g_ctx.outDenGrad.data(), g_ctx.outDenGrad.size() * sizeof(double),
+                  "point density gradients (float64 x 3, d(rho/rho_bar)/dx_i, 'dtfe' profile)" );
     if ( g_ctx.perStream )
     {
         writeRaw( ".pts_stream_offsets", g_ctx.outOffsets.data(),
@@ -583,14 +651,25 @@ void psPointEvalWriteOutputs(User_options const &userOptions)
         writeRaw( ".pts_stream_records", g_ctx.outRecords.data(),
                   g_ctx.outRecords.size() * sizeof(double),
                   "per-stream records (float64 x 4: density, vx, vy, vz; density-descending)" );
+        if ( g_ctx.perStreamIds )
+            writeRaw( ".pts_stream_ids", g_ctx.outIds.data(),
+                      g_ctx.outIds.size() * sizeof(uint64_t),
+                      "per-stream identities (uint64 x 4: sorted Lagrangian-vertex ParticleIDs)" );
+        if ( g_ctx.ptsDenGrad )
+            writeRaw( ".pts_stream_dengrad", g_ctx.outRecGrad.data(),
+                      g_ctx.outRecGrad.size() * sizeof(double),
+                      "per-stream density gradients (float64 x 3, 'dtfe' profile)" );
     }
 }
 
 
 #else // NO_DIM != 3
 
-// PS-DTFE is only validated in 3D; point evaluation is 3D-only.
-#include "../user_options.h"
+// PS-DTFE is only validated in 3D; point evaluation is 3D-only. The per-partition worker
+// must still LINK in 2D (triangulation.cpp references it unconditionally; psPointEvalActive()
+// is always false here, so it can never be called).
+#include "triangulation_common.h"
+void interpolatePoints_phaseSpace(DT &, User_options &) {}
 bool psPointEvalActive() { return false; }
 void psPointEvalInit(User_options &)
 {

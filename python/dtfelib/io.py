@@ -22,6 +22,7 @@ Usage:
     fs = FieldSet("/Users/luukw/output/TNG50-4-Dark/snapdir_099")          # auto-detect method
     rho   = fs.density(units="mean")            # rho/rho_bar for BOTH methods
     v     = fs.load("velocity")                 # (N,N,N,3) km/s
+    v1    = fs.velocity_single_stream()         # velocity, NaN where stream count != 1 (PS only)
     if fs.has("streams"): s = fs.load("streams")
     print(fs)                                   # method, grid, box, z, rho_bar
 """
@@ -141,6 +142,10 @@ class FieldSet:
             mass = float(h["MassTable"][1])                  # 1e10 Msun, h-free
             if mass <= 0:                                    # per-particle masses instead of table
                 mass = float(f["PartType1/Masses"][0])
+            if "HFreeUnits" not in h:
+                # combined files from before the units unification copied the raw TNG
+                # MassTable (1e10 Msun/h) verbatim; normalize so meta is h-free either way
+                mass /= float(h["HubbleParam"])
             return SnapshotMeta(
                 box_mpc=box_mpc,
                 redshift=float(h["Redshift"]),
@@ -199,6 +204,23 @@ class FieldSet:
               f"stale pre-2026-06-17 output -- absolute values are unreliable, regenerate with the "
               f"current binary. Proceeding as units='{guess}'.")
         return guess
+
+    def velocity_single_stream(self) -> np.ndarray:
+        """Velocity (N,N,N,3) km/s with NaN wherever the stream count != 1.
+
+        PS-DTFE only (raises ValueError under method='dtfe'). In single-stream regions the
+        multi-stream velocity reduces to the standard DTFE flow, so this isolates the cold,
+        single-valued flow (void interiors) from multi-stream walls and caustics. The mask
+        uses this FieldSet's streams grid: with averaged=True that is the fractional
+        'a_streams' sub-sample mean (any partially multi-stream cell is masked too); pass
+        averaged=False for the raw integer counts (the crisp streams != 1 mask).
+        """
+        if self.method != "ps":
+            raise ValueError("velocity_single_stream() needs PS-DTFE outputs (method='ps'); "
+                             "the stream-count field is only produced by PS-DTFE")
+        vel = self.load("velocity")
+        vel[self.load("streams") != 1] = np.nan
+        return vel
 
     # ------------------------------------------------------------------ helpers
     def slice(self, field: np.ndarray, axis: int = 2, index: int | None = None) -> np.ndarray:

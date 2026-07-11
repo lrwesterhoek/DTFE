@@ -55,6 +55,10 @@ def smooth_field(field, sigma, mode='wrap'):
 
 
 def calculate_shape_parameters(eigenvalues):
+    # Vectorized over voids; keeps the original per-void semantics bit-for-bit (native
+    # eigenvalue dtype throughout, float64 output rows, NaN for trace <= 1e-12 /
+    # lambda1 <= 1e-12 / a failed 0 <= c/a <= b/a <= 1 sanity gate). Covered by the
+    # reference-equivalence test in tests/py_dtfelib_test.py.
     n_voids = len(eigenvalues)
 
     if n_voids == 0:
@@ -63,35 +67,25 @@ def calculate_shape_parameters(eigenvalues):
             'bbks_params': np.array([]).reshape(0, 2)
         }
 
-    axis_ratios = np.zeros((n_voids, 2))
-    bbks_params = np.zeros((n_voids, 2))
+    ev = np.sort(np.asarray(eigenvalues), axis=1)   # ascending: lambda1 <= lambda2 <= lambda3
+    l1, l2, l3 = ev[:, 0], ev[:, 1], ev[:, 2]
+    trace = l1 + l2 + l3
 
-    for i, evals in enumerate(eigenvalues):
-        evals_sorted = np.sort(evals)
-        lambda1, lambda2, lambda3 = evals_sorted
-        trace = lambda1 + lambda2 + lambda3
+    bbks_params = np.full((n_voids, 2), np.nan)
+    ok = trace > 1e-12
+    bbks_params[ok, 0] = (l3[ok] - l1[ok]) / (2 * trace[ok])
+    bbks_params[ok, 1] = (l1[ok] - 2 * l2[ok] + l3[ok]) / (2 * trace[ok])
 
-        if trace > 1e-12:
-            e = (lambda3 - lambda1) / (2 * trace)
-            p = (lambda1 - 2 * lambda2 + lambda3) / (2 * trace)
-            bbks_params[i] = [e, p]
-        else:
-            bbks_params[i] = [np.nan, np.nan]
-
-        if lambda1 <= 1e-12:
-            axis_ratios[i] = [np.nan, np.nan]
-            continue
-
-        a = 1.0 / np.sqrt(lambda1)
-        b = 1.0 / np.sqrt(lambda2)
-        c = 1.0 / np.sqrt(lambda3)
-
-        b_a = b / a
-        c_a = c / a
-        if not (0 <= c_a <= b_a <= 1.0):
-            axis_ratios[i] = [np.nan, np.nan]
-            continue
-        axis_ratios[i] = [b_a, c_a]
+    axis_ratios = np.full((n_voids, 2), np.nan)
+    pos = np.where(l1 > 1e-12)[0]
+    a = 1.0 / np.sqrt(l1[pos])
+    b = 1.0 / np.sqrt(l2[pos])
+    c = 1.0 / np.sqrt(l3[pos])
+    b_a = b / a
+    c_a = c / a
+    good = (c_a >= 0) & (c_a <= b_a) & (b_a <= 1.0)
+    axis_ratios[pos[good], 0] = b_a[good]
+    axis_ratios[pos[good], 1] = c_a[good]
 
     return {
         'axis_ratios': axis_ratios,

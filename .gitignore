@@ -72,6 +72,9 @@ tests/tmp/
 *.pts_streams
 *.pts_stream_offsets
 *.pts_stream_records
+*.pts_stream_ids
+*.pts_denGrad
+*.pts_stream_dengrad
 
 #  Generated data & media
 *.hdf5

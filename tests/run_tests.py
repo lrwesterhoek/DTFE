@@ -485,6 +485,122 @@ def test_regression(tmpdir, update_ref=False):
         report(name, True)
 
 
+def _read_float32(filepath):
+    import array
+    values = array.array("f")
+    with open(filepath, "rb") as f:
+        values.frombytes(f.read())
+    return values
+
+
+def _run_raw(cmd_tail, input_file, output_file):
+    cmd = [DTFE_BIN, input_file, output_file] + cmd_tail
+    log(f"Running: {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    return result.returncode == 0, result.stdout + result.stderr
+
+
+def test_raw_binary_reader(tmpdir):
+    """Type-121 raw binary reader: the box is 2*NO_DIM floats (a 4-byte read misaligned every
+    later block) and weights/velocities must land in their own buffers (they were read into
+    the positions array, leaving the assigned weight/velocity arrays uninitialized)."""
+    name = "raw_binary_reader_121"
+    import struct
+    box = 10.0
+    particles = make_lattice_particles(8, box)
+    input_file = os.path.join(tmpdir, "raw121.bin")
+    output_file = os.path.join(tmpdir, "out121")
+    with open(input_file, "wb") as f:
+        f.write(struct.pack("<i", len(particles)))
+        f.write(struct.pack("<6f", 0.0, box, 0.0, box, 0.0, box))
+        for p in particles:
+            f.write(struct.pack("<3f", p[0], p[1], p[2]))
+        for p in particles:
+            f.write(struct.pack("<f", p[3]))
+        for _ in particles:
+            f.write(struct.pack("<3f", 10.0, 20.0, 30.0))
+    ok, output = _run_raw(["-i", "121", "-o", "101", "-g", "8", "-f", "density", "velocity",
+                           "--MpcUnit", "1", "--periodic"], input_file, output_file)
+    try:
+        if not ok:
+            raise AssertionError("DTFE failed on the type-121 raw binary input")
+        for v in _read_float32(output_file + ".den"):
+            assert_close(v, 1.0, 1e-3, "lattice density")
+        for i, v in enumerate(_read_float32(output_file + ".vel")):
+            expected = (10.0, 20.0, 30.0)[i % 3]
+            if v != expected:
+                raise AssertionError(f"velocity component {i}: {v} != {expected}")
+        report(name, True)
+    except AssertionError as e:
+        report(name, False, str(e))
+
+
+def test_text_reader_zero_velocity(tmpdir):
+    """Type-111 text reader: velocities are not part of the x y z w format, so they must come
+    out exactly zero (the reader used to allocate-and-mark velocity/scalar arrays it never
+    filled, copying uninitialized memory into every particle)."""
+    name = "text_reader_zero_velocity_111"
+    box = 10.0
+    particles = make_lattice_particles(6, box)
+    input_file = os.path.join(tmpdir, "t111.txt")
+    output_file = os.path.join(tmpdir, "out111")
+    write_text_input(input_file, particles, (0, box, 0, box, 0, box))
+    ok, output = _run_raw(["-i", "111", "-o", "101", "-g", "6", "-f", "density", "velocity",
+                           "--MpcUnit", "1", "--periodic"], input_file, output_file)
+    try:
+        if not ok:
+            raise AssertionError("DTFE failed on the text input")
+        vel = _read_float32(output_file + ".vel")
+        nonzero = sum(1 for v in vel if v != 0.0)
+        if nonzero:
+            raise AssertionError(f"{nonzero}/{len(vel)} velocity components are non-zero")
+        report(name, True)
+    except AssertionError as e:
+        report(name, False, str(e))
+
+
+def test_gadget_mass_block_skip(tmpdir):
+    """Binary Gadget reader: a per-particle mass block must be seeked past when masses are
+    not requested ('--input 101 5'); it used to trip a false 'snapshot file is corrupt'."""
+    name = "gadget_mass_block_skip"
+    import struct
+    box = 10.0
+    particles = make_lattice_particles(8, box)
+    n = len(particles)
+    header = struct.pack("<6i", 0, n, 0, 0, 0, 0) + struct.pack("<6d", 0, 0, 0, 0, 0, 0)
+    header += struct.pack("<2d", 1.0, 0.0)              # time, redshift
+    header += struct.pack("<2i", 0, 0)                  # flag_sfr, flag_feedback
+    header += struct.pack("<6i", 0, n, 0, 0, 0, 0)      # npartTotal
+    header += struct.pack("<2i", 0, 1)                  # flag_cooling, num_files
+    header += struct.pack("<d", box)                    # BoxSize
+    header += b"\x00" * (256 - len(header))
+
+    def block(payload):
+        return struct.pack("<i", len(payload)) + payload + struct.pack("<i", len(payload))
+
+    input_file = os.path.join(tmpdir, "massblock.gadget")
+    with open(input_file, "wb") as f:
+        f.write(block(header))
+        f.write(block(b"".join(struct.pack("<3f", p[0], p[1], p[2]) for p in particles)))
+        f.write(block(struct.pack(f"<{3 * n}f", *([0.0] * 3 * n))))          # velocities
+        f.write(block(struct.pack(f"<{n}I", *range(1, n + 1))))              # ids
+        f.write(block(struct.pack(f"<{n}f", *([2.5] * n))))                  # per-particle masses
+    try:
+        for tail, what in ((["-i", "101"], "masses requested (mass block read)"),
+                           (["-i", "101", "5"], "masses unrequested (mass block skipped)")):
+            output_file = os.path.join(tmpdir, "outmb")
+            ok, output = _run_raw(tail + ["-o", "101", "-g", "8", "-f", "density",
+                                          "--MpcUnit", "1", "--periodic"],
+                                  input_file, output_file)
+            if not ok:
+                raise AssertionError(f"DTFE failed with {what}")
+            for v in _read_float32(output_file + ".den"):
+                assert_close(v, 1.0, 1e-3, what)
+        report(name, True)
+    except AssertionError as e:
+        report(name, False, str(e))
+
+
 def main():
     global VERBOSE, PASSED, FAILED
 
@@ -514,6 +630,9 @@ def main():
         test_output_size_matches_grid(tmpdir)
         test_weight_scaling_invariance(tmpdir)
         test_nonuniform_weight_effect(tmpdir)
+        test_raw_binary_reader(tmpdir)
+        test_text_reader_zero_velocity(tmpdir)
+        test_gadget_mass_block_skip(tmpdir)
         test_regression(tmpdir, update_ref=args.update_ref)
     finally:
         shutil.rmtree(tmpdir)

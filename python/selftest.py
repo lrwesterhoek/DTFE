@@ -76,7 +76,8 @@ def write_fake_snapshot(snapdir, snap, rng, amplitude):
         h.attrs['Redshift'] = REDSHIFTS[snap]
         h.attrs['HubbleParam'] = 0.6774
         h.attrs['NumPart_ThisFile'] = np.array([0, N**3, 0, 0, 0, 0], dtype=np.int64)
-        h.attrs['MassTable'] = np.array([0.0, 1e-3, 0.0, 0.0, 0.0, 0.0])
+        h.attrs['MassTable'] = np.array([0.0, 1e-3, 0.0, 0.0, 0.0, 0.0])   # authored h-free
+        h.attrs['HFreeUnits'] = 0.6774   # marker: FieldSet must not h-correct this MassTable
 
 
 # ---------------------------------------------------------------- child: one target

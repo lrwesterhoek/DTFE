@@ -77,6 +77,8 @@ User_options::User_options()
     psUseMetal = false;   // GPU deposit off unless --ps-gpu/--ps-metal is given (requires a GPU build)
     psSamplePointsFile = "";          // point-evaluation mode off unless --sample-points is given
     psPerStream = false;
+    psPerStreamIds = false;
+    psPtsDenGrad = false;
     psStreamDensityGeometric = false; // default per-stream estimator: 'dtfe'
     psLinearDeposit = false;          // uniform (equal-share) deposit unless --ps-linear-deposit
 #endif
@@ -223,6 +225,8 @@ void User_options::addOptions(po::options_description &allOptions,
             ("ps-metal", po::bool_switch(&(this->psUseMetal)), "same as '--ps-gpu' (legacy name from the original Metal backend).")
             ("sample-points", po::value<std::string>(&(this->psSamplePointsFile)), "PS-DTFE only: evaluate the multi-stream fields at arbitrary Eulerian points read from the given file, in ADDITION to the regular grid interpolation (pass a small '--grid', e.g. '-g 16', when only point values are wanted). Point coordinates are in the box coordinate system (the same units as '--box', i.e. Mpc after the '--MpcUnit' conversion). Accepted formats, auto-detected: a text file with one 'x y z' triplet per line, or a raw binary file of float64 triplets (N x 3, row-major, native/little-endian, no header). Writes '<output>.pts_den' (float64, rho/rho_bar), '.pts_vel' (float64 x3, density-weighted mean over streams), '.pts_velDisp' (float64 x6 dispersion tensor, xx xy xz yy yz zz), '.pts_streams' (int32); all CPU-only, double precision, deterministic under any '--partition' split.")
             ("per-stream", po::bool_switch(&(this->psPerStream)), "PS-DTFE only: with '--sample-points', additionally write each stream's own density and velocity per point in a ragged layout: '<output>.pts_stream_offsets' (uint64, N+1; point i owns records [off[i], off[i+1])) and '<output>.pts_stream_records' (float64 x4 per record: density, vx, vy, vz; sorted by density, descending).")
+            ("per-stream-ids", po::bool_switch(&(this->psPerStreamIds)), "PS-DTFE only: with '--sample-points', also write each stream's identity -- the ParticleIDs of the 4 Lagrangian vertices of its tetrahedron -- to '<output>.pts_stream_ids' (uint64 x4 per record, same ragged order as '.pts_stream_records'; each quadruple sorted ascending, so it is orientation-independent and identical under any '--partition' split). Implies '--per-stream'. Needs an input reader that provides ParticleIDs (Gadget HDF5); otherwise the IDs are written as 0.")
+            ("pts-den-grad", po::bool_switch(&(this->psPtsDenGrad)), "PS-DTFE only: with '--sample-points', also write the spatial gradient of the total point density to '<output>.pts_denGrad' (float64 x3 per point, d(rho/rho_bar)/dx_i in 1/Mpc) -- the sum over the point's streams of each stream's constant linear 'dtfe' density-profile gradient. With '--per-stream', additionally writes '<output>.pts_stream_dengrad' (float64 x3 per record, same ragged order as '.pts_stream_records'). The gradient always belongs to the 'dtfe' estimator: under '--ps-stream-density geometric' the per-stream density is piecewise constant (zero gradient), so the dtfe-profile gradient (well-defined from the vertex densities) is still what is written; hull cells with the constant volume-ratio density contribute 0.")
             ("ps-stream-density", po::value<std::string>()->default_value("dtfe"), "PS-DTFE only: per-stream density estimator for '--sample-points'. 'dtfe' (default) = linear interpolation of the Lagrangian-vertex DTFE densities inside each stream's tetrahedron (matches the PhaseSpaceDTFE class of the reference implementation, github.com/jfeldbrugge/PS-DTFE); 'geometric' = constant per-tetrahedron density m_tet/V_eul = rho_bar*V_lag/V_eul (the density whose mass-conserving rendering the grid deposit produces). The selected estimator also weights the per-point mean velocity and dispersion.")
             ("ps-linear-deposit", po::bool_switch(&(this->psLinearDeposit)), "PS-DTFE only: weight each tetrahedron's grid deposit by the DTFE-interpolated LINEAR density profile inside the tetrahedron instead of spreading its mass uniformly over the interior sub-samples. The per-sample weights are RENORMALIZED per tetrahedron so the deposited total still equals the tetrahedron's mass exactly -- mass conservation is unchanged (it is the fix for the historical caustic 'square' artefacts). Smoother sub-tetrahedron structure at the cost of reading the vertex densities during the deposit; works with the CPU and all GPU deposits.")
 #endif
@@ -621,7 +625,9 @@ void User_options::printOptions()
     if ( not this->psSamplePointsFile.empty() )
         message << "\t point evaluation       : at the sample points in '" << this->psSamplePointsFile
                 << "' (per-stream density: " << (this->psStreamDensityGeometric ? "geometric" : "dtfe")
-                << (this->psPerStream ? ", writing per-stream records" : "") << ")\n";
+                << (this->psPerStream ? ", writing per-stream records" : "")
+                << (this->psPerStreamIds ? " + stream ids" : "")
+                << (this->psPtsDenGrad ? ", writing density gradients" : "") << ")\n";
     if ( this->psLinearDeposit )
         message << "\t grid deposit profile   : linear within each tetrahedron (--ps-linear-deposit; renormalized per tet, mass-conserving)\n";
 #endif
@@ -832,6 +838,8 @@ void User_options::readOptions(int argc, char *argv[], bool getFileNames, bool s
         else if ( variant != "dtfe" )
             throwError( "Unknown value '", variant, "' for '--ps-stream-density'; use 'dtfe' or 'geometric'." );
     }
+    if ( this->psPerStreamIds )
+        this->psPerStream = true;   // the ids file indexes into the per-stream ragged layout
     if ( not this->psSamplePointsFile.empty() )
     {
         if ( vm.count("interlace") )
@@ -839,8 +847,12 @@ void User_options::readOptions(int argc, char *argv[], bool getFileNames, bool s
         if ( vm.count("NGP") or vm.count("CIC") or vm.count("TSC") or vm.count("PCS") or vm.count("SPH") or vm.count("Voronoi") )
             throwError( "'--sample-points' needs the (PS-)DTFE interpolation method; it is not available with NGP/CIC/TSC/PCS/SPH/Voronoi." );
     }
+    else if ( this->psPerStreamIds )
+        throwError( "'--per-stream-ids' requires '--sample-points'." );
     else if ( this->psPerStream )
         throwError( "'--per-stream' requires '--sample-points'." );
+    else if ( this->psPtsDenGrad )
+        throwError( "'--pts-den-grad' requires '--sample-points'." );
 #endif
 
     // read the partition options

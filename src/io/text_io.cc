@@ -29,8 +29,10 @@
 
 // Readers for text input files.
 
-// Example reader. Line 1 = particle count; line 2 = box; line 3+ = "posX posY posZ velX velY velZ
-// weight scalar" per particle. Sized Read_data accessors allocate; all arrays must share the same count.
+// Example reader. Line 1 = particle count; line 2 = box; line 3+ = "posX posY posZ weight" per
+// particle (matches demo/example_input_data_from_text_file.txt and the '--input 111' help).
+// Sized Read_data accessors allocate AND mark the array as assigned -- transferData then copies
+// it into every particle -- so only arrays this reader actually fills may be requested.
 void readTextFile(std::string filename,
                   Read_data<Real> *readData,
                   User_options *userOptions)
@@ -48,14 +50,14 @@ void readTextFile(std::string filename,
         inputFile >> userOptions->boxCoordinates[i];
 
 
-    // assumes each particle line is: posX, posY, posZ, velX, velY, velZ, weight(=mass), scalar(1 component)
+    // each particle line is: posX, posY, posZ, weight(=mass). Velocity/scalar arrays are NOT
+    // requested: they would be flagged assigned but never filled, and transferData would copy
+    // the uninitialized buffers into the particles (the particles' zero defaults apply instead).
     Real *positions = readData->position(noParticles);
-    readData->velocity(noParticles);
     Real *weights = readData->weight(noParticles);    // weights = particle/galaxy masses
-    readData->scalar(noParticles);
 
 
-    for (int i=0; i<noParticles; ++i)
+    for (size_t i=0; i<noParticles; ++i)
     {
         for (int j=0; j<NO_DIM; ++j)
             inputFile >> positions[NO_DIM*i+j];

@@ -34,6 +34,8 @@
 #include "define.h"
 #include "Pvector.h"
 
+#include <cstdint>
+
 
 
 
@@ -87,6 +89,7 @@ struct Particle_data : public Data_structure
     Pvector<Real,NO_DIM>   pos;    // Eulerian position
 #ifdef PHASE_SPACE
     Pvector<Real,NO_DIM>   lagPos; // Lagrangian (initial) position
+    uint64_t               partID = 0; // snapshot ParticleID (0 for readers without IDs); periodic image copies keep the original's ID -- that is what makes the point-eval stream identities partition-invariant
 #endif
 
     inline Pvector<Real,NO_DIM>& position() { return pos;}
@@ -96,6 +99,7 @@ struct Particle_data : public Data_structure
     inline Pvector<Real,NO_DIM>& lagrangianPosition() { return lagPos;}
     inline Real& lagrangianPosition(int const i) { return lagPos[i];}
     inline void setLagrangianPosition(Real *p) { for(size_t j=0; j<NO_DIM; ++j) lagPos[j] = p[j];}
+    inline uint64_t& particleID() { return partID;}
 #endif
 };
 

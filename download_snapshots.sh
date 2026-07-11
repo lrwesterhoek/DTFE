@@ -2,19 +2,27 @@
 #
 # Download TNG data products for a set of snapshots (redshifts).
 #
-# Two modes:
+# Modes:
 #   snapshots (default) : raw particle snapshot chunks -> <DATA_DIR>/snapdir_NNN/
 #   group catalogs (-c) : FoF/Subfind fof_subhalo_tab chunks -> <DATA_DIR>/groups_NNN/
 #                         (needed by the merger-tree tracker for subhalo selection and
 #                          particle-based shape/orientation; trees themselves are separate)
+#   merger trees   (-t) : SubLink tree_extended chunks (whole simulation)
+#   initial conds  (-i) : ics.hdf5 -> <DATA_DIR>/ (single file, whole simulation). The TNG
+#                         API only serves ICs under the BARYONIC run's name, so for a
+#                         '-Dark' simulation the '-Dark' suffix is stripped for the API call
+#                         (same ICs; the Dark run is the DM-only evolution of them). Feed
+#                         the file to python/tools/convert_ic_units.py to produce the
+#                         h-free combined_ics.hdf5 that run_ps_dtfe.sh expects.
 #
 # Usage:
-#   ./download_snapshots.sh [-k API_KEY] [-c|-t] [-d DATA_DIR] [-s SIMULATION] [snapshot ...]
+#   ./download_snapshots.sh [-k API_KEY] [-c|-t|-i] [-d DATA_DIR] [-s SIMULATION] [snapshot ...]
 #
 # Examples:
 #   ./download_snapshots.sh -c -s TNG50-3-Dark            # groupcats for the default ladder
 #   ./download_snapshots.sh -c -s TNG300-3-Dark 99 50     # groupcats, snapshots 99+50 only
 #   ./download_snapshots.sh -k 0123456789abcdef 1 2 3     # raw snapshots
+#   ./download_snapshots.sh -i -s TNG100-3-Dark           # ICs (served as TNG100-3)
 #
 set -uo pipefail
 
@@ -37,20 +45,24 @@ MODE="snapshot"                   # 'snapshot' or 'groupcat' (-c)
 SNAPSHOTS=(1 2 3 4 5 8 13 17 21 25 33 40 50 67 72 78 84 91 99)
 
 usage() {
-    echo "Usage: $0 [-k API_KEY] [-c|-t] [-d DATA_DIR] [-s SIMULATION] [snapshot ...]"
+    echo "Usage: $0 [-k API_KEY] [-c|-t|-i] [-d DATA_DIR] [-s SIMULATION] [snapshot ...]"
     echo "  -c  download FoF/Subfind group catalogs instead of raw snapshots"
     echo "  -t  download the SubLink merger trees (whole simulation; snapshot list ignored)"
+    echo "  -i  download the initial conditions ics.hdf5 (whole simulation; snapshot list"
+    echo "      ignored; '-Dark' is stripped for the API call -- ICs are served under the"
+    echo "      baryonic run's name only)"
     echo "  API key: -k flag, TNG_API_KEY env, or ~/.tng_api_key file (recommended)."
 }
 
 # ---- Parse arguments ------------------------------------------------------
-while getopts "k:d:s:cth" opt; do
+while getopts "k:d:s:ctih" opt; do
     case "$opt" in
         k) API_KEY="$OPTARG" ;;
         d) DATA_DIR="$OPTARG" ;;
         s) SIMULATION="$OPTARG" ;;
         c) MODE="groupcat" ;;
         t) MODE="tree" ;;
+        i) MODE="ics" ;;
         h) usage; exit 0 ;;
         *) usage; exit 1 ;;
     esac
@@ -72,12 +84,47 @@ fi
 echo "Downloading TNG ${MODE} files..."
 echo "Simulation:     ${SIMULATION}"
 echo "Data directory: ${DATA_DIR}"
-[ "${MODE}" != "tree" ] && echo "Snapshots:      ${SNAPSHOTS[*]}"
+[ "${MODE}" != "tree" ] && [ "${MODE}" != "ics" ] && echo "Snapshots:      ${SNAPSHOTS[*]}"
 echo ""
+
+# Initial conditions: one whole-simulation ics.hdf5, direct file endpoint (no chunk listing).
+# The API serves ICs only under the baryonic run's name, so strip a '-Dark' suffix.
+if [ "${MODE}" = "ics" ]; then
+    # already converted? the raw ics.hdf5 is usually deleted after convert_ic_units.py
+    if [ -f "${DATA_DIR}/combined_ics.hdf5" ]; then
+        echo "Skipping ICs: ${DATA_DIR}/combined_ics.hdf5 already exists (delete it to re-download)."
+        echo ""
+        echo "Download complete!"
+        exit 0
+    fi
+    ICS_SIM="${SIMULATION%-Dark}"
+    [ "${ICS_SIM}" != "${SIMULATION}" ] && echo "ICs are served under '${ICS_SIM}' (shared with the -Dark run)."
+    echo "Downloading ics.hdf5 -> ${DATA_DIR} ..."
+    mkdir -p "${DATA_DIR}"
+    if wget -nc -nv --content-disposition \
+            --header="API-Key: ${API_KEY}" \
+            -P "${DATA_DIR}" \
+            "http://www.tng-project.org/api/${ICS_SIM}/files/ics.hdf5"; then
+        echo "  ics.hdf5 downloaded successfully"
+        echo "  next: python3 python/tools/convert_ic_units.py '${DATA_DIR}/ics.hdf5' '${DATA_DIR}/combined_ics.hdf5'"
+    else
+        echo "  Error downloading ics.hdf5"
+    fi
+    echo ""
+    echo "Download complete!"
+    exit 0
+fi
 
 # SubLink merger trees are whole-simulation files (tree_extended.X.hdf5), not per-snapshot.
 if [ "${MODE}" = "tree" ]; then
     dest_dir="${DATA_DIR}/Merger Trees"       # where dtfelib.trees.TreeSet looks
+    # already merged? merge_HDF5.py --trees replaces the chunks
+    if [ -f "${dest_dir}/combined_tree_extended.hdf5" ]; then
+        echo "Skipping trees: ${dest_dir}/combined_tree_extended.hdf5 already exists (delete it to re-download)."
+        echo ""
+        echo "Download complete!"
+        exit 0
+    fi
     echo "Downloading sublink trees -> ${dest_dir} ..."
     mkdir -p "${dest_dir}"
     if wget -nd -nc -nv -e robots=off -l 1 -r -A hdf5 \
@@ -100,9 +147,22 @@ for i in "${SNAPSHOTS[@]}"; do
     if [ "${MODE}" = "groupcat" ]; then
         dest_dir="${DATA_DIR}/groups_${n_str}"      # fof_subhalo_tab_NNN.X.hdf5 chunks
         endpoint="groupcat-${i}"
+        # already merged? merge_HDF5.py --groupcats replaces the chunks
+        if [ -f "${dest_dir}/combined_fof_subhalo_tab_${n_str}.hdf5" ]; then
+            echo "Skipping ${endpoint}: ${dest_dir}/combined_fof_subhalo_tab_${n_str}.hdf5 already exists (delete it to re-download)."
+            echo ""
+            continue
+        fi
     else
         dest_dir="${DATA_DIR}/${INPUT_SUBDIR}_${n_str}"
         endpoint="snapshot-${i}"
+        # already merged? merge_HDF5.py's raw chunks are usually deleted after the merge,
+        # so wget -nc has nothing to skip on and would re-download the whole snapshot
+        if [ -f "${dest_dir}/combined_${n_str}.hdf5" ]; then
+            echo "Skipping ${endpoint}: ${dest_dir}/combined_${n_str}.hdf5 already exists (delete it to re-download)."
+            echo ""
+            continue
+        fi
     fi
 
     echo "Downloading ${endpoint} -> ${dest_dir} ..."

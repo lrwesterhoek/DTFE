@@ -113,6 +113,24 @@ void initializeGadget(std::string filename,
     *noBytesPos = buffer3 / (3*thisNoParts);
     *noBytesVel = buffer4 / (3*thisNoParts);
 
+    // Only 4 (float) and 8 (double) bytes/value exist. Some writers store inconsistent record
+    // markers (demo/z0_64.gadget brackets its float32 velocity block with npart*36-byte
+    // markers): trusting such a marker made every read/skip branch silently do nothing (there
+    // is no 12-byte branch) and the block delimiter check then failed with a misleading
+    // "file is corrupt". Warn and fall back to float32, the standard Gadget width.
+    if ( *noBytesPos!=4 and *noBytesPos!=8 )
+    {
+        MESSAGE::Warning warning( userOptions->verboseLevel );
+        warning << "The position block's record marker implies " << *noBytesPos << " bytes per value, but only 4 (float) or 8 (double) exist -- the file's record markers are inconsistent. Assuming float32." << MESSAGE::EndWarning;
+        *noBytesPos = 4;
+    }
+    if ( *noBytesVel!=4 and *noBytesVel!=8 )
+    {
+        MESSAGE::Warning warning( userOptions->verboseLevel );
+        warning << "The velocity block's record marker implies " << *noBytesVel << " bytes per value, but only 4 (float) or 8 (double) exist -- the file's record markers are inconsistent. Assuming float32." << MESSAGE::EndWarning;
+        *noBytesVel = 4;
+    }
+
 
     // box coordinates + HubbleParam defaults from the header (shared, gadget_reader_header.cc)
     gadgetHeaderDefaults( gadgetHeader, userOptions, message );
@@ -424,6 +442,9 @@ void readGadgetData(std::string fileName,
     if ( massBlockPresent )
     {
         READ_DELIMETER;
+        if ( not userOptions.readParticleData[1] )
+            inputFile.seekg( buffer1, std::ios::cur );  // masses unrequested: seek past the block
+                                                        // (or the closing marker check below reads mass data)
     }
     if ( userOptions.readParticleData[1] )
     {
@@ -437,7 +458,7 @@ void readGadgetData(std::string fileName,
                 continue;
             else if ( tempHeader.mass[i]==0. and not userOptions.readParticleSpecies[i] )
             {
-                size_t skipBytes = tempHeader.npart[i] * sizeof(float);
+                size_t skipBytes = tempHeader.npart[i] * noBytesPos;    // same element width as the read path
                 inputFile.seekg( skipBytes, std::ios::cur );
                 continue;
             }

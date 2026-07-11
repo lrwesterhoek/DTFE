@@ -9,6 +9,9 @@ computable from GroupLenType / GroupNsubs / GroupFirstSub / SubhaloLenType alone
     offset(sub s) = groupOffset(GrNr(s)) + sum SubhaloLenType[firstSub(GrNr) : s]
 
 All returned quantities keep RAW TNG units (ckpc/h, 1e10 Msun/h) unless stated otherwise.
+The merged combined_fof_subhalo_tab_NNN.hdf5 files (merge_HDF5.py --groupcats) store h-FREE
+values on disk; their per-dataset 'divided_by_h' / header 'HFreeUnits' markers are used here
+to restore the raw-unit API, so chunked and merged reads return the same numbers.
 """
 
 from __future__ import annotations
@@ -35,23 +38,42 @@ def _chunks(d: Path, pattern: str) -> list[Path]:
     return files
 
 
+def _groupcat_files(sim: str, snap: int) -> list[Path]:
+    """The merged catalog (merge_HDF5.py --groupcats) when present, else the raw chunks --
+    the merge concatenates in chunk order, so both read identically."""
+    d = groupcat_dir(sim, snap)
+    combined = d / f"combined_fof_subhalo_tab_{snap:03d}.hdf5"
+    if combined.exists():
+        return [combined]
+    return _chunks(d, f"fof_subhalo_tab_{snap:03d}.*.hdf5")
+
+
+def _raw_units(dset, data):
+    """Merged files store h-free values; restore the documented raw ckpc/h API."""
+    factor = dset.attrs.get("divided_by_h")
+    return data if factor is None else data * factor
+
+
 def header(sim: str, snap: int) -> dict:
-    with h5py.File(_chunks(groupcat_dir(sim, snap), "fof_subhalo_tab_*.hdf5")[0], "r") as f:
+    with h5py.File(_groupcat_files(sim, snap)[0], "r") as f:
         h = f["Header"].attrs
+        box = float(h["BoxSize"])
+        if "HFreeUnits" in h:               # merged catalog: BoxSize on disk is h-free ckpc
+            box *= float(h["HFreeUnits"])
         return {"redshift": float(h["Redshift"]), "hubble": float(h["HubbleParam"]),
-                "box_ckpc_h": float(h["BoxSize"]), "time": float(h["Time"])}
+                "box_ckpc_h": box, "time": float(h["Time"])}
 
 
 def load(sim: str, snap: int, subhalo_fields=(), group_fields=()) -> dict:
     """Concatenate the requested Subhalo/Group columns across all catalog chunks."""
     out = {f"Subhalo/{n}": [] for n in subhalo_fields}
     out.update({f"Group/{n}": [] for n in group_fields})
-    for p in _chunks(groupcat_dir(sim, snap), "fof_subhalo_tab_*.hdf5"):
+    for p in _groupcat_files(sim, snap):
         with h5py.File(p, "r") as f:
             for key in out:
                 grp, name = key.split("/")
                 if grp in f and name in f[grp]:
-                    out[key].append(f[grp][name][:])
+                    out[key].append(_raw_units(f[grp][name], f[grp][name][:]))
     return {k.split("/")[1]: (np.concatenate(v) if v else np.empty(0)) for k, v in out.items()}
 
 
@@ -93,9 +115,22 @@ def read_subhalo_coordinates(sim: str, snap: int, subfind_id: int,
         return np.empty((0, 3), dtype=np.float32)
 
     snapdir = DATA_ROOT / sim / f"snapdir_{snap:03d}"
+    # raw chunks when available; else the merged combined_NNN.hdf5 (its particles keep the
+    # chunk concatenation order, so the global offsets are identical). NOTE: the combined
+    # file is h-FREE (ckpc) while this function's contract is raw ckpc/h -- rescale by h.
+    h_rescale = 1.0
+    try:
+        files = _chunks(snapdir, f"snap_{snap:03d}.*.hdf5")
+    except FileNotFoundError:
+        combined = snapdir / f"combined_{snap:03d}.hdf5"
+        if not combined.exists():
+            raise
+        files = [combined]
+        with h5py.File(combined, "r") as f:
+            h_rescale = float(f["Header"].attrs["HubbleParam"])
     parts = []
     remaining_off, remaining = off, length
-    for p in _chunks(snapdir, f"snap_{snap:03d}.*.hdf5"):
+    for p in files:
         with h5py.File(p, "r") as f:
             n = int(f["Header"].attrs["NumPart_ThisFile"][DM])
             if remaining_off >= n:
@@ -110,7 +145,7 @@ def read_subhalo_coordinates(sim: str, snap: int, subfind_id: int,
     if remaining:
         raise IOError(f"snapshot chunks of {sim} snap {snap} ended {remaining} particles early "
                       f"(incomplete download?)")
-    coords = np.concatenate(parts).astype(np.float64)
+    coords = np.concatenate(parts).astype(np.float64) * h_rescale
     if coords.shape[0] > max_particles:
         step = coords.shape[0] // max_particles + 1
         coords = coords[::step]

@@ -41,6 +41,9 @@ def main() -> int:
             src.copy(name, dst)
 
         dst["Header"].attrs["BoxSize"] = src["Header"].attrs["BoxSize"] / h
+        if "MassTable" in dst["Header"].attrs:      # 1e10 Msun/h -> 1e10 Msun, like the snapshots
+            dst["Header"].attrs["MassTable"] = np.asarray(dst["Header"].attrs["MassTable"]) / h
+        dst["Header"].attrs["HFreeUnits"] = h       # marker: this file is h-free
         print(f"h = {h}")
         print(f"BoxSize: {src['Header'].attrs['BoxSize']} -> {dst['Header'].attrs['BoxSize']}")
 

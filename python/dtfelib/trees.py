@@ -13,6 +13,8 @@ Works directly on the `tree_extended.X.hdf5` chunks (e.g. in "<sim>/Merger Trees
     no separate group catalogs at all.
 
 Units are RAW TNG tree units: lengths ckpc/h (comoving), masses 1e10 Msun/h, spins ckpc/h km/s.
+(The merged combined_tree_extended.hdf5 stores h-FREE values on disk; its per-dataset
+'divided_by_h' markers are applied on read so the API returns raw units either way.)
 
     ts = TreeSet("TNG50-3-Dark")
     branch = ts.main_branch(99, 0, fields=["SnapNum", "SubhaloMass", "SubhaloPos"])
@@ -34,10 +36,11 @@ _RAW_FACTOR = 10 ** 12   # SubhaloIDRaw = SnapNum * 1e12 + SubfindID
 def _tree_dir(sim: str) -> Path:
     root = DATA_ROOT / sim
     for cand in (root / "Merger Trees", root / "postprocessing" / "trees" / "SubLink"):
-        if cand.is_dir() and any(cand.glob("tree_extended.*.hdf5")):
+        if cand.is_dir() and ((cand / "combined_tree_extended.hdf5").exists()
+                              or any(cand.glob("tree_extended.*.hdf5"))):
             return cand
     raise FileNotFoundError(
-        f"no SubLink tree_extended.*.hdf5 found under {root} "
+        f"no SubLink tree_extended.*.hdf5 (or combined_tree_extended.hdf5) found under {root} "
         f"(looked in 'Merger Trees/' and 'postprocessing/trees/SubLink/')")
 
 
@@ -47,8 +50,14 @@ class TreeSet:
     def __init__(self, sim: str):
         self.sim = sim
         self.dir = _tree_dir(sim)
-        self.paths = sorted(self.dir.glob("tree_extended.*.hdf5"),
-                            key=lambda p: int(p.stem.split(".")[-1]))
+        # the merged file (merge_HDF5.py --trees) behaves as one big chunk: trees are wholly
+        # contained and stored contiguously, so the row arithmetic below is unaffected
+        combined = self.dir / "combined_tree_extended.hdf5"
+        if combined.exists():
+            self.paths = [combined]
+        else:
+            self.paths = sorted(self.dir.glob("tree_extended.*.hdf5"),
+                                key=lambda p: int(p.stem.split(".")[-1]))
         self._files: dict[int, h5py.File] = {}
         self._id_cols: dict[tuple[int, str], np.ndarray] = {}   # (chunk, colname) -> array
 
@@ -58,11 +67,21 @@ class TreeSet:
             self._files[chunk] = h5py.File(self.paths[chunk], "r")
         return self._files[chunk]
 
+    @staticmethod
+    def _raw(dset, data):
+        """Merged files store h-free values; restore the documented raw-unit API."""
+        factor = dset.attrs.get("divided_by_h")
+        return data if factor is None else data * factor
+
+    def _read(self, chunk: int, name: str, sel=None) -> np.ndarray:
+        f = self._file(chunk)
+        return self._raw(f[name], f[name][:][sel] if sel is not None else f[name][:])
+
     def _col(self, chunk: int, name: str) -> np.ndarray:
         """Whole-column cache for the small int columns used in navigation."""
         key = (chunk, name)
         if key not in self._id_cols:
-            self._id_cols[key] = self._file(chunk)[name][:]
+            self._id_cols[key] = self._read(chunk, name)
         return self._id_cols[key]
 
     # ------------------------------------------------------------------ lookup
@@ -84,11 +103,10 @@ class TreeSet:
             sel = np.nonzero(self._col(chunk, "SnapNum") == snap)[0]
             if not sel.size:
                 continue
-            f = self._file(chunk)
-            m = f["SubhaloMass"][:][sel]
+            m = self._read(chunk, "SubhaloMass", sel)
             keep = m >= min_mass
-            ids.append(f["SubfindID"][:][sel][keep])
-            pos.append(f["SubhaloPos"][:][sel][keep])
+            ids.append(self._read(chunk, "SubfindID", sel)[keep])
+            pos.append(self._read(chunk, "SubhaloPos", sel)[keep])
             mass.append(m[keep])
         if not ids:
             raise KeyError(f"no subhalos at snapshot {snap} in the {self.sim} trees")
@@ -106,12 +124,12 @@ class TreeSet:
             sel = np.nonzero(snapnum == snap)[0]
             if not sel.size:
                 continue
-            f = self._file(chunk)
             if central_only:
-                is_central = (f["FirstSubhaloInFOFGroupID"][:][sel] == self._col(chunk, "SubhaloID")[sel])
+                is_central = (self._read(chunk, "FirstSubhaloInFOFGroupID", sel)
+                              == self._col(chunk, "SubhaloID")[sel])
                 sel = sel[is_central]
-            vals = f[order_by][:][sel]
-            sub = f["SubfindID"][:][sel]
+            vals = self._read(chunk, order_by, sel)
+            sub = self._read(chunk, "SubfindID", sel)
             found.append(np.column_stack([vals, sub]))
         allv = np.concatenate(found)
         top = allv[np.argsort(allv[:, 0])[::-1][:n]]
@@ -125,7 +143,7 @@ class TreeSet:
         order = np.argsort(rows)          # h5py fancy indexing needs increasing order
         out = {}
         for name in want:
-            data = f[name][rows[order].tolist()]
+            data = self._raw(f[name], f[name][rows[order].tolist()])
             inv = np.empty_like(order)
             inv[order] = np.arange(order.size)
             out[name] = np.asarray(data)[inv]
@@ -192,10 +210,9 @@ class TreeSet:
         sid = self._col(chunk, "SubhaloID")
         fprog = self._col(chunk, "FirstProgenitorID")
         nprog = self._col(chunk, "NextProgenitorID")
-        f = self._file(chunk)
-        mass = f[mass_field][:]
+        mass = self._read(chunk, mass_field)
         snapn = self._col(chunk, "SnapNum")
-        subf = f["SubfindID"][:]
+        subf = self._read(chunk, "SubfindID")
 
         # main-branch masses by snapshot (for the 'maxpast' ratio denominator)
         main_rows = self._main_branch_rows(chunk, row)

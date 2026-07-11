@@ -1,0 +1,58 @@
+# Two jobs, deliberately small:
+#  * build-and-test -- the fast Linux CPU build + test battery (a previous
+#    cross-platform-test.yml was removed on purpose, commit eb243c8; this job stays
+#    CPU-only and under ~15 minutes -- it exists to catch "does not compile on Linux"
+#    and "the deposit broke" regressions, nothing more).
+#  * cuda-compile -- COMPILE check of the CUDA GPU backend via the repo Dockerfile
+#    (nvidia/cuda devel base; nvcc needs no GPU to compile). This is the ONLY place the
+#    single-source CUDA/HIP backends (src/CGAL_triangulation/{ps,dtfe}_gpu_cuda.cu) get
+#    compiled at all -- a failure here means they rotted against a shared header change
+#    (they share gpu_host.h / ps_deposit_params.h with the CPU and Metal paths).
+
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential libgsl-dev libboost-all-dev libcgal-dev \
+            libmpfr-dev libhdf5-dev libgmp-dev libfftw3-dev \
+            python3 python3-numpy python3-h5py
+
+      - name: Check dependencies
+        run: make deps-check
+
+      - name: Build DTFE + PS-DTFE (CPU-only)
+        run: |
+          make DTFE    ARCH_FLAGS="-mtune=generic" -j"$(nproc)"
+          make PS-DTFE ARCH_FLAGS="-mtune=generic" -j"$(nproc)"
+
+      - name: Standard-DTFE regression
+        run: python3 tests/run_tests.py
+
+      - name: PS-DTFE smoke test
+        run: tests/ps_smoke_test.sh --no-build
+
+  # Compile check only -- no GPU exists at build time and none is needed. The Dockerfile's
+  # sanity stage still runs the CPU test battery inside the image, so this also proves the
+  # CUDA-built binaries execute their CPU paths.
+  cuda-compile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: CUDA backend compile check (Docker, GPU=cuda)
+        run: docker build --build-arg GPU=cuda .
