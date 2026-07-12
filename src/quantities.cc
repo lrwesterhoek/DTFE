@@ -132,6 +132,7 @@ size_t Quantities::size() const
 #ifdef PHASE_SPACE
     fieldSize( this->stream_count, &temp );
     fieldSize( this->mass_weight, &temp );
+    fieldSize( this->caustic_bits, &temp );
 #endif
     return temp;
 }
@@ -148,6 +149,21 @@ void addField(std::vector<T> const &src, std::vector<T> *dst)
     for (size_t i = 0; i < src.size(); ++i)
         (*dst)[i] += src[i];
 }
+
+#ifdef PHASE_SPACE
+// Bitwise-OR accumulate for bit-mask fields stored as Real (small exact integers, e.g. the
+// caustic orientation bits). OR is commutative AND idempotent, so -- unlike '+=' -- the merge
+// is invariant under the partitions' completion order and under a stream being seen by the
+// deposit any number of times.
+void orField(std::vector<Real> const &src, std::vector<Real> *dst)
+{
+    if (src.empty()) return;
+    if (dst->size() < src.size())
+        dst->resize(src.size(), Real(0.));
+    for (size_t i = 0; i < src.size(); ++i)
+        (*dst)[i] = Real( int((*dst)[i]) | int(src[i]) );
+}
+#endif
 
 // Accumulates every field of 'other' into this object (PS-DTFE: one partition's results summed into the whole).
 void Quantities::addFrom(Quantities const &other)
@@ -168,6 +184,7 @@ void Quantities::addFrom(Quantities const &other)
 #ifdef PHASE_SPACE
     addField(other.stream_count, &this->stream_count);
     addField(other.mass_weight, &this->mass_weight);
+    orField(other.caustic_bits, &this->caustic_bits);   // orientation bits: OR, never '+='
 #endif
 }
 
@@ -257,6 +274,21 @@ void Quantities::addFromSubgrid(Quantities const &other, size_t const *fullGrid)
     addFieldSubgrid(other.velocity_vweb_eigenvalues, &this->velocity_vweb_eigenvalues, o, m, fullGrid);
     addFieldSubgrid(other.stream_count, &this->stream_count, o, m, fullGrid);
     addFieldSubgrid(other.mass_weight, &this->mass_weight, o, m, fullGrid);
+    // caustic orientation bits: same sub-grid -> global mapping, but OR instead of '+='
+    if ( not other.caustic_bits.empty() )
+    {
+        size_t fullTotal = 1; for (int d = 0; d < NO_DIM; ++d) fullTotal *= fullGrid[d];
+        if (this->caustic_bits.size() < fullTotal) this->caustic_bits.resize(fullTotal, Real(0.));
+        size_t subTotal = 1; for (int d = 0; d < NO_DIM; ++d) subTotal *= m[d];
+        for (size_t l = 0; l < subTotal; ++l)
+        {
+            size_t rem = l, c[NO_DIM];
+            for (int d = NO_DIM - 1; d >= 0; --d) { c[d] = rem % m[d]; rem /= m[d]; }
+            size_t g = 0;
+            for (int d = 0; d < NO_DIM; ++d) g = g * fullGrid[d] + (c[d] + o[d]);
+            this->caustic_bits[g] = Real( int(this->caustic_bits[g]) | int(other.caustic_bits[l]) );
+        }
+    }
 }
 #endif
 

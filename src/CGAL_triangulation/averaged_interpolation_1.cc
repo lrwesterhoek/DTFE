@@ -38,6 +38,13 @@
 #include "gpu_host.h"
 #endif
 
+// --exact-average: analytic cell∩tet moments (vendored r3d, Powell & Abel 2015; 3D only;
+// MY_SCALAR is not linear inside a tet, so it keeps the MC loop -- rejected at parsing).
+// r3d.h carries its own extern "C" guard.
+#if NO_DIM==3 && !defined(MY_SCALAR)
+#include "../../third_party/r3d/r3d.h"
+#endif
+
 
 
 // Fills 'arraySize' quasi-random (Sobol) barycentric coordinates inside the unit simplex; samples in
@@ -199,12 +206,15 @@ inline Pvector<Real,noScalarComp> averageScalar(Finite_cells_iterator &cell)
 
 // Volume-averaged grid interpolation (method 1): quasi-Monte-Carlo sampling inside each Delaunay cell,
 // with the sample count proportional to cell volume; scatters each sample's field value into its grid cell.
+// --exact-average replaces the MC inner loop by analytic cell∩tet integration (r3d; NO_DIM==3 only).
 void interpolateGrid_averaged_1(DT &dt,
                                 User_options &userOptions,
                                 Quantities *quantities)
 {
     size_t *nGrid = &(userOptions.gridSize[0]); // grid size along each axis
     size_t const NN = userOptions.noPoints;     // average random points per grid cell
+    // --exact-average: analytic cell∩tet integration of the linear interpolant (3D CPU only)
+    bool const exactAvg = userOptions.exactAverage;
     size_t const minNN = NN/6 + 1;              // minimum sample points per Delaunay cell
     Real const minRatio = 1./6.;                // vol(Delaunay)/vol(grid) below which minNN is used
     size_t const maxNN = 100*NN;                // maximum sample points per Delaunay cell
@@ -229,11 +239,18 @@ void interpolateGrid_averaged_1(DT &dt,
 
 
     MESSAGE::Message message( userOptions.verboseLevel );
-    message << "\nComputing interpolation of the fields volume averaged over the sampling cell on a regular "
-            << MESSAGE::printElements( nGrid, NO_DIM, "*" ) << " grid in the region " 
-            << boxCoordinates.print() 
-            << ". The volume average is done using Monte Carlo sampling in each of the triangles/tetrahedra of the Delaunay triangulation. " 
-            << "There are " << NN << " random sampling points on average in each grid cell of the output fields (the random samples in the Delaunay triangulation's triangles/tetrahedra are proportional to the area/volume of the cell).\n" 
+    if ( exactAvg )
+        message << "\nComputing interpolation of the fields volume averaged over the sampling cell on a regular "
+                << MESSAGE::printElements( nGrid, NO_DIM, "*" ) << " grid in the region "
+                << boxCoordinates.print()
+                << ". The volume average integrates the linear interpolant EXACTLY over every grid-cell/tetrahedron intersection (--exact-average, r3d; '--samples' is ignored).\n"
+                << "\t Done: " << MESSAGE::Flush;
+    else
+        message << "\nComputing interpolation of the fields volume averaged over the sampling cell on a regular "
+            << MESSAGE::printElements( nGrid, NO_DIM, "*" ) << " grid in the region "
+            << boxCoordinates.print()
+            << ". The volume average is done using Monte Carlo sampling in each of the triangles/tetrahedra of the Delaunay triangulation. "
+            << "There are " << NN << " random sampling points on average in each grid cell of the output fields (the random samples in the Delaunay triangulation's triangles/tetrahedra are proportional to the area/volume of the cell).\n"
             << "\t Done: " << MESSAGE::Flush;
     
     // zero-initialize all grid fields
@@ -281,6 +298,12 @@ void interpolateGrid_averaged_1(DT &dt,
     bool metalDeposited = false;
 #ifdef DTFE_GPU_ACTIVE
     bool tryMetal = userOptions.useMetal;
+    if ( tryMetal and exactAvg )
+    {
+        MESSAGE::Warning warning( userOptions.verboseLevel );
+        warning << "--exact-average is CPU-only (analytic r3d integration); using the CPU interpolation for this pass.\n" << MESSAGE::EndWarning;
+        tryMetal = false;
+    }
 #ifdef SCALAR
     if ( tryMetal and (field.scalar or field.scalar_gradient) )
     {
@@ -541,8 +564,101 @@ void interpolateGrid_averaged_1(DT &dt,
             continue;
         }
 #endif
-        
-        
+
+
+#if NO_DIM==3 && !defined(MY_SCALAR)
+        // ----- exact volume average (--exact-average): analytic cell∩tet integration -----
+        // The interpolant is LINEAR inside the tet, so its integral over each intersection
+        // piece is the centroid value times the piece volume -- order-1 r3d moments suffice
+        // (Powell & Abel 2015). Same vertex-0-relative frame as the sampled path (densGrad,
+        // velGrad and the field evaluators all take base-relative coordinates); out-of-region
+        // window cells are skipped exactly like out-of-region samples. The single-grid-cell
+        // fast path above (already exact for linear fields) is shared with the sampled mode.
+        if ( exactAvg )
+        {
+            Vertex_handle base = itC->vertex(0);
+            Real densGrad[NO_DIM];
+            densityGrad( itC, posMatrixInverse, densGrad );
+#ifdef VELOCITY
+            Real velGrad[NO_DIM][noVelComp];
+            velocityGrad( itC, posMatrixInverse, velGrad );
+#endif
+#ifdef SCALAR
+            Real sGrad[NO_DIM][noScalarComp];
+            scalarGrad( itC, posMatrixInverse, sGrad );
+#endif
+
+            r3d_rvec3 tv[NO_DIM+1];
+            for (int d = 0; d < NO_DIM; ++d) tv[0].xyz[d] = 0.;
+            for (int v = 1; v <= NO_DIM; ++v)
+                for (int d = 0; d < NO_DIM; ++d)
+                    tv[v].xyz[d] = vertexMatrix[v-1][d];
+            if ( determinant(vertexMatrix) < 0. )   // r3d wants positive orientation
+            { r3d_rvec3 const tmp = tv[1]; tv[1] = tv[2]; tv[2] = tmp; }
+            r3d_poly tetPoly;
+            r3d_init_tet(&tetPoly, tv);
+
+            // window of grid cells overlapped by the tet bbox (region-frame indices, clamped)
+            int iLo[NO_DIM], iHi[NO_DIM];
+            for (int d = 0; d < NO_DIM; ++d)
+            {
+                double lo = 0., hi = 0.;
+                for (int v = 0; v < NO_DIM; ++v)
+                {
+                    if (vertexMatrix[v][d] < lo) lo = vertexMatrix[v][d];
+                    if (vertexMatrix[v][d] > hi) hi = vertexMatrix[v][d];
+                }
+                iLo[d] = int( std::floor( (double(basePosition[d]) + lo) / double(dx[d]) ) );
+                iHi[d] = int( std::floor( (double(basePosition[d]) + hi) / double(dx[d]) ) ) + 1;
+                if (iLo[d] < 0) iLo[d] = 0;
+                if (iHi[d] > int(nGrid[d])) iHi[d] = int(nGrid[d]);
+            }
+
+            for (int gi = iLo[0]; gi < iHi[0]; ++gi)
+            for (int gj = iLo[1]; gj < iHi[1]; ++gj)
+            for (int gk = iLo[2]; gk < iHi[2]; ++gk)
+            {
+                int const gijk[3] = {gi, gj, gk};
+                r3d_plane planes[6];   // the 6 half-spaces of this cell, n.x + d >= 0 kept
+                for (int d = 0; d < NO_DIM; ++d)
+                {
+                    double const lo = gijk[d] * double(dx[d]) - double(basePosition[d]);
+                    double const hi = lo + double(dx[d]);
+                    for (int q = 0; q < 2; ++q)
+                        for (int dd = 0; dd < NO_DIM; ++dd)
+                            planes[2*d+q].n.xyz[dd] = 0.;
+                    planes[2*d].n.xyz[d]   =  1.; planes[2*d].d   = -lo;
+                    planes[2*d+1].n.xyz[d] = -1.; planes[2*d+1].d =  hi;
+                }
+                r3d_poly piece = tetPoly;
+                r3d_clip(&piece, planes, 6);
+                if ( piece.nverts == 0 ) continue;
+                r3d_real mom[4];
+                r3d_reduce(&piece, mom, 1);
+                if ( !(mom[0] > 0.) ) continue;
+
+                index = ( size_t(gi)*nGrid[1] + size_t(gj) )*nGrid[2] + size_t(gk);
+                Real const dV = Real(mom[0]);
+                Point centroid( mom[1]/mom[0], mom[2]/mom[0], mom[3]/mom[0] );
+                if (field.density) (*density)[index] += densityValue(densGrad, base, centroid) * dV;
+#ifdef VELOCITY
+                if (field.velocity) (*velocity)[index] += velocityValue(velGrad, base, centroid) * dV;
+                if (field.velocity_gradient) (*velocity_gradient)[index] += velocityGradient(velGrad) * dV;
+#endif
+#ifdef SCALAR
+                if (field.scalar) (*scalar)[index] += scalarValue(sGrad, base, centroid) * dV;
+                if (field.scalar_gradient) (*scalar_gradient)[index] += scalarGradient(sGrad) * dV;
+#endif
+#ifdef TEST_PADDING
+                if ( dummyNeighbors ) updateDummyGridCells( index, &incompleteCells_d );
+                if ( dummyVertices ) updateDummyGridCells( index, &incompleteCells );
+#endif
+            }
+            continue;
+        }
+#endif  // NO_DIM==3 (exact average)
+
+
         // cell spans multiple grid cells -> MC-sample inside it
         size_t const tempInt = size_t(NN*cellVolume/gridCellVolume) + 1;
         size_t const noRandomPoints = (cellVolume/gridCellVolume>minRatio) ? (tempInt>maxNN ? maxNN:tempInt) : minNN;

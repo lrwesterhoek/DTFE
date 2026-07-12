@@ -275,6 +275,47 @@ def t_velocity_single_stream():
         raise AssertionError("method='dtfe' must raise ValueError")
 
 
+def t_caustic_field_loader():
+    """FieldSet loads the 0/1 '.caustic' fold-flag grid written by 'PS-DTFE --ps-caustics'
+    (synthetic files; the field is float32 like every grid, so no dtype column is needed)."""
+    import shutil
+    import tempfile
+
+    from dtfelib.io import FieldSet
+    try:
+        import h5py
+    except ImportError as e:              # FieldSet needs a combined_*.hdf5 for units
+        raise FileNotFoundError(f"h5py unavailable: {e}")   # -> SKIP, not FAIL
+    d = Path(tempfile.mkdtemp(prefix="dtfelib_caustic_"))
+    try:
+        n = 8
+        np.ones((n, n, n), dtype=np.float32).tofile(d / "ps_output.den")
+        flag = (np.random.default_rng(7).random((n, n, n)) < 0.2).astype(np.float32)
+        flag.tofile(d / "ps_output.caustic")
+        with h5py.File(d / "combined_000.hdf5", "w") as f:
+            h = f.create_group("Header")
+            h.attrs["BoxSize"] = 100000.0
+            h.attrs["NumPart_ThisFile"] = np.array([0, n**3, 0, 0, 0, 0], dtype=np.int64)
+            h.attrs["MassTable"] = np.array([0.0, 1.0, 0.0, 0.0, 0.0, 0.0])
+            h.attrs["Redshift"] = 0.0
+            h.attrs["HubbleParam"] = 0.7
+            h.attrs["HFreeUnits"] = 1
+        fs = FieldSet(d, method="ps", averaged=False)
+        assert fs.has("caustic"), "has('caustic') must see ps_output.caustic"
+        c = fs.load("caustic")
+        assert c.shape == (n, n, n) and c.dtype == np.float32, f"{c.shape} {c.dtype}"
+        assert np.array_equal(c, flag), "caustic grid roundtrip mismatch"
+        assert set(np.unique(c).tolist()) <= {0.0, 1.0}, "flag must be 0/1"
+        try:
+            FieldSet(d, method="dtfe", averaged=False).load("caustic")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("caustic is ps_only; method='dtfe' must raise ValueError")
+    finally:
+        shutil.rmtree(d)
+
+
 def main():
     print("=" * 60)
     print(" dtfelib merger-tree / void-tracking tests")
@@ -285,6 +326,7 @@ def main():
     check("track_center across box wrap", t_track_center_wrap)
     check("match_catalog_void (periodic)", t_match_catalog_void)
     check("shape estimators: vectorized == loop reference", t_shape_estimators)
+    check("FieldSet caustic loader (synthetic)", t_caustic_field_loader)
     print(f"data-backed ({SIM}):")
     check("main_branch invariants", t_main_branch_invariants)
     check("descendant_branch inverse walk", t_descendant_inverse)

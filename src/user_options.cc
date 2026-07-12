@@ -72,15 +72,19 @@ User_options::User_options()
     noPointsOn = false;
     useMetal = false;     // GPU interpolation off unless --gpu/--metal is given (requires a GPU build)
     gpuAlias = false;
-#ifdef PHASE_SPACE
-    psAvgSubsamples = 3;  // nSub for PS-DTFE '_a' fields (27 sub-points in 3D)
-    psUseMetal = false;   // GPU deposit off unless --ps-gpu/--ps-metal is given (requires a GPU build)
-    psSamplePointsFile = "";          // point-evaluation mode off unless --sample-points is given
+    exactAverage = false; // sampled '_a' averaging unless --exact-average (standard DTFE only)
+    psSamplePointsFile = "";          // point-evaluation mode off unless --sample-points is given (both binaries)
     psPerStream = false;
     psPerStreamIds = false;
     psPtsDenGrad = false;
     psStreamDensityGeometric = false; // default per-stream estimator: 'dtfe'
+#ifdef PHASE_SPACE
+    psAvgSubsamples = 3;  // nSub for PS-DTFE '_a' fields (27 sub-points in 3D)
+    psUseMetal = false;   // GPU deposit off unless --ps-gpu/--ps-metal is given (requires a GPU build)
     psLinearDeposit = false;          // uniform (equal-share) deposit unless --ps-linear-deposit
+    psCaustics = false;               // no '.caustic' fold-flag grid unless --ps-caustics
+    psHaloRelease = Real(0.);         // 0 = deposit every tetrahedron by bbox rasterization (no release)
+    psExactDeposit = false;           // nSub^3 sub-sampled deposit unless --ps-exact-deposit
 #endif
     averageDensity = Real(-1.);
 
@@ -218,17 +222,23 @@ void User_options::addOptions(po::options_description &allOptions,
 #ifndef PHASE_SPACE
             ("gpu", po::bool_switch(&(this->gpuAlias)), "standard DTFE only: run the volume-averaged ('_a', method 1) grid interpolation on the GPU. Requires a GPU build: 'make DTFE METAL=1' (macOS), 'make DTFE CUDA=1' (Linux/NVIDIA) or 'make DTFE HIP=1' (Linux/AMD ROCm); otherwise the option is ignored with a warning and the CPU interpolation is used. Results match the CPU interpolation to float rounding (atomic summation order). Unaveraged fields and methods 2/3 always use the CPU.")
             ("metal", po::bool_switch(&(this->useMetal)), "same as '--gpu' (legacy name from the original Metal backend).")
+            ("exact-average", po::bool_switch(&(this->exactAverage)), "standard DTFE only, 3D only, CPU only: compute the volume-averaged ('_a') fields by integrating the LINEAR DTFE interpolant EXACTLY over every grid-cell/tetrahedron intersection (vendored r3d library, Powell & Abel 2015) instead of Monte-Carlo sampling. For a linear field the integral over each intersection is its centroid value times its volume, so order-1 moments suffice -- no sampling noise, and on a perfect particle lattice the averaged density is exactly 1 to rounding. Runs on the method-1 per-tetrahedron scatter topology with the same cell classification (the single-grid-cell fast path was already exact); '--samples' and '--method' are ignored (pass neither, or '-m 1'). Combined with '--gpu' the interpolation falls back to the CPU with a warning. An accuracy option, not a speed option.")
 #endif
 #ifdef PHASE_SPACE
             ("ps-gpu", po::bool_switch(&(this->gpuAlias)), "PS-DTFE only: run the grid deposit (the dominant cost) on the GPU. Requires a GPU build: 'make PS-DTFE METAL=1' (macOS), CUDA=1 (Linux/NVIDIA) or HIP=1 (Linux/AMD ROCm); otherwise the option is ignored with a warning and the CPU deposit is used. Results match the CPU deposit to float rounding (atomic summation order).")
             ("avg-subsamples", po::value<int>(&(this->psAvgSubsamples))->default_value(3), "PS-DTFE only: linear sub-sample count nSub for the volume-averaged ('_a') fields. Each grid cell is volume-averaged over an nSub^3 regular sub-grid, so the '_a' interpolation cost scales as nSub^3 -- it is the dominant runtime cost. 3 (default) = 27 sub-points; 2 = 8 (~3.4x faster '_a' pass, slightly coarser average); 1 = cell-centre only (= the unaveraged value, no extra cost but no averaging benefit). Lower this to speed up runs dominated by the averaged-field pass.")
             ("ps-metal", po::bool_switch(&(this->psUseMetal)), "same as '--ps-gpu' (legacy name from the original Metal backend).")
-            ("sample-points", po::value<std::string>(&(this->psSamplePointsFile)), "PS-DTFE only: evaluate the multi-stream fields at arbitrary Eulerian points read from the given file, in ADDITION to the regular grid interpolation (pass a small '--grid', e.g. '-g 16', when only point values are wanted). Point coordinates are in the box coordinate system (the same units as '--box', i.e. Mpc after the '--MpcUnit' conversion). Accepted formats, auto-detected: a text file with one 'x y z' triplet per line, or a raw binary file of float64 triplets (N x 3, row-major, native/little-endian, no header). Writes '<output>.pts_den' (float64, rho/rho_bar), '.pts_vel' (float64 x3, density-weighted mean over streams), '.pts_velDisp' (float64 x6 dispersion tensor, xx xy xz yy yz zz), '.pts_streams' (int32); all CPU-only, double precision, deterministic under any '--partition' split.")
-            ("per-stream", po::bool_switch(&(this->psPerStream)), "PS-DTFE only: with '--sample-points', additionally write each stream's own density and velocity per point in a ragged layout: '<output>.pts_stream_offsets' (uint64, N+1; point i owns records [off[i], off[i+1])) and '<output>.pts_stream_records' (float64 x4 per record: density, vx, vy, vz; sorted by density, descending).")
-            ("per-stream-ids", po::bool_switch(&(this->psPerStreamIds)), "PS-DTFE only: with '--sample-points', also write each stream's identity -- the ParticleIDs of the 4 Lagrangian vertices of its tetrahedron -- to '<output>.pts_stream_ids' (uint64 x4 per record, same ragged order as '.pts_stream_records'; each quadruple sorted ascending, so it is orientation-independent and identical under any '--partition' split). Implies '--per-stream'. Needs an input reader that provides ParticleIDs (Gadget HDF5); otherwise the IDs are written as 0.")
-            ("pts-den-grad", po::bool_switch(&(this->psPtsDenGrad)), "PS-DTFE only: with '--sample-points', also write the spatial gradient of the total point density to '<output>.pts_denGrad' (float64 x3 per point, d(rho/rho_bar)/dx_i in 1/Mpc) -- the sum over the point's streams of each stream's constant linear 'dtfe' density-profile gradient. With '--per-stream', additionally writes '<output>.pts_stream_dengrad' (float64 x3 per record, same ragged order as '.pts_stream_records'). The gradient always belongs to the 'dtfe' estimator: under '--ps-stream-density geometric' the per-stream density is piecewise constant (zero gradient), so the dtfe-profile gradient (well-defined from the vertex densities) is still what is written; hull cells with the constant volume-ratio density contribute 0.")
+#endif
+            ("sample-points", po::value<std::string>(&(this->psSamplePointsFile)), "evaluate the fields at arbitrary Eulerian points read from the given file, in ADDITION to the regular grid interpolation (pass a small '--grid', e.g. '-g 16', when only point values are wanted). PS-DTFE: the multi-stream phase-space fields, one stream per folded tetrahedron containing the point, deterministic under any '--partition' split. Standard DTFE: the plain Eulerian DTFE interpolant -- exactly one containing tetrahedron, '.pts_streams' becomes the 0/1 coverage flag, '.pts_velDisp' is identically 0, and the run uses a single triangulation (not combinable with '--partition'). Point coordinates are in the box coordinate system (the same units as '--box', i.e. Mpc after the '--MpcUnit' conversion). Accepted formats, auto-detected: a text file with one 'x y z' triplet per line, or a raw binary file of float64 triplets (N x 3, row-major, native/little-endian, no header). Writes '<output>.pts_den' (float64, rho/rho_bar), '.pts_vel' (float64 x3, density-weighted mean over streams), '.pts_velDisp' (float64 x6 dispersion tensor, xx xy xz yy yz zz), '.pts_streams' (int32); all CPU-only, double precision.")
+            ("per-stream", po::bool_switch(&(this->psPerStream)), "PS-DTFE only: with '--sample-points', additionally write each stream's own density and velocity per point in a ragged layout: '<output>.pts_stream_offsets' (uint64, N+1; point i owns records [off[i], off[i+1])) and '<output>.pts_stream_records' (float64 x4 per record: density, vx, vy, vz; sorted by density, descending). The standard binary rejects this flag (its points have no stream decomposition).")
+            ("per-stream-ids", po::bool_switch(&(this->psPerStreamIds)), "PS-DTFE only: with '--sample-points', also write each stream's identity -- the ParticleIDs of the 4 Lagrangian vertices of its tetrahedron -- to '<output>.pts_stream_ids' (uint64 x4 per record, same ragged order as '.pts_stream_records'; each quadruple sorted ascending, so it is orientation-independent and identical under any '--partition' split). Implies '--per-stream'. Needs an input reader that provides ParticleIDs (Gadget HDF5); otherwise the IDs are written as 0. The standard binary rejects this flag.")
+            ("pts-den-grad", po::bool_switch(&(this->psPtsDenGrad)), "with '--sample-points', also write the spatial gradient of the total point density to '<output>.pts_denGrad' (float64 x3 per point, d(rho/rho_bar)/dx_i in 1/Mpc). PS-DTFE: the sum over the point's streams of each stream's constant linear 'dtfe' density-profile gradient; with '--per-stream', additionally writes '<output>.pts_stream_dengrad' (float64 x3 per record, same ragged order as '.pts_stream_records'). The gradient always belongs to the 'dtfe' estimator: under '--ps-stream-density geometric' the per-stream density is piecewise constant (zero gradient), so the dtfe-profile gradient (well-defined from the vertex densities) is still what is written; hull cells with the constant volume-ratio density contribute 0. Standard DTFE: the containing tetrahedron's constant DTFE density gradient.")
+#ifdef PHASE_SPACE
             ("ps-stream-density", po::value<std::string>()->default_value("dtfe"), "PS-DTFE only: per-stream density estimator for '--sample-points'. 'dtfe' (default) = linear interpolation of the Lagrangian-vertex DTFE densities inside each stream's tetrahedron (matches the PhaseSpaceDTFE class of the reference implementation, github.com/jfeldbrugge/PS-DTFE); 'geometric' = constant per-tetrahedron density m_tet/V_eul = rho_bar*V_lag/V_eul (the density whose mass-conserving rendering the grid deposit produces). The selected estimator also weights the per-point mean velocity and dispersion.")
             ("ps-linear-deposit", po::bool_switch(&(this->psLinearDeposit)), "PS-DTFE only: weight each tetrahedron's grid deposit by the DTFE-interpolated LINEAR density profile inside the tetrahedron instead of spreading its mass uniformly over the interior sub-samples. The per-sample weights are RENORMALIZED per tetrahedron so the deposited total still equals the tetrahedron's mass exactly -- mass conservation is unchanged (it is the fix for the historical caustic 'square' artefacts). Smoother sub-tetrahedron structure at the cost of reading the vertex densities during the deposit; works with the CPU and all GPU deposits.")
+            ("ps-caustics", po::bool_switch(&(this->psCaustics)), "PS-DTFE only, 3D only: flag fold-caustic grid cells during the grid deposit and write '<output>.caustic' (float32, same N^3 layout as '.streams'; 1 = the cell is overlapped by tetrahedra of BOTH orientations, 0 otherwise). The orientation of a stream is the sign of det(Ax), the parity of the Lagrangian->Eulerian map, which flips at every fold caustic -- so a cell containing both parities is crossed by a fold surface (the caustic skeleton of Feldbrugge & van de Weygaert). The two per-cell orientation bits are merged with a bitwise OR across '--partition' splits, making the output partition- and thread-order invariant (byte-identical for any split). Computed by the CPU deposit only: combined with '--ps-gpu' the deposit falls back to the CPU with a warning. Point evaluation ('--sample-points') is unaffected by this flag.")
+            ("ps-exact-deposit", po::bool_switch(&(this->psExactDeposit)), "PS-DTFE only, 3D only, CPU only: replace the nSub^3 sub-sampled grid deposit by the EXACT conservative voxelization of Powell & Abel 2015 (vendored r3d library, third_party/r3d): every kept tetrahedron is analytically clipped against each grid cell in its bounding box and deposits mass * V_intersection/V_tetrahedron per cell -- no sampling noise, mass conservation to double precision. The kept-cell classification, periodic minimum-image convention and per-tet renormalization are IDENTICAL to the standard deposit, so '.streams'-defining overlaps, '--ps-halo-release' and '--ps-caustics' compose unchanged. Velocity moments integrate the LINEAR velocity profile exactly (order-1 moments); the dispersion additionally carries each cell-intersection's exact velocity covariance (order-2 moments). With '--ps-linear-deposit' the per-cell mass shares integrate the linear density profile exactly (order-1), renormalized per tetrahedron exactly like the sampled path. nSub ('--avg-subsamples') is ignored: the exact deposit is the nSub->infinity limit, so the unaveraged and '_a' grids coincide. Combined with '--ps-gpu' the deposit falls back to the CPU with a warning. Point evaluation ('--sample-points') is unaffected. An accuracy option, not a speed option: expect it to be slower than the sampled CPU deposit and far slower than the GPU deposit.")
+            ("ps-halo-release", po::value<Real>(&(this->psHaloRelease)), "PS-DTFE only: release halo-interior streams from the grid deposit's bbox rasterization. A tetrahedron compressed beyond the given threshold D -- geometric stream density rho_geo = rho_bar*V_lag/V_eul > D, in rho/rho_bar units -- is deposited MONOLITHICALLY at its Eulerian centroid cell (the same mass-conserving fallback used for sub-sample-spacing tetrahedra), with its velocity/dispersion moments carrying the centroid-evaluated velocity. Rationale (Stuecker et al. 2021, arXiv:2109.09760): inside virialized halos the dark-matter sheet is mixed, fold counts explode (millions of streams per cell) and the sheet estimate is not converged anyway -- releasing those tetrahedra cuts the dominant tet-cell overlap cost while conserving mass EXACTLY and leaving single-stream regions (void interiors) bit-identical. Applies to the CPU and GPU deposits (identical kept/released classification, double-precision |det Lag| > D*|det Ax| in both). Point evaluation ('--sample-points') is NOT affected by this flag. Suggested range 100-1000; see the README for measured speed/accuracy trade-offs.")
 #endif
             ;
     
@@ -630,6 +640,20 @@ void User_options::printOptions()
                 << (this->psPtsDenGrad ? ", writing density gradients" : "") << ")\n";
     if ( this->psLinearDeposit )
         message << "\t grid deposit profile   : linear within each tetrahedron (--ps-linear-deposit; renormalized per tet, mass-conserving)\n";
+    if ( this->psCaustics )
+        message << "\t caustic flagging       : writing the fold-caustic cell flag to '.caustic' (--ps-caustics; CPU deposit)\n";
+    if ( this->psHaloRelease > Real(0.) )
+        message << "\t halo-interior release  : tetrahedra with rho_geo/rho_bar > " << this->psHaloRelease
+                << " deposit monolithically at their centroid cell (--ps-halo-release; mass-conserving)\n";
+    if ( this->psExactDeposit )
+        message << "\t grid deposit           : EXACT tetrahedron-cell intersection moments (--ps-exact-deposit; r3d, CPU; nSub ignored)\n";
+#else
+    if ( not this->psSamplePointsFile.empty() )
+        message << "\t point evaluation       : at the sample points in '" << this->psSamplePointsFile
+                << "' (standard DTFE interpolant, 0/1 coverage"
+                << (this->psPtsDenGrad ? ", writing density gradients" : "") << ")\n";
+    if ( this->exactAverage )
+        message << "\t volume averaging       : EXACT cell-tetrahedron integration of the linear interpolant (--exact-average; r3d, CPU; --samples ignored)\n";
 #endif
     message << "\t 1Mpc = " << MpcValue << " in units of input data.\n";
     if ( poisson>0 )
@@ -829,8 +853,26 @@ void User_options::readOptions(int argc, char *argv[], bool getFileNames, bool s
 #endif
     }
 
+#ifndef PHASE_SPACE
+    // exact '_a' averaging (--exact-average) options, standard binary only
+    if ( this->exactAverage )
+    {
+#if NO_DIM!=3
+        throwError( "'--exact-average' is only available in 3D builds (NO_DIM==3; r3d is a 3D clipper)." );
+#endif
+#ifdef MY_SCALAR
+        throwError( "'--exact-average' cannot integrate the user-defined MY_SCALAR function (it is not linear inside a tetrahedron); rebuild without MY_SCALAR or use the sampled averaging." );
+#endif
+        // .defaulted(): '--method' carries a default_value, so vm.count() alone is always 1
+        if ( vm.count("method") and not vm["method"].defaulted() and this->method != 1 )
+            throwError( "'--exact-average' replaces the sampled averaging and runs on the method-1 scatter topology; drop '--method' or pass '-m 1'." );
+        if ( vm.count("NGP") or vm.count("CIC") or vm.count("TSC") or vm.count("PCS") or vm.count("SPH") or vm.count("Voronoi") )
+            throwError( "'--exact-average' needs the DTFE interpolation method; it is not available with NGP/CIC/TSC/PCS/SPH/Voronoi." );
+    }
+#endif
+
+    // point evaluation (--sample-points) options, both binaries
 #ifdef PHASE_SPACE
-    // PS-DTFE point evaluation (--sample-points) options
     {
         std::string const variant = vm["ps-stream-density"].as<std::string>();
         if ( variant == "geometric" )
@@ -838,6 +880,14 @@ void User_options::readOptions(int argc, char *argv[], bool getFileNames, bool s
         else if ( variant != "dtfe" )
             throwError( "Unknown value '", variant, "' for '--ps-stream-density'; use 'dtfe' or 'geometric'." );
     }
+#else
+    // the flags parse in both binaries (shared help), but only PS-DTFE has streams to write
+    if ( this->psPerStream or this->psPerStreamIds )
+        throwError( "'--per-stream'/'--per-stream-ids' need the phase-space stream decomposition; they are PS-DTFE only (this standard DTFE binary reports a 0/1 point coverage in '.pts_streams')." );
+    // vm.count, not partitionOn: the partition options are folded into members further down
+    if ( not this->psSamplePointsFile.empty() and (vm.count("partition") or vm.count("partNo")) )
+        throwError( "In the standard DTFE binary '--sample-points' evaluates a single triangulation; it cannot be combined with '--partition' (PS-DTFE supports partitioned point evaluation)." );
+#endif
     if ( this->psPerStreamIds )
         this->psPerStream = true;   // the ids file indexes into the per-stream ragged layout
     if ( not this->psSamplePointsFile.empty() )
@@ -853,6 +903,33 @@ void User_options::readOptions(int argc, char *argv[], bool getFileNames, bool s
         throwError( "'--per-stream' requires '--sample-points'." );
     else if ( this->psPtsDenGrad )
         throwError( "'--pts-den-grad' requires '--sample-points'." );
+
+#ifdef PHASE_SPACE
+    // caustic flagging (--ps-caustics) options
+    if ( this->psCaustics )
+    {
+#if NO_DIM!=3
+        throwError( "'--ps-caustics' is only available in 3D builds (NO_DIM==3)." );
+#endif
+        if ( vm.count("interlace") )
+            throwError( "'--ps-caustics' cannot be combined with '--interlace' (interlacing runs the interpolation twice, which would corrupt the per-cell orientation bits)." );
+        if ( vm.count("NGP") or vm.count("CIC") or vm.count("TSC") or vm.count("PCS") or vm.count("SPH") or vm.count("Voronoi") )
+            throwError( "'--ps-caustics' needs the PS-DTFE interpolation method; it is not available with NGP/CIC/TSC/PCS/SPH/Voronoi." );
+    }
+
+    // halo-interior release (--ps-halo-release) options
+    if ( vm.count("ps-halo-release") and this->psHaloRelease <= Real(0.) )
+        throwError( "'--ps-halo-release' needs a positive threshold D (geometric stream density in rho/rho_bar units, e.g. '--ps-halo-release 300')." );
+
+    // exact conservative deposit (--ps-exact-deposit) options
+    if ( this->psExactDeposit )
+    {
+#if NO_DIM!=3
+        throwError( "'--ps-exact-deposit' is only available in 3D builds (NO_DIM==3; r3d is a 3D clipper)." );
+#endif
+        if ( vm.count("NGP") or vm.count("CIC") or vm.count("TSC") or vm.count("PCS") or vm.count("SPH") or vm.count("Voronoi") )
+            throwError( "'--ps-exact-deposit' needs the PS-DTFE interpolation method; it is not available with NGP/CIC/TSC/PCS/SPH/Voronoi." );
+    }
 #endif
 
     // read the partition options

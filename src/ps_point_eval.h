@@ -20,15 +20,17 @@
  *
  */
 
-/* PS-DTFE arbitrary-point evaluation (--sample-points): CGAL-free entry points.
-   The implementation lives in CGAL_triangulation/ps_point_eval.cc; the per-partition
-   worker interpolatePoints_phaseSpace(DT&, User_options&) is declared where the CGAL
+/* Arbitrary-point evaluation (--sample-points): CGAL-free entry points, shared by BOTH
+   binaries. PS-DTFE evaluates the multi-stream phase-space fields (one stream per folded
+   tetrahedron containing the point); the standard binary evaluates the Eulerian DTFE
+   interpolant (exactly one containing tetrahedron, stream count = 0/1 coverage). The
+   implementation lives in CGAL_triangulation/ps_point_eval.cc; the per-triangulation
+   worker -- interpolatePoints_phaseSpace(DT&, User_options&) under PHASE_SPACE,
+   interpolatePoints_standard(DT&, User_options&) otherwise -- is declared where the CGAL
    types exist (triangulation.cpp). Everything is a no-op unless --sample-points is given. */
 
 #ifndef PS_POINT_EVAL_HEADER
 #define PS_POINT_EVAL_HEADER
-
-#ifdef PHASE_SPACE
 
 struct User_options;
 
@@ -48,7 +50,5 @@ void psPointEvalFinalize(User_options const &userOptions);
 // Writes the finalized point outputs next to the grid outputs ('<root>.pts_*'). See the
 // README (PS-DTFE point evaluation) for the exact file layout.
 void psPointEvalWriteOutputs(User_options const &userOptions);
-
-#endif // PHASE_SPACE
 
 #endif

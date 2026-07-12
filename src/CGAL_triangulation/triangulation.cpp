@@ -39,8 +39,14 @@ void interpolateUserSampling_averaged_2(DT &dt, vector<Sample_point> &samples, U
 // mayClearDT: this call is the triangulation's LAST use and dt is internally owned -> the
 // deposit may free it early (right after its last read) instead of at partition scope end.
 void interpolateGrid_phaseSpace(DT &dt, User_options &userOptions, Quantities *quantities, Field &field, int nSub, bool mayClearDT = false);
+#endif
+// --sample-points point evaluation, both binaries (ps_point_eval.cc): PS build = one stream
+// per folded tetrahedron; standard build = the Eulerian DTFE interpolant, 0/1 coverage.
 #include "../ps_point_eval.h"
+#ifdef PHASE_SPACE
 void interpolatePoints_phaseSpace(DT &dt, User_options &userOptions);   // ps_point_eval.cc
+#else
+void interpolatePoints_standard(DT &dt, User_options &userOptions);    // ps_point_eval.cc
 #endif
 
 
@@ -110,17 +116,20 @@ void DTFE_interpolation(vector<Particle_data> *p,
 #endif
 
 
-#ifdef PHASE_SPACE
     // arbitrary-point evaluation (--sample-points): collect this triangulation's stream
     // contributions for every query point; results accumulate across the Lagrangian
-    // partitions and are reduced once by psPointEvalFinalize() (called from DTFE()).
+    // partitions (PS; the standard binary always evaluates a single triangulation) and are
+    // reduced once by psPointEvalFinalize() (called from DTFE()).
     if ( psPointEvalActive() )
     {
         t.start();
+#ifdef PHASE_SPACE
         interpolatePoints_phaseSpace( dt, userOptions );
+#else
+        interpolatePoints_standard( dt, userOptions );
+#endif
         printComputationTime( &t, &userOptions, "point evaluation (--sample-points)" );
     }
-#endif
 
     // Voronoi: NGP-assign vertex densities to grid (piecewise-constant; bypasses DTFE linear interpolation)
     if ( userOptions.Voronoi )

@@ -11,6 +11,13 @@
 #     (identical .streams, high correlation, bounded max ratio -- no new caustic spikes).
 #  C) GPU parity (GPU builds only): the GPU linear deposit matches the CPU linear deposit
 #     within the usual float32 atomic tolerances.
+#  D) [gated on --ps-exact-deposit support] the r3d exact conservative deposit: mass
+#     conservation at (or below) the sampled deposit's float floor, '.den' == '.a_den'
+#     bit-exact (the exact deposit is nSub-independent), integer '.streams' bit-exact
+#     between same-split partitioned runs at 1 and N threads, the sampled '.a_den' at
+#     nSub = 1/3/5 approaching the exact grid MONOTONICALLY (L1), and the
+#     '--ps-linear-deposit' composition (exact order-1 linear-density shares) conserving
+#     mass and staying strongly correlated with the exact uniform deposit.
 #
 # Usage: tests/ps_linear_deposit_check.sh [--no-build]
 
@@ -40,6 +47,10 @@ fi
 [ -x "${BIN}" ] || { echo "FAIL: ${BIN} not built"; exit 1; }
 GPU_BUILT=0
 [ -f o_ps/.gpu_mode_off ] || GPU_BUILT=1
+# capture FIRST -- piping the binary straight into grep -q would SIGPIPE it under pipefail
+FULL_HELP="$("${BIN}" --full_help 2>/dev/null || true)"
+HAVE_EXACT=0
+grep -q -- '--ps-exact-deposit' <<<"${FULL_HELP}" && HAVE_EXACT=1
 
 echo ">> generating test snapshots ..."
 "${PY}" "${SCRIPT_DIR}/generate_ps_test_data.py" --out "${SNAP_UNI}" --n "${N}" --box "${BOX}" \
@@ -47,13 +58,15 @@ echo ">> generating test snapshots ..."
 "${PY}" "${SCRIPT_DIR}/generate_ps_test_data.py" --out "${SNAP_PAN}" --n "${N}" --box "${BOX}" \
     --amplitude-factor 1.8 >/dev/null
 
-run() {  # $1 = output root, rest = extra args
-    local out="$1"; shift
+run() {  # $1 = output root, $2 = input snapshot, rest = extra flags
+    # out right after the input: multitoken options (--partition X Y Z) must not be able
+    # to swallow the trailing positional
+    local out="$1" snap="$2"; shift 2
     rm -f "${out}".*
     local log="${out}.log"
     set +e
-    "${BIN}" "$@" "${out}" --grid "${GRID}" --field density velocity density_a \
-        --input 105 --MpcUnit 1 --verbose 1 > "$log" 2>&1
+    "${BIN}" "${snap}" "${out}" --grid "${GRID}" --field density velocity density_a \
+        --input 105 --MpcUnit 1 --verbose 1 "$@" > "$log" 2>&1
     local rc=$?
     set -e
     if [ "$rc" -ne 0 ]; then
@@ -78,12 +91,28 @@ else
     echo ">> run 5 skipped (CPU-only build: no GPU parity to check)"
 fi
 
+if [ "${HAVE_EXACT}" -eq 1 ]; then
+    echo ">> run 6: pancake, --ps-exact-deposit"
+    run "${TMP}/pld_pan_ex" "${SNAP_PAN}" --periodic --ps-exact-deposit
+    echo ">> run 7: pancake, --ps-exact-deposit, --partition 2 2 2, 1 thread"
+    OMP_NUM_THREADS=1 run "${TMP}/pld_pan_ex_p1" "${SNAP_PAN}" --periodic --ps-exact-deposit --partition 2 2 2
+    echo ">> run 8: pancake, --ps-exact-deposit, --partition 2 2 2, all threads"
+    run "${TMP}/pld_pan_ex_pN" "${SNAP_PAN}" --periodic --ps-exact-deposit --partition 2 2 2
+    echo ">> run 9: pancake, --ps-exact-deposit --ps-linear-deposit (composition)"
+    run "${TMP}/pld_pan_ex_l" "${SNAP_PAN}" --periodic --ps-exact-deposit --ps-linear-deposit
+    echo ">> runs 10-11: pancake, sampled '.a_den' at nSub 1/5 (3 is run 3) for the convergence ladder"
+    run "${TMP}/pld_pan_ns1" "${SNAP_PAN}" --periodic --avg-subsamples 1
+    run "${TMP}/pld_pan_ns5" "${SNAP_PAN}" --periodic --avg-subsamples 5
+else
+    echo ">> runs 6-11 skipped (binary lacks --ps-exact-deposit)"
+fi
+
 echo ">> checking the numbers ..."
-"${PY}" - "${TMP}" "${GRID}" "${GPU_BUILT}" <<'PY'
+"${PY}" - "${TMP}" "${GRID}" "${GPU_BUILT}" "${HAVE_EXACT}" <<'PY'
 import sys
 import numpy as np
 
-tmp, grid, gpu = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+tmp, grid, gpu, have_exact = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
 ncell = grid ** 3
 fails = []
 
@@ -136,6 +165,45 @@ if gpu:
     check("C GPU density matches CPU", mrel < 1e-4, f"mean rel = {mrel:.3e}")
 else:
     print("   SKIP C GPU parity (CPU-only build)")
+
+# ---------- (D) exact conservative deposit (--ps-exact-deposit, r3d) ----------
+if have_exact:
+    ex = load(f"{tmp}/pld_pan_ex", ".den")
+    exa = load(f"{tmp}/pld_pan_ex", ".a_den")
+    du_mean_err = abs(du.mean() - 1.0)          # sampled uniform-deposit floor (run 3)
+    check("D mass conserved (exact <= sampled floor)",
+          abs(ex.mean() - 1.0) <= du_mean_err + 1e-7,
+          f"|mean-1| = {abs(ex.mean()-1.0):.3e} (sampled: {du_mean_err:.3e})")
+    check("D .den == .a_den (nSub-independent)",
+          np.array_equal(ex, exa), "the exact deposit is the nSub->infinity limit")
+    sx = np.fromfile(f"{tmp}/pld_pan_ex.streams", dtype=np.float32)
+    check("D exact streams integer-valued", bool(np.allclose(sx, np.round(sx), atol=1e-6)),
+          f"max frac dev = {np.abs(sx - np.round(sx)).max():.2e}")
+    s1 = np.fromfile(f"{tmp}/pld_pan_ex_p1.streams", dtype=np.float32)
+    sN = np.fromfile(f"{tmp}/pld_pan_ex_pN.streams", dtype=np.float32)
+    check("D partitioned streams thread-invariant (bit-exact)", np.array_equal(s1, sN),
+          "same split, 1 vs all threads")
+    d1 = load(f"{tmp}/pld_pan_ex_p1", ".den")
+    dN = load(f"{tmp}/pld_pan_ex_pN", ".den")
+    dmax = np.abs(d1 - dN).max() / (np.abs(d1).max() + 1e-30)
+    check("D partitioned density thread-invariant", dmax < 1e-5, f"max rel = {dmax:.3e}")
+    # sampled '.a_den' must approach the exact grid MONOTONICALLY with nSub
+    l1 = {}   # nSub=3 is the default of run 3 (pld_pan_u)
+    for ns, root in ((1, "pld_pan_ns1"), (3, "pld_pan_u"), (5, "pld_pan_ns5")):
+        l1[ns] = np.abs(load(f"{tmp}/{root}", ".a_den") - exa).mean()
+    check("D sampled a_den converges to exact (L1, nSub 1>3>5)",
+          l1[1] > l1[3] > l1[5],
+          f"L1 = {l1[1]:.4e} (nSub=1) > {l1[3]:.4e} (nSub=3) > {l1[5]:.4e} (nSub=5)")
+    exl = load(f"{tmp}/pld_pan_ex_l", ".den")
+    check("D exact+linear composition conserves mass",
+          abs(exl.mean() - 1.0) <= du_mean_err + 1e-6,
+          f"|mean-1| = {abs(exl.mean()-1.0):.3e}")
+    mm = (ex > 0) & (exl > 0)
+    corr_ex = np.corrcoef(np.log(ex[mm]), np.log(exl[mm]))[0, 1]
+    check("D exact+linear differs smoothly from exact", corr_ex > 0.98,
+          f"log-density correlation = {corr_ex:.5f}")
+else:
+    print("   SKIP D exact deposit (binary lacks --ps-exact-deposit)")
 
 print("-" * 60)
 if fails:

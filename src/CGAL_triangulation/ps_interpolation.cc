@@ -18,6 +18,12 @@
 #include "gpu_host.h"   // GPU deposit (METAL=1/CUDA=1/HIP=1 builds); CPU deposit remains the fallback
 #endif
 
+#if NO_DIM==3
+// --ps-exact-deposit: analytic tetrahedron-cell intersection moments (Powell & Abel 2015).
+// Vendored C library; r3d.h carries its own extern "C" guard. 3D only.
+#include "../../third_party/r3d/r3d.h"
+#endif
+
 
 /* Interpolates fields onto a regular grid via PS-DTFE: scatters each finite cell's
    contribution to overlapping grid points so multi-stream regions are handled.
@@ -132,6 +138,30 @@ void interpolateGrid_phaseSpace(DT &dt,
     // Per-grid-point count of overlapping streams (diagnostic; reported as the stream_count field).
     std::vector<int> streamCount(totalGrid, 0);
 
+    // --ps-caustics: per-cell orientation mask (bit0 = a det(Ax)>0 stream overlaps the cell,
+    // bit1 = det<0). det(Ax)'s sign is the parity of the Lagrangian->Eulerian map (CGAL cells
+    // are positively oriented in Lagrangian space), which flips at every fold -- both bits set
+    // means a fold caustic surface crosses the cell. Exported as small exact ints in Real.
+    bool const psCaustics = userOptions.psCaustics;
+    std::vector<unsigned char> orientBits;
+    if ( psCaustics )
+        orientBits.assign(totalGrid, 0);
+
+    // --ps-halo-release: threshold D on the geometric stream density rho_geo/rho_bar =
+    // V_lag/V_eul = |det Lag| / |det Ax| (the 1/NO_DIM! factors cancel). Tets beyond D sit
+    // deep inside virialized, mixed regions where fold counts explode and the sheet estimate
+    // is unconverged anyway (Stuecker et al. 2021): they take the mass-conserving centroid
+    // fallback instead of the bbox rasterization. Classified in double in BOTH deposits
+    // (partition protocol: CPU and GPU must keep/release identical tets). 0 = off.
+    double const psHaloRelease = double(userOptions.psHaloRelease);
+    size_t nReleased = 0;
+
+    // --ps-exact-deposit: analytic per-cell intersection moments instead of nSub^3 sampling.
+    // The exact deposit is the nSub->infinity limit, so nSub is ignored; '.streams' counts
+    // every tet with a nonzero cell intersection (integer, so the partition merge stays
+    // bit-exact -- clipping a given wrapped tet against a given cell is split-independent).
+    bool const psExact = userOptions.psExactDeposit;
+
     // Count of cells dropped because their Eulerian simplex is non-invertible (see the check below).
     size_t nDegenerateInverse = 0;
 
@@ -163,6 +193,8 @@ void interpolateGrid_phaseSpace(DT &dt,
     // still equals tetMass exactly and mass conservation is untouched.
     bool const psLinear = userOptions.psLinearDeposit;
     std::vector<Real>   insideW;
+    // --ps-exact-deposit per-tet scratch: 10 order-2 moments and the mass weight per hit cell
+    std::vector<double> exMom, exW;
 
     if ( not userOptions.psSuppressGridStats )
         message << "\n" << MESSAGE::cBold() << "PS-DTFE:" << MESSAGE::cReset()
@@ -183,6 +215,18 @@ void interpolateGrid_phaseSpace(DT &dt,
         tryMetal = false;
     }
 #endif
+    if ( tryMetal && psCaustics )
+    {
+        MESSAGE::Warning warning( userOptions.verboseLevel );
+        warning << "--ps-caustics is computed by the CPU deposit only; using the CPU deposit for this pass.\n" << MESSAGE::EndWarning;
+        tryMetal = false;
+    }
+    if ( tryMetal && psExact )
+    {
+        MESSAGE::Warning warning( userOptions.verboseLevel );
+        warning << "--ps-exact-deposit is CPU-only (analytic r3d clipping); using the CPU deposit for this pass.\n" << MESSAGE::EndWarning;
+        tryMetal = false;
+    }
     if ( tryMetal )
     {
         // which moment grids this run needs: unselected ones are neither extracted, allocated
@@ -201,6 +245,13 @@ void interpolateGrid_phaseSpace(DT &dt,
         tetMasses.reserve( psKeptCells );
         if ( psLinear )
             tetDens.reserve( psKeptCells*4 );
+        // --ps-halo-release: released tets never reach the GPU arrays; their single-cell
+        // centroid deposits (same arithmetic as the CPU fallback) are collected here and
+        // applied on the host AFTER the GPU grids are copied back (the copy ASSIGNS, so
+        // these are the only further accumulations). Discarded if the GPU dispatch fails --
+        // the CPU loop then re-handles every cell.
+        struct ReleasedTet { size_t flat; Real mass; Real vel[noVelComp]; Real grad[noGradComp]; };
+        std::vector<ReleasedTet> releasedTets;
         PS_FOREACH_FINITE_CELL
         {
             Cell_handle cell = itC;
@@ -210,8 +261,56 @@ void interpolateGrid_phaseSpace(DT &dt,
             Real (&ep)[NO_DIM+1][NO_DIM] = geo.eulerPos;
             double Lag[NO_DIM][NO_DIM];
             for (int v=0;v<NO_DIM;++v) for (int i=0;i<NO_DIM;++i) Lag[v][i]=double(cell->vertex(v+1)->point()[i])-double(cell->vertex(0)->point()[i]);
-            float tm = float( double(userOptions.averageDensity)*std::fabs(determinant(Lag))/factorial(NO_DIM) );
+            double const absDetLag = std::fabs(determinant(Lag));
+            float tm = float( double(userOptions.averageDensity)*absDetLag/factorial(NO_DIM) );
             if (tm<=0.f) continue;
+            if ( psHaloRelease > 0. && absDetLag > psHaloRelease * geo.cellAbsDet )
+            {
+                // identical classification to the CPU loop (double |det Lag| > D*|det Ax|);
+                // centroid cell + centroid-evaluated velocity mirror the CPU fallback exactly
+                Real centroid[NO_DIM];
+                for (int d = 0; d < NO_DIM; ++d)
+                {
+                    centroid[d] = Real(0.);
+                    for (int v = 0; v <= NO_DIM; ++v) centroid[d] += ep[v][d];
+                    centroid[d] /= Real(NO_DIM + 1);
+                }
+                bool cValid = true;
+                size_t f = 0;
+                for (int d = 0; d < NO_DIM; ++d)
+                {
+                    int raw = int(floor((centroid[d] - boxCoordinates[2*d]) / dx[d]));
+                    int w = userOptions.periodic ? ((raw % (int)nGrid[d] + (int)nGrid[d]) % (int)nGrid[d]) : raw;
+                    long loc = (long)w - (long)subOrigin[d];
+                    if (w < 0 || w >= (int)nGrid[d] || loc < 0 || loc >= (long)subDims[d]) { cValid = false; break; }
+                    f = f * subDims[d] + (size_t)loc;
+                }
+                if (!cValid) { continue; }   // centroid outside this grid/partition region: drop (as the CPU fallback does)
+                ReleasedTet rt;
+                rt.flat = f;
+                rt.mass = Real(tm);
+                if ( needsVelArrays )
+                {
+                    Real velGrad[NO_DIM][noVelComp], temp[NO_DIM][noVelComp];
+                    for (int v = 0; v < NO_DIM; ++v)
+                        for (size_t j = 0; j < noVelComp; ++j)
+                            temp[v][j] = cell->vertex(v+1)->info().velocity(j) - cell->vertex(0)->info().velocity(j);
+                    matrixMultiplication<noVelComp>(geo.posMatInv, temp, velGrad);
+                    for (size_t j = 0; j < noVelComp; ++j)
+                    {
+                        rt.vel[j] = cell->vertex(0)->info().velocity(j);
+                        for (int i = 0; i < NO_DIM; ++i)
+                            rt.vel[j] += velGrad[i][j] * (centroid[i] - ep[0][i]);
+                    }
+                    if ( fGrad )
+                        for (size_t j = 0; j < noVelComp; ++j)
+                            for (int i = 0; i < NO_DIM; ++i)
+                                rt.grad[j*NO_DIM+i] = velGrad[i][j];
+                }
+                releasedTets.push_back(rt);
+                ++nReleased;
+                continue;
+            }
             for (int v=0;v<=NO_DIM;++v) for (int d=0;d<NO_DIM;++d) tetVerts.push_back(float(ep[v][d]));
             if (needsVelArrays)
                 for (int v=0;v<=NO_DIM;++v) for (size_t j=0;j<noVelComp;++j) tetVels.push_back(float(cell->vertex(v)->info().velocity(j)));
@@ -319,12 +418,34 @@ void interpolateGrid_phaseSpace(DT &dt,
                         quantities->velocity_dispersion[i][cc] = Real(gpuOut.m2[i*6+cc]);
                 streamCount[i] = int(gpuOut.streams[i]);
             }
+            // --ps-halo-release: host-side monolithic centroid deposits of the released tets
+            // (same accumulation sites and moments as the CPU fallback's single sample)
+            for (ReleasedTet const &rt : releasedTets)
+            {
+                if (field.density) quantities->density[rt.flat] += rt.mass;
+                if (needWeight && !weightIsDensity) massWeight[rt.flat] += rt.mass;
+                if (haveVel)
+                    for (size_t j = 0; j < noVelComp; ++j)
+                        quantities->velocity[rt.flat][j] += rt.vel[j] * rt.mass;
+                if (field.velocity_gradient)
+                    for (size_t q = 0; q < noGradComp; ++q)
+                        quantities->velocity_gradient[rt.flat][q] += rt.grad[q] * rt.mass;
+                if (field.velocity_dispersion)
+                {
+                    size_t c = 0;
+                    for (int a = 0; a < NO_DIM; ++a)
+                        for (int b = a; b < NO_DIM; ++b)
+                            quantities->velocity_dispersion[rt.flat][c++] += rt.mass * rt.vel[a] * rt.vel[b];
+                }
+                streamCount[rt.flat]++;
+            }
             metalDeposited = true;
         }
         else
         {
             MESSAGE::Warning warning( userOptions.verboseLevel );
             warning << "PS-DTFE GPU deposit unavailable (" << metalErr << "); using the CPU deposit.\n" << MESSAGE::EndWarning;
+            nReleased = 0;   // releasedTets are discarded; the CPU loop below recounts them
         }
     }
 #else
@@ -364,15 +485,22 @@ void interpolateGrid_phaseSpace(DT &dt,
         // ~1e7 over a whole grid cell (the grid-aligned "square" over-densities, worse under
         // sub-sampling because more sample points fall in the cell). Depositing m is exact at any nSub.
         Real tetMass;
+        double absDetLag;
         {
             double Lag[NO_DIM][NO_DIM];
             for (int v = 0; v < NO_DIM; ++v)
                 for (int i = 0; i < NO_DIM; ++i)
                     Lag[v][i] = double(cell->vertex(v+1)->point()[i]) - double(cell->vertex(0)->point()[i]);
-            double absDetLag = std::fabs(determinant(Lag));
+            absDetLag = std::fabs(determinant(Lag));
             tetMass = Real( double(userOptions.averageDensity) * absDetLag / factorial(NO_DIM) );  // = rho_bar * V_lag
             if (tetMass < Real(0.)) tetMass = Real(0.);
         }
+
+        // --ps-halo-release: released tets skip PASS 1 below (zero-trip window), so the
+        // empty sample set drives the mass-conserving centroid fallback -- a monolithic
+        // single-cell deposit with the centroid-evaluated velocity.
+        bool const released = psHaloRelease > 0. && absDetLag > psHaloRelease * geo.cellAbsDet;
+        if (released) ++nReleased;
 
         // Eulerian bounding box of this cell (from the wrapped positions).
         Real eMin[NO_DIM], eMax[NO_DIM];
@@ -395,7 +523,9 @@ void interpolateGrid_phaseSpace(DT &dt,
         {
             iMin[d] = int(floor((eMin[d] - boxCoordinates[2*d]) / dx[d]));
             iMax[d] = int(floor((eMax[d] - boxCoordinates[2*d]) / dx[d])) + 1;
-            if (nSub > 1) { iMin[d] -= 1; iMax[d] += 1; }   // sub-sample points can lie in edge cells
+            // sub-sample points can lie in edge cells; the exact deposit clips the bbox
+            // window directly (no sub-samples), so the expansion would only add empty clips
+            if (nSub > 1 && !psExact) { iMin[d] -= 1; iMax[d] += 1; }
             if (!userOptions.periodic)
             {
                 if (iMin[d] < 0) iMin[d] = 0;
@@ -404,6 +534,8 @@ void interpolateGrid_phaseSpace(DT &dt,
             }
         }
         if (outsideGrid) { continue; }
+        if (released)
+            for (int d = 0; d < NO_DIM; ++d) iMax[d] = iMin[d];   // zero-trip PASS 1 -> centroid fallback
 
         // (density is deposited as the per-tetrahedron mass tetMass computed above; no per-vertex
         //  density gradient is needed for the scatter.)
@@ -447,6 +579,189 @@ void interpolateGrid_phaseSpace(DT &dt,
             matrixMultiplication<noScalarComp>(posMatInv, temp, sGrad);
         }
 #endif
+
+#if NO_DIM==3
+        // ===================== exact conservative deposit (--ps-exact-deposit) =====================
+        // r3d (Powell & Abel 2015): clip the Eulerian tetrahedron against every grid cell in
+        // its bbox window and integrate the moments analytically. All geometry lives in
+        // coordinates RELATIVE to (wrapped) vertex 0 -- the same affine frame as velGrad and
+        // denGrad, so the moments feed the linear profiles directly. Released tets (--ps-halo-
+        // release) fall through to the sampled path below, whose zero-tripped window drives
+        // the same monolithic centroid fallback.
+        if ( psExact && !released )
+        {
+            r3d_rvec3 tv[NO_DIM+1];
+            for (int v = 0; v <= NO_DIM; ++v)
+                for (int d = 0; d < NO_DIM; ++d)
+                    tv[v].xyz[d] = double(eulerPos[v][d]) - double(eulerPos[0][d]);
+            // r3d_init_tet wants positive orientation; a folded (negative-parity) tet is
+            // handed over with vertices 1,2 swapped -- vertex 0 stays the frame origin
+            if ( geo.cellDet < 0. )
+            {
+                r3d_rvec3 const tmp = tv[1]; tv[1] = tv[2]; tv[2] = tmp;
+            }
+            r3d_poly tetPoly;
+            r3d_init_tet(&tetPoly, tv);
+
+            // PASS 1 (exact): moments of tet ∩ cell for every window cell with nonzero volume.
+            // Order 2 = 10 moments [1, x, y, z, x2, xy, xz, y2, yz, z2] in the vertex-0 frame.
+            insideFlat.clear();          // reused scratch: flat sub-grid index per hit cell
+            exMom.clear();
+            exW.clear();
+            double sumW = 0.;            // per-tet weight normalizer (uniform: volume)
+            for (int gi = iMin[0]; gi < iMax[0]; ++gi)
+            for (int gj = iMin[1]; gj < iMax[1]; ++gj)
+            for (int gk = iMin[2]; gk < iMax[2]; ++gk)
+            {
+                int const wgi = userOptions.periodic ? ((gi % (int)nGrid[0] + (int)nGrid[0]) % (int)nGrid[0]) : gi;
+                int const wgj = userOptions.periodic ? ((gj % (int)nGrid[1] + (int)nGrid[1]) % (int)nGrid[1]) : gj;
+                int const wgk = userOptions.periodic ? ((gk % (int)nGrid[2] + (int)nGrid[2]) % (int)nGrid[2]) : gk;
+                int const gridIdx[3] = {wgi, wgj, wgk};
+                int const rawIdx[3]  = {gi, gj, gk};
+                size_t flatIdx = 0;
+                bool inSub = true;
+                for (int d = 0; d < NO_DIM; ++d)
+                {
+                    long loc = (long)gridIdx[d] - (long)subOrigin[d];
+                    if (loc < 0 || loc >= (long)subDims[d]) { inSub = false; break; }
+                    flatIdx = flatIdx * subDims[d] + (size_t)loc;
+                }
+                if (!inSub) continue;
+
+                // cell bounds in the vertex-0 frame (RAW indices: the periodic image the
+                // wrapped tet actually intersects), then 6 clip planes n.x + d >= 0
+                r3d_plane planes[6];
+                for (int d = 0; d < NO_DIM; ++d)
+                {
+                    double const lo = double(boxCoordinates[2*d]) + rawIdx[d] * double(dx[d]) - double(eulerPos[0][d]);
+                    double const hi = lo + double(dx[d]);
+                    for (int q = 0; q < 2; ++q)
+                    {
+                        planes[2*d+q].n.xyz[0] = 0.; planes[2*d+q].n.xyz[1] = 0.; planes[2*d+q].n.xyz[2] = 0.;
+                    }
+                    planes[2*d].n.xyz[d]   =  1.; planes[2*d].d   = -lo;
+                    planes[2*d+1].n.xyz[d] = -1.; planes[2*d+1].d =  hi;
+                }
+                r3d_poly piece = tetPoly;
+                r3d_clip(&piece, planes, 6);
+                if ( piece.nverts == 0 ) continue;
+                r3d_real mom[10];
+                r3d_reduce(&piece, mom, 2);
+                if ( !(mom[0] > 0.) ) continue;
+
+                insideFlat.push_back(flatIdx);
+                for (int m = 0; m < 10; ++m) exMom.push_back(double(mom[m]));
+                // per-cell mass weight: exact volume, or the exact integral of the linear
+                // density profile under --ps-linear-deposit (clamped like the sampled path)
+                double w = mom[0];
+                if ( psLinear && linearProfile )
+                {
+                    w = double(denBase) * mom[0];
+                    for (int d = 0; d < NO_DIM; ++d)
+                        w += double(denGrad[d]) * mom[1+d];
+                    if ( w < 0. ) w = 0.;
+                }
+                exW.push_back(w);
+                sumW += w;
+            }
+
+            // PASS 2 (exact): renormalize the shares to tetMass -- conservation is exact per
+            // tet by construction (and matches the sampled path's semantics when part of a
+            // non-periodic tet leaves the grid). An all-empty window (degenerate sliver below
+            // r3d's resolution) falls through to the sampled path's centroid fallback.
+            if ( sumW > 0. )
+            {
+                double const shareFac = double(tetMass) / sumW;
+                for (size_t c = 0; c < insideFlat.size(); ++c)
+                {
+                    size_t const flatIdx = insideFlat[c];
+                    double const *m = &exMom[c*10];
+                    Real const massShare = Real( exW[c] * shareFac );
+                    if (field.density) quantities->density[flatIdx] += massShare;
+                    if (needWeight && !weightIsDensity) massWeight[flatIdx] += massShare;
+
+                    // exact mean of the linear velocity profile over this intersection
+                    Pvector<Real,noVelComp> velBar;
+                    if (haveVel)
+                    {
+                        double const invV = 1. / m[0];
+                        double cen[NO_DIM] = { m[1]*invV, m[2]*invV, m[3]*invV };
+                        for (size_t j = 0; j < noVelComp; ++j)
+                        {
+                            double vb = double( cell->vertex(0)->info().velocity(j) );
+                            for (int i = 0; i < NO_DIM; ++i)
+                                vb += double(velGrad[i][j]) * cen[i];
+                            velBar[j] = Real(vb);
+                        }
+                        quantities->velocity[flatIdx] += velBar * massShare;
+                    }
+                    if (field.velocity_gradient)
+                    {
+                        Pvector<Real,noGradComp> grad;
+                        for (size_t j = 0; j < noVelComp; ++j)
+                            for (int i = 0; i < NO_DIM; ++i)
+                                grad[j*NO_DIM+i] = velGrad[i][j];
+                        quantities->velocity_gradient[flatIdx] += grad * massShare;
+                    }
+                    if (field.velocity_dispersion)
+                    {
+                        // exact second moment of the linear profile: <v_i v_j> over the piece
+                        // = vbar_i vbar_j + (G^T Cov G)_ij with Cov the piece's position
+                        // covariance from the order-2 moments (M2 index map: xx xy xz yy yz zz)
+                        double const invV = 1. / m[0];
+                        double const cen[NO_DIM] = { m[1]*invV, m[2]*invV, m[3]*invV };
+                        double cov[NO_DIM][NO_DIM];
+                        cov[0][0] = m[4]*invV - cen[0]*cen[0];
+                        cov[0][1] = cov[1][0] = m[5]*invV - cen[0]*cen[1];
+                        cov[0][2] = cov[2][0] = m[6]*invV - cen[0]*cen[2];
+                        cov[1][1] = m[7]*invV - cen[1]*cen[1];
+                        cov[1][2] = cov[2][1] = m[8]*invV - cen[1]*cen[2];
+                        cov[2][2] = m[9]*invV - cen[2]*cen[2];
+                        size_t c2 = 0;
+                        for (int a = 0; a < NO_DIM; ++a)
+                            for (int b = a; b < NO_DIM; ++b)
+                            {
+                                double gcg = 0.;
+                                for (int i = 0; i < NO_DIM; ++i)
+                                    for (int k = 0; k < NO_DIM; ++k)
+                                        gcg += double(velGrad[i][a]) * cov[i][k] * double(velGrad[k][b]);
+                                quantities->velocity_dispersion[flatIdx][c2++] +=
+                                    massShare * ( velBar[a] * velBar[b] + Real(gcg) );
+                            }
+                    }
+#ifdef SCALAR
+                    if (field.scalar)
+                    {
+                        // exact mean of the linear scalar profile (same construction as velBar)
+                        double const invV = 1. / m[0];
+                        double const cen[NO_DIM] = { m[1]*invV, m[2]*invV, m[3]*invV };
+                        Pvector<Real,noScalarComp> scalarVal;
+                        for (size_t j = 0; j < noScalarComp; ++j)
+                        {
+                            double sb = double( cell->vertex(0)->info().myScalar()[j] );
+                            for (int i = 0; i < NO_DIM; ++i)
+                                sb += double(sGrad[i][j]) * cen[i];
+                            scalarVal[j] = Real(sb);
+                        }
+                        quantities->scalar[flatIdx] += scalarVal * massShare;
+                    }
+                    if (field.scalar_gradient)
+                    {
+                        Pvector<Real,noScalarGradComp> sgrad;
+                        for (size_t j = 0; j < noScalarComp; ++j)
+                            for (int i = 0; i < NO_DIM; ++i)
+                                sgrad[j*NO_DIM+i] = sGrad[i][j];
+                        quantities->scalar_gradient[flatIdx] += sgrad * massShare;
+                    }
+#endif
+                    streamCount[flatIdx]++;   // one full overlap per tet with V_int > 0
+                    if ( psCaustics )
+                        orientBits[flatIdx] |= (geo.cellDet > 0. ? 1 : 2);
+                }
+                continue;   // next tetrahedron (the sampled PASS 1/2 below is skipped)
+            }
+        }
+#endif  // NO_DIM==3 (exact deposit)
 
         // ===================== Mass-conserving deposit of this tetrahedron =====================
         // PASS 1: gather every sub-sample point (nSub^NO_DIM per grid cell in the Eulerian bbox) that
@@ -658,6 +973,8 @@ void interpolateGrid_phaseSpace(DT &dt,
 #endif
 
             streamCount[flatIdx]++;
+            if ( psCaustics )
+                orientBits[flatIdx] |= (geo.cellDet > 0. ? 1 : 2);   // fold parity: sign of det(Ax)
         }
     }   // end cell loop
 
@@ -676,6 +993,11 @@ void interpolateGrid_phaseSpace(DT &dt,
             message << MESSAGE::cBold() << "PS-DTFE:" << MESSAGE::cReset() << " dropped "
                     << MESSAGE::cMagenta() << nDegenerateInverse << MESSAGE::cReset()
                     << " degenerate (non-invertible) Eulerian cells.\n" << MESSAGE::Flush;
+        if ( nReleased > 0 )
+            message << MESSAGE::cBold() << "PS-DTFE:" << MESSAGE::cReset() << " released "
+                    << MESSAGE::cMagenta() << nReleased << MESSAGE::cReset()
+                    << " halo-interior tetrahedra (rho_geo/rho_bar > " << userOptions.psHaloRelease
+                    << ") to monolithic centroid deposits.\n" << MESSAGE::Flush;
     }
 
     // turn density-weighted moments into mass-weighted means sum(rho_s f_s)/sum(rho_s). Serial: here,
@@ -762,10 +1084,23 @@ void interpolateGrid_phaseSpace(DT &dt,
                 << "\n" << MESSAGE::Flush;
     }
 
-    // Export the per-grid-point stream count, averaged over the sub-samples.
+    // Export the per-grid-point stream count, averaged over the sub-samples. Under the
+    // exact deposit every overlap is a full count (no sub-sampling, so no averaging):
+    // integer-valued, hence bit-exact under any partition split; centroid fallbacks
+    // (released or sub-resolution tets) count 1 in their cell either way.
     quantities->stream_count.resize(totalGrid);
     for (size_t i = 0; i < totalGrid; ++i)
-        quantities->stream_count[i] = Real(streamCount[i]) * invSamples;
+        quantities->stream_count[i] = psExact ? Real(streamCount[i])
+                                              : Real(streamCount[i]) * invSamples;
+
+    // Export the caustic orientation bits (0..3, exact in float); OR-merged across partitions
+    // and binarized to the 0/1 fold flag once in DTFE() after the merge.
+    if ( psCaustics )
+    {
+        quantities->caustic_bits.resize(totalGrid);
+        for (size_t i = 0; i < totalGrid; ++i)
+            quantities->caustic_bits[i] = Real(orientBits[i]);
+    }
 
     // Record the sub-grid box so the caller (addFromSubgrid) can map results back into the full shared grid.
     for (int d = 0; d < NO_DIM; ++d)

@@ -109,16 +109,24 @@ THREADS=4 AVG_SUBSAMPLES=1 ./run_ps_dtfe.sh 99    # cap threads; cell-centre onl
     --field density velocity dispersion density_a --lagrangianInput combined_ics.hdf5 \
     --partition 4 4 4 --max-concurrent 3 --ps-gpu
 
-# point evaluation at arbitrary positions (text 'x y z' per line, or raw float64 Nx3)
+# point evaluation at arbitrary positions (text 'x y z' per line, or raw float64 Nx3);
+# the STANDARD binary supports the same flags/formats (streams = 0/1 coverage; no
+# --per-stream/--per-stream-ids, single triangulation so no --partition)
 ./PS-DTFE snap.hdf5 out --grid 32 --periodic --input 105 --MpcUnit 1 \
     --sample-points points.txt \
     --per-stream               `# + ragged per-stream density/velocity records` \
     --per-stream-ids           `# + stream identities (4 sorted vertex ParticleIDs)` \
     --pts-den-grad             `# + density gradient per point (and per stream)` \
     --ps-stream-density geometric   # per-stream estimator: 'dtfe' (default) | 'geometric'
+./DTFE snap.hdf5 out --grid 32 --periodic --input 105 --MpcUnit 1 \
+    --sample-points points.txt --pts-den-grad
 
 ./PS-DTFE snap.hdf5 out ... --ps-linear-deposit    # linear-profile mass-conserving deposit
 ./PS-DTFE snap.hdf5 out ... --avg-subsamples 2     # cheaper '_a' pass (8 sub-points)
+./PS-DTFE snap.hdf5 out ... --ps-caustics          # + '.caustic' fold-flag grid (CPU deposit)
+./PS-DTFE snap.hdf5 out ... --ps-halo-release 300  # halo-interior tets -> centroid deposit
+./PS-DTFE snap.hdf5 out ... --ps-exact-deposit     # exact r3d tet-cell deposit (CPU, slow)
+./DTFE   snap.hdf5 out ... --exact-average         # exact r3d '_a' averaging (CPU, slow)
 ./PS-DTFE --full_help                              # every option with full descriptions
 ```
 
@@ -167,7 +175,10 @@ python3 tests/ps_regression_test.py --update-baseline
 tests/ps_parallel_check.sh --no-build         # serial vs multi-thread race detector
 tests/ps_point_eval_check.sh --no-build       # --sample-points / ids / gradients battery
 N=32 GRID=64 tests/ps_point_eval_check.sh --no-build    # bigger problem via env
-tests/ps_linear_deposit_check.sh --no-build   # --ps-linear-deposit checks (+ GPU parity)
+tests/ps_linear_deposit_check.sh --no-build   # --ps-linear-deposit checks (+ GPU parity,
+                                              #   + gated --ps-exact-deposit section)
+tests/ps_halo_release_check.sh --no-build     # --ps-halo-release battery (pancake + crossed)
+tests/dtfe_point_eval_check.sh --no-build     # STANDARD-binary --sample-points battery
 tests/dtfe_metal_check.sh                     # CPU vs GPU parity, standard DTFE
 GPU_BUILD=CUDA=1 tests/dtfe_metal_check.sh    # same on an NVIDIA box
 python3 tests/py_dtfelib_test.py              # dtfelib suite (12 checks; real TNG data)

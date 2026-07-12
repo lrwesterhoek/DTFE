@@ -156,16 +156,24 @@ struct User_options
     int    noPoints;      // sample points per grid cell for the average
     bool   noPointsOn;    // true if the user specified the number of sampling points
     bool   useMetal;      // standard DTFE: run the method-1 '_a' interpolation on the GPU; needs a GPU build (METAL=1/CUDA=1/HIP=1, else falls back to the CPU loop with a warning). Set by --gpu or its legacy alias --metal.
+    bool   exactAverage;  // standard DTFE --exact-average: compute the '_a' fields by integrating the LINEAR DTFE interpolant exactly over every cell∩tet intersection (vendored r3d, order-1 moments) instead of Monte-Carlo sampling; --samples is ignored. CPU only (falls back from --gpu with a warning); 3D only; runs on the method-1 scatter topology.
     bool   gpuAlias;      // scratch for the backend-neutral --gpu/--ps-gpu switches; OR-ed into useMetal/psUseMetal after parsing (two bool_switches cannot share one address)
+    // --sample-points point evaluation, BOTH binaries (see ps_point_eval.h): PS-DTFE reports
+    // one stream per folded tetrahedron; the standard binary the Eulerian DTFE interpolant
+    // (0/1 coverage). --per-stream/--per-stream-ids parse in both but are rejected in the
+    // standard binary (there is no stream decomposition to write).
+    std::string psSamplePointsFile;    // --sample-points: file with arbitrary Eulerian evaluation points (empty = mode off)
+    bool   psPerStream;                // --per-stream (PS-DTFE only): also write every stream's density+velocity per sample point (ragged layout)
+    bool   psPerStreamIds;             // --per-stream-ids (PS-DTFE only): also write each stream's identity = its 4 Lagrangian-vertex ParticleIDs, sorted (implies --per-stream)
+    bool   psPtsDenGrad;               // --pts-den-grad: also write the 'dtfe'-profile density gradient at each sample point (float64 x3; + ragged per-stream file with --per-stream)
+    bool   psStreamDensityGeometric;   // PS-DTFE --ps-stream-density: true = 'geometric' (m_tet/V_eul, matches the mass-conserving deposit), false = 'dtfe' (vertex-density interpolation, matches the Feldbrugge reference; DEFAULT). Always false in the standard binary.
 #ifdef PHASE_SPACE
     int    psAvgSubsamples; // PS-DTFE: linear sub-sample count nSub for '_a' fields (nSub^NO_DIM sub-grid per cell, cost ~nSub^NO_DIM); 3 = 27 sub-points (default), 1 = cell-centre.
     bool   psUseMetal;      // PS-DTFE: run the grid deposit on the GPU; needs a GPU build (METAL=1/CUDA=1/HIP=1, else falls back to the CPU deposit with a warning). Set by --ps-gpu or its legacy alias --ps-metal.
-    std::string psSamplePointsFile;    // PS-DTFE --sample-points: file with arbitrary Eulerian evaluation points (empty = mode off); see ps_point_eval.h
-    bool   psPerStream;                // PS-DTFE --per-stream: also write every stream's density+velocity per sample point (ragged layout)
-    bool   psPerStreamIds;             // PS-DTFE --per-stream-ids: also write each stream's identity = its 4 Lagrangian-vertex ParticleIDs, sorted (implies --per-stream)
-    bool   psPtsDenGrad;               // PS-DTFE --pts-den-grad: also write the 'dtfe'-profile density gradient at each sample point (float64 x3; + ragged per-stream file with --per-stream)
-    bool   psStreamDensityGeometric;   // PS-DTFE --ps-stream-density: true = 'geometric' (m_tet/V_eul, matches the mass-conserving deposit), false = 'dtfe' (vertex-density interpolation, matches the Feldbrugge reference; DEFAULT)
     bool   psLinearDeposit;            // PS-DTFE --ps-linear-deposit: weight each tetrahedron's interior samples by the DTFE-interpolated linear density (renormalized per tet, so the deposited total still equals the tet mass EXACTLY) instead of equal shares
+    bool   psCaustics;                 // PS-DTFE --ps-caustics: record per grid cell whether tetrahedra of BOTH map orientations (sign of det(Ax) = Lagrangian->Eulerian parity, flips at each fold) overlap it; the 0/1 flag is written as '<output>.caustic'. CPU deposit only; 3D only.
+    Real   psHaloRelease;              // PS-DTFE --ps-halo-release <D>: during the GRID deposit, a tetrahedron whose geometric stream density rho_geo/rho_bar = V_lag/V_eul exceeds D is deposited monolithically at its Eulerian centroid cell (the sub-sample-spacing fallback path) instead of being rasterized over its bbox. 0 (default) = off. Mass conservation is exact; point evaluation is unaffected.
+    bool   psExactDeposit;             // PS-DTFE --ps-exact-deposit: replace the nSub^3 sub-sampled grid deposit by EXACT tetrahedron-cell intersection moments (vendored r3d, Powell & Abel 2015). CPU only (falls back from --ps-gpu with a warning); 3D only; nSub is ignored (the exact deposit IS the nSub->infinity limit, so '.den' == '.a_den').
 #endif
     Real   averageDensity;// density normalization (computed as the box average if not given)
     size_t randomSeed;    // random seed for the Monte Carlo interpolation

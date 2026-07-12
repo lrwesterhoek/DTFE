@@ -46,11 +46,11 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 
-SNAPSHOT_NUMBERS = [99]
+SNAPSHOT_NUMBERS = [0, 4, 17, 33, 50]
 
 NUM_SUBFILES = 4
 
-BASE_DIR = "/Users/luukw/output/TNG100-3-Dark"
+BASE_DIR = "/Users/luukw/output/TNG300-3-Dark"
 
 SINGLE_FILES = [
 ]

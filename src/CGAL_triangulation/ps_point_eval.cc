@@ -1,16 +1,24 @@
-/* PS-DTFE arbitrary-point evaluation (--sample-points).
+/* Arbitrary-point evaluation (--sample-points), shared by BOTH binaries.
 
-   Evaluates the multi-stream phase-space fields at user-supplied Eulerian points instead of
-   (only) on a regular grid. The triangulation is built in Lagrangian space; every Delaunay
-   cell maps to a (possibly folded) Eulerian tetrahedron, and a query point receives one
-   stream per tetrahedron that contains it. Per point we report the total density, the
-   density-weighted mean velocity, the velocity dispersion tensor and the stream count;
-   --per-stream additionally records every stream's own density and velocity, and
-   --per-stream-ids each stream's identity (the sorted Lagrangian-vertex ParticleIDs).
+   PS-DTFE: evaluates the multi-stream phase-space fields at user-supplied Eulerian points
+   instead of (only) on a regular grid. The triangulation is built in Lagrangian space;
+   every Delaunay cell maps to a (possibly folded) Eulerian tetrahedron, and a query point
+   receives one stream per tetrahedron that contains it. Per point we report the total
+   density, the density-weighted mean velocity, the velocity dispersion tensor and the
+   stream count; --per-stream additionally records every stream's own density and velocity,
+   and --per-stream-ids each stream's identity (the sorted Lagrangian-vertex ParticleIDs).
    --pts-den-grad adds the density gradient: per stream the constant gradient of the linear
    'dtfe' profile (regardless of --ps-stream-density -- the geometric density is piecewise
    constant, so the dtfe-profile gradient is the only well-defined one), per point the sum
    over its streams.
+
+   Standard DTFE (no PHASE_SPACE): the same interface and .pts_* file formats over the
+   EULERIAN tessellation -- exactly one containing tetrahedron per point, so the stream
+   count is the 0/1 coverage flag, the density is the plain linear DTFE interpolant and the
+   dispersion is identically 0. The context, bucket index, reduction and writers below are
+   shared verbatim; only the per-triangulation worker differs (interpolatePoints_standard).
+   --per-stream/--per-stream-ids and --ps-stream-density are PS-only (rejected at option
+   parsing); the legacy Sample_point mechanism is untouched.
 
    Per-stream density comes in two variants (--ps-stream-density):
      'dtfe'      (default) linear interpolation of the Lagrangian-vertex DTFE densities
@@ -37,8 +45,6 @@
 
 #include "../define.h"
 
-#ifdef PHASE_SPACE
-
 #include "../ps_point_eval.h"
 
 #if NO_DIM==3
@@ -50,6 +56,14 @@
 #include <fstream>
 #include <mutex>
 #include <vector>
+
+// terminal-message prefix only -- the machinery is shared by both binaries and the PS
+// output must stay byte-identical (including its log lines)
+#ifdef PHASE_SPACE
+#define PTS_MSG_BINARY "PS-DTFE:"
+#else
+#define PTS_MSG_BINARY "DTFE:"
+#endif
 
 
 namespace psPointEvalDetail {
@@ -126,6 +140,80 @@ inline bool inverse3x3d(double const m[NO_DIM][NO_DIM], double inv[NO_DIM][NO_DI
     inv[1][2] = (m[0][2]*m[1][0] - m[0][0]*m[1][2]) * invDet;
     inv[2][2] = (m[0][0]*m[1][1] - m[0][1]*m[1][0]) * invDet;
     return true;
+}
+
+
+// Eulerian bounding box (+ slack for the +-1e-6 barycentric tolerance) of a wrapped
+// tetrahedron -> point-bucket range and rel-space bbox pre-test bounds. Shared by the PS
+// and standard workers so the candidate search is identical in both binaries. Returns
+// false when the (non-periodic) range misses every bucket.
+inline bool tetBucketRange(Real const eulerPos[NO_DIM+1][NO_DIM],
+                           double relLo[NO_DIM], double relHi[NO_DIM],
+                           int bLo[NO_DIM], int bHi[NO_DIM])
+{
+    for (int d = 0; d < NO_DIM; ++d)
+    {
+        double eMin = double(eulerPos[0][d]);
+        double eMax = eMin;
+        for (int v = 1; v <= NO_DIM; ++v)
+        {
+            double const c = double(eulerPos[v][d]);
+            if (c < eMin) eMin = c;
+            if (c > eMax) eMax = c;
+        }
+        double const margin = 1.e-5 * (eMax - eMin) + 1.e-12;
+        relLo[d] = eMin - double(eulerPos[0][d]) - margin;
+        relHi[d] = eMax - double(eulerPos[0][d]) + margin;
+
+        bLo[d] = int( std::floor( (eMin - margin - g_ctx.boxLo[d]) * g_ctx.bInvW[d] ) );
+        bHi[d] = int( std::floor( (eMax + margin - g_ctx.boxLo[d]) * g_ctx.bInvW[d] ) );
+        if ( g_ctx.periodic )
+        {
+            if ( bHi[d] - bLo[d] + 1 >= g_ctx.nB[d] ) { bLo[d] = 0; bHi[d] = g_ctx.nB[d] - 1; }  // spans every bucket: visit each once
+        }
+        else
+        {
+            if ( bLo[d] < 0 ) bLo[d] = 0;
+            if ( bHi[d] >= g_ctx.nB[d] ) bHi[d] = g_ctx.nB[d] - 1;
+            if ( bLo[d] > bHi[d] ) return false;
+        }
+    }
+    return true;
+}
+
+
+// Minimum-image displacement of query point p to (wrapped) vertex 0, rel-space bbox
+// pre-test, and the barycentric point-in-tet test with the deposit kernels' tolerances
+// (Ax stores edges as rows, so bary = inv^T * rel -- note the [i][v] transpose). Shared by
+// the PS and standard workers. Fills bary[] and returns true when the point is inside.
+inline bool pointInTet(uint32_t p, Real const eulerPos[NO_DIM+1][NO_DIM],
+                       double const inv[NO_DIM][NO_DIM],
+                       double const relLo[NO_DIM], double const relHi[NO_DIM],
+                       double bary[NO_DIM])
+{
+    double rel[NO_DIM];
+    for (int d = 0; d < NO_DIM; ++d)
+    {
+        double r = g_ctx.pos[size_t(p)*NO_DIM+d] - double(eulerPos[0][d]);
+        if ( g_ctx.periodic )
+        {
+            if (r >  0.5 * g_ctx.boxLen[d]) r -= g_ctx.boxLen[d];
+            if (r < -0.5 * g_ctx.boxLen[d]) r += g_ctx.boxLen[d];
+        }
+        if ( r < relLo[d] || r > relHi[d] ) return false;
+        rel[d] = r;
+    }
+    double sum = 0.;
+    for (int v = 0; v < NO_DIM; ++v)
+    {
+        double bc = 0.;
+        for (int i = 0; i < NO_DIM; ++i)
+            bc += inv[i][v] * rel[i];
+        if (bc < -1.e-6) return false;
+        bary[v] = bc;
+        sum += bc;
+    }
+    return sum <= 1. + 1.e-6;
 }
 
 
@@ -209,7 +297,13 @@ void psPointEvalInit(User_options &userOptions)
     g_ctx.ptsDenGrad   = userOptions.psPtsDenGrad;
     g_ctx.useGeometric = userOptions.psStreamDensityGeometric;
     g_ctx.periodic     = userOptions.periodic;
-    g_ctx.rhoBar       = double( userOptions.averageDensity );
+#ifdef PHASE_SPACE
+    g_ctx.rhoBar       = double( userOptions.averageDensity );   // PS vertex densities are physical
+#else
+    g_ctx.rhoBar       = 1.;   // standard vertexDensity() already normalizes by averageDensity
+                               // (triangulation.cpp: factor = (NO_DIM+1)/averageDensity), so the
+                               // interpolated values are rho/rho_bar as-is
+#endif
     for (int d = 0; d < NO_DIM; ++d)
     {
         g_ctx.boxLo[d]  = double( userOptions.region[2*d] );
@@ -273,7 +367,7 @@ void psPointEvalInit(User_options &userOptions)
     g_ctx.recs.resize( g_ctx.nPoints );
     g_ctx.active = true;
 
-    message << "\n" << MESSAGE::cBold() << "PS-DTFE:" << MESSAGE::cReset()
+    message << "\n" << MESSAGE::cBold() << PTS_MSG_BINARY << MESSAGE::cReset()
             << " point evaluation at " << MESSAGE::cMagenta() << g_ctx.nPoints << MESSAGE::cReset()
             << " sample points from '" << MESSAGE::cBlue() << userOptions.psSamplePointsFile
             << MESSAGE::cReset() << "' (per-stream density: "
@@ -283,6 +377,8 @@ void psPointEvalInit(User_options &userOptions)
             << (g_ctx.ptsDenGrad ? ", writing density gradients" : "") << ").\n" << MESSAGE::Flush;
 }
 
+
+#ifdef PHASE_SPACE
 
 /* Collects this partition's stream contributions for every query point. Called once per
    Lagrangian partition (and once for a single-triangulation run) after vertexDensity().
@@ -336,38 +432,10 @@ void interpolatePoints_phaseSpace(DT &dt, User_options &userOptions)
                 vel[v][j] = double( cell->vertex(v)->info().velocity(j) );
         }
 
-        // Eulerian bounding box (+ slack for the +-1e-6 barycentric tolerance) -> bucket range
-        double eMin[NO_DIM], eMax[NO_DIM], relLo[NO_DIM], relHi[NO_DIM];
+        // Eulerian bounding box (+ tolerance slack) -> bucket range (shared helper)
+        double relLo[NO_DIM], relHi[NO_DIM];
         int bLo[NO_DIM], bHi[NO_DIM];
-        bool bucketRangeEmpty = false;
-        for (int d = 0; d < NO_DIM; ++d)
-        {
-            eMin[d] = double(eulerPos[0][d]);
-            eMax[d] = eMin[d];
-            for (int v = 1; v <= NO_DIM; ++v)
-            {
-                double const c = double(eulerPos[v][d]);
-                if (c < eMin[d]) eMin[d] = c;
-                if (c > eMax[d]) eMax[d] = c;
-            }
-            double const margin = 1.e-5 * (eMax[d] - eMin[d]) + 1.e-12;
-            relLo[d] = eMin[d] - double(eulerPos[0][d]) - margin;
-            relHi[d] = eMax[d] - double(eulerPos[0][d]) + margin;
-
-            bLo[d] = int( std::floor( (eMin[d] - margin - g_ctx.boxLo[d]) * g_ctx.bInvW[d] ) );
-            bHi[d] = int( std::floor( (eMax[d] + margin - g_ctx.boxLo[d]) * g_ctx.bInvW[d] ) );
-            if ( g_ctx.periodic )
-            {
-                if ( bHi[d] - bLo[d] + 1 >= g_ctx.nB[d] ) { bLo[d] = 0; bHi[d] = g_ctx.nB[d] - 1; }  // spans every bucket: visit each once
-            }
-            else
-            {
-                if ( bLo[d] < 0 ) bLo[d] = 0;
-                if ( bHi[d] >= g_ctx.nB[d] ) bHi[d] = g_ctx.nB[d] - 1;
-                if ( bLo[d] > bHi[d] ) { bucketRangeEmpty = true; break; }
-            }
-        }
-        if ( bucketRangeEmpty ) { continue; }
+        if ( not tetBucketRange(eulerPos, relLo, relHi, bLo, bHi) ) { continue; }
 
         StreamRec rec;
         rec.denGeo = denGeo;
@@ -407,37 +475,9 @@ void interpolatePoints_phaseSpace(DT &dt, User_options &userOptions)
             {
                 uint32_t const p = g_ctx.bucketPts[s];
 
-                // minimum-image displacement to (wrapped) vertex 0 -- the unwrapped point
-                // position relative to the tetrahedron, as the deposit's raw grid indices see it
-                double rel[NO_DIM];
-                bool inBBox = true;
-                for (int d = 0; d < NO_DIM; ++d)
-                {
-                    double r = g_ctx.pos[size_t(p)*NO_DIM+d] - double(eulerPos[0][d]);
-                    if ( g_ctx.periodic )
-                    {
-                        if (r >  0.5 * g_ctx.boxLen[d]) r -= g_ctx.boxLen[d];
-                        if (r < -0.5 * g_ctx.boxLen[d]) r += g_ctx.boxLen[d];
-                    }
-                    if ( r < relLo[d] || r > relHi[d] ) { inBBox = false; break; }
-                    rel[d] = r;
-                }
-                if ( not inBBox ) continue;
-
-                // barycentric point-in-tet test with the deposit kernels' tolerances
-                // (Ax stores edges as rows, so bary = inv^T * rel -- note the [i][v] transpose)
-                double bary[NO_DIM], sum = 0.;
-                bool inside = true;
-                for (int v = 0; v < NO_DIM; ++v)
-                {
-                    double bc = 0.;
-                    for (int i = 0; i < NO_DIM; ++i)
-                        bc += inv[i][v] * rel[i];
-                    if (bc < -1.e-6) { inside = false; break; }
-                    bary[v] = bc;
-                    sum += bc;
-                }
-                if ( !inside || sum > 1. + 1.e-6 ) continue;
+                // min-image displacement + bbox pre-test + barycentric containment (shared helper)
+                double bary[NO_DIM];
+                if ( not pointInTet(p, eulerPos, inv, relLo, relHi, bary) ) continue;
 
                 if ( useVolumeRatioDensity )
                     rec.denDtfe = denGeo;   // hull cell: vertex densities are undefined (0)
@@ -467,6 +507,171 @@ void interpolatePoints_phaseSpace(DT &dt, User_options &userOptions)
     for (size_t h = 0; h < hits.size(); ++h)
         g_ctx.recs[ hits[h].first ].push_back( hits[h].second );
 }
+
+#else // !PHASE_SPACE
+
+/* Standard-DTFE worker: the tessellation itself is Eulerian, so a query point has exactly
+   one containing tetrahedron (stream count = 0/1 coverage; psPointEvalFinalize additionally
+   collapses the rare +-1e-6-tolerance double-hit of a point sitting ON a shared face).
+   Reuses the PS candidate search verbatim (bucketed points, tetBucketRange/pointInTet);
+   the estimator differences:
+     (a) vertex positions come from the Delaunay points themselves, min-image-wrapped to
+         vertex 0 under --periodic exactly like the PS Eulerian wrap (ps_cell_filter.h);
+     (b) --periodic pads the box with particle COPIES, so a boundary tetrahedron appears as
+         several images: exactly ONE is kept (Eulerian centroid inside the primary box) --
+         the standard-build analogue of the PS Lagrangian-centroid partition ownership;
+     (c) there is no geometric (V_lag/V_eul) density variant: denGeo aliases the 'dtfe'
+         value, so the shared sort/reduction machinery behaves identically. */
+void interpolatePoints_standard(DT &dt, User_options &userOptions)
+{
+    if ( not g_ctx.active || dt.number_of_vertices() < NO_DIM + 1 )
+        return;
+
+    (void)userOptions;   // box geometry/periodicity already captured in g_ctx at init
+
+    // local hit buffer; merged into the shared per-point lists once, at the end
+    std::vector< std::pair<uint32_t, StreamRec> > hits;
+
+    for (DT::Finite_cells_iterator itC = dt.finite_cells_begin(); itC != dt.finite_cells_end(); ++itC)
+    {
+        Cell_handle cell = itC;
+
+#ifdef TEST_PADDING
+        // skip cells touching a dummy padding-test vertex
+        {
+            bool hasDummy = false;
+            for (int v = 0; v <= NO_DIM; ++v)
+                if (cell->vertex(v)->info().isDummy()) { hasDummy = true; break; }
+            if (hasDummy) { continue; }
+        }
+#endif
+
+        // vertex DTFE densities must be positive to interpolate the linear profile; a
+        // nonpositive value only occurs on degenerate hull configurations -- skip the cell
+        double rho[NO_DIM+1], vel[NO_DIM+1][noVelComp];
+        {
+            bool bad = false;
+            for (int v = 0; v <= NO_DIM; ++v)
+            {
+                rho[v] = double( cell->vertex(v)->info().density() );
+                if ( rho[v] <= 0. ) { bad = true; break; }
+                for (size_t j = 0; j < noVelComp; ++j)
+                    vel[v][j] = double( cell->vertex(v)->info().velocity(j) );
+            }
+            if (bad) { continue; }
+        }
+
+        // Eulerian vertex positions; wrap vertices 1..NO_DIM to vertex 0's nearest image
+        Real eulerPos[NO_DIM+1][NO_DIM];
+        for (int v = 0; v <= NO_DIM; ++v)
+            for (int d = 0; d < NO_DIM; ++d)
+                eulerPos[v][d] = Real( cell->vertex(v)->point()[d] );
+        if ( g_ctx.periodic )
+        {
+            for (int v = 1; v <= NO_DIM; ++v)
+                for (int d = 0; d < NO_DIM; ++d)
+                {
+                    Real const diff = eulerPos[v][d] - eulerPos[0][d];
+                    if (diff >  Real(0.5) * Real(g_ctx.boxLen[d])) eulerPos[v][d] -= Real(g_ctx.boxLen[d]);
+                    if (diff < -Real(0.5) * Real(g_ctx.boxLen[d])) eulerPos[v][d] += Real(g_ctx.boxLen[d]);
+                }
+
+            // ownership: keep the ONE periodic image whose centroid lies in the primary box,
+            // so points near the boundary receive exactly one record from each physical tet
+            bool owned = true;
+            for (int d = 0; d < NO_DIM && owned; ++d)
+            {
+                double cen = 0.;
+                for (int v = 0; v <= NO_DIM; ++v) cen += double(eulerPos[v][d]);
+                cen /= double(NO_DIM + 1);
+                if ( cen < g_ctx.boxLo[d] || cen >= g_ctx.boxLo[d] + g_ctx.boxLen[d] )
+                    owned = false;
+            }
+            if (!owned) { continue; }
+        }
+
+        // Eulerian edge matrix + the deposit's relative-determinant degeneracy guard
+        // (|det| < 1e-6 * avgEdge^3, resolution-independent -- see ps_cell_filter.h)
+        double Ax[NO_DIM][NO_DIM];
+        for (int v = 0; v < NO_DIM; ++v)
+            for (int i = 0; i < NO_DIM; ++i)
+                Ax[v][i] = double(eulerPos[v+1][i]) - double(eulerPos[0][i]);
+        {
+            double avgEdge2 = 0.;
+            for (int v = 0; v < NO_DIM; ++v)
+            {
+                double len2 = 0.;
+                for (int i = 0; i < NO_DIM; ++i)
+                    len2 += Ax[v][i] * Ax[v][i];
+                avgEdge2 += len2;
+            }
+            avgEdge2 /= NO_DIM;
+            if ( std::fabs(determinant(Ax)) < 1.e-6 * avgEdge2 * std::sqrt(avgEdge2) )
+                continue;
+        }
+        double inv[NO_DIM][NO_DIM];
+        if ( not inverse3x3d(Ax, inv) ) { continue; }
+
+        double relLo[NO_DIM], relHi[NO_DIM];
+        int bLo[NO_DIM], bHi[NO_DIM];
+        if ( not tetBucketRange(eulerPos, relLo, relHi, bLo, bHi) ) { continue; }
+
+        StreamRec rec;
+        for (int v = 0; v <= NO_DIM; ++v)
+            rec.ids[v] = 0;                 // --per-stream-ids is PS-only (rejected at parsing)
+        for (int i = 0; i < NO_DIM; ++i)
+            rec.grad[i] = 0.;
+        if ( g_ctx.ptsDenGrad )
+        {
+            // constant gradient of the linear DTFE profile, same affine convention as PS:
+            // rho(p) = rho_0 + grad . (p - x_0), grad_i = sum_v inv[i][v] (rho_{v+1} - rho_0)
+            for (int i = 0; i < NO_DIM; ++i)
+                for (int v = 0; v < NO_DIM; ++v)
+                    rec.grad[i] += inv[i][v] * (rho[v+1] - rho[0]);
+        }
+
+        for (int bi = bLo[0]; bi <= bHi[0]; ++bi)
+        for (int bj = bLo[1]; bj <= bHi[1]; ++bj)
+        for (int bk = bLo[2]; bk <= bHi[2]; ++bk)
+        {
+            int const wi = g_ctx.periodic ? ((bi % g_ctx.nB[0] + g_ctx.nB[0]) % g_ctx.nB[0]) : bi;
+            int const wj = g_ctx.periodic ? ((bj % g_ctx.nB[1] + g_ctx.nB[1]) % g_ctx.nB[1]) : bj;
+            int const wk = g_ctx.periodic ? ((bk % g_ctx.nB[2] + g_ctx.nB[2]) % g_ctx.nB[2]) : bk;
+            size_t const b = ( size_t(wi) * size_t(g_ctx.nB[1]) + size_t(wj) ) * size_t(g_ctx.nB[2]) + size_t(wk);
+
+            for (size_t s = g_ctx.bucketStart[b]; s < g_ctx.bucketStart[b+1]; ++s)
+            {
+                uint32_t const p = g_ctx.bucketPts[s];
+
+                double bary[NO_DIM];
+                if ( not pointInTet(p, eulerPos, inv, relLo, relHi, bary) ) continue;
+
+                double dd = rho[0];
+                for (int v = 0; v < NO_DIM; ++v)
+                    dd += bary[v] * (rho[v+1] - rho[0]);
+                rec.denDtfe = (dd > 0.) ? dd : 0.;   // the +-1e-6 tolerance can graze negative
+                rec.denGeo  = rec.denDtfe;           // no geometric variant on the Eulerian tessellation
+                for (size_t j = 0; j < noVelComp; ++j)
+                {
+                    double vv = vel[0][j];
+                    for (int v = 0; v < NO_DIM; ++v)
+                        vv += bary[v] * (vel[v+1][j] - vel[0][j]);
+                    rec.vel[j] = vv;
+                }
+
+                hits.push_back( std::make_pair( p, rec ) );
+            }
+        }
+    }   // end cell loop
+
+    if ( hits.empty() )
+        return;
+    std::lock_guard<std::mutex> lock( g_mergeMutex );
+    for (size_t h = 0; h < hits.size(); ++h)
+        g_ctx.recs[ hits[h].first ].push_back( hits[h].second );
+}
+
+#endif // PHASE_SPACE
 
 
 void psPointEvalFinalize(User_options const &userOptions)
@@ -522,6 +727,15 @@ void psPointEvalFinalize(User_options const &userOptions)
     {
         std::vector<StreamRec> &recs = g_ctx.recs[i];
         std::sort( recs.begin(), recs.end(), recLess );
+
+#ifndef PHASE_SPACE
+        // Eulerian tessellation: exactly one containing tet per point. A second record can
+        // only be the +-1e-6-tolerance double-hit of a point sitting ON a shared face (both
+        // records interpolate the same continuous field, so they are near-identical); keep
+        // the deterministic sorted-first one so the coverage count is an honest 0/1.
+        if ( recs.size() > 1 )
+            recs.resize( 1 );
+#endif
 
         size_t const nS = recs.size();
         g_ctx.outStreams[i] = int32_t( nS );
@@ -599,7 +813,7 @@ void psPointEvalFinalize(User_options const &userOptions)
     std::vector< std::vector<StreamRec> >().swap( g_ctx.recs );
     g_ctx.finalized = true;
 
-    message << "\n" << MESSAGE::cBold() << "PS-DTFE:" << MESSAGE::cReset() << " point evaluation -- "
+    message << "\n" << MESSAGE::cBold() << PTS_MSG_BINARY << MESSAGE::cReset() << " point evaluation -- "
             << MESSAGE::cMagenta() << covered << "/" << N << MESSAGE::cReset() << " points covered, "
             << MESSAGE::cMagenta() << multi << MESSAGE::cReset() << " multi-stream, max streams "
             << MESSAGE::cMagenta() << maxStreams << MESSAGE::cReset() << "."
@@ -630,7 +844,7 @@ void psPointEvalWriteOutputs(User_options const &userOptions)
           << MESSAGE::cReset() << "' ... Done.\n" << MESSAGE::Flush;
     };
 
-    message << "\n" << MESSAGE::cBold() << "PS-DTFE:" << MESSAGE::cReset()
+    message << "\n" << MESSAGE::cBold() << PTS_MSG_BINARY << MESSAGE::cReset()
             << " writing the point-evaluation outputs (raw binary, see README):\n" << MESSAGE::Flush;
     writeRaw( ".pts_den",     g_ctx.outDen.data(),     g_ctx.outDen.size()     * sizeof(double),
               "point densities (float64, rho/rho_bar)" );
@@ -665,19 +879,21 @@ void psPointEvalWriteOutputs(User_options const &userOptions)
 
 #else // NO_DIM != 3
 
-// PS-DTFE is only validated in 3D; point evaluation is 3D-only. The per-partition worker
-// must still LINK in 2D (triangulation.cpp references it unconditionally; psPointEvalActive()
-// is always false here, so it can never be called).
+// Point evaluation is 3D-only. The per-triangulation worker must still LINK in 2D
+// (triangulation.cpp references it unconditionally; psPointEvalActive() is always false
+// here, so it can never be called).
 #include "triangulation_common.h"
+#ifdef PHASE_SPACE
 void interpolatePoints_phaseSpace(DT &, User_options &) {}
+#else
+void interpolatePoints_standard(DT &, User_options &) {}
+#endif
 bool psPointEvalActive() { return false; }
 void psPointEvalInit(User_options &)
 {
-    throwError( "'--sample-points' (PS-DTFE point evaluation) is implemented for 3D only." );
+    throwError( "'--sample-points' (point evaluation) is implemented for 3D only." );
 }
 void psPointEvalFinalize(User_options const &) {}
 void psPointEvalWriteOutputs(User_options const &) {}
 
 #endif // NO_DIM
-
-#endif // PHASE_SPACE

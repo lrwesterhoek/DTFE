@@ -61,6 +61,7 @@ struct Quantities
 #ifdef PHASE_SPACE
     std::vector<Real>                         stream_count;       // number of streams at each grid point
     std::vector<Real>                         mass_weight;        // per-cell summed stream density sum(rho_s); internal to normalizePhaseSpace, never written out
+    std::vector<Real>                         caustic_bits;       // --ps-caustics: per-cell orientation mask (bit0 = det(Ax)>0 stream overlaps the cell, bit1 = det<0). Small exact ints in float; OR-merged across partitions (addFrom/addFromSubgrid), binarized to the 0/1 fold flag once in DTFE() after the merge, written as '.caustic'
     // PS-DTFE partition sub-grid in global grid-cell units, so addFromSubgrid() can map cells back.
     size_t ps_subOrigin[NO_DIM] = {0};
     size_t ps_subDims[NO_DIM]   = {0};   // [0]==0 means "not a sub-grid" (vectors span the full grid)

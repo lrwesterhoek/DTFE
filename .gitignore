@@ -42,6 +42,7 @@ tests/tmp/
 *.den
 *.vel
 *.streams
+*.caustic
 *.scalar
 *.velDisp
 *.velDispTensor

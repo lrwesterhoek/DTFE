@@ -1,4 +1,134 @@
 VERSION 1.3.0
+- Added exact '_a' volume averaging for the STANDARD DTFE binary, '--exact-average'
+  (reuses the vendored third_party/r3d): the volume-averaged fields are computed by
+  integrating the LINEAR DTFE interpolant analytically over every grid-cell/tetrahedron
+  intersection instead of Monte-Carlo sampling. For a linear field the integral over each
+  intersection piece is its centroid value times the piece volume, so order-1 moments
+  suffice; the per-tet loop lives in interpolateGrid_averaged_1 (method-1 scatter
+  topology) with the SAME cell classification as the sampled path -- the single-grid-cell
+  fast path (centroid x volume) was already exact and is shared, the region window is
+  clamped exactly like out-of-region samples, and the TEST_PADDING dummy-cell flagging
+  covers every overlapped cell. '--samples' is ignored; '--method 2/3' is rejected with a
+  clear error (the exact average replaces the sampled estimate); MY_SCALAR builds reject
+  the flag (a user-defined scalar is not linear inside a tet); with '--gpu' the
+  interpolation falls back to the CPU with a warning; 3D only. Measured: on a PERFECT
+  periodic lattice every '.a_den' cell is 1 to float rounding (max |v-1| = 1.8e-7), and
+  the sampled method-1 density approaches the exact grid monotonically (pancake, grid 64:
+  L1 = 4.6e-2 / 1.1e-2 / 1.9e-3 at --samples 100/1000/10000). Two gated tests added to
+  tests/run_tests.py (suite is now 15; they skip cleanly on binaries without the flag).
+  All outputs without the flag are byte-identical (A/B verified for both binaries).
+- Added the exact conservative PS-DTFE deposit, '--ps-exact-deposit' (Powell & Abel 2015,
+  arXiv:1412.4941), backed by the newly VENDORED third_party/r3d (r3d.c/r3d.h at upstream
+  commit 58dfbfb, LANL license and citation request preserved; r3d-config.h stands in for
+  the CMake-generated header; compiled once per object dir as plain C99 with -fPIC and
+  linked into both binaries and libDTFE). Instead of nSub^3 sub-sampling, every kept
+  tetrahedron is analytically clipped against each grid cell in its bbox window (vertex-0
+  relative frame, the same affine convention as velGrad/denGrad; raw-index window with
+  modulo wrapping on write, exactly like the sampled deposit) and one order-2 r3d_reduce
+  per intersection yields: exact per-cell mass shares (renormalized per tet over the
+  in-window volume, so conservation matches the sampled path's semantics and lands at or
+  below its float floor -- measured 2.2e-10 vs 2.4e-9 on the pancake); the exact mean of
+  the linear velocity profile for the velocity moment; and the piece's exact velocity
+  covariance for the dispersion (intra-cell variance without sampling). '--ps-linear-
+  deposit' composes by integrating the linear density profile exactly (order-1 moments,
+  renormalized per tet). Folded (negative-parity) tets are handed to r3d with two vertices
+  swapped. nSub is ignored -- the exact deposit is the nSub->infinity limit, '.den' ==
+  '.a_den' bit-exact, and the sampled '.a_den' converges to the exact grid monotonically
+  (L1 0.319/0.062/0.060 at nSub 1/3/5 on the pancake). '.streams' counts every tet with a
+  nonzero intersection (integer -> bit-exact across same-split partition/thread schedules;
+  serial-vs-partitioned keeps the known pre-existing FP framing edge, a handful of +-1
+  cells). Released tets (--ps-halo-release) fall through to the monolithic centroid path;
+  --ps-caustics orientation bits are set per intersected cell. CPU-only, 3D-only: with
+  '--ps-gpu' the deposit falls back to the CPU with a warning; point evaluation is
+  unaffected. Honest cost (pancake 32^3 particles / 64^3 grid, one thread): the unaveraged
+  deposit is ~35x the sampled nSub=1 pass (6.7 s vs 0.19 s); the '_a' pass costs about the
+  SAME as nSub=3 sampling (6.5 s vs 6.1 s) after skipping the sub-sample window expansion
+  (pointless for exact clipping) -- an accuracy option, not a speed option. Validated by
+  the new gated section (D) of tests/ps_linear_deposit_check.sh (8 checks; skipped cleanly
+  on binaries without the flag). All outputs without the flag are byte-identical (A/B
+  verified for both binaries).
+- Ported the modern point evaluation ('--sample-points') to the STANDARD DTFE binary, so
+  both binaries share one interface and one set of .pts_* file formats. The machinery in
+  ps_point_eval.cc (point reader, bucketed candidate search, deterministic sort/reduce,
+  raw-binary writers) is now compiled into both builds; only the per-triangulation worker
+  differs: interpolatePoints_standard() walks the EULERIAN tessellation, so each point has
+  exactly one containing tetrahedron -- '.pts_streams' is the 0/1 coverage flag,
+  '.pts_velDisp' is identically 0, '.pts_den'/'.pts_vel' are the linear DTFE interpolants
+  (vertex densities are already mean-normalized by vertexDensity(), so no rho_bar division
+  is applied, unlike the PS build's physical vertex densities), and '--pts-den-grad' writes
+  the containing tet's constant DTFE density gradient (validated against central finite
+  differences to ~1e-13). Under '--periodic' the box is padded with particle copies, so
+  exactly ONE image of each boundary tetrahedron is kept (Eulerian centroid inside the
+  primary box -- the standard analogue of the PS Lagrangian-centroid ownership); a point
+  sitting exactly ON a shared face within the 1e-6 barycentric tolerance is collapsed to
+  its single sorted-first record. The geometric predicates (tetBucketRange/pointInTet) were
+  factored out and are shared by both workers -- all PS point outputs remain byte-identical
+  (A/B verified). The standard binary runs point evaluation on a single triangulation:
+  '--sample-points' now bypasses the OpenMP spatial split (overlapping padded
+  sub-triangulations would double-count boundary tets) and rejects '--partition'/'--partNo'
+  with a clear error; '--per-stream'/'--per-stream-ids' parse in both binaries (shared
+  registration; the flag names keep appearing in both helps) but are rejected by the
+  standard binary. '--sample-points'/'--pts-den-grad' help text now describes both modes;
+  '--ps-stream-density' stays PS-only. The legacy Sample_point mechanism is untouched.
+  Validated by the new tests/dtfe_point_eval_check.sh (uniform-lattice density ~1 with
+  exactly-zero velocities/dispersion, full 0/1 coverage, text==binary readers, gradient
+  no-op byte-identity, FD gradient match, PS cross-estimator agreement in single-stream
+  regions: velocity median rel ~2e-5, density median rel ~0.09, and the two rejections).
+- Added the PS-DTFE halo-interior release, '--ps-halo-release <D>' (Stuecker et al. 2021,
+  arXiv:2109.09760): during the grid deposit, any kept tetrahedron whose geometric stream
+  density rho_geo/rho_bar = V_lag/V_eul exceeds D is deposited MONOLITHICALLY at its
+  Eulerian centroid cell -- the pre-existing mass-conserving fallback for sub-sample-spacing
+  tets, now driven by zero-tripping the PASS-1 sample window -- instead of being rasterized
+  over its bbox with nSub^3 sampling; the velocity/dispersion moments carry the
+  centroid-evaluated velocity. The criterion is exact and local: |det Lag| > D*|det Ax| (the
+  1/6 factors cancel), classified in double precision identically by the CPU and GPU
+  deposits (partition protocol); the GPU path skips released tets during tet extraction and
+  applies their single-cell centroid deposits host-side after the GPU grids are copied back
+  (identical released counts asserted). Mass conservation is EXACT (grid mean bit-unchanged
+  vs the base deposit) and cells that are single-stream in the base run keep bit-identical
+  .den/.vel/.streams -- released tets live in multi-stream regions by construction. Point
+  evaluation ('--sample-points') is NOT affected by this flag. Rationale: inside virialized
+  halos fold counts explode (TNG50-3-Dark z=0: mean 15.6 streams/cell, max 1.9e6, 2.1e9
+  tet-cell overlaps) while the sheet estimate is unconverged there anyway; the release cuts
+  exactly that cost. MEASURED on TNG50-4-Dark z=0 (2e7 particles, grid 512, single-domain,
+  max 383k streams in one cell): D=100/300/1000 release 13.1M/7.7M/3.6M of ~118M tets, box
+  mean bit-unchanged, and only 244/22/1 cells of the 114M single-stream cells change --
+  those are thin VOID-WALL sheets (stream compression rho_geo > D at cell-averaged density
+  ~0.2) whose mass collapses to the centroid cell (up to ~50x locally at D=100), so the
+  RECOMMENDED default is D ~ 1000 for void-focused analyses. Wall-time, honestly: the
+  measured savings at THIS scale are small everywhere -- CPU nSub=1 deposit 651 -> 638 s
+  at D=100 (released tets are sub-cell and already took the centroid fallback), Metal GPU
+  110 -> 104 s (unaveraged) and 2305 -> 2287 s (nSub=3 '_a') -- because the deposit cost
+  is dominated by mid-size tetrahedra no reasonable D releases (the CPU nSub=3 '_a' pass
+  is hours at 512^3 with or without the flag; use the GPU deposit or --avg-subsamples 1
+  there). The fold-count explosion the flag targets (TNG50-3-Dark: 1.9e6 streams/cell,
+  2.1e9 overlaps) grows much faster than the tet count, so the flag is primarily the
+  physically-motivated release of unconverged sheet regions, with speedups expected at
+  those larger scales. Validated by the new tests/ps_halo_release_check.sh (pancake +
+  --crossed-waves: releases happen and change the multi-stream deposit, means bit-unchanged,
+  single-stream volume bit-identical, partitioned runs thread-invariant, GPU parity;
+  documents that serial-vs-partitioned keeps the KNOWN pre-existing +-1-stream
+  centroid-cell edge at periodic faces, which this flag neither causes nor worsens). All
+  outputs without the flag are byte-identical (A/B verified for both binaries).
+- Added PS-DTFE caustic flagging, '--ps-caustics' (3D builds): the grid deposit records per
+  grid cell which orientations of the Lagrangian->Eulerian map overlap it (the parity is the
+  sign of det(Ax), already computed by the shared cell filter; it flips at every fold
+  caustic) and writes "<output>.caustic" -- float32, same N^3 layout as '.streams', 1 = the
+  cell is overlapped by tetrahedra of BOTH parities, 0 otherwise. Since every multi-stream
+  interior contains a negative-parity stream, the flagged set is the multi-stream region and
+  its BOUNDARY is the fold-caustic skeleton (folds bound multi-stream regions). The two
+  per-cell orientation bits accumulate locally, are OR-merged across '--partition' splits
+  (quantities.cc orField/addFromSubgrid; OR is commutative and idempotent, so the merge is
+  completion-order invariant) and are binarized ONCE in DTFE() after the merge -- '.caustic'
+  is byte-identical under any partition/thread schedule (asserted by the new gated section of
+  tests/ps_regression_test.py, which also checks the flagged slab's edges against the
+  analytic Zel'dovich fold planes 1 + A k cos(k q) = 0 to +-2 cells and against the deposit's
+  own streams 1<->3 transitions to +-1 cell). CPU deposit only: with '--ps-gpu' the deposit
+  falls back to the CPU with a warning; point evaluation ('--sample-points') is unaffected.
+  Rejected with '--interlace' and with the non-DTFE grid assignments. Python: FieldSet gained
+  the ps-only 'caustic' field (float32 like every grid field, so no dtype column was needed);
+  synthetic loader test added to tests/py_dtfelib_test.py (the suite is now 13 checks). All
+  outputs without the flag are byte-identical (A/B verified for both binaries).
 - ONE unit convention across all merged input data: every combined_* file is h-FREE on disk
   (ckpc, 1e10 Msun, ckpc km/s). merge_HDF5.py divides the groupcat/tree length, mass and spin
   columns by h per a curated per-column map (velocities, counts, indices and IDs carry no h;

@@ -501,7 +501,16 @@ void writeOutputData(Quantities &uQuantities,
     if ( not aQuantities.stream_count.empty() )
         output.write( aQuantities.stream_count, userOptions.outputFilename + ".a_streams", "averaged stream count", userOptions );
 
-    // arbitrary-point evaluation outputs ('<root>.pts_*'; no-op unless --sample-points was given)
-    psPointEvalWriteOutputs( userOptions );
+    // fold-caustic cell flag (--ps-caustics): one '.caustic' file; prefer the unaveraged grid
+    // (nSub=1 sampling, same granularity as '.streams'), fall back to the '_a' pass's grid
+    if ( not uQuantities.caustic_bits.empty() )
+        output.write( uQuantities.caustic_bits, userOptions.outputFilename + ".caustic", "fold-caustic cell flag", userOptions );
+    else if ( not aQuantities.caustic_bits.empty() )
+        output.write( aQuantities.caustic_bits, userOptions.outputFilename + ".caustic", "fold-caustic cell flag", userOptions );
+
 #endif
+
+    // arbitrary-point evaluation outputs ('<root>.pts_*', both binaries; no-op unless
+    // --sample-points was given)
+    psPointEvalWriteOutputs( userOptions );
 }

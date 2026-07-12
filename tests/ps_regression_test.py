@@ -127,6 +127,91 @@ def run(cmd, **kw):
     subprocess.run(cmd, check=True, **kw)
 
 
+def check_caustics(binary, snap, grid=GRID, box=BOX, amp=AMP):
+    """Gated --ps-caustics section: analytic fold positions + partition invariance.
+
+    The flag marks every cell overlapped by tetrahedra of BOTH map orientations. In the
+    pancake's 3-stream slab the middle stream has negative parity THROUGHOUT, so the whole
+    slab is (correctly) flagged; the fold caustics x(q): 1 + AMP cos(k q) = 0 are the
+    BOUNDARIES of the flagged region (folds bound multi-stream regions -- the caustic-
+    skeleton statement). Asserted here: (a) values are exactly {0,1}; (b) the flagged set
+    is an x-slab whose edges lie within +-2 cells of the analytic caustic planes (jitter
+    tolerance) and NOTHING is flagged outside it; (c) the edges coincide with the .streams
+    1<->3 transitions to +-1 cell; (d) '--partition 2 2 2' gives a byte-identical
+    '.caustic' (the orientation bits merge with an order-independent bitwise OR).
+    """
+    full_help = subprocess.run([binary, "--full_help"], capture_output=True,
+                               text=True).stdout
+    if "--ps-caustics" not in full_help:
+        print("  caustics : SKIP (binary lacks --ps-caustics)")
+        return 0
+
+    failures = []
+    roots = {}
+    for tag, extra in (("serial", []), ("part", ["--partition", "2", "2", "2"])):
+        root = os.path.join(TMP, "ps_regression_caustic_" + tag)
+        for ext in (".den", ".streams", ".caustic"):
+            try:
+                os.remove(root + ext)
+            except OSError:
+                pass
+        run([binary, snap, root, "--grid", str(grid), "--periodic",
+             "--field", "density", "--ps-caustics",
+             "--input", "105", "--MpcUnit", "1", "--verbose", "0"] + extra)
+        roots[tag] = root
+
+    with open(roots["serial"] + ".caustic", "rb") as fa, \
+         open(roots["part"] + ".caustic", "rb") as fb:
+        if fa.read() != fb.read():
+            failures.append("serial vs '--partition 2 2 2' '.caustic' differ (OR-merge broken)")
+
+    caustic = load_field(roots["serial"] + ".caustic", grid)
+    streams = load_field(roots["serial"] + ".streams", grid)
+
+    values = set(np.unique(caustic).tolist())
+    if not values <= {0.0, 1.0}:
+        failures.append(f"'.caustic' values not in {{0,1}}: {sorted(values)}")
+
+    _, xlo_a, xhi_a = analytic_pancake(amp)
+    xlo_a, xhi_a = xlo_a * grid, xhi_a * grid          # analytic fold planes, in cells
+    col = caustic.mean(axis=(1, 2))                    # per-x-column flagged fraction
+    flagged_ix = np.where(col > 0)[0]
+    if flagged_ix.size == 0:
+        failures.append("no cells flagged at all")
+    else:
+        lo, hi = flagged_ix.min(), flagged_ix.max()
+        # single contiguous slab, edges on the analytic folds, empty elsewhere
+        if flagged_ix.size != hi - lo + 1:
+            failures.append("flagged x-columns are not one contiguous slab")
+        if abs(lo - xlo_a) > 2.0 or abs((hi + 1) - xhi_a) > 2.0:
+            failures.append("flagged-slab edges [%d, %d) vs analytic folds [%.2f, %.2f] "
+                            "differ by more than 2 cells" % (lo, hi + 1, xlo_a, xhi_a))
+        interior = col[lo + 2: hi - 1]
+        if interior.size and interior.min() < 0.99:
+            failures.append("flagged slab has holes in its interior (min column fraction "
+                            "%.3f)" % interior.min())
+        # edges must track the deposit's own 1<->3 stream transitions. Column criterion is
+        # majority multi-stream, NOT any: at N = grid/2 the nSub=1 deposit's centroid
+        # fallback inflates isolated cells to 2 streams in every column (fraction <= ~0.2,
+        # see analyze()); true slab columns sit at 1.0. The caustic flag itself is immune
+        # (a fallback deposit adds one orientation bit; both parities need the real fold).
+        scol = np.where((streams > 1.5).mean(axis=(1, 2)) > 0.5)[0]
+        if scol.size == 0:
+            failures.append("no multi-stream columns in '.streams' (setup broken)")
+        elif abs(int(scol.min()) - int(lo)) > 1 or abs(int(scol.max()) - int(hi)) > 1:
+            failures.append("flagged-slab edges [%d, %d] vs multi-stream columns [%d, %d] "
+                            "differ by more than 1 cell" % (lo, hi, scol.min(), scol.max()))
+
+    if failures:
+        print("CAUSTIC CHECK FAIL:")
+        for f in failures:
+            print("  - " + f)
+        return 1
+    print("  caustics : OK (flag = {0,1}; slab edges on the analytic folds, matching the "
+          "streams 1<->3 transitions; partition-split byte-identical)")
+    return 0
+
+
 def analyze(den, streams, grid=GRID, box=BOX, amp=AMP, n=N,
             update_baseline=False, baseline_path=BASELINE,
             extra_metrics=None, extra_tol=None, pts_streams=None):
@@ -344,6 +429,9 @@ def main():
         print("AVERAGED DENSITY FAIL: coverage %.1f%% < 99%%" % (100 * a_cov)); code = 1
     else:
         print("  density_a: OK (finite, full coverage, mass-conserving)")
+
+    # gated: only exercised when the binary supports --ps-caustics
+    code |= check_caustics(binary, snap)
     return code
 
 

@@ -40,6 +40,7 @@ FIELDS = {
     "density":           ("den",           1, False),
     "velocity":          ("vel",           3, False),
     "streams":           ("streams",       1, True),
+    "caustic":           ("caustic",       1, True),   # 0/1 fold-caustic cell flag (--ps-caustics)
     "dispersion":        ("velDisp",       1, True),
     "dispersion_tensor": ("velDispTensor", 6, True),   # xx,xy,xz,yy,yz,zz
     "divergence":        ("velDiv",        1, False),

@@ -446,13 +446,11 @@ void DTFE(vector<Particle_data> *allParticles,
     }
 #endif
 
-#ifdef PHASE_SPACE
-    // arbitrary-point evaluation (--sample-points): load the query points and build their
-    // bucket index once, now that region/periodic/averageDensity are final. Each partition
-    // below then contributes its streams; psPointEvalFinalize() reduces them at the end.
+    // arbitrary-point evaluation (--sample-points), both binaries: load the query points and
+    // build their bucket index once, now that region/periodic/averageDensity are final. Each
+    // triangulation then contributes its streams; psPointEvalFinalize() reduces them at the end.
     if ( not state.options.psSamplePointsFile.empty() )
         psPointEvalInit( state.options );
-#endif
 
 #ifdef PHASE_SPACE
     if ( userOptions.partitionOn and userOptions.partNo<0 )
@@ -508,6 +506,13 @@ void DTFE(vector<Particle_data> *allParticles,
                 uQuantities->stream_count.assign(totalGrid, Real(0.));
             if ( state.options.aField.selected() )
                 aQuantities->stream_count.assign(totalGrid, Real(0.));
+            if ( state.options.psCaustics )
+            {
+                if ( state.options.uField.selected() )
+                    uQuantities->caustic_bits.assign(totalGrid, Real(0.));
+                if ( state.options.aField.selected() )
+                    aQuantities->caustic_bits.assign(totalGrid, Real(0.));
+            }
         }
 
         // Eulerian region/padding for the full box (needed by DTFE_interpolation)
@@ -742,11 +747,21 @@ void DTFE(vector<Particle_data> *allParticles,
         DTFE_parallel( &state.particles, samples, state.options, uQuantities, aQuantities );
     }
 
-#ifdef PHASE_SPACE
     // all partitions (or the single triangulation) have contributed their streams: reduce the
     // per-point records to the final density/velocity/dispersion/stream-count outputs
     if ( psPointEvalActive() )
         psPointEvalFinalize( state.options );
+
+#ifdef PHASE_SPACE
+    // --ps-caustics: binarize the orientation bits ONLY here, after every partition has been
+    // OR-merged -- a fold straddling a partition boundary gets its two orientations from
+    // different partitions, so binarizing any earlier would lose it. bits==3 (both parities
+    // overlap) -> 1, else 0. Not idempotent (1 -> 0 on a second pass): DTFE() runs once per
+    // invocation for this flag (--interlace is rejected at option parsing).
+    if ( userOptions.psCaustics )
+        for ( std::vector<Real> *cb : { &uQuantities->caustic_bits, &aQuantities->caustic_bits } )
+            for (size_t i = 0; i < cb->size(); ++i)
+                (*cb)[i] = ( (int((*cb)[i]) & 3) == 3 ) ? Real(1.) : Real(0.);
 #endif
 
     // post-processing: derive velocity divergence/shear/vorticity and cosmic-web labels from the gradient
@@ -805,8 +820,11 @@ void DTFE_parallel(vector<Particle_data> *allParticles,
         noAvailableProcessors = userOptions.maxConcurrent;
 
     // fall back to a single triangulation when spatial partitioning does not apply:
-    // 1 thread, user sampling, redshift cone, or PS-DTFE (which partitions in Lagrangian space instead)
+    // 1 thread, user sampling, redshift cone, --sample-points point evaluation (the standard
+    // worker evaluates ONE Eulerian tessellation; overlapping padded sub-triangulations
+    // would double-count boundary tets), or PS-DTFE (which partitions in Lagrangian space)
     if ( noAvailableProcessors==1 or not samples.empty() or userOptions.redshiftConeOn
+         or psPointEvalActive()
 #ifdef PHASE_SPACE
          or true  // PS-DTFE: bypass spatial partitioning, use single triangulation
 #endif

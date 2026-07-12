@@ -432,6 +432,88 @@ def test_output_size_matches_grid(tmpdir):
     report(name, True)
 
 
+def _has_flag(flag):
+    """True when the built binary's --full_help mentions the given option (feature gate for
+    tests of flags newer than the binary; captured, never piped -- see the .sh scripts)."""
+    result = subprocess.run([DTFE_BIN, "--full_help"], capture_output=True, text=True)
+    return flag in result.stdout
+
+
+def test_exact_average_lattice(tmpdir):
+    """--exact-average on a PERFECT periodic lattice: every vertex density equals the mean
+    exactly, the linear interpolant is the constant 1, so the exact cell integration must
+    return 1 in EVERY grid cell to float rounding (the sampled average is only ~1 on
+    average). Gated on the binary supporting the flag."""
+    name = "exact_average_lattice"
+    if not _has_flag("--exact-average"):
+        log("skipping: binary lacks --exact-average")
+        return
+    n_per_dim, box_size = 6, 10.0
+    particles = make_lattice_particles(n_per_dim, box_size)
+    infile = os.path.join(tmpdir, f"{name}.txt")
+    outfile = os.path.join(tmpdir, name)
+    write_text_input(infile, particles, (0, box_size, 0, box_size, 0, box_size))
+
+    ok, out = run_dtfe(infile, outfile, grid_size=12, input_type=111, output_type=101,
+                       field="density_a", extra_args=["--periodic", "--exact-average"])
+    if not ok:
+        report(name, False, "DTFE execution failed")
+        return
+    density = _read_float32(outfile + ".a_den")
+    if len(density) != 12 ** 3:
+        report(name, False, f"expected {12**3} cells, got {len(density)}")
+        return
+    worst = max(abs(d - 1.0) for d in density)
+    log(f"max |density_a - 1| = {worst:.3e}")
+    try:
+        if worst > 1e-4:
+            raise AssertionError(f"exact average on a perfect lattice must be 1 to rounding "
+                                 f"(max |v-1| = {worst:.3e})")
+        report(name, True)
+    except AssertionError as e:
+        report(name, False, str(e))
+
+
+def test_exact_average_convergence(tmpdir):
+    """Method-1 sampled '_a' density approaches the --exact-average grid MONOTONICALLY as
+    --samples grows (Sobol quasi-random sampling: deterministic, no seed involved). Gated
+    on the binary supporting the flag."""
+    name = "exact_average_convergence"
+    if not _has_flag("--exact-average"):
+        log("skipping: binary lacks --exact-average")
+        return
+    box_size, grid = 10.0, 8
+    particles = make_seeded_random_particles(300, box_size, seed=7)
+    infile = os.path.join(tmpdir, f"{name}.txt")
+    write_text_input(infile, particles, (0, box_size, 0, box_size, 0, box_size))
+
+    out_exact = os.path.join(tmpdir, f"{name}_exact")
+    ok, _ = run_dtfe(infile, out_exact, grid_size=grid, input_type=111, output_type=101,
+                     field="density_a", extra_args=["--exact-average"])
+    if not ok:
+        report(name, False, "exact-average run failed")
+        return
+    exact = _read_float32(out_exact + ".a_den")
+
+    l1 = []
+    for samples in (100, 1000, 10000):
+        out_s = os.path.join(tmpdir, f"{name}_s{samples}")
+        ok, _ = run_dtfe(infile, out_s, grid_size=grid, input_type=111, output_type=101,
+                         field="density_a", extra_args=["--samples", str(samples)])
+        if not ok:
+            report(name, False, f"sampled run (--samples {samples}) failed")
+            return
+        vals = _read_float32(out_s + ".a_den")
+        l1.append(sum(abs(a - b) for a, b in zip(vals, exact)) / len(exact))
+    log(f"L1 to exact: {l1[0]:.5e} (100) / {l1[1]:.5e} (1000) / {l1[2]:.5e} (10000)")
+    try:
+        if not (l1[0] > l1[1] > l1[2]):
+            raise AssertionError(f"L1 distances not monotone: {l1[0]:.4e}, {l1[1]:.4e}, {l1[2]:.4e}")
+        report(name, True)
+    except AssertionError as e:
+        report(name, False, str(e))
+
+
 def test_regression(tmpdir, update_ref=False):
     name = "regression"
     box_size = 10.0
@@ -633,6 +715,8 @@ def main():
         test_raw_binary_reader(tmpdir)
         test_text_reader_zero_velocity(tmpdir)
         test_gadget_mass_block_skip(tmpdir)
+        test_exact_average_lattice(tmpdir)
+        test_exact_average_convergence(tmpdir)
         test_regression(tmpdir, update_ref=args.update_ref)
     finally:
         shutil.rmtree(tmpdir)
