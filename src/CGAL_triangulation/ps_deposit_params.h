@@ -22,6 +22,9 @@ struct PSDepositParams
     int32_t  fDisp;     // second moments (24 B per cell)
     int32_t  fGrad;     // velocity-gradient moments (36 B per cell)
     int32_t  fLinear;   // --ps-linear-deposit: density-weighted (renormalized) sample shares
+    int32_t  fVolW;     // --ps-volume-weighted: moment weight = V_eul shares (mass grid unchanged); momw normalizer grid deposited
+    int32_t  fCaustic;  // --ps-caustics: atomic-OR the per-tet orientation bits (1 = det>0, 2 = det<0) into the caustic grid
+    int32_t  fExact;    // --ps-exact-deposit: analytic tet-cell clipping (float32 r3d port in the kernel) instead of nSub^3 sampling; nSub ignored
     uint32_t nTet;
 };
 

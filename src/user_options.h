@@ -166,14 +166,17 @@ struct User_options
     bool   psPerStream;                // --per-stream (PS-DTFE only): also write every stream's density+velocity per sample point (ragged layout)
     bool   psPerStreamIds;             // --per-stream-ids (PS-DTFE only): also write each stream's identity = its 4 Lagrangian-vertex ParticleIDs, sorted (implies --per-stream)
     bool   psPtsDenGrad;               // --pts-den-grad: also write the 'dtfe'-profile density gradient at each sample point (float64 x3; + ragged per-stream file with --per-stream)
+    bool   psPtsVelGrad;               // --pts-vel-grad: also write the density-weighted mean velocity gradient at each sample point (float64 x9, [d*3+j] = dv_j/dx_d)
     bool   psStreamDensityGeometric;   // PS-DTFE --ps-stream-density: true = 'geometric' (m_tet/V_eul, matches the mass-conserving deposit), false = 'dtfe' (vertex-density interpolation, matches the Feldbrugge reference; DEFAULT). Always false in the standard binary.
 #ifdef PHASE_SPACE
     int    psAvgSubsamples; // PS-DTFE: linear sub-sample count nSub for '_a' fields (nSub^NO_DIM sub-grid per cell, cost ~nSub^NO_DIM); 3 = 27 sub-points (default), 1 = cell-centre.
     bool   psUseMetal;      // PS-DTFE: run the grid deposit on the GPU; needs a GPU build (METAL=1/CUDA=1/HIP=1, else falls back to the CPU deposit with a warning). Set by --ps-gpu or its legacy alias --ps-metal.
     bool   psLinearDeposit;            // PS-DTFE --ps-linear-deposit: weight each tetrahedron's interior samples by the DTFE-interpolated linear density (renormalized per tet, so the deposited total still equals the tet mass EXACTLY) instead of equal shares
-    bool   psCaustics;                 // PS-DTFE --ps-caustics: record per grid cell whether tetrahedra of BOTH map orientations (sign of det(Ax) = Lagrangian->Eulerian parity, flips at each fold) overlap it; the 0/1 flag is written as '<output>.caustic'. CPU deposit only; 3D only.
+    bool   psCaustics;                 // PS-DTFE --ps-caustics: record per grid cell whether tetrahedra of BOTH map orientations (sign of det(Ax) = Lagrangian->Eulerian parity, flips at each fold) overlap it; the 0/1 flag is written as '<output>.caustic'. CPU and GPU deposits; 3D only.
     Real   psHaloRelease;              // PS-DTFE --ps-halo-release <D>: during the GRID deposit, a tetrahedron whose geometric stream density rho_geo/rho_bar = V_lag/V_eul exceeds D is deposited monolithically at its Eulerian centroid cell (the sub-sample-spacing fallback path) instead of being rasterized over its bbox. 0 (default) = off. Mass conservation is exact; point evaluation is unaffected.
-    bool   psExactDeposit;             // PS-DTFE --ps-exact-deposit: replace the nSub^3 sub-sampled grid deposit by EXACT tetrahedron-cell intersection moments (vendored r3d, Powell & Abel 2015). CPU only (falls back from --ps-gpu with a warning); 3D only; nSub is ignored (the exact deposit IS the nSub->infinity limit, so '.den' == '.a_den').
+    bool   psExactDeposit;             // PS-DTFE --ps-exact-deposit: replace the nSub^3 sub-sampled grid deposit by EXACT tetrahedron-cell intersection moments (vendored r3d, Powell & Abel 2015). CPU (double, reference) and GPU (float32 r3d port, --ps-gpu); 3D only; nSub is ignored (the exact deposit IS the nSub->infinity limit, so '.den' == '.a_den').
+    bool   psVertexMass;               // PS-DTFE --ps-vertex-mass: per-tetrahedron mass = sum over its vertices of weight/degree (chart-independent) instead of rho_bar * V_lag. Removes the 1-D(z_ic)/D(z) density-contrast suppression when --lagrangianInput holds PERTURBED IC positions (e.g. TNG z=127) rather than the unperturbed lattice.
+    bool   psVolumeWeighted;           // PS-DTFE --ps-volume-weighted: weight the velocity/gradient/scalar moment deposits (NOT the dispersion -- sigma_ij is an f-weighted CBE moment and stays mass-weighted, bit-identical to a default run) by EULERIAN-VOLUME shares instead of mass shares -> the cell values become volume-weighted means (the standard-DTFE '_a' convention, what linear theory's -aHf delta refers to) instead of mass-weighted (momentum-like) means. Density/streams/caustics unchanged. CPU and GPU deposits (and --ps-exact-deposit); incompatible with --ps-linear-deposit.
 #endif
     Real   averageDensity;// density normalization (computed as the box average if not given)
     size_t randomSeed;    // random seed for the Monte Carlo interpolation
@@ -188,6 +191,7 @@ struct User_options
     
     // additional options
     std::string configFilename;// config file from which program options were read
+    std::string scratchDir;    // --scratch-dir: back >=1 GB allocations (the full-grid accumulators) with mmap'ed files in this LOCAL directory instead of RAM; empty = off. See scratch_alloc.h
     bool   NGP;           // true if to use NGP grid interpolation instead of DTFE
     bool   CIC;           // true if to use CIC grid interpolation instead of DTFE
     bool   TSC;           // true if to use TSC grid interpolation instead of DTFE
@@ -201,6 +205,7 @@ struct User_options
     bool   approxPSD;     // compute approximate phase-space density f = rho * g (velocity-space DTFE)
     Real   lambda_th;    // eigenvalue threshold for T-web/V-web classification (default 0.0)
     Real   hubbleParam;  // Hubble parameter h for T-web/V-web normalization (-1 = read from header)
+    Real   scaleFactor;  // scale factor a of the snapshot (-1 = read from header 'Time'). Gadget velocities are u = v_pec/sqrt(a), so the V-web gradient needs a sqrt(a) to reach peculiar km/s -- without it the eigenvalues are 1/sqrt(a) inflated at high z (4.6x at z=20)
     int    verboseLevel;  // verbose level (see 'message.h')
     Real   randomSample;  // size of the random subsample if using only a subset of the data
     size_t poisson;       // if !=0, generate this many random particles instead of reading positions

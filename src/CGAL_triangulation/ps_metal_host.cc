@@ -92,6 +92,7 @@ bool psGpuDepositFields(std::vector<float>& verts,
                           const size_t nGrid[3], const size_t subOrigin[3], const size_t subDims[3],
                           int nSub, bool periodic,
                           bool fVel, bool fDisp, bool fGrad, bool fLinear,
+                          bool fVolW, bool fCaustic, bool fExact,
                           PSGpuGrids& out, std::string& err)
 {
     std::lock_guard<std::mutex> lock(ctxMutex());   // serialize dispatches (single queue)
@@ -104,11 +105,22 @@ bool psGpuDepositFields(std::vector<float>& verts,
     size_t const momBytes  = fVel  ? nCell * 12 : 4;
     size_t const m2Bytes   = fDisp ? nCell * 24 : 4;
     size_t const gradBytes = fGrad ? nCell * 36 : 4;
+    size_t const momwBytes  = fVolW    ? nCell * 4 : 4;
+    size_t const caustBytes = fCaustic ? nCell * 4 : 4;
+    size_t const svBytes    = fExact   ? nCell * 4 : 4;
+    bool   const fDispOwn   = fVolW && fDisp;   // dispersion keeps its own mass-weighted mean+normalizer
+    size_t const dvBytes    = fDispOwn ? nCell * 12 : 4;
+    size_t const dwBytes    = fDispOwn ? nCell * 4  : 4;
     out.mass.assign(nCell, 0.f);
     out.mom.assign(fVel ? nCell * 3 : 0, 0.f);
     out.m2.assign(fDisp ? nCell * 6 : 0, 0.f);
     out.grad.assign(fGrad ? nCell * 9 : 0, 0.f);
     out.streams.assign(nCell, 0u);
+    out.momw.assign(fVolW ? nCell : 0, 0.f);
+    out.caustic.assign(fCaustic ? nCell : 0, 0u);
+    out.streamvol.assign(fExact ? nCell : 0, 0.f);
+    out.dispvel.assign(fDispOwn ? nCell * 3 : 0, 0.f);
+    out.dispw.assign(fDispOwn ? nCell : 0, 0.f);
     if (masses.empty()) return true;    // nothing to deposit (empty partition)
 
     DepositParams P{};
@@ -126,6 +138,9 @@ bool psGpuDepositFields(std::vector<float>& verts,
     P.fDisp    = fDisp ? 1 : 0;
     P.fGrad    = fGrad ? 1 : 0;
     P.fLinear  = (fLinear && not dens.empty()) ? 1 : 0;
+    P.fVolW    = fVolW    ? 1 : 0;
+    P.fCaustic = fCaustic ? 1 : 0;
+    P.fExact   = fExact   ? 1 : 0;
     P.nTet     = uint32_t(masses.size());
 
     NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
@@ -159,10 +174,15 @@ bool psGpuDepositFields(std::vector<float>& verts,
     MTL::Buffer* bM2   = zeroBuf(m2Bytes);
     MTL::Buffer* bGrad = zeroBuf(gradBytes);
     MTL::Buffer* bStr  = zeroBuf(nCell * 4);
-    if (!bV || !bU || !bM || !bD || !bP || !bMass || !bMom || !bM2 || !bGrad || !bStr)
+    MTL::Buffer* bMomW  = zeroBuf(momwBytes);
+    MTL::Buffer* bCaust = zeroBuf(caustBytes);
+    MTL::Buffer* bSV    = zeroBuf(svBytes);
+    MTL::Buffer* bDV    = zeroBuf(dvBytes);
+    MTL::Buffer* bDW    = zeroBuf(dwBytes);
+    if (!bV || !bU || !bM || !bD || !bP || !bMass || !bMom || !bM2 || !bGrad || !bStr || !bMomW || !bCaust || !bSV || !bDV || !bDW)
     {
         err = "Metal buffer allocation failed (out of GPU-visible memory?)";
-        for (MTL::Buffer* b : {bV,bU,bM,bD,bP,bMass,bMom,bM2,bGrad,bStr}) if (b) b->release();
+        for (MTL::Buffer* b : {bV,bU,bM,bD,bP,bMass,bMom,bM2,bGrad,bStr,bMomW,bCaust,bSV,bDV,bDW}) if (b) b->release();
         pool->release();
         return false;
     }
@@ -179,11 +199,17 @@ bool psGpuDepositFields(std::vector<float>& verts,
     // retry re-zeros the grids, redoes the whole deposit with 4x shorter buffers and wider gaps,
     // and persistent failure falls back to the CPU deposit in the caller.
     // PS_METAL_CHUNK=<n> overrides the starting chunk size.
-    size_t const MIN_CHUNK = 2000;
+    // exact deposit: the per-tet cost spread is huge (a stretched void tet clips thousands of
+    // cells), so let the controller shrink much further than the sampled path's floor
+    size_t const MIN_CHUNK = fExact ? 50 : 2000;
     size_t const MAX_CHUNK = 500000;
     double targetSec = 0.25;
     useconds_t gapUs = 8000;          // ~3% overhead at 0.25 s buffers
-    size_t baseChunk = 25000;
+    // --ps-exact-deposit costs ~1-2 orders of magnitude more per tet (analytic clipping of
+    // every cell in the window vs a barycentric test per sample), so start far smaller: the
+    // adaptive controller only retargets AFTER the first chunk, and one oversized opening
+    // buffer is exactly what the watchdog kills.
+    size_t baseChunk = fExact ? 500 : 25000;
     if (const char* env = getenv("PS_METAL_CHUNK"))
     { long v = atol(env); if (v > 0) baseChunk = size_t(v); }
 
@@ -200,6 +226,11 @@ bool psGpuDepositFields(std::vector<float>& verts,
         std::memset(bM2->contents(),   0, m2Bytes);
         std::memset(bGrad->contents(), 0, gradBytes);
         std::memset(bStr->contents(),  0, nCell * 4);
+        std::memset(bMomW->contents(),  0, momwBytes);
+        std::memset(bCaust->contents(), 0, caustBytes);
+        std::memset(bSV->contents(),    0, svBytes);
+        std::memset(bDV->contents(),    0, dvBytes);
+        std::memset(bDW->contents(),    0, dwBytes);
 
         success = true;
         size_t chunk = baseChunk;
@@ -224,6 +255,11 @@ bool psGpuDepositFields(std::vector<float>& verts,
             enc->setBuffer(bStr,  0, 7);
             enc->setBuffer(bP,    0, 8);
             enc->setBuffer(bD,    P.fLinear ? start * 4 * sizeof(float) : 0, 9);
+            enc->setBuffer(bMomW, 0, 10);
+            enc->setBuffer(bCaust,0, 11);
+            enc->setBuffer(bSV,   0, 12);
+            enc->setBuffer(bDV,   0, 13);
+            enc->setBuffer(bDW,   0, 14);
             enc->dispatchThreads(MTL::Size(n, 1, 1), MTL::Size(tg, 1, 1));
             enc->endEncoding();
             cb->commit();
@@ -269,7 +305,7 @@ bool psGpuDepositFields(std::vector<float>& verts,
     if (!success)
     {
         err = lastErr;
-        for (MTL::Buffer* b : {bV,bU,bM,bD,bP,bMass,bMom,bM2,bGrad,bStr}) b->release();
+        for (MTL::Buffer* b : {bV,bU,bM,bD,bP,bMass,bMom,bM2,bGrad,bStr,bMomW,bCaust,bSV,bDV,bDW}) b->release();
         pool->release();
         return false;
     }
@@ -279,8 +315,15 @@ bool psGpuDepositFields(std::vector<float>& verts,
     if (fDisp) std::memcpy(out.m2.data(),   bM2->contents(),   nCell * 24);
     if (fGrad) std::memcpy(out.grad.data(), bGrad->contents(), nCell * 36);
     std::memcpy(out.streams.data(), bStr->contents(),  nCell * 4);
+    if (fVolW)    std::memcpy(out.momw.data(),    bMomW->contents(),  nCell * 4);
+    if (fCaustic) std::memcpy(out.caustic.data(), bCaust->contents(), nCell * 4);
+    if (fExact)   std::memcpy(out.streamvol.data(), bSV->contents(), nCell * 4);
+    if (fDispOwn) {
+        std::memcpy(out.dispvel.data(), bDV->contents(), nCell * 12);
+        std::memcpy(out.dispw.data(),   bDW->contents(), nCell * 4);
+    }
 
-    for (MTL::Buffer* b : {bV,bU,bM,bD,bP,bMass,bMom,bM2,bGrad,bStr}) b->release();
+    for (MTL::Buffer* b : {bV,bU,bM,bD,bP,bMass,bMom,bM2,bGrad,bStr,bMomW,bCaust,bSV,bDV,bDW}) b->release();
     pool->release();
     return true;
 }

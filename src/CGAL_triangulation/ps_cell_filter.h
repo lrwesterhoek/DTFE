@@ -39,12 +39,19 @@ struct PSCellGeometry
 // volume, so drop it; an adjacent non-degenerate stream covers the region. NOTE: this must
 // stay consistent with matrixInverse()'s degeneracy criterion -- the relative-determinant
 // pre-filter alone does NOT catch every cell that matrixInverse() zeroes.
+// 'skipOwnership': apply every CHART-INDEPENDENT filter (dummy, hull artefact, degeneracy)
+// but NOT the Lagrangian-partition ownership tiling. Used by the --ps-vertex-mass degree
+// pass, which must count a vertex's GLOBALLY-depositing incident tets: ownership only decides
+// WHICH partition deposits a tet, not WHETHER it deposits, so degrees must ignore it -- while
+// the drop filters decide 'whether' and are computed identically in every partition that sees
+// the cell (padded vertices carry their full neighborhood).
 inline bool psFilterCell(Cell_handle &cell,
                          User_options &userOptions,
                          Box &boxCoordinates,
                          bool const checkSingularInverse,
                          size_t *nDegenerateInverse,
-                         PSCellGeometry &g)
+                         PSCellGeometry &g,
+                         bool const skipOwnership = false)
 {
 #ifdef TEST_PADDING
     // Skip cells touching a dummy padding vertex.
@@ -58,7 +65,7 @@ inline bool psFilterCell(Cell_handle &cell,
 
     // Lagrangian-partition ownership: padding zones overlap, so keep a cell only if its
     // Lagrangian centroid (not an arbitrary vertex) lies in the primary box -> tiles without double-counting
-    if ( !userOptions.lagrangianRegion.isNullBox() )
+    if ( !skipOwnership && !userOptions.lagrangianRegion.isNullBox() )
     {
         double cen[NO_DIM];
         for (int d = 0; d < NO_DIM; ++d) cen[d] = 0.;

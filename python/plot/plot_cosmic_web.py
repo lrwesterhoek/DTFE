@@ -332,7 +332,7 @@ def main():
     snapshot = f"{args.snap:03d}"
 
     try:
-        fs = FieldSet(snapdir(args), method=args.method, averaged=not args.raw)
+        fs = FieldSet(snapdir(args), method=args.method, averaged=not args.raw, prefix=args.prefix)
     except FileNotFoundError as e:
         print(f"skipping snapshot {snapshot} (no {args.method} fields): {e}")
         return

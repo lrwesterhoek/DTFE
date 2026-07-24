@@ -38,10 +38,15 @@ std::string gpuDeviceName();
 struct PSGpuGrids
 {
     std::vector<float>    mass;     // subTotal      accumulated MASS (density = mass / cellVolume)
-    std::vector<float>    mom;      // subTotal*3    mass-weighted velocity moment  [i*3+j]   (fVel)
-    std::vector<float>    m2;       // subTotal*6    mass-weighted 2nd moment, upper triangle [i*6+c] (fDisp)
-    std::vector<float>    grad;     // subTotal*9    mass-weighted velocity-gradient moment [i*9+j*3+i'] (fGrad)
+    std::vector<float>    mom;      // subTotal*3    weighted velocity moment  [i*3+j]   (fVel)
+    std::vector<float>    m2;       // subTotal*6    weighted 2nd moment, upper triangle [i*6+c] (fDisp)
+    std::vector<float>    grad;     // subTotal*9    weighted velocity-gradient moment [i*9+j*3+i'] (fGrad)
     std::vector<uint32_t> streams;  // subTotal      interior-sample count (streams = count / nSub^3)
+    std::vector<float>    momw;     // subTotal      moment-weight normalizer sum (fVolW; else EMPTY -- 'mass' is the normalizer)
+    std::vector<uint32_t> caustic;  // subTotal      orientation bits, OR-accumulated (fCaustic; else EMPTY)
+    std::vector<float>    dispvel;  // subTotal*3    dispersion's own mass-weighted mean sum(m_s v_s) (fVolW+fDisp; else EMPTY)
+    std::vector<float>    dispw;    // subTotal      its normalizer sum(m_s)                (fVolW+fDisp; else EMPTY)
+    std::vector<float>    streamvol;// subTotal      exact cell-mean multiplicity sum(V_int)/V_cell (fExact; else EMPTY). 'streams' then carries the raw integer tet-touch count.
 };
 
 // Runs the mass-conserving tetrahedral deposit on the default GPU device. Vertices must
@@ -53,6 +58,17 @@ struct PSGpuGrids
 // fLinear (--ps-linear-deposit) weights the interior samples by the linear density built
 // from the per-tet vertex densities in 'dens' (nTet*4; may be EMPTY when fLinear is off),
 // renormalized per tet so the deposited total still equals the tet mass exactly.
+// fVolW (--ps-volume-weighted) switches the mom/m2/grad moment weights to equal Eulerian-
+// volume shares (|det|/6 per tet, computed in-kernel) and fills out.momw with their
+// normalizer; the mass grid is unaffected. Mutually exclusive with fLinear (rejected at
+// option parsing). fCaustic (--ps-caustics) ORs each tet's orientation bits (1 = det>0,
+// 2 = det<0) into out.caustic at every deposited sample -- OR is order-invariant, so the
+// result matches the CPU deposit's bits (float-vs-double det sign only differs below the
+// degeneracy cut, where cells are dropped).
+// fExact (--ps-exact-deposit) replaces the nSub^3 sampling by the kernel's float32 r3d port
+// (analytic tet-cell clipping + order-2 moments); nSub is then ignored. The CPU path stays
+// the DOUBLE-precision reference -- the GPU exact deposit agrees to float rounding, like
+// every other GPU/CPU field pair.
 // Returns false with 'err' set if there is no device / setup fails; outputs untouched in
 // that case, zeroed otherwise.
 // CONSUMES verts/vels/masses/dens (several GB per partition at scale): Metal frees each one
@@ -61,12 +77,13 @@ struct PSGpuGrids
 // call returns -- the CPU fallback deposits from the triangulation, not from these arrays.
 bool psGpuDepositFields(std::vector<float>& verts,   // nTet*12: 4 wrapped Eulerian vertices
                         std::vector<float>& vels,    // nTet*12: 4 vertex velocities (empty if unused)
-                        std::vector<float>& masses,  // nTet: tet mass rho_bar * V_lag
+                        std::vector<float>& masses,  // nTet: tet mass (rho_bar * V_lag, or the --ps-vertex-mass shares)
                         std::vector<float>& dens,    // nTet*4: vertex densities (empty unless fLinear)
                         const double boxLo[3], const double dx[3],
                         const size_t nGrid[3], const size_t subOrigin[3], const size_t subDims[3],
                         int nSub, bool periodic,
                         bool fVel, bool fDisp, bool fGrad, bool fLinear,
+                        bool fVolW, bool fCaustic, bool fExact,
                         PSGpuGrids& out, std::string& err);
 
 

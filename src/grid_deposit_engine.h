@@ -125,9 +125,10 @@ void gridDeposit_regular_grid(std::vector<Particle_data> &particles,
             {
                 int ni[NO_DIM]; size_t rem = n;
                 for (int d=NO_DIM-1; d>=0; --d) { ni[d] = rem % S; rem /= S; }
-                int index = 0;
+                // size_t: an int32 flat index overflows above ~1290^3 cells (2^31)
+                size_t index = 0;
                 Real result = (*it)->weight();
-                for (int d=0; d<NO_DIM; ++d) { index = index * nGrid[d] + cell[d][ni[d]]; result *= weight[d][ni[d]]; }
+                for (int d=0; d<NO_DIM; ++d) { index = index * size_t(nGrid[d]) + size_t(cell[d][ni[d]]); result *= weight[d][ni[d]]; }
                 q->density[index] += result;
                 q->velocity[index] += (*it)->velocity() * result;
             }
@@ -159,9 +160,10 @@ void gridDeposit_regular_grid(std::vector<Particle_data> &particles,
             {
                 int ni[NO_DIM]; int rem = n;
                 for (int d=NO_DIM-1; d>=0; --d) { ni[d] = rem % cellCount[d]; rem /= cellCount[d]; }
-                int index = 0;
+                // size_t: an int32 flat index overflows above ~1290^3 cells (2^31)
+                size_t index = 0;
                 Real result = (*it)->weight();
-                for (int d=0; d<NO_DIM; ++d) { index = index * nGrid[d] + cell[d][ni[d]]; result *= weight[d][ni[d]]; }
+                for (int d=0; d<NO_DIM; ++d) { index = index * size_t(nGrid[d]) + size_t(cell[d][ni[d]]); result *= weight[d][ni[d]]; }
                 q->density[index] += result;
                 q->velocity[index] += (*it)->velocity() * result;
             }

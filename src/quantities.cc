@@ -131,7 +131,10 @@ size_t Quantities::size() const
     fieldSize( this->velocity_vweb_eigenvalues, &temp );
 #ifdef PHASE_SPACE
     fieldSize( this->stream_count, &temp );
+    fieldSize( this->tet_touch, &temp );
     fieldSize( this->mass_weight, &temp );
+    fieldSize( this->disp_weight, &temp );
+    fieldSize( this->disp_velocity, &temp );
     fieldSize( this->caustic_bits, &temp );
 #endif
     return temp;
@@ -183,7 +186,10 @@ void Quantities::addFrom(Quantities const &other)
     addField(other.velocity_vweb_eigenvalues, &this->velocity_vweb_eigenvalues);
 #ifdef PHASE_SPACE
     addField(other.stream_count, &this->stream_count);
+    addField(other.tet_touch, &this->tet_touch);   // integer tet-touch counts sum linearly across partitions
     addField(other.mass_weight, &this->mass_weight);
+    addField(other.disp_weight, &this->disp_weight);
+    addField(other.disp_velocity, &this->disp_velocity);
     orField(other.caustic_bits, &this->caustic_bits);   // orientation bits: OR, never '+='
 #endif
 }
@@ -201,7 +207,11 @@ void Quantities::normalizePhaseSpace(Field const &field, Real const weightFromDe
     if ( fromDensity and (weightFromDensityScale <= Real(0.) or this->density.empty()) )
         return;   // no mass-weighted field was deferred (or nothing to reconstruct it from)
     size_t const n = fromDensity ? this->density.size() : this->mass_weight.size();
-    bool const haveVel = field.velocity || field.velocity_dispersion; // velocity holds sum(rho v)
+    // velocity holds sum(rho v). A dispersion-only VOLUME-WEIGHTED run never allocates it --
+    // the dispersion carries its own mean in disp_velocity (nonempty disp_weight is that
+    // configuration's signature), so infer the gate from the data actually present.
+    bool const haveVel = field.velocity
+                         || (field.velocity_dispersion and this->disp_weight.empty());
     if ( haveVel and this->velocity.empty() )
         return;   // no weighted moments were accumulated (e.g. density-only field selection)
     for (size_t i = 0; i < n; ++i)
@@ -213,9 +223,10 @@ void Quantities::normalizePhaseSpace(Field const &field, Real const weightFromDe
         if ( field.velocity_gradient ) this->velocity_gradient[i] *= inv;
         if ( field.scalar )            this->scalar[i]            *= inv;
         if ( field.scalar_gradient )   this->scalar_gradient[i]   *= inv;
-        if ( field.velocity_dispersion )
+        if ( field.velocity_dispersion and this->disp_weight.empty() )
         {
-            // sigma_ij = <v_i v_j> - <v_i><v_j>, using the now-normalized <v>.
+            // sigma_ij = <v_i v_j> - <v_i><v_j>, using the now-normalized <v>. Same weighting
+            // for both moments here, so 'velocity' IS the right mean.
             Pvector<Real,noVelComp> const &vbar = this->velocity[i];
             size_t c = 0;
             for (int a = 0; a < NO_DIM; ++a)
@@ -229,8 +240,34 @@ void Quantities::normalizePhaseSpace(Field const &field, Real const weightFromDe
         }
     }
 
-    // mass_weight is internal to this normalization and never written out -- release it for real
+    // --ps-volume-weighted + dispersion: the dispersion carries MASS-weighted moments while
+    // 'velocity' above was normalized by the VOLUME weight, so it must be closed out with its
+    // own mass-weighted mean -- a separate pass over its own normalizer.
+    if ( field.velocity_dispersion and not this->disp_weight.empty() )
+    {
+        size_t const nd = this->disp_weight.size();
+        for (size_t i = 0; i < nd; ++i)
+        {
+            Real const wm = this->disp_weight[i];
+            if ( wm <= Real(0.) ) continue;
+            Real const invm = Real(1.) / wm;
+            Pvector<Real,noVelComp> const vbar = this->disp_velocity[i] * invm;   // <v>_mass
+            size_t c = 0;
+            for (int a = 0; a < NO_DIM; ++a)
+                for (int b = a; b < NO_DIM; ++b)
+                {
+                    Real s = this->velocity_dispersion[i][c] * invm - vbar[a]*vbar[b];
+                    if ( a == b and s < Real(0.) ) s = Real(0.);   // variance: clamp FP-noise negatives
+                    this->velocity_dispersion[i][c] = s;
+                    ++c;
+                }
+        }
+    }
+
+    // these three are internal to this normalization and never written out -- release for real
     std::vector<Real>().swap( this->mass_weight );
+    std::vector<Real>().swap( this->disp_weight );
+    std::vector< Pvector<Real,noVelComp> >().swap( this->disp_velocity );
 }
 
 
@@ -249,7 +286,9 @@ void addFieldSubgrid(std::vector<T> const &src, std::vector<T> *dst,
         size_t rem = l, c[NO_DIM];
         for (int d = NO_DIM - 1; d >= 0; --d) { c[d] = rem % m[d]; rem /= m[d]; }   // local coords
         size_t g = 0;
-        for (int d = 0; d < NO_DIM; ++d) g = g * full[d] + (c[d] + o[d]);           // global row-major flat
+        // '% full[d]': the sub-box may WRAP a periodic axis (o[d]+m[d] > full[d]), which is the
+        // normal case for a partition straddling the box seam. No-op for an unwrapped box.
+        for (int d = 0; d < NO_DIM; ++d) g = g * full[d] + ((c[d] + o[d]) % full[d]);  // global row-major flat
         (*dst)[g] += src[l];
     }
 }
@@ -273,7 +312,10 @@ void Quantities::addFromSubgrid(Quantities const &other, size_t const *fullGrid)
     addFieldSubgrid(other.velocity_tweb_eigenvalues, &this->velocity_tweb_eigenvalues, o, m, fullGrid);
     addFieldSubgrid(other.velocity_vweb_eigenvalues, &this->velocity_vweb_eigenvalues, o, m, fullGrid);
     addFieldSubgrid(other.stream_count, &this->stream_count, o, m, fullGrid);
+    addFieldSubgrid(other.tet_touch, &this->tet_touch, o, m, fullGrid);
     addFieldSubgrid(other.mass_weight, &this->mass_weight, o, m, fullGrid);
+    addFieldSubgrid(other.disp_weight, &this->disp_weight, o, m, fullGrid);
+    addFieldSubgrid(other.disp_velocity, &this->disp_velocity, o, m, fullGrid);
     // caustic orientation bits: same sub-grid -> global mapping, but OR instead of '+='
     if ( not other.caustic_bits.empty() )
     {
@@ -285,7 +327,10 @@ void Quantities::addFromSubgrid(Quantities const &other, size_t const *fullGrid)
             size_t rem = l, c[NO_DIM];
             for (int d = NO_DIM - 1; d >= 0; --d) { c[d] = rem % m[d]; rem /= m[d]; }
             size_t g = 0;
-            for (int d = 0; d < NO_DIM; ++d) g = g * fullGrid[d] + (c[d] + o[d]);
+            // '% fullGrid[d]': the sub-box may WRAP a periodic axis (o[d]+m[d] > fullGrid[d]),
+            // exactly as in addFieldSubgrid above -- without it the seam partitions index past
+            // the end of caustic_bits.
+            for (int d = 0; d < NO_DIM; ++d) g = g * fullGrid[d] + ((c[d] + o[d]) % fullGrid[d]);
             this->caustic_bits[g] = Real( int(this->caustic_bits[g]) | int(other.caustic_bits[l]) );
         }
     }

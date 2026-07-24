@@ -15,8 +15,8 @@ SIMULATION="${DTFE_SIM:-TNG50-3-Dark}"
 SNAPSHOTS=(99)
 
 # Interpolation grid cells per axis and padding (mean interparticle spacings).
-GRID_SIZE=512
-PADDING=25
+GRID_SIZE=1024
+PADDING=50
 
 # Subdirectory prefix of the snapshot chunks inside the simulation directory.
 INPUT_SUBDIR="snapdir"

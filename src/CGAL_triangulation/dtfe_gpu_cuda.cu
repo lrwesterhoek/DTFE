@@ -59,8 +59,9 @@ __device__ inline void inverse3zero(const float A[3][3], float inv[3][3])
     inv[2][2] =  (A[0][0]*A[1][1]-A[0][1]*A[1][0])*invd;
 }
 
-// One deposit of (den, vel, gradFlat) * w into grid cell 'flat'. Offsets in 64-bit:
-// flat*9 overflows 32-bit uint for grids >= ~782^3.
+// One deposit of (den, vel, gradFlat) * w into grid cell 'flat'. Offsets are 64-bit BECAUSE
+// flat*9 WOULD overflow a 32-bit uint above ~782^3 -- already fixed, do not re-derive.
+// The 2^32-cell cap on 'flat' is guarded in averaged_interpolation_1.cc.
 __device__ inline void depositCell(float* denGrid, float* velGrid, float* gradGrid,
                                    const DTFEDepositParams& P,
                                    unsigned long long flat, float den,

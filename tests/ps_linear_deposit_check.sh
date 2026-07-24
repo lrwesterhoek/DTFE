@@ -13,9 +13,11 @@
 #     within the usual float32 atomic tolerances.
 #  D) [gated on --ps-exact-deposit support] the r3d exact conservative deposit: mass
 #     conservation at (or below) the sampled deposit's float floor, '.den' == '.a_den'
-#     bit-exact (the exact deposit is nSub-independent), integer '.streams' bit-exact
-#     between same-split partitioned runs at 1 and N threads, the sampled '.a_den' at
-#     nSub = 1/3/5 approaching the exact grid MONOTONICALLY (L1), and the
+#     bit-exact (the exact deposit is nSub-independent), the raw integer '.tetTouch'
+#     count bit-exact between same-split partitioned runs at 1 and N threads, '.streams'
+#     (the volume-weighted multiplicity -- a float, hence checked to a tolerance, not
+#     bit-exactly) hitting the pancake's ANALYTIC values of 1 and 3, the sampled '.a_den'
+#     at nSub = 1/3/5 approaching the exact grid MONOTONICALLY (L1), and the
 #     '--ps-linear-deposit' composition (exact order-1 linear-density shares) conserving
 #     mass and staying strongly correlated with the exact uniform deposit.
 #
@@ -103,8 +105,30 @@ if [ "${HAVE_EXACT}" -eq 1 ]; then
     echo ">> runs 10-11: pancake, sampled '.a_den' at nSub 1/5 (3 is run 3) for the convergence ladder"
     run "${TMP}/pld_pan_ns1" "${SNAP_PAN}" --periodic --avg-subsamples 1
     run "${TMP}/pld_pan_ns5" "${SNAP_PAN}" --periodic --avg-subsamples 5
+    if [ "${GPU_BUILT}" -eq 1 ]; then
+        echo ">> runs 12-13: exact deposit + dispersion, CPU vs --ps-gpu (float32 r3d port parity)"
+        # dedicated pair (with the dispersion field run() does not request): the GPU exact
+        # deposit is a hand-written float32 r3d port and had NO parity coverage in the suite
+        for tag in exd exg; do
+            GPUFLAG=""; [ "${tag}" = "exg" ] && GPUFLAG="--ps-gpu"
+            rm -f "${TMP}/pld_pan_${tag}".*
+            set +e
+            "${BIN}" "${SNAP_PAN}" "${TMP}/pld_pan_${tag}" --grid "${GRID}" \
+                --field density velocity dispersion --input 105 --MpcUnit 1 --verbose 1 \
+                --periodic --ps-exact-deposit ${GPUFLAG} > "${TMP}/pld_pan_${tag}.log" 2>&1
+            rc=$?
+            set -e
+            if [ "${rc}" -ne 0 ]; then
+                echo "   ERROR: PS-DTFE exited with code ${rc} -- last 25 lines:"
+                tail -n 25 "${TMP}/pld_pan_${tag}.log" | sed 's/^/      | /'
+                exit 1
+            fi
+        done
+    else
+        echo ">> runs 12-13 skipped (CPU-only build: no exact-deposit GPU parity to check)"
+    fi
 else
-    echo ">> runs 6-11 skipped (binary lacks --ps-exact-deposit)"
+    echo ">> runs 6-13 skipped (binary lacks --ps-exact-deposit)"
 fi
 
 echo ">> checking the numbers ..."
@@ -176,13 +200,51 @@ if have_exact:
           f"|mean-1| = {abs(ex.mean()-1.0):.3e} (sampled: {du_mean_err:.3e})")
     check("D .den == .a_den (nSub-independent)",
           np.array_equal(ex, exa), "the exact deposit is the nSub->infinity limit")
-    sx = np.fromfile(f"{tmp}/pld_pan_ex.streams", dtype=np.float32)
-    check("D exact streams integer-valued", bool(np.allclose(sx, np.round(sx), atol=1e-6)),
-          f"max frac dev = {np.abs(sx - np.round(sx)).max():.2e}")
+    # '.tetTouch': the RAW INTEGER count of tetrahedra with a nonzero cell intersection.
+    # This is the field that carries the old integer-'.streams' contract -- quantities.cc
+    # sums it linearly across partitions, so it stays bit-exact under any thread order.
+    tx = np.fromfile(f"{tmp}/pld_pan_ex.tetTouch", dtype=np.float32).astype(np.float64)
+    # 'integer-valued' alone is vacuous -- any int < 2^24 casts exactly, so an all-zero or
+    # scrambled grid would pass it. Pin the count to >= 1 as well: the periodic tessellation
+    # is space-filling, so EVERY cell is touched by at least one tet (measured min = 2).
+    check("D exact tetTouch integer-valued and >= 1",
+          bool(np.allclose(tx, np.round(tx), atol=1e-6)) and tx.min() >= 1,
+          f"max frac dev = {np.abs(tx - np.round(tx)).max():.2e}, "
+          f"touch range = [{tx.min():.0f}, {tx.max():.0f}]")
+    t1 = np.fromfile(f"{tmp}/pld_pan_ex_p1.tetTouch", dtype=np.float32)
+    tN = np.fromfile(f"{tmp}/pld_pan_ex_pN.tetTouch", dtype=np.float32)
+    check("D partitioned tetTouch thread-invariant (bit-exact)", np.array_equal(t1, tN),
+          "same split, 1 vs all threads (integer counts merge order-independently)")
+
+    # '.streams' is now the VOLUME-WEIGHTED multiplicity (1/V_cell) sum V_int -- a float, so
+    # neither integer-valued nor bit-exact (float shares sum order-dependently). What the new
+    # definition buys is that it is the ANALYTIC nSub->infinity limit, so the two properties
+    # below are exact statements about the Zel'dovich pancake rather than sampling artefacts.
+    sx = np.fromfile(f"{tmp}/pld_pan_ex.streams", dtype=np.float32).astype(np.float64)
+    # The pancake folds into exactly 3 streams behind the caustic. The sampled deposit
+    # overshoots this badly (a grazing sub-sample counts a full +1; run 3's 'su' reports
+    # ~14), while the exact deposit weights each tet by its intersected volume and lands on 3.
+    check("D exact streams max == analytic 3", abs(sx.max() - 3.0) < 0.01,
+          f"max = {sx.max():.6f} (analytic 3.00; the sampled deposit gives {su.max():.2f})")
+    # Outside the caustic the tessellation covers each cell exactly once, so those cells
+    # must read exactly 1.0 -- and every cell is covered at least once (space-filling).
+    near1 = np.abs(sx - 1.0) < 1e-3
+    check("D exact streams single-stream cells == 1.0",
+          sx.min() > 1.0 - 1e-3 and near1.mean() > 0.5,
+          f"min = {sx.min():.6f}, {near1.mean()*100:.2f}% of cells within 1e-3 of 1.0")
+    # ties the two fields together: each touching tet contributes exactly 1 to '.tetTouch' and
+    # its volume share V_int/V_cell <= 1 to '.streams', so streams <= tetTouch pointwise. This
+    # is what would catch a zeroed/mis-normalized accumulator in EITHER field. (The bound needs
+    # the bbox rasterization -- --ps-halo-release's centroid fallback deposits V_tet/V_cell,
+    # which may exceed 1 for a tet bigger than a cell. No run here uses it.)
+    viol = int(np.sum(sx > tx + 1e-6))
+    check("D exact streams <= tetTouch (pointwise)", viol == 0,
+          f"{viol} cells violate; min slack = {(tx - sx).min():.6f}")
+    # partition split: same tolerance form as the density check just below
     s1 = np.fromfile(f"{tmp}/pld_pan_ex_p1.streams", dtype=np.float32)
     sN = np.fromfile(f"{tmp}/pld_pan_ex_pN.streams", dtype=np.float32)
-    check("D partitioned streams thread-invariant (bit-exact)", np.array_equal(s1, sN),
-          "same split, 1 vs all threads")
+    smax = np.abs(s1.astype(np.float64) - sN).max() / (np.abs(s1).max() + 1e-30)
+    check("D partitioned streams thread-invariant", smax < 1e-5, f"max rel = {smax:.3e}")
     d1 = load(f"{tmp}/pld_pan_ex_p1", ".den")
     dN = load(f"{tmp}/pld_pan_ex_pN", ".den")
     dmax = np.abs(d1 - dN).max() / (np.abs(d1).max() + 1e-30)
@@ -202,6 +264,21 @@ if have_exact:
     corr_ex = np.corrcoef(np.log(ex[mm]), np.log(exl[mm]))[0, 1]
     check("D exact+linear differs smoothly from exact", corr_ex > 0.98,
           f"log-density correlation = {corr_ex:.5f}")
+    # float32 r3d port parity: the GPU exact deposit (exact_init_tet/exact_clip_plane/
+    # exact_reduce2 in metal/ps_deposit.metal + the CUDA mirror) vs the CPU double r3d
+    if gpu:
+        for ext, nc, tol in ((".den", 1, 1e-4), (".vel", 3, 1e-4), (".velDisp", 1, 1e-4)):
+            c = load(f"{tmp}/pld_pan_exd", ext, nc)
+            g = load(f"{tmp}/pld_pan_exg", ext, nc)
+            mrel = np.abs(c - g).mean() / (np.abs(c).max() + 1e-30)
+            check(f"D exact GPU{ext} matches CPU", mrel < tol, f"mean rel = {mrel:.3e}")
+        sc = np.fromfile(f"{tmp}/pld_pan_exd.streams", dtype=np.float32).astype(np.float64)
+        sg = np.fromfile(f"{tmp}/pld_pan_exg.streams", dtype=np.float32).astype(np.float64)
+        srel = np.abs(sc - sg).max() / (np.abs(sc).max() + 1e-30)
+        check("D exact GPU streams match CPU", srel < 1e-3,
+              f"max rel = {srel:.3e} (float volume-weighted multiplicity)")
+    else:
+        print("   SKIP D exact GPU parity (CPU-only build)")
 else:
     print("   SKIP D exact deposit (binary lacks --ps-exact-deposit)")
 

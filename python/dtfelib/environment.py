@@ -90,13 +90,16 @@ def sample_grid(grid: np.ndarray, frac: np.ndarray, mode: str = "trilinear") -> 
 
 def sample_fields_at(sim: str, snap: int, pos_ckpc_h: np.ndarray,
                      fields=("density", "tweb", "vweb"),
-                     method: str = "auto", averaged: bool = True) -> dict:
+                     method: str = "auto", averaged: bool = True,
+                     prefix: str | None = None) -> dict:
     """Sample `fields` at positions (M,3) in ckpc/h for one snapshot.
 
     Density is returned in mean units (rho/rho_bar) for both estimators; other fields raw.
     Missing individual fields come back as NaN arrays (check FieldSet.has upstream if needed).
+    prefix reads an alternate OUTPUT_PREFIX grid set (e.g. 'ps_mw'), see FieldSet.
     """
-    fs = FieldSet(DATA_ROOT / sim / f"snapdir_{snap:03d}", method=method, averaged=averaged)
+    fs = FieldSet(DATA_ROOT / sim / f"snapdir_{snap:03d}", method=method, averaged=averaged,
+                  prefix=prefix)
     frac = np.asarray(pos_ckpc_h, dtype=np.float64) / box_ckpc_h(sim, snap)
     out = {"_method": fs.method, "_grid_n": fs.grid_n}
     for name in fields:

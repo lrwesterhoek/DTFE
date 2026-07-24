@@ -18,7 +18,8 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as colors
 from scipy.ndimage import gaussian_filter
 
-from dtfelib import make_fieldset
+from dtfelib import STREAM_TOL, make_fieldset
+from dtfelib import pointeval
 
 # which field families to plot (PS-only ones are skipped automatically under --method dtfe)
 PROCESS_DENSITY = True
@@ -28,6 +29,8 @@ PROCESS_VELOCITY = True     # velocity magnitude |v|
 PROCESS_WEB = True          # web volume-fraction stats + eigenvalue maps (no classification maps)
 
 SLICE_PLANES_TO_PLOT = [0, 1, 2]
+PROCESS_POINTEVAL = True    # point-evaluated ('--sample-points') maps, when present
+
 SLICE_PLANES = {
     0: {'name': 'yz_plane', 'axis_labels': ('Y', 'Z')},
     1: {'name': 'xz_plane', 'axis_labels': ('X', 'Z')},
@@ -111,14 +114,17 @@ def plot_density(density_field, slice_dim, box_size, redshift=None, save_path=No
 def plot_streams(stream_field, slice_dim, box_size, redshift=None, save_path=None, label="PS-DTFE"):
     stream_slice = extract_slice(stream_field, slice_dim).T
 
-    max_streams = int(stream_slice.max())
-    if max_streams == 0:
+    # '.streams' is a float multiplicity, not an integer count (see dtfelib.STREAM_TOL), so
+    # every comparison here carries a tolerance: truncating with int() would read a
+    # single-stream 0.99999 cell as an empty slice.
+    max_streams = float(stream_slice.max())
+    if max_streams < STREAM_TOL:
         print(f"    Warning: No streams in slice (dim={slice_dim})")
         return
 
     fig, ax = plt.subplots(figsize=(8, 7))
 
-    if max_streams <= 1:
+    if max_streams <= 1 + STREAM_TOL:
         cmap = plt.cm.viridis.copy()
         cmap.set_bad(cmap(0))
         im = ax.imshow(
@@ -148,12 +154,11 @@ def plot_streams(stream_field, slice_dim, box_size, redshift=None, save_path=Non
     cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     cbar.set_label("Number of streams", fontsize=12)
 
-    nonzero = stream_slice[stream_slice > 0]
-    multi = stream_slice[stream_slice > 1]
+    multi = stream_slice[stream_slice > 1 + STREAM_TOL]
     total = stream_slice.size
     ax.text(
         0.02, 0.98,
-        f"max={max_streams}, multi-stream={100*multi.size/total:.1f}%",
+        f"max={max_streams:.2f}, multi-stream={100*multi.size/total:.1f}%",
         transform=ax.transAxes, fontsize=9, verticalalignment='top',
         bbox=dict(boxstyle='round', facecolor='white', alpha=0.7)
     )
@@ -179,7 +184,7 @@ def plot_density_comparison(density_field, stream_field, slice_dim, box_size,
         return
     vmin_dens = DENSITY_VMIN if DENSITY_VMIN is not None else max(np.min(positive), 1e-6)
     vmax_dens = DENSITY_VMAX if DENSITY_VMAX is not None else dens_slice.max()
-    max_streams = int(stream_slice.max())
+    max_streams = float(stream_slice.max())
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
     plane_info = SLICE_PLANES[slice_dim]
@@ -198,7 +203,7 @@ def plot_density_comparison(density_field, stream_field, slice_dim, box_size,
     ax1.set_aspect('equal')
     fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04, label=r"Density $\rho/\bar{\rho}$")
 
-    if max_streams > 1:
+    if max_streams > 1 + STREAM_TOL:
         cmap_str = plt.cm.inferno.copy()
         cmap_str.set_bad(cmap_str(0))
         cmap_str.set_under(cmap_str(0))
@@ -293,9 +298,17 @@ def plot_web_eigenvalues(eig_field, slice_dim, box_size, title, redshift=None, s
         plt.close(fig)
 
 
+# ---------------------------------------------------------------- point-evaluated maps
+# The '--sample-points' maps live in dtfelib.pointeval (shared with plot_pointeval.py,
+# which renders them for every snapshot of every simulation).
+
 def main():
     global _SMOOTH
-    fs, args = make_fieldset("Slice-map plots of all DTFE/PS-DTFE raw fields.")
+    fs, args = make_fieldset("Slice-map plots of all DTFE/PS-DTFE raw fields.",
+                             extra=lambda p: p.add_argument(
+                                 "--pointeval-only", action="store_true",
+                                 help="render only the point-evaluated ('--sample-points') "
+                                      "maps, skipping every grid load"))
     _SMOOTH = args.smooth
     label = "PS-DTFE" if fs.method == "ps" else "DTFE"
     z, box = fs.meta.redshift, fs.meta.box_mpc
@@ -303,6 +316,11 @@ def main():
 
     print(fs)
     print(f"plot smoothing: {_SMOOTH} cells | figures -> {out_base}")
+
+    if PROCESS_POINTEVAL and fs.method == "ps":
+        pointeval.render_fields(fs, out_base, label=label)
+    if args.pointeval_only:
+        return
 
     fields = {}
 
@@ -314,8 +332,8 @@ def main():
     if PROCESS_STREAMS and fs.has('streams'):
         streams = smooth(fs.load('streams'))
         fields['streams'] = streams
-        print(f"  streams: max={streams.max():.0f} mean={streams.mean():.2f} "
-              f"multi-stream={100*np.mean(streams > 1):.2f}%")
+        print(f"  streams: max={streams.max():.2f} mean={streams.mean():.2f} "
+              f"multi-stream={100*np.mean(streams > 1 + STREAM_TOL):.2f}%")
 
     if PROCESS_DISPERSION and fs.has('dispersion'):
         fields['velDisp'] = smooth(fs.load('dispersion'))

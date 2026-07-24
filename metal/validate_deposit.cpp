@@ -16,6 +16,12 @@
 //    T9  analytic velocity-field checks: constant field reproduced exactly; linear field
 //        v = Gx recovers the gradient in every covered cell
 //    T10 partition sub-grid support (subOrigin/subDims deposit window)
+//    T11 --ps-volume-weighted path (fVolW): two coincident tets with different masses give
+//        the analytic volume-weighted mean in mom/momw and mass-weighted mean in dispvel/dispw
+//    T12 --ps-caustics path (fCaustic): a tet and its orientation-flip stamp distinct bits;
+//        together every covered cell reads exactly 3 (the fold-caustic flag)
+//    T13 --ps-exact-deposit path (fExact): the 6-tet Freudenthal cube at density 1 deposits
+//        exactly mass 1 and multiplicity 1 into each of the 8 cells it tiles, nothing outside
 //
 //  Field tests run when the 'depositFields' kernel exists in the library; density-only
 //  parity runs against 'depositDensity' otherwise (Phase A gate).
@@ -72,6 +78,13 @@ struct CpuOut {
     std::vector<float>    m2;        // nCell*6 (xx,xy,xz,yy,yz,zz)
     std::vector<float>    grad;      // nCell*9 (j*3+i)
     std::vector<uint32_t> streams;   // nCell
+    // flag-gated kernel outputs (filled by Gpu::run when the matching P flag is set;
+    // the T11-T13 tests check them against ANALYTIC expectations, no CPU mirror needed)
+    std::vector<float>    momw;      // nCell    fVolW: volume-share normalizer
+    std::vector<uint32_t> caustic;   // nCell    fCaustic: orientation-bit OR
+    std::vector<float>    sv;        // nCell    fExact: multiplicity sum(V_int)/V_cell
+    std::vector<float>    dispvel;   // nCell*3  fVolW+fDisp: mass-weighted mean numerator
+    std::vector<float>    dispw;     // nCell    fVolW+fDisp: its mass normalizer
 };
 
 static void cpuDeposit(const std::vector<float>& verts, const std::vector<float>& vels,
@@ -84,6 +97,9 @@ static void cpuDeposit(const std::vector<float>& verts, const std::vector<float>
     // wrapped grid cell -> sub-grid flat index; false = cell outside this partition's box
     auto subFlat=[&](int wg0,int wg1,int wg2,size_t& flat)->bool{
         int l0=wg0-P.subOrigin[0], l1=wg1-P.subOrigin[1], l2=wg2-P.subOrigin[2];
+        if(l0<0) l0+=P.nGrid[0];   // sub-box may wrap a periodic axis (see ps_interpolation.cc)
+        if(l1<0) l1+=P.nGrid[1];
+        if(l2<0) l2+=P.nGrid[2];
         if(l0<0||l0>=P.subDims[0]||l1<0||l1>=P.subDims[1]||l2<0||l2>=P.subDims[2]) return false;
         flat=(size_t(l0)*P.subDims[1]+l1)*P.subDims[2]+l2; return true;
     };
@@ -212,13 +228,21 @@ struct Gpu {
 
         MTL::CommandBuffer* cb=q->commandBuffer();
         MTL::ComputeCommandEncoder* e=cb->computeCommandEncoder();
-        MTL::Buffer* bD=zbuf(4);   // dens dummy (fLinear=0 in this harness)
+        // flag-gated buffers: REAL when the P flag requests the path, 4-byte dummies otherwise
+        // (T1-T10 run with the flags off, so their dispatches are unchanged)
+        MTL::Buffer* bD =zbuf(4);                                        // dens (fLinear=0 always here)
+        MTL::Buffer* bW =zbuf(P.fVolW               ? nCell*4  : 4);     // momw
+        MTL::Buffer* bC =zbuf(P.fCaustic            ? nCell*4  : 4);     // caustic bits (uint)
+        MTL::Buffer* bSV=zbuf(P.fExact              ? nCell*4  : 4);     // exact multiplicity
+        MTL::Buffer* bDV=zbuf((P.fVolW&&P.fDisp)    ? nCell*12 : 4);     // dispvel
+        MTL::Buffer* bDW=zbuf((P.fVolW&&P.fDisp)    ? nCell*4  : 4);     // dispw
         if (fields){
             e->setComputePipelineState(psoFld);
             e->setBuffer(bV,0,0); e->setBuffer(bU,0,1); e->setBuffer(bM,0,2);
             e->setBuffer(bMass,0,3); e->setBuffer(bMom,0,4); e->setBuffer(bM2,0,5);
             e->setBuffer(bG,0,6); e->setBuffer(bS,0,7); e->setBuffer(bP,0,8);
-            e->setBuffer(bD,0,9);
+            e->setBuffer(bD,0,9); e->setBuffer(bW,0,10); e->setBuffer(bC,0,11);
+            e->setBuffer(bSV,0,12); e->setBuffer(bDV,0,13); e->setBuffer(bDW,0,14);
         } else {
             e->setComputePipelineState(psoDen);
             e->setBuffer(bV,0,0); e->setBuffer(bM,0,1); e->setBuffer(bMass,0,2); e->setBuffer(bP,0,3);
@@ -235,6 +259,13 @@ struct Gpu {
             o.grad.assign((float*)bG->contents(),(float*)bG->contents()+nCell*9);
             o.streams.assign((uint32_t*)bS->contents(),(uint32_t*)bS->contents()+nCell);
         } else { o.mom.clear(); o.m2.clear(); o.grad.clear(); o.streams.clear(); }
+        if (P.fVolW)   o.momw.assign((float*)bW->contents(),(float*)bW->contents()+nCell);          else o.momw.clear();
+        if (P.fCaustic)o.caustic.assign((uint32_t*)bC->contents(),(uint32_t*)bC->contents()+nCell); else o.caustic.clear();
+        if (P.fExact)  o.sv.assign((float*)bSV->contents(),(float*)bSV->contents()+nCell);          else o.sv.clear();
+        if (P.fVolW && P.fDisp){
+            o.dispvel.assign((float*)bDV->contents(),(float*)bDV->contents()+nCell*3);
+            o.dispw.assign((float*)bDW->contents(),(float*)bDW->contents()+nCell);
+        } else { o.dispvel.clear(); o.dispw.clear(); }
         return fields?1:0;
     }
 };
@@ -252,7 +283,7 @@ static char detail[512];
 // ------------------------------------------------------------------ tests
 static void makeParams(DepositParams& P,int n,float box,int nSub,int periodic){
     for(int i=0;i<3;++i){P.boxLo[i]=0.f;P.nGrid[i]=n;P.dx[i]=box/n;P.subOrigin[i]=0;P.subDims[i]=n;}
-    P.nSub=nSub;P.periodic=periodic;P.fVel=1;P.fDisp=1;P.fGrad=1;P.fLinear=0;P.nTet=0;
+    P.nSub=nSub;P.periodic=periodic;P.fVel=1;P.fDisp=1;P.fGrad=1;P.fLinear=0;P.fVolW=0;P.fCaustic=0;P.fExact=0;P.nTet=0;
 }
 static std::vector<float> linVel(const std::vector<float>& verts){
     // simple linear velocity field v = (2x - y, 0.5z, -x + y) at each vertex
@@ -688,6 +719,120 @@ static void t10_subgrid(Gpu& g){
     verdict("T10 partition sub-grid equivalence",ok,detail);
 }
 
+// T11: --ps-volume-weighted kernel path (fVolW, + the dispersion's own mass-weighted mean).
+// Two COINCIDENT tets with equal volume, masses 1 and 3, constant per-tet velocities
+// (10,0,0) and (-2,0,0). Every covered cell then has ANALYTIC weighted means:
+//   volume-weighted   mom/momw       = (10 + -2)/2            = 4   (equal volume shares)
+//   mass-weighted     dispvel/dispw  = (1*10 + 3*-2)/(1+3)    = 1
+// and the normalizers integrate to momw = 2*V_tet, dispw = m1+m2. This is precisely the
+// mass/volume split the flag introduces -- one number each side, no CPU mirror needed.
+static void t11_volumeWeighted(Gpu& g){
+    if(!g.psoFld){ printf("  [T11 ] fields kernel missing, skipped\n"); return; }
+    DepositParams P; makeParams(P,8,8.f,3,0); P.fVolW=1; P.nTet=2;
+    float o=2.05f,s=3.0f;
+    std::vector<float> tet={o,o,o, o+s,o,o, o,o+s,o, o,o,o+s};
+    std::vector<float> v; v.insert(v.end(),tet.begin(),tet.end()); v.insert(v.end(),tet.begin(),tet.end());
+    std::vector<float> u(24);
+    for(int k=0;k<4;++k){ u[k*3]=10.f; u[k*3+1]=0.f; u[k*3+2]=0.f; }          // tet 1: v=(10,0,0)
+    for(int k=4;k<8;++k){ u[k*3]=-2.f; u[k*3+1]=0.f; u[k*3+2]=0.f; }          // tet 2: v=(-2,0,0)
+    std::vector<float> m={1.f,3.f};
+    CpuOut go; g.run(v,u,m,P,go);
+    double const Vt=s*s*s/6.0;
+    // Contract checks: the NORMALIZED means are what normalizePhaseSpace consumes -- the
+    // normalizer's own scale is a kernel-internal convention (momw integrates to the Eulerian
+    // volume; dispw carries an extra 1/nInside that cancels in the ratio), so only the ratios
+    // and the mass/volume totals with a defined meaning are asserted.
+    double totM=total(go.mass), totW=total(go.momw);
+    double maxVW=0, maxMW=0; size_t nCov=0, nDW=0;
+    for(size_t i=0;i<go.mass.size();++i){
+        if(!(go.momw[i]>1e-6f)) continue;
+        ++nCov;
+        maxVW=std::max(maxVW, std::fabs((double)go.mom[i*3]/go.momw[i] - 4.0));
+        if(go.dispw[i]>0.f){
+            ++nDW;
+            maxMW=std::max(maxMW, std::fabs((double)go.dispvel[i*3]/go.dispw[i] - 1.0));
+        }
+    }
+    bool ok = std::fabs(totM-4.0)<1e-5 && std::fabs(totW-2*Vt)<1e-4*Vt
+           && nCov>=8 && nDW>=8 && maxVW<1e-4 && maxMW<1e-4;
+    snprintf(detail,sizeof(detail),"vol-mean err %.1e (expect 4), mass-mean err %.1e (expect 1), momw %.4f (expect %.4f), %zu covered cells",
+             maxVW,maxMW,totW,2*Vt,nCov);
+    verdict("T11 fVolW mass/volume split",ok,detail);
+}
+
+// T12: --ps-caustics kernel path (fCaustic, atomic-OR orientation bits). A tetrahedron and
+// its orientation-flip (two vertices swapped) must stamp two DIFFERENT single bits whose OR
+// is 3, and depositing both together must give exactly 3 in every covered cell -- the
+// "both orientations present = fold caustic crosses the cell" flag. Convention-independent:
+// only distinctness and the OR are asserted, not which sign gets which bit.
+static void t12_causticBits(Gpu& g){
+    if(!g.psoFld){ printf("  [T12 ] fields kernel missing, skipped\n"); return; }
+    DepositParams P; makeParams(P,8,8.f,3,0); P.fCaustic=1;
+    float o=2.05f,s=3.0f;
+    std::vector<float> tA={o,o,o, o+s,o,o, o,o+s,o, o,o,o+s};
+    std::vector<float> tB={o,o,o, o,o+s,o, o+s,o,o, o,o,o+s};   // verts 1<->2: det flips sign
+    std::vector<float> m1={2.f};
+    auto bitsOf=[&](std::vector<float>& verts)->uint32_t{
+        P.nTet=1; CpuOut go; g.run(verts,linVel(verts),m1,P,go);
+        uint32_t bits=0; bool mixed=false;
+        for(size_t i=0;i<go.mass.size();++i)
+            if(go.mass[i]>1e-6f){ if(bits && go.caustic[i]!=bits) mixed=true; bits=go.caustic[i]; }
+        return mixed? 0xFFu : bits;   // 0xFF = inconsistent across cells (fails the checks below)
+    };
+    uint32_t bA=bitsOf(tA), bB=bitsOf(tB);
+    P.nTet=2; std::vector<float> v; v.insert(v.end(),tA.begin(),tA.end()); v.insert(v.end(),tB.begin(),tB.end());
+    std::vector<float> m2v={2.f,2.f};
+    CpuOut go; g.run(v,linVel(v),m2v,P,go);
+    bool both3=true; size_t nCov=0;
+    for(size_t i=0;i<go.mass.size();++i)
+        if(go.mass[i]>1e-5f){ ++nCov; if(go.caustic[i]!=3u) both3=false; }
+    bool ok = (bA==1u||bA==2u) && (bB==1u||bB==2u) && bA!=bB && (bA|bB)==3u && both3 && nCov>=8;
+    snprintf(detail,sizeof(detail),"tetA bits=%u tetB bits=%u, both-together==3 in %zu covered cells: %s",
+             bA,bB,nCov,both3?"yes":"NO");
+    verdict("T12 fCaustic orientation OR",ok,detail);
+}
+
+// T13: --ps-exact-deposit kernel path (fExact, the float32 r3d port). A cube split into the
+// 6-tet Freudenthal tessellation with density 1 (mass = tet volume) has a FULLY analytic
+// exact deposit: the cube [2,4]^3 covers 8 grid cells of dx=1 exactly, so each receives
+// mass 1.000..., the multiplicity sum(V_int)/V_cell is exactly 1 in each (the tessellation
+// tiles the cube once), nothing lands outside, and the total is the cube volume. The
+// sampled deposit CANNOT do this exactly at any nSub -- only the clipper can.
+static void t13_exactDeposit(Gpu& g){
+    if(!g.psoFld){ printf("  [T13 ] fields kernel missing, skipped\n"); return; }
+    DepositParams P; makeParams(P,8,8.f,1,0); P.fExact=1; P.nTet=6;
+    float const a=2.f, b=4.f;
+    auto C=[&](int x,int y,int z,std::vector<float>& v){ v.push_back(x?b:a); v.push_back(y?b:a); v.push_back(z?b:a); };
+    // Freudenthal: 6 tets {000, path1, path2, 111} along the 6 monotone lattice paths
+    int const path[6][2][3]={{{1,0,0},{1,1,0}},{{1,0,0},{1,0,1}},{{0,1,0},{1,1,0}},
+                             {{0,1,0},{0,1,1}},{{0,0,1},{1,0,1}},{{0,0,1},{0,1,1}}};
+    std::vector<float> v;
+    for(int t=0;t<6;++t){
+        C(0,0,0,v);
+        C(path[t][0][0],path[t][0][1],path[t][0][2],v);
+        C(path[t][1][0],path[t][1][1],path[t][1][2],v);
+        C(1,1,1,v);
+    }
+    double const Vt=8.0/6.0;                         // per-tet volume; density 1 -> mass = volume
+    std::vector<float> m(6,(float)Vt);
+    CpuOut go; g.run(v,linVel(v),m,P,go);
+    double totM=total(go.mass), totSV=total(go.sv);
+    double maxCellErr=0, maxSvErr=0, outside=0;
+    for(int i=0;i<8;++i)for(int j=0;j<8;++j)for(int k=0;k<8;++k){
+        size_t f=((size_t)i*8+j)*8+k;
+        bool in = (i==2||i==3)&&(j==2||j==3)&&(k==2||k==3);
+        if(in){
+            maxCellErr=std::max(maxCellErr,std::fabs((double)go.mass[f]-1.0));
+            maxSvErr  =std::max(maxSvErr,  std::fabs((double)go.sv[f]  -1.0));
+        } else outside+=go.mass[f];
+    }
+    bool ok = std::fabs(totM-8.0)<1e-4 && std::fabs(totSV-8.0)<1e-3
+           && maxCellErr<1e-4 && maxSvErr<1e-4 && outside<1e-5;
+    snprintf(detail,sizeof(detail),"cell mass err %.1e, multiplicity err %.1e, outside leak %.1e, total %.5f (expect 8)",
+             maxCellErr,maxSvErr,outside,totM);
+    verdict("T13 fExact analytic cube",ok,detail);
+}
+
 // BENCH=1: time the all-fields deposit, CPU (1 core) vs GPU, on a 1M-tet stress set.
 static void bench(Gpu& g){
     if(!g.psoFld){ printf("  [bench] fields kernel missing, skipped\n"); return; }
@@ -724,6 +869,9 @@ int main(){
     t8_zeldovich(g,1);
     t9_analyticVelocity(g);
     t10_subgrid(g);
+    t11_volumeWeighted(g);
+    t12_causticBits(g);
+    t13_exactDeposit(g);
     if(getenv("BENCH")) bench(g);
     printf("------------------------------------------------------------------------\n");
     printf("SUMMARY: %d passed, %d failed\n",g_pass,g_fail);

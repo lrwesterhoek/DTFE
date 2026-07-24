@@ -256,13 +256,15 @@ class SnapshotProducts:
     method='dtfe' (default 'auto' = whichever exists in the snapshot directory). Density
     enters all derived products in MEAN units (rho/rho_bar) for either method, so every
     downstream quantity is method-independent by construction. Caches are namespaced by
-    (sim, method, snapshot) -- old caches keyed by snapshot alone are simply not reused.
+    (sim, [prefix,] method, snapshot) -- old caches keyed by snapshot alone are simply not
+    reused, and an alternate OUTPUT_PREFIX set never shares caches with the primary one.
     """
 
-    def __init__(self, snapshot, redshift=None, sim=None, method=None):
-        self.snapshot = f"{int(snapshot):03d}"   # accepts 99, '99' or '099' 
+    def __init__(self, snapshot, redshift=None, sim=None, method=None, prefix=None):
+        self.snapshot = f"{int(snapshot):03d}"   # accepts 99, '99' or '099'
         self.sim = sim or DEFAULT_SIM
         self.method = method or "auto"
+        self.prefix = prefix                     # alternate OUTPUT_PREFIX set, see FieldSet
         self._fs = None
         self._redshift = redshift
         self._ram = {}
@@ -271,7 +273,7 @@ class SnapshotProducts:
     def fs(self):
         if self._fs is None:
             self._fs = FieldSet(DATA_ROOT / self.sim / f"snapdir_{self.snapshot}",
-                                method=self.method)
+                                method=self.method, prefix=self.prefix)
         return self._fs
 
     @property
@@ -328,7 +330,10 @@ class SnapshotProducts:
 
 
     def _cpath(self, name):
-        return cache_dir() / f"{self.sim}_{self.fs.method}_{self.snapshot}_{name}.npz"
+        # an alternate OUTPUT_PREFIX set gets its own cache namespace -- A/B validation
+        # against e.g. ps_mw.* must never reuse (or poison) the primary ps_output caches
+        tag = "" if self.prefix is None else f"{str(self.prefix).rstrip('.')}_"
+        return cache_dir() / f"{self.sim}_{tag}{self.fs.method}_{self.snapshot}_{name}.npz"
 
     def voids(self):
         p = self._cpath('voids')

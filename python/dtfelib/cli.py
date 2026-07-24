@@ -35,6 +35,9 @@ def make_parser(description: str = "") -> argparse.ArgumentParser:
                    help=f"snapshot number (default {DEFAULT_SNAP})")
     p.add_argument("--method", choices=("auto", "ps", "dtfe"), default="auto",
                    help="field estimator to load: PS-DTFE, standard DTFE, or auto-detect")
+    p.add_argument("--prefix", default=None,
+                   help="alternate on-disk grid prefix (run_ps_dtfe.sh OUTPUT_PREFIX, e.g. "
+                        "'ps_mw'); implies --method ps unless one is given explicitly")
     p.add_argument("--raw", action="store_true",
                    help="use the unaveraged fields instead of the volume-averaged '_a' ones")
     p.add_argument("--smooth", type=float, default=0.0,
@@ -56,5 +59,6 @@ def make_fieldset(description: str = "", extra=None, argv=None):
     if extra is not None:
         extra(parser)
     args = parser.parse_args(argv)
-    fs = FieldSet(snapdir(args), method=args.method, averaged=not args.raw)
+    fs = FieldSet(snapdir(args), method=args.method, averaged=not args.raw,
+                  prefix=args.prefix)
     return fs, args

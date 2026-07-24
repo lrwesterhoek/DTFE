@@ -45,6 +45,25 @@ jobs:
       - name: PS-DTFE smoke test
         run: tests/ps_smoke_test.sh --no-build
 
+      # The PS flag suites. None of these ran in CI before, which is how two stale
+      # assertions in ps_linear_deposit_check sat red for days unnoticed -- run_tests.py and
+      # the smoke test never pass a single PS flag. ps_auto_tune_check and ps_scratch_check
+      # stay local-only: they use macOS-isms (/usr/bin/time -l, /private/tmp).
+      - name: PS-DTFE regression (analytic pancake)
+        run: python3 tests/ps_regression_test.py --no-build
+
+      - name: PS-DTFE linear/exact deposit checks
+        run: tests/ps_linear_deposit_check.sh --no-build
+
+      - name: PS-DTFE halo-release check
+        run: tests/ps_halo_release_check.sh --no-build
+
+      - name: PS-DTFE vertex-mass check
+        run: tests/ps_vertex_mass_check.sh --no-build
+
+      - name: PS-DTFE volume-weighted check
+        run: tests/ps_volume_weighted_check.sh --no-build
+
   # Compile check only -- no GPU exists at build time and none is needed. The Dockerfile's
   # sanity stage still runs the CPU test battery inside the image, so this also proves the
   # CUDA-built binaries execute their CPU paths.

@@ -46,12 +46,13 @@ SNAPSHOT_TO_REDSHIFT = config.SNAPSHOT_TO_REDSHIFT
 SLICE_PLANES = config.SLICE_PLANES
 
 
-def process_fields(density_field, velDiv_field, a_scale, sigma=0):
+def process_fields(density_field, velDiv_field, sigma=0):
+    # u-units -> peculiar km/s is applied centrally by FieldSet.load() now
+    # (dtfelib.io._VELOCITY_SCALE_EXP) -- no sqrt(a) correction here.
     mean_density = np.mean(density_field)
     delta_field = (density_field - mean_density) / mean_density
     delta_field = dtfe.smooth_field(delta_field, sigma=sigma)
     velDiv_field = dtfe.smooth_field(velDiv_field, sigma=sigma)
-    velDiv_field *= np.sqrt(a_scale)
     return delta_field, velDiv_field
 
 def compute_regression(delta_field, velDiv_field, threshold=1e-3, delta_range=None):
@@ -211,7 +212,7 @@ def process_snapshot(snapshot, redshift, args):
 
     try:
         try:
-            fs = FieldSet(snapdir, method=args.method, averaged=not args.raw)
+            fs = FieldSet(snapdir, method=args.method, averaged=not args.raw, prefix=args.prefix)
         except ValueError:
             if args.method != 'auto':
                 raise
@@ -239,7 +240,7 @@ def process_snapshot(snapshot, redshift, args):
         f_growth = cosmo_params['f_growth']
         slope_theory = cosmo_params['slope_theory']
 
-        delta_field, velDiv_field = process_fields(density_field, velDiv_field, a_scale, args.smooth)
+        delta_field, velDiv_field = process_fields(density_field, velDiv_field, args.smooth)
         
         print("Computing regression slopes")
         full_slope_reg, full_delta_reg, full_velDiv_reg = compute_regression(

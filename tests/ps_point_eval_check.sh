@@ -204,14 +204,34 @@ else
     echo ">> (G) skipped: this PS-DTFE binary has no --pts-den-grad"
 fi
 
+HAVE_VELGRAD=0
+if grep -q -- '--pts-vel-grad' <<<"${FULL_HELP}" && [ "${HAVE_GRAD}" = "1" ]; then
+    HAVE_VELGRAD=1
+    echo ">> run 13: jitter-free pancake, serial, --pts-vel-grad"
+    run "${TMP}/ppe_vgrad_ser" "${SNAP_PAN0}" --periodic \
+        --sample-points "${PTS_BIN}" --pts-vel-grad
+    echo ">> run 14: jitter-free pancake, --partition 2 2 2, --pts-vel-grad"
+    run "${TMP}/ppe_vgrad_par" "${SNAP_PAN0}" --periodic --partition 2 2 2 \
+        --sample-points "${PTS_BIN}" --pts-vel-grad
+    echo ">> (H) --pts-vel-grad leaves the existing outputs byte-identical"
+    for ext in .pts_den .pts_vel .pts_velDisp .pts_streams; do
+        cmp -s "${TMP}/ppe_grad_off${ext}" "${TMP}/ppe_vgrad_ser${ext}" \
+            || { echo "FAIL: ${ext} changed when --pts-vel-grad was added"; exit 1; }
+    done
+    echo "   OK"
+else
+    echo ">> (H) skipped: this PS-DTFE binary has no --pts-vel-grad (or no --pts-den-grad fixture)"
+fi
+
 echo ">> checking the numbers ..."
-"${PY}" - "${TMP}" "${GRID}" "${HAVE_IDS}" "${HAVE_GRAD}" <<'PY'
+"${PY}" - "${TMP}" "${GRID}" "${HAVE_IDS}" "${HAVE_GRAD}" "${HAVE_VELGRAD}" <<'PY'
 import sys
 import numpy as np
 
 tmp, grid = sys.argv[1], int(sys.argv[2])
 have_ids = len(sys.argv) > 3 and sys.argv[3] == "1"
 have_grad = len(sys.argv) > 4 and sys.argv[4] == "1"
+have_vgrad = len(sys.argv) > 5 and sys.argv[5] == "1"
 ncell = grid ** 3
 fails = []
 
@@ -383,6 +403,36 @@ if have_grad:
     ok = (fst[0::2] == 1) & (fst[1::2] == 1)      # both probes single-stream
     rel = np.abs(fd[ok] - grad[idx[ok], 0]) / (np.abs(grad[idx[ok], 0]) + 1e-12)
     check("G5 grad_x matches central FD of .pts_den", np.median(rel) < 0.02 and np.percentile(rel, 90) < 0.05,
+          f"{ok.sum()}/{idx.size} probes, median rel = {np.median(rel):.2e}, p90 = {np.percentile(rel, 90):.2e}")
+
+# ---------- (H) --pts-vel-grad: velocity gradients ----------
+if have_vgrad:
+    vg = np.fromfile(f"{tmp}/ppe_vgrad_ser.pts_velGrad").reshape(-1, 3, 3)
+    _, _, _, st_v = load_pts(f"{tmp}/ppe_vgrad_ser")
+    check("H1 velocity-gradient layout", vg.shape[0] == ncell, f"{vg.shape[0]} points x 9")
+    # jitter-free pancake: v = v_x(x) only -> every component except dvx/dx ([0,0], stored
+    # index 0) vanishes up to float32 vertex-velocity rounding (same headroom form as G2)
+    m1 = st_v == 1
+    gxx = np.abs(vg[m1, 0, 0]).max()
+    rest = (np.abs(vg[m1]).sum(axis=(1, 2)) - np.abs(vg[m1, 0, 0])).max()
+    check("H2 only dvx/dx survives (1D pancake)", rest < 3e-6 * gxx,
+          f"max|other 8| = {rest:.3e} vs 3e-6 * max|dvx/dx| = {3e-6 * gxx:.3e}")
+    # partition consistency (float level, as C2-C4/G4)
+    vg_p = np.fromfile(f"{tmp}/ppe_vgrad_par.pts_velGrad").reshape(-1, 3, 3)
+    _, _, _, st_vp = load_pts(f"{tmp}/ppe_vgrad_par")
+    same_v = st_v == st_vp
+    dvp = np.abs(vg[same_v] - vg_p[same_v]).max() / (np.abs(vg).max() + 1e-30)
+    check("H3 partition velocity gradient (float level)", dvp < 1e-5, f"max rel = {dvp:.3e}")
+    # central finite difference of .pts_vel's x-component at the (G) probe points vs dvx/dx
+    sel = np.loadtxt(f"{tmp}/ppe_input_fdsel.txt").reshape(-1, 2)
+    idx, eps = sel[:, 0].astype(int), sel[0, 1]
+    fvel = np.fromfile(f"{tmp}/ppe_grad_fd.pts_vel").reshape(-1, 3)
+    fst = np.fromfile(f"{tmp}/ppe_grad_fd.pts_streams", dtype=np.int32)
+    fd = (fvel[1::2, 0] - fvel[0::2, 0]) / (2 * eps)
+    ok = (fst[0::2] == 1) & (fst[1::2] == 1)      # both probes single-stream
+    scale = np.abs(vg[idx[ok], 0, 0]).max() + 1e-12
+    rel = np.abs(fd[ok] - vg[idx[ok], 0, 0]) / scale
+    check("H4 dvx/dx matches central FD of .pts_vel", np.median(rel) < 0.02 and np.percentile(rel, 90) < 0.05,
           f"{ok.sum()}/{idx.size} probes, median rel = {np.median(rel):.2e}, p90 = {np.percentile(rel, 90):.2e}")
 
 print("-" * 60)

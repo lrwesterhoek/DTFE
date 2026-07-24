@@ -39,6 +39,15 @@
 #include "user_options.h"
 
 
+#ifdef PHASE_SPACE
+// Tolerance for testing the stream multiplicity ('stream_count', written as '.streams') against
+// an integer. It is a FLOAT sum under every deposit, so single-stream cells land on 1.0 +/- eps
+// and an exact '== 1' / '> 1' test is always wrong: on the 48^3 Zel'dovich pancake '> 1.0f'
+// reports 28.33% of cells as multi-stream where the true slab is 16.67%. Mirrors
+// dtfelib.STREAM_TOL on the Python side -- keep the two in sync. The plateau is sharp (every
+// single-stream cell measures inside 1e-5 of 1.0), so 1e-3 admits noise but no real structure.
+Real const PS_STREAM_TOL = Real(1.e-3);
+#endif
 
 
 // Container for every interpolated grid field; each vector is allocated only when its field is requested.
@@ -59,8 +68,16 @@ struct Quantities
     std::vector<Real>                         velocity_vweb;        // V-web classification label (0=void, 1=wall, 2=filament, 3=node)
     std::vector< Pvector<Real,NO_DIM> >       velocity_vweb_eigenvalues; // V-web eigenvalues (sorted descending)
 #ifdef PHASE_SPACE
-    std::vector<Real>                         stream_count;       // number of streams at each grid point
-    std::vector<Real>                         mass_weight;        // per-cell summed stream density sum(rho_s); internal to normalizePhaseSpace, never written out
+    std::vector<Real>                         stream_count;       // stream multiplicity at each grid point: the sampled deposit's sample-mean, or --ps-exact-deposit's analytic volume-weighted (1/V_cell)sum(V_int). A FLOAT under both -- compare against integers with PS_STREAM_TOL, never with ==/> 1 exactly (see below)
+    std::vector<Real>                         tet_touch;          // --ps-exact-deposit only: raw INTEGER count of tetrahedra with a nonzero intersection with the cell (incl. corner grazes), written as '.tetTouch'. A geometric multiplicity, NOT a stream count -- 'stream_count' carries the volume-weighted (physical) multiplicity under every deposit.
+    std::vector<Real>                         mass_weight;        // per-cell summed moment weight (mass shares, or the EULERIAN-VOLUME shares under --ps-volume-weighted); normalizes velocity/gradient/scalar. Internal to normalizePhaseSpace, never written out
+    // --ps-volume-weighted + dispersion only: the dispersion stays MASS-weighted (sigma_ij is a
+    // moment of the phase-space distribution f, so it is f- i.e. mass-weighted by definition),
+    // while velocity/gradient go volume-weighted. sigma_ij = <v_i v_j>_m - <v_i>_m <v_j>_m then
+    // needs its OWN mass-weighted mean and normalizer, since 'velocity' now holds the volume-
+    // weighted one. Both are internal to normalizePhaseSpace and never written out.
+    std::vector<Real>                         disp_weight;        // sum(m_s)
+    std::vector< Pvector<Real,noVelComp> >    disp_velocity;      // sum(m_s v_s)
     std::vector<Real>                         caustic_bits;       // --ps-caustics: per-cell orientation mask (bit0 = det(Ax)>0 stream overlaps the cell, bit1 = det<0). Small exact ints in float; OR-merged across partitions (addFrom/addFromSubgrid), binarized to the 0/1 fold flag once in DTFE() after the merge, written as '.caustic'
     // PS-DTFE partition sub-grid in global grid-cell units, so addFromSubgrid() can map cells back.
     size_t ps_subOrigin[NO_DIM] = {0};

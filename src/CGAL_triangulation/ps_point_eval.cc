@@ -76,6 +76,7 @@ struct StreamRec
     double denDtfe;             // 'dtfe': vertex densities linearly interpolated at the point
     double vel[noVelComp];      // velocity linearly interpolated at the point
     double grad[NO_DIM];        // constant 'dtfe' density-profile gradient of the tet (--pts-den-grad; 0 otherwise)
+    double vgrad[NO_DIM*NO_DIM];// constant velocity gradient of the tet, [d*3+j] = dv_j/dx_d (--pts-vel-grad; 0 otherwise)
     uint64_t ids[NO_DIM+1];     // sorted Lagrangian-vertex ParticleIDs (--per-stream-ids; all 0 otherwise)
 };
 
@@ -86,6 +87,7 @@ struct Context
     bool   perStream = false;
     bool   perStreamIds = false;
     bool   ptsDenGrad = false;
+    bool   ptsVelGrad = false;
     bool   useGeometric = false;    // variant used for totals, weights and per-stream output
     bool   periodic = false;
     double rhoBar = 1.;             // output densities are rho/rhoBar (grid convention)
@@ -112,6 +114,7 @@ struct Context
     std::vector<double>   outRecords;    // 4 per stream: density, vx, vy, vz
     std::vector<uint64_t> outIds;        // NO_DIM+1 per stream (only with --per-stream-ids)
     std::vector<double>   outDenGrad;    // 3N (only with --pts-den-grad)
+    std::vector<double>   outVelGrad;    // 9N (only with --pts-vel-grad)
     std::vector<double>   outRecGrad;    // 3 per stream (only with --pts-den-grad + --per-stream)
 };
 
@@ -295,6 +298,7 @@ void psPointEvalInit(User_options &userOptions)
     g_ctx.perStream    = userOptions.psPerStream;
     g_ctx.perStreamIds = userOptions.psPerStreamIds;
     g_ctx.ptsDenGrad   = userOptions.psPtsDenGrad;
+    g_ctx.ptsVelGrad   = userOptions.psPtsVelGrad;
     g_ctx.useGeometric = userOptions.psStreamDensityGeometric;
     g_ctx.periodic     = userOptions.periodic;
 #ifdef PHASE_SPACE
@@ -374,7 +378,8 @@ void psPointEvalInit(User_options &userOptions)
             << MESSAGE::cMagenta() << (g_ctx.useGeometric ? "geometric" : "dtfe") << MESSAGE::cReset()
             << (g_ctx.perStream ? ", writing per-stream records" : "")
             << (g_ctx.perStreamIds ? " + stream ids" : "")
-            << (g_ctx.ptsDenGrad ? ", writing density gradients" : "") << ").\n" << MESSAGE::Flush;
+            << (g_ctx.ptsDenGrad ? ", writing density gradients" : "")
+            << (g_ctx.ptsVelGrad ? ", writing velocity gradients" : "") << ").\n" << MESSAGE::Flush;
 }
 
 
@@ -460,6 +465,20 @@ void interpolatePoints_phaseSpace(DT &dt, User_options &userOptions)
             for (int i = 0; i < NO_DIM; ++i)
                 for (int v = 0; v < NO_DIM; ++v)
                     rec.grad[i] += inv[i][v] * (rho[v+1] - rho[0]);
+        }
+        for (int q = 0; q < NO_DIM*NO_DIM; ++q)
+            rec.vgrad[q] = 0.;
+        if ( g_ctx.ptsVelGrad )
+        {
+            // constant velocity gradient of this stream: dv_j/dx_d = sum_v inv[d][v]
+            // (vel_{v+1,j} - vel_{0,j}), same affine convention as the density gradient and
+            // the SAME [d*3+j] layout as the grid deposit's velGrad (ps_interpolation.cc
+            // matrixMultiplication(posMatInv, dvel)). The velocity profile is linear on every
+            // kept cell -- hull cells included -- so there is no volume-ratio gate here.
+            for (int d = 0; d < NO_DIM; ++d)
+                for (size_t j = 0; j < noVelComp; ++j)
+                    for (int v = 0; v < NO_DIM; ++v)
+                        rec.vgrad[d*NO_DIM + j] += inv[d][v] * (vel[v+1][j] - vel[0][j]);
         }
 
         for (int bi = bLo[0]; bi <= bHi[0]; ++bi)
@@ -629,6 +648,17 @@ void interpolatePoints_standard(DT &dt, User_options &userOptions)
                 for (int v = 0; v < NO_DIM; ++v)
                     rec.grad[i] += inv[i][v] * (rho[v+1] - rho[0]);
         }
+        for (int q = 0; q < NO_DIM*NO_DIM; ++q)
+            rec.vgrad[q] = 0.;
+        if ( g_ctx.ptsVelGrad )
+        {
+            // the containing tetrahedron's constant velocity gradient, same [d*3+j] layout
+            // as the PS worker (exactly one stream per point here, so the 'mean' is it)
+            for (int d = 0; d < NO_DIM; ++d)
+                for (size_t j = 0; j < noVelComp; ++j)
+                    for (int v = 0; v < NO_DIM; ++v)
+                        rec.vgrad[d*NO_DIM + j] += inv[d][v] * (vel[v+1][j] - vel[0][j]);
+        }
 
         for (int bi = bLo[0]; bi <= bHi[0]; ++bi)
         for (int bj = bLo[1]; bj <= bHi[1]; ++bj)
@@ -697,6 +727,8 @@ void psPointEvalFinalize(User_options const &userOptions)
             if (a.vel[j] != b.vel[j]) return a.vel[j] < b.vel[j];
         for (int i = 0; i < NO_DIM; ++i)        // all 0 unless --pts-den-grad
             if (a.grad[i] != b.grad[i]) return a.grad[i] < b.grad[i];
+        for (int q = 0; q < NO_DIM*NO_DIM; ++q) // all 0 unless --pts-vel-grad
+            if (a.vgrad[q] != b.vgrad[q]) return a.vgrad[q] < b.vgrad[q];
         for (int v = 0; v <= NO_DIM; ++v)       // all 0 unless --per-stream-ids; only breaks exact
             if (a.ids[v] != b.ids[v]) return a.ids[v] < b.ids[v];   // den+vel ties, so the ids file
         return false;                                               // is partition-invariant too
@@ -720,6 +752,8 @@ void psPointEvalFinalize(User_options const &userOptions)
     }
     if ( g_ctx.ptsDenGrad )
         g_ctx.outDenGrad.assign( N * NO_DIM, 0. );
+    if ( g_ctx.ptsVelGrad )
+        g_ctx.outVelGrad.assign( N * NO_DIM*NO_DIM, 0. );
 
     size_t covered = 0, multi = 0;
     size_t maxStreams = 0;
@@ -746,12 +780,16 @@ void psPointEvalFinalize(User_options const &userOptions)
         // moments in sorted order (the psDeferNormalization pattern: sums are linear across
         // partitions; the density-weighted means/dispersion are formed exactly once, here)
         double W = 0., mom1[noVelComp] = {0.}, mom2[noDispComp] = {0.};
+        double momG[NO_DIM*NO_DIM] = {0.};
         for (size_t s = 0; s < nS; ++s)
         {
             double const den = geo ? recs[s].denGeo : recs[s].denDtfe;
             W += den;
             for (size_t j = 0; j < noVelComp; ++j)
                 mom1[j] += den * recs[s].vel[j];
+            if ( g_ctx.ptsVelGrad )
+                for (int q = 0; q < NO_DIM*NO_DIM; ++q)
+                    momG[q] += den * recs[s].vgrad[q];
             size_t c = 0;
             for (int a = 0; a < NO_DIM; ++a)
                 for (int b = a; b < NO_DIM; ++b)
@@ -774,6 +812,9 @@ void psPointEvalFinalize(User_options const &userOptions)
             double const invW = 1. / W;
             for (size_t j = 0; j < noVelComp; ++j)
                 g_ctx.outVel[i*noVelComp+j] = mom1[j] * invW;
+            if ( g_ctx.ptsVelGrad )
+                for (int q = 0; q < NO_DIM*NO_DIM; ++q)
+                    g_ctx.outVelGrad[i*NO_DIM*NO_DIM + q] = momG[q] * invW;
             // a single stream has zero dispersion by definition; skip the moment difference
             // (it would only return ~1e-9 cancellation noise)
             if ( nS > 1 )
@@ -857,6 +898,9 @@ void psPointEvalWriteOutputs(User_options const &userOptions)
     if ( g_ctx.ptsDenGrad )
         writeRaw( ".pts_denGrad", g_ctx.outDenGrad.data(), g_ctx.outDenGrad.size() * sizeof(double),
                   "point density gradients (float64 x 3, d(rho/rho_bar)/dx_i, 'dtfe' profile)" );
+    if ( g_ctx.ptsVelGrad )
+        writeRaw( ".pts_velGrad", g_ctx.outVelGrad.data(), g_ctx.outVelGrad.size() * sizeof(double),
+                  "point velocity gradients (float64 x 9, [d*3+j] = dv_j/dx_d, density-weighted stream mean)" );
     if ( g_ctx.perStream )
     {
         writeRaw( ".pts_stream_offsets", g_ctx.outOffsets.data(),

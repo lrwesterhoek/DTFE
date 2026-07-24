@@ -59,7 +59,7 @@ def catalog_for(snapshot, sigma, args):
         return prod.voids(), prod.fs
 
     fs = FieldSet(args.data_root / args.sim / f"snapdir_{snapshot}",
-                  method=args.method)
+                  method=args.method, prefix=args.prefix)
     density = fs.density(units='mean')
     delta_s = dtfe.smooth_field(dtfe.calculate_density_contrast(density),
                                 sigma=sigma)

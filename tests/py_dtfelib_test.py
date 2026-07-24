@@ -255,7 +255,9 @@ def t_environment_box():
 
 def t_velocity_single_stream():
     """NaN-mask semantics of FieldSet.velocity_single_stream on real raw PS grids
-    (TNG50-4-Dark: the raw integer streams grid gives the crisp streams != 1 mask)."""
+    (TNG50-4-Dark). These grids come from the SAMPLED deposit, so the raw '.streams'
+    multiplicities are integers; the tolerance mask must reproduce the crisp != 1 mask
+    exactly there. t_velocity_single_stream_float_mask covers the exact deposit's floats."""
     from dtfelib.cli import DATA_ROOT
     from dtfelib.io import FieldSet
     snapdir = Path(DATA_ROOT) / "TNG50-4-Dark" / "snapdir_099"
@@ -263,6 +265,7 @@ def t_velocity_single_stream():
     st = fs.load("streams")
     v = fs.load("velocity")
     v1 = fs.velocity_single_stream()
+    assert np.array_equal(st, np.round(st)), "fixture assumption: sampled raw streams are integers"
     multi = st != 1
     assert 0 < multi.mean() < 1, f"trivial mask ({multi.mean():.0%} multi-stream)"
     assert np.isnan(v1[multi]).all(), "multi-stream cells must be NaN"
@@ -273,6 +276,196 @@ def t_velocity_single_stream():
         pass
     else:
         raise AssertionError("method='dtfe' must raise ValueError")
+
+
+def t_velocity_single_stream_float_mask():
+    """velocity_single_stream must survive a FLOAT '.streams' grid (--ps-exact-deposit).
+
+    The exact deposit writes the analytic volume-weighted multiplicity, so single-stream
+    cells land on 1.0 +/- float32 eps rather than exactly 1. The old 'streams != 1' mask
+    NaN'd essentially the whole grid; the tolerance mask must keep every ~1.0 cell.
+    """
+    import shutil
+    import tempfile
+
+    from dtfelib.io import FieldSet
+    try:
+        import h5py
+    except ImportError as e:              # FieldSet needs a combined_*.hdf5 for units
+        raise FileNotFoundError(f"h5py unavailable: {e}")   # -> SKIP, not FAIL
+    d = Path(tempfile.mkdtemp(prefix="dtfelib_streams_"))
+    try:
+        n = 8
+        rng = np.random.default_rng(11)
+        # single-stream cells offset by a whole number of float32 ULPs, so NOT ONE of them
+        # is exactly 1.0 (drawing uniform noise instead would round part of the grid back
+        # onto 1.0 and let the '!= 1' bug pass). Plus a genuine multi-stream slab at the
+        # analytic pancake value 3 and caustic-straddling cells at a fractional
+        # multiplicity -- the shapes --ps-exact-deposit actually produces.
+        one, ulp = np.float32(1.0), np.spacing(np.float32(1.0))
+        st = (one + rng.choice(np.float32([-1.0, 1.0]), (n, n, n))
+                  * rng.integers(1, 4, (n, n, n)).astype(np.float32) * ulp).astype(np.float32)
+        st[2:4] = 3.0000091
+        st[5] = 2.3174     # caustic-straddling cells: genuinely fractional, must be masked
+        st.tofile(d / "ps_output.streams")
+        assert not np.any(st == 1.0), "fixture must have NO exactly-1.0 cell, else it proves nothing"
+        vel = rng.normal(size=(n, n, n, 3)).astype(np.float32)
+        vel.tofile(d / "ps_output.vel")
+        np.ones((n, n, n), dtype=np.float32).tofile(d / "ps_output.den")
+        with h5py.File(d / "combined_000.hdf5", "w") as f:
+            h = f.create_group("Header")
+            h.attrs["BoxSize"] = 100000.0
+            h.attrs["NumPart_ThisFile"] = np.array([0, n**3, 0, 0, 0, 0], dtype=np.int64)
+            h.attrs["MassTable"] = np.array([0.0, 1.0, 0.0, 0.0, 0.0, 0.0])
+            h.attrs["Redshift"] = 0.0
+            h.attrs["HubbleParam"] = 0.7
+            h.attrs["HFreeUnits"] = 1
+
+        fs = FieldSet(d, method="ps", averaged=False)
+        v1 = fs.velocity_single_stream()
+        single = np.abs(st.astype(np.float64) - 1.0) < 1e-3      # rows 0,1,4,6,7
+        assert single.mean() > 0.5, f"fixture is degenerate ({single.mean():.0%} single-stream)"
+        kept = ~np.isnan(v1).any(axis=-1)
+        assert np.array_equal(kept, single), (
+            f"mask must keep exactly the ~1.0 cells: kept {kept.sum()} of {single.sum()} "
+            f"single-stream cells (the '!= 1' bug keeps 0)")
+        assert np.array_equal(v1[single], vel[single]), "kept velocities must be untouched"
+        assert np.isnan(v1[~single]).all(), "multi-stream cells must be fully NaN"
+    finally:
+        shutil.rmtree(d)
+
+
+def t_velocity_scale():
+    """FieldSet.load() converts u-units to peculiar km/s: first moments x sqrt(a), the
+    dispersion (a velocity VARIANCE) x a, everything else untouched; exact no-op at z=0."""
+    import shutil
+    import tempfile
+
+    from dtfelib.io import FieldSet
+    try:
+        import h5py
+    except ImportError as e:
+        raise FileNotFoundError(f"h5py unavailable: {e}")   # -> SKIP, not FAIL
+    rng = np.random.default_rng(23)
+    n = 8
+
+    def make(dirpath, redshift):
+        np.abs(rng.normal(1, 0.1, (n, n, n))).astype(np.float32).tofile(dirpath / "ps_output.den")
+        rng.normal(0, 100, (n, n, n, 3)).astype(np.float32).tofile(dirpath / "ps_output.vel")
+        np.abs(rng.normal(0, 50, (n, n, n))).astype(np.float32).tofile(dirpath / "ps_output.velDisp")
+        rng.normal(0, 10, (n, n, n)).astype(np.float32).tofile(dirpath / "ps_output.velDiv")
+        with h5py.File(dirpath / "combined_000.hdf5", "w") as f:
+            h = f.create_group("Header")
+            h.attrs["BoxSize"] = 100000.0
+            h.attrs["NumPart_ThisFile"] = np.array([0, n**3, 0, 0, 0, 0], dtype=np.int64)
+            h.attrs["MassTable"] = np.array([0.0, 1.0, 0.0, 0.0, 0.0, 0.0])
+            h.attrs["Redshift"] = float(redshift)
+            h.attrs["HubbleParam"] = 0.7
+            h.attrs["HFreeUnits"] = 1
+
+    d = Path(tempfile.mkdtemp(prefix="dtfelib_vscale_"))
+    try:
+        make(d, redshift=3.0)                                     # a = 0.25
+        fs = FieldSet(d, method="ps", averaged=False)
+        assert abs(fs.velocity_scale - 0.5) < 1e-12, fs.velocity_scale
+        for name, exp in (("velocity", 0.5), ("divergence", 0.5), ("dispersion", 1.0)):
+            raw = fs.load(name, scaled=False)
+            sc = fs.load(name)
+            assert np.array_equal(sc, raw * np.float32(0.25 ** exp)), f"{name} scaling wrong"
+        assert np.array_equal(fs.load("density"), fs.load("density", scaled=False)), \
+            "density must NOT be velocity-scaled"
+
+        shutil.rmtree(d); d.mkdir()
+        make(d, redshift=0.0)                                     # a = 1: exact no-op
+        fs0 = FieldSet(d, method="ps", averaged=False)
+        assert np.array_equal(fs0.load("velocity"), fs0.load("velocity", scaled=False)), \
+            "z=0 must be bit-identical (factor exactly 1.0)"
+    finally:
+        shutil.rmtree(d)
+
+
+def t_outofcore_loading():
+    """load(mode=...), load_slice, iter_slabs and field_stats: the auto-tuned out-of-core
+    layer must reproduce the eager path EXACTLY (scaling included) and pick ram-vs-memmap
+    from the budget (made deterministic here via the DTFE_PY_RAM_GB override)."""
+    import os
+    import shutil
+    import tempfile
+
+    from dtfelib.io import FieldSet
+    try:
+        import h5py
+    except ImportError as e:
+        raise FileNotFoundError(f"h5py unavailable: {e}")   # -> SKIP, not FAIL
+    rng = np.random.default_rng(31)
+    n = 16
+    d = Path(tempfile.mkdtemp(prefix="dtfelib_ooc_"))
+    saved = {k: os.environ.get(k) for k in ("DTFE_PY_RAM_GB", "DTFE_PY_LOAD_FRAC")}
+    try:
+        np.abs(rng.normal(1, 0.2, (n, n, n))).astype(np.float32).tofile(d / "ps_output.den")
+        rng.normal(0, 100, (n, n, n, 3)).astype(np.float32).tofile(d / "ps_output.vel")
+        (np.abs(rng.normal(1, 0.5, (n, n, n))) + 1).astype(np.float32).tofile(d / "ps_output.streams")
+        with h5py.File(d / "combined_000.hdf5", "w") as f:
+            h = f.create_group("Header")
+            h.attrs["BoxSize"] = 100000.0
+            h.attrs["NumPart_ThisFile"] = np.array([0, n**3, 0, 0, 0, 0], dtype=np.int64)
+            h.attrs["MassTable"] = np.array([0.0, 1.0, 0.0, 0.0, 0.0, 0.0])
+            h.attrs["Redshift"] = 3.0                        # a = 0.25: scaling is LIVE
+            h.attrs["HubbleParam"] = 0.7
+            h.attrs["HFreeUnits"] = 1
+        fs = FieldSet(d, method="ps", averaged=False)
+        ref_vel = fs.load("velocity", mode="ram")            # scaled eager reference
+        ref_den = fs.load("density", mode="ram")
+
+        # --- auto picks ram under a huge budget, memmap under a tiny one ---
+        os.environ["DTFE_PY_RAM_GB"] = "1000"
+        assert not isinstance(fs.load("density"), np.memmap), "huge budget must load eagerly"
+        os.environ["DTFE_PY_RAM_GB"] = "0.0000001"
+        mm = fs.load("density")                              # density has no u-units factor
+        assert isinstance(mm, np.memmap), "tiny budget must return a memmap"
+        assert np.array_equal(np.array(mm), ref_den), "memmap content must equal eager load"
+        try:
+            mm[0, 0, 0] = 9.0
+        except (ValueError, TypeError):
+            pass
+        else:
+            raise AssertionError("the memmap must be read-only")
+        # a scale-needing field over budget must refuse with guidance, not silently unscale
+        try:
+            fs.load("velocity")
+        except MemoryError as e:
+            assert "load_slice" in str(e), f"error must name the escape hatches: {e}"
+        else:
+            raise AssertionError("over-budget scaled load must raise MemoryError")
+        # ... but scaled=False and mode='ram' both stay available
+        assert isinstance(fs.load("velocity", scaled=False), np.memmap)
+        assert np.array_equal(fs.load("velocity", mode="ram"), ref_vel)
+        # velocity_single_stream forces ram internally: must work under the tiny budget
+        v1 = fs.velocity_single_stream()
+        assert np.isnan(v1).any() and np.isfinite(v1).any(), "mask must act, not blanket"
+
+        # --- load_slice == eager slice, every axis, scaling included ---
+        for axis in (0, 1, 2):
+            sl = [slice(None)] * 3
+            sl[axis] = n // 2
+            assert np.array_equal(fs.load_slice("velocity", axis=axis), ref_vel[tuple(sl)]), \
+                f"load_slice axis={axis} != eager slice"
+
+        # --- iter_slabs reassembles the eager load exactly; stats agree ---
+        parts = [slab for _, _, slab in fs.iter_slabs("velocity", max_bytes=4 * n * n * 3 * 4)]
+        assert len(parts) > 1, "test must actually exercise multiple slabs"
+        assert np.array_equal(np.concatenate(parts, axis=0), ref_vel), "slab concat != eager"
+        st = fs.field_stats("velocity")
+        assert abs(st["mean"] - ref_vel.astype(np.float64).mean()) < 1e-10
+        assert st["min"] == float(ref_vel.min()) and st["max"] == float(ref_vel.max())
+        assert st["n"] == ref_vel.size
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(d)
 
 
 def t_caustic_field_loader():
@@ -316,6 +509,59 @@ def t_caustic_field_loader():
         shutil.rmtree(d)
 
 
+def t_alternate_prefix():
+    """FieldSet(prefix=...) reads an alternate OUTPUT_PREFIX grid set (e.g. ps_mw.*).
+
+    Contract: the prefix only redirects the on-disk files -- units, scaling and the
+    field table are untouched; method 'auto' resolves to 'ps' (only run_ps_dtfe.sh's
+    OUTPUT_PREFIX writes alternate prefixes); a prefix with no grids raises, naming it;
+    'ps_mw' and 'ps_mw.' are equivalent; the default set stays reachable side by side.
+    """
+    import shutil
+    import tempfile
+
+    from dtfelib.io import FieldSet
+    try:
+        import h5py
+    except ImportError as e:              # FieldSet needs a combined_*.hdf5 for units
+        raise FileNotFoundError(f"h5py unavailable: {e}")   # -> SKIP, not FAIL
+    d = Path(tempfile.mkdtemp(prefix="dtfelib_prefix_"))
+    try:
+        n = 8
+        rng = np.random.default_rng(23)
+        den_out = np.abs(rng.normal(1, 0.1, (n, n, n))).astype(np.float32)
+        den_mw = np.abs(rng.normal(1, 0.3, (n, n, n))).astype(np.float32)
+        assert not np.array_equal(den_out, den_mw)
+        den_out.tofile(d / "ps_output.den")
+        den_mw.tofile(d / "ps_mw.den")
+        with h5py.File(d / "combined_000.hdf5", "w") as f:
+            h = f.create_group("Header")
+            h.attrs["BoxSize"] = 100000.0
+            h.attrs["NumPart_ThisFile"] = np.array([0, n**3, 0, 0, 0, 0], dtype=np.int64)
+            h.attrs["MassTable"] = np.array([0.0, 1.0, 0.0, 0.0, 0.0, 0.0])
+            h.attrs["Redshift"] = 0.0
+            h.attrs["HubbleParam"] = 0.7
+            h.attrs["HFreeUnits"] = 1
+
+        fs_mw = FieldSet(d, averaged=False, prefix="ps_mw")
+        assert fs_mw.method == "ps", f"prefix must imply method 'ps', got {fs_mw.method!r}"
+        assert np.array_equal(fs_mw.load("density"), den_mw), "prefix set must read ps_mw.den"
+        assert ", prefix='ps_mw.'" in repr(fs_mw), "repr must show a non-default prefix"
+        fs_dot = FieldSet(d, averaged=False, prefix="ps_mw.")
+        assert np.array_equal(fs_dot.load("density"), den_mw), "'ps_mw.' must equal 'ps_mw'"
+        fs_def = FieldSet(d, averaged=False)   # default set untouched next to the alternate
+        assert np.array_equal(fs_def.load("density"), den_out), "default must read ps_output.den"
+        assert ", prefix=" not in repr(fs_def), "repr must not show the default prefix"
+        try:
+            FieldSet(d, averaged=False, prefix="ps_nope")
+        except FileNotFoundError as e:
+            assert "ps_nope" in str(e), f"error must name the missing prefix: {e}"
+        else:
+            raise AssertionError("a prefix with no grids on disk must raise FileNotFoundError")
+    finally:
+        shutil.rmtree(d)
+
+
 def main():
     print("=" * 60)
     print(" dtfelib merger-tree / void-tracking tests")
@@ -327,6 +573,10 @@ def main():
     check("match_catalog_void (periodic)", t_match_catalog_void)
     check("shape estimators: vectorized == loop reference", t_shape_estimators)
     check("FieldSet caustic loader (synthetic)", t_caustic_field_loader)
+    check("velocity_single_stream float-streams mask (synthetic)", t_velocity_single_stream_float_mask)
+    check("FieldSet velocity_scale u-units conversion (synthetic)", t_velocity_scale)
+    check("FieldSet out-of-core loading: auto/memmap/slice/slabs (synthetic)", t_outofcore_loading)
+    check("FieldSet alternate OUTPUT_PREFIX set (synthetic)", t_alternate_prefix)
     print(f"data-backed ({SIM}):")
     check("main_branch invariants", t_main_branch_invariants)
     check("descendant_branch inverse walk", t_descendant_inverse)

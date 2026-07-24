@@ -240,7 +240,7 @@ def process_snapshot(args, snap):
     snap_dir = args.data_root / args.sim / f"snapdir_{snap:03d}"
 
     try:
-        fs = FieldSet(snap_dir, method=args.method, averaged=not args.raw)
+        fs = FieldSet(snap_dir, method=args.method, averaged=not args.raw, prefix=args.prefix)
     except FileNotFoundError:
         print(f"  skipping snapshot {snap:03d} (no {args.method} fields)")
         return False

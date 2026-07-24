@@ -159,4 +159,12 @@ void gadgetHeaderDefaults(Gadget_header *gadgetHeader,
           or userOptions->aField.velocity_tweb or userOptions->aField.velocity_vweb )
             message << "Using HubbleParam = " << userOptions->hubbleParam << " from file header for T-web/V-web normalization.\n" << MESSAGE::Flush;
     }
+    // scale factor a (Gadget 'time' for snapshots): converts the u-velocity gradient
+    // (u = v_pec/sqrt(a)) to peculiar km/s in the V-web normalization
+    if ( userOptions->scaleFactor < Real(0.) && gadgetHeader->time > 0. )
+    {
+        userOptions->scaleFactor = Real(gadgetHeader->time);
+        if ( userOptions->uField.velocity_vweb or userOptions->aField.velocity_vweb )
+            message << "Using scale factor a = " << userOptions->scaleFactor << " from file header for the V-web sqrt(a) velocity normalization.\n" << MESSAGE::Flush;
+    }
 }

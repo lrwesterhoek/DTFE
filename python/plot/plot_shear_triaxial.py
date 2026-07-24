@@ -133,6 +133,9 @@ def compute_snapshot_slices(fs):
         print("  No velocity shear/gradient fields found")
         return None
 
+    # u-units -> peculiar km/s/Mpc is applied centrally by FieldSet.load() now
+    # (dtfelib.io._VELOCITY_SCALE_EXP) -- no per-script correction needed.
+
     def plane_products(smoothed_field):
         planes = {}
         for slice_dim in (0, 1, 2):
@@ -185,7 +188,7 @@ def main():
         print(f"\nProcessing snapshot {snapshot}{z_txt}")
         try:
             fs = FieldSet(args.data_root / args.sim / f"snapdir_{snapshot}",
-                          method=args.method, averaged=not args.raw)
+                          method=args.method, averaged=not args.raw, prefix=args.prefix)
             r = compute_snapshot_slices(fs)
         except FileNotFoundError:
             print(f"  skipping snapshot {snapshot} (no {args.method} fields)")

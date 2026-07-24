@@ -37,6 +37,7 @@ struct vertexData : public Data_structure
 #ifdef PHASE_SPACE
     Pvector<Real,NO_DIM> _eulerianPos; // Eulerian position (triangulation vertices store Lagrangian coords in PS-DTFE mode)
     uint64_t _particleID;              // snapshot ParticleID (stream identities, --per-stream-ids); +8 B/vertex, see auto_tune.h
+    int32_t  _psDeg;                   // --ps-vertex-mass: finite (non-dummy) cells incident to this vertex; +4 B/vertex
 #endif
 
 
@@ -44,6 +45,7 @@ struct vertexData : public Data_structure
     vertexData(){ dummy=false; dummyNeighbor=false;
 #ifdef PHASE_SPACE
         _particleID=0;
+        _psDeg=0;
 #endif
     }
 
@@ -74,6 +76,7 @@ struct vertexData : public Data_structure
     inline Pvector<Real,NO_DIM>& eulerianPosition() { return _eulerianPos; }      // full Eulerian position
     inline Real& eulerianPosition(int const i) { return _eulerianPos[i]; }        // one Eulerian component
     inline uint64_t particleID() { return _particleID; }                          // snapshot ParticleID (0 if the reader has none)
+    inline int32_t& psDegree() { return _psDeg; }                                 // --ps-vertex-mass incident-cell count (see ps_interpolation.cc)
 #endif
     // remaining accessors for 'Data_structure' are in "particle_data.h"
 

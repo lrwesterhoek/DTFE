@@ -74,7 +74,13 @@ void interpolateGrid_phaseSpace(DT &dt,
 
     // psUseSubgrid: store only the Eulerian bbox of cells this partition touches, to bound peak
     // memory. Marks per axis which grid planes any kept cell overlaps (same filter as the scatter,
-    // so the box covers every written cell); an axis reaching both ends stays full. off -> full grid.
+    // so the box covers every written cell). off -> full grid.
+    //
+    // The box may WRAP a periodic axis: subOrigin+subDims can exceed nGrid, and the local index is
+    // then (g - subOrigin + nGrid) % nGrid. Every consumer must apply that same wrap -- the CPU
+    // scatter loops below, the GPU kernels (metal/ps_deposit.metal, ps_gpu_cuda.cu) and the
+    // merge-back (Quantities::addFromSubgrid). The wrap is a no-op for an unwrapped box, so the
+    // one expression serves both.
     size_t subOrigin[NO_DIM], subDims[NO_DIM];
     for (int d = 0; d < NO_DIM; ++d) { subOrigin[d] = 0; subDims[d] = nGrid[d]; }
     // cells surviving the dummy/ownership/degeneracy filters, counted by the subgrid pass below;
@@ -110,18 +116,93 @@ void interpolateGrid_phaseSpace(DT &dt,
             int lo=-1, hi=-1;
             for (int g=0; g<(int)nGrid[d]; ++g) if (touched[d][g]){ if(lo<0)lo=g; hi=g; }
             if (lo<0) { subOrigin[d]=0; subDims[d]=nGrid[d]; }                                 // no cells touched: keep full axis (harmless)
-            else if (touched[d][0] && touched[d][nGrid[d]-1]) { subOrigin[d]=0; subDims[d]=nGrid[d]; }  // spans both ends (likely wraps): keep full axis
+            else if (touched[d][0] && touched[d][nGrid[d]-1])
+            {
+                // Touched planes reach both ends. Under --periodic that is the NORMAL case for
+                // any partition whose Eulerian footprint straddles the box seam, and keeping the
+                // full axis here was what made every boundary-touching Lagrangian slab allocate
+                // the whole grid (the documented "each partition writes the WHOLE Eulerian grid").
+                // The footprint is really a WRAPPED arc, so crop to it: its complement is the
+                // largest run of untouched planes, and because both ends are touched that run is
+                // strictly interior and a plain linear scan finds it.
+                int bestLen=0, bestStart=-1, curStart=-1;
+                for (int g=0; g<(int)nGrid[d]; ++g)
+                {
+                    if (!touched[d][g]) { if (curStart<0) curStart=g; }
+                    else if (curStart>=0)
+                    {
+                        int const len = g - curStart;
+                        if (len > bestLen) { bestLen=len; bestStart=curStart; }
+                        curStart = -1;
+                    }
+                }
+                if (bestLen<=0) { subOrigin[d]=0; subDims[d]=nGrid[d]; }                       // every plane touched: genuinely full
+                else { subOrigin[d]=(size_t)((bestStart+bestLen)%(int)nGrid[d]); subDims[d]=(size_t)((int)nGrid[d]-bestLen); }
+            }
             else { subOrigin[d]=(size_t)lo; subDims[d]=(size_t)(hi-lo+1); }                    // crop to the touched [lo,hi] span
         }
     }
     size_t subTotal = 1; for (int d = 0; d < NO_DIM; ++d) subTotal *= subDims[d];
     totalGrid = subTotal;   // all allocations and loops below use the sub-grid size
 
+    // --ps-vertex-mass: chart-independent per-tetrahedron masses. Count, per vertex, the
+    // incident cells that will actually DEPOSIT; each tet's mass is then the sum of its
+    // vertices' weight/degree shares (computed where tetMass is needed below). Mass follows
+    // the particles instead of rho_bar * V_lag, which removes the 1 - D(z_ic)/D(z) contrast
+    // suppression when the Lagrangian input is a PERTURBED IC snapshot (see --ps-vertex-mass
+    // help). Counted on THIS triangulation with a reset first -- the unaveraged and averaged
+    // passes share one dt, so the pass must be idempotent.
+    //
+    // The degree applies the SAME chart-independent drop filters as the deposit loop (dummy,
+    // periodic hull artefact, singular Eulerian inverse) so that sum over deposited tets of
+    // sum_v m_v/deg(v) equals sum_v m_v EXACTLY (up to vertices whose every incident tet is
+    // dropped): counting a dropped tet in the degree used to send its vertices' shares into
+    // the void with it -- a mass deficit tracking the dropped-tet fraction (0.74% at TNG z=0).
+    // Ownership is deliberately SKIPPED: it tiles cells across partitions (each cell deposits
+    // exactly once globally, and padded-region vertices see their full local neighborhood, so
+    // per-partition degrees match the global tessellation).
+    bool const psVertexMass = userOptions.psVertexMass;
+    if ( psVertexMass )
+    {
+        for (DT::Finite_vertices_iterator vit = dt.finite_vertices_begin(); vit != dt.finite_vertices_end(); ++vit)
+            vit->info().psDegree() = 0;
+        size_t degDropped = 0;   // local counter: the deposit loop reports its own
+        PS_FOREACH_FINITE_CELL
+        {
+            Cell_handle cell = itC;
+            PSCellGeometry dgeo;
+            if ( !psFilterCell(cell, userOptions, boxCoordinates, true, &degDropped, dgeo,
+                               /*skipOwnership=*/true) )
+                continue;
+            for (int v = 0; v <= NO_DIM; ++v)
+                cell->vertex(v)->info().psDegree() += 1;
+        }
+    }
+    // per-tet vertex-share mass: sum over the cell's vertices of weight/degree
+    auto psVertexShareMass = [](Cell_handle const &cell) -> double
+    {
+        double m = 0.;
+        for (int v = 0; v <= NO_DIM; ++v)
+        {
+            int32_t const deg = cell->vertex(v)->info().psDegree();
+            if (deg > 0)
+                m += double(cell->vertex(v)->info().weight()) / double(deg);
+        }
+        return m;
+    };
+
     // Allocate the requested output fields, zeroed since the cell loop accumulates into them.
     if ( field.density )
         quantities->density.assign(totalGrid, Real(0.));
-    // Dispersion needs <v>, so allocate velocity storage even when only dispersion was requested.
-    bool const haveVel = field.velocity || field.velocity_dispersion;
+    // Dispersion needs <v>, so allocate velocity storage even when only dispersion was
+    // requested -- EXCEPT under --ps-volume-weighted, where the dispersion carries its OWN
+    // mass-weighted mean (disp_velocity/disp_weight below): a dispersion-only volume-weighted
+    // run would otherwise allocate, deposit and GPU-round-trip a 12 B/cell grid nothing reads.
+    bool const haveVel = field.velocity
+                         || (field.velocity_dispersion && !userOptions.psVolumeWeighted);
+    // the dispersion always needs the per-sample velocity VALUES (for sum m v_i v_j and its
+    // own mean), even when the velocity GRID above is gated away -- keep the two distinct
+    bool const needVelValues = haveVel || field.velocity_dispersion;
     if ( haveVel )
         quantities->velocity.assign(totalGrid, Pvector<Real,noVelComp>::zero());
     if ( field.velocity_gradient )
@@ -136,7 +217,21 @@ void interpolateGrid_phaseSpace(DT &dt,
 #endif
 
     // Per-grid-point count of overlapping streams (diagnostic; reported as the stream_count field).
+    // Sampled deposit: incremented once per in-simplex sample, divided by nSub^NO_DIM at the end
+    // -> the cell-mean stream multiplicity. Exact deposit: this counts TETRAHEDRA TOUCHING the
+    // cell (every nonzero clip, including corner grazes) -- a geometric multiplicity that is NOT
+    // a stream count (it runs to hundreds), so it is exported separately as '.tetTouch' and the
+    // physical multiplicity is accumulated in exactMult below.
     std::vector<int> streamCount(totalGrid, 0);
+    // --ps-exact-deposit: exact cell-mean stream multiplicity = (1/V_cell) * sum_tets V_int,
+    // the analytic nSub->infinity limit of the sampled definition (which is the sample-mean
+    // multiplicity). On the same scale as the sampled '.streams', so single-stream masking
+    // works under either deposit -- but ONLY to a tolerance (|s-1| < 1e-3, see
+    // dtfelib.STREAM_TOL): this is a float sum, so single-stream cells land on 1.0 +/- eps,
+    // never exactly 1. Grazing slivers contribute ~0 here instead of a full +1, which also
+    // makes it far more robust than the raw touch count (float GPU included).
+    std::vector<Real> exactMult;
+    if ( userOptions.psExactDeposit ) exactMult.assign(totalGrid, Real(0.));
 
     // --ps-caustics: per-cell orientation mask (bit0 = a det(Ax)>0 stream overlaps the cell,
     // bit1 = det<0). det(Ax)'s sign is the parity of the Lagrangian->Eulerian map (CGAL cells
@@ -157,9 +252,10 @@ void interpolateGrid_phaseSpace(DT &dt,
     size_t nReleased = 0;
 
     // --ps-exact-deposit: analytic per-cell intersection moments instead of nSub^3 sampling.
-    // The exact deposit is the nSub->infinity limit, so nSub is ignored; '.streams' counts
-    // every tet with a nonzero cell intersection (integer, so the partition merge stays
-    // bit-exact -- clipping a given wrapped tet against a given cell is split-independent).
+    // The exact deposit is the nSub->infinity limit, so nSub is ignored. '.streams' carries
+    // the volume-weighted multiplicity (see exactMult above): a FLOAT, so the partition merge
+    // is NOT bit-exact -- the per-tet volume shares sum in thread order. The raw integer
+    // tet-touch count, which does merge bit-exactly, is exported separately as '.tetTouch'.
     bool const psExact = userOptions.psExactDeposit;
 
     // Count of cells dropped because their Eulerian simplex is non-invertible (see the check below).
@@ -175,14 +271,33 @@ void interpolateGrid_phaseSpace(DT &dt,
                             || field.scalar || field.scalar_gradient
 #endif
                             ;
+    // --ps-volume-weighted: the velocity/scalar moments (and their normalizer) carry equal
+    // EULERIAN-VOLUME shares instead of mass shares -> the normalized cell values are volume
+    // averages (the standard-DTFE '_a' convention) instead of mass-weighted means. Density,
+    // stream count and caustics always keep the mass deposit.
+    bool const psVolWeighted = userOptions.psVolumeWeighted;
     // when the density field is selected, its accumulator receives exactly the same per-cell
     // mass sums as massWeight would (both add massShare at the same sites), so the weight
     // ALIASES the density grid instead of allocating a second full grid (4 B/cell). The
     // deferNorm caller reconstructs the weight from the summed density (normalizePhaseSpace
     // scale argument), since density is only converted to rho/rho_bar after weighting here.
-    bool const weightIsDensity = needWeight && field.density;
+    // Volume weighting breaks the aliasing (the moment normalizer is no longer the mass sum),
+    // so it always allocates the explicit weight grid.
+    bool const weightIsDensity = needWeight && field.density && !psVolWeighted;
     std::vector<Real> massWeight;
     if ( needWeight && !weightIsDensity ) massWeight.assign(totalGrid, Real(0.));
+    // --ps-volume-weighted keeps the DISPERSION mass-weighted (sigma_ij is a moment of the
+    // phase-space distribution f -- f-weighted by definition) while velocity/gradient go
+    // volume-weighted. sigma_ij = <v_i v_j>_m - <v_i>_m<v_j>_m then needs its own mass-weighted
+    // mean and normalizer, because 'velocity' now carries the volume-weighted one.
+    bool const dispNeedsOwnWeight = psVolWeighted && field.velocity_dispersion;
+    std::vector<Real> dispWeight;                      // sum(m_s)
+    std::vector< Pvector<Real,noVelComp> > dispVel;    // sum(m_s v_s)
+    if ( dispNeedsOwnWeight )
+    {
+        dispWeight.assign(totalGrid, Real(0.));
+        dispVel.assign(totalGrid, Pvector<Real,noVelComp>::zero());
+    }
 
     // Reusable per-tetrahedron scratch for the mass-conserving deposit (see the cell loop): the flat
     // grid index and Eulerian offset (rel = samplePos - vertex0) of every in-simplex sample point.
@@ -215,16 +330,19 @@ void interpolateGrid_phaseSpace(DT &dt,
         tryMetal = false;
     }
 #endif
-    if ( tryMetal && psCaustics )
+    // The kernels index cells with a 32-bit 'uint flat' (metal/ps_deposit.metal, ps_gpu_cuda.cu).
+    // Above 2^32 cells it wraps -- and because the buffers are LARGER than 2^32, the wrapped index
+    // is still in bounds: no crash, no OOB, just atomics landing in the wrong cells. Fall back to
+    // the CPU instead, mirroring the standard-DTFE guard in averaged_interpolation_1.cc. This is
+    // checked on subTotal, the only quantity that knows about the wrap-to-full-axis case above:
+    // the cap is on the PARTITION's sub-box, so a finer --partition can bring a big grid back
+    // under it. Uniform across field selections -- the moment offsets are already 64-bit.
+    if ( tryMetal and subTotal > size_t(UINT32_MAX) )
     {
         MESSAGE::Warning warning( userOptions.verboseLevel );
-        warning << "--ps-caustics is computed by the CPU deposit only; using the CPU deposit for this pass.\n" << MESSAGE::EndWarning;
-        tryMetal = false;
-    }
-    if ( tryMetal && psExact )
-    {
-        MESSAGE::Warning warning( userOptions.verboseLevel );
-        warning << "--ps-exact-deposit is CPU-only (analytic r3d clipping); using the CPU deposit for this pass.\n" << MESSAGE::EndWarning;
+        warning << "--ps-metal does not support more than 2^32 cells per partition sub-grid (this one has "
+                << subTotal << ", i.e. > " << size_t(UINT32_MAX) << "); using the CPU deposit for this pass. "
+                << "A finer --partition would bring the sub-grid back under the cap.\n" << MESSAGE::EndWarning;
         tryMetal = false;
     }
     if ( tryMetal )
@@ -249,8 +367,9 @@ void interpolateGrid_phaseSpace(DT &dt,
         // centroid deposits (same arithmetic as the CPU fallback) are collected here and
         // applied on the host AFTER the GPU grids are copied back (the copy ASSIGNS, so
         // these are the only further accumulations). Discarded if the GPU dispatch fails --
-        // the CPU loop then re-handles every cell.
-        struct ReleasedTet { size_t flat; Real mass; Real vel[noVelComp]; Real grad[noGradComp]; };
+        // the CPU loop then re-handles every cell. momw = the moment weight (V_eul under
+        // --ps-volume-weighted, else the mass); orient = the caustic orientation bits.
+        struct ReleasedTet { size_t flat; Real mass; Real momw; Real volFrac; unsigned char orient; Real vel[noVelComp]; Real grad[noGradComp]; };
         std::vector<ReleasedTet> releasedTets;
         PS_FOREACH_FINITE_CELL
         {
@@ -261,8 +380,11 @@ void interpolateGrid_phaseSpace(DT &dt,
             Real (&ep)[NO_DIM+1][NO_DIM] = geo.eulerPos;
             double Lag[NO_DIM][NO_DIM];
             for (int v=0;v<NO_DIM;++v) for (int i=0;i<NO_DIM;++i) Lag[v][i]=double(cell->vertex(v+1)->point()[i])-double(cell->vertex(0)->point()[i]);
+            // absDetLag always computed: the --ps-halo-release classification below stays
+            // geometric (V_lag/V_eul) so kept/released sets are identical under either mass
             double const absDetLag = std::fabs(determinant(Lag));
-            float tm = float( double(userOptions.averageDensity)*absDetLag/factorial(NO_DIM) );
+            float tm = psVertexMass ? float( psVertexShareMass(cell) )
+                                    : float( double(userOptions.averageDensity)*absDetLag/factorial(NO_DIM) );
             if (tm<=0.f) continue;
             if ( psHaloRelease > 0. && absDetLag > psHaloRelease * geo.cellAbsDet )
             {
@@ -282,6 +404,7 @@ void interpolateGrid_phaseSpace(DT &dt,
                     int raw = int(floor((centroid[d] - boxCoordinates[2*d]) / dx[d]));
                     int w = userOptions.periodic ? ((raw % (int)nGrid[d] + (int)nGrid[d]) % (int)nGrid[d]) : raw;
                     long loc = (long)w - (long)subOrigin[d];
+                    if (loc < 0) loc += (long)nGrid[d];        // sub-box may wrap a periodic axis
                     if (w < 0 || w >= (int)nGrid[d] || loc < 0 || loc >= (long)subDims[d]) { cValid = false; break; }
                     f = f * subDims[d] + (size_t)loc;
                 }
@@ -289,6 +412,9 @@ void interpolateGrid_phaseSpace(DT &dt,
                 ReleasedTet rt;
                 rt.flat = f;
                 rt.mass = Real(tm);
+                rt.momw = psVolWeighted ? Real( geo.cellAbsDet / factorial(NO_DIM) ) : rt.mass;
+                rt.volFrac = Real( geo.cellAbsDet / factorial(NO_DIM) / double(cellVolume) );
+                rt.orient = geo.cellDet > 0. ? 1 : 2;
                 if ( needsVelArrays )
                 {
                     Real velGrad[NO_DIM][noVelComp], temp[NO_DIM][noVelComp];
@@ -397,7 +523,8 @@ void interpolateGrid_phaseSpace(DT &dt,
         std::string metalErr;
         if ( psGpuDepositFields(tetVerts, tetVels, tetMasses, tetDens, bl, dxv,
                                   nGrid, subOrigin, subDims, nSub,
-                                  userOptions.periodic, fVel, fDisp, fGrad, psLinear, gpuOut, metalErr) )
+                                  userOptions.periodic, fVel, fDisp, fGrad, psLinear,
+                                  psVolWeighted, psCaustics, psExact, gpuOut, metalErr) )
         {
             if ( not userOptions.psSuppressGridStats )
                 message << MESSAGE::cBold() << "PS-DTFE:" << MESSAGE::cReset() << " " << gpuBackendName() << " GPU deposit ("
@@ -406,7 +533,9 @@ void interpolateGrid_phaseSpace(DT &dt,
             for (size_t i = 0; i < totalGrid; ++i)
             {
                 if (field.density) quantities->density[i] = Real(gpuOut.mass[i]);
-                if (needWeight && !weightIsDensity) massWeight[i] = Real(gpuOut.mass[i]);
+                // moment normalizer: the volume-share sum under --ps-volume-weighted, else the mass
+                if (needWeight && !weightIsDensity)
+                    massWeight[i] = Real( psVolWeighted ? gpuOut.momw[i] : gpuOut.mass[i] );
                 if (haveVel)
                     for (size_t j = 0; j < noVelComp; ++j)
                         quantities->velocity[i][j] = Real(gpuOut.mom[i*3+j]);
@@ -416,28 +545,48 @@ void interpolateGrid_phaseSpace(DT &dt,
                 if (field.velocity_dispersion)
                     for (size_t cc = 0; cc < noDispComp; ++cc)
                         quantities->velocity_dispersion[i][cc] = Real(gpuOut.m2[i*6+cc]);
+                if (dispNeedsOwnWeight)
+                {   // the dispersion's own mass-weighted mean/normalizer (kernel buffers 13/14)
+                    dispWeight[i] = Real(gpuOut.dispw[i]);
+                    for (size_t j = 0; j < noVelComp; ++j)
+                        dispVel[i][j] = Real(gpuOut.dispvel[i*3+j]);
+                }
                 streamCount[i] = int(gpuOut.streams[i]);
+                if (psExact)
+                    exactMult[i] = Real(gpuOut.streamvol[i]);   // exact cell-mean multiplicity
+                if (psCaustics)
+                    orientBits[i] = (unsigned char)(gpuOut.caustic[i] & 3u);
             }
             // --ps-halo-release: host-side monolithic centroid deposits of the released tets
             // (same accumulation sites and moments as the CPU fallback's single sample)
             for (ReleasedTet const &rt : releasedTets)
             {
                 if (field.density) quantities->density[rt.flat] += rt.mass;
-                if (needWeight && !weightIsDensity) massWeight[rt.flat] += rt.mass;
+                if (needWeight && !weightIsDensity) massWeight[rt.flat] += rt.momw;
                 if (haveVel)
                     for (size_t j = 0; j < noVelComp; ++j)
-                        quantities->velocity[rt.flat][j] += rt.vel[j] * rt.mass;
+                        quantities->velocity[rt.flat][j] += rt.vel[j] * rt.momw;
                 if (field.velocity_gradient)
                     for (size_t q = 0; q < noGradComp; ++q)
-                        quantities->velocity_gradient[rt.flat][q] += rt.grad[q] * rt.mass;
+                        quantities->velocity_gradient[rt.flat][q] += rt.grad[q] * rt.momw;
                 if (field.velocity_dispersion)
                 {
                     size_t c = 0;
                     for (int a = 0; a < NO_DIM; ++a)
                         for (int b = a; b < NO_DIM; ++b)
                             quantities->velocity_dispersion[rt.flat][c++] += rt.mass * rt.vel[a] * rt.vel[b];
+                    if ( dispNeedsOwnWeight )
+                    {
+                        dispWeight[rt.flat] += rt.mass;
+                        for (size_t j = 0; j < noVelComp; ++j)
+                            dispVel[rt.flat][j] += rt.vel[j] * rt.mass;
+                    }
                 }
                 streamCount[rt.flat]++;
+                if (psExact)
+                    exactMult[rt.flat] += rt.volFrac;   // V_tet / V_cell, as the CPU fallback deposits
+                if (psCaustics)
+                    orientBits[rt.flat] |= rt.orient;
             }
             metalDeposited = true;
         }
@@ -491,8 +640,11 @@ void interpolateGrid_phaseSpace(DT &dt,
             for (int v = 0; v < NO_DIM; ++v)
                 for (int i = 0; i < NO_DIM; ++i)
                     Lag[v][i] = double(cell->vertex(v+1)->point()[i]) - double(cell->vertex(0)->point()[i]);
+            // absDetLag always computed: the --ps-halo-release classification stays geometric
+            // (V_lag/V_eul) so kept/released sets are identical under either mass convention
             absDetLag = std::fabs(determinant(Lag));
-            tetMass = Real( double(userOptions.averageDensity) * absDetLag / factorial(NO_DIM) );  // = rho_bar * V_lag
+            tetMass = psVertexMass ? Real( psVertexShareMass(cell) )
+                                   : Real( double(userOptions.averageDensity) * absDetLag / factorial(NO_DIM) );  // = rho_bar * V_lag
             if (tetMass < Real(0.)) tetMass = Real(0.);
         }
 
@@ -623,6 +775,7 @@ void interpolateGrid_phaseSpace(DT &dt,
                 for (int d = 0; d < NO_DIM; ++d)
                 {
                     long loc = (long)gridIdx[d] - (long)subOrigin[d];
+                    if (loc < 0) loc += (long)nGrid[d];        // sub-box may wrap a periodic axis
                     if (loc < 0 || loc >= (long)subDims[d]) { inSub = false; break; }
                     flatIdx = flatIdx * subDims[d] + (size_t)loc;
                 }
@@ -677,12 +830,15 @@ void interpolateGrid_phaseSpace(DT &dt,
                     size_t const flatIdx = insideFlat[c];
                     double const *m = &exMom[c*10];
                     Real const massShare = Real( exW[c] * shareFac );
+                    // moment weight: mass share, or the analytic intersection volume V_int
+                    // (--ps-volume-weighted, the exact continuum volume share)
+                    Real const momShare = psVolWeighted ? Real( m[0] ) : massShare;
                     if (field.density) quantities->density[flatIdx] += massShare;
-                    if (needWeight && !weightIsDensity) massWeight[flatIdx] += massShare;
+                    if (needWeight && !weightIsDensity) massWeight[flatIdx] += momShare;
 
                     // exact mean of the linear velocity profile over this intersection
                     Pvector<Real,noVelComp> velBar;
-                    if (haveVel)
+                    if (needVelValues)
                     {
                         double const invV = 1. / m[0];
                         double cen[NO_DIM] = { m[1]*invV, m[2]*invV, m[3]*invV };
@@ -693,7 +849,8 @@ void interpolateGrid_phaseSpace(DT &dt,
                                 vb += double(velGrad[i][j]) * cen[i];
                             velBar[j] = Real(vb);
                         }
-                        quantities->velocity[flatIdx] += velBar * massShare;
+                        if (haveVel)
+                            quantities->velocity[flatIdx] += velBar * momShare;
                     }
                     if (field.velocity_gradient)
                     {
@@ -701,7 +858,7 @@ void interpolateGrid_phaseSpace(DT &dt,
                         for (size_t j = 0; j < noVelComp; ++j)
                             for (int i = 0; i < NO_DIM; ++i)
                                 grad[j*NO_DIM+i] = velGrad[i][j];
-                        quantities->velocity_gradient[flatIdx] += grad * massShare;
+                        quantities->velocity_gradient[flatIdx] += grad * momShare;
                     }
                     if (field.velocity_dispersion)
                     {
@@ -728,6 +885,11 @@ void interpolateGrid_phaseSpace(DT &dt,
                                 quantities->velocity_dispersion[flatIdx][c2++] +=
                                     massShare * ( velBar[a] * velBar[b] + Real(gcg) );
                             }
+                        if ( dispNeedsOwnWeight )
+                        {
+                            dispWeight[flatIdx] += massShare;
+                            dispVel[flatIdx]    += velBar * massShare;
+                        }
                     }
 #ifdef SCALAR
                     if (field.scalar)
@@ -743,7 +905,7 @@ void interpolateGrid_phaseSpace(DT &dt,
                                 sb += double(sGrad[i][j]) * cen[i];
                             scalarVal[j] = Real(sb);
                         }
-                        quantities->scalar[flatIdx] += scalarVal * massShare;
+                        quantities->scalar[flatIdx] += scalarVal * momShare;
                     }
                     if (field.scalar_gradient)
                     {
@@ -751,10 +913,11 @@ void interpolateGrid_phaseSpace(DT &dt,
                         for (size_t j = 0; j < noScalarComp; ++j)
                             for (int i = 0; i < NO_DIM; ++i)
                                 sgrad[j*NO_DIM+i] = sGrad[i][j];
-                        quantities->scalar_gradient[flatIdx] += sgrad * massShare;
+                        quantities->scalar_gradient[flatIdx] += sgrad * momShare;
                     }
 #endif
-                    streamCount[flatIdx]++;   // one full overlap per tet with V_int > 0
+                    streamCount[flatIdx]++;   // raw tet-touch count -> '.tetTouch'
+                    exactMult[flatIdx] += Real( m[0] / double(cellVolume) );   // exact multiplicity share
                     if ( psCaustics )
                         orientBits[flatIdx] |= (geo.cellDet > 0. ? 1 : 2);
                 }
@@ -795,6 +958,7 @@ void interpolateGrid_phaseSpace(DT &dt,
             for (int d = 0; d < NO_DIM; ++d)
             {
                 long loc = (long)gridIdx[d] - (long)subOrigin[d];
+                if (loc < 0) loc += (long)nGrid[d];            // sub-box may wrap a periodic axis
                 if (loc < 0 || loc >= (long)subDims[d]) { inSub = false; break; }
                 flatIdx = flatIdx * subDims[d] + (size_t)loc;
             }
@@ -874,6 +1038,7 @@ void interpolateGrid_phaseSpace(DT &dt,
                 int raw = int(floor((centroid[d] - boxCoordinates[2*d]) / dx[d]));
                 int w = userOptions.periodic ? ((raw % (int)nGrid[d] + (int)nGrid[d]) % (int)nGrid[d]) : raw;
                 long loc = (long)w - (long)subOrigin[d];
+                if (loc < 0) loc += (long)nGrid[d];        // sub-box may wrap a periodic axis
                 if (w < 0 || w >= (int)nGrid[d] || loc < 0 || loc >= (long)subDims[d]) { cValid = false; break; }
                 f = f * subDims[d] + (size_t)loc;
             }
@@ -890,6 +1055,9 @@ void interpolateGrid_phaseSpace(DT &dt,
         // than the tetrahedron's mass and the caustic fix is untouched.
         size_t const nInside = useCentroid ? size_t(1) : insideFlat.size();
         Real   const uniformShare = tetMass / Real(nInside);
+        // --ps-volume-weighted: equal Eulerian-volume share per sample for the velocity
+        // moments (the centroid fallback carries the whole tet volume); density keeps mass
+        Real   const volumeShare  = Real( geo.cellAbsDet / factorial(NO_DIM) ) / Real(nInside);
         double shareFactor = 0.;
         bool useLinearShares = false;
         if ( psLinear && !useCentroid )
@@ -918,20 +1086,24 @@ void interpolateGrid_phaseSpace(DT &dt,
             }
             Real const massShare = useLinearShares ? Real(double(insideW[s]) * shareFactor)
                                                    : uniformShare;
+            // moment weight: mass share (default, momentum-like means) or equal volume share
+            // (--ps-volume-weighted, volume-average means); density always deposits MASS
+            Real const momShare = psVolWeighted ? volumeShare : massShare;
 
             // density accumulates MASS here; it is divided by the cell volume once at the end.
             if (field.density) quantities->density[flatIdx] += massShare;
-            if (needWeight && !weightIsDensity) massWeight[flatIdx] += massShare;
+            if (needWeight && !weightIsDensity) massWeight[flatIdx] += momShare;
 
-            // Mass-weighted velocity moment sum(m_s v_s); also needed for the dispersion (uses <v>).
+            // Weighted velocity moment sum(w_s v_s); also needed for the dispersion (uses <v>).
             Pvector<Real,noVelComp> velVal;
-            if (haveVel)
+            if (needVelValues)
             {
                 velVal = cell->vertex(0)->info().velocity();
                 for (int i = 0; i < NO_DIM; ++i)
                     for (size_t j = 0; j < noVelComp; ++j)
                         velVal[j] += velGrad[i][j] * rel[i];
-                quantities->velocity[flatIdx] += velVal * massShare;
+                if (haveVel)
+                    quantities->velocity[flatIdx] += velVal * momShare;
             }
 
             if (field.velocity_gradient)
@@ -940,10 +1112,10 @@ void interpolateGrid_phaseSpace(DT &dt,
                 for (size_t j = 0; j < noVelComp; ++j)
                     for (int i = 0; i < NO_DIM; ++i)
                         grad[j*NO_DIM+i] = velGrad[i][j];
-                quantities->velocity_gradient[flatIdx] += grad * massShare;
+                quantities->velocity_gradient[flatIdx] += grad * momShare;
             }
 
-            // velocity dispersion: mass-weighted second moment sum(m_s v_i v_j) (upper triangle).
+            // velocity dispersion: weighted second moment sum(w_s v_i v_j) (upper triangle).
             // After normalization -> sigma_ij = <v_i v_j> - <v_i><v_j>.
             if (field.velocity_dispersion)
             {
@@ -951,6 +1123,11 @@ void interpolateGrid_phaseSpace(DT &dt,
                 for (int i = 0; i < NO_DIM; ++i)
                     for (int j = i; j < NO_DIM; ++j)
                         quantities->velocity_dispersion[flatIdx][c++] += massShare * velVal[i] * velVal[j];
+                if ( dispNeedsOwnWeight )
+                {
+                    dispWeight[flatIdx] += massShare;
+                    dispVel[flatIdx]    += velVal * massShare;
+                }
             }
 
 #ifdef SCALAR
@@ -960,7 +1137,7 @@ void interpolateGrid_phaseSpace(DT &dt,
                 for (int i = 0; i < NO_DIM; ++i)
                     for (size_t j = 0; j < noScalarComp; ++j)
                         scalarVal[j] += sGrad[i][j] * rel[i];
-                quantities->scalar[flatIdx] += scalarVal * massShare;
+                quantities->scalar[flatIdx] += scalarVal * momShare;
             }
             if (field.scalar_gradient)
             {
@@ -968,11 +1145,18 @@ void interpolateGrid_phaseSpace(DT &dt,
                 for (size_t j = 0; j < noScalarComp; ++j)
                     for (int i = 0; i < NO_DIM; ++i)
                         sgrad[j*NO_DIM+i] = sGrad[i][j];
-                quantities->scalar_gradient[flatIdx] += sgrad * massShare;
+                quantities->scalar_gradient[flatIdx] += sgrad * momShare;
             }
 #endif
 
             streamCount[flatIdx]++;
+            // --ps-exact-deposit fall-through (empty clip window, released or sub-resolution
+            // tets): the tet's volume is shared equally among its nInside samples, so each
+            // carries V_tet/nInside -- for the monolithic centroid fallback (nInside==1) that
+            // is exactly V_tet/V_cell, the same volume fraction the exact path deposits.
+            if ( psExact )
+                exactMult[flatIdx] += Real( geo.cellAbsDet / factorial(NO_DIM) / double(cellVolume) )
+                                      / Real(nInside);
             if ( psCaustics )
                 orientBits[flatIdx] |= (geo.cellDet > 0. ? 1 : 2);   // fold parity: sign of det(Ax)
         }
@@ -1013,6 +1197,11 @@ void interpolateGrid_phaseSpace(DT &dt,
         {
             if ( !weightIsDensity )
                 quantities->mass_weight.swap( massWeight );   // sum(rho_s); normalized later by caller
+            if ( dispNeedsOwnWeight )
+            {   // the dispersion's mass-weighted mean/normalizer must survive the partition merge
+                quantities->disp_weight.swap( dispWeight );
+                quantities->disp_velocity.swap( dispVel );
+            }
         }
         else
             for (size_t i = 0; i < totalGrid; ++i)
@@ -1027,9 +1216,11 @@ void interpolateGrid_phaseSpace(DT &dt,
                     if (field.scalar)            quantities->scalar[i]            *= inv;
                     if (field.scalar_gradient)   quantities->scalar_gradient[i]   *= inv;
 #endif
-                    if (field.velocity_dispersion)
+                    if (field.velocity_dispersion && !dispNeedsOwnWeight)
                     {
                         // sigma_ij = <v_i v_j> - <v_i><v_j>; quantities->velocity is now <v>.
+                        // (Under --ps-volume-weighted the dispersion has its OWN mass-weighted
+                        //  mean/normalizer and is closed out in the separate pass below.)
                         Pvector<Real,noVelComp> const &vbar = quantities->velocity[i];
                         size_t c = 0;
                         for (int a = 0; a < NO_DIM; ++a)
@@ -1042,6 +1233,27 @@ void interpolateGrid_phaseSpace(DT &dt,
                             }
                     }
                 }
+            }
+
+        // --ps-volume-weighted, serial path: close out the MASS-weighted dispersion against its
+        // own mean/normalizer (the loop above normalized 'velocity' by the VOLUME weight, so it
+        // is not the right mean here). Mirrors normalizePhaseSpace's second pass.
+        if ( !deferNorm && dispNeedsOwnWeight )
+            for (size_t i = 0; i < totalGrid; ++i)
+            {
+                Real const wm = dispWeight[i];
+                if ( wm <= Real(0.) ) continue;
+                Real const invm = Real(1.) / wm;
+                Pvector<Real,noVelComp> const vbar = dispVel[i] * invm;   // <v>_mass
+                size_t c = 0;
+                for (int a = 0; a < NO_DIM; ++a)
+                    for (int b = a; b < NO_DIM; ++b)
+                    {
+                        Real s = quantities->velocity_dispersion[i][c] * invm - vbar[a]*vbar[b];
+                        if (a == b and s < Real(0.)) s = Real(0.);   // variance: clamp FP-noise negatives
+                        quantities->velocity_dispersion[i][c] = s;
+                        ++c;
+                    }
             }
     }
 
@@ -1067,10 +1279,17 @@ void interpolateGrid_phaseSpace(DT &dt,
         size_t coveredCells = 0;
         for (size_t i = 0; i < totalGrid; ++i)
         {
-            Real const avg = Real(streamCount[i]) * invSamples;        // mean streams over the cell
+            // mean streams over the cell. Under psExact 'streamCount' is the raw tet-TOUCH count
+            // ('.tetTouch', up to hundreds), NOT a multiplicity -- the physical one is exactMult,
+            // which is what '.streams' exports. Reading streamCount here reported 110 instead of
+            // 3.0 and 100% multi-stream instead of 16.67% on the pancake.
+            Real const avg = psExact ? exactMult[i] : Real(streamCount[i]) * invSamples;
             if (avg > maxStreams) maxStreams = avg;
-            if (streamCount[i] > (int)nSamplesPerCell) multiStreamCells++;  // cell average > 1
-            if (streamCount[i] > 0) coveredCells++;
+            // '> 1' to a tolerance: exactMult is a float sum, so single-stream cells sit at
+            // 1.0 +/- eps (the sampled count is an exact integer multiple of invSamples).
+            if (psExact ? (avg > Real(1.) + PS_STREAM_TOL)
+                        : (streamCount[i] > (int)nSamplesPerCell)) multiStreamCells++;
+            if (streamCount[i] > 0) coveredCells++;   // geometric coverage: any tet touches the cell
         }
         message << MESSAGE::cBold() << "PS-DTFE:" << MESSAGE::cReset() << " Max streams at a grid point: "
                 << MESSAGE::cMagenta() << maxStreams << MESSAGE::cReset()
@@ -1084,14 +1303,30 @@ void interpolateGrid_phaseSpace(DT &dt,
                 << "\n" << MESSAGE::Flush;
     }
 
-    // Export the per-grid-point stream count, averaged over the sub-samples. Under the
-    // exact deposit every overlap is a full count (no sub-sampling, so no averaging):
-    // integer-valued, hence bit-exact under any partition split; centroid fallbacks
-    // (released or sub-resolution tets) count 1 in their cell either way.
-    quantities->stream_count.resize(totalGrid);
-    for (size_t i = 0; i < totalGrid; ++i)
-        quantities->stream_count[i] = psExact ? Real(streamCount[i])
-                                              : Real(streamCount[i]) * invSamples;
+    // Export the per-grid-point stream count: the sampled deposit's sample-mean multiplicity,
+    // or -- under --ps-exact-deposit -- the ANALYTIC cell-mean multiplicity (1/V_cell) sum V_int,
+    // its exact nSub->infinity limit. Both are the same physical quantity on the same scale, so
+    // single-stream cells select the same way under either deposit -- but only TO A TOLERANCE
+    // (PS_STREAM_TOL / dtfelib.STREAM_TOL): this is a float, never exactly 1.
+    if ( psExact )
+        quantities->stream_count.swap(exactMult);   // same type and exactMult is dead below: no copy
+    else
+    {
+        quantities->stream_count.resize(totalGrid);
+        for (size_t i = 0; i < totalGrid; ++i)
+            quantities->stream_count[i] = Real(streamCount[i]) * invSamples;
+    }
+
+    // --ps-exact-deposit: also export the raw integer tet-touch count ('.tetTouch'), the
+    // number of tetrahedra with a nonzero intersection with the cell. Kept as a geometric
+    // diagnostic (tessellation multiplicity, hundreds in resolved regions); it is NOT a
+    // stream count and is not comparable to the sampled deposit's '.streams'.
+    if ( psExact )
+    {
+        quantities->tet_touch.resize(totalGrid);
+        for (size_t i = 0; i < totalGrid; ++i)
+            quantities->tet_touch[i] = Real(streamCount[i]);
+    }
 
     // Export the caustic orientation bits (0..3, exact in float); OR-merged across partitions
     // and binarized to the 0/1 fold flag once in DTFE() after the merge.

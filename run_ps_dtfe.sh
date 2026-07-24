@@ -4,8 +4,9 @@
 # Shared defaults (DATA_ROOT, SIMULATION, SNAPSHOTS, GRID_SIZE, PADDING) live in config.sh.
 #
 # Usage:
-#   ./run_ps_dtfe.sh [-d DATA_DIR] [-s SIMULATION] [-g GRID_SIZE] [-n AVG_SUBSAMPLES] [-m] [snapshot ...]
+#   ./run_ps_dtfe.sh [-d DATA_DIR] [-s SIMULATION] [-g GRID_SIZE] [-n AVG_SUBSAMPLES] [-m] [-e] [snapshot ...]
 #     -m   run the deposit on the Apple GPU (same as PS_METAL=1; needs 'make PS-DTFE METAL=1')
+#     -e   exact conservative deposit (same as PS_EXACT=1; --ps-exact-deposit, CPU-only, slower)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/config.sh"
@@ -21,20 +22,64 @@ MAX_CONCURRENT="${MAX_CONCURRENT:-}"  # cap on concurrent partitions. EMPTY (def
 AVG_SUBSAMPLES="${AVG_SUBSAMPLES:-3}"   # nSub^3 sub-points for the '_a' fields; dominant runtime cost (~nSub^3), 1 = no averaging. Override: -n 1 or AVG_SUBSAMPLES=1
 MPC_UNIT=1000              # length of 1 Mpc in the input's units (1000 for ckpc/h)
 THREADS="${THREADS:-}"     # cap OpenMP threads globally; empty = all cores
+SCRATCH_DIR="${SCRATCH_DIR:-}"  # out-of-core mode (--scratch-dir): back the full-resolution grid
+                           # accumulators (>= 1 GB allocations) with mmap'ed files in this LOCAL
+                           # directory instead of RAM. Required for GRID_SIZE=1024 with the full
+                           # FIELDS list (~146 GB of accumulators vs 55 GB budget); bit-identical
+                           # results, RSS stays bounded, scratch files self-delete on any exit.
+                           # MUST be a local non-synced path, e.g. /private/tmp/dtfe-scratch
+                           # (mkdir it first) -- iCloud paths are rejected by the binary.
+SAMPLE_POINTS="${SAMPLE_POINTS:-}"  # path to a --sample-points file (e.g. from
+                           # python/tools/make_image_plane.py): evaluate the continuous field at
+                           # those points IN ADDITION to the grid deposit, writing
+                           # <snapdir>/<prefix>.pts_* (CPU, double precision). Shares the run's
+                           # triangulation, so the marginal cost is just the evaluation --
+                           # this is how the high-resolution figure slices piggyback on a
+                           # production grid run (see run_ps_pipeline.sh).
+PTS_VEL_GRAD="${PTS_VEL_GRAD:-0}"   # 1 = with SAMPLE_POINTS, also write '.pts_velGrad'
+                           # (--pts-vel-grad): the density-weighted velocity gradient at each
+                           # sample point (float64 x9). dtfelib.PointPlane derives the
+                           # divergence / shear / vorticity maps from it, so this is what makes
+                           # the velocity-derivative fields available to the hi-res figures.
 PS_METAL="${PS_METAL:-0}"  # 1 = run the deposit on the Apple GPU (--ps-metal; needs 'make PS-DTFE METAL=1')
+PS_VERTEX_MASS="${PS_VERTEX_MASS:-1}"  # 1 (default) = chart-independent tet masses (--ps-vertex-mass):
+                           # each particle's mass splits equally among its incident tetrahedra. REQUIRED for
+                           # TNG runs: combined_ics.hdf5 holds the z=127 IC positions, whose configuration
+                           # already carries delta_ic = D(127)/D(z)*delta -- the default rho_bar*V_lag masses
+                           # then filter every density mode by 1-D(127)/D(z) (-16.5% at z=20, -3% at z=2;
+                           # verified against regular DTFE on TNG50-3). Velocities are unaffected either way.
+                           # Set PS_VERTEX_MASS=0 only for true-lattice Lagrangian inputs or A/B comparisons.
+PS_VOLUME_WEIGHTED="${PS_VOLUME_WEIGHTED:-0}"  # 1 = volume-weighted velocity moments (--ps-volume-weighted):
+                           # velocity/gradient/div/shear/vort/dispersion become VOLUME averages per cell
+                           # (the standard-DTFE '_a' convention that -aHf*delta refers to) instead of the
+                           # default mass-weighted (momentum-like) means. The DISPERSION is excluded and stays
+                           # mass-weighted (sigma_ij is an f-weighted CBE moment by definition) -- it comes out
+                           # bit-identical to a default run, so this ONE config is the literature-standard
+                           # estimator for every field at once. Works with the CPU and GPU (-m) deposits.
+PS_EXACT="${PS_EXACT:-0}"  # 1 = exact conservative deposit (--ps-exact-deposit): analytic r3d tet-cell
+                           # clipping instead of the nSub^3 sub-sampled deposit -- no sampling noise, mass
+                           # conservation to the arithmetic's precision. Runs on the CPU (double, the
+                           # reference) and on the GPU with -m (float32 r3d port) -- USE -m HERE, the
+                           # clipping is the most expensive deposit by far. Still slower than the sampled
+                           # deposit: an accuracy option. AVG_SUBSAMPLES is ignored (the exact deposit is
+                           # the nSub->infinity limit, so '.den' == '.a_den'). Override: -e
 
 DATA_DIR=""                # default: $DATA_ROOT/$SIMULATION (config.sh); override with -d
-OUTPUT_PREFIX="ps_output"   # -> <snapdir>/ps_output_nsubN.* so different nSub runs sit side by side instead of clobbering
+OUTPUT_PREFIX="${OUTPUT_PREFIX:-ps_output}"   # -> <snapdir>/<prefix>.*  Override to keep incompatible runs side by
+                           # side instead of clobbering, e.g. OUTPUT_PREFIX=ps_mw with PS_VOLUME_WEIGHTED=0 for the
+                           # mass-weighted (physical) dispersion next to the default volume-weighted shear/divergence
+                           # set. dtfelib.FieldSet reads the 'ps_output.' prefix, so keep the primary set there.
 
-usage() { echo "Usage: $0 [-d DATA_DIR] [-s SIMULATION] [-g GRID_SIZE] [-n AVG_SUBSAMPLES] [-m] [snapshot ...]"; }
+usage() { echo "Usage: $0 [-d DATA_DIR] [-s SIMULATION] [-g GRID_SIZE] [-n AVG_SUBSAMPLES] [-m] [-e] [snapshot ...]"; }
 
-while getopts "d:s:g:n:mh" opt; do
+while getopts "d:s:g:n:meh" opt; do
     case "$opt" in
         d) DATA_DIR="$OPTARG" ;;
         s) SIMULATION="$OPTARG" ;;
         g) GRID_SIZE="$OPTARG" ;;
         n) AVG_SUBSAMPLES="$OPTARG" ;;
         m) PS_METAL=1 ;;
+        e) PS_EXACT=1 ;;
         h) usage; exit 0 ;;
         *) usage; exit 1 ;;
     esac
@@ -67,7 +112,11 @@ LAGRANGIAN_INPUT="${DATA_DIR}/combined_ics.hdf5"
 # (dimensionless; literature ~0.2-0.4 -- NOTE: runs before 2026-07-03 used the old default 0.0).
 # The binary applies NO smoothing anywhere; smoothing is a plot-time choice in plot_PS_DTFE.py.
 LAMBDA_TH="${LAMBDA_TH:-0.3}"
-FIELDS="density_a velocity_a dispersion_a"
+# Same velocity-derivative set as run_dtfe.sh (gradient_a divergence_a shear_a vorticity_a, all
+# derived from the density-weighted multi-stream velocity gradient -- single-stream caveat above)
+# plus the PS-only dispersion; add tweb_a/vweb_a here to also classify the cosmic web.
+# Env-overridable, e.g. FIELDS="density_a velocity_a" for a lighter batch.
+FIELDS="${FIELDS:-density_a velocity_a gradient_a divergence_a shear_a vorticity_a dispersion_a}"
 
 cd "$SCRIPT_DIR" || exit 1
 
@@ -106,6 +155,23 @@ for i in "${SNAPSHOTS[@]}"; do
     metal_args=()
     [ "${PS_METAL}" = "1" ] && metal_args=(--ps-metal)
 
+    # Exact conservative deposit toggle (-e / PS_EXACT=1); CPU and GPU deposits.
+    exact_args=()
+    [ "${PS_EXACT}" = "1" ] && exact_args=(--ps-exact-deposit)
+
+    # Chart-independent tet masses (PS_VERTEX_MASS=1, default -- see the comment at the top).
+    vmass_args=()
+    [ "${PS_VERTEX_MASS}" = "1" ] && vmass_args=(--ps-vertex-mass)
+
+    # Volume-weighted velocity moments (PS_VOLUME_WEIGHTED=1); CPU and GPU deposits.
+    vw_args=()
+    [ "${PS_VOLUME_WEIGHTED}" = "1" ] && vw_args=(--ps-volume-weighted)
+
+    # Point evaluation on top of the grid run (SAMPLE_POINTS=<file>, see the comment at the top).
+    sp_args=()
+    [ -n "${SAMPLE_POINTS}" ] && sp_args=(--sample-points "${SAMPLE_POINTS}")
+    [ -n "${SAMPLE_POINTS}" ] && [ "${PTS_VEL_GRAD}" = "1" ] && sp_args+=(--pts-vel-grad)
+
     # Separate Lagrangian input, unless InitialCoordinates is in the snapshot (empty here).
     lag_args=()
     if [ -n "${LAGRANGIAN_INPUT}" ]; then
@@ -129,6 +195,7 @@ for i in "${SNAPSHOTS[@]}"; do
     part_args=()
     [ -n "${PARTITION}" ] && part_args+=(--partition ${PARTITION})
     [ -n "${MAX_CONCURRENT}" ] && part_args+=(--max-concurrent "${MAX_CONCURRENT}")
+    [ -n "${SCRATCH_DIR}" ] && part_args+=(--scratch-dir "${SCRATCH_DIR}")
 
     /usr/bin/time -l ./PS-DTFE "${input_file}" "${output_root}" \
         --grid ${GRID_SIZE} \
@@ -140,7 +207,11 @@ for i in "${SNAPSHOTS[@]}"; do
         --MpcUnit ${MPC_UNIT} \
         --field ${FIELDS} \
         --lambda_th ${LAMBDA_TH} \
-        "${metal_args[@]}" \
+        ${metal_args[@]+"${metal_args[@]}"} \
+        ${exact_args[@]+"${exact_args[@]}"} \
+        ${vmass_args[@]+"${vmass_args[@]}"} \
+        ${vw_args[@]+"${vw_args[@]}"} \
+        ${sp_args[@]+"${sp_args[@]}"} \
         "${lag_args[@]}" 2>&1 | tee "${run_log}"
     rc=${PIPESTATUS[0]}
 

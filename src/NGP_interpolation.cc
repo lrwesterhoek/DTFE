@@ -108,8 +108,9 @@ void NGP_interpolation_regular_grid(vector<Particle_data> &particles,
 				validCell = false;
 		}
 		if ( not validCell ) continue;
-		int index = 0;
-		for (int d=0; d<NO_DIM; ++d) index = index * nGrid[d] + cell[d];
+		// size_t: an int32 flat index overflows above ~1290^3 cells (2^31) -> heap corruption
+		size_t index = 0;
+		for (int d=0; d<NO_DIM; ++d) index = index * size_t(nGrid[d]) + size_t(cell[d]);
 		q->density[index] += it->weight();
 		if ( userOptions.aField.velocity )
 			q->velocity[index] += it->velocity() * it->weight();
@@ -165,8 +166,10 @@ void NGP_particle_count(vector<Particle_data> &particles,
 				validCell = false;
 		}
 		if ( not validCell ) continue;
-		int index = 0;
-		for (int d=0; d<NO_DIM; ++d) index = index * nGrid[d] + cell[d];
+		// size_t: an int32 flat index overflows above ~1290^3 cells (2^31) -> heap corruption.
+		// This function runs during partition setup, BEFORE any split can reduce the grid.
+		size_t index = 0;
+		for (int d=0; d<NO_DIM; ++d) index = index * size_t(nGrid[d]) + size_t(cell[d]);
 		(*counts)[index] += 1;
 	}
 }

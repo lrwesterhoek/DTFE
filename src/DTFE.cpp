@@ -38,8 +38,11 @@
 #include "quantities.h"
 #include "subpartition.h"
 #include "miscellaneous.h"
+#include <limits>
+
 #include "message.h"
 #include "auto_tune.h"
+#include "scratch_alloc.h"
 #include "ps_point_eval.h"
 
 
@@ -67,6 +70,7 @@ void computeWebClassification(Field &fields,
                                int const verboseLevel,
                                Real lambda_th,
                                Real hubbleParam,
+                               Real scaleFactor,
                                Quantities *q);
 
 // Derives the T-web classification from the tidal tensor of the DENSITY grid (FFT Poisson).
@@ -82,8 +86,8 @@ void postProcessWebFields(User_options &userOptions,
 {
     computeDivergenceShearVorticity( userOptions.uField, userOptions.verboseLevel, uQuantities );
     computeDivergenceShearVorticity( userOptions.aField, userOptions.verboseLevel, aQuantities );
-    computeWebClassification( userOptions.uField, userOptions.verboseLevel, userOptions.lambda_th, userOptions.hubbleParam, uQuantities );
-    computeWebClassification( userOptions.aField, userOptions.verboseLevel, userOptions.lambda_th, userOptions.hubbleParam, aQuantities );
+    computeWebClassification( userOptions.uField, userOptions.verboseLevel, userOptions.lambda_th, userOptions.hubbleParam, userOptions.scaleFactor, uQuantities );
+    computeWebClassification( userOptions.aField, userOptions.verboseLevel, userOptions.lambda_th, userOptions.hubbleParam, userOptions.scaleFactor, aQuantities );
     computeTidalWebClassification( userOptions.uField, userOptions, uQuantities );
     computeTidalWebClassification( userOptions.aField, userOptions, aQuantities );
 }
@@ -154,6 +158,35 @@ DTFE_State DTFE_setup(vector<Particle_data> *allParticles,
     userOptions.updateEntries( particlePointer->size(), not samples.empty() );
     if ( userOptions.averageDensity<0. )
         userOptions.averageDensity = averageDensity( *particlePointer, userOptions );
+
+    // --scratch-dir: arm the out-of-core allocator BEFORE any full-grid allocation and before
+    // auto-tune (which excludes the disk-backed grid term from its RAM model when armed). The
+    // path itself was validated at option parsing; the arming can still fail in the library
+    // build, whose scratch_alloc STUB never hijacks the host program's allocator.
+    if ( not userOptions.scratchDir.empty() )
+    {
+        double thresholdGB = 1.0;
+        if ( const char *env = std::getenv("DTFE_SCRATCH_MIN_GB") )
+        {
+            double v = std::atof(env);
+            if ( v > 0. ) thresholdGB = v;
+        }
+        if ( ScratchAlloc::scratchArm( userOptions.scratchDir.c_str(), size_t(thresholdGB*1.e9) ) )
+        {
+            MESSAGE::Message message( userOptions.verboseLevel );
+            message << MESSAGE::cBold() << "SCRATCH:" << MESSAGE::cReset() << " allocations >= "
+                    << thresholdGB << " GB (the full-grid accumulators) are backed by mmap'ed files in '"
+                    << userOptions.scratchDir << "' -- unlinked at creation, so they free themselves on any exit.\n"
+                    << MESSAGE::Flush;
+        }
+        else
+        {
+            MESSAGE::Warning warning( userOptions.verboseLevel );
+            warning << "'--scratch-dir' has no effect in the library build (libDTFE must not replace the host "
+                    << "program's global allocator); the full grids stay in RAM.\n" << MESSAGE::EndWarning;
+            userOptions.scratchDir.clear();   // keep auto-tune's RAM model honest
+        }
+    }
 
     // auto-select --partition / --max-concurrent from the data and machine when not user-given
     {
@@ -513,6 +546,13 @@ void DTFE(vector<Particle_data> *allParticles,
                 if ( state.options.aField.selected() )
                     aQuantities->caustic_bits.assign(totalGrid, Real(0.));
             }
+            if ( state.options.psExactDeposit )
+            {
+                if ( state.options.uField.selected() )
+                    uQuantities->tet_touch.assign(totalGrid, Real(0.));
+                if ( state.options.aField.selected() )
+                    aQuantities->tet_touch.assign(totalGrid, Real(0.));
+            }
         }
 
         // Eulerian region/padding for the full box (needed by DTFE_interpolation)
@@ -669,7 +709,10 @@ void DTFE(vector<Particle_data> *allParticles,
                 {
                     Real const v = (*sc)[i];
                     if (v > Real(0.)) ++covered;
-                    if (v > Real(1.)) ++multi;
+                    // multiplicity is a float sum under every deposit -- single-stream cells land
+                    // on 1.0 +/- eps, so a bare 'v > 1' counts float noise as multi-stream (28.33%
+                    // vs the true 16.67% on the pancake). See PS_STREAM_TOL in quantities.h.
+                    if (v > Real(1.) + PS_STREAM_TOL) ++multi;
                     if (v > maxStreams) maxStreams = v;
                 }
                 message << "\n" << MESSAGE::cCyan() << "PS-DTFE: aggregate over " << totalPartitions
@@ -1026,6 +1069,7 @@ void computeWebClassification(Field &fields,
                                int const verboseLevel,
                                Real lambda_th,
                                Real hubbleParam,
+                               Real scaleFactor,
                                Quantities *q)
 {
     if ( q->velocity_gradient.empty() ) return;
@@ -1035,6 +1079,20 @@ void computeWebClassification(Field &fields,
     Real H0_norm = Real(1.);
     if ( hubbleParam > Real(0.) )
         H0_norm = Real(100.) * hubbleParam;  // H0 in km/s/Mpc
+    // The gradient is in Gadget u-units (u = v_pec/sqrt(a)): multiply by sqrt(a) to reach
+    // peculiar km/s, or the eigenvalues come out 1/sqrt(a) inflated at high z (4.6x at z=20)
+    // and lambda_th is effectively miscalibrated there. sqrt(1) == 1 exactly, so z=0 results
+    // are bit-identical to the uncorrected code. -1 = unknown (no header value): warn, treat as 1.
+    Real sqrtA = Real(1.);
+    if ( scaleFactor > Real(0.) )
+        sqrtA = std::sqrt( scaleFactor );
+    else
+    {
+        MESSAGE::Warning warning( verboseLevel );
+        warning << "V-web: no scale factor available (header lacked 'Time' and no '--scale-factor' given); "
+                << "assuming a = 1. At high redshift the eigenvalues are then 1/sqrt(a) inflated.\n"
+                << MESSAGE::EndWarning;
+    }
 
     size_t const N = q->velocity_gradient.size();
 
@@ -1046,7 +1104,7 @@ void computeWebClassification(Field &fields,
         for (size_t i=0; i<N; ++i)
         {
             Pvector<Real,noGradComp> &g = q->velocity_gradient[i];
-            Real norm = Real(-1.) / (Real(2.) * H0_norm);
+            Real norm = -sqrtA / (Real(2.) * H0_norm);   // sqrtA: u-units -> peculiar km/s
             Real s00 = norm * (g[0*NO_DIM+0] + g[0*NO_DIM+0]);
             Real s11 = norm * (g[1*NO_DIM+1] + g[1*NO_DIM+1]);
             Real s01 = norm * (g[0*NO_DIM+1] + g[1*NO_DIM+0]);
@@ -1102,6 +1160,12 @@ void computeTidalWebClassification(Field &fields,
     size_t const nx = userOptions.gridSize[0], ny = userOptions.gridSize[1], nz = userOptions.gridSize[2];
     size_t const N  = nx * ny * nz;
     if ( q->density.size() != N ) { skip("it needs the density field on the full grid (select 'density'/'density_a' too)."); return; }
+    // FFTW's basic planner takes int transform sizes: above 2^31 total cells (~1290^3, e.g.
+    // 2048^3 = 8.6e9) the int(nx*ny*nz) arithmetic inside FFTW overflows -- NULL plan or a
+    // silently wrong transform. Refuse cleanly; switching to the guru64 interface is the fix
+    // if such grids ever become reachable (today they exceed this machine's disk anyway).
+    if ( N > size_t(std::numeric_limits<int>::max()) )
+    { skip("the grid exceeds 2^31 cells, past FFTW's int-based planner (needs the guru64 interface)."); return; }
 
     auto const tidalStart = std::chrono::steady_clock::now();
     message << "\nComputing the T-web from the tidal tensor of the raw density grid (lambda_th = "
