@@ -24,7 +24,7 @@ analysis/plot script works with either method unchanged:
                        a 1024^3 velGrad (38.6 GB) plots and summarizes at MB-level RSS.
 
 Usage:
-    fs = FieldSet("/Users/luukw/output/TNG50-4-Dark/snapdir_099")          # auto-detect method
+    fs = FieldSet("$DATA_ROOT/TNG50-4-Dark/snapdir_099")                   # auto-detect method
     rho   = fs.density(units="mean")            # rho/rho_bar for BOTH methods
     v     = fs.load("velocity")                 # (N,N,N,3) km/s
     v1    = fs.velocity_single_stream()         # velocity, NaN where stream count != 1 (PS only)

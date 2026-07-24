@@ -366,7 +366,7 @@ inline void autoTunePartitioning(User_options &u,
     bool const psDisp = u.uField.velocity_dispersion or u.aField.velocity_dispersion;
     bool const psGrad = u.uField.velocity_gradient or u.uField.selectedVelocityDerivatives()
                         or u.aField.velocity_gradient or u.aField.selectedVelocityDerivatives();
-    // flags gating the remaining GPU buffers (ps_metal_host.cc / ps_gpu_cuda.cu)
+    // flags gating the remaining GPU buffers (ps_metal_host.cc)
     bool const psVolW  = ps.volumeWeighted;
     bool const psCaust = ps.caustics;
     bool const psExact = ps.exactDeposit;

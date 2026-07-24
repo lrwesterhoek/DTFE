@@ -6,7 +6,8 @@
 /DTFE
 /PS-DTFE
 output/
-/DTFE_include/   # header-copy artifact of 'make library' (copy_headers)
+# header-copy artifact of 'make library' (copy_headers)
+/DTFE_include/
 
 # compiled objects, libraries, shared objects, executables, debug symbols
 *.o

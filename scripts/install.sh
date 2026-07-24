@@ -4,10 +4,8 @@
 #   ./install.sh              install any missing dependencies, wipe the build, and rebuild
 #                             BOTH binaries with the best backend for this machine:
 #                               macOS (Apple Silicon)      -> METAL=1  (GPU deposit)
-#                               Linux with nvcc            -> CUDA=1
-#                               Linux with hipcc (ROCm)    -> HIP=1
 #                               anything else              -> CPU-only
-#   ./install.sh --cpu        force a CPU-only build (skip the GPU backend detection)
+#   ./install.sh --cpu        force a CPU-only build (skip the Metal backend detection)
 #   ./install.sh --no-deps    skip the dependency-installation step (just clean + rebuild)
 #   ./install.sh --docker     build the containerized LINUX image instead (docker build .).
 #                             NOTE: a container is a Linux VM even on a Mac -- it can NEVER
@@ -19,7 +17,7 @@
 # from different GPU modes are never mixed (a mode switch wipes the object directory).
 
 set -euo pipefail
-cd "$(dirname "${BASH_SOURCE[0]}")"
+cd "$(dirname "${BASH_SOURCE[0]}")/.."   # run from the repo root (this script lives in scripts/)
 
 BLUE='\033[0;34m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
 info()  { echo -e "${BLUE}[install]${NC} $1"; }
@@ -57,7 +55,7 @@ fi
 UNAME_S="$(uname -s)"
 if [ "$DO_DEPS" -eq 1 ]; then
     info "step 1/4: installing missing dependencies (skip with --no-deps)"
-    bash ./install_dependencies.sh
+    bash scripts/install_dependencies.sh
 else
     info "step 1/4: skipped (--no-deps)"
 fi
@@ -93,16 +91,6 @@ if [ "$FORCE_CPU" -eq 0 ]; then
                 GPU_ARG="METAL=1"
                 BACKEND="Metal GPU (--gpu / --ps-gpu at runtime, automatic CPU fallback)"
             fi
-        fi
-    elif [ "$UNAME_S" = "Linux" ]; then
-        if command -v nvcc >/dev/null 2>&1 || [ -x /usr/local/cuda/bin/nvcc ]; then
-            GPU_ARG="CUDA=1"
-            BACKEND="CUDA GPU (--gpu / --ps-gpu at runtime, automatic CPU fallback)"
-        elif command -v hipcc >/dev/null 2>&1 || [ -x /opt/rocm/bin/hipcc ]; then
-            GPU_ARG="HIP=1"
-            BACKEND="HIP/ROCm GPU"
-            warn "HIP binaries are arch-specific: on a machine that cannot see the target GPU,"
-            warn "re-run as: make PS-DTFE HIP=1 GPU_ARCH=gfxNNN (rocminfo | grep gfx)"
         fi
     fi
 fi

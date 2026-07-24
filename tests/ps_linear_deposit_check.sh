@@ -265,7 +265,7 @@ if have_exact:
     check("D exact+linear differs smoothly from exact", corr_ex > 0.98,
           f"log-density correlation = {corr_ex:.5f}")
     # float32 r3d port parity: the GPU exact deposit (exact_init_tet/exact_clip_plane/
-    # exact_reduce2 in metal/ps_deposit.metal + the CUDA mirror) vs the CPU double r3d
+    # exact_reduce2 in metal/ps_deposit.metal) vs the CPU double r3d
     if gpu:
         for ext, nc, tol in ((".den", 1, 1e-4), (".vel", 3, 1e-4), (".velDisp", 1, 1e-4)):
             c = load(f"{tmp}/pld_pan_exd", ext, nc)

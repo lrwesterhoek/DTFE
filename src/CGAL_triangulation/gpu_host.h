@@ -1,17 +1,13 @@
-/* Backend-neutral host interface to the GPU deposit kernels. Exactly one backend
-   implements it per binary, selected at build time:
+/* Backend-neutral host interface to the GPU deposit kernels, implemented by the Metal
+   backend (ps_metal_host.cc / dtfe_metal_host.cc) when built with 'make <target> METAL=1'
+   on macOS/Apple Silicon. The interface is kept backend-neutral so another backend could
+   be added without touching the callers.
 
-     make <target> METAL=1   macOS/Apple Silicon  (ps_metal_host.cc / dtfe_metal_host.cc,
-     make <target> CUDA=1    Linux/NVIDIA         (ps_gpu_cuda.cu / dtfe_gpu_cuda.cu via nvcc)
-     make <target> HIP=1     Linux/AMD ROCm       (same .cu sources via hipcc; the sources
-                             use a small cuda-vs-hip macro shim and compile for both)
-
-   Any backend defines PS_GPU (PS-DTFE build) / DTFE_GPU (standard build); the callers in
+   The Metal build defines PS_GPU (PS-DTFE) / DTFE_GPU (standard); the callers in
    ps_interpolation.cc and averaged_interpolation_1.cc guard every use on those and fall
    back to the CPU path on any failure. The GPU results match the CPU path to float
-   rounding (atomic summation order) -- the parity contract validated for the Metal
-   backend (tests/dtfe_metal_check.sh, metal/validate_deposit.cpp) applies to every
-   backend, since all kernels implement the same algorithm on float32.
+   rounding (atomic summation order) -- the parity contract is validated by
+   tests/dtfe_metal_check.sh and metal/validate_deposit.cpp.
 
    This header is self-contained (no DTFE/CGAL/backend includes). */
 
@@ -23,7 +19,7 @@
 #include <string>
 #include <vector>
 
-// Name of the backend compiled into this binary ("Metal", "CUDA", "HIP").
+// Name of the backend compiled into this binary ("Metal").
 std::string gpuBackendName();
 
 // Name of the GPU device (empty if unavailable); initializes the device on first call.
@@ -72,9 +68,8 @@ struct PSGpuGrids
 // Returns false with 'err' set if there is no device / setup fails; outputs untouched in
 // that case, zeroed otherwise.
 // CONSUMES verts/vels/masses/dens (several GB per partition at scale): Metal frees each one
-// right after copying it into unified memory; CUDA/HIP stream them to the device in
-// chunks and free them when the dispatch loop ends. Either way they may be empty when the
-// call returns -- the CPU fallback deposits from the triangulation, not from these arrays.
+// right after copying it into unified memory, so they may be empty when the call returns --
+// the CPU fallback deposits from the triangulation, not from these arrays.
 bool psGpuDepositFields(std::vector<float>& verts,   // nTet*12: 4 wrapped Eulerian vertices
                         std::vector<float>& vels,    // nTet*12: 4 vertex velocities (empty if unused)
                         std::vector<float>& masses,  // nTet: tet mass (rho_bar * V_lag, or the --ps-vertex-mass shares)

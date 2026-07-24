@@ -43,8 +43,8 @@ if [ "${DO_BUILD}" -eq 1 ]; then
     # macOS SDK handling (MACOS_ISYSROOT) lives in the Makefile; needed because an
     # OS/CLT update can leave Homebrew clang pointing at a non-existent SDK.
     # Respect the current build mode: a plain 'make PS-DTFE' would silently strip the
-    # GPU support from a METAL=1/CUDA=1/HIP=1 binary (the Makefile wipes o_ps on mode
-    # changes and records the mode's make argument in o_ps/.build_mode).
+    # GPU support from a METAL=1 binary (the Makefile wipes o_ps on mode changes and
+    # records the mode's make argument in o_ps/.build_mode).
     BUILD_MODE="$(cat o_ps/.build_mode 2>/dev/null || true)"
     make PS-DTFE ${BUILD_MODE:+"$BUILD_MODE"}
 else

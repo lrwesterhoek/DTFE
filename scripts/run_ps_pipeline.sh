@@ -37,6 +37,7 @@
 
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"   # python/ and the binaries live one level up
 USER_GRID="${GRID_SIZE:-}"          # capture BEFORE config.sh, which sets its own GRID_SIZE
 source "${SCRIPT_DIR}/config.sh"
 
@@ -102,7 +103,7 @@ print(1 if abs(c-float(sys.argv[2]))<1e-9 else 0)" "${plane}.json" "${CENTER}") 
     if [ "${plane_new}" = "1" ] || [ ! -f "${plane}.bin" ] || [ ! -f "${plane}.json" ]; then
         first=$(printf "%03d" "${snaps[0]}")
         center_args=(); [ -n "${CENTER}" ] && center_args=(--center "${CENTER}")
-        run "${PY}" "${SCRIPT_DIR}/python/tools/make_image_plane.py" \
+        run "${PY}" "${REPO_ROOT}/python/tools/make_image_plane.py" \
             --combined "${simdir}/snapdir_${first}/combined_${first}.hdf5" \
             --axis "${AXIS}" --nu "${NU}" --planes 1 ${center_args[@]+"${center_args[@]}"} \
             -o "${plane}" || { echo "!! ${sim}: plane generation failed"; overall_rc=1; continue; }

@@ -9,16 +9,15 @@ run with a python whose h5py works (`/opt/homebrew/bin/python3.14` on the develo
 ## Build (`Makefile`, `install.sh`)
 
 ```bash
-./install.sh                      # one-command clean rebuild, best backend auto-detected
-                                  #   (Apple Silicon -> METAL=1, nvcc -> CUDA=1, hipcc -> HIP=1)
-./install.sh --cpu                # force CPU-only binaries
-./install.sh --no-deps            # skip dependency installation, just clean + rebuild
-./install.sh --jobs 4             # limit parallel build jobs
-./install.sh --docker             # containerized LINUX image instead (never Metal)
+./scripts/install.sh                      # one-command clean rebuild, best backend auto-detected
+                                  #   (Apple Silicon -> METAL=1, else CPU-only)
+./scripts/install.sh --cpu                # force CPU-only binaries
+./scripts/install.sh --no-deps            # skip dependency installation, just clean + rebuild
+./scripts/install.sh --jobs 4             # limit parallel build jobs
+./scripts/install.sh --docker             # containerized LINUX image instead (never Metal)
 
 make DTFE METAL=1 -j10            # standard DTFE, Apple-GPU '_a' interpolation backend
 make PS-DTFE METAL=1 -j10         # phase-space DTFE, Apple-GPU deposit backend
-make PS-DTFE CUDA=1 / HIP=1       # NVIDIA / AMD backends (Linux)
 make PS-DTFE TBB=1                # opt-in parallel CGAL triangulation (slower at small N!)
 make library                      # shared libDTFE
 make clean                        # binaries + objects + auto-dependency .d files
@@ -39,14 +38,14 @@ under `$DATA_ROOT/<SIM>/` (`config.sh`: `DTFE_DATA_ROOT`, default `~/output`); `
 Anything whose merged/converted product already exists is skipped automatically.
 
 ```bash
-./download_snapshots.sh -s TNG50-3-Dark 0 4 17 33 50 99    # raw snapshot chunks (z=20..0)
-./download_snapshots.sh -c -s TNG50-3-Dark 0 4 17 33 50 99 # FoF/Subfind group catalogs
-./download_snapshots.sh -t -s TNG50-3-Dark                 # SubLink merger trees (whole sim)
-./download_snapshots.sh -i -s TNG100-3-Dark                # initial conditions ics.hdf5
+./scripts/download_snapshots.sh -s TNG50-3-Dark 0 4 17 33 50 99    # raw snapshot chunks (z=20..0)
+./scripts/download_snapshots.sh -c -s TNG50-3-Dark 0 4 17 33 50 99 # FoF/Subfind group catalogs
+./scripts/download_snapshots.sh -t -s TNG50-3-Dark                 # SubLink merger trees (whole sim)
+./scripts/download_snapshots.sh -i -s TNG100-3-Dark                # initial conditions ics.hdf5
                                                            #   ('-Dark' stripped: ICs are
                                                            #    served under TNG100-3)
-./download_snapshots.sh -s TNG50-3-Dark                    # default snapshot ladder (19 snaps)
-./download_snapshots.sh -k 0123abcd -d /scratch/tng -s TNG300-3-Dark 99
+./scripts/download_snapshots.sh -s TNG50-3-Dark                    # default snapshot ladder (19 snaps)
+./scripts/download_snapshots.sh -k 0123abcd -d /scratch/tng -s TNG300-3-Dark 99
 ```
 
 ## Merge / units (`python/tools/merge_HDF5.py`, `convert_ic_units.py`)
@@ -83,15 +82,15 @@ arguments override the snapshot list. Partitioning is auto-tuned unless `PARTITI
 `MAX_CONCURRENT` are set.
 
 ```bash
-./run_ps_dtfe.sh                                  # PS-DTFE, default sim + snapshot ladder
-./run_ps_dtfe.sh -s TNG300-3-Dark 99              # one sim, one snapshot
-./run_ps_dtfe.sh -g 512 -n 2 -m 99                # grid 512^3, nSub=2, Metal deposit
-DTFE_SIM=TNG100-3-Dark ./run_ps_dtfe.sh 0 50 99   # sim via env
-PARTITION="5 5 5" MAX_CONCURRENT=2 ./run_ps_dtfe.sh -s TNG300-3-Dark 99   # manual memory plan
-THREADS=4 AVG_SUBSAMPLES=1 ./run_ps_dtfe.sh 99    # cap threads; cell-centre only (fast, no '_a')
+./scripts/run_ps_dtfe.sh                                  # PS-DTFE, default sim + snapshot ladder
+./scripts/run_ps_dtfe.sh -s TNG300-3-Dark 99              # one sim, one snapshot
+./scripts/run_ps_dtfe.sh -g 512 -n 2 -m 99                # grid 512^3, nSub=2, Metal deposit
+DTFE_SIM=TNG100-3-Dark ./scripts/run_ps_dtfe.sh 0 50 99   # sim via env
+PARTITION="5 5 5" MAX_CONCURRENT=2 ./scripts/run_ps_dtfe.sh -s TNG300-3-Dark 99   # manual memory plan
+THREADS=4 AVG_SUBSAMPLES=1 ./scripts/run_ps_dtfe.sh 99    # cap threads; cell-centre only (fast, no '_a')
 
-./run_dtfe.sh -s TNG50-3-Dark -g 512 99           # standard DTFE
-./run_dtfe.sh -m 99                               # Metal '_a' interpolation
+./scripts/run_dtfe.sh -s TNG50-3-Dark -g 512 99           # standard DTFE
+./scripts/run_dtfe.sh -m 99                               # Metal '_a' interpolation
 ```
 
 ## The binaries directly (`./DTFE`, `./PS-DTFE`)
@@ -180,7 +179,6 @@ tests/ps_linear_deposit_check.sh --no-build   # --ps-linear-deposit checks (+ GP
 tests/ps_halo_release_check.sh --no-build     # --ps-halo-release battery (pancake + crossed)
 tests/dtfe_point_eval_check.sh --no-build     # STANDARD-binary --sample-points battery
 tests/dtfe_metal_check.sh                     # CPU vs GPU parity, standard DTFE
-GPU_BUILD=CUDA=1 tests/dtfe_metal_check.sh    # same on an NVIDIA box
 python3 tests/py_dtfelib_test.py              # dtfelib suite (12 checks; real TNG data)
 python3 python/selftest.py                    # sandboxed pipeline+plots selftest (~2 min)
 python3 tests/ps_3d_test.py                   # crossed-waves 3D stream-count analytics

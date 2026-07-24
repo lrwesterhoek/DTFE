@@ -15,7 +15,7 @@
 #include <cstring>   // memcpy in the in-place cost-sort permutation
 
 #if defined(PS_GPU) && NO_DIM==3
-#include "gpu_host.h"   // GPU deposit (METAL=1/CUDA=1/HIP=1 builds); CPU deposit remains the fallback
+#include "gpu_host.h"   // GPU deposit (METAL=1 build); CPU deposit remains the fallback
 #endif
 
 #if NO_DIM==3
@@ -78,7 +78,7 @@ void interpolateGrid_phaseSpace(DT &dt,
     //
     // The box may WRAP a periodic axis: subOrigin+subDims can exceed nGrid, and the local index is
     // then (g - subOrigin + nGrid) % nGrid. Every consumer must apply that same wrap -- the CPU
-    // scatter loops below, the GPU kernels (metal/ps_deposit.metal, ps_gpu_cuda.cu) and the
+    // scatter loops below, the GPU kernels (metal/ps_deposit.metal) and the
     // merge-back (Quantities::addFromSubgrid). The wrap is a no-op for an unwrapped box, so the
     // one expression serves both.
     size_t subOrigin[NO_DIM], subDims[NO_DIM];
@@ -315,7 +315,7 @@ void interpolateGrid_phaseSpace(DT &dt,
         message << "\n" << MESSAGE::cBold() << "PS-DTFE:" << MESSAGE::cReset()
                 << " Interpolating fields to grid by iterating over all Delaunay cells ...\n" << MESSAGE::Flush;
 
-    // GPU deposit (--ps-metal / --ps-gpu, GPU builds): extract flat per-tet arrays with EXACTLY the CPU
+    // GPU deposit (--ps-gpu, Metal build): extract flat per-tet arrays with EXACTLY the CPU
     // loop's filters, dispatch metal/ps_deposit.metal::depositFields (validated to mirror the CPU
     // scatter incl. the partition sub-grid), and copy the moment grids back. Any failure (no
     // device, kernel compile, buffer alloc) falls back to the CPU loop below with a warning.
@@ -326,11 +326,11 @@ void interpolateGrid_phaseSpace(DT &dt,
     if ( tryMetal && (field.scalar || field.scalar_gradient) )
     {
         MESSAGE::Warning warning( userOptions.verboseLevel );
-        warning << "--ps-metal does not support the scalar fields; using the CPU deposit for this pass.\n" << MESSAGE::EndWarning;
+        warning << "--ps-gpu does not support the scalar fields; using the CPU deposit for this pass.\n" << MESSAGE::EndWarning;
         tryMetal = false;
     }
 #endif
-    // The kernels index cells with a 32-bit 'uint flat' (metal/ps_deposit.metal, ps_gpu_cuda.cu).
+    // The kernels index cells with a 32-bit 'uint flat' (metal/ps_deposit.metal).
     // Above 2^32 cells it wraps -- and because the buffers are LARGER than 2^32, the wrapped index
     // is still in bounds: no crash, no OOB, just atomics landing in the wrong cells. Fall back to
     // the CPU instead, mirroring the standard-DTFE guard in averaged_interpolation_1.cc. This is
@@ -340,7 +340,7 @@ void interpolateGrid_phaseSpace(DT &dt,
     if ( tryMetal and subTotal > size_t(UINT32_MAX) )
     {
         MESSAGE::Warning warning( userOptions.verboseLevel );
-        warning << "--ps-metal does not support more than 2^32 cells per partition sub-grid (this one has "
+        warning << "--ps-gpu does not support more than 2^32 cells per partition sub-grid (this one has "
                 << subTotal << ", i.e. > " << size_t(UINT32_MAX) << "); using the CPU deposit for this pass. "
                 << "A finer --partition would bring the sub-grid back under the cap.\n" << MESSAGE::EndWarning;
         tryMetal = false;
@@ -605,7 +605,7 @@ void interpolateGrid_phaseSpace(DT &dt,
         {
             warned = true;
             MESSAGE::Warning warning( userOptions.verboseLevel );
-            warning << "--ps-gpu/--ps-metal requested but this binary was built without GPU support (rebuild with METAL=1, CUDA=1 or HIP=1; or NO_DIM!=3); using the CPU deposit.\n" << MESSAGE::EndWarning;
+            warning << "--ps-gpu requested but this binary was built without GPU support (rebuild with METAL=1; or NO_DIM!=3); using the CPU deposit.\n" << MESSAGE::EndWarning;
         }
     }
 #endif // PS_GPU

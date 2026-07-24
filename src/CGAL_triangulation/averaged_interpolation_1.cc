@@ -28,7 +28,7 @@
 #include <stdio.h>
 #include <gsl/gsl_qrng.h>
 
-// GPU deposit (METAL=1/CUDA=1/HIP=1 builds, 3D only); the CPU loop below remains the fallback. MY_SCALAR
+// GPU deposit (METAL=1 build, 3D only); the CPU loop below remains the fallback. MY_SCALAR
 // evaluates arbitrary user C++ per sample, which cannot run on the GPU.
 #if defined(DTFE_GPU) && NO_DIM==3 && !defined(MY_SCALAR)
 #define DTFE_GPU_ACTIVE
@@ -291,7 +291,7 @@ void interpolateGrid_averaged_1(DT &dt,
     quasiRandomSequence( quasiRandomNumbers, maxNN );
 
 
-    // GPU deposit (--metal / --gpu, GPU builds): extract flat per-tetrahedron arrays using the CPU
+    // GPU deposit (--gpu, Metal build): extract flat per-tetrahedron arrays using the CPU
     // loop's own helpers (classification, sample counts, volumes -- so both paths make identical
     // decisions), dispatch metal/dtfe_deposit.metal::depositAveraged1, and copy the grids back.
     // Any failure (no device, kernel compile, buffer alloc) falls back to the CPU loop below.
@@ -308,7 +308,7 @@ void interpolateGrid_averaged_1(DT &dt,
     if ( tryMetal and (field.scalar or field.scalar_gradient) )
     {
         MESSAGE::Warning warning( userOptions.verboseLevel );
-        warning << "--metal does not support the scalar fields; using the CPU interpolation for this pass.\n" << MESSAGE::EndWarning;
+        warning << "--gpu does not support the scalar fields; using the CPU interpolation for this pass.\n" << MESSAGE::EndWarning;
         tryMetal = false;
     }
 #endif
@@ -316,7 +316,7 @@ void interpolateGrid_averaged_1(DT &dt,
     if ( tryMetal and gridSize > size_t(UINT32_MAX) )
     {
         MESSAGE::Warning warning( userOptions.verboseLevel );
-        warning << "--metal does not support more than 2^32 grid cells; using the CPU interpolation.\n" << MESSAGE::EndWarning;
+        warning << "--gpu does not support more than 2^32 grid cells; using the CPU interpolation.\n" << MESSAGE::EndWarning;
         tryMetal = false;
     }
     if ( tryMetal )
@@ -492,7 +492,7 @@ void interpolateGrid_averaged_1(DT &dt,
         {
             warned = true;
             MESSAGE::Warning warning( userOptions.verboseLevel );
-            warning << "--gpu/--metal requested but this binary was built without GPU support (rebuild with METAL=1, CUDA=1 or HIP=1; or NO_DIM!=3 / MY_SCALAR); using the CPU interpolation.\n" << MESSAGE::EndWarning;
+            warning << "--gpu requested but this binary was built without GPU support (rebuild with METAL=1; or NO_DIM!=3 / MY_SCALAR); using the CPU interpolation.\n" << MESSAGE::EndWarning;
         }
     }
 #endif // DTFE_GPU_ACTIVE

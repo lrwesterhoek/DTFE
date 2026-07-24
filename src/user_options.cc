@@ -71,7 +71,7 @@ User_options::User_options()
     method = 1;
     noPoints = 100;
     noPointsOn = false;
-    useMetal = false;     // GPU interpolation off unless --gpu/--metal is given (requires a GPU build)
+    useMetal = false;     // GPU interpolation off unless --gpu is given (requires a Metal build)
     gpuAlias = false;
     exactAverage = false; // sampled '_a' averaging unless --exact-average (standard DTFE only)
     psSamplePointsFile = "";          // point-evaluation mode off unless --sample-points is given (both binaries)
@@ -82,7 +82,7 @@ User_options::User_options()
     psStreamDensityGeometric = false; // default per-stream estimator: 'dtfe'
 #ifdef PHASE_SPACE
     psAvgSubsamples = 3;  // nSub for PS-DTFE '_a' fields (27 sub-points in 3D)
-    psUseMetal = false;   // GPU deposit off unless --ps-gpu/--ps-metal is given (requires a GPU build)
+    psUseMetal = false;   // GPU deposit off unless --ps-gpu is given (requires a Metal build)
     psLinearDeposit = false;          // uniform (equal-share) deposit unless --ps-linear-deposit
     psCaustics = false;               // no '.caustic' fold-flag grid unless --ps-caustics
     psHaloRelease = Real(0.);         // 0 = deposit every tetrahedron by bbox rasterization (no release)
@@ -225,14 +225,12 @@ void User_options::addOptions(po::options_description &allOptions,
             ("density0", po::value<Real>(&averageDensity), "supply a value to be used to scale the density. If none is supplied, the average density will be used for this task.")
             ("seed", po::value<size_t>(&(this->randomSeed)), "integer value to be used for the random seed generator when interpolating to the grid using Monte Carlo methods. Generated randomly if not supplied by the user.")
 #ifndef PHASE_SPACE
-            ("gpu", po::bool_switch(&(this->gpuAlias)), "standard DTFE only: run the volume-averaged ('_a', method 1) grid interpolation on the GPU. Requires a GPU build: 'make DTFE METAL=1' (macOS), 'make DTFE CUDA=1' (Linux/NVIDIA) or 'make DTFE HIP=1' (Linux/AMD ROCm); otherwise the option is ignored with a warning and the CPU interpolation is used. Results match the CPU interpolation to float rounding (atomic summation order). Unaveraged fields and methods 2/3 always use the CPU.")
-            ("metal", po::bool_switch(&(this->useMetal)), "same as '--gpu' (legacy name from the original Metal backend).")
+            ("gpu", po::bool_switch(&(this->gpuAlias)), "standard DTFE only: run the volume-averaged ('_a', method 1) grid interpolation on the GPU. Requires a GPU build ('make DTFE METAL=1', macOS/Apple Silicon); otherwise the option is ignored with a warning and the CPU interpolation is used. Results match the CPU interpolation to float rounding (atomic summation order). Unaveraged fields and methods 2/3 always use the CPU.")
             ("exact-average", po::bool_switch(&(this->exactAverage)), "standard DTFE only, 3D only, CPU only: compute the volume-averaged ('_a') fields by integrating the LINEAR DTFE interpolant EXACTLY over every grid-cell/tetrahedron intersection (vendored r3d library, Powell & Abel 2015) instead of Monte-Carlo sampling. For a linear field the integral over each intersection is its centroid value times its volume, so order-1 moments suffice -- no sampling noise, and on a perfect particle lattice the averaged density is exactly 1 to rounding. Runs on the method-1 per-tetrahedron scatter topology with the same cell classification (the single-grid-cell fast path was already exact); '--samples' and '--method' are ignored (pass neither, or '-m 1'). Combined with '--gpu' the interpolation falls back to the CPU with a warning. An accuracy option, not a speed option.")
 #endif
 #ifdef PHASE_SPACE
-            ("ps-gpu", po::bool_switch(&(this->gpuAlias)), "PS-DTFE only: run the grid deposit (the dominant cost) on the GPU. Requires a GPU build: 'make PS-DTFE METAL=1' (macOS), CUDA=1 (Linux/NVIDIA) or HIP=1 (Linux/AMD ROCm); otherwise the option is ignored with a warning and the CPU deposit is used. Results match the CPU deposit to float rounding (atomic summation order).")
+            ("ps-gpu", po::bool_switch(&(this->gpuAlias)), "PS-DTFE only: run the grid deposit (the dominant cost) on the GPU. Requires a GPU build ('make PS-DTFE METAL=1', macOS/Apple Silicon); otherwise the option is ignored with a warning and the CPU deposit is used. Results match the CPU deposit to float rounding (atomic summation order).")
             ("avg-subsamples", po::value<int>(&(this->psAvgSubsamples))->default_value(3), "PS-DTFE only: linear sub-sample count nSub for the volume-averaged ('_a') fields. Each grid cell is volume-averaged over an nSub^3 regular sub-grid, so the '_a' interpolation cost scales as nSub^3 -- it is the dominant runtime cost. 3 (default) = 27 sub-points; 2 = 8 (~3.4x faster '_a' pass, slightly coarser average); 1 = cell-centre only (= the unaveraged value, no extra cost but no averaging benefit). Lower this to speed up runs dominated by the averaged-field pass.")
-            ("ps-metal", po::bool_switch(&(this->psUseMetal)), "same as '--ps-gpu' (legacy name from the original Metal backend).")
 #endif
             ("sample-points", po::value<std::string>(&(this->psSamplePointsFile)), "evaluate the fields at arbitrary Eulerian points read from the given file, in ADDITION to the regular grid interpolation (pass a small '--grid', e.g. '-g 16', when only point values are wanted). PS-DTFE: the multi-stream phase-space fields, one stream per folded tetrahedron containing the point, deterministic under any '--partition' split. Standard DTFE: the plain Eulerian DTFE interpolant -- exactly one containing tetrahedron, '.pts_streams' becomes the 0/1 coverage flag, '.pts_velDisp' is identically 0, and the run uses a single triangulation (not combinable with '--partition'). Point coordinates are in the box coordinate system (the same units as '--box', i.e. Mpc after the '--MpcUnit' conversion). Accepted formats, auto-detected: a text file with one 'x y z' triplet per line, or a raw binary file of float64 triplets (N x 3, row-major, native/little-endian, no header). Writes '<output>.pts_den' (float64, rho/rho_bar), '.pts_vel' (float64 x3, density-weighted mean over streams), '.pts_velDisp' (float64 x6 dispersion tensor, xx xy xz yy yz zz), '.pts_streams' (int32); all CPU-only, double precision.")
             ("per-stream", po::bool_switch(&(this->psPerStream)), "PS-DTFE only: with '--sample-points', additionally write each stream's own density and velocity per point in a ragged layout: '<output>.pts_stream_offsets' (uint64, N+1; point i owns records [off[i], off[i+1])) and '<output>.pts_stream_records' (float64 x4 per record: density, vx, vy, vz; sorted by density, descending). The standard binary rejects this flag (its points have no stream decomposition).")
@@ -615,7 +613,7 @@ void User_options::printOptions()
 #ifdef DTFE_GPU
             message << "\t '_a' interpolation     : " GPU_BACKEND_NAME " GPU (--gpu)\n";
 #else
-            message << "\t '_a' interpolation     : CPU (--gpu/--metal given but this binary was built without GPU support; falling back)\n";
+            message << "\t '_a' interpolation     : CPU (--gpu given but this binary was built without GPU support; falling back)\n";
 #endif
     }
 #endif
@@ -636,7 +634,7 @@ void User_options::printOptions()
 #ifdef PS_GPU
             message << "\t PS deposit             : " GPU_BACKEND_NAME " GPU (--ps-gpu)\n";
 #else
-            message << "\t PS deposit             : CPU (--ps-gpu/--ps-metal given but this binary was built without GPU support; falling back)\n";
+            message << "\t PS deposit             : CPU (--ps-gpu given but this binary was built without GPU support; falling back)\n";
 #endif
     }
     if ( not this->lagrangianInputFilename.empty() )
@@ -855,8 +853,8 @@ void User_options::readOptions(int argc, char *argv[], bool getFileNames, bool s
     }
     
     
-    // fold the backend-neutral GPU switch into the legacy member ('--gpu' == '--metal',
-    // '--ps-gpu' == '--ps-metal'; two bool_switches cannot share one address in boost)
+    // fold the '--gpu' / '--ps-gpu' switch into the internal member (the Metal path reads
+    // useMetal / psUseMetal)
     if ( this->gpuAlias )
     {
 #ifdef PHASE_SPACE
@@ -1045,7 +1043,7 @@ void User_options::readOptions(int argc, char *argv[], bool getFileNames, bool s
     if ( this->useMetal and this->method!=1 )
     {
         MESSAGE::Warning warning( this->verboseLevel );
-        warning << "--gpu/--metal accelerates only the method-1 ('--method 1') volume-averaged interpolation; method " << this->method << " will run on the CPU.\n" << MESSAGE::EndWarning;
+        warning << "--gpu accelerates only the method-1 ('--method 1') volume-averaged interpolation; method " << this->method << " will run on the CPU.\n" << MESSAGE::EndWarning;
     }
     if ( vm.count("samples") )
     {

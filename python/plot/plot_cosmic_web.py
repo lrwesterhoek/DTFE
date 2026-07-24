@@ -14,7 +14,6 @@ from pathlib import Path
 
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
 from matplotlib.colors import ListedColormap, BoundaryNorm
 
 from dtfelib import make_parser, snapdir, FieldSet

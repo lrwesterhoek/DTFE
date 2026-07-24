@@ -3,8 +3,8 @@
 
 #include <cstdint>
 
-// Host-side parameter block of the PS-DTFE GPU deposit, shared by every backend host
-// (ps_metal_host.cc, ps_gpu_cuda.cu, metal/validate_deposit.cpp). MUST match the MSL
+// Host-side parameter block of the PS-DTFE GPU deposit, shared by the Metal host
+// (ps_metal_host.cc) and metal/validate_deposit.cpp. MUST match the MSL
 // 'DepositParams' struct in metal/ps_deposit.metal byte-for-byte -- that copy is the one
 // intentional duplicate (MSL cannot include this header).
 struct PSDepositParams

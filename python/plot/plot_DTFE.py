@@ -22,6 +22,7 @@ import matplotlib.colors as colors
 from scipy.ndimage import gaussian_filter
 
 from dtfelib import make_parser, FieldSet
+from dtfelib.fields import extract_2d_slice as extract_slice, extract_velocity_slice
 
 OUTPUT_DIR = Path(config.LOCAL_FIGURES_ROOT) / "dtfe"
 
@@ -51,29 +52,6 @@ SLICE_PLANES = {
     1: {'name': 'xz_plane', 'axis_labels': ('X', 'Z')},
     2: {'name': 'xy_plane', 'axis_labels': ('X', 'Y')}
 }
-
-def extract_slice(field, slice_dim=2):
-    idx = field.shape[slice_dim] // 2
-    slices = [slice(None)] * 3
-    slices[slice_dim] = idx
-    return field[tuple(slices)]
-
-def extract_velocity_slice(velocity_field, slice_dim=2):
-    idx = velocity_field.shape[slice_dim] // 2
-
-    if slice_dim == 0:
-        slice_data = velocity_field[idx, :, :]
-        U, V = slice_data[..., 1], slice_data[..., 2]
-    elif slice_dim == 1:
-        slice_data = velocity_field[:, idx, :]
-        U, V = slice_data[..., 0], slice_data[..., 2]
-    else:
-        slice_data = velocity_field[:, :, idx]
-        U, V = slice_data[..., 0], slice_data[..., 1]
-
-    ny, nx = U.shape
-    X, Y = np.meshgrid(np.arange(nx), np.arange(ny), indexing='xy')
-    return X, Y, U, V
 
 def plot_density(density_field, slice_dim, box_size, redshift=None, save_path=None):
     dens_slice = extract_slice(density_field, slice_dim).T

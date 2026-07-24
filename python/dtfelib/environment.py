@@ -18,7 +18,6 @@ nearest-grid-point. Snapshots without fields on disk yield NaN with a note in en
 
 from __future__ import annotations
 
-from pathlib import Path
 
 import h5py
 import numpy as np

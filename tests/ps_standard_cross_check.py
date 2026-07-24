@@ -48,7 +48,7 @@ def main():
 
     if not args.no_build:
         # respect the current build mode of each build dir: a plain 'make' after a GPU build
-        # (METAL=1/CUDA=1/HIP=1) flips the mode stamp and silently strips the GPU support;
+        # (METAL=1) flips the mode stamp and silently strips the GPU support;
         # .build_mode records the make argument of the current mode
         def make_cmd(target, obj_dir):
             try:

@@ -2,7 +2,7 @@
 import json
 import numpy as np
 from pathlib import Path
-from scipy.ndimage import minimum_filter, maximum_filter, gaussian_filter
+from scipy.ndimage import minimum_filter, maximum_filter
 
 import config
 from .io import FieldSet

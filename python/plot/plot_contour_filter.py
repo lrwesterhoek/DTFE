@@ -1,18 +1,11 @@
 import _bootstrap  # noqa: F401  (puts python/ on sys.path)
 from pathlib import Path
 
-import os
 import numpy as np
 import matplotlib as mpl
 import matplotlib.pyplot as plt
-from scipy import ndimage
 from scipy.stats import gaussian_kde
 from matplotlib.lines import Line2D
-import matplotlib.cm as cm
-from matplotlib.colors import Normalize, LinearSegmentedColormap
-import matplotlib.animation as animation
-from scipy.ndimage import minimum_filter
-from dtfelib import fields as dtfe
 from dtfelib.figures import save_plot_to_multiple_paths
 import config
 from dtfelib import figures as style

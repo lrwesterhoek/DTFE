@@ -270,7 +270,7 @@ def main():
                    sorted((gc.DATA_ROOT / args.sim).glob("snapdir_*/combined_*.hdf5"))
         if not snapdirs:
             raise SystemExit(f"no header source (groupcat or snapshot) found for {args.sim}; "
-                             "download groupcats first: ./download_snapshots.sh -c -s " + args.sim)
+                             "download groupcats first: ./scripts/download_snapshots.sh -c -s " + args.sim)
         import h5py
         with h5py.File(snapdirs[0], "r") as f:
             hubble = float(f["Header"].attrs["HubbleParam"])

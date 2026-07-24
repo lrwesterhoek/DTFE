@@ -8,10 +8,9 @@
 # tests/ps_parallel_check.sh: means must agree to ~1e-5 relative, per-cell differences
 # to max|field| must stay below REL_TOL outside a tiny borderline-cell fraction.
 #
-# Requires a GPU build; fails loudly if the binary fell back to the CPU (then the two
+# Requires a Metal build; fails loudly if the binary fell back to the CPU (then the two
 # runs would be identical, which defeats the test). The backend is taken from the
-# current build mode (o/.build_mode), the GPU_BUILD env var, or defaults to METAL=1 --
-# on Linux run e.g.:  GPU_BUILD=CUDA=1 tests/dtfe_metal_check.sh
+# current build mode (o/.build_mode), the GPU_BUILD env var, or defaults to METAL=1.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

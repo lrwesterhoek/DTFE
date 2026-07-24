@@ -35,7 +35,7 @@ echo "============================================================"
 if [ "${1:-}" != "--no-build" ]; then
     echo ">> building PS-DTFE ..."
     # respect the current build mode (don't silently strip GPU support from a GPU binary;
-    # o_ps/.build_mode records the make argument, e.g. METAL=1 / CUDA=1 / HIP=1)
+    # o_ps/.build_mode records the make argument, e.g. METAL=1)
     BUILD_MODE="$(cat o_ps/.build_mode 2>/dev/null || true)"
     make PS-DTFE ${BUILD_MODE:+"$BUILD_MODE"} >/dev/null
 fi

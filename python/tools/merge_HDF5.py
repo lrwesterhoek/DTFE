@@ -36,6 +36,7 @@ Usage:
 """
 
 import argparse
+import os
 import subprocess
 import sys
 
@@ -50,7 +51,9 @@ SNAPSHOT_NUMBERS = [0, 4, 17, 33, 50]
 
 NUM_SUBFILES = 4
 
-BASE_DIR = "/Users/luukw/output/TNG300-3-Dark"
+# default simulation dir; follows the project-wide DTFE_DATA_ROOT convention (see config.sh),
+# override per run with -d/--data-dir
+BASE_DIR = str(Path(os.environ.get("DTFE_DATA_ROOT", str(Path.home() / "output"))) / "TNG300-3-Dark")
 
 SINGLE_FILES = [
 ]

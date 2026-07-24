@@ -13,7 +13,6 @@ from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Ellipse
-from dtfelib import fields as dtfe
 from dtfelib.figures import save_plot_to_multiple_paths
 import config
 from dtfelib import figures as style

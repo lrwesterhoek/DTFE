@@ -20,6 +20,7 @@ from scipy.ndimage import gaussian_filter
 
 from dtfelib import STREAM_TOL, make_fieldset
 from dtfelib import pointeval
+from dtfelib.fields import extract_2d_slice as extract_slice
 
 # which field families to plot (PS-only ones are skipped automatically under --method dtfe)
 PROCESS_DENSITY = True
@@ -46,12 +47,6 @@ DENSITY_VMIN = 1e-1
 DENSITY_VMAX = 1e4
 
 _SMOOTH = 0.0   # set from --smooth in main()
-
-def extract_slice(field, slice_dim=2):
-    idx = field.shape[slice_dim] // 2
-    slices = [slice(None)] * 3
-    slices[slice_dim] = idx
-    return field[tuple(slices)]
 
 def smooth(field):
     """Plot-time Gaussian smoothing (--smooth, grid cells); identity when 0."""

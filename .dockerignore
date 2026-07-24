@@ -16,7 +16,7 @@ metal/*.metallib
 metal/validate_deposit
 third_party/
 figures/
-documentation/
+docs/
 demo/
 *.hdf5
 *.runlog

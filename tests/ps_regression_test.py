@@ -343,7 +343,7 @@ def main():
     print("=" * 60)
 
     if not args.no_build:
-        # rebuild in the current GPU mode (o_ps/.build_mode records METAL=1/CUDA=1/HIP=1;
+        # rebuild in the current GPU mode (o_ps/.build_mode records METAL=1;
         # a plain 'make PS-DTFE' would wipe o_ps and silently strip the GPU support)
         try:
             mode = open(os.path.join(ROOT, "o_ps", ".build_mode")).read().strip()

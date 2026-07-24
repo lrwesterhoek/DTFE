@@ -155,7 +155,7 @@ struct User_options
     int    method;        // volume-averaging method
     int    noPoints;      // sample points per grid cell for the average
     bool   noPointsOn;    // true if the user specified the number of sampling points
-    bool   useMetal;      // standard DTFE: run the method-1 '_a' interpolation on the GPU; needs a GPU build (METAL=1/CUDA=1/HIP=1, else falls back to the CPU loop with a warning). Set by --gpu or its legacy alias --metal.
+    bool   useMetal;      // standard DTFE: run the method-1 '_a' interpolation on the GPU; needs a Metal build (METAL=1, else falls back to the CPU loop with a warning). Set by --gpu.
     bool   exactAverage;  // standard DTFE --exact-average: compute the '_a' fields by integrating the LINEAR DTFE interpolant exactly over every cell∩tet intersection (vendored r3d, order-1 moments) instead of Monte-Carlo sampling; --samples is ignored. CPU only (falls back from --gpu with a warning); 3D only; runs on the method-1 scatter topology.
     bool   gpuAlias;      // scratch for the backend-neutral --gpu/--ps-gpu switches; OR-ed into useMetal/psUseMetal after parsing (two bool_switches cannot share one address)
     // --sample-points point evaluation, BOTH binaries (see ps_point_eval.h): PS-DTFE reports
@@ -170,7 +170,7 @@ struct User_options
     bool   psStreamDensityGeometric;   // PS-DTFE --ps-stream-density: true = 'geometric' (m_tet/V_eul, matches the mass-conserving deposit), false = 'dtfe' (vertex-density interpolation, matches the Feldbrugge reference; DEFAULT). Always false in the standard binary.
 #ifdef PHASE_SPACE
     int    psAvgSubsamples; // PS-DTFE: linear sub-sample count nSub for '_a' fields (nSub^NO_DIM sub-grid per cell, cost ~nSub^NO_DIM); 3 = 27 sub-points (default), 1 = cell-centre.
-    bool   psUseMetal;      // PS-DTFE: run the grid deposit on the GPU; needs a GPU build (METAL=1/CUDA=1/HIP=1, else falls back to the CPU deposit with a warning). Set by --ps-gpu or its legacy alias --ps-metal.
+    bool   psUseMetal;      // PS-DTFE: run the grid deposit on the GPU; needs a Metal build (METAL=1, else falls back to the CPU deposit with a warning). Set by --ps-gpu.
     bool   psLinearDeposit;            // PS-DTFE --ps-linear-deposit: weight each tetrahedron's interior samples by the DTFE-interpolated linear density (renormalized per tet, so the deposited total still equals the tet mass EXACTLY) instead of equal shares
     bool   psCaustics;                 // PS-DTFE --ps-caustics: record per grid cell whether tetrahedra of BOTH map orientations (sign of det(Ax) = Lagrangian->Eulerian parity, flips at each fold) overlap it; the 0/1 flag is written as '<output>.caustic'. CPU and GPU deposits; 3D only.
     Real   psHaloRelease;              // PS-DTFE --ps-halo-release <D>: during the GRID deposit, a tetrahedron whose geometric stream density rho_geo/rho_bar = V_lag/V_eul exceeds D is deposited monolithically at its Eulerian centroid cell (the sub-sample-spacing fallback path) instead of being rasterized over its bbox. 0 (default) = off. Mass conservation is exact; point evaluation is unaffected.

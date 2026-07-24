@@ -132,7 +132,7 @@ def main() -> int:
                 continue
             if up_to_date < 0:
                 print(f"   (no point-evaluated fields on disk for snap {n:03d} -- "
-                      f"run run_ps_pipeline.sh first)")
+                      f"run scripts/run_ps_pipeline.sh first)")
                 skipped += 1
             elif not written:
                 print(f"   ({up_to_date} figure(s) already up to date; --force to re-render)")

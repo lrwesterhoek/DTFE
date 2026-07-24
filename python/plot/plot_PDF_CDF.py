@@ -6,7 +6,6 @@ import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
 from scipy.stats import norm
 import warnings
-from dtfelib import fields as dtfe
 from dtfelib.figures import save_plot_to_multiple_paths
 from dtfelib import make_parser
 import config

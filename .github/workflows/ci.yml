@@ -1,13 +1,8 @@
-# Two jobs, deliberately small:
-#  * build-and-test -- the fast Linux CPU build + test battery (a previous
-#    cross-platform-test.yml was removed on purpose, commit eb243c8; this job stays
-#    CPU-only and under ~15 minutes -- it exists to catch "does not compile on Linux"
-#    and "the deposit broke" regressions, nothing more).
-#  * cuda-compile -- COMPILE check of the CUDA GPU backend via the repo Dockerfile
-#    (nvidia/cuda devel base; nvcc needs no GPU to compile). This is the ONLY place the
-#    single-source CUDA/HIP backends (src/CGAL_triangulation/{ps,dtfe}_gpu_cuda.cu) get
-#    compiled at all -- a failure here means they rotted against a shared header change
-#    (they share gpu_host.h / ps_deposit_params.h with the CPU and Metal paths).
+# One job, deliberately small: build-and-test -- the fast Linux CPU build + test battery
+# (a previous cross-platform-test.yml was removed on purpose, commit eb243c8; this job stays
+# CPU-only and under ~15 minutes -- it exists to catch "does not compile on Linux" and "the
+# deposit broke" regressions, nothing more). The Metal GPU path is macOS-only and validated
+# locally (tests/dtfe_metal_check.sh, metal/validate_deposit.cpp).
 
 name: ci
 
@@ -63,15 +58,3 @@ jobs:
 
       - name: PS-DTFE volume-weighted check
         run: tests/ps_volume_weighted_check.sh --no-build
-
-  # Compile check only -- no GPU exists at build time and none is needed. The Dockerfile's
-  # sanity stage still runs the CPU test battery inside the image, so this also proves the
-  # CUDA-built binaries execute their CPU paths.
-  cuda-compile:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: CUDA backend compile check (Docker, GPU=cuda)
-        run: docker build --build-arg GPU=cuda .

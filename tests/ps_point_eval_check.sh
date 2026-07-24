@@ -68,7 +68,7 @@ echo "============================================================"
 
 if [ "${1:-}" != "--no-build" ]; then
     echo ">> building PS-DTFE ..."
-    # respect the current build mode (o_ps/.build_mode: METAL=1 / CUDA=1 / HIP=1 / empty)
+    # respect the current build mode (o_ps/.build_mode: METAL=1 / empty)
     BUILD_MODE="$(cat o_ps/.build_mode 2>/dev/null || true)"
     make PS-DTFE ${BUILD_MODE:+"$BUILD_MODE"} >/dev/null
 fi

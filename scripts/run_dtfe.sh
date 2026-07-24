@@ -12,6 +12,7 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"   # the binaries and Makefile live one level up
 source "${SCRIPT_DIR}/config.sh"
 
 # ---- Script-specific configuration ----------------------------------------
@@ -20,7 +21,7 @@ PARTITION="${PARTITION:-}"       # EMPTY (default) = the binary AUTO-TUNES the s
                                  # it prints). Set to override, e.g. PARTITION="2 2 2".
 MAX_CONCURRENT="${MAX_CONCURRENT:-}"  # cap on concurrent triangulations to bound peak RAM (0 = all cores).
                                  # EMPTY (default) = auto-tuned together with the partition split.
-DTFE_METAL="${DTFE_METAL:-0}"  # 1 = run the '_a' interpolation on the Apple GPU (--metal; needs 'make DTFE METAL=1')
+DTFE_METAL="${DTFE_METAL:-0}"  # 1 = run the '_a' interpolation on the Apple GPU (--gpu; needs 'make DTFE METAL=1')
 
 DATA_DIR=""                # default: $DATA_ROOT/$SIMULATION (config.sh); override with -d
 OUTPUT_SUBDIR="output"
@@ -49,7 +50,7 @@ fi
 
 [ -z "${DATA_DIR}" ] && DATA_DIR="${DATA_ROOT}/${SIMULATION}"
 
-cd "$SCRIPT_DIR" || exit 1
+cd "$REPO_ROOT" || exit 1
 
 echo "Starting DTFE processing..."
 echo "Data directory: ${DATA_DIR}"
@@ -74,7 +75,7 @@ for i in "${SNAPSHOTS[@]}"; do
 
     # GPU interpolation toggle (-m / DTFE_METAL=1); ignored with a warning on non-METAL builds.
     metal_args=()
-    [ "${DTFE_METAL}" = "1" ] && metal_args=(--metal)
+    [ "${DTFE_METAL}" = "1" ] && metal_args=(--gpu)
 
     # pass --partition/--max-concurrent only when set; otherwise the binary auto-tunes them
     part_args=()

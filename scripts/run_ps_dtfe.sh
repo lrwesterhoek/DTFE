@@ -9,6 +9,7 @@
 #     -e   exact conservative deposit (same as PS_EXACT=1; --ps-exact-deposit, CPU-only, slower)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"   # the binaries and Makefile live one level up
 source "${SCRIPT_DIR}/config.sh"
 
 PARTITION="${PARTITION:-}"        # Lagrangian-partition grid. EMPTY (default) = the binary AUTO-TUNES the split
@@ -41,7 +42,7 @@ PTS_VEL_GRAD="${PTS_VEL_GRAD:-0}"   # 1 = with SAMPLE_POINTS, also write '.pts_v
                            # sample point (float64 x9). dtfelib.PointPlane derives the
                            # divergence / shear / vorticity maps from it, so this is what makes
                            # the velocity-derivative fields available to the hi-res figures.
-PS_METAL="${PS_METAL:-0}"  # 1 = run the deposit on the Apple GPU (--ps-metal; needs 'make PS-DTFE METAL=1')
+PS_METAL="${PS_METAL:-0}"  # 1 = run the deposit on the Apple GPU (--ps-gpu; needs 'make PS-DTFE METAL=1')
 PS_VERTEX_MASS="${PS_VERTEX_MASS:-1}"  # 1 (default) = chart-independent tet masses (--ps-vertex-mass):
                            # each particle's mass splits equally among its incident tetrahedra. REQUIRED for
                            # TNG runs: combined_ics.hdf5 holds the z=127 IC positions, whose configuration
@@ -118,7 +119,7 @@ LAMBDA_TH="${LAMBDA_TH:-0.3}"
 # Env-overridable, e.g. FIELDS="density_a velocity_a" for a lighter batch.
 FIELDS="${FIELDS:-density_a velocity_a gradient_a divergence_a shear_a vorticity_a dispersion_a}"
 
-cd "$SCRIPT_DIR" || exit 1
+cd "$REPO_ROOT" || exit 1
 
 if [ ! -x "./PS-DTFE" ]; then
     echo "Error: ./PS-DTFE not found or not executable. Build it with 'make PS-DTFE'." >&2
@@ -153,7 +154,7 @@ for i in "${SNAPSHOTS[@]}"; do
 
     # GPU deposit toggle (PS_METAL=1 ./run_ps_dtfe.sh); ignored with a warning on non-METAL builds.
     metal_args=()
-    [ "${PS_METAL}" = "1" ] && metal_args=(--ps-metal)
+    [ "${PS_METAL}" = "1" ] && metal_args=(--ps-gpu)
 
     # Exact conservative deposit toggle (-e / PS_EXACT=1); CPU and GPU deposits.
     exact_args=()
