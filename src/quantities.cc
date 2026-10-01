@@ -136,6 +136,7 @@ size_t Quantities::size() const
     fieldSize( this->disp_weight, &temp );
     fieldSize( this->disp_velocity, &temp );
     fieldSize( this->caustic_bits, &temp );
+    fieldSize( this->hidden_streams, &temp );
 #endif
     return temp;
 }
@@ -191,8 +192,26 @@ void Quantities::addFrom(Quantities const &other)
     addField(other.disp_weight, &this->disp_weight);
     addField(other.disp_velocity, &this->disp_velocity);
     orField(other.caustic_bits, &this->caustic_bits);   // orientation bits: OR, never '+='
+    orField(other.hidden_streams, &this->hidden_streams);       // bitmask: OR
 #endif
 }
+
+#ifdef PHASE_SPACE
+// '.hidden_streams' bit 1 is marked per partition from the geometry alone (a flipped tet overlaps the
+// cell); whether the SAMPLES missed it is only known once every partition's samples are summed
+// into stream_count. Where '.streams' already reads multi-stream the samples saw it, so the bit
+// is cleared: bit 1 then means exactly "multi-stream volume that '.streams' does not show".
+void Quantities::finalizeHiddenStreams()
+{
+    if ( hidden_streams.empty() || stream_count.size() != hidden_streams.size() ) return;
+    for (size_t i = 0; i < hidden_streams.size(); ++i)
+    {
+        int const bits = int(hidden_streams[i]);
+        if ( (bits & 1) && stream_count[i] > Real(1.) + PS_STREAM_TOL )
+            hidden_streams[i] = Real(bits & ~1);
+    }
+}
+#endif
 
 
 #ifdef PHASE_SPACE
@@ -293,6 +312,27 @@ void addFieldSubgrid(std::vector<T> const &src, std::vector<T> *dst,
     }
 }
 
+// The bitwise-OR twin of addFieldSubgrid, for the mask fields (caustic_bits, hidden_streams): same
+// sub-grid -> global mapping -- INCLUDING the '% full[d]' wrap of a sub-box that straddles a
+// periodic seam; a hand-rolled copy of this loop once lacked it and indexed past the end --
+// but OR instead of '+='.
+void orFieldSubgrid(std::vector<Real> const &src, std::vector<Real> *dst,
+                    size_t const *o, size_t const *m, size_t const *full)
+{
+    if (src.empty()) return;
+    size_t fullTotal = 1; for (int d = 0; d < NO_DIM; ++d) fullTotal *= full[d];
+    if (dst->size() < fullTotal) dst->resize(fullTotal, Real(0.));
+    size_t subTotal = 1; for (int d = 0; d < NO_DIM; ++d) subTotal *= m[d];
+    for (size_t l = 0; l < subTotal; ++l)
+    {
+        size_t rem = l, c[NO_DIM];
+        for (int d = NO_DIM - 1; d >= 0; --d) { c[d] = rem % m[d]; rem /= m[d]; }
+        size_t g = 0;
+        for (int d = 0; d < NO_DIM; ++d) g = g * full[d] + ((c[d] + o[d]) % full[d]);
+        (*dst)[g] = Real( int((*dst)[g]) | int(src[l]) );
+    }
+}
+
 // Accumulates 'other' (which holds only its Eulerian sub-box) into the full grid, mapping each cell by global index.
 void Quantities::addFromSubgrid(Quantities const &other, size_t const *fullGrid)
 {
@@ -316,24 +356,9 @@ void Quantities::addFromSubgrid(Quantities const &other, size_t const *fullGrid)
     addFieldSubgrid(other.mass_weight, &this->mass_weight, o, m, fullGrid);
     addFieldSubgrid(other.disp_weight, &this->disp_weight, o, m, fullGrid);
     addFieldSubgrid(other.disp_velocity, &this->disp_velocity, o, m, fullGrid);
-    // caustic orientation bits: same sub-grid -> global mapping, but OR instead of '+='
-    if ( not other.caustic_bits.empty() )
-    {
-        size_t fullTotal = 1; for (int d = 0; d < NO_DIM; ++d) fullTotal *= fullGrid[d];
-        if (this->caustic_bits.size() < fullTotal) this->caustic_bits.resize(fullTotal, Real(0.));
-        size_t subTotal = 1; for (int d = 0; d < NO_DIM; ++d) subTotal *= m[d];
-        for (size_t l = 0; l < subTotal; ++l)
-        {
-            size_t rem = l, c[NO_DIM];
-            for (int d = NO_DIM - 1; d >= 0; --d) { c[d] = rem % m[d]; rem /= m[d]; }
-            size_t g = 0;
-            // '% fullGrid[d]': the sub-box may WRAP a periodic axis (o[d]+m[d] > fullGrid[d]),
-            // exactly as in addFieldSubgrid above -- without it the seam partitions index past
-            // the end of caustic_bits.
-            for (int d = 0; d < NO_DIM; ++d) g = g * fullGrid[d] + ((c[d] + o[d]) % fullGrid[d]);
-            this->caustic_bits[g] = Real( int(this->caustic_bits[g]) | int(other.caustic_bits[l]) );
-        }
-    }
+    // the mask fields: same sub-grid -> global mapping, but OR instead of '+='
+    orFieldSubgrid(other.caustic_bits, &this->caustic_bits, o, m, fullGrid);
+    orFieldSubgrid(other.hidden_streams, &this->hidden_streams, o, m, fullGrid);
 }
 #endif
 

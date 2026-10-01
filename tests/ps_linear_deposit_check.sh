@@ -185,7 +185,7 @@ if gpu:
     eq = np.mean(sl == sg)
     scale = np.abs(dl).max()
     mrel = np.abs(dl - dg).mean() / scale
-    check("C GPU streams match CPU", eq > 0.999, f"{eq*100:.4f}% equal")
+    check("C GPU streams match CPU", eq == 1.0, f"{eq*100:.4f}% equal (exact inside test on both: must be 100%)")
     check("C GPU density matches CPU", mrel < 1e-4, f"mean rel = {mrel:.3e}")
 else:
     print("   SKIP C GPU parity (CPU-only build)")

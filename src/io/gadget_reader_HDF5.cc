@@ -24,8 +24,18 @@
 
 /* Readers for Gadget snapshots stored in HDF5 (standard and HI-mass variants). */
 #ifdef HDF5
+#include <vector>
 #include <H5Cpp.h>
 using namespace H5;
+
+// Memory type of the Real buffers the datasets are read into. HDF5 converts from whatever the
+// file stores (TNG keeps Coordinates in float64), so a DOUBLE build keeps the full precision
+// that the default single-precision build rounds away on read.
+#ifdef DOUBLE
+#define REAL_H5_TYPE PredType::NATIVE_DOUBLE
+#else
+#define REAL_H5_TYPE PredType::NATIVE_FLOAT
+#endif
 
 
 // Returns true if the HDF5 object 'obj_id' has an attribute named 'name'.
@@ -110,14 +120,14 @@ void HDF5_readGadgetHeader(std::string filename,
 
 // read the coordinates
 static void HDF5_readCoordinatesBlock(H5File *file,
-                                      Read_data<float> *readData,
+                                      Read_data<Real> *readData,
                                       Gadget_header const &gadgetHeader,
                                       User_options &userOptions,
                                       size_t const numberParticlesRead,
                                       MESSAGE::Message &message)
 {
     if ( not userOptions.readParticleData[0] ) return;
-    float *positions = readData->position();
+    Real *positions = readData->position();
     size_t dataOffset = numberParticlesRead * NO_DIM;   // offset (in floats) where new data starts
     message << "\t reading the particles positions ... " << MESSAGE::Flush;
     for(int type=0; type<6; type++)
@@ -129,7 +139,7 @@ static void HDF5_readCoordinatesBlock(H5File *file,
 
         DataSet dataset = group->openDataSet("Coordinates");
 
-        dataset.read( &(positions[dataOffset]), PredType::NATIVE_FLOAT );
+        dataset.read( &(positions[dataOffset]), REAL_H5_TYPE );
         delete group;
 
         dataOffset += gadgetHeader.npart[type] * NO_DIM;
@@ -139,14 +149,14 @@ static void HDF5_readCoordinatesBlock(H5File *file,
 
 // read the masses (or weights) if different
 static void HDF5_readMassesBlock(H5File *file,
-                                 Read_data<float> *readData,
+                                 Read_data<Real> *readData,
                                  Gadget_header const &gadgetHeader,
                                  User_options &userOptions,
                                  size_t const numberParticlesRead,
                                  MESSAGE::Message &message)
 {
     if ( not userOptions.readParticleData[1] ) return;
-    float *weights = readData->weight();
+    Real *weights = readData->weight();
     size_t dataOffset = numberParticlesRead;
     message << "\t reading the particles masses ... " << MESSAGE::Flush;
     for(int type=0; type<6; type++)
@@ -154,7 +164,7 @@ static void HDF5_readMassesBlock(H5File *file,
         if ( gadgetHeader.npart[type]<=0 ) continue;
         if ( gadgetHeader.mass[type]!=0. )          // common mass given in header
         {
-            float mass = gadgetHeader.mass[type];
+            Real mass = gadgetHeader.mass[type];
             for (size_t j=dataOffset; j<dataOffset+gadgetHeader.npart[type]; ++j)
                 weights[j] = mass;
         }
@@ -164,9 +174,13 @@ static void HDF5_readMassesBlock(H5File *file,
             snprintf( buf, sizeof(buf),  "/PartType%d", type );
             Group *group = new Group( file->openGroup(buf) );
 
-            DataSet dataset = group->openDataSet("Mass");
+            // Gadget writes 'Mass'; IllustrisTNG and most GADGET-4 outputs write 'Masses'
+            char const *massName = ( H5Lexists(group->getId(), "Mass", H5P_DEFAULT) > 0 ) ? "Mass" : "Masses";
+            if ( H5Lexists(group->getId(), massName, H5P_DEFAULT) <= 0 )
+                throwError( "The header gives no common mass for particle type ", type, " (MassTable = 0), but neither a 'Mass' nor a 'Masses' dataset exists in '", buf, "'." );
+            DataSet dataset = group->openDataSet(massName);
 
-            dataset.read( &(weights[dataOffset]), PredType::NATIVE_FLOAT );
+            dataset.read( &(weights[dataOffset]), REAL_H5_TYPE );
             delete group;
         }
         dataOffset += gadgetHeader.npart[type];
@@ -176,14 +190,14 @@ static void HDF5_readMassesBlock(H5File *file,
 
 // read the velocities
 static void HDF5_readVelocitiesBlock(H5File *file,
-                                     Read_data<float> *readData,
+                                     Read_data<Real> *readData,
                                      Gadget_header const &gadgetHeader,
                                      User_options &userOptions,
                                      size_t const numberParticlesRead,
                                      MESSAGE::Message &message)
 {
     if ( not userOptions.readParticleData[2] ) return;
-    float *velocities = readData->velocity();
+    Real *velocities = readData->velocity();
     size_t dataOffset = numberParticlesRead * NO_DIM;
     message << "\t reading the particles velocities ... " << MESSAGE::Flush;
     for(int type=0; type<6; type++)
@@ -195,7 +209,7 @@ static void HDF5_readVelocitiesBlock(H5File *file,
 
         DataSet dataset = group->openDataSet("Velocities");
 
-        dataset.read( &(velocities[dataOffset]), PredType::NATIVE_FLOAT );
+        dataset.read( &(velocities[dataOffset]), REAL_H5_TYPE );
         delete group;
 
         dataOffset += gadgetHeader.npart[type] * NO_DIM;
@@ -205,7 +219,7 @@ static void HDF5_readVelocitiesBlock(H5File *file,
 
 // read the gas temperature (gas particles only) and store it mass-weighted as a scalar field
 static void HDF5_readGasTemperatureBlock(H5File *file,
-                                         Read_data<float> *readData,
+                                         Read_data<Real> *readData,
                                          Gadget_header const &gadgetHeader,
                                          User_options &userOptions,
                                          size_t const numberParticlesRead,
@@ -213,16 +227,17 @@ static void HDF5_readGasTemperatureBlock(H5File *file,
                                          int &noScalarsRead)
 {
     if ( not (userOptions.readParticleData[3] and gadgetHeader.npart[0]>0) ) return;
+    if ( not userOptions.scalarDataset.empty() ) return;   // '--scalar-dataset' replaces the default scalar
     message << "\t reading the gas temperature ..." << MESSAGE::Flush;
     Group *group = new Group( file->openGroup( "/PartType0" ) );
     DataSet dataset = group->openDataSet("Temperature");
-    float *tempData = new float[ gadgetHeader.npart[0] ];
-    dataset.read( tempData, PredType::NATIVE_FLOAT );
+    Real *tempData = new Real[ gadgetHeader.npart[0] ];
+    dataset.read( tempData, REAL_H5_TYPE );
     delete group;
 
     // store the mass-weighted temperature as a scalar field
-    float *scalar = readData->scalar();
-    float *weights = readData->weight();
+    Real *scalar = readData->scalar();
+    Real *weights = readData->weight();
     size_t dataOffset = numberParticlesRead;
     for (size_t i=0; i<size_t(gadgetHeader.npart[0]); ++i)
     {
@@ -237,10 +252,59 @@ static void HDF5_readGasTemperatureBlock(H5File *file,
 }
 
 
+// '--scalar-dataset NAME': read '/PartTypeN/NAME' of every selected species as scalar component 0,
+// raw (one value per particle, NOT mass-weighted: the estimators interpolate it as an intensive
+// per-particle value, like the velocity). A missing dataset is an error, not a silent zero field.
+static void HDF5_readScalarDatasetBlock(H5File *file,
+                                        Read_data<Real> *readData,
+                                        Gadget_header const &gadgetHeader,
+                                        User_options &userOptions,
+                                        size_t const numberParticlesRead,
+                                        MESSAGE::Message &message,
+                                        int &noScalarsRead)
+{
+    if ( userOptions.scalarDataset.empty() ) return;
+    message << "\t reading the scalar dataset '" << userOptions.scalarDataset << "' ... " << MESSAGE::Flush;
+    Real *scalar = readData->scalar();
+    size_t dataOffset = numberParticlesRead;
+    for (int type=0; type<6; type++)
+    {
+        if ( gadgetHeader.npart[type]<=0 ) continue;
+        char buf[500];
+        snprintf( buf, sizeof(buf), "/PartType%d", type );
+        Group *group = new Group( file->openGroup(buf) );
+        if ( H5Lexists(group->getId(), userOptions.scalarDataset.c_str(), H5P_DEFAULT) <= 0 )
+        {
+            delete group;
+            throwError( "'--scalar-dataset ", userOptions.scalarDataset, "': no such dataset in '", buf,
+                        "' of the input file." );
+        }
+        DataSet dataset = group->openDataSet( userOptions.scalarDataset.c_str() );
+        hsize_t dims[2] = {0, 0};
+        int const rank = dataset.getSpace().getSimpleExtentNdims();
+        if ( rank == 1 ) dataset.getSpace().getSimpleExtentDims( dims );
+        if ( rank != 1 or dims[0] != hsize_t(gadgetHeader.npart[type]) )
+        {
+            delete group;
+            throwError( "'--scalar-dataset " + userOptions.scalarDataset + "' in '" + std::string(buf)
+                        + "' must hold exactly one value per particle (a 1-D dataset of "
+                        + std::to_string( gadgetHeader.npart[type] ) + " entries)." );
+        }
+        std::vector<Real> values( size_t(gadgetHeader.npart[type]) );
+        dataset.read( values.data(), REAL_H5_TYPE );
+        delete group;
+        for (size_t i=0; i<values.size(); ++i)
+            scalar[ (dataOffset + i) * NO_SCALARS + noScalarsRead ] = values[i];
+        dataOffset += gadgetHeader.npart[type];
+    }
+    noScalarsRead += 1;
+    message << MESSAGE::cGreen() << "Done" << MESSAGE::cReset() << "\n";
+}
+
 
 // Reads the Gadget particle data from a single HDF5 file (one of possibly several per snapshot).
 void HDF5_readGadgetData(std::string filename,
-                         Read_data<float> *readData,
+                         Read_data<Real> *readData,
                          User_options &userOptions,
                          int const fileIndex,
                          size_t *numberParticlesRead)
@@ -289,7 +353,7 @@ void HDF5_readGadgetData(std::string filename,
     // InitialCoordinates may be absent if Lagrangian positions come from a separate --lagrangianInput file
     if ( readData->_lagrangianPosition._assigned )
     {
-        float *lagPositions = readData->lagrangianPosition();
+        Real *lagPositions = readData->lagrangianPosition();
         size_t dataOffset = (*numberParticlesRead) * NO_DIM;
         bool success = true;
         for(int type=0; type<6; type++)
@@ -308,7 +372,7 @@ void HDF5_readGadgetData(std::string filename,
             }
 
             DataSet dataset = group->openDataSet("InitialCoordinates");
-            dataset.read( &(lagPositions[dataOffset]), PredType::NATIVE_FLOAT );
+            dataset.read( &(lagPositions[dataOffset]), REAL_H5_TYPE );
             delete group;
             dataOffset += gadgetHeader.npart[type] * NO_DIM;
         }
@@ -322,6 +386,7 @@ void HDF5_readGadgetData(std::string filename,
 
     int noScalarsRead = 0;
     HDF5_readGasTemperatureBlock( file, readData, gadgetHeader, userOptions, *numberParticlesRead, message, noScalarsRead );
+    HDF5_readScalarDatasetBlock( file, readData, gadgetHeader, userOptions, *numberParticlesRead, message, noScalarsRead );
 
 
     delete file;
@@ -366,7 +431,7 @@ void HDF5_countGadgetParticleNumber(std::string filenameRoot,
 
 // Reads the Gadget header for one snapshot and initializes the corresponding userOptions values.
 void HDF5_initializeGadget(std::string filename,
-                           Read_data<float> *readData,
+                           Read_data<Real> *readData,
                            User_options *userOptions,
                            Gadget_header *gadgetHeader,
                            size_t *noParticles)
@@ -459,7 +524,7 @@ void HDF5_initializeGadget(std::string filename,
 
 // Reads the Gadget data from single or multiple HDF5 files.
 void HDF5_readGadgetFile(std::string filename,
-                         Read_data<float> *readData,
+                         Read_data<Real> *readData,
                          User_options *userOptions)
 {
     MESSAGE::Message message( userOptions->verboseLevel );
@@ -491,7 +556,7 @@ void HDF5_readGadgetFile(std::string filename,
 // Reads one of possibly several files per snapshot.
 void HDF5_readGadgetData_HI(std::string filename,
                             std::string h1FileName,
-                            Read_data<float> *readData,
+                            Read_data<Real> *readData,
                             User_options &userOptions,
                             int const fileIndex,
                             size_t *numberParticlesRead)
@@ -539,7 +604,7 @@ void HDF5_readGadgetData_HI(std::string filename,
 
 
         // HI mass = gas mass * hydrogen fraction * atomic (non-molecular) fraction * HI fraction
-        float *weights = readData->weight();
+        Real *weights = readData->weight();
         size_t dataOffset = (*numberParticlesRead);
         for (size_t i=0; i<size_t(gadgetHeader.npart[0]); ++i)
         {
@@ -560,6 +625,7 @@ void HDF5_readGadgetData_HI(std::string filename,
 
     int noScalarsRead = 0;
     HDF5_readGasTemperatureBlock( file, readData, gadgetHeader, userOptions, *numberParticlesRead, message, noScalarsRead );
+    HDF5_readScalarDatasetBlock( file, readData, gadgetHeader, userOptions, *numberParticlesRead, message, noScalarsRead );
 
 
     delete file;
@@ -572,7 +638,7 @@ void HDF5_readGadgetData_HI(std::string filename,
 
 // Reads HI data from single or multiple HDF5 files; reads the HI mass, not the gas mass.
 void HDF5_readGadgetFile_HI(std::string filename,
-                            Read_data<float> *readData,
+                            Read_data<Real> *readData,
                             User_options *userOptions)
 {
     MESSAGE::Message message( userOptions->verboseLevel );

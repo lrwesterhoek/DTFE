@@ -10,11 +10,18 @@
 #     region) while the grid means of .den and .a_den stay 1 to float accumulation (mass
 #     conservation is exact per tetrahedron, so the mean is UNCHANGED vs the base run).
 #  B) cells that are single-stream in the base run keep BIT-IDENTICAL .den/.vel/.streams:
-#     released tets live in multi-stream regions by construction.
+#     released tets live in multi-stream regions by construction. Single-stream means
+#     streams==1 AND '.hidden_streams' == 0: a cell that already holds a never-sampled tet's mass
+#     in the base run is where that tet's release adds its volume fraction to '.streams'.
 #  C) partition/thread invariance with the flag on: two '--partition 2 2 2' runs at 1 and
-#     all threads give bit-exact .streams and float-rounding FP fields (the protocol the
-#     deposit guarantees; serial-vs-partitioned keeps the KNOWN pre-existing +-1-stream
-#     centroid-cell edge at periodic faces, so it is not asserted bit-exact here).
+#     all threads give bit-exact integer '.streams' (the exact sample counts: the protocol the
+#     deposit guarantees) and float-rounding FP fields. A cell holding a RELEASED tet carries
+#     its volume fraction, a float32 sum whose order depends on the deposit-thread split and on
+#     the order the concurrent partitions merge in, so those cells are held to a few ulps only
+#     (one cell in 262144 differed by one ulp in one run of six; the same run with
+#     --max-concurrent 1 splits each partition's deposit over all threads and moves 1100 cells
+#     by <= 1e-6). Serial-vs-partitioned keeps the KNOWN pre-existing +-1-stream centroid-cell
+#     edge at periodic faces, so it is not asserted bit-exact here.
 #  D) GPU parity (GPU builds): the GPU deposit classifies kept/released identically
 #     (equal released counts) and matches the CPU deposit within the usual tolerances.
 #
@@ -147,9 +154,11 @@ for tag, rel in (("pan", rel_pan), ("crw", rel_crw)):
     # ---------- (B) single-stream cells are bit-identical ----------
     sb, sf = load(base, ".streams"), load(flag, ".streams")
     vb, vf = load(base, ".vel", 3), load(flag, ".vel", 3)
-    m = sb == 1
+    ub = load(base, ".hidden_streams")
+    m = (sb == 1) & (ub == 0)
     check(f"B [{tag}] single-stream .den identical", np.array_equal(db[m], df[m]),
-          f"{int(m.sum())} cells with streams==1")
+          f"{int(m.sum())} cells with streams==1 and resolved "
+          f"({int(((sb == 1) & (ub != 0)).sum())} more hold sub-sample mass or hidden streams)")
     check(f"B [{tag}] single-stream .vel identical", np.array_equal(vb[m], vf[m]),
           "released tets must live elsewhere")
     check(f"B [{tag}] single-stream .streams identical", np.array_equal(sb[m], sf[m]),
@@ -157,8 +166,13 @@ for tag, rel in (("pan", rel_pan), ("crw", rel_crw)):
 
 # ---------- (C) partition/thread invariance with the flag ----------
 s1, sN = load(f"{tmp}/phr_pan_p1", ".streams"), load(f"{tmp}/phr_pan_pN", ".streams")
-check("C partitioned streams thread-invariant", np.array_equal(s1, sN),
-      "possible race in the released-deposit path")
+# integer-valued cells hold sample counts only: bit-exact; a released fraction is a float32 sum
+released = (np.abs(s1 - np.round(s1)) > 0) | (np.abs(sN - np.round(sN)) > 0)
+check("C partitioned streams thread-invariant (sample counts)", np.array_equal(s1[~released], sN[~released]),
+      f"{int((s1[~released] != sN[~released]).sum())} integer cells differ: possible race in the deposit path")
+dr = float(np.abs(s1[released] - sN[released]).max()) if released.any() else 0.0
+check("C partitioned streams thread-invariant (released fractions, float sums)", dr < 1e-5,
+      f"{int(released.sum())} released cells, max |diff| = {dr:.2e} (summation order only)")
 for ext, nc in ((".den", 1), (".a_den", 1), (".vel", 3)):
     f1, fN = load(f"{tmp}/phr_pan_p1", ext, nc), load(f"{tmp}/phr_pan_pN", ext, nc)
     scale = float(np.abs(f1).max()) + 1e-30
@@ -175,7 +189,7 @@ if gpu:
     sf = load(f"{tmp}/phr_pan_rel", ".streams")
     eq = float((sf == sg).mean())
     mrel = float(np.abs(df - dg).mean() / (np.abs(df).max() + 1e-30))
-    check("D GPU streams match CPU", eq > 0.999, f"{eq*100:.4f}% equal")
+    check("D GPU streams match CPU", eq == 1.0, f"{eq*100:.4f}% equal (exact inside test on both: must be 100%)")
     check("D GPU density matches CPU", mrel < 1e-4, f"mean rel = {mrel:.3e}")
 else:
     print("   SKIP D GPU parity (CPU-only build)")

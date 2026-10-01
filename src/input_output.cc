@@ -76,9 +76,9 @@ typedef void (*FunctionReadInputData)(std::string, Read_data<Real> *, User_optio
 // Pick the reader function for the given 'inputFileType'.
 FunctionReadInputData chooseInputDataReadFunction(int const inputFileType)
 {
+    // every reader fills Real buffers, so all of them work in a DOUBLE build too
     if ( inputFileType==101 )
         return &readGadgetFile;    // single/multiple Gadget snapshot, type 1 or 2
-#ifndef DOUBLE
 #ifdef HDF5
     else if ( inputFileType==105 )
         return &HDF5_readGadgetFile;        // HDF5 Gadget snapshot
@@ -93,7 +93,6 @@ FunctionReadInputData chooseInputDataReadFunction(int const inputFileType)
         return &readBinaryFile;             // custom binary reader
     else if ( inputFileType==122 )
         return &readBinaryFile_StructuredData;  // structured-data binary reader
-#endif
     else
         throwError( "Unknow value for the 'inputFileType' argument in function 'chooseInputDataReadFunction'. The program could not recognize the input data file type." );
     
@@ -500,6 +499,13 @@ void writeOutputData(Quantities &uQuantities,
         output.write( uQuantities.stream_count, userOptions.outputFilename + ".streams", "stream count", userOptions );
     if ( not aQuantities.stream_count.empty() )
         output.write( aQuantities.stream_count, userOptions.outputFilename + ".a_streams", "averaged stream count", userOptions );
+    // the companion of '.streams' (quantities.h): bit 1 = multi-stream volume the stream count
+    // does not show (exact), bit 2 = mass from a never-sampled tetrahedron
+    // for single-stream masks (quantities.h)
+    if ( not uQuantities.hidden_streams.empty() )
+        output.write( uQuantities.hidden_streams, userOptions.outputFilename + ".hidden_streams", "hidden-stream flags", userOptions );
+    if ( not aQuantities.hidden_streams.empty() )
+        output.write( aQuantities.hidden_streams, userOptions.outputFilename + ".a_hidden_streams", "averaged-grid hidden-stream flags", userOptions );
 
     // --ps-exact-deposit: raw tetrahedron-touch count (geometric multiplicity, NOT a stream
     // count -- see '.streams' for the physical one). One file, same preference order as '.caustic'.
@@ -508,12 +514,29 @@ void writeOutputData(Quantities &uQuantities,
     else if ( not aQuantities.tet_touch.empty() )
         output.write( aQuantities.tet_touch, userOptions.outputFilename + ".tetTouch", "tetrahedron-touch count", userOptions );
 
-    // fold-caustic cell flag (--ps-caustics): one '.caustic' file; prefer the unaveraged grid
-    // (nSub=1 sampling, same granularity as '.streams'), fall back to the '_a' pass's grid
-    if ( not uQuantities.caustic_bits.empty() )
-        output.write( uQuantities.caustic_bits, userOptions.outputFilename + ".caustic", "fold-caustic cell flag", userOptions );
-    else if ( not aQuantities.caustic_bits.empty() )
-        output.write( aQuantities.caustic_bits, userOptions.outputFilename + ".caustic", "fold-caustic cell flag", userOptions );
+    /* --ps-caustics writes two files from ONE grid, so the ORDER BELOW IS LOAD-BEARING:
+       caustic_bits arrives holding the full mask, '.causticClass' must be written from it FIRST,
+       and only then is it collapsed in place to the 0/1 fold flag for '.caustic'. Both prefer the
+       unaveraged grid (nSub=1, the granularity of '.streams'), falling back to the '_a' pass. */
+    {
+        Quantities *src = not uQuantities.caustic_bits.empty() ? &uQuantities
+                        : not aQuantities.caustic_bits.empty() ? &aQuantities : NULL;
+        if ( src != NULL )
+        {
+            // Only export the stratification when the deposit produced it: nothing above the
+            // parity bits means a grid claiming "k = 0 everywhere", which is worse than no grid.
+            bool haveClass = false;
+            for (size_t i = 0; i < src->caustic_bits.size() and not haveClass; ++i)
+                if ( (int(src->caustic_bits[i]) & ~3) != 0 ) haveClass = true;
+            if ( haveClass )
+                output.write( src->caustic_bits, userOptions.outputFilename + ".causticClass", "caustic stratification mask", userOptions );
+
+            // now collapse the mask to the fold flag: bits 0 AND 1 both set = a fold crosses the cell
+            for (size_t i = 0; i < src->caustic_bits.size(); ++i)
+                src->caustic_bits[i] = ( (int(src->caustic_bits[i]) & 3) == 3 ) ? Real(1.) : Real(0.);
+            output.write( src->caustic_bits, userOptions.outputFilename + ".caustic", "fold-caustic cell flag", userOptions );
+        }
+    }
 
 #endif
 

@@ -45,9 +45,14 @@ struct PSGpuGrids
     std::vector<float>    streamvol;// subTotal      exact cell-mean multiplicity sum(V_int)/V_cell (fExact; else EMPTY). 'streams' then carries the raw integer tet-touch count.
 };
 
-// Runs the mass-conserving tetrahedral deposit on the default GPU device. Vertices must
-// already be min-image-wrapped relative to vertex 0 (as in the CPU deposit). Thread-safe
-// (serialized on one device queue/stream).
+// Runs the mass-conserving tetrahedral deposit on the default GPU device. 'verts' holds one
+// PS_TET_STRIDE-float record per tet (ps_deposit_params.h psFillTetRecord: vertex 0 as cell
+// index + fraction and the edges, in the canonical frame of the exact inside test).
+// Thread-safe (serialized on one device queue/stream).
+// The kernel decides which samples each tet contains exactly as the CPU deposit does
+// (ps_exact_inside.h): in float, with a rigorous error bound. A tet with a sample inside that
+// bound is NOT deposited; its index (into the arrays as passed) is returned in 'deferred', and
+// the caller must deposit it with the CPU's exact test.
 // fVel = velocity moments needed (velocity or dispersion selected), fDisp = second moments
 // (dispersion), fGrad = velocity-gradient moments; unselected grids are neither allocated on
 // the device (4-byte dummies) nor on the host. 'vels' may be EMPTY when all three are off.
@@ -70,7 +75,7 @@ struct PSGpuGrids
 // CONSUMES verts/vels/masses/dens (several GB per partition at scale): Metal frees each one
 // right after copying it into unified memory, so they may be empty when the call returns --
 // the CPU fallback deposits from the triangulation, not from these arrays.
-bool psGpuDepositFields(std::vector<float>& verts,   // nTet*12: 4 wrapped Eulerian vertices
+bool psGpuDepositFields(std::vector<float>& verts,   // nTet*PS_TET_STRIDE: the per-tet records
                         std::vector<float>& vels,    // nTet*12: 4 vertex velocities (empty if unused)
                         std::vector<float>& masses,  // nTet: tet mass (rho_bar * V_lag, or the --ps-vertex-mass shares)
                         std::vector<float>& dens,    // nTet*4: vertex densities (empty unless fLinear)
@@ -79,7 +84,7 @@ bool psGpuDepositFields(std::vector<float>& verts,   // nTet*12: 4 wrapped Euler
                         int nSub, bool periodic,
                         bool fVel, bool fDisp, bool fGrad, bool fLinear,
                         bool fVolW, bool fCaustic, bool fExact,
-                        PSGpuGrids& out, std::string& err);
+                        PSGpuGrids& out, std::vector<uint32_t>& deferred, std::string& err);
 
 
 // ---------------------------------------------------------------- standard-DTFE method-1 deposit

@@ -29,16 +29,48 @@
 #include <algorithm>
 #include "define.h"
 
+// Singularity threshold of matrixInverse(), RELATIVE: a matrix counts as singular when |det| is
+// below REAL_PRECISSION times the product of its row norms. By Hadamard's inequality that ratio is
+// a pure shape measure in [0,1] (1 for orthogonal rows), so the test is independent of the length
+// unit and of the simplex's size. It used to be an ABSOLUTE |det| < 1e-6, in (length unit)^3: every
+// well-shaped tetrahedron with edges below ~0.01 Mpc was declared singular -- the PS-DTFE deposit
+// then DROPPED it (22.6% of the mass lost on a 1 Mpc box at 48^3, i.e. TNG50-1 resolution) and the
+// standard binary interpolated a constant field (zero gradient) inside it.
 #define REAL_PRECISSION 1.e-6
+
+// Product of the row norms of an NxN matrix (the Hadamard bound on |det|).
+inline double rowNormProduct(double const matrix[][NO_DIM])
+{
+    double prod = 1.0;
+    for (int i=0; i<NO_DIM; ++i)
+    {
+        double n2 = 0.0;
+        for (int j=0; j<NO_DIM; ++j)
+            n2 += matrix[i][j] * matrix[i][j];
+        prod *= std::sqrt(n2);
+    }
+    return prod;
+}
+
+// True when matrixInverse() treats the matrix as singular (see REAL_PRECISSION). Written as a
+// negated '>' so a zero or NaN determinant is singular too.
+inline bool isRelativelySingular(double const det, double const matrix[][NO_DIM])
+{
+    return not ( std::fabs(det) > REAL_PRECISSION * rowNormProduct(matrix) );
+}
 
 
 // Determinant of an NxN matrix via Gaussian elimination with partial pivoting.
 inline double determinant(double matrix[][NO_DIM])
 {
     double temp[NO_DIM][NO_DIM];
+    double maxAbs = 0.0;   // scale of the entries: the zero-pivot test below is relative to it
     for (int i=0; i<NO_DIM; ++i)
         for (int j=0; j<NO_DIM; ++j)
+        {
             temp[i][j] = matrix[i][j];
+            maxAbs = std::max( maxAbs, std::fabs(matrix[i][j]) );
+        }
 
     double det = 1.0;
     for (int i=0; i<NO_DIM; ++i)
@@ -54,7 +86,7 @@ inline double determinant(double matrix[][NO_DIM])
             det = -det;
         }
 
-        if (std::fabs(temp[i][i]) < 1e-15) return 0.0;
+        if ( not (std::fabs(temp[i][i]) > 1e-15 * maxAbs) ) return 0.0;
 
         det *= temp[i][i];
 
@@ -75,7 +107,7 @@ inline void matrixInverse(double matrix[][NO_DIM],
 {
 #if NO_DIM==2
     double det = matrix[0][0]*matrix[1][1] - matrix[0][1]*matrix[1][0];
-    if (std::fabs(det) < REAL_PRECISSION)
+    if ( isRelativelySingular(det, matrix) )
     {
         result[0][0] = result[0][1] = result[1][0] = result[1][1] = Real(0.);
         return;
@@ -90,7 +122,7 @@ inline void matrixInverse(double matrix[][NO_DIM],
     double c01 = matrix[1][2]*matrix[2][0] - matrix[1][0]*matrix[2][2];
     double c02 = matrix[1][0]*matrix[2][1] - matrix[1][1]*matrix[2][0];
     double det = matrix[0][0]*c00 + matrix[0][1]*c01 + matrix[0][2]*c02;
-    if (std::fabs(det) < REAL_PRECISSION)
+    if ( isRelativelySingular(det, matrix) )
     {
         for (int r=0; r<3; ++r)
             for (int c=0; c<3; ++c)

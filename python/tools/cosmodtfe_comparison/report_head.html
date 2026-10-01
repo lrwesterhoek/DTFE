@@ -1,0 +1,67 @@
+<title>PS-DTFE versus CosmoDTFE</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,500;6..72,600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root {
+  --paper: #f8f9fb;
+  --surface: #eef1f5;
+  --rule: #d6dce5;
+  --ink: #18202e;
+  --muted: #5a6577;
+  --ours: #1f6fb4;
+  --cosmo: #d4700f;
+  --good: #2e7d4f;
+  --warn: #9a5b00;
+  --display: "Newsreader", "Iowan Old Style", Georgia, serif;
+  --body: "IBM Plex Sans", -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --paper: #10151d; --surface: #19212c; --rule: #2c3644; --ink: #e5e9ef; --muted: #97a3b4;
+    --ours: #62a8e6; --cosmo: #f0a04b; --good: #5cc28a; --warn: #e0a84a;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --paper: #10151d; --surface: #19212c; --rule: #2c3644; --ink: #e5e9ef; --muted: #97a3b4;
+  --ours: #62a8e6; --cosmo: #f0a04b; --good: #5cc28a; --warn: #e0a84a;
+}
+body { background: var(--paper); color: var(--ink); font: 15px/1.6 var(--body); padding-inline: 16px; }
+main { max-width: 1040px; margin: 0 auto; padding-block: 40px 72px; display: grid; gap: 44px; }
+h1, h2, h3 { font-family: var(--display); font-weight: 600; text-wrap: balance; line-height: 1.2; margin: 0; }
+h1 { font-size: clamp(30px, 5vw, 44px); }
+h2 { font-size: 26px; }
+h3 { font-size: 18px; font-family: var(--body); font-weight: 600; }
+p { margin: 0; max-width: 70ch; }
+section { display: grid; gap: 16px; }
+.eyebrow { font: 500 12px/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+.lede { font-size: 17px; color: var(--muted); max-width: 72ch; }
+.meta { font: 13px/1.5 var(--mono); color: var(--muted); display: flex; flex-wrap: wrap; gap: 6px 18px; }
+.who-ours { color: var(--ours); font-weight: 600; }
+.who-cosmo { color: var(--cosmo); font-weight: 600; }
+.verdict { display: grid; gap: 0; border-top: 1px solid var(--rule); }
+.verdict > div { display: grid; grid-template-columns: 170px 1fr; gap: 16px; padding: 16px 0; border-bottom: 1px solid var(--rule); }
+.verdict .k { font: 600 13px/1.4 var(--mono); letter-spacing: .04em; text-transform: uppercase; color: var(--muted); padding-top: 2px; }
+.verdict .v { display: grid; gap: 6px; }
+.chip { display: inline-block; font: 600 12px/1 var(--mono); padding: 5px 8px; border-radius: 4px; margin-right: 8px;
+        background: color-mix(in srgb, var(--good) 14%, transparent); color: var(--good); }
+.chip.split { background: color-mix(in srgb, var(--warn) 16%, transparent); color: var(--warn); }
+figure { margin: 0; display: grid; gap: 8px; }
+figure img { width: 100%; height: auto; border-radius: 6px; background: #fff; border: 1px solid var(--rule); }
+figcaption { font-size: 13.5px; color: var(--muted); max-width: 80ch; }
+.tablewrap { overflow-x: auto; border: 1px solid var(--rule); border-radius: 6px; }
+table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
+th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--rule); vertical-align: top; }
+thead th { background: var(--surface); font-weight: 600; font-size: 12.5px; }
+tbody tr:last-child td { border-bottom: 0; }
+table.num td:not(:first-child), table.num th:not(:first-child) { font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+td.yes { color: var(--good); } td.no { color: var(--muted); }
+.note { font-size: 13px; color: var(--muted); }
+ul.plain { margin: 0; padding-left: 20px; display: grid; gap: 6px; max-width: 76ch; }
+.grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 24px; }
+code { font-family: var(--mono); font-size: .92em; background: var(--surface); padding: 1px 5px; border-radius: 3px; }
+@media (max-width: 640px) { .verdict > div { grid-template-columns: 1fr; gap: 6px; } main { padding-block: 24px 48px; gap: 36px; } }
+</style>

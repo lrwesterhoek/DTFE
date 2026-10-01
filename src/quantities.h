@@ -78,7 +78,8 @@ struct Quantities
     // weighted one. Both are internal to normalizePhaseSpace and never written out.
     std::vector<Real>                         disp_weight;        // sum(m_s)
     std::vector< Pvector<Real,noVelComp> >    disp_velocity;      // sum(m_s v_s)
-    std::vector<Real>                         caustic_bits;       // --ps-caustics: per-cell orientation mask (bit0 = det(Ax)>0 stream overlaps the cell, bit1 = det<0). Small exact ints in float; OR-merged across partitions (addFrom/addFromSubgrid), binarized to the 0/1 fold flag once in DTFE() after the merge, written as '.caustic'
+    std::vector<Real>                         caustic_bits;       // --ps-caustics: per-cell caustic mask, small exact ints in float (bit0 = a det(Ax)>0 stream overlaps the cell, bit1 = det<0, higher bits = the stratification of CGAL_triangulation/ps_caustic_class.h). OR-merged across partitions (addFrom/addFromSubgrid) and kept FULL right through post-processing: writeOutputData emits '.causticClass' from it and only then binarizes it in place to the 0/1 fold flag for '.caustic'. There is deliberately no second grid -- see the note there
+    std::vector<Real>                         hidden_streams;     // PS-DTFE: a small bitmask in Real, written as '.hidden_streams' (named '.unresolved' before 2026-09-30). BIT 1 (value 1) = the cell holds multi-stream volume its '.streams' does not show: a negatively oriented (folded) tetrahedron overlaps it with positive volume while '.streams' reads single-stream -- a fold thinner than the sub-sample spacing. Exact in a periodic box (degree-1 map: a point is multi-stream iff a flipped tet covers it), so the single-stream mask is '.streams == 1 (to PS_STREAM_TOL) and not (hidden_streams & 1)': every point of such a cell lies on one stream. BIT 2 (value 2) = the cell received MASS from a tetrahedron none of whose sub-samples lies in it (the centroid fallback, or a --ps-halo-release tet): the cell mean includes a sub-resolution piece, possibly of the SAME stream -- a quadrature note, not a stream count (non-periodic runs also set bit 1 there, conservatively). '.unresolved' files from 2026-09-28/29 hold only 0/1 = the old mass flag, which reads as bit 1 and so stays conservative. OR-merged like caustic_bits; finalizeHiddenStreams() clears bit 1 where '.streams' already reads multi-stream
     // PS-DTFE partition sub-grid in global grid-cell units, so addFromSubgrid() can map cells back.
     size_t ps_subOrigin[NO_DIM] = {0};
     size_t ps_subDims[NO_DIM]   = {0};   // [0]==0 means "not a sub-grid" (vectors span the full grid)
@@ -101,6 +102,7 @@ struct Quantities
     // (rho/rho_bar) density; 0 keeps the historical mass_weight-only behaviour.
     void normalizePhaseSpace(Field const &field, Real const weightFromDensityScale = Real(0.));
     void addFromSubgrid(Quantities const &other, size_t const *fullGrid); // like addFrom but 'other' stores only its Eulerian box; maps each cell into the full grid (dims fullGrid)
+    void finalizeHiddenStreams();   // after the merge: clear '.hidden_streams' bit 1 where '.streams' reads multi-stream (idempotent)
 #endif
 };
 

@@ -44,6 +44,7 @@ tests/tmp/
 *.vel
 *.streams
 *.caustic
+*.causticClass
 *.scalar
 *.velDisp
 *.velDispTensor
@@ -90,3 +91,4 @@ metal/validate_deposit
 
 #  Generated analysis-figure directories (tracked PNGs at figures/ top level stay)
 figures/*/
+HANDOFF.md

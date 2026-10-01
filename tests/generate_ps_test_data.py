@@ -10,8 +10,24 @@ import sys
 import numpy as np
 
 
+# Three-harmonic 1-D wave with an EXACT A4 (swallowtail), the analytic control for bit 8.
+#
+# For x = q + a1 sin(u) + a2 sin(2u) + a3 sin(3u) with u = k*q, the deformation is
+#     J(u) = 1 + A cos u + 2B cos 2u + 3C cos 3u,   A = a1*k, B = a2*k, C = a3*k
+# which in c = cos u is the cubic  J = 12C c^3 + 4B c^2 + (A - 9C) c + (1 - 2B).
+#
+# An exact A4 needs J to have a TRIPLE root. Matching against 12C (c - c0)^3 at c0 = -1/2 -- chosen
+# because sin u != 0 there, so the root is not the wave's own symmetry point at u = pi, where every
+# odd derivative vanishes and the degeneracy would be A5 -- gives
+#     C = -1/(6 c0 (2 c0^2 + 3)) = 2/21,   B = -9 C c0 = 3/7,   A = 9C + 36 C c0^2 = 12/7
+# i.e. J(u) = (8/7)(cos u + 1/2)^3: D1 = D2 = 0, D3 != 0 at k*q = 2pi/3 and 4pi/3 (q = L/3, 2L/3),
+# with J < 0 strictly between them, so the wave really does shell-cross. Translation symmetry
+# inflates the A4 points into planes, which is what makes them measurable.
+SWALLOWTAIL_HARMONICS = (12.0 / 7.0, 3.0 / 7.0, 2.0 / 21.0)   # (A, B, C) = (a1, a2, a3) * k
+
+
 def build_pancake(n_side, box, amplitude_factor, jitter_frac, seed, margin_frac=0.0,
-                  crossed=False):
+                  crossed=False, swallowtail=False):
     rng = np.random.default_rng(seed)
 
     if margin_frac > 0.0:
@@ -32,9 +48,16 @@ def build_pancake(n_side, box, amplitude_factor, jitter_frac, seed, margin_frac=
     amplitude = amplitude_factor / k
 
     displacement = np.zeros_like(q)
-    naxes = q.shape[1] if crossed else 1
-    for d in range(naxes):
-        displacement[:, d] = amplitude * np.sin(k * q[:, d])
+    if swallowtail:
+        # exact A4 along x only; y and z stay unperturbed so their eigenvalues are 1 and the
+        # critical eigenvalue is unambiguously the x one
+        a1, a2, a3 = (h / k for h in SWALLOWTAIL_HARMONICS)
+        u = k * q[:, 0]
+        displacement[:, 0] = a1 * np.sin(u) + a2 * np.sin(2.0 * u) + a3 * np.sin(3.0 * u)
+    else:
+        naxes = q.shape[1] if crossed else 1
+        for d in range(naxes):
+            displacement[:, d] = amplitude * np.sin(k * q[:, d])
 
     if margin_frac > 0.0:
         x = q + displacement
@@ -103,6 +126,11 @@ def main():
     ap.add_argument("--crossed-waves", action="store_true",
                     help="displace along ALL axes (independent sine per axis) -> a genuinely "
                          "3D multi-stream test; stream counts become {1,3,9,27}")
+    ap.add_argument("--swallowtail", action="store_true",
+                    help="three-harmonic 1-D wave engineered so the deformation has an exact "
+                         "TRIPLE root: an A4 (swallowtail) caustic at q = L/3 and 2L/3, where "
+                         "lambda_c and its first two directional derivatives all vanish. "
+                         "Overrides --amplitude-factor and --crossed-waves")
     ap.add_argument("--mass", type=float, default=1.0,
                     help="particle mass placed in MassTable (default 1.0)")
     ap.add_argument("--seed", type=int, default=42, help="RNG seed (default 42)")
@@ -110,7 +138,7 @@ def main():
 
     q, x, velocity = build_pancake(args.n, args.box, args.amplitude_factor,
                                    args.jitter_frac, args.seed, args.margin_frac,
-                                   args.crossed_waves)
+                                   args.crossed_waves, args.swallowtail)
     write_snapshot(args.out, q, x, velocity, args.box, args.mass)
 
     n = x.shape[0]

@@ -66,8 +66,8 @@ def main() -> int:
     args = p.parse_args()
 
     from dtfelib.io import FieldSet
-    from dtfelib.cli import DATA_ROOT
-    snapdir = DATA_ROOT / args.sim / f"snapdir_{args.snap:03d}"
+    from dtfelib.cli import sim_dir
+    snapdir = sim_dir(args.sim) / f"snapdir_{args.snap:03d}"
     fa = FieldSet(snapdir, prefix=args.a)
     fb = FieldSet(snapdir, prefix=args.b)
     print(f"A (reference): {fa!r}")

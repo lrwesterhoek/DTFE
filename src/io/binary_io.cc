@@ -26,7 +26,8 @@
 
 
 // Reads input from a binary file: int noParticles; 6 floats box (xMin,xMax,...,zMax);
-// positions; weights; velocities. All values single-precision float.
+// positions; weights; velocities. All values single-precision float in the file (widened on
+// read in a DOUBLE build).
 void readBinaryFile(std::string filename,
                     Read_data<Real> *readData,
                     User_options *userOptions)
@@ -48,20 +49,25 @@ void readBinaryFile(std::string filename,
         userOptions->boxCoordinates[i] = boxCoordinates[i];
 
 
-    // the file stores float32, so the raw reads below require a single-precision build (Real == float)
+    // the file stores float32: read it straight into the buffers in a single-precision build,
+    // through a float32 staging block (widened) in a DOUBLE build
     Real *positions  = readData->position(noParticles);
     Real *weights    = readData->weight(noParticles);    // weights = particle masses
     Real *velocities = readData->velocity(noParticles);
 
-
-    size_t dataSize = noParticles * sizeof(float) * NO_DIM;
-    inputFile.read( reinterpret_cast<char *>(positions), dataSize );
-
-    dataSize = noParticles * sizeof(float);
-    inputFile.read( reinterpret_cast<char *>(weights), dataSize );
-
-    dataSize = noParticles * sizeof(float) * NO_DIM;
-    inputFile.read( reinterpret_cast<char *>(velocities), dataSize );
+    auto readFloat32 = [&inputFile](Real *dest, size_t count)
+    {
+#ifdef DOUBLE
+        std::vector<float> stage( count );
+        inputFile.read( reinterpret_cast<char *>(stage.data()), count * sizeof(float) );
+        for (size_t i = 0; i < count; ++i) dest[i] = Real( stage[i] );
+#else
+        inputFile.read( reinterpret_cast<char *>(dest), count * sizeof(float) );
+#endif
+    };
+    readFloat32( positions,  size_t(noParticles) * NO_DIM );
+    readFloat32( weights,    size_t(noParticles) );
+    readFloat32( velocities, size_t(noParticles) * NO_DIM );
 
     checkFileOperations( inputFile, "read from" );
     inputFile.close();

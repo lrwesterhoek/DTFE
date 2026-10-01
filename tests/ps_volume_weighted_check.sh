@@ -134,8 +134,11 @@ for ext, ncomp in ((".vel", 3), (".velDiv", 1), (".velShear", 5)):
         # single-stream cells hold one sample, so the weighting is mathematically irrelevant --
         # but the stored value is (v*w)/w and the float ROUNDING of that round-trip depends on
         # w, so the two runs differ by ~1 ulp there. Assert rounding-level agreement, and that
-        # the multi-stream difference is the genuinely physical (orders larger) one.
-        single_mask = ~np.repeat(multi, ncomp)
+        # the multi-stream difference is the genuinely physical (orders larger) one. A cell
+        # flagged in '.hidden_streams' (either bit) holds a second deposit (a sub-sample tet's centroid) however
+        # it counts, so the weighting matters there too: it belongs with the multi-stream set.
+        unres = load(f"{tmp}/pvw_mw", ".hidden_streams") != 0
+        single_mask = ~np.repeat(multi | unres, ncomp)
         scale = float(np.abs(a).max()) + 1e-30
         rel_single = float(np.abs(a - b)[single_mask].max()) / scale
         rel_multi  = float(np.abs(a - b)[~single_mask].max()) / scale
@@ -158,7 +161,7 @@ if gpu:
     sc = load(f"{tmp}/pvw_vw", ".streams")
     sg = load(f"{tmp}/pvw_vwg", ".streams")
     eq = float((sc == sg).mean())
-    check("E GPU streams match CPU", eq > 0.999, f"{eq*100:.4f}% equal")
+    check("E GPU streams match CPU", eq == 1.0, f"{eq*100:.4f}% equal (exact inside test on both: must be 100%)")
 else:
     print("   SKIP E GPU parity (CPU-only build)")
 

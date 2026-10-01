@@ -92,8 +92,8 @@ def main() -> None:
     if args.sim:
         if args.snap is None:
             p.error("--sim needs --snap")
-        from dtfelib.cli import DATA_ROOT
-        combined = DATA_ROOT / args.sim / f"snapdir_{args.snap:03d}" / f"combined_{args.snap:03d}.hdf5"
+        from dtfelib.cli import sim_dir
+        combined = sim_dir(args.sim) / f"snapdir_{args.snap:03d}" / f"combined_{args.snap:03d}.hdf5"
     else:
         combined = args.combined
     if not combined.is_file():

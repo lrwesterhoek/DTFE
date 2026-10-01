@@ -45,8 +45,8 @@ FIELD_FILES = ['output.a_den', 'output.a_vel', 'output.a_velDiv',
 # ---------------------------------------------------------------- check
 
 def check_data():
-    from dtfelib.cli import DATA_ROOT
-    base = DATA_ROOT / config.SIMULATION
+    from dtfelib.cli import sim_dir
+    base = sim_dir(config.SIMULATION)
     missing = []
     for snap, z in config.snapshot_items():
         d = base / f"snapdir_{snap}"

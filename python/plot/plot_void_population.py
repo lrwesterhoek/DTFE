@@ -84,7 +84,7 @@ def main():
         config.SMOOTHING_SIGMA_CELLS = args.smooth
 
     ztab = gc.redshift_table(args.sim)
-    ladder = sorted({int(d.name.split("_")[1]) for d in (env.DATA_ROOT / args.sim).glob("snapdir_*")})
+    ladder = sorted({int(d.name.split("_")[1]) for d in env.sim_dir(args.sim).glob("snapdir_*")})
 
     stats, method_used = {}, {}
     for s in ladder:

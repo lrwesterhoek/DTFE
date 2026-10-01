@@ -17,7 +17,7 @@ from dtfelib.figures import save_plot_to_multiple_paths
 import config
 from dtfelib import figures as style
 from dtfelib import pipeline
-from dtfelib import make_parser, DATA_ROOT
+from dtfelib import make_parser, sim_dir
 
 style.apply()
 
@@ -402,7 +402,7 @@ def main():
     args = parser.parse_args()
 
     print("Starting 3D void shape analysis")
-    print(f"Data directory: {DATA_ROOT / args.sim} (method: {args.method})")
+    print(f"Data directory: {sim_dir(args.sim, args.data_root)} (method: {args.method})")
     print(f"Output directory: {OUTPUT_DIR}/void_shapes_sigma{SMOOTHING_SIGMA}")
     print(f"Smoothing sigma: {SMOOTHING_SIGMA}")
     print(f"Footprint size: {FOOTPRINT_SIZE}")

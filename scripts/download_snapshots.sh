@@ -37,7 +37,7 @@ API_KEY="${TNG_API_KEY:-}"
 if [ -z "${API_KEY}" ] && [ -r "${HOME}/.tng_api_key" ]; then
     API_KEY="$(head -n1 "${HOME}/.tng_api_key" | tr -d '[:space:]')"
 fi
-DATA_DIR=""                       # default: $DATA_ROOT/<SIMULATION> (config.sh)
+DATA_DIR=""                       # default: sim_dir <SIMULATION> (config.sh)
 MODE="snapshot"                   # 'snapshot' or 'groupcat' (-c)
 
 # Snapshot numbers (each corresponds to a redshift) to download; overrides the
@@ -79,7 +79,7 @@ if [ -z "${API_KEY}" ]; then
     usage
     exit 1
 fi
-[ -z "${DATA_DIR}" ] && DATA_DIR="${DATA_ROOT}/${SIMULATION}"
+[ -z "${DATA_DIR}" ] && DATA_DIR="$(sim_dir "${SIMULATION}")"
 
 echo "Downloading TNG ${MODE} files..."
 echo "Simulation:     ${SIMULATION}"

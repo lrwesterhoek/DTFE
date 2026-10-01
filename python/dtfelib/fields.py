@@ -9,6 +9,42 @@ from scipy.ndimage import gaussian_filter, minimum_filter
 from pathlib import Path
 
 
+def pseudo_phase_space_density(density, dispersion, eps=1e-30):
+    """Q = rho / sigma^3, the standard scalar proxy for the phase-space density.
+
+    The true distribution function of a collisionless sheet is singular -- f(x,v) is a sum of
+    delta functions, one per stream -- so nothing can tabulate it on a grid. Two things are
+    computable instead, and they are not the same:
+
+      * this Q (Taylor & Navarro 2001), formed from the EXACT multi-stream density and velocity
+        dispersion that PS-DTFE deposits, so it inherits the real multi-stream structure;
+      * the standard binary's '--approxPSD', f ~ rho(x) * g(v), which builds a second Delaunay
+        tessellation in VELOCITY space and multiplies the two densities. That assumes the local
+        distribution factorises into a spatial and a velocity part, which is exactly what fails
+        in a multi-stream region.
+
+    Comparing the two is therefore a direct measurement of how badly the factorisation assumption
+    breaks down where streams cross; see the recipe in demo/COMMANDS.md.
+
+    Parameters
+    ----------
+    density : array
+        Multi-stream density, in whatever units the caller wants Q expressed in
+        (FieldSet.density(units="mean") for rho/rho_bar).
+    dispersion : array
+        Velocity dispersion sigma (the '.velDisp' TRACE field is sigma^2; pass its square root,
+        or use FieldSet-derived sigma). Cells with sigma below `eps` return NaN rather than a
+        divergent Q -- cold single-stream regions have sigma == 0 by construction.
+    """
+    import numpy as np
+    rho = np.asarray(density, dtype=np.float64)
+    sig = np.asarray(dispersion, dtype=np.float64)
+    out = np.full(np.broadcast(rho, sig).shape, np.nan, dtype=np.float64)
+    ok = sig > eps
+    np.divide(rho, sig ** 3, out=out, where=ok)
+    return out
+
+
 def calculate_density_contrast(density_field):
     mean_density = np.mean(density_field)
     if mean_density == 0:

@@ -45,15 +45,17 @@ import numpy as np
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR.parent))  # python/ on sys.path, for dtfelib.cli.sim_dir
 
 
 SNAPSHOT_NUMBERS = [0, 4, 17, 33, 50]
 
 NUM_SUBFILES = 4
 
-# default simulation dir; follows the project-wide DTFE_DATA_ROOT convention (see config.sh),
-# override per run with -d/--data-dir
-BASE_DIR = str(Path(os.environ.get("DTFE_DATA_ROOT", str(Path.home() / "output"))) / "TNG300-3-Dark")
+# default simulation dir; follows the project-wide DTFE_DATA_ROOT convention and layouts (see
+# config.sh / dtfelib.cli.sim_dir), override per run with -d/--data-dir
+from dtfelib.cli import sim_dir
+BASE_DIR = str(sim_dir("TNG300-3-Dark"))
 
 SINGLE_FILES = [
 ]

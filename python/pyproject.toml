@@ -1,0 +1,24 @@
+# dtfelib: the Python side of DTFE / PS-DTFE -- field loaders, analysis helpers and the
+# interactive dtfelib.Estimator (a live '--serve' tessellation queried from Python).
+#
+#   pip install -e python        (from the repository root; scripts/install.sh does this)
+#
+# Install it EDITABLE: dtfelib.find_binary() then locates ./DTFE and ./PS-DTFE in the
+# repository root it lives in. A regular (non-editable) install works too, with the binaries
+# found through $DTFE_BIN_DIR or $PATH instead.
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dtfelib"
+version = "0.1.0"
+description = "Python front end of the DTFE / PS-DTFE field estimators: loaders, analysis and the interactive Estimator"
+readme = { text = "See the repository README (sections 'Phase-Space DTFE' and 'Interactive point evaluation').", content-type = "text/plain" }
+requires-python = ">=3.10"
+dependencies = ["numpy", "h5py", "scipy", "matplotlib"]
+
+[tool.setuptools]
+packages = ["dtfelib"]
+py-modules = ["config"]   # dtfelib.figures / dtfelib.pipeline import the top-level config

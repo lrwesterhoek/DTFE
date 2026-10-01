@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstdio>
+#include <cmath>
 #include <cstring>
 #include <deque>
 #include <mutex>
@@ -30,7 +31,8 @@ struct Ctx
 {
     MTL::Device*               dev  = nullptr;
     MTL::CommandQueue*         q    = nullptr;
-    MTL::ComputePipelineState* pso  = nullptr;
+    MTL::ComputePipelineState* pso  = nullptr;   // depositFields: one thread per tet
+    MTL::ComputePipelineState* psoItems = nullptr;   // depositExactItems: one per (tet, cell block)
     std::string                err;
     bool                       ready = false;
 };
@@ -58,14 +60,18 @@ Ctx& ctx()
               + (nsErr ? nsErr->localizedDescription()->utf8String() : "unknown");
         return c;
     }
-    MTL::Function* fn = lib->newFunction(NS::String::string("depositFields", NS::UTF8StringEncoding));
-    if (!fn) { c.err = "kernel 'depositFields' not found"; return c; }
-    c.pso = c.dev->newComputePipelineState(fn, &nsErr);
-    if (!c.pso)
+    for (auto [name, dst] : { std::pair<const char*, MTL::ComputePipelineState**>{"depositFields", &c.pso},
+                              std::pair<const char*, MTL::ComputePipelineState**>{"depositExactItems", &c.psoItems} })
     {
-        c.err = std::string("pipeline state failed: ")
-              + (nsErr ? nsErr->localizedDescription()->utf8String() : "unknown");
-        return c;
+        MTL::Function* fn = lib->newFunction(NS::String::string(name, NS::UTF8StringEncoding));
+        if (!fn) { c.err = std::string("kernel '") + name + "' not found"; return c; }
+        *dst = c.dev->newComputePipelineState(fn, &nsErr);
+        if (!*dst)
+        {
+            c.err = std::string("pipeline state failed: ")
+                  + (nsErr ? nsErr->localizedDescription()->utf8String() : "unknown");
+            return c;
+        }
     }
     c.ready = true;
     return c;
@@ -93,7 +99,7 @@ bool psGpuDepositFields(std::vector<float>& verts,
                           int nSub, bool periodic,
                           bool fVel, bool fDisp, bool fGrad, bool fLinear,
                           bool fVolW, bool fCaustic, bool fExact,
-                          PSGpuGrids& out, std::string& err)
+                          PSGpuGrids& out, std::vector<uint32_t>& deferred, std::string& err)
 {
     std::lock_guard<std::mutex> lock(ctxMutex());   // serialize dispatches (single queue)
     Ctx& c = ctx();
@@ -121,7 +127,13 @@ bool psGpuDepositFields(std::vector<float>& verts,
     out.streamvol.assign(fExact ? nCell : 0, 0.f);
     out.dispvel.assign(fDispOwn ? nCell * 3 : 0, 0.f);
     out.dispw.assign(fDispOwn ? nCell : 0, 0.f);
+    deferred.clear();
     if (masses.empty()) return true;    // nothing to deposit (empty partition)
+    if (verts.size() != masses.size() * size_t(PS_TET_STRIDE))
+    {
+        err = "tet record size mismatch (verts must hold PS_TET_STRIDE floats per tet)";
+        return false;
+    }
 
     DepositParams P{};
     for (int d = 0; d < 3; ++d)
@@ -157,14 +169,22 @@ bool psGpuDepositFields(std::vector<float>& verts,
     };
     MTL::Buffer* bV = c.dev->newBuffer(verts.data(),  verts.size()  * sizeof(float), MTL::ResourceStorageModeShared);
     std::vector<float>().swap(verts);
-    // vels is empty for density-only runs (kernel never reads it then): bind a dummy
+    // vels is empty for density-only runs (kernel never reads it then): bind a dummy. Whether it
+    // is real matters at bind time: the per-chunk offset below must NOT be applied to the 4-byte
+    // dummy, or every chunk after the first binds past its end -- undefined behaviour that the
+    // kernel gets away with only because it never dereferences the pointer in that case.
+    bool const haveVels = not vels.empty();
     MTL::Buffer* bU = vels.empty() ? zeroBuf(4)
                     : c.dev->newBuffer(vels.data(), vels.size() * sizeof(float), MTL::ResourceStorageModeShared);
     std::vector<float>().swap(vels);
     MTL::Buffer* bM = c.dev->newBuffer(masses.data(), masses.size() * sizeof(float), MTL::ResourceStorageModeShared);
     std::vector<float>().swap(masses);
     // per-tet vertex densities (--ps-linear-deposit); dummy when the uniform deposit runs
-    MTL::Buffer* bD = (P.fLinear && !dens.empty())
+    // 'dens' carries either the per-tet vertex densities (fLinear) or, when fCaustic runs without
+    // fLinear, the per-tet caustic mask in slot 0. Either way the buffer is real and its per-chunk
+    // offset must be applied -- keyed on the vector being non-empty, not on fLinear.
+    bool const haveDens = not dens.empty();
+    MTL::Buffer* bD = (haveDens)
                     ? c.dev->newBuffer(dens.data(), dens.size() * sizeof(float), MTL::ResourceStorageModeShared)
                     : zeroBuf(4);
     std::vector<float>().swap(dens);
@@ -187,8 +207,8 @@ bool psGpuDepositFields(std::vector<float>& verts,
         return false;
     }
 
-    // Dispatch in CHUNKS of tetrahedra, one short command buffer each, FULLY SERIALIZED with a
-    // small host-side gap between buffers. Why chunk + gaps:
+    // Dispatch in CHUNKS, one short command buffer each, FULLY SERIALIZED with a small host-side
+    // gap between buffers. Why chunk + gaps:
     //  - one monolithic buffer runs minutes -> killed by the macOS GPU watchdog ("Impacting
     //    Interactivity") when the display needs the GPU;
     //  - keeping buffers back-to-back (pipelined) sustains 100% GPU queue pressure and gets killed
@@ -198,9 +218,7 @@ bool psGpuDepositFields(std::vector<float>& verts,
     // may have PARTIALLY deposited its atomics, so a failed chunk is never retried alone: each
     // retry re-zeros the grids, redoes the whole deposit with 4x shorter buffers and wider gaps,
     // and persistent failure falls back to the CPU deposit in the caller.
-    // PS_METAL_CHUNK=<n> overrides the starting chunk size.
-    // exact deposit: the per-tet cost spread is huge (a stretched void tet clips thousands of
-    // cells), so let the controller shrink much further than the sampled path's floor
+    // PS_METAL_CHUNK=<n> overrides the starting chunk size of the one-thread-per-tet kernel.
     size_t const MIN_CHUNK = fExact ? 50 : 2000;
     size_t const MAX_CHUNK = 500000;
     double targetSec = 0.25;
@@ -212,12 +230,246 @@ bool psGpuDepositFields(std::vector<float>& verts,
     size_t baseChunk = fExact ? 500 : 25000;
     if (const char* env = getenv("PS_METAL_CHUNK"))
     { long v = atol(env); if (v > 0) baseChunk = size_t(v); }
+    std::string lastErr;
+    // PS_METAL_TIMING=1: one line per kernel run (threads, buffers, GPU-busy and wall seconds)
+    bool const timing = getenv("PS_METAL_TIMING") && atoi(getenv("PS_METAL_TIMING")) != 0;
 
-    NS::UInteger tg = c.pso->maxTotalThreadsPerThreadgroup();
-    if (tg > 256) tg = 256;
+    // One paced, chunked run of 'pso' over nThreads threads; bind(enc, start, n) binds the buffers
+    // for the chunk [start, start+n). False (lastErr set) when a command buffer failed.
+    auto runChunked = [&](MTL::ComputePipelineState* pso, size_t nThreads, size_t firstChunk,
+                          size_t minChunk, auto&& bind) -> bool
+    {
+        NS::UInteger tg = pso->maxTotalThreadsPerThreadgroup();
+        if (tg > 256) tg = 256;
+        size_t chunk = std::max(firstChunk, minChunk);
+        size_t start = 0, nBuf = 0;
+        double busy = 0.;
+        auto const tRun = std::chrono::steady_clock::now();
+        while (start < nThreads)
+        {
+            uint32_t const n = uint32_t(std::min(chunk, nThreads - start));
+            auto t0 = std::chrono::steady_clock::now();
+            MTL::CommandBuffer* cb = c.q->commandBuffer();
+            MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
+            enc->setComputePipelineState(pso);
+            bind(enc, start, n);
+            enc->dispatchThreads(MTL::Size(n, 1, 1), MTL::Size(tg, 1, 1));
+            enc->endEncoding();
+            cb->commit();
+            cb->waitUntilCompleted();
+            double const el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+
+            if (cb->status() == MTL::CommandBufferStatusError)
+            {
+                NS::Error* e = cb->error();
+                lastErr = std::string("Metal command buffer failed: ")
+                        + (e ? e->localizedDescription()->utf8String() : "unknown");
+                return false;
+            }
+
+            start += n;
+            ++nBuf;
+            busy += el;
+            if (el > 1e-4)   // retarget the next chunk toward targetSec (bounded rescale)
+            {
+                double scale = targetSec / el;
+                if (scale < 0.5) scale = 0.5;
+                if (scale > 4.0) scale = 4.0;
+                chunk = std::min(std::max(size_t(double(chunk) * scale), minChunk), MAX_CHUNK);
+            }
+            usleep(gapUs);   // deliberate idle gap: lets WindowServer take the GPU
+        }
+        if (timing)
+            fprintf(stderr, "PS-DTFE Metal: %-17s %10zu threads  %6zu buffers  %8.3f s busy  %8.3f s wall\n",
+                    pso == c.psoItems ? "depositExactItems" : "depositFields", nThreads, nBuf, busy,
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - tRun).count());
+        return true;
+    };
+
+    // depositFields over the tets [0,nT) of the given records. The grids are bound whole; the
+    // per-tet buffers at the chunk's offset (P.nTet = chunk size, rewritten per chunk: safe, the
+    // previous chunk completed).
+    auto runPerTet = [&](MTL::Buffer* vB, MTL::Buffer* uB, MTL::Buffer* mB, MTL::Buffer* dB, size_t nT) -> bool
+    {
+        return runChunked(c.pso, nT, baseChunk, MIN_CHUNK, [&](MTL::ComputeCommandEncoder* enc, size_t start, uint32_t n)
+        {
+            P.nTet = n;
+            std::memcpy(bP->contents(), &P, sizeof(P));
+            enc->setBuffer(vB,    start * PS_TET_STRIDE * sizeof(float), 0);
+            enc->setBuffer(uB,    haveVels ? start * 12 * sizeof(float) : 0, 1);
+            enc->setBuffer(mB,    start * sizeof(float),      2);
+            enc->setBuffer(bMass, 0, 3);
+            enc->setBuffer(bMom,  0, 4);
+            enc->setBuffer(bM2,   0, 5);
+            enc->setBuffer(bGrad, 0, 6);
+            enc->setBuffer(bStr,  0, 7);
+            enc->setBuffer(bP,    0, 8);
+            enc->setBuffer(dB,    haveDens ? start * 4 * sizeof(float) : 0, 9);
+            enc->setBuffer(bMomW, 0, 10);
+            enc->setBuffer(bCaust,0, 11);
+            enc->setBuffer(bSV,   0, 12);
+            enc->setBuffer(bDV,   0, 13);
+            enc->setBuffer(bDW,   0, 14);
+        });
+    };
+
+    // --ps-exact-deposit: split the work below the tet (depositExactItems in ps_deposit.metal).
+    // An item is (tet, block of blockCells cells of its bbox window); the host only needs an
+    // UPPER bound of each window -- the kernel re-derives it in float and idles surplus blocks.
+    // The float and double floors can differ only when the value is within rounding of an integer,
+    // so only such a bound is widened (by eps, far above the float error): padding every axis by a
+    // cell instead inflated a 2-3 cell window up to 8x, and each idle item still pays the setup.
+    // The items follow the caller's cost order, keeping a SIMD group's threads on similar work.
+    // PS_EXACT_ITEMS=0 keeps the one-thread-per-tet kernel (A/B), PS_EXACT_ITEM_CELLS sets the block.
+    bool useItems = fExact;
+    if (const char* env = getenv("PS_EXACT_ITEMS")) useItems = useItems && atoi(env) != 0;
+    MTL::Buffer* bItems = nullptr;
+    MTL::Buffer* bSumW  = nullptr;
+    size_t nItems = 0;
+    uint32_t blockCells = 16;
+    if (const char* env = getenv("PS_EXACT_ITEM_CELLS")) { long v = atol(env); if (v > 0) blockCells = uint32_t(v); }
+    if (useItems)
+    {
+        float const* R0 = static_cast<float const*>(bV->contents());
+        std::vector<uint64_t> bound(nTetTotal);
+        double total = 0.;
+        for (size_t t = 0; t < nTetTotal; ++t)
+        {
+            float const* R = R0 + t * PS_TET_STRIDE;
+            uint64_t nw = 1;
+            for (int dd = 0; dd < 3 && nw; ++dd)
+            {
+                int32_t ic0; std::memcpy(&ic0, &R[dd], sizeof ic0);
+                double lo = 0., hi = 0.;
+                for (int e = 0; e < 3; ++e) { double const a = R[6 + e*3 + dd]; lo = std::min(lo, a); hi = std::max(hi, a); }
+                double const f0 = R[3 + dd], dxd = double(P.dx[dd]);
+                double const vlo = f0 + lo / dxd, vhi = f0 + hi / dxd;
+                double const flo = std::floor(vlo - (1.e-3 + 1.e-5 * std::fabs(vlo)));
+                double const fhi = std::floor(vhi + (1.e-3 + 1.e-5 * std::fabs(vhi)));
+                if (!std::isfinite(flo) || !std::isfinite(fhi) || fhi - flo > 1.e7) { nw = 0; break; }
+                int64_t iLo = int64_t(ic0) + int64_t(flo);
+                int64_t iHi = int64_t(ic0) + int64_t(fhi) + 1;
+                if (!periodic) { iLo = std::max<int64_t>(iLo, 0); iHi = std::min<int64_t>(iHi, int64_t(nGrid[dd])); }
+                nw = iHi > iLo ? nw * uint64_t(iHi - iLo) : 0;
+            }
+            bound[t] = nw;
+            total += double(nw);
+        }
+        // at most ~32M items (256 MB): coarser blocks beyond that (16-32 cells run within 10%)
+        double const maxItems = 32.e6;
+        if (total / blockCells > maxItems) blockCells = uint32_t(std::ceil(total / maxItems));
+        // a tet whose window lies wholly outside the grid gets no item: it is a leftover (below)
+        for (size_t t = 0; t < nTetTotal; ++t)
+            nItems += (bound[t] + blockCells - 1) / blockCells;
+        if (timing)
+            fprintf(stderr, "PS-DTFE Metal: exact items: %zu tets, %zu items of %u cells, window bound %.3g cells\n",
+                    nTetTotal, nItems, blockCells, total);
+        bItems = c.dev->newBuffer(std::max<size_t>(nItems, 1) * 2 * sizeof(uint32_t), MTL::ResourceStorageModeShared);
+        bSumW  = c.dev->newBuffer(std::max<size_t>(nTetTotal, 1) * sizeof(float), MTL::ResourceStorageModeShared);
+        if (!bItems || !bSumW)
+        {
+            // too big for GPU-visible memory: the one-thread-per-tet kernel still works
+            if (bItems) bItems->release();
+            if (bSumW)  bSumW->release();
+            bItems = bSumW = nullptr;
+            useItems = false;
+        }
+        else
+        {
+            uint32_t* it = static_cast<uint32_t*>(bItems->contents());
+            for (size_t t = 0; t < nTetTotal; ++t)
+            {
+                uint64_t const nb = (bound[t] + blockCells - 1) / blockCells;
+                for (uint64_t k = 0; k < nb; ++k) { *it++ = uint32_t(t); *it++ = uint32_t(std::min<uint64_t>(k, 0xFFFFFFFFu)); }
+            }
+        }
+    }
+    struct ExactItemParams { uint32_t nItems, phase, blockCells, pad; };   // == the MSL struct
+    auto runItems = [&](uint32_t phase) -> bool
+    {
+        // an item clips at most blockCells cells: far cheaper and more uniform than a whole tet
+        return runChunked(c.psoItems, nItems, 8192, 1024, [&](MTL::ComputeCommandEncoder* enc, size_t start, uint32_t n)
+        {
+            ExactItemParams const IP{ n, phase, blockCells, 0u };
+            enc->setBuffer(bV,    0, 0);
+            enc->setBuffer(bU,    0, 1);
+            enc->setBuffer(bM,    0, 2);
+            enc->setBuffer(bMass, 0, 3);
+            enc->setBuffer(bMom,  0, 4);
+            enc->setBuffer(bM2,   0, 5);
+            enc->setBuffer(bGrad, 0, 6);
+            enc->setBuffer(bStr,  0, 7);
+            enc->setBuffer(bP,    0, 8);
+            enc->setBuffer(bD,    0, 9);
+            enc->setBuffer(bMomW, 0, 10);
+            enc->setBuffer(bCaust,0, 11);
+            enc->setBuffer(bSV,   0, 12);
+            enc->setBuffer(bDV,   0, 13);
+            enc->setBuffer(bDW,   0, 14);
+            enc->setBuffer(bItems, start * 2 * sizeof(uint32_t), 15);
+            enc->setBuffer(bSumW, 0, 16);
+            enc->setBytes(&IP, sizeof IP, 17);
+        });
+    };
+
+    // The tets the items pass leaves over (sumW still 0: float-degenerate, or a window that clips
+    // empty or lies outside the grid) run through depositFields, which falls through to the sampled
+    // path / centroid fallback or defers them, exactly as the one-thread path does; their
+    // deferrals (negated masses) are copied back into bM. A few leftovers run on compacted copies
+    // of their records; many (a --box region cut from a larger cloud leaves most of an outer
+    // partition's tets outside) run in place with every other tet's mass masked to 0 (skipped by
+    // the kernel), 4 B per tet instead of a ~130 B copy each.
+    auto runLeftovers = [&]() -> bool
+    {
+        float* mb = static_cast<float*>(bM->contents());
+        float const* sw = static_cast<float const*>(bSumW->contents());
+        std::vector<uint32_t> left;
+        for (size_t t = 0; t < nTetTotal; ++t)
+            if (mb[t] > 0.f && !(sw[t] > 0.f)) left.push_back(uint32_t(t));
+        if (left.empty()) return true;
+        size_t const nL = left.size();
+        bool const compact = nL <= nTetTotal / 16;
+        auto gather = [&](MTL::Buffer* src, size_t stride) {
+            MTL::Buffer* b = c.dev->newBuffer(nL * stride * sizeof(float), MTL::ResourceStorageModeShared);
+            if (!b) return b;
+            float const* s0 = static_cast<float const*>(src->contents());
+            float* d0 = static_cast<float*>(b->contents());
+            for (size_t k = 0; k < nL; ++k) std::memcpy(d0 + k * stride, s0 + size_t(left[k]) * stride, stride * sizeof(float));
+            return b;
+        };
+        MTL::Buffer* lM = nullptr;
+        MTL::Buffer *lV = bV, *lU = bU, *lD = bD;
+        if (compact)
+        {
+            lV = gather(bV, PS_TET_STRIDE);
+            lU = haveVels ? gather(bU, 12) : zeroBuf(4);
+            lM = gather(bM, 1);
+            lD = haveDens ? gather(bD, 4) : zeroBuf(4);
+        }
+        else if ((lM = zeroBuf(nTetTotal * sizeof(float))))
+        {
+            float* lm = static_cast<float*>(lM->contents());
+            for (uint32_t t : left) lm[t] = mb[t];
+        }
+        bool ok = lV && lU && lM && lD;
+        if (!ok) lastErr = "Metal buffer allocation failed (exact-deposit leftovers)";
+        else ok = runPerTet(lV, lU, lM, lD, compact ? nL : nTetTotal);
+        if (ok)
+        {
+            float const* lm = static_cast<float const*>(lM->contents());
+            for (size_t k = 0; k < nL; ++k)
+            {
+                float const v = lm[compact ? k : size_t(left[k])];
+                if (v < 0.f) mb[left[k]] = v;
+            }
+        }
+        if (lM) lM->release();
+        if (compact) for (MTL::Buffer* b : {lV, lU, lD}) if (b) b->release();
+        return ok;
+    };
+
     int const maxAttempts = 3;
     bool success = false;
-    std::string lastErr;
 
     for (int attempt = 0; attempt < maxAttempts && !success; ++attempt)
     {
@@ -232,59 +484,13 @@ bool psGpuDepositFields(std::vector<float>& verts,
         std::memset(bDV->contents(),    0, dvBytes);
         std::memset(bDW->contents(),    0, dwBytes);
 
-        success = true;
-        size_t chunk = baseChunk;
-        size_t start = 0;
-        while (start < nTetTotal)
+        if (useItems)
         {
-            uint32_t const n = uint32_t(std::min(chunk, nTetTotal - start));
-            P.nTet = n;
-            std::memcpy(bP->contents(), &P, sizeof(P));   // safe: previous chunk completed
-
-            auto t0 = std::chrono::steady_clock::now();
-            MTL::CommandBuffer* cb = c.q->commandBuffer();
-            MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
-            enc->setComputePipelineState(c.pso);
-            enc->setBuffer(bV,    start * 12 * sizeof(float), 0);
-            enc->setBuffer(bU,    start * 12 * sizeof(float), 1);
-            enc->setBuffer(bM,    start * sizeof(float),      2);
-            enc->setBuffer(bMass, 0, 3);
-            enc->setBuffer(bMom,  0, 4);
-            enc->setBuffer(bM2,   0, 5);
-            enc->setBuffer(bGrad, 0, 6);
-            enc->setBuffer(bStr,  0, 7);
-            enc->setBuffer(bP,    0, 8);
-            enc->setBuffer(bD,    P.fLinear ? start * 4 * sizeof(float) : 0, 9);
-            enc->setBuffer(bMomW, 0, 10);
-            enc->setBuffer(bCaust,0, 11);
-            enc->setBuffer(bSV,   0, 12);
-            enc->setBuffer(bDV,   0, 13);
-            enc->setBuffer(bDW,   0, 14);
-            enc->dispatchThreads(MTL::Size(n, 1, 1), MTL::Size(tg, 1, 1));
-            enc->endEncoding();
-            cb->commit();
-            cb->waitUntilCompleted();
-            double const el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-
-            if (cb->status() == MTL::CommandBufferStatusError)
-            {
-                NS::Error* e = cb->error();
-                lastErr = std::string("Metal command buffer failed: ")
-                        + (e ? e->localizedDescription()->utf8String() : "unknown");
-                success = false;
-                break;      // restart the WHOLE deposit (grids re-zeroed above)
-            }
-
-            start += n;
-            if (el > 1e-4)   // retarget the next chunk toward targetSec (bounded rescale)
-            {
-                double scale = targetSec / el;
-                if (scale < 0.5) scale = 0.5;
-                if (scale > 4.0) scale = 4.0;
-                chunk = std::min(std::max(size_t(double(chunk) * scale), MIN_CHUNK), MAX_CHUNK);
-            }
-            usleep(gapUs);   // deliberate idle gap: lets WindowServer take the GPU
+            std::memset(bSumW->contents(), 0, nTetTotal * sizeof(float));
+            success = runItems(0) && runItems(1) && runLeftovers();
         }
+        else
+            success = runPerTet(bV, bU, bM, bD, nTetTotal);
 
         if (!success)
         {
@@ -302,12 +508,21 @@ bool psGpuDepositFields(std::vector<float>& verts,
             }
         }
     }
+    for (MTL::Buffer* b : {bItems, bSumW}) if (b) b->release();
     if (!success)
     {
         err = lastErr;
         for (MTL::Buffer* b : {bV,bU,bM,bD,bP,bMass,bMom,bM2,bGrad,bStr,bMomW,bCaust,bSV,bDV,bDW}) b->release();
         pool->release();
         return false;
+    }
+
+    // tets the kernel could not classify exactly (a sample within float rounding of a face):
+    // it negated their masses and deposited nothing; the caller deposits them on the CPU
+    {
+        float const* mb = static_cast<float const*>(bM->contents());
+        for (size_t t = 0; t < nTetTotal; ++t)
+            if (mb[t] < 0.f) deferred.push_back(uint32_t(t));
     }
 
     std::memcpy(out.mass.data(),    bMass->contents(), nCell * 4);

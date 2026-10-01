@@ -29,13 +29,12 @@ matplotlib.use("Agg")
 
 import config
 from dtfelib import pointeval
-from dtfelib.cli import DATA_ROOT
+from dtfelib.cli import DATA_ROOT, find_sims, sim_dir
 from dtfelib.io import FieldSet
 
 
 def discover_sims(data_root: Path):
-    return sorted(d.name for d in data_root.iterdir()
-                  if d.is_dir() and any(d.glob("snapdir_*/combined_*.hdf5")))
+    return find_sims(data_root, "snapdir_*/combined_*.hdf5")   # flat or per-family layout
 
 
 def discover_snaps(simdir: Path):
@@ -98,7 +97,7 @@ def main() -> int:
 
     total, failed, skipped = 0, 0, 0
     for sim in sims:
-        simdir = args.data_root / sim
+        simdir = sim_dir(sim, args.data_root)
         if not simdir.is_dir():
             print(f"!! {sim}: not found under {args.data_root}")
             failed += 1

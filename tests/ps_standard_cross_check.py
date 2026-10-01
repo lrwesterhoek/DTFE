@@ -76,13 +76,16 @@ def main():
     sv = load(std_root + ".vel", GRID, 3)
     pv = load(ps_root + ".vel", GRID, 3)
     st = load(ps_root + ".streams", GRID)
+    # a cell holding a sub-sample tet's centroid deposit reads streams==1 but mixes in that
+    # tet's velocity; single-stream means one sampled stream AND no hidden-stream flag (either bit)
+    ur = load(ps_root + ".hidden_streams", GRID)
 
     print(f"\n  density normalization: standard/PS mean ratio = {sd.mean()/pd.mean():.2f} "
           f"(std mean={sd.mean():.3f} ~1; PS mean={pd.mean():.4f}=N*m/L^3)")
 
     fails = []
 
-    ss = (st == 1) & (sd > 0) & (pd > 0)
+    ss = (st == 1) & (ur == 0) & (sd > 0) & (pd > 0)
     relv = np.abs(sv[..., 0][ss] - pv[..., 0][ss]) / (np.abs(sv[..., 0][ss]) + 1e-30)
     vmed = float(np.median(relv))
     print(f"  velocity (single-stream, {ss.sum()} cells): median relΔ={vmed:.2e}  "

@@ -30,15 +30,19 @@ struct PSCellGeometry
 // on success 'g' holds the wrapped positions and edge-matrix geometry every consumer needs.
 //
 // checkSingularInverse: additionally drop cells whose matrixInverse() is the ALL-ZERO matrix
-// (|det| below REAL_PRECISSION; counted in *nDegenerateInverse when given). A zero inverse
+// (|det| below REAL_PRECISSION x the product of the edge lengths -- a RELATIVE, unit-free test
+// since 2026-09; the old absolute |det| < 1e-6 dropped every small but well-shaped tetrahedron,
+// losing their mass; counted in *nDegenerateInverse when given). A zero inverse
 // makes every barycentric coordinate below exactly 0, which the point-in-simplex test then
 // reads as "inside" for EVERY grid point in the cell's bounding box -- so the cell floods its
 // whole axis-aligned bbox. That is the source of the grid-aligned "square" artefacts: worst
 // at caustics (flat, collapsed cells cluster there) and amplified by sub-sampling (nSub>1
 // puts more sample points inside the bbox). A collapsed cell has no reliable Eulerian
 // volume, so drop it; an adjacent non-degenerate stream covers the region. NOTE: this must
-// stay consistent with matrixInverse()'s degeneracy criterion -- the relative-determinant
-// pre-filter alone does NOT catch every cell that matrixInverse() zeroes.
+// stay consistent with matrixInverse()'s degeneracy criterion. With both tests relative, the
+// pre-filter below (|det| < 1e-6 avgEdge^3) already implies it (avgEdge^3 >= the product of
+// the edge lengths, by AM-GM), so this check is now a safety net -- keep it anyway: the zero
+// sentinel is what the "square" artefact came from, and the Metal kernel mirrors it.
 // 'skipOwnership': apply every CHART-INDEPENDENT filter (dummy, hull artefact, degeneracy)
 // but NOT the Lagrangian-partition ownership tiling. Used by the --ps-vertex-mass degree
 // pass, which must count a vertex's GLOBALLY-depositing incident tets: ownership only decides
@@ -80,6 +84,51 @@ inline bool psFilterCell(Cell_handle &cell,
             { owned = false; break; }
         }
         if (!owned) { return false; }
+    }
+
+    // Non-periodic clouds (--ps-alpha-shape): keep only the tetrahedra of the cloud's ALPHA SHAPE,
+    // whose Lagrangian circumradius is at most psLagAlphaRadius (3 mean spacings by default). Interior
+    // tetrahedra of lattice-like initial conditions stay below ~0.9 spacings (measured on jittered
+    // lattices and on TNG100-3 ICs); the cut removes the flat slivers on the convex hull and the
+    // tetrahedra bridging concavities, which are no flow elements -- a hull sliver joins particles up
+    // to a whole cloud face apart, and its stretched Eulerian image put spurious mass and streams
+    // across the region. They are also why --partition runs differed from single ones: the hull of a
+    // nearly flat face is a GLOBAL object, built differently by each partition, whereas a tetrahedron
+    // within the cut is in a partition's Delaunay triangulation exactly when it is in the global one
+    // (its empty circumsphere lies inside the padded box: the partition plan pads by >= 4 cuts).
+    // A drop filter, so it applies with skipOwnership too; a function of the four vertices only.
+    if ( userOptions.psLagAlphaRadius > 0. )
+    {
+#if NO_DIM==3
+        double e[3][3];
+        for (int v = 0; v < 3; ++v)
+            for (int d = 0; d < 3; ++d)
+                e[v][d] = double(cell->vertex(v+1)->point()[d]) - double(cell->vertex(0)->point()[d]);
+        auto cross = [](double const *a, double const *b, double *c)
+        { c[0] = a[1]*b[2] - a[2]*b[1]; c[1] = a[2]*b[0] - a[0]*b[2]; c[2] = a[0]*b[1] - a[1]*b[0]; };
+        double bc[3], ca[3], ab[3];
+        cross(e[1], e[2], bc); cross(e[2], e[0], ca); cross(e[0], e[1], ab);
+        double const den = 2. * (e[0][0]*bc[0] + e[0][1]*bc[1] + e[0][2]*bc[2]);
+        double n2[3];
+        for (int v = 0; v < 3; ++v) n2[v] = e[v][0]*e[v][0] + e[v][1]*e[v][1] + e[v][2]*e[v][2];
+        double num2 = 0.;
+        for (int d = 0; d < 3; ++d)
+        {
+            double const c = n2[0]*bc[d] + n2[1]*ca[d] + n2[2]*ab[d];
+            num2 += c*c;
+        }
+        // circumradius = |num| / |den|; a flat tetrahedron (den -> 0) is beyond any cut
+        double const a = userOptions.psLagAlphaRadius;
+        if ( !( num2 <= a*a * den*den ) || den == 0. ) { return false; }
+#else
+        double const p0x = cell->vertex(0)->point()[0], p0y = cell->vertex(0)->point()[1];
+        double const ax = cell->vertex(1)->point()[0] - p0x, ay = cell->vertex(1)->point()[1] - p0y;
+        double const bx = cell->vertex(2)->point()[0] - p0x, by = cell->vertex(2)->point()[1] - p0y;
+        double const den = 2. * (ax*by - ay*bx);
+        double const ux = by*(ax*ax + ay*ay) - ay*(bx*bx + by*by), uy = ax*(bx*bx + by*by) - bx*(ax*ax + ay*ay);
+        double const a = userOptions.psLagAlphaRadius;
+        if ( !( ux*ux + uy*uy <= a*a * den*den ) || den == 0. ) { return false; }
+#endif
     }
 
     // zero/negative-density vertex sits on the Lagrangian convex hull. Periodic: artefact, drop the

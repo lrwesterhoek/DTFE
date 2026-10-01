@@ -12,7 +12,8 @@
 //    T8  Zel'dovich pancake (real multi-stream caustic flow, 6-tet Freudenthal tessellation):
 //        mass conservation, full-coverage, density & stream-count profiles vs ANALYTIC
 //        solution of z = q + A sin(kq), dispersion invariants (sigma_xx=sigma_yy=0 for
-//        z-only flow; single-stream sigma_zz ~ 0 at nSub=1), CPU vs GPU on all fields.
+//        z-only flow; single-stream sigma_zz ~ 0 at nSub=1, where single-stream means
+//        streams==1 AND not '.unresolved'), CPU vs GPU on all fields.
 //    T9  analytic velocity-field checks: constant field reproduced exactly; linear field
 //        v = Gx recovers the gradient in every covered cell
 //    T10 partition sub-grid support (subOrigin/subDims deposit window)
@@ -22,9 +23,17 @@
 //        together every covered cell reads exactly 3 (the fold-caustic flag)
 //    T13 --ps-exact-deposit path (fExact): the 6-tet Freudenthal cube at density 1 deposits
 //        exactly mass 1 and multiplicity 1 into each of the 8 cells it tiles, nothing outside
+//    T14 the production exact path, depositExactItems (a tet's window split over many threads,
+//        two phases through a per-tet weight total): T13's analytic cube with one cell per item,
+//        and every grid equal to the one-thread depositFields path on stress sets (periodic,
+//        partition sub-grid, non-periodic), with the leftover/deferred tets routed as in production
+//    T15 a tet cut by a non-periodic grid face keeps only its inside share (exact, both paths, and
+//        sampled): a --box region of a larger cloud must not collect the outside mass on its faces;
+//        T15c with large tets, whose samples beyond the grid the kernel counts column by column
 //
-//  Field tests run when the 'depositFields' kernel exists in the library; density-only
-//  parity runs against 'depositDensity' otherwise (Phase A gate).
+//  Every test runs the production kernel, 'depositFields' (T14 also 'depositExactItems'; tests without velocities switch its
+//  moment grids off). Its inside test is exact, the reference's (cpuDeposit) a float test with a
+//  +-1e-6 tolerance, so stream counts may differ in samples on a shared face (T7 allows it).
 //
 //  Build: bash metal/build_prototype.sh          Run: ./metal/validate_deposit
 
@@ -61,9 +70,13 @@ static float det3(const float A[3][3]) {
          - A[0][1]*(A[1][0]*A[2][2]-A[1][2]*A[2][0])
          + A[0][2]*(A[1][0]*A[2][1]-A[1][1]*A[2][0]);
 }
+// RELATIVE singularity test, mirroring the kernel and math_functions.h: |det| vs the product of
+// the row lengths (unit-free; an absolute 1e-6 dropped every small well-shaped tetrahedron).
 static bool inverse3(const float A[3][3], float inv[3][3]) {
     float d = det3(A);
-    if (std::fabs(d) < 1.0e-6f) return false;
+    float rn = 1.0f;
+    for (int i=0;i<3;++i) rn *= std::sqrt(A[i][0]*A[i][0]+A[i][1]*A[i][1]+A[i][2]*A[i][2]);
+    if (!(std::fabs(d) > 1.0e-6f * rn)) return false;
     float q = 1.0f/d;
     inv[0][0]=(A[1][1]*A[2][2]-A[1][2]*A[2][1])*q; inv[1][0]=-(A[1][0]*A[2][2]-A[1][2]*A[2][0])*q; inv[2][0]=(A[1][0]*A[2][1]-A[1][1]*A[2][0])*q;
     inv[0][1]=-(A[0][1]*A[2][2]-A[0][2]*A[2][1])*q; inv[1][1]=(A[0][0]*A[2][2]-A[0][2]*A[2][0])*q; inv[2][1]=-(A[0][0]*A[2][1]-A[0][1]*A[2][0])*q;
@@ -77,7 +90,8 @@ struct CpuOut {
     std::vector<float>    mom;       // nCell*3
     std::vector<float>    m2;        // nCell*6 (xx,xy,xz,yy,yz,zz)
     std::vector<float>    grad;      // nCell*9 (j*3+i)
-    std::vector<uint32_t> streams;   // nCell
+    std::vector<uint32_t> streams;   // nCell    sample count (GPU: bits 0-30 of the counter)
+    std::vector<uint8_t>  unresolved;// nCell    1 = a centroid-fallback deposit landed here (GPU: bit 31)
     // flag-gated kernel outputs (filled by Gpu::run when the matching P flag is set;
     // the T11-T13 tests check them against ANALYTIC expectations, no CPU mirror needed)
     std::vector<float>    momw;      // nCell    fVolW: volume-share normalizer
@@ -91,7 +105,7 @@ static void cpuDeposit(const std::vector<float>& verts, const std::vector<float>
                        const std::vector<float>& masses, const DepositParams& P, CpuOut& o) {
     const bool hasV = !vels.empty();
     const size_t nCell = size_t(P.subDims[0])*P.subDims[1]*P.subDims[2];   // output = sub-grid sized
-    o.mass.assign(nCell,0.f); o.streams.assign(nCell,0u);
+    o.mass.assign(nCell,0.f); o.streams.assign(nCell,0u); o.unresolved.assign(nCell,0);
     o.mom.assign(nCell*3,0.f); o.m2.assign(nCell*6,0.f); o.grad.assign(nCell*9,0.f);
     const int nSub=P.nSub; const uint32_t nSamp=uint32_t(nSub)*nSub*nSub;
     // wrapped grid cell -> sub-grid flat index; false = cell outside this partition's box
@@ -126,13 +140,17 @@ static void cpuDeposit(const std::vector<float>& verts, const std::vector<float>
 
         float lo[3],hi[3]; for(int i=0;i<3;++i){lo[i]=hi[i]=v[0][i];}
         for(int k=1;k<4;++k)for(int i=0;i<3;++i){lo[i]=std::min(lo[i],v[k][i]);hi[i]=std::max(hi[i],v[k][i]);}
-        int iMin[3],iMax[3];
+        // the window stays UNCLAMPED on a non-periodic grid: samples beyond the grid are counted
+        // (Nout) so a tet cut by the grid face deposits only its inside share (the kernel's rule);
+        // a tet wholly beyond the grid deposits nothing
+        int iMin[3],iMax[3]; bool beyond=false;
         for(int dd=0;dd<3;++dd){
             iMin[dd]=int(std::floor((lo[dd]-P.boxLo[dd])/P.dx[dd]));
             iMax[dd]=int(std::floor((hi[dd]-P.boxLo[dd])/P.dx[dd]))+1;
             if(nSub>1){iMin[dd]-=1;iMax[dd]+=1;}
-            if(!P.periodic){if(iMin[dd]<0)iMin[dd]=0;if(iMax[dd]>P.nGrid[dd])iMax[dd]=P.nGrid[dd];}
+            if(!P.periodic && (std::max(iMin[dd],0)>=P.nGrid[dd] || std::min(iMax[dd],P.nGrid[dd])<=0)) beyond=true;
         }
+        if(beyond) continue;
         auto samplePos=[&](uint32_t s,int dd,int raw)->float{
             uint32_t rem=s; for(int k=0;k<dd;++k) rem/=uint32_t(nSub);
             float fr=(nSub==1)?0.5f:(float(int(rem%uint32_t(nSub)))+0.5f)/float(nSub);
@@ -144,7 +162,9 @@ static void cpuDeposit(const std::vector<float>& verts, const std::vector<float>
             float sum=0.f; for(int vv=0;vv<3;++vv){float bc=0;for(int i=0;i<3;++i)bc+=posInv[i][vv]*rel[i]; if(bc<-1.0e-6f)return false; sum+=bc;}
             return sum<=1.0f+1.0e-6f;
         };
-        auto depositAt=[&](size_t flat,const float rel[3],float w){
+        // countStream=false for the centroid fallback: '.streams' is the sample count, and a tet
+        // that contains no sample contributes none (mirrors the kernel's depositSample)
+        auto depositAt=[&](size_t flat,const float rel[3],float w,bool countStream=true){
             o.mass[flat]+=w;
             if (hasV) {
                 float vv[3]; for(int j=0;j<3;++j){ vv[j]=u[0][j]; for(int i=0;i<3;++i) vv[j]+=vG[i][j]*rel[i]; }
@@ -152,24 +172,28 @@ static void cpuDeposit(const std::vector<float>& verts, const std::vector<float>
                 size_t c=0; for(int i=0;i<3;++i) for(int j=i;j<3;++j) o.m2[flat*6+c++]+=w*vv[i]*vv[j];
                 for(int j=0;j<3;++j) for(int i=0;i<3;++i) o.grad[flat*9+j*3+i]+=vG[i][j]*w;
             }
-            o.streams[flat]+=1u;
+            if (countStream) o.streams[flat]+=1u;
         };
 
         // Two identical passes with the per-cell wrap + sub-grid guard resolved BEFORE sample
         // counting (matches the kernel and the production inSub guard): N counts exactly the
         // samples that get deposited.
-        uint32_t N=0; float rel[3]; float share=0.f;
+        uint32_t N=0, Nout=0; float rel[3]; float share=0.f;
         for(int pass=0;pass<2;++pass){
-            if(pass==1){ if(N==0) break; share=m/float(N); }
+            if(pass==1){ if(N==0) break; share=m/float(N+Nout); }
             for(int gi=iMin[0];gi<iMax[0];++gi)for(int gj=iMin[1];gj<iMax[1];++gj)for(int gk=iMin[2];gk<iMax[2];++gk){
                 int wg0=P.periodic?wrapIdx(gi,P.nGrid[0]):gi, wg1=P.periodic?wrapIdx(gj,P.nGrid[1]):gj, wg2=P.periodic?wrapIdx(gk,P.nGrid[2]):gk;
-                if(wg0<0||wg0>=P.nGrid[0]||wg1<0||wg1>=P.nGrid[1]||wg2<0||wg2>=P.nGrid[2])continue;
+                if(wg0<0||wg0>=P.nGrid[0]||wg1<0||wg1>=P.nGrid[1]||wg2<0||wg2>=P.nGrid[2]){
+                    if(pass==0) for(uint32_t s=0;s<nSamp;++s) if(insideRel(s,gi,gj,gk,rel)) Nout++;
+                    continue;
+                }
                 size_t flat; if(!subFlat(wg0,wg1,wg2,flat))continue;
                 for(uint32_t s=0;s<nSamp;++s) if(insideRel(s,gi,gj,gk,rel)){
                     if(pass==0) N++; else depositAt(flat,rel,share);
                 }
             }
         }
+        if(N==0 && Nout>0) continue;   // every sample beyond the grid: not the grid's mass
         if(N==0){
             float c[3]; for(int i=0;i<3;++i)c[i]=(v[0][i]+v[1][i]+v[2][i]+v[3][i])*0.25f;
             int wg[3]; bool ok=true;
@@ -177,7 +201,8 @@ static void cpuDeposit(const std::vector<float>& verts, const std::vector<float>
             size_t flat;
             if(ok && subFlat(wg[0],wg[1],wg[2],flat)){
                 float cr[3]={c[0]-v[0][0],c[1]-v[0][1],c[2]-v[0][2]};
-                depositAt(flat, cr, m);
+                depositAt(flat, cr, m, false);
+                o.unresolved[flat]=1;
             }
             continue;
         }
@@ -187,7 +212,15 @@ static void cpuDeposit(const std::vector<float>& verts, const std::vector<float>
 // ------------------------------------------------------------------ GPU runner
 struct Gpu {
     MTL::Device* dev=nullptr; MTL::CommandQueue* q=nullptr;
-    MTL::ComputePipelineState *psoDen=nullptr, *psoFld=nullptr;
+    MTL::ComputePipelineState *psoFld=nullptr, *psoItems=nullptr;
+    size_t lastDeferred=0;   // tets the kernel deferred in the last run() (deposited by the CPU reference)
+    // itemCells > 0: fExact runs go through depositExactItems with that many cells per item, as the
+    // production host does (ps_metal_host.cc), leftovers (per-tet weight total 0) through
+    // depositFields; the window bound here is deliberately LOOSE (+2 cells a side), so surplus
+    // items that must idle are exercised too
+    uint32_t itemCells=0;
+    size_t lastItems=0, lastLeftovers=0;
+    bool lastFailed=false;   // a command buffer of the last run() errored (e.g. the GPU watchdog)
 
     bool init(const char* srcPath) {
         dev=MTL::CreateSystemDefaultDevice(); if(!dev) return false;
@@ -201,64 +234,173 @@ struct Gpu {
             lib=dev->newLibrary(NS::String::string(src.c_str(),NS::UTF8StringEncoding),(MTL::CompileOptions*)nullptr,&err);
         }
         if(!lib){ printf("kernel lib load fail: %s\n", err?err->localizedDescription()->utf8String():"?"); return false; }
-        MTL::Function* fd=lib->newFunction(NS::String::string("depositDensity",NS::UTF8StringEncoding));
-        if(fd) psoDen=dev->newComputePipelineState(fd,&err);
-        // DENSITY_ONLY=1: Phase A gate -- validate the density kernel in isolation.
-        if(!getenv("DENSITY_ONLY")){
-            MTL::Function* ff=lib->newFunction(NS::String::string("depositFields",NS::UTF8StringEncoding));
-            if(ff) psoFld=dev->newComputePipelineState(ff,&err);
-        }
-        return psoDen!=nullptr;
+        MTL::Function* ff=lib->newFunction(NS::String::string("depositFields",NS::UTF8StringEncoding));
+        if(ff) psoFld=dev->newComputePipelineState(ff,&err);
+        MTL::Function* fi=lib->newFunction(NS::String::string("depositExactItems",NS::UTF8StringEncoding));
+        if(fi) psoItems=dev->newComputePipelineState(fi,&err);
+        return psoFld!=nullptr;
     }
 
-    // Runs the fields kernel if available (and vels provided), else density-only.
-    // Returns which mode ran: 0=density, 1=fields.
+    // Runs the production kernel (depositFields) on tets given as ABSOLUTE vertices (12 floats per
+    // tet, as the tests write them): builds each tet's record like the host does
+    // (ps_deposit_params.h psFillTetRecord, with the centroid-fallback cell computed as
+    // cpuDeposit does), dispatches, and deposits the tets the kernel DEFERRED (a sample within
+    // float rounding of a face) with cpuDeposit -- the production host deposits them with its
+    // CPU loop -- so the outputs are complete. The tests' vertices are written explicitly, not
+    // made as float-shifted periodic copies, so the record's frame is the plain grid frame.
+    // Without 'vels' the moment flags are off: a density-only run, as in production. Returns 1
+    // when the moment grids were filled (vels given), else 0. causticMask (fCaustic only): per-tet
+    // masks to hand the kernel; tets beyond its end get the parity bit from det(Ax).
     int run(const std::vector<float>& verts, const std::vector<float>& vels,
-            const std::vector<float>& masses, const DepositParams& P, CpuOut& o) {
+            const std::vector<float>& masses, const DepositParams& P, CpuOut& o,
+            const std::vector<uint32_t>& causticMask = {}) {
         const size_t nCell=size_t(P.subDims[0])*P.subDims[1]*P.subDims[2];
-        const bool fields = psoFld && !vels.empty();
-        MTL::Buffer* bV=dev->newBuffer(verts.data(),verts.size()*sizeof(float),MTL::ResourceStorageModeShared);
-        MTL::Buffer* bU=fields? dev->newBuffer(vels.data(),vels.size()*sizeof(float),MTL::ResourceStorageModeShared):nullptr;
-        MTL::Buffer* bM=dev->newBuffer(masses.data(),masses.size()*sizeof(float),MTL::ResourceStorageModeShared);
-        MTL::Buffer* bP=dev->newBuffer(&P,sizeof(P),MTL::ResourceStorageModeShared);
+        const bool fields = !vels.empty();
+        DepositParams Pk=P;
+        if (!fields) { Pk.fVel=0; Pk.fDisp=0; Pk.fGrad=0; }
+        std::vector<float> rec(size_t(P.nTet)*PS_TET_STRIDE);
+        {
+            double const lo[3]={P.boxLo[0],P.boxLo[1],P.boxLo[2]};
+            double const len[3]={double(P.dx[0])*P.nGrid[0],double(P.dx[1])*P.nGrid[1],double(P.dx[2])*P.nGrid[2]};
+            double const zero[3]={0.,0.,0.};
+            for(uint32_t t=0;t<P.nTet;++t){
+                float cv[4][3];
+                for(int k=0;k<4;++k) for(int i=0;i<3;++i) cv[k][i]=verts[size_t(t)*12+k*3+i];
+                // the centroid-fallback cell, exactly as cpuDeposit picks it
+                uint32_t cflat=0xFFFFFFFFu; int wg[3]; bool ok=true;
+                for(int dd=0;dd<3;++dd){
+                    float const c=(cv[0][dd]+cv[1][dd]+cv[2][dd]+cv[3][dd])*0.25f;
+                    int const cg=int(std::floor((c-P.boxLo[dd])/P.dx[dd]));
+                    wg[dd]=P.periodic?wrapIdx(cg,P.nGrid[dd]):cg;
+                    if(wg[dd]<0||wg[dd]>=P.nGrid[dd]){ok=false;break;}
+                }
+                if(ok){
+                    int l[3];
+                    for(int dd=0;dd<3;++dd){ l[dd]=wg[dd]-P.subOrigin[dd]; if(l[dd]<0) l[dd]+=P.nGrid[dd]; }
+                    if(l[0]<P.subDims[0]&&l[1]<P.subDims[1]&&l[2]<P.subDims[2])
+                        cflat=uint32_t((size_t(l[0])*P.subDims[1]+l[1])*P.subDims[2]+l[2]);
+                }
+                psFillTetRecord(&rec[size_t(t)*PS_TET_STRIDE],cv,lo,len,P.nGrid,zero,zero,cflat);
+            }
+        }
+        std::vector<float> mcopy(masses);   // the kernel negates a deferred tet's mass
+        MTL::Buffer* bV=dev->newBuffer(rec.data(),rec.size()*sizeof(float),MTL::ResourceStorageModeShared);
         auto zbuf=[&](size_t n){ MTL::Buffer* b=dev->newBuffer(n,MTL::ResourceStorageModeShared); memset(b->contents(),0,n); return b; };
+        MTL::Buffer* bU=fields? dev->newBuffer(vels.data(),vels.size()*sizeof(float),MTL::ResourceStorageModeShared) : zbuf(4);
+        MTL::Buffer* bM=dev->newBuffer(mcopy.data(),mcopy.size()*sizeof(float),MTL::ResourceStorageModeShared);
+        MTL::Buffer* bP=dev->newBuffer(&Pk,sizeof(Pk),MTL::ResourceStorageModeShared);
         MTL::Buffer* bMass=zbuf(nCell*4);
-        MTL::Buffer *bMom=nullptr,*bM2=nullptr,*bG=nullptr,*bS=nullptr;
-        if (fields){ bMom=zbuf(nCell*12); bM2=zbuf(nCell*24); bG=zbuf(nCell*36); bS=zbuf(nCell*4); }
+        MTL::Buffer* bMom=zbuf(Pk.fVel ? nCell*12 : 4);
+        MTL::Buffer* bM2 =zbuf(Pk.fDisp? nCell*24 : 4);
+        MTL::Buffer* bG  =zbuf(Pk.fGrad? nCell*36 : 4);
+        MTL::Buffer* bS  =zbuf(nCell*4);
 
-        MTL::CommandBuffer* cb=q->commandBuffer();
-        MTL::ComputeCommandEncoder* e=cb->computeCommandEncoder();
         // flag-gated buffers: REAL when the P flag requests the path, 4-byte dummies otherwise
         // (T1-T10 run with the flags off, so their dispatches are unchanged)
-        MTL::Buffer* bD =zbuf(4);                                        // dens (fLinear=0 always here)
+        // dens (fLinear=0 always here). Under fCaustic the host parks each tet's caustic mask in
+        // slot 0 of this otherwise-unused buffer (ps_interpolation.cc) and the kernel reads it
+        // there rather than re-deriving the parity -- so a 4-byte dummy gave every tet mask 0.
+        // Mirror the parity half (sign of det Ax); 'causticMask' overrides it per tet.
+        MTL::Buffer* bD=nullptr;
+        if (P.fCaustic){
+            std::vector<float> dm(size_t(P.nTet)*4,0.f);
+            for(uint32_t t=0;t<P.nTet;++t){
+                float Ax[3][3];
+                for(int e=0;e<3;++e) for(int i=0;i<3;++i) Ax[e][i]=verts[t*12+(e+1)*3+i]-verts[t*12+i];
+                dm[size_t(t)*4] = t<causticMask.size() ? float(causticMask[t]) : (det3(Ax)>0.f ? 1.f : 2.f);
+            }
+            bD=dev->newBuffer(dm.data(),dm.size()*sizeof(float),MTL::ResourceStorageModeShared);
+        } else bD=zbuf(4);
         MTL::Buffer* bW =zbuf(P.fVolW               ? nCell*4  : 4);     // momw
         MTL::Buffer* bC =zbuf(P.fCaustic            ? nCell*4  : 4);     // caustic bits (uint)
         MTL::Buffer* bSV=zbuf(P.fExact              ? nCell*4  : 4);     // exact multiplicity
         MTL::Buffer* bDV=zbuf((P.fVolW&&P.fDisp)    ? nCell*12 : 4);     // dispvel
         MTL::Buffer* bDW=zbuf((P.fVolW&&P.fDisp)    ? nCell*4  : 4);     // dispw
-        if (fields){
-            e->setComputePipelineState(psoFld);
-            e->setBuffer(bV,0,0); e->setBuffer(bU,0,1); e->setBuffer(bM,0,2);
+        auto dispatch=[&](MTL::ComputePipelineState* pso, MTL::Buffer* massB, size_t nThreads,
+                          MTL::Buffer* bI, MTL::Buffer* bSW, uint32_t phase){
+            MTL::CommandBuffer* cb=q->commandBuffer();
+            MTL::ComputeCommandEncoder* e=cb->computeCommandEncoder();
+            e->setComputePipelineState(pso);
+            e->setBuffer(bV,0,0); e->setBuffer(bU,0,1); e->setBuffer(massB,0,2);
             e->setBuffer(bMass,0,3); e->setBuffer(bMom,0,4); e->setBuffer(bM2,0,5);
             e->setBuffer(bG,0,6); e->setBuffer(bS,0,7); e->setBuffer(bP,0,8);
             e->setBuffer(bD,0,9); e->setBuffer(bW,0,10); e->setBuffer(bC,0,11);
             e->setBuffer(bSV,0,12); e->setBuffer(bDV,0,13); e->setBuffer(bDW,0,14);
-        } else {
-            e->setComputePipelineState(psoDen);
-            e->setBuffer(bV,0,0); e->setBuffer(bM,0,1); e->setBuffer(bMass,0,2); e->setBuffer(bP,0,3);
-        }
-        MTL::ComputePipelineState* pso = fields? psoFld : psoDen;
-        NS::UInteger tg=pso->maxTotalThreadsPerThreadgroup(); if(tg>256)tg=256;
-        e->dispatchThreads(MTL::Size(P.nTet,1,1),MTL::Size(tg,1,1));
-        e->endEncoding(); cb->commit(); cb->waitUntilCompleted();
+            if(bI){
+                uint32_t const IP[4]={uint32_t(nThreads),phase,itemCells,0u};
+                e->setBuffer(bI,0,15); e->setBuffer(bSW,0,16); e->setBytes(IP,sizeof IP,17);
+            }
+            NS::UInteger tg=pso->maxTotalThreadsPerThreadgroup(); if(tg>256)tg=256;
+            if(nThreads) e->dispatchThreads(MTL::Size(nThreads,1,1),MTL::Size(tg,1,1));
+            e->endEncoding(); cb->commit(); cb->waitUntilCompleted();
+            if(cb->status()==MTL::CommandBufferStatusError){
+                lastFailed=true;
+                printf("  [note] command buffer failed: %s\n", cb->error()? cb->error()->localizedDescription()->utf8String() : "?");
+            }
+        };
+        lastItems=lastLeftovers=0; lastFailed=false;
+        if(itemCells && Pk.fExact && psoItems){
+            std::vector<uint32_t> items;
+            for(uint32_t t=0;t<P.nTet;++t){
+                uint64_t nw=1;
+                for(int dd=0;dd<3;++dd){
+                    float lo=verts[size_t(t)*12+dd], hi=lo;
+                    for(int k=1;k<4;++k){ float const c=verts[size_t(t)*12+k*3+dd]; lo=std::min(lo,c); hi=std::max(hi,c); }
+                    nw*=uint64_t(int(std::floor((hi-P.boxLo[dd])/P.dx[dd]))-int(std::floor((lo-P.boxLo[dd])/P.dx[dd]))+5);
+                }
+                for(uint64_t k=0;k<(nw+itemCells-1)/itemCells;++k){ items.push_back(t); items.push_back(uint32_t(k)); }
+            }
+            lastItems=items.size()/2;
+            MTL::Buffer* bI=dev->newBuffer(items.data(),items.size()*sizeof(uint32_t),MTL::ResourceStorageModeShared);
+            MTL::Buffer* bSW=zbuf(size_t(P.nTet)*4+4);
+            dispatch(psoItems,bM,lastItems,bI,bSW,0);
+            dispatch(psoItems,bM,lastItems,bI,bSW,1);
+            // leftovers (weight total 0): depositFields, every other tet masked to mass 0 (skipped)
+            float* mb=(float*)bM->contents(); const float* sw=(const float*)bSW->contents();
+            std::vector<float> lm(P.nTet,0.f);
+            for(uint32_t t=0;t<P.nTet;++t) if(mb[t]>0.f && !(sw[t]>0.f)){ lm[t]=mb[t]; ++lastLeftovers; }
+            MTL::Buffer* bL=dev->newBuffer(lm.data(),lm.size()*sizeof(float),MTL::ResourceStorageModeShared);
+            dispatch(psoFld,bL,P.nTet,nullptr,nullptr,0);
+            const float* lb=(const float*)bL->contents();
+            for(uint32_t t=0;t<P.nTet;++t) if(lb[t]<0.f) mb[t]=lb[t];   // its deferrals
+            bI->release(); bSW->release(); bL->release();
+        } else
+            dispatch(psoFld,bM,P.nTet,nullptr,nullptr,0);
 
         o.mass.assign((float*)bMass->contents(),(float*)bMass->contents()+nCell);
         if (fields){
             o.mom.assign((float*)bMom->contents(),(float*)bMom->contents()+nCell*3);
             o.m2.assign((float*)bM2->contents(),(float*)bM2->contents()+nCell*6);
             o.grad.assign((float*)bG->contents(),(float*)bG->contents()+nCell*9);
-            o.streams.assign((uint32_t*)bS->contents(),(uint32_t*)bS->contents()+nCell);
-        } else { o.mom.clear(); o.m2.clear(); o.grad.clear(); o.streams.clear(); }
+        } else { o.mom.clear(); o.m2.clear(); o.grad.clear(); }
+        {   // one counter carries both: the sample count in bits 0-30, '.unresolved' in bit 31
+            const uint32_t* raw=(const uint32_t*)bS->contents();
+            o.streams.resize(nCell); o.unresolved.resize(nCell);
+            for(size_t i=0;i<nCell;++i){ o.streams[i]=raw[i]&0x7FFFFFFFu; o.unresolved[i]=uint8_t(raw[i]>>31); }
+        }
+        // the deferred tets, through the CPU reference (its float test), added in
+        {
+            const float* mb=(const float*)bM->contents();
+            std::vector<float> dv, du, dm;
+            for(uint32_t t=0;t<P.nTet;++t) if(mb[t]<0.f){
+                dv.insert(dv.end(),verts.begin()+size_t(t)*12,verts.begin()+size_t(t)*12+12);
+                if(fields) du.insert(du.end(),vels.begin()+size_t(t)*12,vels.begin()+size_t(t)*12+12);
+                dm.push_back(masses[t]);
+            }
+            lastDeferred=dm.size();
+            if(!dm.empty()){
+                DepositParams Pd=P; Pd.nTet=uint32_t(dm.size());
+                CpuOut c; cpuDeposit(dv,du,dm,Pd,c);
+                for(size_t i=0;i<nCell;++i){ o.mass[i]+=c.mass[i]; o.streams[i]+=c.streams[i]; o.unresolved[i]|=c.unresolved[i]; }
+                if(fields){
+                    for(size_t i=0;i<nCell*3;++i) o.mom[i]+=c.mom[i];
+                    for(size_t i=0;i<nCell*6;++i) o.m2[i]+=c.m2[i];
+                    for(size_t i=0;i<nCell*9;++i) o.grad[i]+=c.grad[i];
+                }
+                if(P.fVolW||P.fCaustic||P.fExact)
+                    printf("  [note] %zu deferred tets are missing from the flag grids (momw/caustic/sv)\n",dm.size());
+            }
+        }
         if (P.fVolW)   o.momw.assign((float*)bW->contents(),(float*)bW->contents()+nCell);          else o.momw.clear();
         if (P.fCaustic)o.caustic.assign((uint32_t*)bC->contents(),(uint32_t*)bC->contents()+nCell); else o.caustic.clear();
         if (P.fExact)  o.sv.assign((float*)bSV->contents(),(float*)bSV->contents()+nCell);          else o.sv.clear();
@@ -322,10 +464,15 @@ static void t2_centroid(Gpu& g){
     size_t flat=(size_t(3)*8+4)*8+5;
     bool ok = std::fabs(c.mass[flat]-1.7)<1e-6 && std::fabs(gout.mass[flat]-1.7)<1e-6
            && std::fabs(total(c.mass)-1.7)<1e-6 && std::fabs(total(gout.mass)-1.7)<1e-6
-           && c.streams[flat]==1u;                        // exactly ONE deposit => fallback path ran
-    if(mode==1) ok = ok && gout.streams[flat]==1u;
-    snprintf(detail,sizeof(detail),"centroid cell mass CPU=%.6f GPU=%.6f streams=%u (expect 1.7 via 1 fallback deposit)",
-             (double)c.mass[flat],(double)gout.mass[flat],c.streams[flat]);
+           && c.streams[flat]==0u    // the fallback moves MASS only: no sample lies in the tet, so
+                                     // it adds nothing to the sample-count multiplicity '.streams'
+           && c.unresolved[flat]==1; // ...and flags the cell '.unresolved' instead
+    size_t nFlag=0; for(uint8_t f:c.unresolved) nFlag+=f;
+    ok = ok && nFlag==1;
+    if(mode==1) ok = ok && gout.streams[flat]==0u && gout.unresolved==c.unresolved;   // bit 31 decoded, count bits clean
+    snprintf(detail,sizeof(detail),"centroid cell mass CPU=%.6f GPU=%.6f streams=%u unresolved=%u/%u (expect 1.7 via the fallback, 0 sampled streams, flag 1)",
+             (double)c.mass[flat],(double)gout.mass[flat],c.streams[flat],
+             unsigned(c.unresolved[flat]),mode==1?unsigned(gout.unresolved[flat]):0u);
     verdict("T2 tiny tet centroid fallback",ok,detail);
 }
 
@@ -429,9 +576,13 @@ static void t7_stressFields(Gpu& g){
     size_t smis=0; uint32_t smax=0;
     for(size_t i=0;i<c.streams.size();++i){ uint32_t d=c.streams[i]>go.streams[i]?c.streams[i]-go.streams[i]:go.streams[i]-c.streams[i]; if(d){smis++; smax=std::max(smax,d);} }
     double smisf=double(smis)/c.streams.size();
-    ok = ok && dmm<1e-3 && dm2<1e-3 && dg<1e-3 && smisf<5e-3;
-    snprintf(detail,sizeof(detail),"mass %.1e mom %.1e m2 %.1e grad %.1e | streams mismatch %.3f%% (max %u)",
-             dm,dmm,dm2,dg,100*smisf,smax);
+    // '.unresolved' follows the same N==0 classification as the fallback itself, so CPU and GPU
+    // may differ only where a float barycentric test flips a sample in or out of a sliver
+    size_t umis=0, uC=0; for(size_t i=0;i<c.unresolved.size();++i){ umis+=(c.unresolved[i]!=go.unresolved[i]); uC+=c.unresolved[i]; }
+    double umisf=double(umis)/c.unresolved.size();
+    ok = ok && dmm<1e-3 && dm2<1e-3 && dg<1e-3 && smisf<5e-3 && umisf<5e-3 && uC>0;
+    snprintf(detail,sizeof(detail),"mass %.1e mom %.1e m2 %.1e grad %.1e | streams mismatch %.3f%% (max %u) | unresolved %zu cells, mismatch %.3f%%",
+             dm,dmm,dm2,dg,100*smisf,smax,uC,100*umisf);
     verdict("T7 stress set all fields CPU vs GPU",ok,detail);
 }
 
@@ -616,10 +767,16 @@ static void t8_zeldovich(Gpu& g,int nSub){
         verdict((std::string("T8 tensor invariants ")+tag).c_str(), maxOff<1e-4*maxZZ, detail);
 
         if(nSub==1){
-            double ssMax=0; size_t nss=0;
-            for(size_t f=0;f<nCell;++f) if(go.streams[f]==1u){ nss++; ssMax=std::max(ssMax,(double)sigG[f*6+5]); }
-            snprintf(detail,sizeof(detail),"%zu single-stream cells, max sigma_zz %.3f (km/s)^2 (expect ~0)",nss,ssMax);
-            verdict("T8 single-stream sigma_zz=0 (nSub=1)", ssMax<5.0, detail);
+            // single-stream = one sample stream AND no unresolved mass: a sheet tet too thin to hold
+            // the cell's sample still deposits its mass (and momentum) there without counting, so
+            // '.streams'==1 alone admits the collapsed pancake's velocity into a void cell.
+            double ssMax=0; size_t nss=0, nExcl=0;
+            for(size_t f=0;f<nCell;++f) if(go.streams[f]==1u){
+                if(go.unresolved[f]){ nExcl++; continue; }
+                nss++; ssMax=std::max(ssMax,(double)sigG[f*6+5]); }
+            snprintf(detail,sizeof(detail),"%zu single-stream cells (%zu more excluded as unresolved), max sigma_zz %.3f (km/s)^2 (expect ~0)",
+                     nss,nExcl,ssMax);
+            verdict("T8 single-stream sigma_zz=0 (nSub=1)", ssMax<5.0 && nss>nCell/2, detail);
         }
         double dS=meanRelDiff(sigG,sigC), dV=meanRelDiff(vbG,vbC);
         snprintf(detail,sizeof(detail),"normalized sigma mean-rel %.2e, vbar mean-rel %.2e",dS,dV);
@@ -705,7 +862,7 @@ static void t10_subgrid(Gpu& g){
         size_t fS=((size_t)a*24+b)*24+c;
         maxd=std::max(maxd,std::fabs((double)full.mass[fF]-sub.mass[fS]));
         peak=std::max(peak,(double)sub.mass[fS]);
-        if(full.streams[fF]!=sub.streams[fS]) smis++;
+        if(full.streams[fF]!=sub.streams[fS] || full.unresolved[fF]!=sub.unresolved[fS]) smis++;
         totCrop+=full.mass[fF];
     }
     double totFull=total(full.mass), totSub=total(sub.mass);
@@ -764,7 +921,10 @@ static void t11_volumeWeighted(Gpu& g){
 // its orientation-flip (two vertices swapped) must stamp two DIFFERENT single bits whose OR
 // is 3, and depositing both together must give exactly 3 in every covered cell -- the
 // "both orientations present = fold caustic crosses the cell" flag. Convention-independent:
-// only distinctness and the OR are asserted, not which sign gets which bit.
+// only distinctness and the OR are asserted, not which sign gets which bit. The kernel reads
+// each tet's mask from slot 0 of the 'dens' buffer (the host builds it: parity + stratification
+// bits); Gpu::run mirrors the parity half, and a final run hands it a full mask with the A4 bit
+// (bit 8, beyond a byte) to check the whole CausticMask survives the float slot and the OR.
 static void t12_causticBits(Gpu& g){
     if(!g.psoFld){ printf("  [T12 ] fields kernel missing, skipped\n"); return; }
     DepositParams P; makeParams(P,8,8.f,3,0); P.fCaustic=1;
@@ -786,9 +946,15 @@ static void t12_causticBits(Gpu& g){
     bool both3=true; size_t nCov=0;
     for(size_t i=0;i<go.mass.size();++i)
         if(go.mass[i]>1e-5f){ ++nCov; if(go.caustic[i]!=3u) both3=false; }
-    bool ok = (bA==1u||bA==2u) && (bB==1u||bB==2u) && bA!=bB && (bA|bB)==3u && both3 && nCov>=8;
-    snprintf(detail,sizeof(detail),"tetA bits=%u tetB bits=%u, both-together==3 in %zu covered cells: %s",
-             bA,bB,nCov,both3?"yes":"NO");
+    uint32_t const full=1u|(1u<<3)|(1u<<8);          // parity + wall + A4 swallowtail
+    P.nTet=1; CpuOut gm; g.run(tA,linVel(tA),m1,P,gm,{full});
+    bool maskOk=true; size_t nMask=0;
+    for(size_t i=0;i<gm.mass.size();++i)
+        if(gm.mass[i]>1e-6f){ ++nMask; if(gm.caustic[i]!=full) maskOk=false; }
+    bool ok = (bA==1u||bA==2u) && (bB==1u||bB==2u) && bA!=bB && (bA|bB)==3u && both3 && nCov>=8
+           && maskOk && nMask>=8;
+    snprintf(detail,sizeof(detail),"tetA bits=%u tetB bits=%u, both-together==3 in %zu covered cells: %s; mask 0x%x intact in %zu cells: %s",
+             bA,bB,nCov,both3?"yes":"NO",full,nMask,maskOk?"yes":"NO");
     verdict("T12 fCaustic orientation OR",ok,detail);
 }
 
@@ -833,6 +999,146 @@ static void t13_exactDeposit(Gpu& g){
     verdict("T13 fExact analytic cube",ok,detail);
 }
 
+// T14: the production exact path, depositExactItems. (a) T13's analytic cube with ONE cell per item
+// (every tet split over ~8 threads, most of them surplus); (b) every grid against the one-thread
+// depositFields path -- the same clipping and moments, so equal to float atomic-order rounding and
+// the tet-touch counts identical -- on the stress set (thin, tiny and degenerate tets included, so
+// leftovers and deferrals occur), windows up to ~12 cells a side, 7 cells per item (items cross
+// window rows and planes): periodic, a periodic partition sub-grid, and non-periodic.
+static void t14_exactItems(Gpu& g){
+    if(!g.psoFld || !g.psoItems){ printf("  [T14 ] depositExactItems kernel missing, skipped\n"); return; }
+    {
+        DepositParams P; makeParams(P,8,8.f,1,0); P.fExact=1; P.nTet=6;
+        float const a=2.f, b=4.f;
+        auto C=[&](int x,int y,int z,std::vector<float>& v){ v.push_back(x?b:a); v.push_back(y?b:a); v.push_back(z?b:a); };
+        int const path[6][2][3]={{{1,0,0},{1,1,0}},{{1,0,0},{1,0,1}},{{0,1,0},{1,1,0}},
+                                 {{0,1,0},{0,1,1}},{{0,0,1},{1,0,1}},{{0,0,1},{0,1,1}}};
+        std::vector<float> v;
+        for(int t=0;t<6;++t){ C(0,0,0,v); C(path[t][0][0],path[t][0][1],path[t][0][2],v); C(path[t][1][0],path[t][1][1],path[t][1][2],v); C(1,1,1,v); }
+        std::vector<float> m(6,float(8.0/6.0));
+        g.itemCells=1;
+        CpuOut go; g.run(v,linVel(v),m,P,go);
+        g.itemCells=0;
+        double maxCellErr=0, maxSvErr=0, outside=0;
+        for(int i=0;i<8;++i)for(int j=0;j<8;++j)for(int k=0;k<8;++k){
+            size_t f=((size_t)i*8+j)*8+k;
+            bool in=(i==2||i==3)&&(j==2||j==3)&&(k==2||k==3);
+            if(in){ maxCellErr=std::max(maxCellErr,std::fabs((double)go.mass[f]-1.0)); maxSvErr=std::max(maxSvErr,std::fabs((double)go.sv[f]-1.0)); }
+            else outside+=go.mass[f];
+        }
+        bool ok = std::fabs(total(go.mass)-8.0)<1e-4 && maxCellErr<1e-4 && maxSvErr<1e-4 && outside<1e-5 && g.lastItems>6;
+        snprintf(detail,sizeof(detail),"%zu items for 6 tets: cell mass err %.1e, multiplicity err %.1e, outside leak %.1e",
+                 g.lastItems,maxCellErr,maxSvErr,outside);
+        verdict("T14a exact items: analytic cube, 1 cell per item",ok,detail);
+    }
+    // Gaussian vertices of sigma 1-3 cells: windows of ~4-12 cells a side, 7 cells per item. The
+    // FULL set (thin, tiny, degenerate) checks mass, multiplicity, counts and routing; the velocity
+    // moments of its thin tets are ill-conditioned (float contraction differs between the two
+    // kernels' code, amplified by the condition number), so they are compared on the
+    // well-conditioned set.
+    std::vector<float> vF,uF,mF; makeStress(4000,10.f,10.f/64.f,vF,uF,mF);
+    std::vector<float> vW,uW,mW; makeStress(4000,10.f,10.f/64.f,vW,uW,mW,true);
+    struct Case { const char* name; int periodic; int subOrigin, subDims; };
+    auto rel=[](const std::vector<float>& a,const std::vector<float>& b){
+        double mx=0,d=0; for(size_t i=0;i<a.size();++i){ mx=std::max(mx,(double)std::fabs(b[i])); d=std::max(d,std::fabs((double)a[i]-b[i])); }
+        return mx>0? d/mx : d; };
+    for(Case cs : {Case{"periodic",1,0,64}, Case{"periodic sub-grid",1,40,40}, Case{"non-periodic",0,0,64}}){
+        DepositParams P; makeParams(P,64,10.f,1,cs.periodic); P.fExact=1; P.nTet=uint32_t(mF.size());
+        for(int i=0;i<3;++i){ P.subOrigin[i]=cs.subOrigin; P.subDims[i]=cs.subDims; }   // 40+40 > 64: the crop wraps
+        CpuOut one, it, oneW, itW;
+        g.itemCells=0; g.run(vF,uF,mF,P,one); size_t const def1=g.lastDeferred; bool failed=g.lastFailed;
+        g.itemCells=7; g.run(vF,uF,mF,P,it);  size_t const defI=g.lastDeferred, nItems=g.lastItems, nLeft=g.lastLeftovers; failed|=g.lastFailed;
+        g.itemCells=0; g.run(vW,uW,mW,P,oneW); failed|=g.lastFailed;
+        g.itemCells=7; g.run(vW,uW,mW,P,itW);  failed|=g.lastFailed;
+        g.itemCells=0;
+        size_t smis=0; for(size_t i=0;i<one.streams.size();++i) if(one.streams[i]!=it.streams[i]||one.unresolved[i]!=it.unresolved[i]) ++smis;
+        double const dM=rel(it.mass,one.mass), dSV=rel(it.sv,one.sv);
+        double const dV=rel(itW.mom,oneW.mom), dD=rel(itW.m2,oneW.m2), dG=rel(itW.grad,oneW.grad), dMW=rel(itW.mass,oneW.mass);
+        double const tot1=total(one.mass), totI=total(it.mass);
+        bool ok = !failed && smis==0 && dM<2e-5 && dSV<2e-5 && dMW<2e-5 && dV<2e-5 && dD<2e-5 && dG<2e-5
+               && std::fabs(totI-tot1)<1e-5*tot1 && def1==defI && nItems>mF.size();
+        snprintf(detail,sizeof(detail),"%zu items, %zu leftovers, %zu deferred; max rel diff mass %.1e sv %.1e | well-conditioned mass %.1e mom %.1e m2 %.1e grad %.1e; counts %s; total %.6g vs %.6g%s",
+                 nItems,nLeft,defI,dM,dSV,dMW,dV,dD,dG,smis?"DIFFER":"identical",totI,tot1,failed?"; A COMMAND BUFFER FAILED":"");
+        char name[96]; snprintf(name,sizeof(name),"T14b exact items == one-thread (%s)",cs.name);
+        verdict(name,ok,detail);
+    }
+}
+
+// T15: a tet cut by a NON-PERIODIC grid face keeps only its inside share (a --box region taken from
+// a larger cloud). T13's Freudenthal cube, density 1, shifted to straddle x=0: [-1,1]x[2,4]x[2,4] on
+// the 8^3 grid [0,8). Exact deposit (both the one-thread and the items path): the 4 inside cells
+// (x in [0,1]) hold mass exactly 1 each, total 4 of 8 -- renormalizing over the inside pieces put
+// the whole 8 there. Sampled deposit (nSub=3): GPU == the float reference, total within sample
+// quantization of 4. A second cube wholly beyond the grid ([-5,-3]) deposits nothing.
+static void t15_regionFace(Gpu& g){
+    float const a=-1.f, b=1.f;
+    auto C=[&](float x0,int x,int y,int z,std::vector<float>& v){ v.push_back(x0+(x?b-a:0.f)+a); v.push_back(y?4.f:2.f); v.push_back(z?4.f:2.f); };
+    int const path[6][2][3]={{{1,0,0},{1,1,0}},{{1,0,0},{1,0,1}},{{0,1,0},{1,1,0}},
+                             {{0,1,0},{0,1,1}},{{0,0,1},{1,0,1}},{{0,0,1},{0,1,1}}};
+    std::vector<float> v;
+    for(float x0 : {0.f, -4.f})   // the straddling cube, and one wholly beyond x=0
+        for(int t=0;t<6;++t){ C(x0,0,0,0,v); C(x0,path[t][0][0],path[t][0][1],path[t][0][2],v); C(x0,path[t][1][0],path[t][1][1],path[t][1][2],v); C(x0,1,1,1,v); }
+    std::vector<float> m(12,float(8.0/6.0));
+    for(uint32_t cells : {0u, 1u}){   // one-thread path, then the items path
+        DepositParams P; makeParams(P,8,8.f,1,0); P.fExact=1; P.nTet=12;
+        g.itemCells=cells;
+        CpuOut go; g.run(v,linVel(v),m,P,go);
+        g.itemCells=0;
+        double maxErr=0, other=0;
+        for(int i=0;i<8;++i)for(int j=0;j<8;++j)for(int k=0;k<8;++k){
+            size_t f=((size_t)i*8+j)*8+k;
+            bool in = i==0 && (j==2||j==3) && (k==2||k==3);
+            if(in) maxErr=std::max(maxErr,std::fabs((double)go.mass[f]-1.0)); else other+=go.mass[f];
+        }
+        bool ok = maxErr<1e-5 && other<1e-6 && std::fabs(total(go.mass)-4.0)<1e-4 && !g.lastFailed;
+        snprintf(detail,sizeof(detail),"inside cells mass err %.1e (expect 1 each), elsewhere %.1e, total %.5f (expect 4 of 8)",maxErr,other,total(go.mass));
+        verdict(cells? "T15a region face, exact items: inside share only" : "T15a region face, exact one-thread: inside share only",ok,detail);
+    }
+    {
+        DepositParams P; makeParams(P,8,8.f,3,0); P.nTet=12;
+        CpuOut c,go; cpuDeposit(v,linVel(v),m,P,c); g.run(v,linVel(v),m,P,go);
+        double const totC=total(c.mass), totG=total(go.mass);
+        bool ok = std::fabs(totG-totC)<1e-5*totC && meanRelDiff(go.mass,c.mass)<1e-6 && std::fabs(totG-4.0)<0.35 && go.streams==c.streams;
+        snprintf(detail,sizeof(detail),"total GPU %.5f CPU %.5f (expect ~4 of 8: sampled share of the inside half), mass mean-rel %.1e, counts %s",
+                 totG,totC,meanRelDiff(go.mass,c.mass),go.streams==c.streams?"identical":"DIFFER");
+        verdict("T15b region face, sampled: inside share only",ok,detail);
+    }
+    {
+        // T15c: LARGE tets across the grid faces (8-20 cells, most of each beyond the grid, nSub=3),
+        // so the kernel counts the samples beyond the grid column by column (count_beyond_grid, bulk
+        // runs + per-sample edges) -- against the reference's plain per-sample count. The reference's
+        // float test differs from the kernel's exact one only for a sample within 1e-6 of a face.
+        std::mt19937 rng(77);
+        std::uniform_real_distribution<float> U(0.f,1.f);
+        std::vector<float> vv, uu, mm;
+        for(int t=0;t<300;++t){
+            float c[3]; for(int i=0;i<3;++i) c[i]=4.f+24.f*U(rng);
+            int const ax=t%3; c[ax] = (U(rng)<0.5f) ? -2.f+4.f*U(rng) : 30.f+4.f*U(rng);   // straddle a face
+            float const sc=4.f+6.f*U(rng);
+            for(;;){
+                float v[12];
+                for(int k=0;k<4;++k) for(int i=0;i<3;++i) v[k*3+i]=c[i]+sc*(2.f*U(rng)-1.f);
+                float Ax[3][3]; for(int e=0;e<3;++e) for(int i=0;i<3;++i) Ax[e][i]=v[(e+1)*3+i]-v[i];
+                float const d=det3(Ax);
+                if(std::fabs(d) < 0.05f*sc*sc*sc) continue;              // well-conditioned
+                vv.insert(vv.end(),v,v+12);
+                for(int k=0;k<12;++k) uu.push_back(100.f*(2.f*U(rng)-1.f));
+                mm.push_back(0.5f+U(rng));
+                break;
+            }
+        }
+        DepositParams P; makeParams(P,32,32.f,3,0); P.nTet=uint32_t(mm.size());
+        CpuOut c,go; cpuDeposit(vv,uu,mm,P,c); g.run(vv,uu,mm,P,go);
+        size_t smis=0; for(size_t i=0;i<c.streams.size();++i) smis += c.streams[i]!=go.streams[i];
+        double const totC=total(c.mass), totG=total(go.mass), mr=meanRelDiff(go.mass,c.mass);
+        bool ok = !g.lastFailed && std::fabs(totG-totC)<1e-5*totC && mr<1e-5 && smis<=c.streams.size()/10000
+               && totC < 0.9*total(mm);   // most of their mass lies beyond the grid
+        snprintf(detail,sizeof(detail),"300 tets of 8-20 cells across the faces: grid mass %.4f of %.4f, GPU vs reference total %.1e, mean-rel %.1e, %zu count mismatches, %zu deferred",
+                 totG,total(mm),std::fabs(totG-totC)/totC,mr,smis,g.lastDeferred);
+        verdict("T15c region face, large tets: beyond-grid counts by column",ok,detail);
+    }
+}
+
 // BENCH=1: time the all-fields deposit, CPU (1 core) vs GPU, on a 1M-tet stress set.
 static void bench(Gpu& g){
     if(!g.psoFld){ printf("  [bench] fields kernel missing, skipped\n"); return; }
@@ -855,8 +1161,7 @@ static void bench(Gpu& g){
 int main(){
     Gpu g;
     if(!g.init("metal/ps_deposit.metal")){ printf("GPU init failed\n"); return 1; }
-    printf("device: %s | kernels: depositDensity=%s depositFields=%s\n",
-           g.dev->name()->utf8String(), g.psoDen?"yes":"NO", g.psoFld?"yes":"MISSING (density-only gate)");
+    printf("device: %s | kernel: depositFields\n", g.dev->name()->utf8String());
     printf("------------------------------------------------------------------------\n");
     t1_singleCell(g);
     t2_centroid(g);
@@ -872,6 +1177,8 @@ int main(){
     t11_volumeWeighted(g);
     t12_causticBits(g);
     t13_exactDeposit(g);
+    t14_exactItems(g);
+    t15_regionFace(g);
     if(getenv("BENCH")) bench(g);
     printf("------------------------------------------------------------------------\n");
     printf("SUMMARY: %d passed, %d failed\n",g_pass,g_fail);

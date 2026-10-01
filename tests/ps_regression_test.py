@@ -191,10 +191,10 @@ def check_caustics(binary, snap, grid=GRID, box=BOX, amp=AMP):
             failures.append("flagged slab has holes in its interior (min column fraction "
                             "%.3f)" % interior.min())
         # edges must track the deposit's own 1<->3 stream transitions. Column criterion is
-        # majority multi-stream, NOT any: at N = grid/2 the nSub=1 deposit's centroid
-        # fallback inflates isolated cells to 2 streams in every column (fraction <= ~0.2,
-        # see analyze()); true slab columns sit at 1.0. The caustic flag itself is immune
-        # (a fallback deposit adds one orientation bit; both parities need the real fold).
+        # majority multi-stream, not any: true slab columns sit at 1.0, and the criterion
+        # tolerated isolated inflated cells (before 2026-09 the centroid fallback inflated
+        # cells in every column, up to a fraction ~0.2, and the +-1e-6 inside tolerance
+        # double-counted samples on shared faces; the deposit's count is now exact).
         scol = np.where((streams > 1.5).mean(axis=(1, 2)) > 0.5)[0]
         if scol.size == 0:
             failures.append("no multi-stream columns in '.streams' (setup broken)")
@@ -220,10 +220,11 @@ def analyze(den, streams, grid=GRID, box=BOX, amp=AMP, n=N,
     cell_vol = (box / grid) ** 3
 
     # Stream statistics use the EXACT containment counts from the point evaluation
-    # (--sample-points at the cell centres) when available: the deposit's .streams at
-    # nSub=1 additionally counts the centroid FALLBACK deposits of sub-cell tetrahedra
-    # (what makes it exactly mass-conserving), inflating ~1/4 of the counts by
-    # construction at N=grid/2 -- a deposit property, not what the analytics describe.
+    # (--sample-points at the cell centres) when available. The deposit's .streams at
+    # nSub=1 is the same quantity -- one sample per cell, at the centre -- and must now
+    # agree with them (checked below); until 2026-09 it additionally counted every
+    # centroid-FALLBACK deposit of a sub-cell tetrahedron as a stream, inflating ~1/4 of
+    # the counts at N=grid/2.
     counts = pts_streams if pts_streams is not None else streams
 
     rho_1d = den.mean(axis=(1, 2))
@@ -286,6 +287,17 @@ def analyze(den, streams, grid=GRID, box=BOX, amp=AMP, n=N,
     if pts_streams is not None and even_frac > 0.01:
         failures.append("stream-count parity broken: %.2f%% of covered points have an even "
                         "count (>1%%); should be odd away from the caustics" % (100 * even_frac))
+    # the nSub=1 deposit's sample count == the exact count at the same centre, in EVERY cell:
+    # the deposit decides containment with the point evaluation's exact test, at the same
+    # double positions. (The old centroid-fallback inflation was ~25% of the cells; the old
+    # +-1e-6 inside tolerance left a few per million.)
+    if pts_streams is not None:
+        nmism = int((np.rint(streams).astype(int) != pts_streams).sum())
+        print("  streams  : nSub=1 deposit vs exact point counts -- %d cells differ" % nmism)
+        if nmism:
+            failures.append("deposit '.streams' (nSub=1) disagrees with the exact point counts "
+                            "in %d cells (must be 0): sub-sample tetrahedra counted as streams, "
+                            "or the inside test no longer exact?" % nmism)
 
     metrics = {"mass_ratio": round(mass_ratio, 4),
                "multistream_fraction": round(f_measured, 4),

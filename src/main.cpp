@@ -25,18 +25,53 @@
 #include <chrono>           // total wall time for the run summary
 #include <sys/resource.h>   // getrusage -> peak RSS report
 
+#include <cstdio>
+#include <cstring>
+
 #include "DTFE.h"
 #include "io/io.h"
 #include "interlacing.h"
+#include "ps_point_eval.h"
 
 using namespace std;
+
+// build provenance (build_info.cc, recompiled on every link with the git revision and time)
+char const *dtfeBuildRevision();
+char const *dtfeBuildTime();
+
+#ifdef PHASE_SPACE
+static char const *const BINARY_NAME = "PS-DTFE";
+#else
+static char const *const BINARY_NAME = "DTFE";
+#endif
 
 
 // Reads options/input, runs the interpolation (with optional interlacing), writes output, prints a run summary.
 int main( int argc, char *argv[] )
 {
+    // '--version': the build stamp only (checked before option parsing, which needs an input file)
+    for (int i = 1; i < argc; ++i)
+        if ( std::strcmp( argv[i], "--version" ) == 0 )
+        {
+            std::printf( "%s %s (built %s)\n", BINARY_NAME, dtfeBuildRevision(), dtfeBuildTime() );
+            return 0;
+        }
+
+    // --serve speaks a binary protocol on stdout: divert all logging to stderr before the
+    // first line is printed (option parsing already prints)
+    for (int i = 1; i < argc; ++i)
+        if ( std::strcmp( argv[i], "--serve" ) == 0 ) { psServeRedirectStdout(); break; }
+
     User_options userOptions;		// program options plus program-wide constants
     userOptions.readOptions( argc, argv );
+
+    // one parseable provenance line per run: the results browser (python/gui) reads it back from the
+    // runlog to tell outputs made before an output-changing fix from those made after it
+    {
+        MESSAGE::Message build( userOptions.verboseLevel );
+        build << "Build: " << BINARY_NAME << " " << dtfeBuildRevision() << " (built " << dtfeBuildTime()
+              << ")\n" << MESSAGE::Flush;
+    }
 
     // wall-clock (not CPU) timer for the run summary, so it reflects elapsed time across all threads
     auto const wallStart = std::chrono::steady_clock::now();

@@ -6,11 +6,17 @@ package so scripts are agnostic to the estimator, snapshot, simulation, and unit
 """
 
 from .io import FieldSet, FIELDS, STREAM_TOL, SnapshotMeta, PointPlane
-from . import pointeval  # noqa: F401  (figure rendering for --sample-points)
-from .cli import make_parser, make_fieldset, snapdir, DATA_ROOT, DEFAULT_SIM, DEFAULT_SNAP
+try:
+    from . import pointeval  # noqa: F401  (figure rendering for --sample-points)
+except ModuleNotFoundError as _e:   # the loaders and the Estimator need only numpy (+h5py);
+    if not (_e.name or "").startswith("matplotlib"):   # only the figures need matplotlib
+        raise
+from .estimator import Estimator, PointFields, find_binary
+from .cli import make_parser, make_fieldset, snapdir, sim_dir, find_sims, DATA_ROOT, DEFAULT_SIM, DEFAULT_SNAP
 
 __all__ = [
     "FieldSet", "FIELDS", "STREAM_TOL", "SnapshotMeta", "PointPlane",
+    "Estimator", "PointFields", "find_binary",
     "make_parser", "make_fieldset", "snapdir",
-    "DATA_ROOT", "DEFAULT_SIM", "DEFAULT_SNAP",
+    "DATA_ROOT", "DEFAULT_SIM", "DEFAULT_SNAP", "sim_dir", "find_sims",
 ]

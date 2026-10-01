@@ -23,7 +23,7 @@ MAX_CONCURRENT="${MAX_CONCURRENT:-}"  # cap on concurrent triangulations to boun
                                  # EMPTY (default) = auto-tuned together with the partition split.
 DTFE_METAL="${DTFE_METAL:-0}"  # 1 = run the '_a' interpolation on the Apple GPU (--gpu; needs 'make DTFE METAL=1')
 
-DATA_DIR=""                # default: $DATA_ROOT/$SIMULATION (config.sh); override with -d
+DATA_DIR=""                # default: sim_dir $SIMULATION (config.sh); override with -d
 OUTPUT_SUBDIR="output"
 
 FIELDS="density_a velocity_a gradient_a divergence_a shear_a vorticity_a"
@@ -48,7 +48,7 @@ if [ "$#" -gt 0 ]; then
     SNAPSHOTS=("$@")
 fi
 
-[ -z "${DATA_DIR}" ] && DATA_DIR="${DATA_ROOT}/${SIMULATION}"
+[ -z "${DATA_DIR}" ] && DATA_DIR="$(sim_dir "${SIMULATION}")"
 
 cd "$REPO_ROOT" || exit 1
 
@@ -83,15 +83,17 @@ for i in "${SNAPSHOTS[@]}"; do
     [ -n "${MAX_CONCURRENT}" ] && part_args+=(--max-concurrent "${MAX_CONCURRENT}")
 
     echo "  Running DTFE on ${input_file}..."
+    # the run log beside the outputs (<snapdir>/output.runlog), as run_ps_dtfe.sh keeps one: the
+    # GUI's Runs browser reads the settings, build stamp, wall time and peak memory back from it
     ./DTFE "${input_file}" "${output_root}" \
         --grid ${GRID_SIZE} \
         --padding ${PADDING} \
         --periodic \
         ${part_args[@]+"${part_args[@]}"} \
         --field ${FIELDS} \
-        ${metal_args[@]+"${metal_args[@]}"}
+        ${metal_args[@]+"${metal_args[@]}"} 2>&1 | tee "${output_root}.runlog"
 
-    if [ $? -eq 0 ]; then
+    if [ "${PIPESTATUS[0]}" -eq 0 ]; then
         echo "  Snapshot ${n_str} processed successfully"
     else
         echo "  Error processing snapshot ${n_str}"

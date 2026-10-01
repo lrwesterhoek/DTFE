@@ -113,7 +113,7 @@ install_macos() {
 
     # fftw: T-web tidal-tensor FFT; llvm + libomp: the Makefile prefers Homebrew clang++
     # (Apple's clang has no bundled OpenMP runtime, so a plain CLT setup fails on -fopenmp)
-    PACKAGES=(gsl boost cgal mpfr hdf5 gmp fftw llvm libomp)
+    PACKAGES=(gsl boost cgal tbb mpfr hdf5 gmp fftw llvm libomp)
     
     for package in "${PACKAGES[@]}"; do
         if brew list "$package" &> /dev/null; then
@@ -140,7 +140,7 @@ install_ubuntu_debian() {
     sudo apt-get install -y \
         libgsl-dev \
         libboost-all-dev \
-        libcgal-dev \
+        libcgal-dev libtbb-dev \
         libmpfr-dev \
         libhdf5-dev \
         libgmp-dev \
@@ -192,6 +192,7 @@ install_arch() {
         gsl \
         boost \
         cgal \
+        tbb \
         mpfr \
         hdf5 \
         gmp \
@@ -209,6 +210,7 @@ install_opensuse() {
         gsl-devel \
         boost-devel \
         cgal-devel \
+        tbb-devel \
         mpfr-devel \
         hdf5-devel \
         gmp-devel \

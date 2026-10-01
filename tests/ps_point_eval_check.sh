@@ -9,11 +9,13 @@
 #     match to float32 vertex-density rounding. Velocities are identically zero.
 #  B) PANCAKE (amp=1.8, multi-stream): cross-checks against the nSub=1 grid deposit at the
 #     48^3 cell centers.
-#       - stream sets: the deposit's .streams at nSub=1 counts the tetrahedra containing the
-#         cell centre (plus centroid-fallback deposits of sub-cell tetrahedra, which do not
-#         occur in single-stream cells here) -> integer equality in single-stream cells.
+#       - stream counts: the deposit's .streams at nSub=1 counts the tetrahedra containing the
+#         cell centre with the SAME exact test (a sub-cell tetrahedron's centroid-fallback
+#         deposit moves mass only and is not counted) -> equal in every cell.
 #       - VELOCITY: at nSub=1 the deposit evaluates each stream's velocity AT the cell centre,
-#         so single-stream cells must match the point evaluation to float32 rounding. This is
+#         so single-stream cells must match the point evaluation to float32 rounding -- once
+#         '.hidden_streams' cells are excluded: there a sub-cell tetrahedron's centroid deposit
+#         adds its velocity AT ITS CENTROID to the cell's mass-weighted mean. This is
 #         the float-level deposit cross-check; the deposit's DENSITY cannot match pointwise
 #         because it deposits mass shares m/N (quantized at tetrahedron scale), so density is
 #         checked in aggregate (mean ratio) and via the exact uniform case (A).
@@ -34,6 +36,10 @@
 #     transverse gradients vanish, grad_x matches a central finite difference of '.pts_den'
 #     at x +- eps probe points away from the caustics, the per-point gradient equals the sum
 #     of its per-stream gradients, and serial vs --partition 2 2 2 agree to float rounding.
+#  I) PACKED RECORDS: the per-point stream records are stored with only the members the options
+#     fill (RecLayout, ps_point_eval.cc); DTFE_PTS_FULL_RECORDS=1 stores every member as before.
+#     Both must give byte-identical outputs -- with no options, and with every per-stream option
+#     on at once across a --partition 2 2 2 merge.
 #
 # Usage:
 #   tests/ps_point_eval_check.sh              # build, run, check
@@ -223,6 +229,25 @@ else
     echo ">> (H) skipped: this PS-DTFE binary has no --pts-vel-grad (or no --pts-den-grad fixture)"
 fi
 
+if [ "${HAVE_IDS}" = "1" ] && [ "${HAVE_VELGRAD}" = "1" ]; then
+    echo ">> (I) packed per-point records == every member stored (DTFE_PTS_FULL_RECORDS=1)"
+    for opts in "" "--per-stream-ids --pts-den-grad --pts-vel-grad"; do
+        run "${TMP}/ppe_pack" "${SNAP_PAN}" --periodic --partition 2 2 2 --sample-points "${PTS_BIN}" ${opts}
+        DTFE_PTS_FULL_RECORDS=1 run "${TMP}/ppe_full" "${SNAP_PAN}" --periodic --partition 2 2 2 \
+            --sample-points "${PTS_BIN}" ${opts}
+        n=0
+        for f in "${TMP}"/ppe_full.pts_*; do
+            ext="${f##*/ppe_full}"; n=$((n+1))
+            cmp -s "${f}" "${TMP}/ppe_pack${ext}" \
+                || { echo "FAIL: ${ext} differs between packed and full records (${opts:-no options})"; exit 1; }
+        done
+        echo "   OK  ${n} outputs byte-identical (${opts:-no options})"
+        rm -f "${TMP}"/ppe_pack.* "${TMP}"/ppe_full.*
+    done
+else
+    echo ">> (I) skipped: needs --per-stream-ids and --pts-vel-grad"
+fi
+
 echo ">> checking the numbers ..."
 "${PY}" - "${TMP}" "${GRID}" "${HAVE_IDS}" "${HAVE_GRAD}" "${HAVE_VELGRAD}" <<'PY'
 import sys
@@ -257,8 +282,8 @@ def load_ragged(root):
 den, vel, dsp, st = load_pts(f"{tmp}/ppe_uni_geo")
 off, rec = load_ragged(f"{tmp}/ppe_uni_geo")
 check("A1 uniform coverage", st.min() >= 1, f"min streams {st.min()}")
-check("A2 uniform mostly single-stream", np.mean(st == 1) > 0.99,
-      f"{np.mean(st == 1) * 100:.3f}% single-stream (face-grazing tolerance cases excepted)")
+check("A2 uniform single-stream everywhere", bool((st == 1).all()),
+      f"{int((st != 1).sum())} points with a count other than 1 (exact location: must be 0)")
 # every stream's geometric density is rho_bar exactly => den == stream count to double rounding
 check("A3 uniform geometric density exact", np.abs(den - st).max() < 1e-9,
       f"max|rho/rho_bar - streams| = {np.abs(den - st).max():.3e}")
@@ -281,16 +306,19 @@ den, vel, dsp, st = load_pts(f"{tmp}/ppe_pan_ser")
 gden = np.fromfile(f"{tmp}/ppe_pan_ser.den", dtype=np.float32).astype(np.float64)
 gst  = np.fromfile(f"{tmp}/ppe_pan_ser.streams", dtype=np.float32)
 gvel = np.fromfile(f"{tmp}/ppe_pan_ser.vel", dtype=np.float32).reshape(-1, 3).astype(np.float64)
+gunr = np.fromfile(f"{tmp}/ppe_pan_ser.hidden_streams", dtype=np.float32)
 check("B0 multi-stream present", st.max() >= 3, f"max streams {st.max()}")
 m1 = gst == 1  # single-stream cells per the deposit
-agree = np.mean(st[m1] == 1)
-check("B1 single-stream stream sets match deposit", agree > 0.999,
-      f"{agree * 100:.4f}% of {m1.sum()} cells")
-both1 = m1 & (st == 1)
+nmis = int((np.rint(gst).astype(np.int64) != st).sum())
+check("B1 stream counts match the deposit in every cell", nmis == 0,
+      f"{nmis} of {st.size} cells differ (both use the exact test: must be 0)")
+# resolved single-stream cells: one sampled stream and no centroid-fallback mass
+both1 = m1 & (st == 1) & (gunr == 0)
 vscale = np.abs(gvel).max()
 dv = np.abs(gvel[both1] - vel[both1]).max() / vscale
 check("B2 single-stream velocity matches deposit (float level)", dv < 1e-5,
-      f"max rel diff = {dv:.3e}")
+      f"max rel diff = {dv:.3e} over {both1.sum()} resolved cells "
+      f"({int((m1 & (gunr != 0)).sum())} more hold sub-sample mass or hidden streams)")
 check("B3 single-stream dispersion is zero", np.abs(dsp[st == 1]).max() == 0,
       f"max = {np.abs(dsp[st == 1]).max():.3e}")
 ratio = den[both1].mean() / gden[both1].mean()
@@ -300,7 +328,7 @@ check("B4 single-stream mean density vs deposit", 0.9 < ratio < 1.12,
 # ---------- (C) partition-split consistency ----------
 den2, vel2, dsp2, st2 = load_pts(f"{tmp}/ppe_pan_par")
 eq = np.mean(st == st2)
-check("C1 partition streams identical", eq > 0.999, f"{eq * 100:.4f}% equal")
+check("C1 partition streams identical", eq == 1.0, f"{eq * 100:.4f}% equal (exact point location: must be 100%)")
 same = st == st2
 dd = np.abs(den[same] - den2[same]).max() / (np.abs(den).max() + 1e-30)
 dv = np.abs(vel[same] - vel2[same]).max() / (np.abs(vel).max() + 1e-30)

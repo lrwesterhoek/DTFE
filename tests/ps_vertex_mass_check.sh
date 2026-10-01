@@ -201,7 +201,7 @@ if gpu:
     eq = float((sc == sg).mean())
     mrel_d = float(np.abs(dc - dg).mean() / (np.abs(dc).max() + 1e-30))
     mrel_v = float(np.abs(vc - vg).mean() / (np.abs(vc).max() + 1e-30))
-    check("D GPU streams match CPU", eq > 0.999, f"{eq*100:.4f}% equal")
+    check("D GPU streams match CPU", eq == 1.0, f"{eq*100:.4f}% equal (exact inside test on both: must be 100%)")
     check("D GPU density matches CPU", mrel_d < 1e-4, f"mean rel = {mrel_d:.3e}")
     check("D GPU velocity matches CPU", mrel_v < 1e-4, f"mean rel = {mrel_v:.3e}")
 else:

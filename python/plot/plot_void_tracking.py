@@ -112,7 +112,7 @@ def main():
     print(f"tracer pool: {pool_frac.shape[0]} tree subhalos at snap {args.snap}")
 
     ztab = gc.redshift_table(args.sim)
-    ladder = sorted({int(d.name.split("_")[1]) for d in (env.DATA_ROOT / args.sim).glob("snapdir_*")})
+    ladder = sorted({int(d.name.split("_")[1]) for d in env.sim_dir(args.sim).glob("snapdir_*")})
 
     # per-snapshot pipeline catalogs (cached on disk by the pipeline itself)
     catalogs = {}

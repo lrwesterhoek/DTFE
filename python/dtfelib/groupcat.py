@@ -22,13 +22,13 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-from .cli import DATA_ROOT
+from .cli import DATA_ROOT, sim_dir
 
 DM = 1   # PartType1 (the only species in the -Dark runs)
 
 
 def groupcat_dir(sim: str, snap: int) -> Path:
-    return DATA_ROOT / sim / f"groups_{snap:03d}"
+    return sim_dir(sim) / f"groups_{snap:03d}"
 
 
 def _chunks(d: Path, pattern: str) -> list[Path]:
@@ -114,7 +114,7 @@ def read_subhalo_coordinates(sim: str, snap: int, subfind_id: int,
     if length == 0:
         return np.empty((0, 3), dtype=np.float32)
 
-    snapdir = DATA_ROOT / sim / f"snapdir_{snap:03d}"
+    snapdir = sim_dir(sim) / f"snapdir_{snap:03d}"
     # raw chunks when available; else the merged combined_NNN.hdf5 (its particles keep the
     # chunk concatenation order, so the global offsets are identical). NOTE: the combined
     # file is h-FREE (ckpc) while this function's contract is raw ckpc/h -- rescale by h.
@@ -184,7 +184,7 @@ def redshift_table(sim: str) -> dict[int, float]:
 
     Snapshots without any file get a log-a interpolation between the nearest anchors
     (TNG outputs are near-uniform in log a, good to ~1%)."""
-    root = DATA_ROOT / sim
+    root = sim_dir(sim)
     anchors: dict[int, float] = {}
     for d in sorted(root.glob("groups_*")):
         try:

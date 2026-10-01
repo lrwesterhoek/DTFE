@@ -27,7 +27,7 @@ Usage:
     fs = FieldSet("$DATA_ROOT/TNG50-4-Dark/snapdir_099")                   # auto-detect method
     rho   = fs.density(units="mean")            # rho/rho_bar for BOTH methods
     v     = fs.load("velocity")                 # (N,N,N,3) km/s
-    v1    = fs.velocity_single_stream()         # velocity, NaN where stream count != 1 (PS only)
+    v1    = fs.velocity_single_stream()         # velocity, NaN unless single-stream (PS only)
     if fs.has("streams"): s = fs.load("streams")
     print(fs)                                   # method, grid, box, z, rho_bar
 """
@@ -45,7 +45,9 @@ FIELDS = {
     "density":           ("den",           1, False),
     "velocity":          ("vel",           3, False),
     "streams":           ("streams",       1, True),
-    "caustic":           ("caustic",       1, True),   # 0/1 fold-caustic cell flag (--ps-caustics)
+    "hidden_streams":    ("hidden_streams", 1, True),  # bitmask: bit 1 = multi-stream volume the stream count does not show (a folded tetrahedron overlaps the cell while '.streams' reads 1 -- a fold thinner than the sampling; exact in a periodic box), bit 2 = the cell holds mass from a tetrahedron none of whose sub-samples lies in it (a quadrature note, usually the SAME stream). Single-stream mask = streams==1 and not (hidden_streams & 1): velocity_single_stream does it. Written as '.unresolved' by the 2026-09-28/29 builds (0/1 = the old mass flag, read as bit 1: conservative; see LEGACY_SUFFIX); older outputs have neither and counted those tets in '.streams'
+    "caustic":         ("caustic",       1, True),   # 0/1 fold-caustic cell flag (--ps-caustics)
+    "caustic_class":     ("causticClass",  1, True),   # --ps-caustics (CPU or GPU; --ps-linear-deposit forces CPU): caustic stratification bitmask. bit0/1 = a det(J)>0 / det(J)<0 tetrahedron overlaps the cell (both = fold, i.e. '.caustic'), bits 2-5 = a tetrahedron with 0/1/2/3 collapsed axes overlaps it (1 = wall, 2 = filament, 3 = node), bit6 = two eigenvalues coincide AT ZERO (umbilic/D4 INDICATOR, not a D4 identification; both halves matter -- merely coincident eigenvalues occur throughout caustic-free volume), bit7 = the A3 CUSP indicator and bit8 = the A4 SWALLOWTAIL indicator, both present only under '--ps-caustic-cusps'. See src/CGAL_triangulation/ps_caustic_class.h; decode with caustic_collapse_max() / caustic_is_fold() / caustic_is_cusp() / caustic_is_swallowtail()
     "tet_touch":         ("tetTouch",      1, True),   # --ps-exact-deposit: raw count of tetrahedra touching the cell (geometric multiplicity, runs to hundreds -- NOT a stream count; use 'streams' for that)
     "dispersion":        ("velDisp",       1, True),
     "dispersion_tensor": ("velDispTensor", 6, True),   # xx,xy,xz,yy,yz,zz
@@ -64,7 +66,85 @@ _PREFIX = {"ps": "ps_output.", "dtfe": "output."}
 # Fields the binary writes ONCE, with no 'a_' (averaged) counterpart: the deposit produces a
 # single grid for them regardless of the u/a pass (see writeOutputData in src/input_output.cc).
 # Without this, averaged=True (the default) would look for a nonexistent 'ps_output.a_caustic'.
-_NO_AVG_VARIANT = {"caustic", "tet_touch"}
+_NO_AVG_VARIANT = {"caustic", "caustic_class", "tet_touch"}
+# a field's file suffix before a rename: read when the current name is absent (old outputs)
+LEGACY_SUFFIX = {"hidden_streams": "unresolved"}
+
+
+# Bit layout of the 'caustic_class' mask, mirroring src/CGAL_triangulation/ps_caustic_class.h.
+CAUSTIC_PARITY_POS = 1 << 0
+CAUSTIC_PARITY_NEG = 1 << 1
+CAUSTIC_COLLAPSE   = (1 << 2, 1 << 3, 1 << 4, 1 << 5)   # indexed by the collapse multiplicity k
+CAUSTIC_DEGENERATE  = 1 << 6
+CAUSTIC_CUSP        = 1 << 7
+CAUSTIC_SWALLOWTAIL = 1 << 8
+
+
+def caustic_is_cusp(mask):
+    """Boolean mask of the A3 CUSP indicator (bit 7) of a 'caustic_class' / '.pts_caustic' grid.
+
+    Only ever set when the run passed '--ps-caustic-cusps' (CPU deposit); otherwise all False.
+
+    TREAT THIS AS A CANDIDATE MAP, NOT A CLASSIFICATION. The condition is that the critical
+    eigenvalue of the deformation tensor stops varying along its own null direction, and the
+    gradient it needs does not exist inside a tetrahedron where the deformation is constant -- it is
+    estimated by least squares over the tetrahedra sharing a vertex with each near-fold tetrahedron.
+    On a 1-D Zel'dovich wave whose caustic is two parallel planes, and which therefore has NO cusps
+    anywhere, about 0.01% of the fold cells are still flagged (it was 7% when the fit used only the
+    four face neighbours). Good enough to map, but it remains an indicator at the tessellation's
+    resolution rather than a pointwise A3 identification.
+    """
+    import numpy as np
+    return (np.asarray(mask).astype(np.int64) & CAUSTIC_CUSP) != 0
+
+
+def caustic_is_swallowtail(mask):
+    """Boolean mask of the A4 SWALLOWTAIL indicator (bit 8) of a 'caustic_class' grid.
+
+    Set only when the run passed '--ps-caustic-cusps', which computes bits 7 and 8 from the same
+    stencil; otherwise all False.
+
+    PROXIMITY, NOT MEMBERSHIP -- more strongly than for the cusp bit. A4 points are codimension 3,
+    so they are isolated and generically lie inside no tetrahedron. The bit marks the neighbourhood
+    along the cusp curve where the second derivative of lambda_c along its null direction has
+    dropped to the stencil's noise floor, over a band whose width is a fixed fraction of the stencil
+    radius -- it shrinks with the tessellation, never with a tolerance.
+
+    Measured on 1-D waves with known strata: an exact A4 lights 74.5% of the cusp cells, a pure A3
+    (the hard control, genuinely tangent too) 0.5%, a generic A2 fold none -- a factor ~146.
+
+    NOT a subset of caustic_is_cusp(): near a true swallowtail lambda_c varies as the CUBE of the
+    distance along the null direction, which the cusp bit's linear fit reads as a spurious slope, so
+    it stays off there. OR the two if you want the whole A3-and-above skeleton.
+    """
+    import numpy as np
+    return (np.asarray(mask).astype(np.int64) & CAUSTIC_SWALLOWTAIL) != 0
+
+
+def caustic_is_fold(mask):
+    """Boolean mask of the fold (A2) condition: BOTH map parities present in the cell/point.
+
+    Identical to the 0/1 '.caustic' grid, recomputed from the mask so a single array can answer
+    every caustic question without loading a second file.
+    """
+    import numpy as np
+    m = np.asarray(mask).astype(np.int64)
+    return (m & (CAUSTIC_PARITY_POS | CAUSTIC_PARITY_NEG)) == (CAUSTIC_PARITY_POS | CAUSTIC_PARITY_NEG)
+
+
+def caustic_collapse_max(mask):
+    """Highest collapse multiplicity k present in each cell of a 'caustic_class' grid.
+
+    k counts the principal axes along which the sheet has already collapsed and inverted:
+    0 = single-stream/uncollapsed, 1 = wall/pancake, 2 = filament, 3 = node. Cells with no
+    collapse bit at all (never deposited into) come back as -1.
+    """
+    import numpy as np
+    m = np.asarray(mask).astype(np.int64)
+    out = np.full(m.shape, -1, dtype=np.int8)
+    for k, bit in enumerate(CAUSTIC_COLLAPSE):
+        out = np.where((m & bit) != 0, np.int8(k), out)
+    return out
 
 # Velocity-derived fields are stored in Gadget u-units (u = v_pec/sqrt(a)): the binaries
 # difference the snapshot velocities verbatim. FieldSet.load() converts them to peculiar
@@ -146,6 +226,19 @@ def _load_budget_bytes() -> int:
     return int(frac * _available_ram_bytes())
 
 
+def _grid_shape_of(path: Path, ncomp: int) -> tuple[int, np.dtype]:
+    """(N, dtype) of a raw N^3 x ncomp grid file, from its size alone: float32 (the default
+    build) or float64 (a DOUBLE=1 build). The two never collide -- N^3 = 2 M^3 has no integer
+    solution -- so the size is unambiguous."""
+    size = Path(path).stat().st_size
+    for dt in (np.float32, np.float64):
+        item = np.dtype(dt).itemsize
+        n = round((size / item / ncomp) ** (1 / 3))
+        if n > 0 and n ** 3 * ncomp * item == size:
+            return n, np.dtype(dt)
+    raise ValueError(f"{path}: {size} bytes is not an N^3 x {ncomp} float32 or float64 grid")
+
+
 @dataclass
 class SnapshotMeta:
     box_mpc: float        # comoving box size, h-free Mpc
@@ -187,7 +280,7 @@ class FieldSet:
         # only real field grids count -- run logs and other same-prefix artifacts (e.g. the
         # ps_output.runlog an aborted run leaves behind) must not trigger detection, or a
         # snapshot with no usable PS grids would be classified 'ps' and then fail to load
-        suffixes = {s for s, _, _ in FIELDS.values()}
+        suffixes = {s for s, _, _ in FIELDS.values()} | set(LEGACY_SUFFIX.values())
         return any(p.name[len(prefix):].removeprefix("a_") in suffixes
                    for p in self.snapdir.glob(prefix + "*"))
 
@@ -211,7 +304,12 @@ class FieldSet:
         if ps_only and self.method != "ps":
             raise ValueError(f"field {name!r} is only produced by PS-DTFE (method='ps')")
         avg = "a_" if (self.averaged and name not in _NO_AVG_VARIANT) else ""
-        return self.snapdir / f"{self.prefix}{avg}{suffix}"
+        path = self.snapdir / f"{self.prefix}{avg}{suffix}"
+        if name in LEGACY_SUFFIX and not path.exists():
+            old = self.snapdir / f"{self.prefix}{avg}{LEGACY_SUFFIX[name]}"
+            if old.exists():
+                return old
+        return path
 
     def has(self, name: str) -> bool:
         try:
@@ -225,15 +323,23 @@ class FieldSet:
             for probe in ("density", "velocity"):
                 p = self._field_path(probe)
                 if p.exists():
-                    ncomp = FIELDS[probe][1]
-                    n = round((p.stat().st_size / 4 / ncomp) ** (1 / 3))
-                    if n ** 3 * ncomp * 4 != p.stat().st_size:
-                        raise ValueError(f"{p}: size is not an N^3 float32 grid")
-                    self._grid_n = n
+                    self._grid_n = _grid_shape_of(p, FIELDS[probe][1])[0]
                     break
             else:
                 raise FileNotFoundError(f"no density/velocity file to infer grid size in {self.snapdir}")
         return self._grid_n
+
+    def _dtype_of(self, name: str) -> np.dtype:
+        """On-disk element type of a field's grid: float32 from the default build, float64
+        from a DOUBLE=1 build ('make PS-DTFE DOUBLE=1'). Read from the file size."""
+        path = self._field_path(name)
+        ncomp = FIELDS[name][1]
+        n = self.grid_n
+        size = path.stat().st_size
+        for dt in (np.float32, np.float64):
+            if size == n ** 3 * ncomp * np.dtype(dt).itemsize:
+                return np.dtype(dt)
+        raise ValueError(f"{path}: {size} bytes is neither {n}^3 x {ncomp} float32 nor float64")
 
     # ------------------------------------------------------------------ metadata
     def _read_meta(self) -> SnapshotMeta:
@@ -291,10 +397,9 @@ class FieldSet:
             raise FileNotFoundError(f"{path} (field {name!r}, method {self.method!r})")
         ncomp = FIELDS[name][1]
         n = self.grid_n
-        if path.stat().st_size != n ** 3 * ncomp * 4:
-            raise ValueError(f"{path}: size is not {n}^3 x {ncomp} float32")
+        dtype = self._dtype_of(name)
         shape = (n, n, n) if ncomp == 1 else (n, n, n, ncomp)
-        return np.memmap(path, dtype=np.float32, mode="r", shape=shape)
+        return np.memmap(path, dtype=dtype, mode="r", shape=shape)
 
     def load(self, name: str, scaled: bool = True, mode: str = "auto") -> np.ndarray:
         """Field as stored on disk, shape (N,N,N) or (N,N,N,ncomp) -- with velocity-derived
@@ -333,10 +438,10 @@ class FieldSet:
         if not path.exists():
             raise FileNotFoundError(f"{path} (field {name!r}, method {self.method!r})")
         ncomp = FIELDS[name][1]
-        data = np.fromfile(path, dtype=np.float32)
+        data = np.fromfile(path, dtype=self._dtype_of(name))
         n = self.grid_n
         if data.size != n ** 3 * ncomp:
-            raise ValueError(f"{path}: {data.size} floats != {n}^3 x {ncomp}")
+            raise ValueError(f"{path}: {data.size} values != {n}^3 x {ncomp}")
         if factor is not None:
             data *= factor                    # in place: fromfile owns the buffer
         return data.reshape((n, n, n) if ncomp == 1 else (n, n, n, ncomp))
@@ -383,7 +488,7 @@ class FieldSet:
         load(name, mode='ram') exactly, scaling included."""
         mm = self._open_memmap(name)
         n = self.grid_n
-        row_bytes = int(np.prod(mm.shape[1:], dtype=np.int64)) * 4
+        row_bytes = int(np.prod(mm.shape[1:], dtype=np.int64)) * mm.dtype.itemsize
         if max_bytes is None:
             max_bytes = max(_load_budget_bytes() // 8, row_bytes)
         thick = max(1, min(n, int(max_bytes // row_bytes)))
@@ -466,15 +571,29 @@ class FieldSet:
         Which grid is masked follows this FieldSet: averaged=True uses the fractional
         'a_streams' sub-sample mean (any partially multi-stream cell is masked too);
         averaged=False uses the raw '.streams' grid.
+
+        Cells with bit 1 of 'hidden_streams' set are masked as well: multi-stream volume that
+        '.streams' does not show. '.streams' counts sub-samples, so a folded sliver too thin to
+        catch one (a collapsed wall crossing a cell) deposits mass and momentum there without
+        raising the count. The flag is geometric and exact in a periodic box -- a point is
+        multi-stream exactly where a folded tetrahedron covers it -- so every cell this keeps
+        is single-stream at every point, and none is dropped just for holding a small tet of
+        its own stream (bit 2, which the mask ignores). Outputs from 2026-09-28/29 store the old
+        conservative 0/1 mass flag as '.unresolved', which reads as bit 1; outputs without either grid
+        predate it and counted such tets +1 in '.streams', so the streams test alone is correct
+        there.
         """
         if self.method != "ps":
             raise ValueError("velocity_single_stream() needs PS-DTFE outputs (method='ps'); "
                              "the stream-count field is only produced by PS-DTFE")
         # mode='ram': the NaN masking below WRITES into the array, so it must never be the
-        # read-only memmap that mode='auto' returns for over-budget grids. The streams grid
-        # is only compared against, so auto (possibly memmap) is fine there.
+        # read-only memmap that mode='auto' returns for over-budget grids. The mask grids are
+        # only compared against, so auto (possibly memmap) is fine there.
         vel = self.load("velocity", mode="ram")
-        vel[np.abs(self.load("streams") - 1.0) > STREAM_TOL] = np.nan
+        multi = np.abs(self.load("streams") - 1.0) > STREAM_TOL
+        if self.has("hidden_streams"):
+            multi |= (np.rint(self.load("hidden_streams")).astype(np.int32) & 1) != 0
+        vel[multi] = np.nan
         return vel
 
     # ------------------------------------------------------------------ helpers
@@ -523,6 +642,9 @@ class PointPlane:
         "dispersion": (".pts_velDisp", 6, 1.0),
         "velGrad":    (".pts_velGrad", 9, 0.5),
         "denGrad":    (".pts_denGrad", 3, None),
+        # --ps-caustics: per-point caustic mask, same bit layout as the grid 'caustic_class'
+        # (both parity bits set = the point sits on a fold). Decode with caustic_collapse_max().
+        "caustic":    (".pts_caustic", 1, None),
     }
     _DERIVED = ("speed", "dispTrace", "dispMag", "velDiv", "velShear", "velVort", "denGradMag")
 
@@ -530,6 +652,7 @@ class PointPlane:
                  project: str = "plane"):
         import json
         self.prefix = Path(prefix)
+        self._plane_json = Path(plane_json)         # sample_grid_field() reads the '.bin' beside it
         self.side = json.loads(Path(plane_json).read_text())
         self.nu, self.nv = int(self.side["nu"]), int(self.side["nv"])
         self.planes = int(self.side["planes"])
@@ -583,17 +706,63 @@ class PointPlane:
 
     def _load(self, name: str) -> np.ndarray:
         ext, comps, exp = self._PTS_FIELDS[name]
-        dtype = np.int32 if name == "streams" else np.float64
+        dtype = np.int32 if name in ("streams", "caustic") else np.float64
         k = self.supersample
         raw = np.fromfile(f"{self.prefix}{ext}", dtype=dtype)
         shape = (self.planes, self.nv * k, self.nu * k) + ((comps,) if comps > 1 else ())
         arr = raw.reshape(shape)
+        if name == "caustic":
+            # A BITMASK must never be averaged: the mean of two masks is not a mask. Both
+            # reductions are a bitwise OR instead, which is exactly how the grid merges the
+            # same bits across partitions -- so a supersampled or slab plane reports "this
+            # pixel is covered by a tetrahedron with these properties", the intended meaning.
+            arr = np.bitwise_or.reduce(arr, axis=0) if self.project == "slab" \
+                  else arr[self.planes // 2]
+            if k > 1:
+                arr = np.bitwise_or.reduce(arr.reshape(self.nv, k, self.nu, k), axis=(1, 3))
+            return arr
         arr = arr.mean(axis=0) if self.project == "slab" else arr[self.planes // 2]
         if k > 1:                                   # average each KxK sub-sample block
             tail = (comps,) if comps > 1 else ()
             arr = arr.reshape((self.nv, k, self.nu, k) + tail).mean(axis=(1, 3))
         s = self._scale(exp)
         return arr if s == 1.0 else arr * s
+
+    def sample_grid_field(self, grid, plane_bin=None, mode="trilinear"):
+        """Sample a full-box grid field at this plane's sample points, in the plane's shape.
+
+        This is how the T-web and V-web reach a point-evaluated plane. Neither is a local
+        quantity that point evaluation could produce on its own: the T-web comes from the tidal
+        tensor, i.e. a GLOBAL FFT Poisson solve over the density grid, and the V-web from the
+        velocity shear tensor under a specific normalisation (-sqrt(a)/(2*100h), applied by the
+        binary). Rather than re-deriving either -- and risking a classification that disagrees
+        with the grid's -- the certified grid is sampled at the very positions the plane was
+        evaluated at, read back from the plane's own '.bin'.
+
+        Pass mode='ngp' for categorical grids (tweb/vweb labels must never be interpolated).
+        """
+        from .environment import sample_grid
+
+        if plane_bin is None:
+            plane_bin = str(self._plane_json).replace(".json", ".bin")
+        pts = np.fromfile(str(plane_bin), dtype=np.float64).reshape(-1, 3)
+        frac = (pts / float(self.side["box"])) % 1.0
+        vals = sample_grid(np.asarray(grid), frac, mode=mode)
+
+        k = self.supersample
+        comps = 1 if vals.ndim == 1 else vals.shape[-1]
+        shape = (self.planes, self.nv * k, self.nu * k) + ((comps,) if comps > 1 else ())
+        arr = vals.reshape(shape)
+        if mode == "ngp":       # labels: take the central plane / sub-sample, never a mean
+            arr = arr[self.planes // 2]
+            if k > 1:
+                arr = arr[k // 2::k, k // 2::k]
+            return arr
+        arr = arr.mean(axis=0) if self.project == "slab" else arr[self.planes // 2]
+        if k > 1:
+            tail = (comps,) if comps > 1 else ()
+            arr = arr.reshape((self.nv, k, self.nu, k) + tail).mean(axis=(1, 3))
+        return arr
 
     def available(self):
         base = [n for n, (ext, _, _) in self._PTS_FIELDS.items()

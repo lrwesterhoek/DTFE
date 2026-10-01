@@ -116,10 +116,12 @@ struct User_options
 #ifdef PHASE_SPACE
     std::string lagrangianInputFilename; // file with Lagrangian (initial condition) positions for PS-DTFE
 #endif
+    std::string tessellationCacheDir;    // --tessellation-cache: directory holding the reusable on-disk tessellation (empty = off); BOTH binaries build a tessellation, so this is not PS-only. See CGAL_triangulation/tessellation_cache.h
 
 
     std::vector<size_t> gridSize;// grid size along each direction
     bool   periodic;      // true if the particle data is in a periodic box
+    bool   periodicInput; // the user's '--periodic' as given -- never reset by the partition/padding code, which turns 'periodic' off once the copies exist (the tessellation cache keys on this: the copies change the tessellation)
     Box    boxCoordinates;// coordinates of the full particle data box
     bool   userGivenBoxCoordinates;// true if the user supplied the box coordinates
     int    inputFileType;   // input file type
@@ -132,10 +134,12 @@ struct User_options
     Field  aField;        // averaged field: volume average over the grid cell
     
     
-    bool   partitionOn;   // true if the user selects the partition option
+    bool   partitionOn;   // true if the data IS split into several partitions (user- or auto-selected)
+    bool   partitionGiven;// true if the user passed '--partition' at all -- including '1 1 1', which asks for ONE triangulation (partitionOn stays false) and must keep the auto-tuner from choosing a split
     std::vector<size_t> partition;// grid along which to split the particle data so the Delaunay triangulation runs on parts (time/memory)
     int    partNo;        // which partition the program should output (index in 'fileGrid')
     int    maxConcurrent; // cap on concurrently-built Delaunay triangulations (peak RAM ~ concurrency x per-triangulation); 0 = all threads. PS-DTFE: concurrent Lagrangian partitions; standard DTFE: concurrent spatial sub-triangulations.
+    bool   autoTuneReport;  // --auto-tune-report: print the auto-tuner's decision and predicted peak memory as ONE machine-readable line after loading the input, then exit (the GUI's memory check)
     bool   maxConcurrentOn; // true if the user gave --max-concurrent explicitly (0 is both the default and a legal value, so presence must be tracked separately for the auto-tuner)
     
     
@@ -163,16 +167,24 @@ struct User_options
     // (0/1 coverage). --per-stream/--per-stream-ids parse in both but are rejected in the
     // standard binary (there is no stream decomposition to write).
     std::string psSamplePointsFile;    // --sample-points: file with arbitrary Eulerian evaluation points (empty = mode off)
+    bool   psServe;                    // --serve: keep the (single) tessellation in memory and answer point-evaluation batches over stdin/stdout (the dtfelib.Estimator protocol, ps_point_eval.cc) instead of writing grids
     bool   psPerStream;                // --per-stream (PS-DTFE only): also write every stream's density+velocity per sample point (ragged layout)
     bool   psPerStreamIds;             // --per-stream-ids (PS-DTFE only): also write each stream's identity = its 4 Lagrangian-vertex ParticleIDs, sorted (implies --per-stream)
     bool   psPtsDenGrad;               // --pts-den-grad: also write the 'dtfe'-profile density gradient at each sample point (float64 x3; + ragged per-stream file with --per-stream)
     bool   psPtsVelGrad;               // --pts-vel-grad: also write the density-weighted mean velocity gradient at each sample point (float64 x9, [d*3+j] = dv_j/dx_d)
+    bool   psPtsScalar;                // --pts-scalar: also interpolate the particles' scalar value (--scalar-dataset) per stream: '.pts_scalar' (density-weighted mean over the streams) + '.pts_stream_scalar' with --per-stream
+    bool   psPtsLagrangian;            // --pts-lagrangian (PS-DTFE only): also write each stream's Lagrangian coordinate q(x) -- where the matter at the point started -- to '.pts_stream_lagpos' (float64 x3 per stream; implies --per-stream)
+    std::string scalarDataset;         // --scalar-dataset NAME: Gadget HDF5 input reads '/PartTypeN/NAME' (one value per particle, raw) as the scalar field every estimator interpolates (empty = the reader's own scalar, if any)
+    int    serveResident;              // --serve-resident N: with '--serve --partition', how many partition tessellations stay in memory at once (the rest are reloaded from '--tessellation-cache' on demand); 0 = automatic
     bool   psStreamDensityGeometric;   // PS-DTFE --ps-stream-density: true = 'geometric' (m_tet/V_eul, matches the mass-conserving deposit), false = 'dtfe' (vertex-density interpolation, matches the Feldbrugge reference; DEFAULT). Always false in the standard binary.
 #ifdef PHASE_SPACE
     int    psAvgSubsamples; // PS-DTFE: linear sub-sample count nSub for '_a' fields (nSub^NO_DIM sub-grid per cell, cost ~nSub^NO_DIM); 3 = 27 sub-points (default), 1 = cell-centre.
     bool   psUseMetal;      // PS-DTFE: run the grid deposit on the GPU; needs a Metal build (METAL=1, else falls back to the CPU deposit with a warning). Set by --ps-gpu.
     bool   psLinearDeposit;            // PS-DTFE --ps-linear-deposit: weight each tetrahedron's interior samples by the DTFE-interpolated linear density (renormalized per tet, so the deposited total still equals the tet mass EXACTLY) instead of equal shares
+    bool   psCausticCusps;      // --ps-caustic-cusps: also estimate the A3 (cusp) indicator, bit 7 of the caustic mask. Opt-in: it costs a neighbour gather per near-fold tetrahedron and, being a finite-difference estimator on an irregular tessellation, carries a measurable false-positive rate (see ps_caustic_class.h)
     bool   psCaustics;                 // PS-DTFE --ps-caustics: record per grid cell whether tetrahedra of BOTH map orientations (sign of det(Ax) = Lagrangian->Eulerian parity, flips at each fold) overlap it; the 0/1 flag is written as '<output>.caustic'. CPU and GPU deposits; 3D only.
+    bool   psParallelTriangulation;    // PS-DTFE --parallel-triangulation: build the Delaunay triangulation on the performance cores (TBB build). Off by default: the parallel insert's vertex and cell order differ run to run, so float outputs then differ at rounding (stream counts do not); a sequential insert reproduces bit for bit
+    Real   psAlphaShape;               // PS-DTFE --ps-alpha-shape <c>: a NON-periodic run keeps only the tetrahedra whose Lagrangian circumradius is at most c mean particle spacings -- the cloud's alpha shape instead of its convex hull (default 3; 0 = the whole hull)
     Real   psHaloRelease;              // PS-DTFE --ps-halo-release <D>: during the GRID deposit, a tetrahedron whose geometric stream density rho_geo/rho_bar = V_lag/V_eul exceeds D is deposited monolithically at its Eulerian centroid cell (the sub-sample-spacing fallback path) instead of being rasterized over its bbox. 0 (default) = off. Mass conservation is exact; point evaluation is unaffected.
     bool   psExactDeposit;             // PS-DTFE --ps-exact-deposit: replace the nSub^3 sub-sampled grid deposit by EXACT tetrahedron-cell intersection moments (vendored r3d, Powell & Abel 2015). CPU (double, reference) and GPU (float32 r3d port, --ps-gpu); 3D only; nSub is ignored (the exact deposit IS the nSub->infinity limit, so '.den' == '.a_den').
     bool   psVertexMass;               // PS-DTFE --ps-vertex-mass: per-tetrahedron mass = sum over its vertices of weight/degree (chart-independent) instead of rho_bar * V_lag. Removes the 1-D(z_ic)/D(z) density-contrast suppression when --lagrangianInput holds PERTURBED IC positions (e.g. TNG z=127) rather than the unperturbed lattice.
@@ -218,9 +230,11 @@ struct User_options
     // set during runtime, not from the command line
 #ifdef PHASE_SPACE
     Box    lagrangianRegion; // unpadded Lagrangian partition region (PS-DTFE cell ownership check)
+    double psLagAlphaRadius; // the --ps-alpha-shape cut in Lagrangian length (c x mean spacing, set for non-periodic runs; 0 = no cut)
     bool   psMayClearDT;     // set by the DTFE_interpolation overload that OWNS its triangulation: the last interpolateGrid_phaseSpace call may clear the DT right after its deposit (frees ~650 B/vertex before the merge phase). Never set when the caller keeps the triangulation (TRIANGULATION library API).
     bool   psSuppressGridStats; // PS-DTFE partition path: silence per-partition coverage/stream stats (each covers ~1/Npart of the grid); aggregate reported once after the loop
     bool   psUseSubgrid;        // PS-DTFE partition path: allocate only each partition's Eulerian bounding box, mapped back via addFromSubgrid -> lower peak memory
+    bool   psOrderedMerge;      // PS-DTFE partition path: merge the partitions' grids in index order (bit-reproducible sums). Set by the auto-tuner's SPEED split of a small set, whose uniform partitions wait for each other at no cost; a memory-driven split of a large set merges in completion order (waiting behind a slow partition cost the TNG region's GPU grid 35%, for sums the GPU's atomics make non-reproducible anyway)
     bool   psDeferNormalization; // PS-DTFE partition path: keep fields as density-weighted moments (no per-partition normalize) so they sum linearly and normalize once afterwards; correct for multi-stream cells spanning partitions
 #endif
     Box    paddedBox;      // dimensions of the padded box

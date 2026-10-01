@@ -24,6 +24,9 @@
 
 #include <vector>
 #include <cmath>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
 #include <chrono>   // partition-loop progress + ETA
 #ifdef OPEN_MP
     #include <omp.h>
@@ -99,6 +102,22 @@ extern void computeVelocitySpaceDensity(vector<Particle_data> &particles,
 #endif
 
 
+// A partition loop announces how many tessellations it builds at once and how many it has left
+// (triangulation.cpp divides the cores of its parallel insertion by the smaller of the two);
+// each partition counts itself off when it is done with its build and deposit.
+extern std::atomic<int> dtfeTriangulationConcurrency;
+extern std::atomic<int> dtfeTriangulationsRemaining;
+struct ConcurrentTriangulationPlan
+{
+    ConcurrentTriangulationPlan(int const concurrency, int const total)
+    { dtfeTriangulationConcurrency = concurrency; dtfeTriangulationsRemaining = total; }
+    ~ConcurrentTriangulationPlan() { dtfeTriangulationConcurrency = 0; dtfeTriangulationsRemaining = 0; }
+};
+struct ConcurrentTriangulationGuard
+{
+    ~ConcurrentTriangulationGuard() { --dtfeTriangulationsRemaining; }
+};
+
 // Particle data plus the resolved per-run options produced by the common DTFE setup.
 struct DTFE_State {
     vector<Particle_data> particles;
@@ -130,6 +149,109 @@ static void computeLagrangianBoundingBox(vector<Particle_data> const &particles,
         lagBox[2*d+1] += eps;
     }
 }
+
+
+// The Lagrangian partition geometry of a partitioned PS-DTFE run, shared by the batch partition
+// loop and the composite '--serve' builder: both must select EXACTLY the same particles for
+// partition pi (the server even reuses the batch runs' per-partition tessellation caches, whose
+// identity is the partition's lagrangianRegion). The arithmetic is the batch loop's, verbatim.
+struct PSPartitionPlan
+{
+    Box    lagBox;
+    Real   lagLen[NO_DIM], eulerLen[NO_DIM], lagPadding[NO_DIM];
+    size_t grid[NO_DIM];
+    int    total = 1;
+    bool   periodicCopies = false;
+
+    void init(DTFE_State &state, Box &lagBoxGlobal, bool const hasLagrangianPeriodicCopies,
+              MESSAGE::Message &message)
+    {
+        periodicCopies = hasLagrangianPeriodicCopies;
+        total = 1;
+        for (int d=0; d<NO_DIM; ++d)
+        {
+            grid[d] = state.options.partition[d];
+            total *= int(grid[d]);
+        }
+
+        // reuse the Lagrangian bounding box computed before periodic copies, else recompute it here
+        if (!lagBoxGlobal.isNullBox())
+            lagBox = lagBoxGlobal;
+        else
+            computeLagrangianBoundingBox( state.particles, lagBox );
+        message << MESSAGE::cBold() << "PS-DTFE:" << MESSAGE::cReset() << " Lagrangian bounding box = "
+                << MESSAGE::cMagenta() << lagBox.print() << MESSAGE::cReset() << "\n" << MESSAGE::Flush;
+
+        for (int d=0; d<NO_DIM; ++d)
+            lagLen[d] = lagBox[2*d+1] - lagBox[2*d];
+
+        // Eulerian box length per axis: the period used to shift each partition's deferred copies
+        for (int d=0; d<NO_DIM; ++d)
+            eulerLen[d] = state.options.boxCoordinates[2*d+1] - state.options.boxCoordinates[2*d];
+
+        // Lagrangian padding per axis: same fraction as Eulerian, floored at 0.30 of a partition cell
+        for (int d=0; d<NO_DIM; ++d)
+        {
+            Real padFrac = (state.options.paddingLength[2*d] + state.options.paddingLength[2*d+1]) / (Real(2.) * eulerLen[d]);
+            lagPadding[d] = padFrac * lagLen[d];
+            if (lagPadding[d] < lagLen[d] / state.options.partition[d] * Real(0.3))
+                lagPadding[d] = lagLen[d] / state.options.partition[d] * Real(0.3);
+            // --ps-alpha-shape (non-periodic): a kept tetrahedron (circumradius <= a) owned by this
+            // partition has its empty circumsphere within 2a of its centroid, so with >= 2a of
+            // padding it is in the partition's triangulation exactly when it is in the global one;
+            // --ps-vertex-mass also counts the kept tets around each of its vertices, which reach 4a
+            if ( state.options.psLagAlphaRadius > 0. )
+            {
+                Real const alphaPad = Real( 4.2 * state.options.psLagAlphaRadius );
+                if (lagPadding[d] < alphaPad) lagPadding[d] = alphaPad;
+            }
+        }
+    }
+
+    // partition pi's unpadded Lagrangian region (its ownership box) and the padded one that
+    // selects its particles
+    void regions(int const pi, Box &lagRegion, Box &lagPadded)      // read-only (Box has no const operator[])
+    {
+        // unflatten the linear partition index pi into per-axis partition coordinates
+        int idx[NO_DIM];
+        {
+            int rem = pi;
+            for (int d=NO_DIM-1; d>=0; --d)
+            {
+                idx[d] = rem % grid[d];
+                rem /= grid[d];
+            }
+        }
+
+        for (int d=0; d<NO_DIM; ++d)
+        {
+            lagRegion[2*d]   = lagBox[2*d] + lagLen[d] * idx[d] / grid[d];
+            lagRegion[2*d+1] = lagBox[2*d] + lagLen[d] * (idx[d]+1) / grid[d];
+            // periodic: the partition regions must tile one full PERIOD, not just the
+            // particle bounding box. Image tets can have Lagrangian centroids in the gap
+            // between lagBox and the periodic box (half a lattice spacing for cell-centred
+            // ICs); with the tiling anchored to lagBox they are owned by NO partition and
+            // their mass is silently dropped (uncovered Eulerian slabs at the box edges).
+            // Anchoring the first partition's lower edge one period below the last
+            // partition's upper edge keeps the tiling exclusive AND exhaustive mod L.
+            if (periodicCopies && idx[d] == 0)
+                lagRegion[2*d] = lagBox[2*d+1] - eulerLen[d];
+        }
+
+        lagPadded = lagRegion;
+        for (int d=0; d<NO_DIM; ++d)
+        {
+            lagPadded[2*d]   -= lagPadding[d];
+            lagPadded[2*d+1] += lagPadding[d];
+            // clamp to the overall Lagrangian box only when no periodic copies exist
+            if (!periodicCopies)
+            {
+                if (lagPadded[2*d]   < lagBox[2*d])   lagPadded[2*d]   = lagBox[2*d];
+                if (lagPadded[2*d+1] > lagBox[2*d+1]) lagPadded[2*d+1] = lagBox[2*d+1];
+            }
+        }
+    }
+};
 #endif
 
 
@@ -196,7 +318,14 @@ DTFE_State DTFE_setup(vector<Particle_data> *allParticles,
 #elif defined(DTFE_GPU)
         gpuActive = userOptions.useMetal;
 #endif
-        autoTunePartitioning( userOptions, particlePointer->size(), not samples.empty(), gpuActive );
+        AutoTuneReport const report = autoTunePartitioning( userOptions, particlePointer->size(),
+                                                            not samples.empty(), gpuActive, particlePointer );
+        if ( userOptions.autoTuneReport )   // the memory check: the decision and prediction, nothing else
+        {
+            std::printf( "%s\n", report.line().c_str() );
+            std::fflush( stdout );
+            std::exit( 0 );
+        }
     }
 
     // velocity derivatives are computed from the gradient afterwards, so request the gradient now
@@ -351,6 +480,16 @@ void DTFE(vector<Particle_data> *allParticles,
                 msg << MESSAGE::cBold() << "PS-DTFE (non-periodic):" << MESSAGE::cReset()
                     << " density normalized to the Lagrangian cloud density N*m/V_lagBox = "
                     << MESSAGE::cMagenta() << state.options.averageDensity << MESSAGE::cReset() << ".\n" << MESSAGE::Flush;
+                // --ps-alpha-shape: the Lagrangian domain is the cloud's alpha shape (psFilterCell)
+                if ( state.options.psAlphaShape > Real(0.) )
+                {
+                    double const spacing = std::cbrt( vLag / double(state.particles.size()) );
+                    state.options.psLagAlphaRadius = double(state.options.psAlphaShape) * spacing;
+                    msg << MESSAGE::cBold() << "PS-DTFE (non-periodic):" << MESSAGE::cReset()
+                        << " Lagrangian domain = alpha shape, tetrahedra with circumradius <= "
+                        << MESSAGE::cMagenta() << state.options.psLagAlphaRadius << MESSAGE::cReset() << " ("
+                        << state.options.psAlphaShape << " mean spacings of " << spacing << "; --ps-alpha-shape).\n" << MESSAGE::Flush;
+                }
             }
         }
     }
@@ -482,7 +621,8 @@ void DTFE(vector<Particle_data> *allParticles,
     // arbitrary-point evaluation (--sample-points), both binaries: load the query points and
     // build their bucket index once, now that region/periodic/averageDensity are final. Each
     // triangulation then contributes its streams; psPointEvalFinalize() reduces them at the end.
-    if ( not state.options.psSamplePointsFile.empty() )
+    // --serve arms the same context without points; each request supplies its own.
+    if ( not state.options.psSamplePointsFile.empty() or state.options.psServe )
         psPointEvalInit( state.options );
 
 #ifdef PHASE_SPACE
@@ -499,32 +639,58 @@ void DTFE(vector<Particle_data> *allParticles,
                 << " partitions [" << MESSAGE::printElements( userOptions.partition, "," ) << "]"
                 << MESSAGE::cReset() << ".\n" << MESSAGE::Flush;
 
-        // reuse the Lagrangian bounding box computed before periodic copies, else recompute it here
-        Box lagBox;
-        if (!lagBoxGlobal.isNullBox())
-            lagBox = lagBoxGlobal;
-        else
-            computeLagrangianBoundingBox( state.particles, lagBox );
-        message << MESSAGE::cBold() << "PS-DTFE:" << MESSAGE::cReset() << " Lagrangian bounding box = "
-                << MESSAGE::cMagenta() << lagBox.print() << MESSAGE::cReset() << "\n" << MESSAGE::Flush;
+        // the partition geometry (bounding box, lengths, padding), shared with the composite server
+        PSPartitionPlan plan;
+        plan.init( state, lagBoxGlobal, hasLagrangianPeriodicCopies, message );
 
-        Real lagLen[NO_DIM];
-        for (int d=0; d<NO_DIM; ++d)
-            lagLen[d] = lagBox[2*d+1] - lagBox[2*d];
-
-        // Eulerian box length per axis: the period used to shift each partition's deferred copies
-        Real eulerLenArr[NO_DIM];
-        for (int d=0; d<NO_DIM; ++d)
-            eulerLenArr[d] = state.options.boxCoordinates[2*d+1] - state.options.boxCoordinates[2*d];
-
-        // Lagrangian padding per axis: same fraction as Eulerian, floored at 0.30 of a partition cell
-        Real lagPadding[NO_DIM];
-        for (int d=0; d<NO_DIM; ++d)
+        // Eulerian region/padding for the full box (needed by DTFE_interpolation; also part of every
+        // partition's tessellation-cache identity, so it is set before the composite server too)
+        if ( not userOptions.regionOn and not (userOptions.partitionOn and userOptions.partNo>=0) )
         {
-            Real padFrac = (state.options.paddingLength[2*d] + state.options.paddingLength[2*d+1]) / (Real(2.) * eulerLenArr[d]);
-            lagPadding[d] = padFrac * lagLen[d];
-            if (lagPadding[d] < lagLen[d] / state.options.partition[d] * Real(0.3))
-                lagPadding[d] = lagLen[d] / state.options.partition[d] * Real(0.3);
+            state.options.region = state.options.boxCoordinates;
+            state.options.paddedBox = state.options.region;
+            state.options.paddedBox.addPadding( state.options.paddingLength );
+        }
+
+        // '--serve --partition': a composite server of the partition tessellations instead of grids
+        if ( state.options.psServe )
+        {
+            int concurrency = plan.total;
+            if ( userOptions.maxConcurrent > 0 and userOptions.maxConcurrent < concurrency )
+                concurrency = userOptions.maxConcurrent;
+#ifdef OPEN_MP
+            concurrency = std::max( 1, std::min( concurrency, omp_get_max_threads() ) );
+#endif
+            psServeCompositeBegin( state.options, plan.total );
+            ConcurrentTriangulationPlan triangulationPlan( concurrency, plan.total );
+#ifdef OPEN_MP
+            #pragma omp parallel for schedule(dynamic, 1) num_threads(concurrency)
+#endif
+            for (int pi=0; pi<plan.total; ++pi)
+            {
+            ConcurrentTriangulationGuard concurrentTriangulation;
+                Box lagRegion, lagPadded;
+                plan.regions( pi, lagRegion, lagPadded );
+                // the batch loop's per-partition options (below), so the cache files are shared
+                User_options tempOpt = state.options;
+                tempOpt.lagrangianRegion = lagRegion;
+                tempOpt.psSuppressGridStats = true;
+                tempOpt.psDeferNormalization = true;
+                tempOpt.psUseSubgrid = true;
+                int tnum = 0;
+#ifdef OPEN_MP
+                tnum = omp_get_thread_num();
+#endif
+                tempOpt.verboseLevel = (tnum == 0) ? std::min( userOptions.verboseLevel, 1 ) : 0;
+                psServeCompositeAddPartition( pi, tempOpt,
+                    [&](std::vector<Particle_data> &out)
+                    {
+                        findParticlesInBoxLagrangianPeriodic( state.particles, &out, lagPadded,
+                                                              plan.eulerLen, plan.periodicCopies, 0 );
+                    }, nullptr, nullptr );
+            }
+            std::vector<Particle_data>().swap( state.particles );
+            psServeCompositeRun( state.options );   // answers requests until stdin closes; never returns
         }
 
         uQuantities->reserveMemory( &(state.options.gridSize[0]), state.options.uField );
@@ -536,9 +702,15 @@ void DTFE(vector<Particle_data> *allParticles,
             size_t totalGrid = 1;
             for (int d=0; d<NO_DIM; ++d) totalGrid *= state.options.gridSize[d];
             if ( state.options.uField.selected() )
+            {
                 uQuantities->stream_count.assign(totalGrid, Real(0.));
+                uQuantities->hidden_streams.assign(totalGrid, Real(0.));
+            }
             if ( state.options.aField.selected() )
+            {
                 aQuantities->stream_count.assign(totalGrid, Real(0.));
+                aQuantities->hidden_streams.assign(totalGrid, Real(0.));
+            }
             if ( state.options.psCaustics )
             {
                 if ( state.options.uField.selected() )
@@ -555,21 +727,11 @@ void DTFE(vector<Particle_data> *allParticles,
             }
         }
 
-        // Eulerian region/padding for the full box (needed by DTFE_interpolation)
-        if ( not userOptions.regionOn and not (userOptions.partitionOn and userOptions.partNo>=0) )
-        {
-            state.options.region = state.options.boxCoordinates;
-            state.options.paddedBox = state.options.region;
-            state.options.paddedBox.addPadding( state.options.paddingLength );
-        }
         // periodic=true here only drives grid-level index wrapping; data periodicity comes
         // from the Lagrangian copies and Eulerian unwrapping
 
         // each thread builds, interpolates, and accumulates its own triangulation into the
         // shared grids inside a critical section; peak memory ~ (concurrent partitions) x full grid
-        size_t partGrid[NO_DIM];
-        for (int d=0; d<NO_DIM; ++d)
-            partGrid[d] = state.options.partition[d];
 
         // cap concurrent partition triangulations (the dominant memory cost); --max-concurrent trades cores for RAM, 0 = all threads
         int psConcurrency = totalPartitions;
@@ -580,65 +742,43 @@ void DTFE(vector<Particle_data> *allParticles,
                 << MESSAGE::cMagenta() << psConcurrency << MESSAGE::cReset() << " partition triangulation(s) concurrently"
                 << ( userOptions.maxConcurrent > 0 ? " (--max-concurrent)" : "" ) << ".\n" << MESSAGE::Flush;
 
-        // progress + ETA; updated only in the critical section below so it is race-free
+        // progress + ETA; updated only under mergeMutex below so it is race-free
         auto const psLoopStart = std::chrono::steady_clock::now();
         int psDone = 0;
+        // The auto-tuner's SPEED split of a small set (psOrderedMerge) adds the partitions' grids
+        // in INDEX order, so the float sums are the same run after run; its partitions are small
+        // and uniform, so waiting for the predecessor costs nothing. A memory-driven split keeps
+        // merging in completion order: its partitions differ 30x in cost, and threads idling behind
+        // a slow one cost the TNG region's GPU grid 35% -- for sums the GPU's atomics make non-
+        // reproducible anyway. Waiting cannot deadlock: the dynamic schedule hands iterations out in
+        // order, so every lower index is already running or done.
+        bool const orderedMerge = state.options.psOrderedMerge;
+        std::mutex mergeMutex;
+        std::condition_variable mergeCv;
+        int nextMerge = 0;
 
+        ConcurrentTriangulationPlan triangulationPlan( psConcurrency, totalPartitions );
 #ifdef OPEN_MP
         #pragma omp parallel for schedule(dynamic, 1) num_threads(psConcurrency)
 #endif
         for (int pi=0; pi<totalPartitions; ++pi)
         {
-            // unflatten the linear partition index pi into per-axis partition coordinates
-            int idx[NO_DIM];
-            {
-                int rem = pi;
-                for (int d=NO_DIM-1; d>=0; --d)
-                {
-                    idx[d] = rem % partGrid[d];
-                    rem /= partGrid[d];
-                }
-            }
-
-            // unpadded Lagrangian region for this partition
-            Box lagRegion;
-            for (int d=0; d<NO_DIM; ++d)
-            {
-                lagRegion[2*d]   = lagBox[2*d] + lagLen[d] * idx[d] / partGrid[d];
-                lagRegion[2*d+1] = lagBox[2*d] + lagLen[d] * (idx[d]+1) / partGrid[d];
-                // periodic: the partition regions must tile one full PERIOD, not just the
-                // particle bounding box. Image tets can have Lagrangian centroids in the gap
-                // between lagBox and the periodic box (half a lattice spacing for cell-centred
-                // ICs); with the tiling anchored to lagBox they are owned by NO partition and
-                // their mass is silently dropped (uncovered Eulerian slabs at the box edges).
-                // Anchoring the first partition's lower edge one period below the last
-                // partition's upper edge keeps the tiling exclusive AND exhaustive mod L.
-                if (hasLagrangianPeriodicCopies && idx[d] == 0)
-                    lagRegion[2*d] = lagBox[2*d+1] - eulerLenArr[d];
-            }
-
-            Box lagPadded = lagRegion;
-            for (int d=0; d<NO_DIM; ++d)
-            {
-                lagPadded[2*d]   -= lagPadding[d];
-                lagPadded[2*d+1] += lagPadding[d];
-                // clamp to the overall Lagrangian box only when no periodic copies exist
-                if (!hasLagrangianPeriodicCopies)
-                {
-                    if (lagPadded[2*d]   < lagBox[2*d])   lagPadded[2*d]   = lagBox[2*d];
-                    if (lagPadded[2*d+1] > lagBox[2*d+1]) lagPadded[2*d+1] = lagBox[2*d+1];
-                }
-            }
+            ConcurrentTriangulationGuard concurrentTriangulation;
+            // unpadded Lagrangian region for this partition (ownership) and the padded selection box
+            Box lagRegion, lagPadded;
+            plan.regions( pi, lagRegion, lagPadded );
 
             // select particles by Lagrangian position; when periodic, this partition's images
             // are generated on the fly so the global array stays originals-only
             vector<Particle_data> tempPart;
             findParticlesInBoxLagrangianPeriodic( state.particles, &tempPart, lagPadded,
-                                                  eulerLenArr, hasLagrangianPeriodicCopies, 0 );
+                                                  plan.eulerLen, plan.periodicCopies, 0 );
 
-            if (tempPart.empty())
-                continue;
-
+            // an empty partition builds nothing but still takes its turn in the ordered merge
+            bool const emptyPartition = tempPart.empty();
+            Quantities temp_uQuantities, temp_aQuantities;
+            if ( not emptyPartition )
+            {
             // per-partition options use the full Eulerian grid; only the master thread logs
             User_options tempOpt = state.options;
             tempOpt.lagrangianRegion = lagRegion;  // for cell ownership check
@@ -652,16 +792,24 @@ void DTFE(vector<Particle_data> *allParticles,
             tempOpt.verboseLevel = (tnum == 0) ? userOptions.verboseLevel : 0;
 
             // PS-DTFE: DTFE_parallel calls serial interpolation directly (no nested OpenMP region)
-            Quantities temp_uQuantities, temp_aQuantities;
             DTFE_parallel( &tempPart, samples, tempOpt, &temp_uQuantities, &temp_aQuantities );
+            }
 
-            // accumulate into the shared grids (serialized)
-#ifdef OPEN_MP
-            #pragma omp critical
-#endif
+            // accumulate into the shared grids (in partition order under the speed split)
             {
-                uQuantities->addFromSubgrid( temp_uQuantities, &(state.options.gridSize[0]) );
-                aQuantities->addFromSubgrid( temp_aQuantities, &(state.options.gridSize[0]) );
+                std::unique_lock<std::mutex> lock( mergeMutex );
+                if ( orderedMerge )
+                    mergeCv.wait( lock, [&]{ return nextMerge == pi; } );
+                if ( not emptyPartition )
+                {
+                    uQuantities->addFromSubgrid( temp_uQuantities, &(state.options.gridSize[0]) );
+                    aQuantities->addFromSubgrid( temp_aQuantities, &(state.options.gridSize[0]) );
+                }
+                if ( orderedMerge )
+                {
+                    nextMerge = pi + 1;
+                    mergeCv.notify_all();
+                }
 
                 ++psDone;
                 double const elapsed = std::chrono::duration<double>( std::chrono::steady_clock::now() - psLoopStart ).count();
@@ -739,6 +887,66 @@ void DTFE(vector<Particle_data> *allParticles,
         MESSAGE::Message message( userOptions.verboseLevel );
         message << "The program will interpolate the fields in the region of interest using " << totalPartitions << " partitions defined via the grid [" << MESSAGE::printElements( userOptions.partition, "," ) << "].\n" << MESSAGE::Flush;
 
+#if NO_DIM==3 && !defined(PHASE_SPACE)
+        // '--serve --partition': a composite server of Eulerian partition tessellations. Each
+        // partition owns the tetrahedra whose centroid lies in its (unpadded) region -- the outer
+        // faces of a non-periodic box open to infinity, so hull tetrahedra keep an owner.
+        if ( state.options.psServe )
+        {
+            // the load-balancing split works on particle counts per grid cell; a server has no
+            // grid of its own (2^3), so the split gets a private 64^3 one
+            User_options splitOpt = state.options;
+            for (int d=0; d<NO_DIM; ++d)
+                splitOpt.gridSize[d] = std::max<size_t>( 64, state.options.partition[d] );
+            std::vector< std::vector<size_t> > subgridList;
+            std::vector< Box > subgridCoords;
+            optimalPartitionSplit( state.particles, splitOpt, state.options.partition, &subgridList, &subgridCoords );
+
+            int concurrency = totalPartitions;
+            if ( userOptions.maxConcurrent > 0 and userOptions.maxConcurrent < concurrency )
+                concurrency = userOptions.maxConcurrent;
+#ifdef OPEN_MP
+            concurrency = std::max( 1, std::min( concurrency, omp_get_max_threads() ) );
+#endif
+            psServeCompositeBegin( state.options, totalPartitions );
+#ifdef OPEN_MP
+            #pragma omp parallel for schedule(dynamic, 1) num_threads(concurrency)
+#endif
+            for (int i=0; i<totalPartitions; ++i)
+            {
+                User_options tempOpt = splitOpt;
+                tempOpt.partNo = i;
+                copySubgridInformation( &tempOpt, subgridList, subgridCoords );
+                tempOpt.paddedBox = tempOpt.region;
+                tempOpt.paddedBox.addPadding( tempOpt.paddingLength );
+                User_options selectOpt = tempOpt;      // periodic as given: findParticlesInBox adds the images
+                tempOpt.periodic = false;
+                int tnum = 0;
+#ifdef OPEN_MP
+                tnum = omp_get_thread_num();
+#endif
+                tempOpt.verboseLevel = (tnum == 0) ? std::min( userOptions.verboseLevel, 1 ) : 0;
+
+                double ownLo[NO_DIM], ownHi[NO_DIM];
+                for (int d=0; d<NO_DIM; ++d)
+                {
+                    ownLo[d] = double( tempOpt.region[2*d] );
+                    ownHi[d] = double( tempOpt.region[2*d+1] );
+                    if ( not state.options.periodic )
+                    {
+                        if ( tempOpt.region[2*d]   <= state.options.region[2*d] )   ownLo[d] = -std::numeric_limits<double>::infinity();
+                        if ( tempOpt.region[2*d+1] >= state.options.region[2*d+1] ) ownHi[d] =  std::numeric_limits<double>::infinity();
+                    }
+                }
+                psServeCompositeAddPartition( i, tempOpt,
+                    [&](std::vector<Particle_data> &out) { findParticlesInBox( state.particles, &out, selectOpt ); },
+                    ownLo, ownHi );
+            }
+            std::vector<Particle_data>().swap( state.particles );
+            psServeCompositeRun( state.options );   // answers requests until stdin closes; never returns
+        }
+#endif
+
         uQuantities->reserveMemory( &(state.options.gridSize[0]), state.options.uField );
         aQuantities->reserveMemory( &(state.options.gridSize[0]), state.options.aField );
 
@@ -801,10 +1009,13 @@ void DTFE(vector<Particle_data> *allParticles,
     // different partitions, so binarizing any earlier would lose it. bits==3 (both parities
     // overlap) -> 1, else 0. Not idempotent (1 -> 0 on a second pass): DTFE() runs once per
     // invocation for this flag (--interlace is rejected at option parsing).
-    if ( userOptions.psCaustics )
-        for ( std::vector<Real> *cb : { &uQuantities->caustic_bits, &aQuantities->caustic_bits } )
-            for (size_t i = 0; i < cb->size(); ++i)
-                (*cb)[i] = ( (int((*cb)[i]) & 3) == 3 ) ? Real(1.) : Real(0.);
+    /* The caustic mask is deliberately NOT binarized here. It stays full until writeOutputData,
+       which writes '.causticClass' from it and only then collapses it in place for '.caustic' --
+       one grid instead of two, saving 4 B/cell per Quantities across the post-processing window
+       where peak RSS is set. The write order there is load-bearing. */
+    // '.hidden_streams' bit 1: likewise only now, with '.streams' summed over every partition
+    uQuantities->finalizeHiddenStreams();
+    aQuantities->finalizeHiddenStreams();
 #endif
 
     // post-processing: derive velocity divergence/shear/vorticity and cosmic-web labels from the gradient

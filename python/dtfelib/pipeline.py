@@ -6,7 +6,7 @@ from scipy.ndimage import minimum_filter, maximum_filter
 
 import config
 from .io import FieldSet
-from .cli import DATA_ROOT, DEFAULT_SIM
+from .cli import DATA_ROOT, DEFAULT_SIM, sim_dir
 from . import fields as dtfe
 
 try:
@@ -272,7 +272,7 @@ class SnapshotProducts:
     @property
     def fs(self):
         if self._fs is None:
-            self._fs = FieldSet(DATA_ROOT / self.sim / f"snapdir_{self.snapshot}",
+            self._fs = FieldSet(sim_dir(self.sim) / f"snapdir_{self.snapshot}",
                                 method=self.method, prefix=self.prefix)
         return self._fs
 

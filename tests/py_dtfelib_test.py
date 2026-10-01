@@ -258,9 +258,9 @@ def t_velocity_single_stream():
     (TNG50-4-Dark). These grids come from the SAMPLED deposit, so the raw '.streams'
     multiplicities are integers; the tolerance mask must reproduce the crisp != 1 mask
     exactly there. t_velocity_single_stream_float_mask covers the exact deposit's floats."""
-    from dtfelib.cli import DATA_ROOT
+    from dtfelib.cli import sim_dir
     from dtfelib.io import FieldSet
-    snapdir = Path(DATA_ROOT) / "TNG50-4-Dark" / "snapdir_099"
+    snapdir = sim_dir("TNG50-4-Dark") / "snapdir_099"
     fs = FieldSet(snapdir, method="ps", averaged=False)
     st = fs.load("streams")
     v = fs.load("velocity")
@@ -331,8 +331,63 @@ def t_velocity_single_stream_float_mask():
             f"single-stream cells (the '!= 1' bug keeps 0)")
         assert np.array_equal(v1[single], vel[single]), "kept velocities must be untouched"
         assert np.isnan(v1[~single]).all(), "multi-stream cells must be fully NaN"
+
+        # '.hidden_streams': bit 1 = multi-stream volume '.streams' does not show, so a cell with
+        # it set is masked although its '.streams' reads 1. Bit 2 (a never-sampled tet's mass,
+        # usually of the SAME stream) must NOT mask on its own. The 2026-09-28/29 outputs wrote
+        # it as '.unresolved' with 0/1 = the old mass flag, read as bit 1 (conservative): the
+        # legacy name is exercised first, then the current one. Without either file (older
+        # outputs, whose '.streams' counted those tets) the streams test alone decides -- above.
+        unres = np.zeros((n, n, n), dtype=np.float32)
+        unres[0, :4] = 1.0                 # bit 1 inside the single-stream rows (or an old 0/1 flag)
+        unres[1, :4] = 2.0                 # bit 2 only: same-stream sub-sample mass, kept
+        unres[1, 4:6] = 3.0                # both bits: masked
+        unres[2, 0] = 1.0                  # already multi-stream: masked either way
+        old = (unres != 0).astype(np.float32)          # a 2026-09-28/29 output: 0/1 under the old name
+        old.tofile(d / "ps_output.unresolved")
+        fs = FieldSet(d, method="ps", averaged=False)
+        assert fs.has("hidden_streams"), "the old '.unresolved' file must be found under the new name"
+        kept = ~np.isnan(fs.velocity_single_stream()).any(axis=-1)
+        assert np.array_equal(kept, single & (old == 0)), "an old 0/1 flag must mask conservatively"
+        unres.tofile(d / "ps_output.hidden_streams")    # the current name wins over the old one
+        fs = FieldSet(d, method="ps", averaged=False)
+        v1 = fs.velocity_single_stream()
+        keep = single & ((unres.astype(np.int32) & 1) == 0)
+        assert 0 < keep.sum() < single.sum(), "fixture must flag some single-stream cells"
+        assert (single & (unres == 2.0)).any(), "fixture must hold bit-2-only single-stream cells"
+        kept = ~np.isnan(v1).any(axis=-1)
+        assert np.array_equal(kept, keep), (
+            f"bit-1 cells must be masked and bit-2-only cells kept: kept {kept.sum()}, expected {keep.sum()}")
+        assert np.array_equal(v1[keep], vel[keep]), "kept velocities must be untouched"
     finally:
         shutil.rmtree(d)
+
+
+def t_sim_dir_layouts():
+    """dtfelib.cli.sim_dir / find_sims resolve BOTH data layouts exactly like config.sh's sim_dir:
+    per family <root>/<family>/<sim> (the Samsung T7), and flat <root>/<sim> (~/output), under a
+    root whose name has a space; an existing flat directory wins, a new simulation goes beside its
+    family, a name without a family stays flat."""
+    import shutil
+    import tempfile
+
+    from dtfelib.cli import find_sims, sim_dir
+    root = Path(tempfile.mkdtemp(prefix="dtfelib_layout_")) / "Illustris TNG"
+    try:
+        (root / "TNG100" / "TNG100-3-Dark" / "snapdir_004").mkdir(parents=True)
+        (root / "TNG100" / "TNG100-3-Dark" / "snapdir_004" / "combined_004.hdf5").touch()
+        (root / "FLAT-1-Dark" / "snapdir_099").mkdir(parents=True)
+        (root / "FLAT-1-Dark" / "snapdir_099" / "combined_099.hdf5").touch()
+        assert sim_dir("TNG100-3-Dark", root) == root / "TNG100" / "TNG100-3-Dark"
+        assert sim_dir("TNG100-1-Dark", root) == root / "TNG100" / "TNG100-1-Dark", "new sim beside its family"
+        assert sim_dir("FLAT-1-Dark", root) == root / "FLAT-1-Dark", "an existing flat dir wins"
+        assert sim_dir("NoFamily", root) == root / "NoFamily"
+        (root / "TNG100-3-Dark").mkdir()                     # flat AND family: flat wins
+        assert sim_dir("TNG100-3-Dark", root) == root / "TNG100-3-Dark"
+        found = find_sims(root, "snapdir_*/combined_*.hdf5")
+        assert found == ["FLAT-1-Dark", "TNG100-3-Dark"], found
+    finally:
+        shutil.rmtree(root.parent)
 
 
 def t_velocity_scale():
@@ -573,8 +628,9 @@ def main():
     check("match_catalog_void (periodic)", t_match_catalog_void)
     check("shape estimators: vectorized == loop reference", t_shape_estimators)
     check("FieldSet caustic loader (synthetic)", t_caustic_field_loader)
-    check("velocity_single_stream float-streams mask (synthetic)", t_velocity_single_stream_float_mask)
+    check("velocity_single_stream float-streams + hidden-streams mask (synthetic)", t_velocity_single_stream_float_mask)
     check("FieldSet velocity_scale u-units conversion (synthetic)", t_velocity_scale)
+    check("sim_dir / find_sims: per-family and flat data layouts (synthetic)", t_sim_dir_layouts)
     check("FieldSet out-of-core loading: auto/memmap/slice/slabs (synthetic)", t_outofcore_loading)
     check("FieldSet alternate OUTPUT_PREFIX set (synthetic)", t_alternate_prefix)
     print(f"data-backed ({SIM}):")

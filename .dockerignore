@@ -14,9 +14,15 @@ tests/__pycache__/
 metal/*.air
 metal/*.metallib
 metal/validate_deposit
-third_party/
+# third_party/r3d MUST ship: r3d.o is unconditionally on both binaries' link lines, so excluding
+# the whole directory breaks the image build. Only metal-cpp is macOS-only and safe to drop.
+third_party/metal-cpp/
 figures/
 docs/
 demo/
+# generated analysis output, not build input (python/figures alone is >7 GB)
+python/figures/
+python/cache/
+python/__pycache__/
 *.hdf5
 *.runlog

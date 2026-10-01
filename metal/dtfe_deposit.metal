@@ -37,12 +37,15 @@ static inline float det3(thread const float A[3][3]) {
          + A[0][2]*(A[1][0]*A[2][1]-A[1][1]*A[2][0]);
 }
 
-// Inverse of 3x3, mirroring the CPU matrixInverse(): |det| < 1e-6 -> ZERO matrix. The
-// CPU then interpolates a constant field from the base vertex; it does NOT drop the
-// tetrahedron, so neither do we (unlike the PS deposit, which conserves mass and drops).
+// Inverse of 3x3, mirroring the CPU matrixInverse(): |det| <= 1e-6 x the product of the row
+// lengths (RELATIVE, unit-free -- see math_functions.h) -> ZERO matrix. The CPU then
+// interpolates a constant field from the base vertex; it does NOT drop the tetrahedron, so
+// neither do we (unlike the PS deposit, which conserves mass and drops).
 static inline void inverse3zero(thread const float A[3][3], thread float inv[3][3]) {
     float d = det3(A);
-    if (fabs(d) < 1.0e-6f) {
+    float rn = 1.0f;
+    for (int i=0; i<3; ++i) rn *= sqrt(A[i][0]*A[i][0] + A[i][1]*A[i][1] + A[i][2]*A[i][2]);
+    if (!(fabs(d) > 1.0e-6f * rn)) {
         for (int i=0;i<3;++i) for (int j=0;j<3;++j) inv[i][j]=0.0f;
         return;
     }

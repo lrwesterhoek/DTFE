@@ -16,7 +16,7 @@
 #
 # Linux:
 #   Uses standard system paths (/usr). Install development packages:
-#   sudo apt-get install libgsl-dev libboost-all-dev libcgal-dev libmpfr-dev libhdf5-dev libgmp-dev
+#   sudo apt-get install libgsl-dev libboost-all-dev libcgal-dev libmpfr-dev libhdf5-dev libgmp-dev libtbb-dev
 #   or equivalent for your distribution, then run 'make DTFE'
 #
 # CUSTOMIZATION:
@@ -138,9 +138,33 @@ INC_DIR = ./DTFE_include
 # Common options shared by both standard DTFE and PS-DTFE builds
 OPTIONS_COMMON =
 #------------------------ set the number of spatial dimensions (2 or 3 dimensions)
-OPTIONS_COMMON += -DNO_DIM=3
-#------------------------ set type of variables - float (comment the next line) or double (uncomment the next line)
-# OPTIONS_COMMON += -DDOUBLE
+# Override per build with 'make DTFE DIM=2'. The dimension is part of the object-directory
+# stamp below, so switching it wipes the objects exactly like a backend switch does -- mixing
+# 2D and 3D objects would otherwise link into a binary that disagrees with itself about NO_DIM.
+DIM ?= 3
+ifeq ($(filter $(DIM),2 3),)
+$(error DIM must be 2 or 3 (got '$(DIM)'))
+endif
+OPTIONS_COMMON += -DNO_DIM=$(DIM)
+#------------------------ floating-point precision: 'make PS-DTFE DOUBLE=1' builds every position,
+# density, field and accumulator in double (Real = double; outputs become float64), end to end
+# including the HDF5 reads (TNG stores Coordinates in float64, which the default float build
+# rounds on read). Costs ~2x the memory. CPU only: the Metal kernels are single precision.
+# Precision is stamped in the object directories like the backend and DIM (a switch wipes them).
+DOUBLE ?= 0
+ifeq ($(DOUBLE),1)
+OPTIONS_COMMON += -DDOUBLE
+PRECISION = double
+PREC_BUILD_ARG = DOUBLE=1
+ifeq ($(METAL),1)
+$(error DOUBLE=1 cannot be combined with METAL=1: the GPU kernels are single precision. Build the double-precision binaries CPU-only ('make PS-DTFE DOUBLE=1'))
+endif
+else ifeq ($(DOUBLE),0)
+PRECISION = float
+PREC_BUILD_ARG =
+else
+$(error DOUBLE must be 0 or 1 (got '$(DOUBLE)'))
+endif
 
 ############################# Quantities to be computed ##################################
 #------------------------ set which quantities can be computed (can save memory by leaving some out)
@@ -211,11 +235,11 @@ endif
 .PHONY: ps_gpu_mode_check
 ps_gpu_mode_check:
 	@$(MKDIR_P) $(OBJ_DIR_PS)
-	@if [ ! -f $(OBJ_DIR_PS)/.gpu_mode_$(GPU_MODE) ]; then \
-		echo ">> PS build GPU mode is now '$(GPU_MODE)'; wiping $(OBJ_DIR_PS) to avoid mixed objects"; \
-		rm -f $(OBJ_DIR_PS)/*$(OBJ_EXT) $(OBJ_DIR_PS)/*.d $(OBJ_DIR_PS)/ps_deposit_msl.h $(OBJ_DIR_PS)/.gpu_mode_* $(OBJ_DIR_PS)/.metal_mode_* $(OBJ_DIR_PS)/.build_mode; \
-		touch $(OBJ_DIR_PS)/.gpu_mode_$(GPU_MODE); \
-		printf '%s' "$(GPU_BUILD_ARG)" > $(OBJ_DIR_PS)/.build_mode; \
+	@if [ ! -f $(OBJ_DIR_PS)/.gpu_mode_$(GPU_MODE) ] || [ ! -f $(OBJ_DIR_PS)/.dim_$(DIM) ] || [ ! -f $(OBJ_DIR_PS)/.prec_$(PRECISION) ] || [ ! -f $(OBJ_DIR_PS)/.tbb_$(TBB_PS) ]; then \
+		echo ">> PS build mode is now '$(GPU_MODE)', $(DIM)D, $(PRECISION), TBB=$(TBB_PS); wiping $(OBJ_DIR_PS) to avoid mixed objects"; \
+		rm -f $(OBJ_DIR_PS)/*$(OBJ_EXT) $(OBJ_DIR_PS)/*.d $(OBJ_DIR_PS)/ps_deposit_msl.h $(OBJ_DIR_PS)/.gpu_mode_* $(OBJ_DIR_PS)/.dim_* $(OBJ_DIR_PS)/.prec_* $(OBJ_DIR_PS)/.tbb_* $(OBJ_DIR_PS)/.metal_mode_* $(OBJ_DIR_PS)/.build_mode; \
+		touch $(OBJ_DIR_PS)/.gpu_mode_$(GPU_MODE) $(OBJ_DIR_PS)/.dim_$(DIM) $(OBJ_DIR_PS)/.prec_$(PRECISION) $(OBJ_DIR_PS)/.tbb_$(TBB_PS); \
+		printf '%s' "$(strip $(GPU_BUILD_ARG) $(PREC_BUILD_ARG) $(TBB_BUILD_ARG))" > $(OBJ_DIR_PS)/.build_mode; \
 	fi
 
 # Same guard for the standard build: the mode is stamped in o/ (which also holds the *_l library
@@ -223,11 +247,11 @@ ps_gpu_mode_check:
 .PHONY: dtfe_gpu_mode_check
 dtfe_gpu_mode_check:
 	@$(MKDIR_P) $(OBJ_DIR)
-	@if [ ! -f $(OBJ_DIR)/.gpu_mode_$(GPU_MODE) ]; then \
-		echo ">> DTFE build GPU mode is now '$(GPU_MODE)'; wiping $(OBJ_DIR) to avoid mixed objects"; \
-		rm -f $(OBJ_DIR)/*$(OBJ_EXT) $(OBJ_DIR)/*.d $(OBJ_DIR)/dtfe_deposit_msl.h $(OBJ_DIR)/.gpu_mode_* $(OBJ_DIR)/.metal_mode_* $(OBJ_DIR)/.build_mode; \
-		touch $(OBJ_DIR)/.gpu_mode_$(GPU_MODE); \
-		printf '%s' "$(GPU_BUILD_ARG)" > $(OBJ_DIR)/.build_mode; \
+	@if [ ! -f $(OBJ_DIR)/.gpu_mode_$(GPU_MODE) ] || [ ! -f $(OBJ_DIR)/.dim_$(DIM) ] || [ ! -f $(OBJ_DIR)/.prec_$(PRECISION) ]; then \
+		echo ">> DTFE build mode is now '$(GPU_MODE)', $(DIM)D, $(PRECISION); wiping $(OBJ_DIR) to avoid mixed objects"; \
+		rm -f $(OBJ_DIR)/*$(OBJ_EXT) $(OBJ_DIR)/*.d $(OBJ_DIR)/dtfe_deposit_msl.h $(OBJ_DIR)/.gpu_mode_* $(OBJ_DIR)/.dim_* $(OBJ_DIR)/.prec_* $(OBJ_DIR)/.metal_mode_* $(OBJ_DIR)/.build_mode; \
+		touch $(OBJ_DIR)/.gpu_mode_$(GPU_MODE) $(OBJ_DIR)/.dim_$(DIM) $(OBJ_DIR)/.prec_$(PRECISION); \
+		printf '%s' "$(strip $(GPU_BUILD_ARG) $(PREC_BUILD_ARG))" > $(OBJ_DIR)/.build_mode; \
 	fi
 
 #------------------------ options usefull when using DTFE as a library
@@ -348,24 +372,41 @@ LINK_FLAGS =
 # so recent Homebrew/Boost no longer ship libboost_system ("library not found").
 BASE_LIBS = -lboost_thread -lboost_filesystem -lboost_program_options -lgsl -lgslcblas -lm -lgmp -lmpfr -lfftw3f -lfftw3
 HDF5_LIBS = -lhdf5 -lhdf5_cpp
+# zlib: the tessellation cache deflates its body (CGAL_triangulation/tessellation_cache.h). A system
+# library on both platforms, and HDF5 already depends on it.
+BASE_LIBS += -lz
 
-# Optional TBB-parallel Delaunay triangulation: `make PS-DTFE TBB=1` (or DTFE TBB=1).
-# Enables CGAL's parallel insertion (Parallel_tag data structure + lock grid) so the
-# single global tessellation (the no-`--partition` path) is built across cores.
-# Requires the 'tbb' package (macOS: `brew install tbb`). Toggling TBB on/off changes
-# the DT type, so do a clean rebuild (`make clean`) when switching. Override the TBB
-# location with TBB_PATH_OVERRIDE=/path.
+# TBB-parallel Delaunay insertion for PS-DTFE (CGAL's Parallel_tag data structure + lock grid,
+# CGAL_triangulation/triangulation.cpp; used at run time only with --parallel-triangulation or
+# DTFE_TBB_THREADS -- the default insert stays sequential and bit-reproducible). 'auto': compiled in when the tbb package is installed
+# (macOS: `brew install tbb`; Debian/Ubuntu: libtbb-dev); TBB=0 forces it off, TBB=1 requires it.
+# PS-DTFE only: the standard DTFE binary keeps its sequential insert and Fast_location hierarchy
+# (its clustered Eulerian points built 4.5x SLOWER in parallel, where PS-DTFE's near-lattice
+# Lagrangian points build 2x faster). The DT type changes with it, so o_ps/ is stamped and wiped
+# on a toggle like the GPU mode. Override the TBB location with TBB_PATH_OVERRIDE=/path.
+TBB ?= auto
+ifeq ($(PLATFORM),macos)
+    TBB_PATH := $(or $(TBB_PATH_OVERRIDE),$(BREW_PREFIX)/opt/tbb)
+else
+    TBB_PATH := $(or $(TBB_PATH_OVERRIDE),/usr)
+endif
+TBB_PS := 0
 ifeq ($(TBB),1)
-    ifeq ($(PLATFORM),macos)
-        TBB_PATH := $(or $(TBB_PATH_OVERRIDE),$(BREW_PREFIX)/opt/tbb)
-    else
-        TBB_PATH := $(or $(TBB_PATH_OVERRIDE),/usr)
+    TBB_PS := 1
+endif
+ifeq ($(TBB),auto)
+    ifneq ($(wildcard $(TBB_PATH)/include/tbb/task_arena.h $(TBB_PATH)/include/oneapi/tbb/task_arena.h),)
+        TBB_PS := 1
     endif
-    OPTIONS    += -DPARALLEL_TRIANGULATION -DCGAL_LINKED_WITH_TBB
-    OPTIONS_PS += -DPARALLEL_TRIANGULATION -DCGAL_LINKED_WITH_TBB
-    INCLUDES   += -I $(TBB_PATH)/include
-    LIBRARIES  += -L$(TBB_PATH)/lib
-    BASE_LIBS  += -ltbb -ltbbmalloc
+endif
+ifeq ($(TBB_PS),1)
+    OPTIONS_PS   += -DPARALLEL_TRIANGULATION -DCGAL_LINKED_WITH_TBB
+    INCLUDES     += -I $(TBB_PATH)/include
+    PS_TBB_LIBS  := -L$(TBB_PATH)/lib -ltbb -ltbbmalloc
+    TBB_BUILD_ARG := $(if $(filter 1,$(TBB)),TBB=1,)
+else
+    PS_TBB_LIBS  :=
+    TBB_BUILD_ARG := $(if $(filter 0,$(TBB)),TBB=0,)
 endif
 
 # Platform-specific OpenMP settings only
@@ -406,6 +447,13 @@ endif
 
 IO_SOURCES = $(addprefix io/, input_output.h gadget_reader_header.cc gadget_reader_binary.cc gadget_reader_HDF5.cc text_io.cc binary_io.cc)
 MAIN_SOURCES = main.cpp DTFE.h message.h user_options.h io/io.h interlacing.h
+
+# Build provenance (src/build_info.cc): recompiled inside BOTH link recipes, i.e. on every link, so
+# the binary always reports the revision and time it was linked at ('--version', and the 'Build:'
+# line every run prints into its log). Outside a git checkout the revision reads 'unknown'.
+BUILD_REV  := $(shell git describe --always --dirty --abbrev=10 2>/dev/null || echo unknown)
+BUILD_TIME := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+BUILD_INFO_FLAGS = -DDTFE_BUILD_REV='"$(BUILD_REV)"' -DDTFE_BUILD_TIME='"$(BUILD_TIME)"'
 IO_CC_SOURCES = input_output.cc $(IO_SOURCES) user_options.h define.h quantities.h message.h particle_data.h box.h ps_point_eval.h
 DTFE_SOURCES = DTFE.cpp define.h particle_data.h user_options.h box.h quantities.h subpartition.h interpolations.h kdtree/kdtree2.hpp Pvector.h message.h miscellaneous.h auto_tune.h ps_point_eval.h
 DTFE_CC_SOURCES = user_options.cc quantities.cc NGP_interpolation.cc CIC_interpolation.cc TSC_interpolation.cc PCS_interpolation.cc SPH_interpolation.cc interlacing.cc random.cc
@@ -443,7 +491,8 @@ DTFE: dtfe_gpu_mode_check
 	@$(MAKE) DTFE-build
 
 DTFE-build: set_directories $(OBJ_DIR)/DTFE$(OBJ_EXT) $(OBJ_DIR)/triangulation$(OBJ_EXT) $(OBJ_DIR)/main$(OBJ_EXT) $(OBJ_DIR)/kdtree2$(OBJ_EXT) $(OBJ_DIR)/r3d$(OBJ_EXT) $(DTFE_CC_OBJS) $(IO_CC_OBJS) $(TRIANG_CC_OBJS) $(DTFE_GPU_OBJS) Makefile
-	$(CC) $(COMPILE_FLAGS) $(OBJ_DIR)/DTFE$(OBJ_EXT) $(OBJ_DIR)/triangulation$(OBJ_EXT) $(OBJ_DIR)/main$(OBJ_EXT) $(OBJ_DIR)/kdtree2$(OBJ_EXT) $(OBJ_DIR)/r3d$(OBJ_EXT) $(DTFE_CC_OBJS) $(IO_CC_OBJS) $(TRIANG_CC_OBJS) $(DTFE_GPU_OBJS) $(DTFE_LIB) $(DTFE_GPU_LIBS) -o $(BIN_DIR)/DTFE$(EXE_EXT)
+	$(CC) $(COMPILE_FLAGS) $(BUILD_INFO_FLAGS) -o $(OBJ_DIR)/build_info$(OBJ_EXT) -c $(SRC)/build_info.cc
+	$(CC) $(COMPILE_FLAGS) $(OBJ_DIR)/DTFE$(OBJ_EXT) $(OBJ_DIR)/triangulation$(OBJ_EXT) $(OBJ_DIR)/main$(OBJ_EXT) $(OBJ_DIR)/kdtree2$(OBJ_EXT) $(OBJ_DIR)/r3d$(OBJ_EXT) $(OBJ_DIR)/build_info$(OBJ_EXT) $(DTFE_CC_OBJS) $(IO_CC_OBJS) $(TRIANG_CC_OBJS) $(DTFE_GPU_OBJS) $(DTFE_LIB) $(DTFE_GPU_LIBS) -o $(BIN_DIR)/DTFE$(EXE_EXT)
 
 
 $(OBJ_DIR)/main$(OBJ_EXT): $(addprefix $(SRC)/, $(MAIN_SOURCES)) Makefile
@@ -535,7 +584,8 @@ PS-DTFE: ps_gpu_mode_check
 	@$(MAKE) PS-DTFE-build
 
 PS-DTFE-build: set_directories_ps $(OBJ_DIR_PS)/DTFE$(OBJ_EXT) $(OBJ_DIR_PS)/triangulation$(OBJ_EXT) $(OBJ_DIR_PS)/main$(OBJ_EXT) $(OBJ_DIR_PS)/kdtree2$(OBJ_EXT) $(OBJ_DIR_PS)/r3d$(OBJ_EXT) $(PS_DTFE_CC_OBJS) $(PS_DTFE_IO_OBJS) $(PS_DTFE_TRIANG_OBJS) $(PS_GPU_OBJS) Makefile
-	$(CC) $(COMPILE_FLAGS_PS) $(OBJ_DIR_PS)/DTFE$(OBJ_EXT) $(OBJ_DIR_PS)/triangulation$(OBJ_EXT) $(OBJ_DIR_PS)/main$(OBJ_EXT) $(OBJ_DIR_PS)/kdtree2$(OBJ_EXT) $(OBJ_DIR_PS)/r3d$(OBJ_EXT) $(PS_DTFE_CC_OBJS) $(PS_DTFE_IO_OBJS) $(PS_DTFE_TRIANG_OBJS) $(PS_GPU_OBJS) $(DTFE_LIB) $(PS_GPU_LIBS) -o $(BIN_DIR)/PS-DTFE$(EXE_EXT)
+	$(CC) $(COMPILE_FLAGS_PS) $(BUILD_INFO_FLAGS) -o $(OBJ_DIR_PS)/build_info$(OBJ_EXT) -c $(SRC)/build_info.cc
+	$(CC) $(COMPILE_FLAGS_PS) $(OBJ_DIR_PS)/DTFE$(OBJ_EXT) $(OBJ_DIR_PS)/triangulation$(OBJ_EXT) $(OBJ_DIR_PS)/main$(OBJ_EXT) $(OBJ_DIR_PS)/kdtree2$(OBJ_EXT) $(OBJ_DIR_PS)/r3d$(OBJ_EXT) $(OBJ_DIR_PS)/build_info$(OBJ_EXT) $(PS_DTFE_CC_OBJS) $(PS_DTFE_IO_OBJS) $(PS_DTFE_TRIANG_OBJS) $(PS_GPU_OBJS) $(DTFE_LIB) $(PS_GPU_LIBS) $(PS_TBB_LIBS) -o $(BIN_DIR)/PS-DTFE$(EXE_EXT)
 
 set_directories_ps:
 	@$(MKDIR_P) $(OBJ_DIR_PS)

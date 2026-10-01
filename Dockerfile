@@ -19,6 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libgsl-dev \
         libboost-all-dev \
         libcgal-dev \
+        libtbb-dev \
         libmpfr-dev \
         libhdf5-dev \
         libgmp-dev \
@@ -51,6 +52,24 @@ RUN set -eux; \
     rm -f tests/reference/regression_density.txt; \
     python3 tests/run_tests.py; \
     tests/ps_smoke_test.sh --no-build
+
+# ---- suites that gate SILENT wrongness rather than crashes ----
+# A caustic mask that stops matching the fold flag, a stale tessellation served to the wrong
+# partition, a point traversal drifting from the deposit, a batch driver that skips everything and
+# exits 0. All were developed on macOS, and CI only runs on push/PR, so for an uncommitted branch
+# `docker build` is the only Linux gate. No GPU needed.
+#
+# 'rm -rf tests/tmp' must stay in THIS RUN: files written by a RUN are baked into that layer, and
+# deleting them later only adds a whiteout. These suites leave 438 MB behind, a third of the image.
+RUN set -eux; \
+    tests/ps_caustic_class_check.sh --no-build; \
+    tests/ps_tessellation_cache_check.sh --no-build; \
+    tests/ps_point_eval_check.sh --no-build; \
+    tests/dtfe_point_eval_check.sh --no-build; \
+    tests/point_exact_serve_check.sh --no-build; \
+    tests/ps_hidden_streams_check.sh --no-build;     python3 tests/ps_nonperiodic_test.py --no-build; \
+    tests/run_scripts_check.sh --no-build; \
+    rm -rf tests/tmp
 
 # default entrypoint just documents the two binaries
 CMD ["/bin/sh", "-c", "echo 'DTFE image: binaries at /opt/dtfe/DTFE and /opt/dtfe/PS-DTFE (run with --help for options)'"]

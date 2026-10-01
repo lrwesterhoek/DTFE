@@ -19,10 +19,40 @@ from pathlib import Path
 
 from .io import FieldSet
 
-# Same environment variables as the shell side (config.sh): DTFE_DATA_ROOT / DTFE_SIM.
-DATA_ROOT = Path(os.environ.get("DTFE_DATA_ROOT", str(Path.home() / "output")))
+# Same environment variables as the shell side (config.sh): DTFE_DATA_ROOT / DTFE_SIM. The default
+# root is the Samsung T7, which groups simulations by family (Illustris TNG/TNG100/TNG100-3-Dark);
+# sim_dir() resolves that layout and the flat one (e.g. DTFE_DATA_ROOT=~/output).
+DATA_ROOT = Path(os.environ.get("DTFE_DATA_ROOT", "/Volumes/Samsung T7/Illustris TNG"))
 DEFAULT_SIM = os.environ.get("DTFE_SIM", "TNG50-4-Dark")
 DEFAULT_SNAP = 99
+
+
+def sim_dir(sim: str, root=None) -> Path:
+    """Directory of simulation `sim` under `root` (default DATA_ROOT), in either layout: flat
+    <root>/<sim>, or per family <root>/<family>/<sim> with <family> the name up to its first '-'
+    (TNG100-3-Dark -> TNG100). An existing directory wins; a simulation not on disk yet goes into
+    its family folder when that exists, else flat. Mirrors sim_dir in scripts/config.sh."""
+    root = DATA_ROOT if root is None else Path(root)
+    flat = root / sim
+    family = root / sim.split("-", 1)[0]
+    if flat.is_dir():
+        return flat
+    if family != flat and family.is_dir():
+        return family / sim
+    return flat
+
+
+def find_sims(root=None, pattern: str = "snapdir_*") -> list[str]:
+    """Names of the simulations under `root` (default DATA_ROOT), in either layout, whose
+    directory contains something matching `pattern` (e.g. 'snapdir_*/combined_*.hdf5')."""
+    root = DATA_ROOT if root is None else Path(root)
+    if not root.is_dir():
+        return []
+    names = set()
+    for d in list(root.iterdir()) + [c for f in root.iterdir() if f.is_dir() for c in f.iterdir()]:
+        if d.is_dir() and any(d.glob(pattern)):
+            names.add(d.name)
+    return sorted(names)
 
 
 def make_parser(description: str = "") -> argparse.ArgumentParser:
@@ -46,7 +76,7 @@ def make_parser(description: str = "") -> argparse.ArgumentParser:
 
 
 def snapdir(args) -> Path:
-    return args.data_root / args.sim / f"snapdir_{args.snap:03d}"
+    return sim_dir(args.sim, args.data_root) / f"snapdir_{args.snap:03d}"
 
 
 def make_fieldset(description: str = "", extra=None, argv=None):

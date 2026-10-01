@@ -1,0 +1,203 @@
+<main>
+<header style="display:grid;gap:14px">
+  <div class="eyebrow">DTFE benchmark · 30 September – 1 October 2026 · every number re-measured after the fixes</div>
+  <h1>PS-DTFE versus CosmoDTFE</h1>
+  <p class="lede">The same data through both codes: crossed Zel'dovich waves with an exact analytic answer (up to 7.1 million
+  particles) and an 11.8-million-particle piece of TNG100-3-Dark at z&nbsp;=&nbsp;0. Every estimate is scored against the
+  exact solution where one exists, and every run is timed with its peak memory.</p>
+  <div class="meta"><span><span class="who-ours">ours</span>: PS-DTFE / DTFE, C++/CGAL, Metal GPU</span>
+  <span><span class="who-cosmo">CosmoDTFE</span>: edbe0e8 (upstream HEAD), Julia 1.12, 10 threads</span>
+  <span>Apple Silicon, 10 cores, 64 GB</span></div>
+</header>
+
+<section>
+  <h2>Verdict</h2>
+  <div class="verdict">
+    <div><div class="k">Best results</div><div class="v"><p><span class="chip">ours, by a wide margin</span></p>
+      <p>Our phase-space density is within 10% of the exact answer at 99.6% of points; standard DTFE (both codes give the
+      identical field) manages 53%, and 24% inside multi-stream regions. CosmoDTFE has no phase-space density, no
+      mass-weighted mean velocity (its multi-stream velocity is off by 25% of the wave amplitude, ours by 0.5%) and no
+      cell averages: its grids are point samples that lose 13% of the mass on a 256³ grid, where our exact deposit
+      conserves it and matches the exact cell averages to 0.34%.</p></div></div>
+    <div><div class="k">Most efficient</div><div class="v"><p><span class="chip">ours, at every size</span></p>
+      <p>At 7.1M particles every task both codes can do is 1.4–3.8× faster in ours, whole task included (reading and
+      tessellating), and standard DTFE needs 5–9 GB against CosmoDTFE's 17 GB. On the TNG piece the phase-space slice is
+      4.0× faster at under a third of the memory. On a 0.26M-particle box the two codes tie on the standard-DTFE slice and
+      ours leads on everything else (2× on the phase-space slice, 4× on the grids); CosmoDTFE's queries are very fast
+      once built, but only after tuning its search-tree depth by hand: at the default it needs 355 µs per point at 7.1M
+      particles (25 minutes for one 2048² slice).</p></div></div>
+    <div><div class="k">Features</div><div class="v"><p><span class="chip">ours</span></p>
+      <p>Everything CosmoDTFE computes, ours computes too (identically, to 10⁻⁸, for standard DTFE and the stream counts),
+      plus phase-space densities, dispersion, per-stream records, mass-conserving and exact cell averages, caustics,
+      cosmic-web labels, GPU deposits and boxes larger than memory. CosmoDTFE's real strength is being a small Julia
+      library you can hold in your head and call directly.</p></div></div>
+    <div><div class="k">Found in ours</div><div class="v"><p><span class="chip">6 issues fixed, 3 speedups</span></p>
+      <p>The benchmark exposed a bug in our memory auto-tuner and three real costs: point evaluation held every point's
+      stream records in memory, the exact GPU deposit parallelised badly when cells are much smaller than tetrahedra,
+      and the CPU sampled deposit ran serially inside one partition. Fixing them turned up two errors in non-periodic
+      runs: a region cut from a larger cloud collected mass on its faces, and partitioned runs differed along the
+      partition seams. All six are fixed; the TNG region now holds exactly the mass of the particles inside it, and
+      every number in this report is re-measured after the fixes (before and after at the end). Two further speedups
+      came from asking where a small run's time goes — its vertex densities and its triangulation — and a third from
+      letting the auto-tuner split small sets for speed.</p></div></div>
+  </div>
+</section>
+
+<section>
+  <h2>How it was tested</h2>
+  <ul class="plain">
+    <li><b>Synthetic data with an exact answer.</b> Crossed Zel'dovich waves (<code>tests/generate_ps_test_data.py
+      --crossed-waves</code>, A·k = 1.8, 100 Mpc periodic box) at 64³, 128³ and 192³ particles. Every axis maps
+      independently, so the density, stream count, mass-weighted velocity and their exact <em>cell averages</em> all
+      factorise into 1-D inverse maps, computed to machine precision.</li>
+    <li><b>Real data.</b> TNG100-3-Dark z&nbsp;=&nbsp;0: every particle that starts in the central half-box Lagrangian cube
+      (11.8M particles, non-periodic). Compared in the 31 Mpc region [40, 71)³ Mpc, 12 Mpc inside the cube's image, where
+      no particle from outside the cube arrives (checked on the full box).</li>
+    <li><b>Workloads.</b> A 2048² slice of points (4.2M) and a 256³ grid (16.8M cells). Each code runs its own intended
+      method: CosmoDTFE's <code>PeriodicEstimator(DensityEstimator)</code> and <code>PeriodicPhaseSpaceEstimator</code>
+      with <code>streamNumber</code>; ours the PS-DTFE and DTFE binaries.</li>
+    <li><b>Fair timing.</b> Ours: the whole process, reading and writing included. CosmoDTFE: build plus evaluation, with
+      Julia's compilation and the file reading excluded (both in its favour). CosmoDTFE's BVH depth was tuned per size
+      (18, 21, 22) on a probe; padding 5%.</li>
+  </ul>
+</section>
+
+<section>
+  <h2>Accuracy against the exact solution (7.1M particles)</h2>
+  <figure><img src="fig/density_slice_192.png" alt="Density on a 2048 by 2048 slice: exact, our phase-space DTFE, our standard DTFE and CosmoDTFE's standard DTFE, with maps of the log ratio to the exact answer">
+    <figcaption>Density at 4.2M points. The phase-space estimate is the exact field to within a few tenths of a percent;
+    both standard-DTFE codes produce the same triangulation-limited field.</figcaption></figure>
+  <figure><img src="fig/density_zoom_192.png" alt="Zoom on the crossing of the folds">
+    <figcaption>Where the folds cross: the caustic edges are resolved by the phase-space estimate and smeared by standard DTFE.</figcaption></figure>
+  {{acc_points}}
+  <figure><img src="fig/streams_velocity_192.png" alt="Stream counts and the x velocity: exact, ours, CosmoDTFE">
+    <figcaption>Both codes count streams exactly. Inside the folds the mass-weighted mean velocity keeps the exact
+    structure; CosmoDTFE can only sum over streams or average them without weights.</figcaption></figure>
+  {{acc_velocity}}
+  <figure><img src="fig/grid_cells_192.png" alt="A plane of the 256 cubed grid: exact cell averages, our exact and sampled deposits, and CosmoDTFE point samples">
+    <figcaption>A grid cell should hold the cell's average. A point value at its centre (the only kind of grid CosmoDTFE
+    makes) misses thin walls and caustics entirely.</figcaption></figure>
+  {{acc_grid}}
+</section>
+
+<section>
+  <h2>Real data: TNG100-3-Dark at z = 0</h2>
+  <p>There is no exact answer here, so the checks are agreement where the two codes compute the same thing, and the
+  maps where they do not.</p>
+  <figure><img src="fig/tng_density.png" alt="TNG density slice: our phase-space DTFE, our standard DTFE, CosmoDTFE standard DTFE">
+    <figcaption>The phase-space density resolves the thin caustic sheets and filaments crossing the voids; standard DTFE
+    (identical in both codes) blurs them into the triangulation.</figcaption></figure>
+  <figure><img src="fig/tng_density_zoom.png" alt="Zoom on the densest halo in the slice"></figure>
+  {{tng_agree}}
+  <figure><img src="fig/tng_streams_velocity.png" alt="TNG stream counts and mean velocity with arrows, ours and CosmoDTFE">
+    <figcaption>Stream counts agree point for point, up to the 733 streams inside the central halo. The velocity fields
+    agree wherever there is one stream and differ by 13 km/s rms where there are several.</figcaption></figure>
+</section>
+
+<section>
+  <h2>Speed and memory</h2>
+  <figure><img src="fig/performance.png" alt="Wall time and peak memory per task at 7.1 million particles, and scaling with the number of particles">
+    <figcaption>Top: 7.1M particles. Bottom: the tasks both codes can do, against the number of particles.</figcaption></figure>
+  <h3>7.1M particles (crossed waves 192³)</h3>
+  {{perf_192}}
+  <h3>11.8M particles (TNG100-3 piece, 31 Mpc region)</h3>
+  {{perf_tng}}
+  <p class="note">On TNG our standard-DTFE grid tessellates only the particles in and around the region, CosmoDTFE the
+  whole cloud: part of that 35× is a feature a CosmoDTFE user could imitate by cutting the input. Smaller sets: 2.1M
+  particles ours 1.5–3.4× faster; 0.26M particles the standard-DTFE slice is even and ours is 2× faster on the
+  phase-space slice, 4× on the grids.</p>
+  <ul class="plain">
+    <li><b>Memory per particle.</b> CosmoDTFE's standard DTFE peaks at about 2.6 KB per particle (17.4 GiB at 7.1M). The
+      full TNG100-3 box (94M particles) would need about 250 GB, so on this machine it cannot be done in one piece; ours
+      ran it at 512³ in 34 GB.</li>
+    <li><b>CosmoDTFE's tree depth.</b> The default (9) costs 116 µs per point at 2.1M particles and 355 µs at 7.1M. The
+      fix is a deeper tree, but its memory grows as 2<sup>depth</sup> regardless of the data: depth 24 took 12 GB even
+      for 0.26M particles.</li>
+  </ul>
+</section>
+
+<section>
+  <h2>Feature sets</h2>
+  {{features}}
+</section>
+
+<section>
+  <h2>What the benchmark found in ours, and the fixes</h2>
+  <ul class="plain">
+    <li><b>The auto-tuner's stream estimate for non-periodic data.</b> It tiled the output region
+      (<code>--box</code>) instead of the particle cloud and wrapped initial positions into it, estimating 8.1 million
+      streams per point on the TNG piece, and then ran the point evaluation one small partition at a time: 222 s instead
+      of 29 s. It now tiles the cloud's own Lagrangian bounding box; <code>ps_auto_tune_check</code> section G fails on
+      the old code (75,593 streams per point on a synthetic clump) and passes on the new. The TNG runs below no longer
+      need the manual override the first measurement used.</li>
+    <li><b>Point evaluation memory.</b> Every point's stream records stayed in memory until the end. Each thread now
+      packs its records into 16 MB blocks, and the blocks are grouped by point only when the results are written; the
+      output is byte-identical. 16.8M points at 2.1M particles: 28.2 GB → 8.6 GB (CosmoDTFE 8.8 GB). At 7.1M
+      particles the auto-tuner now spends the saving on fewer, larger partitions (2³ instead of 3³) at the same speed;
+      at the old split the run needs 9.5 GB instead of 12.3 GB.</li>
+    <li><b>Exact deposit with small cells.</b> One GPU thread per tetrahedron left each buffer waiting on its few giant
+      tetrahedra. Each tetrahedron's cells are now split into blocks of 16 that run on separate threads, in two passes
+      through a per-tetrahedron weight total, so every tetrahedron still deposits exactly its mass. Stopped runs now
+      finish: 32 s at 0.26M particles, 135 s on the TNG region, and the 2.1M run drops from 104 s to 57 s. Grids agree
+      with the old kernel to float rounding (tet-touch counts identical).</li>
+    <li><b>CPU sampled deposit.</b> Now threaded inside a partition, with private per-thread grids merged in a fixed
+      order; on one thread the output is byte-identical to before. A single-partition box goes from 145 s to 20 s. Large
+      boxes were already parallel across concurrently running partitions, so they gain less (7.1M: 131 s → 121 s; TNG
+      169 s → 145 s).</li>
+    <li><b>Mass on the faces of a region.</b> Found while fixing the above: in a non-periodic run whose
+      <code>--box</code> region cuts through a larger cloud, a tetrahedron crossing the region's face gave its whole mass
+      to the part inside. On the TNG region the outermost layer of cells averaged 2.04 (exact deposit) and 1.49 (sampled)
+      against 0.70 inside, and the region held 5.6% and 3.6% more mass than the particles inside it. A tetrahedron now
+      keeps only its inside share: the sampled deposits count its samples beyond the face too, the exact deposit weighs
+      its inside pieces against the whole tetrahedron. The face layer now reads 0.71, the region's mass matches its
+      particles to 0.01%, and on a synthetic clump a region reproduces the same cells of a larger grid to the last digit.
+      Counting the samples beyond the face one by one first cost the TNG region's sampled deposits a third (CPU 142 s →
+      190 s). They are now counted one sample column at a time: along a column the four face tests are linear in the
+      position, so the samples certainly inside form one run found by a seeded binary search, and only the few within
+      rounding distance of a face are tested individually, which keeps the count exactly the per-sample one. Most of the
+      remaining cost turned out not to be the counting at all (1% of the deposit) but the compiler reloading the
+      tetrahedron's geometry on every in-grid sample test once the counting routine had taken its address; handing it
+      copies removed that. Against the pre-fix code on the same session the CPU deposit is back to 138–142 s for
+      138–140 s (700 vs 701 CPU-seconds), the GPU deposit within its run-to-run spread (113–137 s, old 117–124 s).</li>
+    <li><b>Partition seams in non-periodic runs.</b> A non-periodic run split into partitions (the TNG region's
+      auto-tuned run uses 27) differed from a single triangulation along the seams: 0.04% of cells, the density by up to 1%
+      of its peak and the velocity by up to 84%. The cause was the flat slivers that fill the space between a finite
+      cloud's nearly planar faces and its convex hull, joining particles up to a whole face apart: the hull of a face is
+      a global object, so each partition built different slivers. The Lagrangian domain is now the cloud's alpha shape,
+      the tetrahedra with a Lagrangian circumradius of at most three mean spacings (interior ones never exceed 0.91, in
+      jittered lattices and in TNG's initial conditions alike). Those are local, so split and single runs now agree to
+      the rounding of their sums, and the slivers' stretched images no longer put spurious mass across the grid.</li>
+    <li><b>Small runs: the vertex densities.</b> On a 0.26M-particle slice the work the benchmark measures — evaluating
+      4.2M points — took 0.2 s of a 3 s run; 1.5 s went into the Delaunay triangulation and 0.6 s into the vertex
+      densities, where every vertex walked its incident cells and recomputed each cell's volume four times. The densities
+      are now summed over the cells, in double: 0.6 s → 0.14 s in PS-DTFE, 0.25 s → 0.02 s in standard DTFE (at 11.8M
+      particles the DTFE slice drops from 57 s to 44 s). A density can move in its last float bit; the stream counts do
+      not.</li>
+    <li><b>Small runs: the triangulation.</b> CGAL can insert in parallel. It helps PS-DTFE's near-lattice Lagrangian
+      points (1.45 s → 0.5 s on six performance cores — more threads only add lock contention, and a thread on an
+      efficiency core stalls the rest) and hurts standard DTFE's clustered Eulerian points (4.5× slower), so only
+      PS-DTFE has it. It is <em>opt-in</em> (<code>--parallel-triangulation</code>): the parallel insert's vertex and
+      cell order differ from run to run, which moves every floating-point output between two identical runs at the level
+      of rounding, and the query server, the tessellation cache and the test suites rely on bit-identical repeats. With
+      the flag the 0.26M slice takes 1.4 s instead of 2.4 s and the TNG region's GPU grid 110 s instead of 135 s; the
+      tables below use the default.</li>
+    <li><b>Small runs: let the tuner split for speed.</b> There is a way to parallelise the triangulation that keeps
+      every bit reproducible: split a small set into eight partitions and triangulate each on its own core. The
+      memory-driven auto-tuner never did that for sets that fit, so it now predicts the wall time of one, eight and
+      twenty-seven partitions — the sequential triangulation gains, the deposit and point evaluation already use every
+      core, a GPU deposit serialises whatever the split — and splits only for a clear gain. The 0.26M slice takes 1.4 s
+      instead of 2.4 s and its 16.8M point values 4.2 s instead of 5.3 s; grids stay in one domain. Such a split merges
+      its partitions in a fixed order, so repeated runs agree bit for bit (ordering the merge of <em>every</em> partitioned
+      run was tried and rejected: the TNG region's partitions differ thirty-fold in cost, threads idled behind the slow
+      ones for a 35% loss, and its GPU sums are not reproducible anyway). The same pass fixed the tuner's memory
+      report for single-domain runs, which multiplied one domain's bytes by the thread count and told the GUI a
+      0.26M-particle run needed 52 GB.</li>
+  </ul>
+  {{fixes}}
+  <p class="note">Before: the first run of each task (stopped runs marked). After: the same command on the fixed code,
+  auto-tuned as before; the TNG rows include the region and seam fixes. Whole process, reading and writing
+  included.</p>
+  <p class="note">Reproduce: the harness (analytic solution, both drivers, scoring and figures) is in
+  <code>python/tools/cosmodtfe_comparison/</code>; figures and scores in <code>figures/cosmodtfe_comparison/</code>.</p>
+</section>
+</main>

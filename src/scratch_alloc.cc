@@ -42,9 +42,21 @@ namespace
     // to this one is unspecified. A std::mutex has a destructor -- locking it after that ran
     // is UB (measured: SIGSEGV at exit teardown) -- so the lock is a pthread mutex with a
     // static initializer, which is plain data and never dies.
-    struct Slot { void *p; std::size_t sz; };
+    //
+    // The delete path must NOT take the mutex for ordinary heap pointers: every delete in the
+    // process runs through here, and a global lock serialized all concurrent partitions -- the
+    // PS vertex-density pass (millions of small vector frees) went from 10 s to 191 s per
+    // partition at --max-concurrent 5. So each slot's pointer is an atomic, published with
+    // release ordering BEFORE the mapping is handed out, and freeImpl first rules a pointer out
+    // lock-free: outside [g_lo, g_hi) (the span of every mapping ever made) it cannot be ours,
+    // and otherwise a scan of the slots ever used finds it or not. The mutex is taken only to
+    // create or unmap a mapping -- tens of times per run. A pointer being deleted was returned
+    // by operator new earlier (happens-before), so the scan always sees its own slot.
+    struct Slot { std::atomic<void*> p; std::size_t sz; };   // std::atomic<void*>: trivially destructible
     constexpr int kSlots = 512;
     Slot            g_slots[kSlots] = {};
+    std::atomic<int>            g_slotHigh{0};                      // one past the highest slot ever used
+    std::atomic<std::uintptr_t> g_lo{~std::uintptr_t(0)}, g_hi{0};  // address span of all mappings made
     pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
     std::atomic<std::uint64_t> g_counter{0};
     std::atomic<bool> g_warnedFallback{false};
@@ -109,10 +121,17 @@ namespace
         {
             MutexGuard lock(g_mtx);
             for (int i = 0; i < kSlots; ++i)
-                if ( g_slots[i].p == nullptr )
+                if ( g_slots[i].p.load(std::memory_order_relaxed) == nullptr )
                 {
-                    g_slots[i].p  = p;
                     g_slots[i].sz = mapSz;
+                    std::uintptr_t const a = reinterpret_cast<std::uintptr_t>(p);
+                    if ( a < g_lo.load(std::memory_order_relaxed) )
+                        g_lo.store(a, std::memory_order_release);
+                    if ( a + mapSz > g_hi.load(std::memory_order_relaxed) )
+                        g_hi.store(a + mapSz, std::memory_order_release);
+                    if ( i + 1 > g_slotHigh.load(std::memory_order_relaxed) )
+                        g_slotHigh.store(i + 1, std::memory_order_release);
+                    g_slots[i].p.store(p, std::memory_order_release);   // publish last
                     g_liveBytes  += long(mapSz);
                     g_totalAllocs += 1;
                     return p;
@@ -126,14 +145,24 @@ namespace
     bool scratchRelease(void *p)
     {
         if ( g_totalAllocs.load(std::memory_order_relaxed) == 0 )
-            return false;     // fast path: nothing ever mapped, skip the lock entirely
+            return false;     // nothing ever mapped
+        // lock-free: outside every mapping ever made, or in no used slot => an ordinary heap pointer
+        std::uintptr_t const a = reinterpret_cast<std::uintptr_t>(p);
+        if ( a < g_lo.load(std::memory_order_acquire) or a >= g_hi.load(std::memory_order_acquire) )
+            return false;
+        int const high = g_slotHigh.load(std::memory_order_acquire);
+        bool ours = false;
+        for (int i = 0; i < high and not ours; ++i)
+            ours = ( g_slots[i].p.load(std::memory_order_acquire) == p );
+        if ( not ours )
+            return false;
         MutexGuard lock(g_mtx);
         for (int i = 0; i < kSlots; ++i)
-            if ( g_slots[i].p == p )
+            if ( g_slots[i].p.load(std::memory_order_relaxed) == p )
             {
                 ::munmap( p, g_slots[i].sz );
                 g_liveBytes -= long(g_slots[i].sz);
-                g_slots[i].p  = nullptr;
+                g_slots[i].p.store(nullptr, std::memory_order_release);
                 g_slots[i].sz = 0;
                 return true;
             }

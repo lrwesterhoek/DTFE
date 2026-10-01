@@ -266,8 +266,8 @@ def main():
         hd = gc.header(args.sim, args.snap)
         hubble, box = hd["hubble"], hd["box_ckpc_h"]
     except FileNotFoundError:
-        snapdirs = sorted((gc.DATA_ROOT / args.sim).glob("snapdir_*/snap_*.hdf5")) or \
-                   sorted((gc.DATA_ROOT / args.sim).glob("snapdir_*/combined_*.hdf5"))
+        snapdirs = sorted(gc.sim_dir(args.sim).glob("snapdir_*/snap_*.hdf5")) or \
+                   sorted(gc.sim_dir(args.sim).glob("snapdir_*/combined_*.hdf5"))
         if not snapdirs:
             raise SystemExit(f"no header source (groupcat or snapshot) found for {args.sim}; "
                              "download groupcats first: ./scripts/download_snapshots.sh -c -s " + args.sim)

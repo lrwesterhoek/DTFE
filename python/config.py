@@ -28,7 +28,7 @@ PANEL_SNAPSHOTS = ['000', '017', '050', '099']
 # ---- Active simulation & box geometry ---------------------------------------------------
 # One simulation is analysed at a time: DTFE_SIM env var, else dtfelib's default. Every
 # script that opens fields via dtfelib.cli can also override per run with --sim.
-from dtfelib.cli import DATA_ROOT, DEFAULT_SIM
+from dtfelib.cli import DATA_ROOT, DEFAULT_SIM, sim_dir
 SIMULATION = os.environ.get("DTFE_SIM", DEFAULT_SIM)
 
 # Comoving box sizes in h-free Mpc (raw BoxSize[ckpc/h] / h / 1000). Known simulations are
@@ -45,7 +45,7 @@ SIMULATION_BOX_MPC = {
 def _box_size_mpc(sim):
     if sim in SIMULATION_BOX_MPC:
         return SIMULATION_BOX_MPC[sim]
-    root = DATA_ROOT / sim
+    root = sim_dir(sim)
     for combined in sorted(root.glob("snapdir_*/combined_*.hdf5"), reverse=True):
         import h5py
         with h5py.File(combined, "r") as f:
@@ -241,7 +241,7 @@ def cosmic_time_gyr(z, n_steps=20000):
 
 def verify_snapshot_redshifts(base_dir=None, tolerance=0.02):
     import glob
-    base = Path(base_dir) if base_dir else DATA_ROOT / SIMULATION
+    base = Path(base_dir) if base_dir else sim_dir(SIMULATION)
     mismatches = []
     try:
         import h5py

@@ -22,7 +22,7 @@ from __future__ import annotations
 import h5py
 import numpy as np
 
-from .cli import DATA_ROOT
+from .cli import DATA_ROOT, sim_dir
 from .io import FieldSet
 
 # fields whose values are categorical labels: sample NGP, never interpolate
@@ -35,7 +35,7 @@ def box_ckpc_h(sim: str, snap: int) -> float:
     Prefers a raw snapshot chunk or groupcat header (always ckpc/h); falls back to the
     merged combined_*.hdf5, which is h-free ckpc by the current convention (BoxSize * h).
     """
-    root = DATA_ROOT / sim
+    root = sim_dir(sim)
     snapdir = root / f"snapdir_{snap:03d}"
     for pat in (f"snap_{snap:03d}.*.hdf5",):
         files = sorted(snapdir.glob(pat))
@@ -97,7 +97,7 @@ def sample_fields_at(sim: str, snap: int, pos_ckpc_h: np.ndarray,
     Missing individual fields come back as NaN arrays (check FieldSet.has upstream if needed).
     prefix reads an alternate OUTPUT_PREFIX grid set (e.g. 'ps_mw'), see FieldSet.
     """
-    fs = FieldSet(DATA_ROOT / sim / f"snapdir_{snap:03d}", method=method, averaged=averaged,
+    fs = FieldSet(sim_dir(sim) / f"snapdir_{snap:03d}", method=method, averaged=averaged,
                   prefix=prefix)
     frac = np.asarray(pos_ckpc_h, dtype=np.float64) / box_ckpc_h(sim, snap)
     out = {"_method": fs.method, "_grid_n": fs.grid_n}

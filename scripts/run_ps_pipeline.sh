@@ -18,13 +18,16 @@
 # Interrupted batches continue where they stopped. FORCE=1 recomputes everything.
 #
 # Env knobs (all optional):
-#   SIMS          simulations to process (default: every dir under $DATA_ROOT with snapshots)
+#   SIMS          simulations to process (default: every simulation under $DATA_ROOT with
+#                 snapshots, in either layout -- flat <sim>/ or per-family <family>/<sim>/)
 #   NU            image-plane pixels across the box (default 8192; ~13 kpc/px at TNG100-3)
 #   AXIS, CENTER  plane orientation/position (default z, box centre). Changing CENTER with an
 #                 existing plane file regenerates the plane -- which makes every snapshot's
 #                 image plane stale, so the batch recomputes (as it must: geometry changed).
 #   GRID_SIZE     analysis grid passed to run_ps_dtfe.sh (default 512)
 #   FIELDS        forwarded to run_ps_dtfe.sh (default: its full production list)
+#   SNAPS         only these snapshot numbers, e.g. "50 67 99" (default: every snapshot on disk);
+#                 the GUI's adaptive plane size runs the pipeline once per plane size with it
 #   FORCE         1 = ignore all freshness checks (default 0)
 #   PTS_VEL_GRAD  1 (default) = also evaluate the velocity gradient at every sample point
 #                 (.pts_velGrad), which is what makes the velDiv/velShear/velVort maps
@@ -53,8 +56,9 @@ PREFIX="${OUTPUT_PREFIX:-ps_output}"
 
 if [ -z "${SIMS:-}" ]; then
     SIMS=""
-    for d in "${DATA_ROOT}"/*/; do
-        compgen -G "${d}snapdir_*/combined_[0-9][0-9][0-9].hdf5" > /dev/null && SIMS="${SIMS} $(basename "$d")"
+    for d in "${DATA_ROOT}"/*/ "${DATA_ROOT}"/*/*/; do
+        compgen -G "${d}snapdir_*/combined_[0-9][0-9][0-9].hdf5" > /dev/null || continue
+        case " ${SIMS} " in *" $(basename "$d") "*) ;; *) SIMS="${SIMS} $(basename "$d")" ;; esac
     done
 fi
 echo "Simulations:${SIMS}"
@@ -73,14 +77,18 @@ fresh() {
 
 overall_rc=0
 for sim in ${SIMS}; do
-    simdir="${DATA_ROOT}/${sim}"
+    simdir="$(sim_dir "${sim}")"
 
     # ---- discover snapshots (numbers, sorted) --------------------------------------------
     snaps=()
     for f in "${simdir}"/snapdir_*/combined_[0-9][0-9][0-9].hdf5; do
         [ -e "$f" ] || continue
         n=$(basename "$f"); n=${n#combined_}; n=${n%.hdf5}
-        snaps+=("$((10#$n))")
+        n=$((10#$n))
+        if [ -n "${SNAPS:-}" ]; then
+            case " ${SNAPS} " in *" ${n} "*|*" $(printf "%03d" "${n}") "*) ;; *) continue ;; esac
+        fi
+        snaps+=("${n}")
     done
     if [ ${#snaps[@]} -eq 0 ]; then echo "-- ${sim}: no combined snapshots, skipping"; continue; fi
     echo ""

@@ -28,13 +28,13 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-from .cli import DATA_ROOT
+from .cli import DATA_ROOT, sim_dir
 
 _RAW_FACTOR = 10 ** 12   # SubhaloIDRaw = SnapNum * 1e12 + SubfindID
 
 
 def _tree_dir(sim: str) -> Path:
-    root = DATA_ROOT / sim
+    root = sim_dir(sim)
     for cand in (root / "Merger Trees", root / "postprocessing" / "trees" / "SubLink"):
         if cand.is_dir() and ((cand / "combined_tree_extended.hdf5").exists()
                               or any(cand.glob("tree_extended.*.hdf5"))):

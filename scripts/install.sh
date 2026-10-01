@@ -12,6 +12,21 @@
 #                             build or run the Metal backend. For native macOS binaries run
 #                             this script WITHOUT --docker.
 #   ./install.sh --jobs N     parallel build jobs (default: all cores)
+#   ./install.sh --no-python  skip step 4 (the editable 'pip install -e python' of dtfelib)
+#   ./install.sh --no-gui     skip step 5 (the GUI's PySide6 environment; e.g. on a cluster)
+#   ./install.sh --no-app     set up the GUI, but no "DTFE Launcher" app / Desktop shortcut
+#   ./install.sh --double     build the double-precision binaries (DOUBLE=1; CPU-only)
+#
+# The GUI (scripts/gui.sh) gets its own virtual environment, ~/.venvs/dtfe-gui (DTFE_GUI_VENV
+# overrides), made with --system-site-packages so it sees this Python's numpy/h5py, holding
+# PySide6 (~1 GB). Already set up -> left alone. It never fails the install: the binaries come first.
+# Then scripts/install_gui_app.sh makes it launchable like any application: "DTFE Launcher.app" in
+# /Applications + a Desktop shortcut on macOS (give it Full Disk Access once: the repository and
+# the data are on protected locations), a .desktop entry on Linux.
+#
+# After it, Python can drive the binaries directly:
+#     from dtfelib import Estimator
+#     est = Estimator("snapshot.hdf5"); est(points).density
 #
 # Idempotent: safe to re-run any time; the Makefile's build-mode stamps guarantee objects
 # from different GPU modes are never mixed (a mode switch wipes the object directory).
@@ -28,14 +43,22 @@ fail()  { echo -e "${RED}[install]${NC} $1"; exit 1; }
 DO_DEPS=1
 FORCE_CPU=0
 USE_DOCKER=0
+DO_PYTHON=1
+DO_GUI=1
+DO_APP=1
+PREC_ARG=""
 JOBS="$( (sysctl -n hw.ncpu || nproc || echo 4) 2>/dev/null | head -1 )"
 while [ $# -gt 0 ]; do
     case "$1" in
         --no-deps) DO_DEPS=0 ;;
         --cpu)     FORCE_CPU=1 ;;
         --docker)  USE_DOCKER=1 ;;
+        --no-python) DO_PYTHON=0 ;;
+        --no-gui)  DO_GUI=0 ;;
+        --no-app)  DO_APP=0 ;;
+        --double)  PREC_ARG="DOUBLE=1"; FORCE_CPU=1 ;;   # the GPU kernels are single precision
         --jobs)    shift; JOBS="${1:?--jobs needs a number}" ;;
-        -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) fail "unknown option '$1' (see ./install.sh --help)" ;;
     esac
     shift
@@ -51,17 +74,24 @@ if [ "$USE_DOCKER" -eq 1 ]; then
     exec docker build -t dtfe .
 fi
 
-# ---------------------------------------------------------------- 1/4 dependencies
+# ---------------------------------------------------------------- 1/6 dependencies
 UNAME_S="$(uname -s)"
 if [ "$DO_DEPS" -eq 1 ]; then
-    info "step 1/4: installing missing dependencies (skip with --no-deps)"
+    info "step 1/6: installing missing dependencies (skip with --no-deps)"
     bash scripts/install_dependencies.sh
 else
-    info "step 1/4: skipped (--no-deps)"
+    info "step 1/6: skipped (--no-deps)"
 fi
 make deps-check
+# optional: the tbb library lets PS-DTFE triangulate in parallel (Makefile TBB=auto detects it)
+TBB_INC="$([ "$UNAME_S" = "Darwin" ] && echo "$(brew --prefix tbb 2>/dev/null)/include" || echo /usr/include)"
+if [ -f "$TBB_INC/tbb/task_arena.h" ] || [ -f "$TBB_INC/oneapi/tbb/task_arena.h" ]; then
+    info "tbb found: PS-DTFE will build its triangulation in parallel (TBB=0 disables)"
+else
+    warn "tbb not found: PS-DTFE triangulates on one core (optional: brew install tbb / apt-get install libtbb-dev)"
+fi
 
-# ---------------------------------------------------------------- 2/4 pick the backend
+# ---------------------------------------------------------------- 2/6 pick the backend
 GPU_ARG=""
 BACKEND="CPU-only"
 if [ "$FORCE_CPU" -eq 0 ]; then
@@ -94,23 +124,90 @@ if [ "$FORCE_CPU" -eq 0 ]; then
         fi
     fi
 fi
-info "step 2/4: build backend -> ${BACKEND}"
+[ -n "$PREC_ARG" ] && BACKEND="${BACKEND}, double precision"
+info "step 2/6: build backend -> ${BACKEND}"
 
-# ---------------------------------------------------------------- 3/4 clean rebuild
-info "step 3/4: make clean + rebuild (jobs: ${JOBS})"
+# ---------------------------------------------------------------- 3/6 clean rebuild
+info "step 3/6: make clean + rebuild (jobs: ${JOBS})"
 make clean >/dev/null
-# shellcheck disable=SC2086  # GPU_ARG is deliberately word-split ("" or METAL=1 etc.)
-make DTFE    $GPU_ARG -j"$JOBS"
-make PS-DTFE $GPU_ARG -j"$JOBS"
+# shellcheck disable=SC2086  # GPU_ARG/PREC_ARG are deliberately word-split ("" or METAL=1 etc.)
+make DTFE    $GPU_ARG $PREC_ARG -j"$JOBS"
+make PS-DTFE $GPU_ARG $PREC_ARG -j"$JOBS"
 
-# ---------------------------------------------------------------- 4/4 report + verify hints
-good "step 4/4: done -- ./DTFE and ./PS-DTFE rebuilt (${BACKEND})"
-if [ -n "$GPU_ARG" ]; then
-    info "build mode stamped in o/.build_mode and o_ps/.build_mode ($GPU_ARG);"
+# ---------------------------------------------------------------- 4/6 python package
+if [ "$DO_PYTHON" -eq 1 ]; then
+    PY="${PYTHON:-python3}"
+    info "step 4/6: pip install -e python  (dtfelib, editable; skip with --no-python)"
+    if ! command -v "$PY" >/dev/null 2>&1; then
+        warn "no '$PY' found; skipped. Install dtfelib later with: python3 -m pip install -e python"
+    elif "$PY" -m pip install -e python; then
+        good "dtfelib installed: 'from dtfelib import Estimator' works from any directory"
+    else
+        # e.g. PEP 668 'externally-managed-environment' on a Homebrew/system interpreter
+        warn "pip could not install dtfelib into '$PY' (see above). The binaries are built;"
+        warn "install dtfelib inside a virtual environment instead:"
+        warn "    python3 -m venv .venv && . .venv/bin/activate && pip install -e python"
+    fi
+else
+    info "step 4/6: skipped (--no-python)"
+fi
+
+# ---------------------------------------------------------------- 5/6 the GUI
+GUI_STATE="not installed (--no-gui)"
+if [ "$DO_GUI" -eq 1 ]; then
+    PY="${PYTHON:-python3}"
+    GUI_VENV="${DTFE_GUI_VENV:-$HOME/.venvs/dtfe-gui}"
+    GUI_PY="$GUI_VENV/bin/python"
+    info "step 5/6: the GUI -> PySide6 in ${GUI_VENV}  (skip with --no-gui)"
+    GUI_STATE="NOT installed (see the warnings of step 5)"
+    if [ -x "$GUI_PY" ] && "$GUI_PY" -c "import PySide6" >/dev/null 2>&1; then
+        good "PySide6 $("$GUI_PY" -c 'import PySide6; print(PySide6.__version__)') already there; left as is"
+        GUI_STATE="ready"
+    elif ! command -v "$PY" >/dev/null 2>&1; then
+        warn "no '$PY' found; GUI skipped"
+    elif ! "$PY" -m venv --system-site-packages "$GUI_VENV"; then
+        warn "could not create $GUI_VENV (Debian/Ubuntu: sudo apt-get install python3-venv); GUI skipped"
+    elif ! "$GUI_PY" -m pip install --quiet --upgrade pip || ! "$GUI_PY" -m pip install --quiet "PySide6>=6.5"; then
+        warn "pip could not install PySide6 into $GUI_VENV (network?); retry: $GUI_PY -m pip install PySide6"
+    else
+        good "PySide6 $("$GUI_PY" -c 'import PySide6; print(PySide6.__version__)') installed"
+        GUI_STATE="ready"
+    fi
+    if [ "$GUI_STATE" = "ready" ]; then
+        # the GUI imports dtfelib (numpy, h5py) from this Python, and loads Qt's libraries: check
+        # both now, headless, instead of letting the first launch fail
+        if ! "$GUI_PY" -c "import numpy, h5py" >/dev/null 2>&1; then
+            warn "the GUI needs numpy and h5py in '$PY' (its venv sees that Python's packages):"
+            warn "    $PY -m pip install numpy h5py     (or: brew install numpy / apt-get install python3-h5py)"
+            GUI_STATE="installed, but numpy/h5py are missing"
+        elif ! QT_QPA_PLATFORM=offscreen "$GUI_PY" -c "import sys; sys.path.insert(0, 'python/gui'); import app" \
+                >/dev/null 2>&1; then
+            warn "PySide6 is installed but Qt's libraries do not load. On Debian/Ubuntu:"
+            warn "    sudo apt-get install libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3 libxcb-cursor0"
+            GUI_STATE="installed, but Qt does not load"
+        fi
+    fi
+    [ "$GUI_STATE" = "ready" ] && good "GUI ready: scripts/gui.sh"
+    if [ "$GUI_STATE" = "ready" ] && [ "$DO_APP" -eq 1 ]; then
+        if DTFE_GUI_PYTHON="$GUI_PY" bash scripts/install_gui_app.sh; then
+            GUI_STATE="ready (DTFE Launcher: Applications + Desktop)"
+        else
+            warn "could not make the DTFE Launcher app (see above); scripts/gui.sh still works"
+        fi
+    fi
+else
+    info "step 5/6: skipped (--no-gui)"
+fi
+
+# ---------------------------------------------------------------- 6/6 report + verify hints
+good "step 6/6: done -- ./DTFE and ./PS-DTFE rebuilt (${BACKEND}); GUI: ${GUI_STATE}"
+if [ -n "$GPU_ARG$PREC_ARG" ]; then
+    info "build mode stamped in o/.build_mode and o_ps/.build_mode ($GPU_ARG$PREC_ARG);"
     info "incremental rebuilds must keep it: make PS-DTFE \$(cat o_ps/.build_mode)"
 fi
 info "verify with the fast checks:"
 info "    tests/ps_smoke_test.sh --no-build"
 info "    tests/ps_point_eval_check.sh --no-build"
 [ "$UNAME_S" = "Darwin" ] && [ -n "$GPU_ARG" ] && info "    tests/dtfe_metal_check.sh   (CPU vs GPU parity)"
+case "$GUI_STATE" in ready*) info "    ${GUI_PY} tests/py_gui_app_test.py   (the GUI, end to end)" ;; esac
 exit 0

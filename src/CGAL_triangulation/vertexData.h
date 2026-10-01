@@ -34,6 +34,7 @@ struct vertexData : public Data_structure
     protected:
     bool   dummy;         // true if vertex is a dummy test point (padding-efficiency test)
     bool   dummyNeighbor; // true if vertex has at least one dummy neighbor (padding test for density)
+    double _volAcc;       // vertexDensity's per-vertex volume sum (triangulation.cpp); -1 marks a convex-hull vertex. +8 B/vertex, see auto_tune.h
 #ifdef PHASE_SPACE
     Pvector<Real,NO_DIM> _eulerianPos; // Eulerian position (triangulation vertices store Lagrangian coords in PS-DTFE mode)
     uint64_t _particleID;              // snapshot ParticleID (stream identities, --per-stream-ids); +8 B/vertex, see auto_tune.h
@@ -42,7 +43,7 @@ struct vertexData : public Data_structure
 
 
     public:
-    vertexData(){ dummy=false; dummyNeighbor=false;
+    vertexData(){ dummy=false; dummyNeighbor=false; _volAcc=0.;
 #ifdef PHASE_SPACE
         _particleID=0;
         _psDeg=0;
@@ -76,10 +77,12 @@ struct vertexData : public Data_structure
     inline Pvector<Real,NO_DIM>& eulerianPosition() { return _eulerianPos; }      // full Eulerian position
     inline Real& eulerianPosition(int const i) { return _eulerianPos[i]; }        // one Eulerian component
     inline uint64_t particleID() { return _particleID; }                          // snapshot ParticleID (0 if the reader has none)
+    inline void setParticleID(uint64_t const id) { _particleID = id; }             // restoring a cached tessellation (tessellation_cache.h)
     inline int32_t& psDegree() { return _psDeg; }                                 // --ps-vertex-mass incident-cell count (see ps_interpolation.cc)
 #endif
     // remaining accessors for 'Data_structure' are in "particle_data.h"
 
+    inline double& volumeAccumulator() { return _volAcc; }                       // vertexDensity's scratch (triangulation.cpp)
     inline void setDummy() { dummy=true; dummyNeighbor=true; setDensity(0.); }    // mark as a dummy test point
     inline void setDummyNeighbor() { dummyNeighbor=true; }                        // mark as adjacent to a dummy
     inline bool isDummy() { return dummy; }
