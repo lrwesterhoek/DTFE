@@ -27,7 +27,7 @@ SWALLOWTAIL_HARMONICS = (12.0 / 7.0, 3.0 / 7.0, 2.0 / 21.0)   # (A, B, C) = (a1,
 
 
 def build_pancake(n_side, box, amplitude_factor, jitter_frac, seed, margin_frac=0.0,
-                  crossed=False, swallowtail=False):
+                  crossed=False, swallowtail=False, dim=3, modulation=0.0):
     rng = np.random.default_rng(seed)
 
     if margin_frac > 0.0:
@@ -37,8 +37,8 @@ def build_pancake(n_side, box, amplitude_factor, jitter_frac, seed, margin_frac=
     else:
         spacing = box / n_side
         coords1d = (np.arange(n_side) + 0.5) * spacing
-    qx, qy, qz = np.meshgrid(coords1d, coords1d, coords1d, indexing="ij")
-    q = np.stack([qx.ravel(), qy.ravel(), qz.ravel()], axis=1)
+    axes = np.meshgrid(*([coords1d] * dim), indexing="ij")
+    q = np.stack([a.ravel() for a in axes], axis=1)        # (n^dim, dim): a 2D file holds 2-column datasets
 
     q += (rng.uniform(-1.0, 1.0, size=q.shape) * jitter_frac * spacing)
     if margin_frac == 0.0:
@@ -54,6 +54,12 @@ def build_pancake(n_side, box, amplitude_factor, jitter_frac, seed, margin_frac=
         a1, a2, a3 = (h / k for h in SWALLOWTAIL_HARMONICS)
         u = k * q[:, 0]
         displacement[:, 0] = a1 * np.sin(u) + a2 * np.sin(2.0 * u) + a3 * np.sin(3.0 * u)
+    elif modulation != 0.0:
+        # a pancake whose amplitude varies along y: psi_x = A sin(k q_x) (1 + eps cos(k q_y)). Its
+        # fold region is a lens that closes in two CUSPS (A3), at k q_x = pi and
+        # cos(k q_y) = (1/(A k) - 1) / eps -- where the critical eigenvalue 1 + A k cos(k q_x)
+        # (1 + eps cos(k q_y)) of the null direction x reaches zero with zero x-derivative
+        displacement[:, 0] = amplitude * np.sin(k * q[:, 0]) * (1.0 + modulation * np.cos(k * q[:, 1]))
     else:
         naxes = q.shape[1] if crossed else 1
         for d in range(naxes):
@@ -131,18 +137,26 @@ def main():
                          "TRIPLE root: an A4 (swallowtail) caustic at q = L/3 and 2L/3, where "
                          "lambda_c and its first two directional derivatives all vanish. "
                          "Overrides --amplitude-factor and --crossed-waves")
+    ap.add_argument("--modulation", type=float, default=0.0,
+                    help="eps: modulate the pancake along y, psi_x = A sin(k q_x)(1 + eps cos(k q_y)); "
+                         "the fold region then closes in two cusps (A3) at k q_x = pi, "
+                         "cos(k q_y) = (1/(A k) - 1)/eps (needs A k (1-eps) < 1 < A k (1+eps))")
     ap.add_argument("--mass", type=float, default=1.0,
                     help="particle mass placed in MassTable (default 1.0)")
     ap.add_argument("--seed", type=int, default=42, help="RNG seed (default 42)")
+    ap.add_argument("--dim", type=int, choices=(2, 3), default=3,
+                    help="2 writes a 2D snapshot for the DIM=2 builds (PS-DTFE-2d / DTFE-2d): an n^2 "
+                         "lattice and two-column Coordinates/Velocities/InitialCoordinates; with "
+                         "--crossed-waves the stream counts are {1,3,9} (default 3)")
     args = ap.parse_args()
 
     q, x, velocity = build_pancake(args.n, args.box, args.amplitude_factor,
                                    args.jitter_frac, args.seed, args.margin_frac,
-                                   args.crossed_waves, args.swallowtail)
+                                   args.crossed_waves, args.swallowtail, args.dim, args.modulation)
     write_snapshot(args.out, q, x, velocity, args.box, args.mass)
 
     n = x.shape[0]
-    mean_density = n * args.mass / args.box ** 3
+    mean_density = n * args.mass / args.box ** args.dim
     print(f"Wrote {args.out}")
     print(f"  particles            : {n} ({args.n}^3) of type PartType1")
     print(f"  box size             : {args.box} Mpc "

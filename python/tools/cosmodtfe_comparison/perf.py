@@ -49,6 +49,10 @@ for tag, n_part in (("64", 64 ** 3), ("128", 128 ** 3), ("192", 192 ** 3), ("tng
         "256³ grid, phase-space CELL AVERAGES (GPU)": {"ours": ours("ps_grid_gpu"), "CosmoDTFE": None},
         "256³ grid, phase-space EXACT cell averages (GPU)": {"ours": ours("ps_grid_exact"), "CosmoDTFE": None},
         "256³ grid, phase-space cell averages (CPU)": {"ours": ours("ps_grid_cpu"), "CosmoDTFE": None},
+        "256³ grid, standard DTFE CELL AVERAGES, ρ and v (GPU)": {"ours": ours("dtfe_avg_gpu"), "CosmoDTFE": None},
+        "256³ grid, standard DTFE cell averages, ρ and v (CPU)": {"ours": ours("dtfe_avg_cpu"), "CosmoDTFE": None},
+        "512³ grid, standard DTFE CELL AVERAGES, ρ and v (GPU)": {"ours": ours("dtfe_avg512_gpu"), "CosmoDTFE": None},
+        "512³ grid, standard DTFE cell averages, ρ and v (CPU)": {"ours": ours("dtfe_avg512_cpu"), "CosmoDTFE": None},
     }})
 (FIG / "performance.json").write_text(json.dumps(rows, indent=1))
 
@@ -67,7 +71,11 @@ SHORT = {"slice 2048², standard DTFE density": "slice 2048², standard DTFE",
          "256³ grid, phase-space at cell centres": "256³, phase-space, point samples",
          "256³ grid, phase-space CELL AVERAGES (GPU)": "256³, phase-space cell averages, GPU",
          "256³ grid, phase-space EXACT cell averages (GPU)": "256³, EXACT cell averages, GPU",
-         "256³ grid, phase-space cell averages (CPU)": "256³, phase-space cell averages, CPU"}
+         "256³ grid, phase-space cell averages (CPU)": "256³, phase-space cell averages, CPU",
+         "256³ grid, standard DTFE CELL AVERAGES, ρ and v (GPU)": "256³, standard DTFE cell averages, GPU",
+         "256³ grid, standard DTFE cell averages, ρ and v (CPU)": "256³, standard DTFE cell averages, CPU",
+         "512³ grid, standard DTFE CELL AVERAGES, ρ and v (GPU)": "512³, standard DTFE cell averages, GPU",
+         "512³ grid, standard DTFE cell averages, ρ and v (CPU)": "512³, standard DTFE cell averages, CPU"}
 big = next((r for r in rows if r["data"] == "192"), rows[-1])
 tasks = list(big["tasks"])
 fig = plt.figure(figsize=(15, 10), constrained_layout=True)

@@ -219,6 +219,32 @@ def robust_vmax(data):
     return float(_np.percentile(_np.abs(a), config.PERCENTILE_CLIP[1])) if a.size else 0.0
 
 
+def symmetric_limits(data, pct=None):
+    """(-m, m) for a diverging map centred on 0 (a divergence, an eigenvalue): m = the 'pct' (default
+    config.PERCENTILE_CLIP[1]) percentile of the finite |values|; (-1, 1) when the slice is empty or all
+    zero, so imshow never gets vmin == vmax. A percentile pair (1, 99) of the signed values put 0 off
+    centre whenever the slice was skewed (plot_DTFE's divergence map, found 2026-10-05)."""
+    a = _finite(data)
+    m = float(_np.percentile(_np.abs(a), config.PERCENTILE_CLIP[1] if pct is None else pct)) if a.size else 0.0
+    if not m > 0:
+        m = 1.0
+    return -m, m
+
+
+def log_limits(data, floor=1e-6):
+    """(vmin, vmax) for a log colour scale: the smallest and largest finite POSITIVE values, vmin at least
+    'floor'; None when there is none (an empty slice -- the caller skips the map instead of crashing on
+    the min of an empty array, as the shear map did). vmax > vmin always."""
+    a = _finite(data)
+    a = a[a > 0]
+    if not a.size:
+        return None
+    vmin, vmax = max(float(a.min()), floor), float(a.max())
+    if not vmax > vmin:
+        vmax = vmin * 10.0
+    return vmin, vmax
+
+
 def delta_contour_levels(field_slice, norm, num_contours=20):
     vmin = float(_np.min(field_slice))
     vmax = float(_np.max(field_slice))

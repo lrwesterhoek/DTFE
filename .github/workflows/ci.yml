@@ -1,20 +1,28 @@
-# One job, deliberately small: build-and-test -- the fast Linux CPU build + test battery
-# (a previous cross-platform-test.yml was removed on purpose, commit eb243c8; this job stays
-# CPU-only and under ~15 minutes -- it exists to catch "does not compile on Linux", "the
-# deposit broke" and "the GUI no longer runs what it shows" regressions, nothing more). The Metal GPU path is macOS-only and validated
-# locally (tests/dtfe_metal_check.sh, metal/validate_deposit.cpp).
+# Two jobs. build-and-test -- the Linux CPU build of all three binary pairs (single, DOUBLE=1, DIM=2)
+# and the test battery through tests/ci_suite.sh, the SAME list the Dockerfile runs, so the two cannot
+# drift (a previous cross-platform-test.yml was removed on purpose, commit eb243c8; this job stays
+# CPU-only -- it exists to catch "does not compile on Linux", "the deposit broke" and "the GUI no
+# longer runs what it shows" regressions). The Metal GPU path is macOS-only and validated locally
+# (tests/dtfe_metal_check.sh, tests/gpu_scalar_check.sh, metal/validate_deposit.cpp).
+# cuda-compile -- the CUDA/HIP backend (src/CGAL_triangulation/*_gpu_cuda.cu, a port of the Metal
+# kernels) compiled with nvcc in NVIDIA's toolkit image: no GPU on the runner, so this only keeps the
+# port compiling (the two .cu files are self-contained, so no CGAL is needed for this).
+# hip-compile -- the same port compiled with ROCm's hipcc (AMD), compile only as well.
 
 name: ci
 
+# The working branch is Phase-Space: until 2026-10-02 the workflow ran only on master and on pull
+# requests, so it never ran at all. workflow_dispatch adds a manual "Run workflow" button.
 on:
   push:
-    branches: [master]
+    branches: [master, Phase-Space]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   build-and-test:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -23,112 +31,70 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential libgsl-dev libboost-all-dev libcgal-dev libtbb-dev \
-            libmpfr-dev libhdf5-dev libgmp-dev libfftw3-dev \
+            libmpfr-dev libhdf5-dev libgmp-dev libfftw3-dev libdeflate-dev \
             python3 python3-numpy python3-h5py
 
-      - name: Check dependencies
-        run: make deps-check
+      # single + DOUBLE=1 + DIM=2: each is a separate compile of every translation unit, so only a
+      # build catches a float-only or 3D-only construct creeping in (the 2D build was broken for a
+      # day by the 3D-only cache reader before anyone noticed)
+      - name: Build the single, double and 2D binaries (CPU-only)
+        run: tests/ci_suite.sh build
 
-      - name: Build DTFE + PS-DTFE (CPU-only)
-        run: |
-          make DTFE    ARCH_FLAGS="-mtune=generic" -j"$(nproc)"
-          make PS-DTFE ARCH_FLAGS="-mtune=generic" -j"$(nproc)"
+      # every CPU suite against ./DTFE and ./PS-DTFE (tests/ci_suite.sh lists them, with why)
+      - name: Test battery (single precision)
+        run: tests/ci_suite.sh core
 
-      - name: Standard-DTFE regression
-        run: python3 tests/run_tests.py
-
-      - name: PS-DTFE smoke test
-        run: tests/ps_smoke_test.sh --no-build
-
-      # The PS flag suites. None of these ran in CI before, which is how two stale
-      # assertions in ps_linear_deposit_check sat red for days unnoticed -- run_tests.py and
-      # the smoke test never pass a single PS flag. ps_auto_tune_check and ps_scratch_check
-      # stay local-only: they use macOS-isms (/usr/bin/time -l, /private/tmp).
-      - name: PS-DTFE regression (analytic pancake)
-        run: python3 tests/ps_regression_test.py --no-build
-
-      - name: PS-DTFE linear/exact deposit checks
-        run: tests/ps_linear_deposit_check.sh --no-build
-
-      - name: PS-DTFE halo-release check
-        run: tests/ps_halo_release_check.sh --no-build
-
-      - name: PS-DTFE vertex-mass check
-        run: tests/ps_vertex_mass_check.sh --no-build
-
-      - name: PS-DTFE volume-weighted check
-        run: tests/ps_volume_weighted_check.sh --no-build
-
-      # The caustic stratification and the tessellation cache are the two features whose contracts
-      # are about SILENT wrongness (a mask that no longer matches the fold flag; a stale cache
-      # served to the wrong partition), so they belong in CI even though both were developed on
-      # macOS. Neither needs a GPU: the caustic check skips its Metal section unless o_ps carries
-      # the metal stamp, and the cache check puts its files under $TMPDIR.
-      - name: PS-DTFE caustic stratification check
-        run: tests/ps_caustic_class_check.sh --no-build
-
-      - name: PS-DTFE tessellation cache check
-        run: tests/ps_tessellation_cache_check.sh --no-build
-
-      # Point evaluation shares the tessellation with the deposit but reads it through a completely
-      # separate traversal, so a regression there is invisible to every grid test above.
-      - name: PS-DTFE point-evaluation check
-        run: tests/ps_point_eval_check.sh --no-build
-
-      - name: standard-DTFE point-evaluation check
-        run: tests/dtfe_point_eval_check.sh --no-build
-
-      # Exact point location has a contract no other suite pins -- zero double counts, even for
-      # queries AT particle positions, identical under any partition split or thread count --
-      # and --serve must answer bit-identically to --sample-points (it is the dtfelib.Estimator
-      # backend). Needs only numpy + h5py on the Python side.
-      - name: exact point location + --serve check
-        run: tests/point_exact_serve_check.sh --no-build
-
-      # '.hidden_streams' bit 1 (a folded tetrahedron overlaps the cell) must be EXACT: checked against
-      # dense exact point evaluation and the exact r3d deposit on walls thinner than the sampling,
-      # and identical serial vs --partition. Single-stream masks everywhere rely on it.
-      - name: exact hidden-streams flag check
-        run: tests/ps_hidden_streams_check.sh --no-build
-      - name: PS-DTFE non-periodic suite (isolated cloud, --box region faces, --partition == one triangulation)
-        run: python3 tests/ps_nonperiodic_test.py --no-build
-
-      # The batch driver itself. Every other suite here tests the binary; this one tests the shell
-      # around it, which is where two silent failures (a discarded environment variable, snapshots
-      # skipped for a file they did not need) survived two handoffs unnoticed. It also pins the
-      # driver's PORTABILITY, so a macOS-only command cannot creep back onto its critical path --
-      # which this Linux runner is the only place that would catch.
-      - name: run_ps_dtfe.sh batch-driver contract check
-        run: tests/run_scripts_check.sh --no-build
-
-      # The GUI (python/gui, scripts/gui.sh). The job-spec test is pure Python: it pins every
-      # command the GUI can run -- all four tabs and the queue -- and needs only numpy + h5py.
-      # The end-to-end test drives the real window offscreen through REAL runs of every tab on
-      # synthetic data (grids, pipeline, plots, a queue; the Data tab through a fake wget, so no
-      # network), which needs PySide6 (in a venv: Ubuntu's python refuses pip), the libraries of
-      # Qt's offscreen platform, and matplotlib + scipy for the plot scripts it launches.
-      # DTFE_GUI_TEST_REQUIRED=1 turns its "PySide6 missing" skip into a failure. Before the
-      # DOUBLE=1 step, which replaces the float binaries it runs.
-      - name: GUI job specifications (no Qt)
-        run: python3 tests/py_gui_runspec_test.py
-
-      - name: GUI end-to-end (PySide6, offscreen)
-        env:
-          QT_QPA_PLATFORM: offscreen
-          DTFE_GUI_TEST_REQUIRED: "1"
+      # The GUI (python/gui). The job-spec test is pure Python; the end-to-end test drives the real
+      # window offscreen through REAL runs of every tab on synthetic data (the Data tab through a
+      # fake wget, so no network), which needs PySide6 (in a venv: Ubuntu's python refuses pip), the
+      # libraries of Qt's offscreen platform, and matplotlib + scipy for the plot scripts.
+      # DTFE_GUI_TEST_REQUIRED=1 (set by ci_suite.sh) turns its "PySide6 missing" skip into a failure.
+      - name: GUI job specifications + end-to-end (PySide6, offscreen)
         run: |
           sudo apt-get install -y --no-install-recommends \
             python3-venv python3-matplotlib python3-scipy \
             libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3 libglib2.0-0t64
           python3 -m venv --system-site-packages "$RUNNER_TEMP/gui-venv"
           "$RUNNER_TEMP/gui-venv/bin/pip" install --quiet PySide6
-          "$RUNNER_TEMP/gui-venv/bin/python" tests/py_gui_app_test.py
+          DTFE_GUI_PYTHON="$RUNNER_TEMP/gui-venv/bin/python" tests/ci_suite.sh gui
 
-      # DOUBLE=1 is a separate compile of every translation unit (Real = double), so only a
-      # build catches a float-only construct creeping in; the smoke test then runs it end to end
-      # through the HDF5 reader. LAST, because it replaces the float binaries every step above uses.
-      - name: Build + smoke-test the double-precision binaries
+      # the double pair against the single pair, then the program-running suites again against the
+      # double pair (DTFE_TEST_PRECISION=double reads their float64 grids; tests/precision.sh)
+      - name: Test battery (double precision)
+        run: tests/ci_suite.sh double
+
+      - name: 2D phase space against analytic 2D flows
+        run: tests/ci_suite.sh 2d
+
+  cuda-compile:
+    runs-on: ubuntu-24.04
+    container: nvidia/cuda:12.6.3-devel-ubuntu24.04
+    timeout-minutes: 15
+    steps:
+      - name: git for the checkout (the toolkit image has none)
+        run: apt-get update && apt-get install -y --no-install-recommends git ca-certificates
+      - uses: actions/checkout@v4
+      - name: "Compile the CUDA/HIP backend with nvcc (no device: compile only)"
         run: |
-          make DTFE    DOUBLE=1 ARCH_FLAGS="-mtune=generic" -j"$(nproc)"
-          make PS-DTFE DOUBLE=1 ARCH_FLAGS="-mtune=generic" -j"$(nproc)"
-          tests/ps_smoke_test.sh --no-build
+          cd src/CGAL_triangulation
+          nvcc -O3 -std=c++17 -Xcompiler -fPIC -c ps_gpu_cuda.cu   -o /tmp/ps_gpu_cuda.o
+          nvcc -O3 -std=c++17 -Xcompiler -fPIC -c dtfe_gpu_cuda.cu -o /tmp/dtfe_gpu_cuda.o
+          ls -la /tmp/*_gpu_cuda.o
+
+  # The same two files as HIP (AMD, ROCm's hipcc, '-x hip' as the Makefile's HIP=1 build): compile only,
+  # for one common datacenter target. First compiled 2026-10-02 (HIP 7.15, rocm/dev-ubuntu-24.04, under
+  # x86 emulation): clean once gpuFree's [[nodiscard]] hipError_t was discarded explicitly.
+  hip-compile:
+    runs-on: ubuntu-24.04
+    container: rocm/dev-ubuntu-24.04:latest
+    timeout-minutes: 20
+    steps:
+      - name: git for the checkout (the ROCm image has none)
+        run: apt-get update && apt-get install -y --no-install-recommends git ca-certificates
+      - uses: actions/checkout@v4
+      - name: "Compile the CUDA/HIP backend with hipcc (no device: compile only)"
+        run: |
+          cd src/CGAL_triangulation
+          hipcc -O3 -std=c++17 -fPIC -x hip --offload-arch=gfx90a -c ps_gpu_cuda.cu   -o /tmp/ps_gpu_hip.o
+          hipcc -O3 -std=c++17 -fPIC -x hip --offload-arch=gfx90a -c dtfe_gpu_cuda.cu -o /tmp/dtfe_gpu_hip.o
+          ls -la /tmp/*_gpu_hip.o

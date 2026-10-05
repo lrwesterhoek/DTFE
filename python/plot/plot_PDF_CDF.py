@@ -7,7 +7,7 @@ from scipy.optimize import curve_fit
 from scipy.stats import norm
 import warnings
 from dtfelib.figures import save_plot_to_multiple_paths
-from dtfelib import make_parser
+from dtfelib import make_parser, sim_dir
 import config
 from dtfelib import figures as style
 from dtfelib import pipeline
@@ -265,7 +265,8 @@ def process_snapshot(snapshot, redshift, args):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        p = pipeline.products(snapshot, redshift, sim=args.sim, method=args.method)
+        p = pipeline.products(snapshot, redshift, sim=args.sim, method=args.method, prefix=args.prefix,
+                              data_root=args.data_root)
         cp = p.critical_points()
         box_size = p.fs.meta.box_mpc
         grid_n = p.fs.grid_n
@@ -444,7 +445,7 @@ def main():
     args = parser.parse_args()
 
     print("Starting critical point PDF/CDF analysis")
-    print(f"Data directory: {args.data_root / args.sim}")
+    print(f"Data directory: {sim_dir(args.sim, args.data_root)}")
     print(f"Output directory: {OUTPUT_DIR}")
     print(f"Processing {len(SNAPSHOT_TO_REDSHIFT)} snapshots")
 

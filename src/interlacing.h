@@ -9,7 +9,6 @@
 
 #include <vector>
 #include "define.h"
-#include "user_options.h"
 
 /* Average two density grids in Fourier space (interlacing). field1: original grid, modified
    in-place with the result; field2: half-cell-offset grid; nGrid, dx: NO_DIM elements each. */

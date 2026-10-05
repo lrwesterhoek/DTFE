@@ -1,6 +1,6 @@
 <main>
 <header style="display:grid;gap:14px">
-  <div class="eyebrow">DTFE benchmark · 30 September – 1 October 2026 · every number re-measured after the fixes</div>
+  <div class="eyebrow">DTFE benchmark · 30 September – 1 October 2026 · every number re-measured after the fixes · standard-DTFE GPU rows added 1 October evening</div>
   <h1>PS-DTFE versus CosmoDTFE</h1>
   <p class="lede">The same data through both codes: crossed Zel'dovich waves with an exact analytic answer (up to 7.1 million
   particles) and an 11.8-million-particle piece of TNG100-3-Dark at z&nbsp;=&nbsp;0. Every estimate is scored against the
@@ -31,7 +31,7 @@
       plus phase-space densities, dispersion, per-stream records, mass-conserving and exact cell averages, caustics,
       cosmic-web labels, GPU deposits and boxes larger than memory. CosmoDTFE's real strength is being a small Julia
       library you can hold in your head and call directly.</p></div></div>
-    <div><div class="k">Found in ours</div><div class="v"><p><span class="chip">6 issues fixed, 3 speedups</span></p>
+    <div><div class="k">Found in ours</div><div class="v"><p><span class="chip">6 issues fixed, 4 speedups</span></p>
       <p>The benchmark exposed a bug in our memory auto-tuner and three real costs: point evaluation held every point's
       stream records in memory, the exact GPU deposit parallelised badly when cells are much smaller than tetrahedra,
       and the CPU sampled deposit ran serially inside one partition. Fixing them turned up two errors in non-periodic
@@ -39,7 +39,10 @@
       partition seams. All six are fixed; the TNG region now holds exactly the mass of the particles inside it, and
       every number in this report is re-measured after the fixes (before and after at the end). Two further speedups
       came from asking where a small run's time goes — its vertex densities and its triangulation — and a third from
-      letting the auto-tuner split small sets for speed.</p></div></div>
+      letting the auto-tuner split small sets for speed. A fourth came from a measurement the benchmark had never
+      made: standard DTFE's own GPU deposit, fine, it turned out, on 256³ grids and ten times <em>slower</em> than the
+      CPU on 512³ ones. Rebuilt, it is now 1.5–2.3× faster than the ten-core CPU where the cells are smaller than the
+      tetrahedra.</p></div></div>
   </div>
 </section>
 
@@ -105,7 +108,10 @@
   <p class="note">On TNG our standard-DTFE grid tessellates only the particles in and around the region, CosmoDTFE the
   whole cloud: part of that 35× is a feature a CosmoDTFE user could imitate by cutting the input. Smaller sets: 2.1M
   particles ours 1.5–3.4× faster; 0.26M particles the standard-DTFE slice is even and ours is 2× faster on the
-  phase-space slice, 4× on the grids.</p>
+  phase-space slice, 4× on the grids. The standard-DTFE <em>cell averages</em> (the volume-averaged fields the
+  production grids use; CosmoDTFE has no equivalent) are listed at 256³ and 512³, on the CPU and on the GPU: the GPU
+  pays where the tetrahedra are larger than the cells, so at 512³ and for small sets, and ties the CPU at 256³ with
+  7.1M particles, where reading, triangulating and writing are the floor.</p>
   <ul class="plain">
     <li><b>Memory per particle.</b> CosmoDTFE's standard DTFE peaks at about 2.6 KB per particle (17.4 GiB at 7.1M). The
       full TNG100-3 box (94M particles) would need about 250 GB, so on this machine it cannot be done in one piece; ours
@@ -181,6 +187,25 @@
       of rounding, and the query server, the tessellation cache and the test suites rely on bit-identical repeats. With
       the flag the 0.26M slice takes 1.4 s instead of 2.4 s and the TNG region's GPU grid 110 s instead of 135 s; the
       tables below use the default.</li>
+    <li><b>Standard DTFE on the GPU.</b> The report grids are 256³, where 7.1M particles put about three tetrahedra
+      in every cell and the GPU deposit of standard DTFE (<code>--gpu</code>, the volume-averaged fields) was a little
+      faster than the CPU. Measured for the launcher's GPU default at 512³, the same run took 397 s against 37 s on the
+      CPU. With 0.35 tetrahedra per cell nearly every tetrahedron takes the sampled path, hundreds of samples each with
+      an atomic add per field, and loops of up to 10 000 samples per thread that tripped the GPU watchdog (whole
+      sub-domain deposits restarted; a retried run differed from its repeat by a whole sample in sparse cells). The
+      kernel was rebuilt in measured steps: one thread per <em>work item</em> of a tetrahedron and 48 of its samples,
+      mapped implicitly (no per-item buffer) and dealt round-robin so neighbouring threads read neighbouring table
+      entries; a per-thread cell cache flushed by a SIMD-group reduction, the tetrahedra in Morton order so the lanes
+      share cells; one pipeline per field set, since the kernel is register-bound; and, the decisive step, a
+      threadgroup-shared cell table for the cache evictions — samples are proportional to volume, so most are void
+      samples whose tetrahedron spans hundreds of cells, each hit some twenty times but across two hundred items. Each
+      step was measured by skipping exactly the branch under suspicion; the two probes that measured a lighter kernel
+      instead (density only, no writes) pointed at the wrong cost first. Sharing one grid between the sub-domains, the
+      obvious restructuring, was built, verified to agree with the per-sub-domain grids to 10⁻⁶, and found slower:
+      the atomics lose cache and TLB locality on a 2 GB grid; it stays as an option. Results agree with the CPU's as
+      before (float against double sample placement), and repeats agree to 4·10⁻⁷. Whole runs with 7.1M particles at
+      512³: 39.1 s on the CPU, 17.3 s on the GPU (with the velocity gradient 48.2 s and 32.0 s); the launcher now ticks
+      the GPU for standard DTFE too.</li>
     <li><b>Small runs: let the tuner split for speed.</b> There is a way to parallelise the triangulation that keeps
       every bit reproducible: split a small set into eight partitions and triangulate each on its own core. The
       memory-driven auto-tuner never did that for sets that fit, so it now predicts the wall time of one, eight and
@@ -196,7 +221,8 @@
   {{fixes}}
   <p class="note">Before: the first run of each task (stopped runs marked). After: the same command on the fixed code,
   auto-tuned as before; the TNG rows include the region and seam fixes. Whole process, reading and writing
-  included.</p>
+  included. The standard-DTFE GPU rows compare this morning's per-tetrahedron kernel with the rebuilt one, both run
+  this evening on the same machine.</p>
   <p class="note">Reproduce: the harness (analytic solution, both drivers, scoring and figures) is in
   <code>python/tools/cosmodtfe_comparison/</code>; figures and scores in <code>figures/cosmodtfe_comparison/</code>.</p>
 </section>

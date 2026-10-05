@@ -120,6 +120,29 @@ struct User_options
 
 
     std::vector<size_t> gridSize;// grid size along each direction
+    // the grid the output files hold: the --ps-window cells (PS-DTFE) or the full grid, and its box
+    void   outputGridSize(size_t out[NO_DIM]) const;
+    void   outputBox(Box &out) const;
+    // --ps-window x0 x1 y0 y1 z0 z1 (the output coordinates, Mpc; PS-DTFE only, the standard binary refuses it
+    // but carries the members so the writers compile once): deposit, allocate and write ONLY the cells of the
+    // full '--grid' that lie in this box. The tessellation and every tetrahedron's normalization are those of
+    // the full run, so a window run equals the full run's window cells: bit for bit for the sampled deposit
+    // (a straddling tetrahedron counts all its samples, deposits the inside part), to float rounding for the
+    // exact one (only the window's cells are clipped; the whole weight normalizes). For a fine look at a
+    // region of a periodic box (the launcher's exact zoom), where the full fine grid would not fit.
+    bool   psWindowOn;
+    std::vector<Real> psWindow;        // the box as given
+    size_t psWindowLo[NO_DIM];         // its cell range in the full grid, set by computePsWindow() once the box is final
+    size_t psWindowDims[NO_DIM];
+    void   computePsWindow();          // from psWindow, the grid box (region/boxCoordinates) and gridSize
+    // (both binaries compile the setup that reads them; only PS-DTFE sets them)
+    // ps_globals_record.h: a --ps-window run that started WITHOUT reading its particles (their globals come
+    // from the record in the tessellation cache); they are read late if a needed partition is not cached
+    std::string psGlobalsKey;           // its key, computed in main() BEFORE the input is read (the box as given)
+    bool   psParticlesDeferred = false;
+    size_t psPresetN = 0;               // the recorded particle count (padding, auto-tune)
+    Box    psPresetLagBox;              // the recorded bounding box of the initial positions
+    bool   psAverageDensityFromParticles = false;   // set when the run computed the mean density from its particles
     bool   periodic;      // true if the particle data is in a periodic box
     bool   periodicInput; // the user's '--periodic' as given -- never reset by the partition/padding code, which turns 'periodic' off once the copies exist (the tessellation cache keys on this: the copies change the tessellation)
     Box    boxCoordinates;// coordinates of the full particle data box
@@ -137,6 +160,7 @@ struct User_options
     bool   partitionOn;   // true if the data IS split into several partitions (user- or auto-selected)
     bool   partitionGiven;// true if the user passed '--partition' at all -- including '1 1 1', which asks for ONE triangulation (partitionOn stays false) and must keep the auto-tuner from choosing a split
     std::vector<size_t> partition;// grid along which to split the particle data so the Delaunay triangulation runs on parts (time/memory)
+    std::vector<size_t> subgridOffset; // set by copySubgridInformation(): this sub-grid's origin (cells) in the grid it was split from -- the GPU's shared deposit maps the sub-domain into that grid
     int    partNo;        // which partition the program should output (index in 'fileGrid')
     int    maxConcurrent; // cap on concurrently-built Delaunay triangulations (peak RAM ~ concurrency x per-triangulation); 0 = all threads. PS-DTFE: concurrent Lagrangian partitions; standard DTFE: concurrent spatial sub-triangulations.
     bool   autoTuneReport;  // --auto-tune-report: print the auto-tuner's decision and predicted peak memory as ONE machine-readable line after loading the input, then exit (the GUI's memory check)
@@ -175,6 +199,7 @@ struct User_options
     bool   psPtsScalar;                // --pts-scalar: also interpolate the particles' scalar value (--scalar-dataset) per stream: '.pts_scalar' (density-weighted mean over the streams) + '.pts_stream_scalar' with --per-stream
     bool   psPtsLagrangian;            // --pts-lagrangian (PS-DTFE only): also write each stream's Lagrangian coordinate q(x) -- where the matter at the point started -- to '.pts_stream_lagpos' (float64 x3 per stream; implies --per-stream)
     std::string scalarDataset;         // --scalar-dataset NAME: Gadget HDF5 input reads '/PartTypeN/NAME' (one value per particle, raw) as the scalar field every estimator interpolates (empty = the reader's own scalar, if any)
+    bool   psServeProgress;            // --serve-progress: plain stderr progress lines for the build and every request, whatever --verbose says (the launcher's progress bar)
     int    serveResident;              // --serve-resident N: with '--serve --partition', how many partition tessellations stay in memory at once (the rest are reloaded from '--tessellation-cache' on demand); 0 = automatic
     bool   psStreamDensityGeometric;   // PS-DTFE --ps-stream-density: true = 'geometric' (m_tet/V_eul, matches the mass-conserving deposit), false = 'dtfe' (vertex-density interpolation, matches the Feldbrugge reference; DEFAULT). Always false in the standard binary.
 #ifdef PHASE_SPACE
@@ -233,6 +258,7 @@ struct User_options
     double psLagAlphaRadius; // the --ps-alpha-shape cut in Lagrangian length (c x mean spacing, set for non-periodic runs; 0 = no cut)
     bool   psMayClearDT;     // set by the DTFE_interpolation overload that OWNS its triangulation: the last interpolateGrid_phaseSpace call may clear the DT right after its deposit (frees ~650 B/vertex before the merge phase). Never set when the caller keeps the triangulation (TRIANGULATION library API).
     bool   psSuppressGridStats; // PS-DTFE partition path: silence per-partition coverage/stream stats (each covers ~1/Npart of the grid); aggregate reported once after the loop
+    bool   psCacheOnly = false;  // PS-DTFE partition path: the partition's particles were NOT selected because its cached tessellation's header matched -- a load that then fails is an error, never an empty build (internal, no option)
     bool   psUseSubgrid;        // PS-DTFE partition path: allocate only each partition's Eulerian bounding box, mapped back via addFromSubgrid -> lower peak memory
     bool   psOrderedMerge;      // PS-DTFE partition path: merge the partitions' grids in index order (bit-reproducible sums). Set by the auto-tuner's SPEED split of a small set, whose uniform partitions wait for each other at no cost; a memory-driven split of a large set merges in completion order (waiting behind a slow partition cost the TNG region's GPU grid 35%, for sums the GPU's atomics make non-reproducible anyway)
     bool   psDeferNormalization; // PS-DTFE partition path: keep fields as density-weighted moments (no per-partition normalize) so they sum linearly and normalize once afterwards; correct for multi-stream cells spanning partitions

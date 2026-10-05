@@ -33,7 +33,7 @@ SEED = 42
 JITTER = 0.02
 
 
-from ps_test_helpers import make_cmd, load
+from ps_test_helpers import make_cmd, load, binary as test_binary, require, PRECISION
 
 
 def run(cmd):
@@ -46,19 +46,18 @@ def main():
     ap.add_argument("--no-build", action="store_true")
     args = ap.parse_args()
     os.makedirs(TMP, exist_ok=True)
-    binary = os.path.join(ROOT, "PS-DTFE")
+    binary = test_binary("PS-DTFE")
     snap = os.path.join(TMP, "ps_3d.hdf5")
     out = os.path.join(TMP, "ps_3d_out")
 
     print("=" * 60)
     print(" PS-DTFE 3D test — three crossed Zel'dovich waves (Tier 4.1)")
-    print(f"   N={N}^3  grid={GRID}^3  box={BOX} Mpc  AMP={AMP}")
+    print(f"   N={N}^3  grid={GRID}^3  box={BOX} Mpc  AMP={AMP}  precision={PRECISION}")
     print("=" * 60)
 
-    if not args.no_build:
+    if not args.no_build and make_cmd():
         run(make_cmd())
-    if not (os.path.isfile(binary) and os.access(binary, os.X_OK)):
-        sys.exit(f"FAIL: '{binary}' not built")
+    require(binary)
 
     run([sys.executable, os.path.join(HERE, "generate_ps_test_data.py"),
          "--out", snap, "--n", str(N), "--box", str(BOX), "--amplitude-factor", str(AMP),

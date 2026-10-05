@@ -184,7 +184,8 @@ def plot_panel(r, curve, lo, hi, color, label, ylabel, null_level, ylim,
 
 
 def process_snapshot(snapshot, redshift, args):
-    p = pipeline.products(snapshot, redshift, sim=args.sim, method=args.method)
+    p = pipeline.products(snapshot, redshift, sim=args.sim, method=args.method, prefix=args.prefix,
+                          data_root=args.data_root)
     redshift = p.redshift
     if redshift is None:
         print(f"\nskipping snapshot {snapshot} (unknown redshift)")

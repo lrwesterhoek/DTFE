@@ -30,6 +30,8 @@
 #     the single-domain report predicts a sane peak (it said 52 GB for a 0.26M run: the GUI's
 #     memory check believed it); and two auto-split runs give bit-identical grids (the split
 #     merges its partitions in index order).
+#  I) Very fine grids: GPU sub-grids kept under 2^32 cells by the split; a small set on a huge grid
+#     splits for memory instead of staying in one domain over budget.
 #  F) --auto-tune-report (the GUI's memory check): ONE machine-readable line, exit 0, nothing
 #     written; a hand-set --partition/--max-concurrent is reported as given (the prediction uses
 #     the concurrency the run will use); DTFE_AUTO_PTS_N sizes a plane that does not exist yet.
@@ -47,9 +49,11 @@ PY="${PYTHON:-python3}"
 command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/python3.14
 ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT}"
+source "${SCRIPT_DIR}/precision.sh"     # DTFE_TEST_PRECISION=double: the double pair
 
 N="${N:-64}"; BOX="${BOX:-100.0}"
-BIN="./PS-DTFE"
+BIN="${PS_BIN}"
+precision_require "${BIN}"
 TMP="${SCRIPT_DIR}/tmp"; mkdir -p "${TMP}"
 SNAP="${TMP}/at_input_pancake.hdf5"
 
@@ -57,7 +61,7 @@ echo "============================================================"
 echo " auto-tune check   N=${N}^3"
 echo "============================================================"
 
-if [ "${1:-}" != "--no-build" ]; then
+if [ "${1:-}" != "--no-build" ] && ! precision_double; then
     echo ">> building PS-DTFE ..."
     BUILD_MODE="$(cat o_ps/.build_mode 2>/dev/null || true)"
     make PS-DTFE ${BUILD_MODE:+"$BUILD_MODE"} >/dev/null
@@ -230,7 +234,7 @@ check "G the estimate stays physical: 0 < ${sg:-none} < 20 streams/point" \
 
 # ---------- (H) the time-aware split of a small set ----------
 echo ">> H: time-aware split for small sets (speed, not memory)"
-GPU_H=0; grep -q "METAL=1" o_ps/.build_mode 2>/dev/null && GPU_H=1
+GPU_H=0; grep -q "METAL=1\|CUDA=1\|HIP=1" o_ps/.build_mode 2>/dev/null && GPU_H=1
 COMMON_H=(--input 105 --MpcUnit 1 --verbose 2 --auto-tune-report)
 # H1: a slice of the 64^3 box (4.2M points, 16^3 grid) is triangulation-bound -> 2^3 partitions
 env DTFE_RAM_GB=64 DTFE_AUTO_PTS_N=4194304 "${BIN}" "${SNAP}" "${TMP}/at_h1" --grid 16 --field density --periodic \
@@ -266,6 +270,31 @@ else
     check "H5 two auto-split runs are bit-identical (.den, .streams: ordered merge)" 0
 fi
 rm -f "${TMP}"/at_h*.den "${TMP}"/at_h*.streams "${TMP}"/at_h*.hidden_streams
+
+# ---------- (I) very fine grids: the GPU's 2^32-cell sub-grid cap, and a small set's memory ----------
+# The GPU kernels number a partition's sub-grid cells with 32 bits: above 2^32 the deposit falls back to
+# the CPU. The tuner now splits to keep every GPU sub-grid under the cap (a 1700^3 grid: 2^3) and warns
+# about a user split that does not. And a small particle set on such a grid no longer stays in one
+# domain when that domain's deposit buffers do not fit (it predicted 83 GB unsplit): it splits for memory.
+echo ">> I: very fine grids (1700^3, grids on scratch)"
+ISCR="${TMPDIR:-/tmp}/dtfe-at-scratch"; mkdir -p "${ISCR}"
+COMMON_I=(--grid 1700 --periodic --field density_a --input 105 --MpcUnit 1 --verbose 2 --scratch-dir "${ISCR}" --auto-tune-report)
+env DTFE_RAM_GB=64 "${BIN}" "${SNAP}" "${TMP}/at_i_cpu" "${COMMON_I[@]}" > "${TMP}/at_i_cpu.log" 2>&1
+pi=$(sed -n 's/^AUTO-TUNE-REPORT partition=\([0-9]*\) .*/\1/p' "${TMP}/at_i_cpu.log" | head -1)
+ob=$(sed -n 's/^AUTO-TUNE-REPORT .*over_budget=\([01]\).*/\1/p' "${TMP}/at_i_cpu.log" | head -1)
+check "I1 CPU: a small set on a 1700^3 grid splits for memory (partition ${pi:-none}, over_budget ${ob:-none})" \
+      "$([ -n "${pi}" ] && [ "${pi}" -ge 2 ] && [ "${ob}" = "0" ] && echo 1 || echo 0)"
+env DTFE_RAM_GB=64 "${BIN}" "${SNAP}" "${TMP}/at_i_gpu" "${COMMON_I[@]}" --ps-gpu > "${TMP}/at_i_gpu.log" 2>&1
+if grep -q "GPU (--ps-gpu)" "${TMP}/at_i_gpu.log"; then
+    pg=$(sed -n 's/^AUTO-TUNE-REPORT partition=\([0-9]*\) .*/\1/p' "${TMP}/at_i_gpu.log" | head -1)
+    check "I2 GPU: the tuner splits a 1700^3 grid so each sub-grid stays under 2^32 cells (partition ${pg:-none})" \
+          "$([ -n "${pg}" ] && [ "${pg}" -ge 2 ] && grep -q "under the 2^32 cells the GPU kernels number" "${TMP}/at_i_gpu.log" && echo 1 || echo 0)"
+    env DTFE_RAM_GB=64 "${BIN}" "${SNAP}" "${TMP}/at_i_user" "${COMMON_I[@]}" --ps-gpu --partition 1 1 1 > "${TMP}/at_i_user.log" 2>&1
+    agrep "I3 GPU: a user's unsplit 1700^3 grid is told which split keeps the GPU" "above the 2\^32 the GPU kernels number" "${TMP}/at_i_user.log"
+else
+    echo "   SKIP  I2/I3 (this build has no GPU backend)"
+fi
+rm -rf "${ISCR}"
 
 echo "------------------------------------------------------------"
 if [ "${FAILS}" -gt 0 ]; then

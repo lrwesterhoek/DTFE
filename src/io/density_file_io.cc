@@ -155,13 +155,17 @@ struct Density_header
             userOptions.regionMpcOn = true;
         }
         
+        size_t outGrid[NO_DIM];             // the grid the files hold: the --ps-window cells, else the full grid
+        userOptions.outputGridSize( outGrid );
         for (int i=0; i<NO_DIM; ++i)        // update the grid dimensions
-            this->gridSize[i] = userOptions.gridSize[i];
+            this->gridSize[i] = outGrid[i];
         if ( userOptions.partNo>=0 )        // update the data coordinates if file was split
             for (int i=0; i<NO_DIM; ++i)
                 this->densityFileGrid[i] = userOptions.partition[i]; 
+        Box outBox;                         // the box of those cells (the window's, cell-aligned)
+        userOptions.outputBox( outBox );
         for (int i=0; i<2*NO_DIM; ++i)      // update the box coordinates
-            this->box[i] = userOptions.regionOn ? userOptions.region[i] : userOptions.boxCoordinates[i];
+            this->box[i] = userOptions.regionOn ? userOptions.region[i] : outBox[i];
         
 #if NO_DIM==2
         this->gridSize[2] = 1;

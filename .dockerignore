@@ -4,9 +4,11 @@
 .github/
 Dockerfile
 o/
-o_ps/
+o_*/
 DTFE
+DTFE-*
 PS-DTFE
+PS-DTFE-*
 libDTFE.*
 DTFE_include/
 tests/tmp/

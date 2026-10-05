@@ -23,9 +23,11 @@ PY="${PYTHON:-python3}"
 command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/python3.14
 ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT}"
+source "${SCRIPT_DIR}/precision.sh"     # DTFE_TEST_PRECISION=double: the double pair
 
 N="${N:-32}"; GRID="${GRID:-48}"; BOX="${BOX:-100.0}"
-BIN="./PS-DTFE"
+BIN="${PS_BIN}"
+precision_require "${BIN}"
 TMP="${SCRIPT_DIR}/tmp"; mkdir -p "${TMP}"
 SNAP="${TMP}/pcc_input.hdf5"
 OUT="${TMP}/pcc_out"
@@ -34,7 +36,7 @@ echo "============================================================"
 echo " PS-DTFE caustic stratification check   N=${N}^3  grid=${GRID}^3"
 echo "============================================================"
 
-if [ "${1:-}" != "--no-build" ]; then
+if [ "${1:-}" != "--no-build" ] && ! precision_double; then
     echo ">> building PS-DTFE ..."
     BUILD_MODE="$(cat o_ps/.build_mode 2>/dev/null || true)"
     make PS-DTFE ${BUILD_MODE:+"$BUILD_MODE"} >/dev/null
@@ -55,11 +57,12 @@ echo ">> CPU deposit with --ps-caustics ..."
 "${PY}" - "${OUT}" <<'EOF'
 import sys
 import numpy as np
+import os as _os; REAL = np.dtype(_os.environ.get("DTFE_TEST_REAL", "float32"))   # tests/precision.sh
 
 root = sys.argv[1]
-cls = np.fromfile(root + ".causticClass", dtype=np.float32)
-fold = np.fromfile(root + ".caustic", dtype=np.float32)
-strm = np.fromfile(root + ".streams", dtype=np.float32)
+cls = np.fromfile(root + ".causticClass", dtype=REAL)
+fold = np.fromfile(root + ".caustic", dtype=REAL)
+strm = np.fromfile(root + ".streams", dtype=REAL)
 m = cls.astype(np.int64)
 
 fails = 0
@@ -191,10 +194,11 @@ done
 "${PY}" - "${TMP}" <<'PYEOF' || py_rc=1
 import sys
 import numpy as np
+import os as _os; REAL = np.dtype(_os.environ.get("DTFE_TEST_REAL", "float32"))   # tests/precision.sh
 
 tmp = sys.argv[1]
 def mask(name):
-    return np.fromfile(f"{tmp}/{name}.causticClass", dtype=np.float32).astype(np.int64)
+    return np.fromfile(f"{tmp}/{name}.causticClass", dtype=REAL).astype(np.int64)
 
 fails = 0
 def check(ok, msg):
@@ -236,11 +240,12 @@ echo "    D1 = D2 = 0 with D3 != 0 -- an exact A4 at q = L/3 and 2L/3."
 "${PY}" - "${TMP}" <<'PYEOF' || py_rc=1
 import sys
 import numpy as np
+import os as _os; REAL = np.dtype(_os.environ.get("DTFE_TEST_REAL", "float32"))   # tests/precision.sh
 
 tmp = sys.argv[1]
 G = 48
 def mask(name):
-    return np.fromfile(f"{tmp}/{name}.causticClass", dtype=np.float32).astype(np.int64)
+    return np.fromfile(f"{tmp}/{name}.causticClass", dtype=REAL).astype(np.int64)
 
 fails = 0
 def check(ok, msg):
@@ -303,9 +308,10 @@ echo "    it. An umbilic needs the coincident pair to sit AT ZERO, not merely to
 "${PY}" - "${TMP}" <<'PYEOF' || py_rc=1
 import sys
 import numpy as np
+import os as _os; REAL = np.dtype(_os.environ.get("DTFE_TEST_REAL", "float32"))   # tests/precision.sh
 
 tmp = sys.argv[1]
-m = np.fromfile(f"{tmp}/pcc_weak.causticClass", dtype=np.float32).astype(np.int64)
+m = np.fromfile(f"{tmp}/pcc_weak.causticClass", dtype=REAL).astype(np.int64)
 fails = 0
 def check(ok, msg):
     global fails
@@ -326,7 +332,7 @@ echo ""
 echo "(E) GPU behaviour: BOTH the fold flag and the full stratification must match the CPU exactly."
 echo "    The per-tet mask reaches the kernel through the otherwise-unused 'dens' buffer, so only the"
 echo "    --ps-linear-deposit combination (which needs that buffer) falls back to parity."
-if [ -f o_ps/.gpu_mode_metal ]; then
+if [ -d o_ps ] && [ ! -f o_ps/.gpu_mode_off ]; then   # any GPU backend stamp (metal / cuda / hip)
     msg="$("${BIN}" "${SNAP}" "${OUT}_gpu" --grid "${GRID}" --periodic --field density --MpcUnit 1 \
             --max-concurrent 1 --ps-caustics --ps-gpu 2>&1 || true)"
     if cmp -s "${OUT}.caustic" "${OUT}_gpu.caustic"; then

@@ -10,22 +10,34 @@ run with a python whose h5py works (`/opt/homebrew/bin/python3` on the developme
 
 ```bash
 ./scripts/install.sh              # one-command clean rebuild, best backend auto-detected
-                                  #   (Apple Silicon -> METAL=1, else CPU-only)
+                                  #   (Apple Silicon -> METAL=1; Linux with nvcc / hipcc -> CUDA=1 / HIP=1; else CPU-only)
 ./scripts/install.sh --cpu        # force CPU-only binaries
 ./scripts/install.sh --no-deps    # skip dependency installation, just clean + rebuild
 ./scripts/install.sh --jobs 4     # limit parallel build jobs
 ./scripts/install.sh --docker     # containerized LINUX image instead (never Metal)
-./scripts/install.sh --double     # double-precision binaries (DOUBLE=1, CPU-only)
+./scripts/install.sh --double     # ALSO the double-precision pair (DOUBLE=1, same GPU backend)
 ./scripts/install.sh --no-python  # skip the 'pip install -e python' step (dtfelib)
 python3 -m pip install -e python  # dtfelib alone (editable: finds ./DTFE, ./PS-DTFE itself;
                                   #   a non-editable install needs DTFE_BIN_DIR or $PATH)
 
 make DTFE METAL=1 -j10            # standard DTFE, Apple-GPU '_a' interpolation backend
 make PS-DTFE METAL=1 -j10         # phase-space DTFE, Apple-GPU deposit backend
-make DTFE DIM=2                   # 2D standard DTFE (default DIM=3). PS-DTFE is 3D ONLY and
-                                  #   refuses to build with DIM=2 (see the #error in
-                                  #   ps_interpolation.cc: no 2D Lagrangian input exists).
-                                  #   Switching DIM wipes the object dir, like a backend switch.
+make DTFE PS-DTFE CUDA=1 -j10     # Linux/NVIDIA: the same kernels ported to CUDA (nvcc; compiled +
+                                  #   CPU-fallback-tested on Linux, not yet validated on a GPU)
+make DTFE PS-DTFE HIP=1 GPU_ARCH=gfx90a   # Linux/AMD ROCm (hipcc; one backend per build)
+make DTFE PS-DTFE CUDAEMU=1       # the CUDA/HIP sources as plain C++ on a CPU emulation of the device API:
+                                  #   a validation build for machines without a GPU (lanes = coroutines in
+                                  #   lockstep; GPU_EMU_WARP=64 for the HIP width); runs the GPU test suites
+make DTFE PS-DTFE DOUBLE=1 METAL=1 -j10   # the double-precision pair as well (./DTFE-double, ./PS-DTFE-double;
+                                          # float64 end to end, ~2x memory; GPU deposit in float). Run scripts:
+                                          # DTFE_PRECISION=double ./scripts/run_ps_dtfe.sh ...
+make DTFE PS-DTFE DIM=2           # the 2D pair: ./DTFE-2d and ./PS-DTFE-2d (own object dirs o_2d / o_ps_2d,
+                                  #   so they coexist with the 3D binaries; CPU-only). 2D input: HDF5 with
+                                  #   two-column Coordinates/Velocities/InitialCoordinates, e.g.
+                                  #   python3 tests/generate_ps_test_data.py --dim 2 --out snap2d.hdf5 --n 96
+                                  #   Every field works in 2D, the T-web too (classes 0 void, 1 filament,
+                                  #   2 node): ./PS-DTFE-2d snap2d.hdf5 out2d --grid 192 --periodic --field density tweb
+                                  #   tests/ps_2d_check.sh checks the 2D pair against analytic 2D flows.
 make PS-DTFE TBB=1                # opt-in parallel CGAL triangulation (slower at small N!)
 make PS-DTFE DOUBLE=1             # double precision end to end (Real = double; float64 output
                                   #   grids, full-precision HDF5 reads). CPU-only: refused with
@@ -163,8 +175,10 @@ GRID_SIZE=512 PTS_VEL_GRAD=1 ./scripts/run_ps_pipeline.sh
 ## The binaries directly (`./DTFE`, `./PS-DTFE`)
 
 ```bash
-# quickstart on the demo file (binary Gadget auto-detected; velocity block of THIS file is junk)
-./DTFE demo/z0_64.gadget out --grid 64 --field density
+# quickstart on the demo file (binary Gadget auto-detected; velocity block of THIS file is junk).
+# The box is periodic, and its voids are wider than the default padding (5 spacings): without
+# --periodic up to a quarter of a thread's cells lie outside the tessellation, with it ~1%.
+./DTFE demo/z0_64.gadget out --grid 64 --field density --periodic --padding 12
 
 # standard DTFE, all main fields, GPU '_a' pass
 ./DTFE combined_099.hdf5 out --grid 512 --periodic --input 105 --MpcUnit 1000 \
@@ -262,7 +276,14 @@ mkdir -p /private/tmp/dtfe-tess
     --sample-points b.bin --tessellation-cache /private/tmp/dtfe-tess     # reuses it
 ./PS-DTFE snap.hdf5 out ... --tessellation-cache DIR --verbose 3          # says why a lookup missed
 ./PS-DTFE snap.hdf5 out ... --field vweb --lambda_th 0.3 --scale-factor 0.25 --hubble 0.6774
-./DTFE   snap.hdf5 out ... --exact-average         # exact r3d '_a' averaging (CPU-only, slow)
+./DTFE   snap.hdf5 out ... --exact-average         # exact r3d '_a' averaging (on the GPU with --gpu)
+./PS-DTFE snap.hdf5 out --grid 4096 --periodic --MpcUnit 1 --ps-exact-deposit \
+    --ps-window 20 30 20 30 50 50.1               # only the window's cells of the 4096^3 grid: the
+                                                  # full run's cells there, in seconds (the launcher's exact zoom)
+./PS-DTFE snap.hdf5 out --grid 4096 --periodic --MpcUnit 1 --ps-exact-deposit --ps-window 20 30 20 30 50 50.1 \
+    --partition 4 4 4 --tessellation-cache /private/tmp/dtfe-tess   # the query server's split and cache:
+                                                  # cached partitions are loaded, those whose occupancy maps
+                                                  # never reach the window are skipped
 ./PS-DTFE --full_help                              # every option with full descriptions
 ```
 
@@ -271,11 +292,12 @@ Common to both: `--grid N [NY NZ]`, `--periodic`, `--input 101|105|111|112|121|1
 `--region`, `--padding`. Input 101 = binary Gadget, 105 = Gadget HDF5 (default), 111 = text
 `x y z w`, 112 = text positions-only, 121 = raw binary (count, box, pos, weights, vels).
 
-**Which flags reach the GPU** (`METAL=1` build): the grid deposit, and `--ps-linear-deposit`,
-`--ps-volume-weighted`, `--ps-vertex-mass`, `--ps-caustics` and `--ps-exact-deposit` all compose
-with `--ps-gpu`. CPU-only: point evaluation (`--sample-points`/`--serve`: double precision by
-design, multi-threaded over the tessellation, exact point location), the standard binary's
-`--exact-average`, and scalar fields (they fall back with a warning).
+**Which flags reach the GPU** (`METAL=1`, `CUDA=1` or `HIP=1` build): the grid deposit, and
+`--ps-linear-deposit`, `--ps-volume-weighted`, `--ps-vertex-mass`, `--ps-caustics`,
+`--ps-exact-deposit` and `--ps-window` all compose with `--ps-gpu`; the standard binary's
+`--exact-average` and the scalar fields (`NO_SCALARS=1` builds) with `--gpu`. CPU-only: point
+evaluation (`--sample-points`/`--serve`: double precision by design, multi-threaded over the
+tessellation, exact point location).
 
 ### Interactive point evaluation (`--serve`, `dtfelib.Estimator`)
 
@@ -309,7 +331,26 @@ partition tessellations: built once in parallel, each with a 64^3 occupancy map 
 file>.occ'), a request visits only the partitions whose map holds one of its points, and at most
 `--serve-resident N` of them are in memory (LRU; the rest reload from the cache). Answers are
 bit-identical to `--sample-points --partition` with the same split; a later session registers
-every partition from the cache without building. `DTFE_PTS_THREADS=N` pins the point-evaluation
+every partition from the cache without building. The partitions a request needs that are not in
+memory are loaded in parallel (up to 8 threads, within the resident limit) while the resident ones
+are evaluated. `--serve-progress` writes plain progress lines to stderr for the build and every
+request (`[request k/P] partition p: in memory | loading from the cache`, `[request done] ...`),
+whatever `--verbose` says -- the launcher's progress bar. A partition's cell index is built only after
+it has answered 8 requests from memory and only when it fits in the memory budget next to the resident
+partitions (`DTFE_SERVE_INDEX=0|1` forces the walk or the index). The automatic resident set counts bytes
+(tessellations ~666 B/vertex + the indexes built); `DTFE_SERVE_BUDGET_GB=X` overrides its budget (tests).
+
+```bash
+python3 python/tools/upgrade_tess_cache.py "/Volumes/Samsung T7/Illustris TNG/.dtfe-tessellation-cache"  # old cache files -> chunked
+```
+Cache files are written in 16 MB chunks, compressed and decompressed on several cores
+(`DTFE_TESS_CACHE_THREADS=N` pins the threads per file, `DTFE_TESS_CACHE_LEGACY=1` writes the old single
+stream; `DTFE_TESS_CACHE_ZLIB=1` uses zlib where the build has libdeflate (`make ... LIBDEFLATE=0` builds
+without it); `DTFE_TESS_CACHE_CGAL_IO=1` reads and writes the triangulation through CGAL's own stream
+operators instead of the block reader/writer, and `DTFE_TESS_CACHE_FINGERPRINT=1` prints a hash of each
+loaded structure -- both for comparisons). A partitioned run with a cache also records the snapshot's particle totals there
+(`globals_<hash>.txt`): a later `--ps-window` run whose partitions are all cached then never reads the
+snapshot. `DTFE_PTS_THREADS=N` pins the point-evaluation
 thread count (default: all cores, or cores / concurrent partitions inside a partitioned PS run).
 
 ```bash
@@ -333,7 +374,9 @@ thread count (default: all cores, or cores / concurrent partitions inside a part
                                                             #   density, NGP-assigned. Density
                                                             #   ONLY (other fields rejected);
                                                             #   '--field density_a' -> '.a_den'
-./DTFE snap.hdf5 out --grid 256 --periodic --CIC --interlace  # anti-aliasing (needs --periodic)
+./DTFE snap.hdf5 out --grid 256 --periodic --CIC --interlace  # anti-aliasing (needs --periodic; 2D too; its
+                                                               # half-cell phase was wrong for half the modes
+                                                               # before 2026-10-02 night: older interlaced grids are off)
 
 # approximate phase-space density f = rho * g: a SECOND Delaunay in velocity space.
 # Standard binary only; the result lands in the scalar output field. It ASSUMES the local
@@ -354,9 +397,10 @@ thread count (default: all cores, or cores / concurrent partitions inside a part
 #     from dtfelib.fields import pseudo_phase_space_density
 #     Q = pseudo_phase_space_density(fs.density(units="mean"), np.sqrt(fs.load("dispersion")))
 
-# redshift cone (spherical) grid instead of a box, and redshift-space distortions
+# redshift cone (spherical) grid instead of a box
 ./DTFE survey.hdf5 out --grid 128 --redshiftCone 0 200 -30 30 -30 30 --origin 0 0 0
-./DTFE snap.hdf5 out --grid 256 --periodic --redshiftSpace 0 0 1
+# (--redshiftSpace d1 d2 d3 is NOT implemented in this version: the run is refused; it used to be
+#  accepted and silently skipped. Shift the positions before running instead.)
 
 # zoom region, sub-sampling, synthetic points, options file
 ./DTFE snap.hdf5 out --grid 256 --region 0.4 0.6 0.3 0.7 0.45 0.55   # fractions of the box
@@ -433,7 +477,14 @@ move to Trash). Every job shows its commands; Export saves them as a bash script
 
 ## Tests
 
+Every suite that runs the programs also runs against the double-precision pair (built by
+`make DTFE PS-DTFE DOUBLE=1`, add `METAL=1` on a Mac): set `DTFE_TEST_PRECISION=double` and it uses
+`./PS-DTFE-double` / `./DTFE-double`, reads their grids as float64 and never rebuilds (a missing pair is a
+SKIP). The GPU-versus-CPU checks that demand identical stream counts allow 1e-4 of the cells there: the
+double build hands the single-precision GPU kernels float copies of its tetrahedra.
+
 ```bash
+DTFE_TEST_PRECISION=double tests/ps_window_check.sh --no-build    # any suite below, double pair
 python3 tests/run_tests.py                    # standard-DTFE suite (15 tests; -v verbose)
 python3 tests/run_tests.py --update-ref       # regenerate the tracked density reference
 tests/ps_smoke_test.sh                        # build + Zel'dovich pancake sanity
@@ -473,6 +524,15 @@ python3 tests/ps_3d_test.py                   # crossed-waves 3D stream-count an
 python3 tests/ps_convergence_test.py          # density profile -> analytic convergence
 python3 tests/ps_nonperiodic_test.py          # isolated cloud: mass, --box region faces, --partition == one triangulation
 python3 tests/ps_standard_cross_check.py      # PS vs standard DTFE where streams==1
+tests/ps_2d_check.sh --no-build               # the 2D pair (make PS-DTFE DTFE DIM=2): analytic 2D pancake +
+                                              #   crossed waves, exact == sampled, flags, splits, cache,
+                                              #   point evaluation (streams at the cell centres == grid)
+tests/ps_slab_deposit_check.sh --no-build     # slab-mode CPU deposit == 1 thread, byte for byte, 13 variants
+                                              #   (DTFE_DEPOSIT_SLABS=1 forces it, 0 forbids it)
+tests/tweb_check.sh --no-build                # T-web: eigenvalue sum = delta, a 1D field gives {delta, 0, 0};
+                                              #   the 2D pair too ({delta, 0}, crossed waves against numpy)
+tests/interlacing_check.sh                    # interlacing recovers a band-limited field (2D + 3D, both precisions)
+tests/serve_split_check.sh --no-build         # the composite server reuses a cached split, else ~8 resident
 tests/ps_scaling_benchmark.sh                 # strong-scaling table (MIN_EFFICIENCY=0.4)
 
 # synthetic snapshot generator used by the tests (Gadget HDF5, input type 105):

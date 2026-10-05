@@ -17,6 +17,12 @@
 #     descriptor separates them by their unpadded Lagrangian region -- without that, partitions
 #     2..N would silently load the first partition's tessellation.
 #  F) A partitioned cache hit also reproduces the uncached run bit-for-bit.
+#  G) The standard binary caches its thread sub-domains too.
+#  H) New files carry the CHUNKED body; single-stream files still load; the converter rewrites them.
+#  I) The block-wise triangulation reader builds exactly CGAL's triangulation (structure hashes),
+#     and the block-wise writer writes exactly CGAL's bytes.
+#  J) A symlinked or relative name of the input hits the cache its absolute name wrote (canonical keys).
+#  K) libdeflate (when compiled in) and zlib read each other's chunked files.
 #  A2) The body is DEFLATED while magic/version/descriptor stay plaintext, so a staleness check
 #     needs no inflation. Compression takes 735 MB down to 225 MB per 1.5e6 vertices at zlib
 #     level 1 -- level 6 saves a further 5% but costs 24 s more on every write.
@@ -30,9 +36,11 @@ PY="${PYTHON:-python3}"
 command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/python3.14
 ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT}"
+source "${SCRIPT_DIR}/precision.sh"     # DTFE_TEST_PRECISION=double: the double pair
 
 N="${N:-24}"; GRID="${GRID:-48}"; BOX="${BOX:-100.0}"
-BIN="./PS-DTFE"
+BIN="${PS_BIN}"
+precision_require "${BIN}"
 TMP="${SCRIPT_DIR}/tmp"; mkdir -p "${TMP}"
 SNAP="${TMP}/ptc_input.hdf5"
 # The cache must live on a LOCAL volume -- the repo itself is in iCloud, which the binary rejects.
@@ -44,7 +52,7 @@ echo "============================================================"
 echo " PS-DTFE --tessellation-cache check   N=${N}^3  grid=${GRID}^3"
 echo "============================================================"
 
-if [ "${1:-}" != "--no-build" ]; then
+if [ "${1:-}" != "--no-build" ] && ! precision_double; then
     echo ">> building PS-DTFE ..."
     BUILD_MODE="$(cat o_ps/.build_mode 2>/dev/null || true)"
     make PS-DTFE ${BUILD_MODE:+"$BUILD_MODE"} >/dev/null
@@ -174,12 +182,12 @@ echo "(G) the STANDARD binary caches its processor-split sub-domains too"
 # cache file. Only one 'Reused' line is printed (non-master threads run at verbosity 0), so the
 # evidence that all of them hit is that the warm run adds no new files and is much faster.
 SCACHE="${CACHE}-std"; rm -rf "${SCACHE}"; mkdir -p "${SCACHE}"
-if [ -x ./DTFE ]; then
-    ./DTFE "${SNAP}" "${TMP}/ptc_std_cold" --grid "${GRID}" --periodic --field density \
+if [ -x "${DTFE_BIN}" ]; then
+    "${DTFE_BIN}" "${SNAP}" "${TMP}/ptc_std_cold" --grid "${GRID}" --periodic --field density \
            --MpcUnit 1 --tessellation-cache "${SCACHE}" >/dev/null 2>&1 || true
     n_cold=$(ls -1 "${SCACHE}"/*.tess 2>/dev/null | wc -l | tr -d ' ')
     check "$([ "${n_cold}" -ge "2" ] && echo 1 || echo 0)" "standard binary wrote one file per sub-domain (${n_cold})"
-    ./DTFE "${SNAP}" "${TMP}/ptc_std_warm" --grid "${GRID}" --periodic --field density \
+    "${DTFE_BIN}" "${SNAP}" "${TMP}/ptc_std_warm" --grid "${GRID}" --periodic --field density \
            --MpcUnit 1 --tessellation-cache "${SCACHE}" >/dev/null 2>&1 || true
     n_warm=$(ls -1 "${SCACHE}"/*.tess 2>/dev/null | wc -l | tr -d ' ')
     check "$([ "${n_warm}" = "${n_cold}" ] && echo 1 || echo 0)" "warm run added no files (${n_warm} == ${n_cold}) => every sub-domain hit"
@@ -192,7 +200,147 @@ if [ -x ./DTFE ]; then
     fi
     rm -rf "${SCACHE}"
 else
-    echo "   SKIP  (./DTFE not built)"
+    echo "   SKIP  (${DTFE_BIN} not built)"
+fi
+
+echo ""
+echo "(H) the CHUNKED body (parallel inflate), the single-stream format before it, and the converter"
+tessfile=$(ls -1 "${CACHE}"/*.tess 2>/dev/null | head -1)
+chunked=$("${PY}" -c "
+import struct, sys
+f = open(sys.argv[1], 'rb'); f.read(8); (n,) = struct.unpack('<I', f.read(4)); f.read(n)
+sys.stdout.write('1' if f.read(8) == b'DTFECHK1' else '0')
+" "${tessfile}")
+check "${chunked}" "a new cache file carries the chunked body (marker after the descriptor)"
+LCACHE="${CACHE}-legacy"; rm -rf "${LCACHE}"; mkdir -p "${LCACHE}"
+export DTFE_TESS_CACHE_LEGACY=1
+run "${TMP}/ptc_legacy_write" "${GRID}" --tessellation-cache "${LCACHE}"
+unset DTFE_TESS_CACHE_LEGACY
+run "${TMP}/ptc_legacy_hit" "${GRID}" --tessellation-cache "${LCACHE}"
+check "$([ "$(hits)" -ge 1 ] && echo 1 || echo 0)" "a single-stream (older) cache file still loads"
+cmp -s "${TMP}/ptc_out_nocache.den" "${TMP}/ptc_legacy_hit.den" && check 1 "... bit-identically" || check 0 "... bit-identically"
+"${PY}" "${ROOT}/python/tools/upgrade_tess_cache.py" "${LCACHE}" -j 2 > "${TMP}/ptc_upgrade.log" 2>&1
+check "$([ $? -eq 0 ] && grep -q '^converted' "${TMP}/ptc_upgrade.log" && echo 1 || echo 0)" "the converter rewrites the older file as chunks"
+run "${TMP}/ptc_conv_hit" "${GRID}" --tessellation-cache "${LCACHE}"
+[ "$(hits)" -ge 1 ] && cmp -s "${TMP}/ptc_out_nocache.den" "${TMP}/ptc_conv_hit.den" \
+    && check 1 "the converted file loads, bit-identically" || check 0 "the converted file loads, bit-identically"
+rm -rf "${LCACHE}"
+
+echo ""
+echo "(I) the block-wise reader and writer: exactly CGAL's triangulation, exactly CGAL's bytes"
+# tessellation_cache.h reads the triangulation in blocks (readTriangulationBlocks) instead of through
+# CGAL's operator>> (3.4x faster loads). DTFE_TESS_CACHE_CGAL_IO=1 restores CGAL's reader, and
+# DTFE_TESS_CACHE_FINGERPRINT=1 prints a hash of the loaded STRUCTURE (points, every vertex's stored
+# cell, every cell's vertices and neighbours, in iteration order). Same files, both readers: the same
+# hashes and bit-identical outputs, for one tessellation, for 8 partitions, and for the standard
+# binary's sub-domains (its hierarchy triangulation shares the format).
+fprints() { echo "${RUN_OUT}" | grep "^TESS_FINGERPRINT" | sort || true; }
+export DTFE_TESS_CACHE_FINGERPRINT=1
+for which in single part; do
+    if [ "${which}" = "single" ]; then dir="${CACHE}"; extra=(); else dir="${PCACHE}"; extra=(--partition 2 2 2); fi
+    export DTFE_TESS_CACHE_CGAL_IO=1
+    run "${TMP}/ptc_rd_cgal_${which}" "${GRID}" --tessellation-cache "${dir}" ${extra[@]+"${extra[@]}"}
+    unset DTFE_TESS_CACHE_CGAL_IO
+    fp_cgal="$(fprints)"; h_cgal=$(hits)
+    run "${TMP}/ptc_rd_block_${which}" "${GRID}" --tessellation-cache "${dir}" ${extra[@]+"${extra[@]}"}
+    fp_block="$(fprints)"; h_block=$(hits)
+    nfp=$(echo "${fp_block}" | grep -c . || true)
+    check "$([ "${h_cgal}" -ge 1 ] && [ "${h_cgal}" = "${h_block}" ] && [ "${nfp}" = "${h_block}" ] && echo 1 || echo 0)" \
+          "${which}: both readers hit (${h_cgal} / ${h_block}) and fingerprint every load (${nfp})"
+    check "$([ -n "${fp_block}" ] && [ "${fp_cgal}" = "${fp_block}" ] && echo 1 || echo 0)" \
+          "${which}: identical structure fingerprints"
+    same=1
+    for f in "${TMP}"/ptc_rd_cgal_${which}.*; do
+        ext="${f##*ptc_rd_cgal_${which}}"
+        cmp -s "${f}" "${TMP}/ptc_rd_block_${which}${ext}" || same=0
+    done
+    check "${same}" "${which}: bit-identical outputs, sample points included"
+done
+if [ -x "${DTFE_BIN}" ]; then
+    SCACHE="${CACHE}-std"; rm -rf "${SCACHE}"; mkdir -p "${SCACHE}"
+    "${DTFE_BIN}" "${SNAP}" "${TMP}/ptc_std_rd0" --grid "${GRID}" --periodic --field density --MpcUnit 1 \
+           --tessellation-cache "${SCACHE}" >/dev/null 2>&1 || true
+    fp_cgal="$(DTFE_TESS_CACHE_CGAL_IO=1 "${DTFE_BIN}" "${SNAP}" "${TMP}/ptc_std_rd1" --grid "${GRID}" --periodic \
+               --field density --MpcUnit 1 --tessellation-cache "${SCACHE}" 2>&1 | grep "^TESS_FINGERPRINT" | sort || true)"
+    fp_block="$("${DTFE_BIN}" "${SNAP}" "${TMP}/ptc_std_rd2" --grid "${GRID}" --periodic \
+               --field density --MpcUnit 1 --tessellation-cache "${SCACHE}" 2>&1 | grep "^TESS_FINGERPRINT" | sort || true)"
+    check "$([ -n "${fp_block}" ] && [ "${fp_cgal}" = "${fp_block}" ] && echo 1 || echo 0)" \
+          "standard binary: identical structure fingerprints ($(echo "${fp_block}" | grep -c . || true) sub-domains)"
+    cmp -s "${TMP}/ptc_std_rd1.den" "${TMP}/ptc_std_rd2.den" && check 1 "standard binary: bit-identical '.den'" \
+                                                            || check 0 "standard binary: bit-identical '.den'"
+    SCACHE2="${CACHE}-std2"; rm -rf "${SCACHE2}"; mkdir -p "${SCACHE2}"
+    DTFE_TESS_CACHE_CGAL_IO=1 "${DTFE_BIN}" "${SNAP}" "${TMP}/ptc_std_wr" --grid "${GRID}" --periodic --field density \
+           --MpcUnit 1 --tessellation-cache "${SCACHE2}" >/dev/null 2>&1 || true
+    same=1; nw=0
+    for f in "${SCACHE2}"/*.tess; do nw=$((nw+1)); cmp -s "${f}" "${SCACHE}/$(basename "${f}")" || same=0; done
+    check "$([ "${nw}" -ge 2 ] && [ "${same}" = 1 ] && echo 1 || echo 0)" "standard binary: the block writer's ${nw} sub-domain files are byte-identical to CGAL's"
+    rm -rf "${SCACHE}" "${SCACHE2}"
+fi
+unset DTFE_TESS_CACHE_FINGERPRINT
+# ... and the block-wise WRITER writes CGAL's bytes: the same run cached by each writer gives
+# byte-identical files (the chunks deflate independently, so equal content means equal files)
+for which in single part; do
+    if [ "${which}" = "single" ]; then extra=(); else extra=(--partition 2 2 2); fi
+    WA="${CACHE}-wcgal"; WB="${CACHE}-wblock"; rm -rf "${WA}" "${WB}"; mkdir -p "${WA}" "${WB}"
+    export DTFE_TESS_CACHE_CGAL_IO=1
+    run "${TMP}/ptc_wr_cgal" "${GRID}" --tessellation-cache "${WA}" ${extra[@]+"${extra[@]}"}
+    unset DTFE_TESS_CACHE_CGAL_IO
+    run "${TMP}/ptc_wr_block" "${GRID}" --tessellation-cache "${WB}" ${extra[@]+"${extra[@]}"}
+    same=1; nw=0
+    for f in "${WA}"/*.tess; do
+        nw=$((nw+1))
+        cmp -s "${f}" "${WB}/$(basename "${f}")" || same=0
+    done
+    check "$([ "${nw}" -ge 1 ] && [ "${same}" = 1 ] && echo 1 || echo 0)" "${which}: the block writer's ${nw} cache file(s) are byte-identical to CGAL's"
+    rm -rf "${WA}" "${WB}"
+done
+
+echo ""
+echo "(J) one key per FILE: a symlinked or relative name of the input hits the cache its absolute name wrote"
+# The descriptor stores the input's realpath (canonical_path.h). Before, '/tmp/x' and '/private/tmp/x' or
+# 'x' run from its folder were three keys, i.e. two needless rebuilds of the same tessellation.
+LINKDIR="${TMP}_link"; rm -f "${LINKDIR}"; ln -s "${TMP}" "${LINKDIR}"
+nbefore=$(ls -1 "${CACHE}"/*.tess 2>/dev/null | wc -l | tr -d ' ')
+RUN_OUT="$( "${BIN}" "${LINKDIR}/$(basename "${SNAP}")" "${TMP}/ptc_sym" --grid "${GRID}" "${COMMON[@]}" \
+            --tessellation-cache "${CACHE}" --verbose 3 2>&1 || true )"
+check "$([ "$(hits)" -ge 1 ] && echo 1 || echo 0)" "a path through a symlinked folder HITS"
+ABSBIN="$(pwd)/${PS_BIN#./}"
+RUN_OUT="$( cd "${TMP}" && "${ABSBIN}" "$(basename "${SNAP}")" "${TMP}/ptc_rel" --grid "${GRID}" "${COMMON[@]}" \
+            --tessellation-cache "${CACHE}" --verbose 3 2>&1 || true )"
+check "$([ "$(hits)" -ge 1 ] && echo 1 || echo 0)" "a relative path HITS"
+same=1
+for f in "${TMP}"/ptc_out_hit.*; do
+    ext="${f##*ptc_out_hit}"
+    for g in "${TMP}/ptc_sym${ext}" "${TMP}/ptc_rel${ext}"; do cmp -s "${f}" "${g}" || same=0; done
+done
+check "${same}" "... both bit-identical to the absolute-path hit"
+nafter=$(ls -1 "${CACHE}"/*.tess 2>/dev/null | wc -l | tr -d ' ')
+check "$([ "${nafter}" = "${nbefore}" ] && echo 1 || echo 0)" "and no new cache file was written (${nbefore} -> ${nafter})"
+rm -f "${LINKDIR}"
+
+echo ""
+echo "(K) the chunk codec: libdeflate and zlib read each other's files (both write plain gzip members)"
+run "${TMP}/ptc_codec_probe" "${GRID}" --tessellation-cache "${CACHE}"
+if echo "${RUN_OUT}" | grep -q "read with libdeflate"; then
+    for w in zlib libdeflate; do
+        KC="${CACHE}-codec-${w}"; rm -rf "${KC}"; mkdir -p "${KC}"
+        if [ "${w}" = zlib ]; then export DTFE_TESS_CACHE_ZLIB=1; fi
+        run "${TMP}/ptc_codec_w_${w}" "${GRID}" --tessellation-cache "${KC}"
+        unset DTFE_TESS_CACHE_ZLIB
+        if [ "${w}" = libdeflate ]; then export DTFE_TESS_CACHE_ZLIB=1; fi
+        run "${TMP}/ptc_codec_r_${w}" "${GRID}" --tessellation-cache "${KC}"
+        reader=$(echo "${RUN_OUT}" | grep -o "read with [a-z]*" | head -1 | cut -d' ' -f3)
+        unset DTFE_TESS_CACHE_ZLIB
+        same=1
+        for f in "${TMP}"/ptc_out_nocache.*; do
+            ext="${f##*ptc_out_nocache}"; cmp -s "${f}" "${TMP}/ptc_codec_r_${w}${ext}" || same=0
+        done
+        check "$([ "$(hits)" -ge 1 ] && [ "${reader}" != "${w}" ] && [ "${same}" = 1 ] && echo 1 || echo 0)" \
+              "written with ${w}, read with ${reader}: a hit, bit-identical to the uncached run"
+        rm -rf "${KC}"
+    done
+else
+    echo "   SKIP  (this build has no libdeflate: every chunk goes through zlib)"
 fi
 
 echo ""

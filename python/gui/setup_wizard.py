@@ -2,8 +2,10 @@
 
   1  Data folder      where simulations and grids live (defaults to the configured root when it
                       exists -- an external disk that is unplugged is said so -- else ~/DTFE-data)
-  2  Programs         are DTFE / PS-DTFE built, with GPU support, and does the Python that runs the
-                      figure scripts have its packages? 'Build' runs make (the command is shown)
+  2  Programs         are DTFE / PS-DTFE built, with which GPU backend (Metal, CUDA, HIP) and (PS-DTFE) the TBB parallel
+                      triangulation, are the optional double-precision pair and the 2D programs there,
+                      and does the Python that runs the figure scripts have its packages? 'Build' runs
+                      make (the commands are shown; ticks add the double pair and the 2D programs)
   3  TNG API key      optional, only for downloading IllustrisTNG data: saved to ~/.tng_api_key with
                       owner-only permissions, never shown again or put on a command line
   4  Try it           a synthetic demo (32^3 crossed waves, streams 1/3/9/27): generated and run in
@@ -34,17 +36,25 @@ TNG_REGISTER = "https://www.tng-project.org/users/register/"
 
 
 def binary_status(name: str) -> tuple[bool, str]:
-    """(built, one-line description) of ./DTFE or ./PS-DTFE."""
+    """(built, one-line description) of ./DTFE, ./PS-DTFE, their -double pair or the -2d programs."""
     exe = rs.REPO_ROOT / name
+    precision = "double" if name.endswith("-double") else "single"
+    dim = 2 if "-2d" in name else 3
     if not exe.is_file():
-        return False, f"{name}: not built"
+        why = " (optional: the 2D programs, for snapshots in a plane)" if dim == 2 else \
+            " (optional: the double-precision pair)" if precision == "double" else ""
+        return False, f"{name}: not built" + why
     try:
         ver = subprocess.run([str(exe), "--version"], capture_output=True, text=True, timeout=10).stdout.strip()
     except (OSError, subprocess.TimeoutExpired):
         ver = ""
-    est = "ps" if name == "PS-DTFE" else "dtfe"
-    gpu = "with GPU (Metal)" if rs.gpu_built(est) else "CPU only"
-    return True, f"{ver or name} · {gpu}"
+    est = "ps" if name.startswith("PS-DTFE") else "dtfe"
+    backend = rs.gpu_backend(est, precision, dim)
+    gpu = f"with GPU ({backend})" if backend else "CPU only"
+    tbb = ""
+    if est == "ps" and dim == 3:    # the parallel Delaunay insertion needs the tbb library at build time (3D only)
+        tbb = " · parallel triangulation (TBB)" if rs.tbb_built(precision) else " · no TBB (sequential triangulation only)"
+    return True, f"{ver or name} · {gpu}{tbb}"
 
 
 def python_status() -> tuple[bool, str]:
@@ -58,12 +68,25 @@ def python_status() -> tuple[bool, str]:
                 "MISSING (pip install numpy h5py matplotlib scipy)"))
 
 
-def build_command() -> list[str]:
-    """make for both binaries -- with the GPU on a Mac (Metal), as scripts/install.sh does."""
+def build_command(double: bool = False, dim: int = 3) -> list[str]:
+    """make for both binaries -- with the GPU backend this machine can build (Metal on a Mac, CUDA or
+    HIP on Linux when nvcc / hipcc is found), as scripts/install.sh does; double=True builds the
+    double-precision pair (DTFE-double, PS-DTFE-double) instead, same backend; dim=2 the 2D programs
+    (DTFE-2d, PS-DTFE-2d: CPU only, the GPU kernels are 3D)."""
     cmd = ["make", "DTFE", "PS-DTFE", f"-j{os.cpu_count() or 4}"]
-    if sys.platform == "darwin":
-        cmd.append("METAL=1")
+    gpu = rs.gpu_compiler() if dim == 3 else ""
+    if gpu:
+        cmd.append(gpu)
+    if double:
+        cmd.append("DOUBLE=1")
+    if dim == 2:
+        cmd.append("DIM=2")
     return cmd
+
+
+BINARIES = ("PS-DTFE", "DTFE")
+DOUBLE_BINARIES = ("PS-DTFE-double", "DTFE-double")
+TWO_D_BINARIES = ("PS-DTFE-2d", "DTFE-2d")
 
 
 def save_api_key(key: str, path: Path = rs.API_KEY_FILE) -> None:
@@ -84,6 +107,7 @@ class SetupDialog(QDialog):
         self.resize(720, 520)
         self.run_demo = False
         self._build: QProcess | None = None
+        self._build_queue: list[list[str]] = []
 
         v = QVBoxLayout(self)
         self.step = QLabel("")
@@ -142,9 +166,18 @@ class SetupDialog(QDialog):
         self.build_btn = QPushButton("Build the programs")
         self.build_btn.clicked.connect(self._start_build)
         row.addWidget(self.build_btn)
-        row.addWidget(self._text("runs: " + " ".join(build_command()) + "   (a few minutes; needs CGAL, Boost, "
-                                 "FFTW, HDF5, GSL; scripts/install.sh installs them)"), 1)
+        self.build_note = self._text("")
+        row.addWidget(self.build_note, 1)
         pv.addLayout(row)
+        self.build_double = QCheckBox("Also build the double-precision pair (every position and field in float64; "
+                                      "about twice the memory per run; picked per run with the precision setting)")
+        self.build_double.toggled.connect(self._build_note)
+        pv.addWidget(self.build_double)
+        self.build_2d = QCheckBox("Also build the 2D programs (for snapshots in a plane, whose coordinates have two "
+                                  "columns; CPU only; picked per run with the dimensions setting)")
+        self.build_2d.toggled.connect(self._build_note)
+        pv.addWidget(self.build_2d)
+        self._build_note()
         self.build_log = QPlainTextEdit(readOnly=True)
         self.build_log.setMaximumBlockCount(4000)
         pv.addWidget(self.build_log, 1)
@@ -240,23 +273,48 @@ class SetupDialog(QDialog):
         if d:
             self.root.setText(d)
 
+    def _build_note(self, *_):
+        cmds = [" ".join(c) for c in self._build_commands()]
+        self.build_note.setText("runs: " + "; then ".join(cmds) + "   (a few minutes each; needs CGAL, Boost, "
+                                "FFTW, HDF5, GSL; scripts/install.sh installs them)")
+
     def _programs(self):
         lines = []
-        for name in ("PS-DTFE", "DTFE"):
+        for name in BINARIES:
             ok, text = binary_status(name)
             lines.append(("✔ " if ok else "✖ ") + text)
+        for name in DOUBLE_BINARIES + TWO_D_BINARIES:
+            ok, text = binary_status(name)
+            lines.append(("✔ " if ok else "○ ") + text)
         ok, text = python_status()
         lines.append(("✔ " if ok else "⚠ ") + text)
         lines.append(("✔ wget found" if shutil.which("wget") else "⚠ wget not found (only needed for TNG downloads: "
                                                                  "brew install wget)"))
         self.prog_info.setText("\n".join(lines))
-        both = all(binary_status(n)[0] for n in ("PS-DTFE", "DTFE"))
+        both = all(binary_status(n)[0] for n in BINARIES)
         self.build_btn.setText("Rebuild the programs" if both else "Build the programs")
+        if all(binary_status(n)[0] for n in DOUBLE_BINARIES) and not self.build_double.isChecked():
+            self.build_double.setChecked(True)      # a pair that exists is kept up to date
+        if all(binary_status(n)[0] for n in TWO_D_BINARIES) and not self.build_2d.isChecked():
+            self.build_2d.setChecked(True)
+
+    def _build_commands(self) -> list[list[str]]:
+        return ([build_command()] + ([build_command(double=True)] if self.build_double.isChecked() else [])
+                + ([build_command(dim=2)] if self.build_2d.isChecked() else []))
 
     def _start_build(self):
         if self._build is not None:
             return
-        cmd = build_command()
+        self._build_queue = self._build_commands()
+        self._run_next_build()
+
+    def _run_next_build(self):
+        if not self._build_queue:
+            self._build = None
+            self.build_btn.setEnabled(True)
+            self._programs()
+            return
+        cmd = self._build_queue.pop(0)
         self.build_log.appendPlainText("$ " + " ".join(cmd))
         self._build = QProcess(self)
         self._build.setWorkingDirectory(str(rs.REPO_ROOT))
@@ -270,9 +328,9 @@ class SetupDialog(QDialog):
 
     def _build_done(self, code, _status):
         self.build_log.appendPlainText(f"make finished with exit code {code}")
-        self._build = None
-        self.build_btn.setEnabled(True)
-        self._programs()
+        if code != 0:
+            self._build_queue = []
+        self._run_next_build()
 
     def _save_key(self):
         try:

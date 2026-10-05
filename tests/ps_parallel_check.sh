@@ -18,10 +18,12 @@ PY="${PYTHON:-python3}"
 command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/python3.14
 ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT}"
+source "${SCRIPT_DIR}/precision.sh"     # DTFE_TEST_PRECISION=double: the double pair
 
 N="${N:-32}"; GRID="${GRID:-64}"; BOX="${BOX:-100.0}"; AMP="${AMP:-1.8}"
 PARTITION="${PARTITION:-2 2 2}"   # Lagrangian partition grid; parallelism is over these
-BIN="./PS-DTFE"
+BIN="${PS_BIN}"
+precision_require "${BIN}"
 TMP="${SCRIPT_DIR}/tmp"; mkdir -p "${TMP}"
 # Input name must NOT share a prefix with the output roots (ps_serial/ps_par),
 # or the per-run 'rm -f <root>.*' would delete it.
@@ -32,7 +34,7 @@ echo "============================================================"
 echo " PS-DTFE parallel-vs-serial check   N=${N}^3  grid=${GRID}^3  cores=${NPROC}  partition=[${PARTITION}]"
 echo "============================================================"
 
-if [ "${1:-}" != "--no-build" ]; then
+if [ "${1:-}" != "--no-build" ] && ! precision_double; then
     echo ">> building PS-DTFE ..."
     # respect the current build mode (don't silently strip GPU support from a GPU binary;
     # o_ps/.build_mode records the make argument, e.g. METAL=1)

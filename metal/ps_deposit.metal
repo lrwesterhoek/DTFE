@@ -57,6 +57,18 @@ struct DepositParams {
     // fall-through the CPU exact deposit uses.
     int   fExact;
     uint  nTet;
+    // The scalar field (builds with ONE scalar component, NO_SCALARS=1; the callers decline the GPU
+    // otherwise): the per-tet vertex scalars arrive in buffer 18 (nTet*4; a dummy when both flags are
+    // 0) and are deposited exactly like the velocity moment -- the linear profile's value at the
+    // sample (or at the piece centroid) times the moment weight -- into buffer 19 (nCell), and the
+    // tet's constant scalar gradient times the moment weight into buffer 20 (nCell*3, [flat*3+i] =
+    // ds/dx_i, the CPU's scalar_gradient layout for one component).
+    int   fScal;
+    int   fSGrad;
+    // --ps-window: the sub-box (subOrigin/subDims) is a WINDOW of the full grid, not a partition's own
+    // box: a tet straddling its edge counts every in-grid sample (pass 0 / phase 0 sumW) exactly as in
+    // the full run and deposits only the samples / pieces inside, so the window equals the full run.
+    int   windowMode;
 };
 
 static inline float det3(thread const float A[3][3]) {
@@ -161,245 +173,9 @@ static inline int classifySample(thread const float C[3][3], thread const float 
     return sure ? 1 : 0;
 }
 
-// ================================================================================================
-// --ps-exact-deposit: float32 port of the vendored r3d (Powell & Abel 2015) specialized to ONE
-// tetrahedron clipped by the 6 axis-aligned planes of a grid cell, with order-2 moments.
-// Faithful to third_party/r3d/r3d.c (r3d_init_tet, r3d_clip, r3d_reduce): same vertex-graph
-// clipping and the same Koehl (2012) moment recursion, hand-unrolled to order 2. Metal has no
-// double, so results match the CPU exact deposit to FLOAT rounding -- the same parity contract
-// as the sampled GPU deposit; the CPU path remains the double-precision reference. All geometry
-// is vertex-0-relative (values of order the tet size), which keeps float32 well-conditioned.
-// EXV bounds the vertex buffer: a tet clipped by <= 6 planes has <= 16 final and <= ~40
-// transient vertices; on (unreachable) overflow the poly is emptied, dropping that cell's
-// share -- the per-tet renormalization then redistributes it, so mass stays conserved.
-// ================================================================================================
-#define EXV 48
-
-struct ExPoly {
-    // packed_float3 (12 B) not float3 (16 B): 48 vertices x 4 padding bytes = 192 B/thread of
-    // pure waste at float3, and this struct dominates the kernel's stack (1348 -> 1156 B).
-    // Every access is a value read or whole-element store, so the packed type drops in.
-    packed_float3 pos[EXV];
-    int    nbr[EXV][3];
-    int    nv;
-};
-
-// The tet's four face planes, outward (n.x <= off inside), in the vertex-0 frame: a cell lying
-// wholly beyond one of them cannot intersect the tet, so it is skipped before any clipping. A
-// stretched (folded, sheet-like) tet's axis-aligned window holds mostly such cells -- a diagonal
-// 16x16x0.1 Mpc sheet spans ~40^3 cells of 0.4 Mpc and touches ~40^2 -- and clipping every one of
-// them twice made the exact deposit crawl when cells are much smaller than tets (0.26M particles
-// on 256^3: >17 min). Skipped cells clip to nothing anyway: same output, to float rounding.
-struct TetPlanes { float3 n[4]; float off[4]; };
-
-static inline TetPlanes tet_planes(float3 t1, float3 t2, float3 t3) {
-    float3 const P[4] = { float3(0.0f), t1, t2, t3 };
-    TetPlanes F;
-    for (int k=0; k<4; ++k) {
-        float3 const A = P[(k+1)&3], B = P[(k+2)&3], C = P[(k+3)&3];
-        float3 n = cross(B - A, C - A);
-        float off = dot(n, A);
-        if (dot(n, P[k]) - off > 0.0f) { n = -n; off = -off; }   // vertex k on the inner side
-        F.n[k] = n; F.off[k] = off;
-    }
-    return F;
-}
-
-// true when the box (centre c, half-widths h) lies strictly outside the tet; the margin keeps a
-// box that touches or overlaps it within float rounding
-static inline bool box_outside_tet(thread const TetPlanes& F, float3 c, float3 h) {
-    for (int k=0; k<4; ++k) {
-        float3 const n = F.n[k];
-        float const r = h.x*fabs(n.x) + h.y*fabs(n.y) + h.z*fabs(n.z);
-        float const margin = 1.0e-4f * (fabs(n.x)*(fabs(c.x)+h.x) + fabs(n.y)*(fabs(c.y)+h.y)
-                                      + fabs(n.z)*(fabs(c.z)+h.z) + fabs(F.off[k]));
-        if (dot(n, c) - F.off[k] > r + margin) return true;
-    }
-    return false;
-}
-
-static inline void exact_init_tet(thread ExPoly& T, float3 t1, float3 t2, float3 t3) {
-    T.nv = 4;
-    T.pos[0] = float3(0.0f);
-    T.pos[1] = t1; T.pos[2] = t2; T.pos[3] = t3;
-    T.nbr[0][0]=1; T.nbr[0][1]=3; T.nbr[0][2]=2;
-    T.nbr[1][0]=2; T.nbr[1][1]=3; T.nbr[1][2]=0;
-    T.nbr[2][0]=0; T.nbr[2][1]=3; T.nbr[2][2]=1;
-    T.nbr[3][0]=1; T.nbr[3][1]=2; T.nbr[3][2]=0;
-}
-
-// r3d_clip for one axis-aligned plane sgn*pos[axis] + dd >= 0 (keeps the non-negative side).
-static inline void exact_clip_plane(thread ExPoly& T, int axis, float sgn, float dd) {
-    if (T.nv <= 0) return;
-    float sdists[EXV];
-    int   clipped[EXV];
-    int const onv = T.nv;
-    float smin = 1.0e30f, smax = -1.0e30f;
-    for (int v=0; v<onv; ++v) {
-        float const coord = (axis==0) ? T.pos[v].x : (axis==1 ? T.pos[v].y : T.pos[v].z);
-        float const s = dd + sgn*coord;
-        sdists[v] = s;
-        clipped[v] = (s < 0.0f) ? 1 : 0;
-        if (s < smin) smin = s;
-        if (s > smax) smax = s;
-    }
-    if (smin >= 0.0f) return;             // fully inside this plane
-    if (smax <= 0.0f) { T.nv = 0; return; }   // fully clipped away
-
-    // insert a new vertex on every inside->outside edge (r3d: single-linked to the inside end)
-    for (int vcur=0; vcur<onv; ++vcur) {
-        if (clipped[vcur]) continue;
-        for (int np=0; np<3; ++np) {
-            int const vnext = T.nbr[vcur][np];
-            if (!clipped[vnext]) continue;
-            if (T.nv == EXV) { T.nv = 0; return; }   // overflow guard (see header comment)
-            float const wa = -sdists[vnext], wb = sdists[vcur];
-            T.pos[T.nv] = (wa*float3(T.pos[vcur]) + wb*float3(T.pos[vnext])) / (wa + wb);
-            T.nbr[T.nv][0] = vcur;
-            T.nbr[T.nv][1] = -1;
-            T.nbr[T.nv][2] = -1;
-            T.nbr[vcur][np] = T.nv;
-            T.nv++;
-        }
-    }
-
-    // walk around each face to doubly-link the new boundary vertices into the clip face
-    for (int vstart=onv; vstart<T.nv; ++vstart) {
-        int vcur = vstart;
-        int vnext = T.nbr[vcur][0];
-        int np = 0;
-        do {
-            for (np=0; np<3; ++np)
-                if (T.nbr[vnext][np] == vcur) break;
-            vcur = vnext;
-            int const pnext = (np+1)%3;
-            vnext = T.nbr[vcur][pnext];
-        } while (vcur < onv);
-        T.nbr[vstart][2] = vcur;
-        T.nbr[vcur][1] = vstart;
-    }
-
-    // compress out the clipped vertices, reusing clipped[] as the re-index map (r3d-style);
-    // vertices >= onv are the new (kept) boundary vertices
-    int nun = 0;
-    for (int v=0; v<T.nv; ++v) {
-        bool const isClipped = (v < onv) && (clipped[v] != 0);
-        if (!isClipped) {
-            T.pos[nun] = T.pos[v];
-            T.nbr[nun][0] = T.nbr[v][0];
-            T.nbr[nun][1] = T.nbr[v][1];
-            T.nbr[nun][2] = T.nbr[v][2];
-            clipped[v] = nun++;
-        }
-    }
-    T.nv = nun;
-    for (int v=0; v<T.nv; ++v)
-        for (int np=0; np<3; ++np)
-            T.nbr[v][np] = clipped[T.nbr[v][np]];
-}
-
-// r3d_reduce, order 2: moments [1, x, y, z, x2, xy, xz, y2, yz, z2] of the polyhedron.
-// The Koehl (2012) trinomial recursion is hand-unrolled: per triangle-fan triangle (v0,v1,v2),
-// S1_a = a0+a1+a2, S2_aa = a0^2+a1^2+a2^2 + a0a1+a0a2+a1a2,
-// S2_ab = 2(a0b0+a1b1+a2b2) + a0b1+a1b0 + a0b2+a2b0 + a1b2+a2b1, with the r3d normalizations
-// 1/6, 1/24, 1/60 (diagonal) and 1/120 (off-diagonal).
-static inline void exact_reduce2(thread const ExPoly& T, thread float* mom) {
-    for (int m=0; m<10; ++m) mom[m] = 0.0f;
-    if (T.nv <= 0) return;
-    bool emk[EXV][3];
-    for (int v=0; v<T.nv; ++v) { emk[v][0]=false; emk[v][1]=false; emk[v][2]=false; }
-
-    for (int vstart=0; vstart<T.nv; ++vstart)
-    for (int pstart=0; pstart<3; ++pstart) {
-        if (emk[vstart][pstart]) continue;
-        int pnext = pstart;
-        int vcur  = vstart;
-        emk[vcur][pnext] = true;
-        int vnext = T.nbr[vcur][pnext];
-        float3 const v0 = T.pos[vstart];
-        int np;
-        for (np=0; np<3; ++np)
-            if (T.nbr[vnext][np] == vcur) break;
-        vcur = vnext;
-        pnext = (np+1)%3;
-        emk[vcur][pnext] = true;
-        vnext = T.nbr[vcur][pnext];
-        while (vnext != vstart) {
-            float3 const v2 = T.pos[vcur];
-            float3 const v1 = T.pos[vnext];
-            float const sixv = (-v2.x*v1.y*v0.z + v1.x*v2.y*v0.z + v2.x*v0.y*v1.z
-                                -v0.x*v2.y*v1.z - v1.x*v0.y*v2.z + v0.x*v1.y*v2.z);
-            mom[0] += sixv;
-            float3 const s1 = v0 + v1 + v2;
-            mom[1] += sixv*s1.x;  mom[2] += sixv*s1.y;  mom[3] += sixv*s1.z;
-            mom[4] += sixv*(v0.x*v0.x + v1.x*v1.x + v2.x*v2.x + v0.x*v1.x + v0.x*v2.x + v1.x*v2.x);
-            mom[5] += sixv*(2.0f*(v0.x*v0.y + v1.x*v1.y + v2.x*v2.y)
-                            + v0.x*v1.y + v0.y*v1.x + v0.x*v2.y + v0.y*v2.x + v1.x*v2.y + v1.y*v2.x);
-            mom[6] += sixv*(2.0f*(v0.x*v0.z + v1.x*v1.z + v2.x*v2.z)
-                            + v0.x*v1.z + v0.z*v1.x + v0.x*v2.z + v0.z*v2.x + v1.x*v2.z + v1.z*v2.x);
-            mom[7] += sixv*(v0.y*v0.y + v1.y*v1.y + v2.y*v2.y + v0.y*v1.y + v0.y*v2.y + v1.y*v2.y);
-            mom[8] += sixv*(2.0f*(v0.y*v0.z + v1.y*v1.z + v2.y*v2.z)
-                            + v0.y*v1.z + v0.z*v1.y + v0.y*v2.z + v0.z*v2.y + v1.y*v2.z + v1.z*v2.y);
-            mom[9] += sixv*(v0.z*v0.z + v1.z*v1.z + v2.z*v2.z + v0.z*v1.z + v0.z*v2.z + v1.z*v2.z);
-            for (np=0; np<3; ++np)
-                if (T.nbr[vnext][np] == vcur) break;
-            vcur = vnext;
-            pnext = (np+1)%3;
-            emk[vcur][pnext] = true;
-            vnext = T.nbr[vcur][pnext];
-        }
-    }
-    mom[0] /= 6.0f;
-    mom[1] /= 24.0f;  mom[2] /= 24.0f;  mom[3] /= 24.0f;
-    mom[4] /= 60.0f;  mom[7] /= 60.0f;  mom[9] /= 60.0f;
-    mom[5] /= 120.0f; mom[6] /= 120.0f; mom[8] /= 120.0f;
-}
-
-// Order-1 variant for PASS 0 of the exact deposit, which consumes only the volume (and the
-// first moments under fLinear): the six order-2 accumulations above are ~78% of the moment
-// arithmetic and were computed twice per cell only to be discarded. IDENTICAL fan walk and
-// accumulation order for mom[0..3], so the pass-0 weights -- and therefore every deposited
-// value -- stay BIT-IDENTICAL to the full reduction.
-static inline void exact_reduce1(thread const ExPoly& T, thread float* mom) {
-    for (int m=0; m<4; ++m) mom[m] = 0.0f;
-    if (T.nv <= 0) return;
-    bool emk[EXV][3];
-    for (int v=0; v<T.nv; ++v) { emk[v][0]=false; emk[v][1]=false; emk[v][2]=false; }
-
-    for (int vstart=0; vstart<T.nv; ++vstart)
-    for (int pstart=0; pstart<3; ++pstart) {
-        if (emk[vstart][pstart]) continue;
-        int pnext = pstart;
-        int vcur  = vstart;
-        emk[vcur][pnext] = true;
-        int vnext = T.nbr[vcur][pnext];
-        float3 const v0 = T.pos[vstart];
-        int np;
-        for (np=0; np<3; ++np)
-            if (T.nbr[vnext][np] == vcur) break;
-        vcur = vnext;
-        pnext = (np+1)%3;
-        emk[vcur][pnext] = true;
-        vnext = T.nbr[vcur][pnext];
-        while (vnext != vstart) {
-            float3 const v2 = T.pos[vcur];
-            float3 const v1 = T.pos[vnext];
-            float const sixv = (-v2.x*v1.y*v0.z + v1.x*v2.y*v0.z + v2.x*v0.y*v1.z
-                                -v0.x*v2.y*v1.z - v1.x*v0.y*v2.z + v0.x*v1.y*v2.z);
-            mom[0] += sixv;
-            float3 const s1 = v0 + v1 + v2;
-            mom[1] += sixv*s1.x;  mom[2] += sixv*s1.y;  mom[3] += sixv*s1.z;
-            for (np=0; np<3; ++np)
-                if (T.nbr[vnext][np] == vcur) break;
-            vcur = vnext;
-            pnext = (np+1)%3;
-            emk[vcur][pnext] = true;
-            vnext = T.nbr[vcur][pnext];
-        }
-    }
-    mom[0] /= 6.0f;
-    mom[1] /= 24.0f;  mom[2] /= 24.0f;  mom[3] /= 24.0f;
-}
+// The r3d clip helpers (ExPoly, tet_planes, box_outside_tet, exact_init_tet, exact_clip_plane,
+// exact_reduce2, exact_reduce1) live in metal/exact_clip.metal.inc, which the Makefile prepends to
+// this source when it embeds it (dtfe_deposit.metal shares them).
 
 // ------------------------------------------------------------------------------------------------
 // depositFields: the deposit. Each interior sample receives the mass share and, per the field
@@ -420,6 +196,8 @@ struct FieldGrids {
     device atomic_float* sv;      // nCell     exact multiplicity sum(V_int)/V_cell (fExact; else dummy)
     device atomic_float* dispvel; // nCell*3   sum(m_s v_s), the dispersion's own MASS-weighted mean (fVolW+fDisp; else dummy)
     device atomic_float* dispw;   // nCell     sum(m_s), its normalizer (fVolW+fDisp; else dummy)
+    device atomic_float* scal;    // nCell     scalar moment sum(wm s) (fScal; else dummy)
+    device atomic_float* sgrad;   // nCell*3   scalar-gradient moment sum(wm ds/dx_i) (fSGrad; else dummy)
 };
 
 // w = mass share (mass grid), wm = moment weight (== w by default; the V_eul share under
@@ -434,8 +212,10 @@ struct FieldGrids {
 static inline void depositSample(thread const FieldGrids& G, uint flat,
                                  thread const float rel[3], float w, float wm, uint obits,
                                  thread const float u0[3], thread const float vG[3][3],
+                                 float s0, thread const float sG[3],
                                  bool fVel, bool fDisp, bool fGrad, bool fVolW, bool fCaustic,
-                                 bool fExact, float svShare, bool countStream, bool unresolved)
+                                 bool fExact, float svShare, bool countStream, bool unresolved,
+                                 bool fScal, bool fSGrad)
 {
     // Moment-grid offsets are 64-bit BECAUSE flat*9 WOULD overflow a 32-bit uint above ~782^3
     // and silently scatter atomics to low addresses. Already fixed -- do not re-derive.
@@ -469,6 +249,14 @@ static inline void depositSample(thread const FieldGrids& G, uint flat,
         for (int j=0;j<3;++j)
             for (int i=0;i<3;++i)
                 atomic_fetch_add_explicit(&G.grad[base*9ul + ulong(j*3+i)], vG[i][j]*wm, memory_order_relaxed);
+    if (fScal) {   // the linear scalar profile at the sample, moment-weighted like the velocity
+        float sv = s0;
+        for (int i=0;i<3;++i) sv += sG[i]*rel[i];
+        atomic_fetch_add_explicit(&G.scal[flat], sv*wm, memory_order_relaxed);
+    }
+    if (fSGrad)
+        for (int i=0;i<3;++i)
+            atomic_fetch_add_explicit(&G.sgrad[base*3ul + ulong(i)], sG[i]*wm, memory_order_relaxed);
     if (fVolW)
         atomic_fetch_add_explicit(&G.momw[flat], wm, memory_order_relaxed);
     if (fCaustic)
@@ -491,18 +279,41 @@ static inline void depositSample(thread const FieldGrids& G, uint flat,
 // ------------------------------------------------------------------------------------------------
 
 // A RAW window index triple -> its flat sub-grid index: the periodic wrap, then the partition
-// sub-box, which may itself wrap a periodic axis (see ps_interpolation.cc). False when the cell
-// lies outside the grid or the sub-box.
-static inline bool window_flat(thread const int raw[3], constant DepositParams& P, thread uint& flat) {
+// sub-box, which may itself wrap a periodic axis (see ps_interpolation.cc). 0 when the cell lies
+// outside the grid, 1 when inside the grid but outside the sub-box (under windowMode the SAMPLED
+// deposit still counts such a cell's samples for the tet's normalization), 2 when inside the sub-box.
+static inline int window_flat(thread const int raw[3], constant DepositParams& P, thread uint& flat) {
     int l[3];
+    bool inSub = true;
     for (int dd=0; dd<3; ++dd) {
         int const wg = P.periodic ? wrapIdx(raw[dd], P.nGrid[dd]) : raw[dd];
-        if (wg < 0 || wg >= P.nGrid[dd]) return false;
+        if (wg < 0 || wg >= P.nGrid[dd]) return 0;
         l[dd] = wg - P.subOrigin[dd];
         if (l[dd] < 0) l[dd] += P.nGrid[dd];
-        if (l[dd] < 0 || l[dd] >= P.subDims[dd]) return false;
+        if (l[dd] < 0 || l[dd] >= P.subDims[dd]) inSub = false;
     }
+    if (!inSub) return 1;
     flat = (uint(l[0])*uint(P.subDims[1]) + uint(l[1]))*uint(P.subDims[2]) + uint(l[2]);
+    return 2;
+}
+
+// --ps-window, exact deposit: restrict a tet's raw span [lo, hi) along one axis to the hull of the
+// window's periodic images it meets (gpu_host.h psWindowHull, which the host's item bound uses --
+// keep in sync). False when the span misses the window.
+static inline bool window_hull(thread int& lo, thread int& hi, int n, bool periodic, int o, int m) {
+    if (hi <= lo || m <= 0) return false;
+    if (!periodic) { lo = max(lo, 0); hi = min(hi, n); if (hi <= lo) return false; }
+    bool any = false;
+    int hlo = 0, hhi = 0;
+    int const kMax = periodic ? 2 : 0;
+    for (int k = -kMax; k <= kMax; ++k) {
+        int const a = max(lo, o + k*n), b = min(hi, o + m + k*n);
+        if (b <= a) continue;
+        if (!any) { hlo = a; hhi = b; any = true; }
+        else { hlo = min(hlo, a); hhi = max(hhi, b); }
+    }
+    if (!any) return false;
+    lo = hlo; hi = hhi;
     return true;
 }
 
@@ -513,6 +324,7 @@ struct ExactTet {
     int    ic0[3];
     float  f0[3];
     float  u0[3], vG[3][3];  // the linear velocity (zero when no velocity grid is requested)
+    float  s0, sG[3];        // the linear scalar (fScal / fSGrad; else zero)
     float  d0, dG[3];        // the linear density (fLinear)
     uint   obits;
     float  invCellVol;
@@ -537,7 +349,7 @@ static inline float exact_full_weight(float vol, bool fLinear, float d0, thread 
 // w its deposit weight -- V_int, or the exact linear-profile integral under fLinear (clamped at 0).
 static inline bool exact_cell_clip(thread const ExactTet& E, thread const int raw[3],
                                    constant DepositParams& P, bool full, bool fLinear,
-                                   thread float mo[10], thread float& w)
+                                   thread float mo[10], thread float& w, thread float3& cc)
 {
     // a cell wholly outside a face plane cannot hold any of the tet
     float3 const ccen = float3((float(raw[0] - E.ic0[0]) - E.f0[0] + 0.5f) * P.dx[0],
@@ -545,23 +357,29 @@ static inline bool exact_cell_clip(thread const ExactTet& E, thread const int ra
                                (float(raw[2] - E.ic0[2]) - E.f0[2] + 0.5f) * P.dx[2]);
     if (box_outside_tet(E.faces, ccen, E.hcell)) return false;
 
-    // clip the tet against this cell (bounds in the vertex-0 frame, RAW indices)
+    // clip the tet against this cell in the OVERLAP frame (exact_clip.metal.inc: origin at the centre
+    // of the tet bbox's overlap with the cell, where the piece lies): the moments come out about that
+    // origin 'cc' (vertex-0 frame), which the caller adds back to the centroid
+    float3 const clo = ccen - E.hcell, chi = ccen + E.hcell;
+    float3 const tlo = min(min(float3(0.0f), E.t1), min(E.t2, E.t3));
+    float3 const thi = max(max(float3(0.0f), E.t1), max(E.t2, E.t3));
+    float3 const org = 0.5f * (max(clo, tlo) + min(chi, thi));
     ExPoly piece;
-    exact_init_tet(piece, E.t1, E.t2, E.t3);
+    exact_init_tet4(piece, -org, E.t1 - org, E.t2 - org, E.t3 - org);
     for (int dd=0; dd<3; ++dd) {
-        float const clo = (float(raw[dd] - E.ic0[dd]) - E.f0[dd]) * P.dx[dd];
-        float const chi = clo + P.dx[dd];
-        exact_clip_plane(piece, dd,  1.0f, -clo);   //  x_d >= clo
-        exact_clip_plane(piece, dd, -1.0f,  chi);   //  x_d <= chi
+        exact_clip_plane(piece, dd,  1.0f, org[dd] - clo[dd]);   //  x_d >= clo - org
+        exact_clip_plane(piece, dd, -1.0f, chi[dd] - org[dd]);   //  x_d <= chi - org
     }
     if (piece.nv == 0) return false;
     if (full) exact_reduce2(piece, mo);
     else      exact_reduce1(piece, mo);
     if (!(mo[0] > 0.0f)) return false;
 
+    cc = org;
     w = mo[0];
-    if (fLinear) {
-        w = E.d0*mo[0] + E.dG[0]*mo[1] + E.dG[1]*mo[2] + E.dG[2]*mo[3];
+    if (fLinear) {   // the linear density integrated over the piece: (d0 + dG.cc) V + dG.(first moments about cc)
+        w = (E.d0 + E.dG[0]*org.x + E.dG[1]*org.y + E.dG[2]*org.z)*mo[0]
+          + E.dG[0]*mo[1] + E.dG[1]*mo[2] + E.dG[2]*mo[3];
         if (w < 0.0f) w = 0.0f;
     }
     return true;
@@ -572,13 +390,16 @@ static inline bool exact_cell_clip(thread const ExactTet& E, thread const int ra
 // gradient, the caustic bits, the exact multiplicity share V_int/V_cell and the tet-touch count.
 static inline void exact_cell_deposit(thread const FieldGrids& G, uint flat, thread const float mo[10],
                                       float massShare, thread const ExactTet& E,
-                                      bool fVel, bool fDisp, bool fGrad, bool fVolW, bool fCaustic)
+                                      bool fVel, bool fDisp, bool fGrad, bool fVolW, bool fCaustic,
+                                      bool fScal, bool fSGrad, float3 cc)
 {
     float const wmEx = fVolW ? mo[0] : massShare;
     ulong const base = ulong(flat);
     atomic_fetch_add_explicit(&G.mass[flat], massShare, memory_order_relaxed);
     float const invV = 1.0f / mo[0];
-    float const cen[3] = { mo[1]*invV, mo[2]*invV, mo[3]*invV };
+    // the piece's centroid about the clip origin cc (the moments' frame), and in the vertex-0 frame
+    float const loc[3] = { mo[1]*invV, mo[2]*invV, mo[3]*invV };
+    float const cen[3] = { cc.x + loc[0], cc.y + loc[1], cc.z + loc[2] };
     float vb[3];
     if (fVel || fDisp) {
         for (int j=0; j<3; ++j) {
@@ -591,12 +412,13 @@ static inline void exact_cell_deposit(thread const FieldGrids& G, uint flat, thr
             // exact second moment of the linear profile: <v_a v_b> over the piece
             // = vb_a vb_b + (G^T Cov G)_ab, Cov from the order-2 position moments
             float cov[3][3];
-            cov[0][0] = mo[4]*invV - cen[0]*cen[0];
-            cov[0][1] = cov[1][0] = mo[5]*invV - cen[0]*cen[1];
-            cov[0][2] = cov[2][0] = mo[6]*invV - cen[0]*cen[2];
-            cov[1][1] = mo[7]*invV - cen[1]*cen[1];
-            cov[1][2] = cov[2][1] = mo[8]*invV - cen[1]*cen[2];
-            cov[2][2] = mo[9]*invV - cen[2]*cen[2];
+            // (translation-invariant: taken about the clip origin, near the piece, where nothing cancels)
+            cov[0][0] = mo[4]*invV - loc[0]*loc[0];
+            cov[0][1] = cov[1][0] = mo[5]*invV - loc[0]*loc[1];
+            cov[0][2] = cov[2][0] = mo[6]*invV - loc[0]*loc[2];
+            cov[1][1] = mo[7]*invV - loc[1]*loc[1];
+            cov[1][2] = cov[2][1] = mo[8]*invV - loc[1]*loc[2];
+            cov[2][2] = mo[9]*invV - loc[2]*loc[2];
             ulong c2 = 0;
             for (int a=0; a<3; ++a)
                 for (int b=a; b<3; ++b) {
@@ -618,6 +440,14 @@ static inline void exact_cell_deposit(thread const FieldGrids& G, uint flat, thr
         for (int j=0; j<3; ++j)
             for (int i=0; i<3; ++i)
                 atomic_fetch_add_explicit(&G.grad[base*9ul + ulong(j*3+i)], E.vG[i][j]*wmEx, memory_order_relaxed);
+    if (fScal) {   // exact mean of the linear scalar profile over the piece (the velocity's construction)
+        float sb = E.s0;
+        for (int i=0; i<3; ++i) sb += E.sG[i]*cen[i];
+        atomic_fetch_add_explicit(&G.scal[flat], sb*wmEx, memory_order_relaxed);
+    }
+    if (fSGrad)
+        for (int i=0; i<3; ++i)
+            atomic_fetch_add_explicit(&G.sgrad[base*3ul + ulong(i)], E.sG[i]*wmEx, memory_order_relaxed);
     if (fVolW)
         atomic_fetch_add_explicit(&G.momw[flat], wmEx, memory_order_relaxed);
     if (fCaustic)
@@ -818,6 +648,9 @@ kernel void depositFields(
     device atomic_float*       svGrid   [[buffer(12)]], // nCell exact multiplicity sum(V_int)/V_cell (fExact; else dummy)
     device atomic_float*       dvGrid   [[buffer(13)]], // nCell*3 dispersion's mass-weighted mean (fVolW+fDisp; else dummy)
     device atomic_float*       dwGrid   [[buffer(14)]], // nCell   its normalizer (fVolW+fDisp; else dummy)
+    device const float*        scal     [[buffer(18)]], // nTet*4 vertex scalars (fScal / fSGrad; else dummy)
+    device atomic_float*       scalGrid [[buffer(19)]], // nCell   scalar moment (fScal; else dummy)
+    device atomic_float*       sgGrid   [[buffer(20)]], // nCell*3 scalar-gradient moment (fSGrad; else dummy)
     uint tid [[thread_position_in_grid]])
 {
     if (tid >= P.nTet) return;
@@ -863,7 +696,17 @@ kernel void depositFields(
             }
     }
 
-    FieldGrids G { massGrid, momGrid, m2Grid, gradGrid, strGrid, momwGrid, caustGrid, svGrid, dvGrid, dwGrid };
+    // the linear scalar profile (its gradient is constant over the tet, like the velocity's)
+    bool const fScal = P.fScal != 0, fSGrad = P.fSGrad != 0;
+    float s0 = 0.0f, sG[3] = { 0.0f, 0.0f, 0.0f };
+    if (fScal || fSGrad) {
+        s0 = scal[tid*4+0];
+        float ds[3];
+        for (int e=0;e<3;++e) ds[e] = scal[tid*4+e+1] - s0;
+        for (int i=0;i<3;++i) { float s=0.0f; for (int k=0;k<3;++k) s+=posInv[i][k]*ds[k]; sG[i]=s; }
+    }
+
+    FieldGrids G { massGrid, momGrid, m2Grid, gradGrid, strGrid, momwGrid, caustGrid, svGrid, dvGrid, dwGrid, scalGrid, sgGrid };
 
     // --ps-volume-weighted: the tet's total moment weight is its Eulerian volume |det|/6
     // (matching the CPU volumeShare); default: the moment weight equals the mass share.
@@ -984,20 +827,26 @@ kernel void depositFields(
         E.faces = tet_planes(E.t1, E.t2, E.t3);
         E.hcell = float3(0.5f*P.dx[0], 0.5f*P.dx[1], 0.5f*P.dx[2]);
         for (int i=0; i<3; ++i) {
-            E.ic0[i] = ic0[i];  E.f0[i] = f0[i];  E.u0[i] = u0[i];  E.dG[i] = dG[i];
+            E.ic0[i] = ic0[i];  E.f0[i] = f0[i];  E.u0[i] = u0[i];  E.dG[i] = dG[i];  E.sG[i] = sG[i];
             for (int j=0; j<3; ++j) E.vG[i][j] = vG[i][j];
         }
-        E.d0 = d0;  E.obits = obits;  E.invCellVol = invCellVol;
+        E.d0 = d0;  E.s0 = s0;  E.obits = obits;  E.invCellVol = invCellVol;
         E.straddle = straddle;
         E.wFull = exact_full_weight(tetVol, fLinear, d0, dG, E.t1, E.t2, E.t3);
 
+        // --ps-window: only the window's cells are clipped and the tet is normalized by its whole
+        // weight (as a straddling tet is); an empty window then means "no volume inside the
+        // window", not a degenerate tet -- nothing to deposit, no sampled fallback
+        if (P.windowMode != 0)
+            for (int dd=0; dd<3; ++dd)
+                if (!window_hull(iMinC[dd], iMaxC[dd], P.nGrid[dd], P.periodic != 0, P.subOrigin[dd], P.subDims[dd])) return;
         float sumW = 0.0f;
         float shareFac = 0.0f;
         bool  deposited = false;
         for (int pass=0; pass<2; ++pass) {
             if (pass==1) {
-                if (!(sumW > 0.0f)) break;   // empty window: sampled fallback below
-                shareFac = m / (E.straddle ? max(sumW, E.wFull) : sumW);
+                if (!(sumW > 0.0f)) { if (P.windowMode != 0) return; break; }   // empty window: sampled fallback below
+                shareFac = m / ((E.straddle || P.windowMode != 0) ? max(sumW, E.wFull) : sumW);
                 deposited = true;
             }
             for (int gi=iMinC[0]; gi<iMaxC[0]; ++gi)
@@ -1005,11 +854,12 @@ kernel void depositFields(
             for (int gk=iMinC[2]; gk<iMaxC[2]; ++gk) {
                 int const raw[3]={gi,gj,gk};
                 uint flat;
-                if (!window_flat(raw, P, flat)) continue;
+                if (window_flat(raw, P, flat) != 2) continue;   // outside the sub-box / window
                 float mo[10], w;
-                if (!exact_cell_clip(E, raw, P, pass==1, fLinear, mo, w)) continue;
+                float3 cc;
+                if (!exact_cell_clip(E, raw, P, pass==1, fLinear, mo, w, cc)) continue;
                 if (pass==0) { sumW += w; continue; }
-                exact_cell_deposit(G, flat, mo, w * shareFac, E, fVel, fDisp, fGrad, fVolW, fCaustic);
+                exact_cell_deposit(G, flat, mo, w * shareFac, E, fVel, fDisp, fGrad, fVolW, fCaustic, fScal, fSGrad, cc);
             }
         }
         if (deposited) return;   // exact deposit complete; skip the sampled path
@@ -1054,6 +904,7 @@ kernel void depositFields(
             bool const inGrid = !(wg0<0||wg0>=P.nGrid[0]||wg1<0||wg1>=P.nGrid[1]||wg2<0||wg2>=P.nGrid[2]);
             if (!inGrid) continue;   // beyond the grid: counted column by column (count_beyond_grid)
             uint flat = 0u;
+            bool inSub = true;
             {
                 int l0=wg0-P.subOrigin[0], l1=wg1-P.subOrigin[1], l2=wg2-P.subOrigin[2];
                 // the sub-box may wrap a periodic axis (ps_interpolation.cc): without this every
@@ -1062,9 +913,12 @@ kernel void depositFields(
                 if (l0<0) l0+=P.nGrid[0];
                 if (l1<0) l1+=P.nGrid[1];
                 if (l2<0) l2+=P.nGrid[2];
-                if (l0<0||l0>=P.subDims[0]||l1<0||l1>=P.subDims[1]||l2<0||l2>=P.subDims[2]) continue;
-                flat=(uint(l0)*uint(P.subDims[1])+uint(l1))*uint(P.subDims[2])+uint(l2);
+                if (l0<0||l0>=P.subDims[0]||l1<0||l1>=P.subDims[1]||l2<0||l2>=P.subDims[2]) inSub = false;
+                else flat=(uint(l0)*uint(P.subDims[1])+uint(l1))*uint(P.subDims[2])+uint(l2);
             }
+            // outside the sub-box: a partition's box holds every cell its tets touch, so skip; a WINDOW
+            // still counts the cell's samples in pass 0 (the full run's normalization) and skips its deposit
+            if (!inSub && !(P.windowMode != 0 && pass == 0)) continue;
             // this cell's offset from vertex 0 in cells, before the sub-sample fraction
             float const cb[3] = { float(raw[0] - ic0[0]) - f0[0],
                                   float(raw[1] - ic0[1]) - f0[1],
@@ -1092,7 +946,7 @@ kernel void depositFields(
                         float wm = fVolW ? mw / float(N + Nout) : w;
                         // --ps-exact-deposit fall-through: share the tet volume over its samples
                         float sv = fExact ? (tetVol*invCellVol)/float(N + Nout) : 0.0f;
-                        depositSample(G, flat, rel, w, wm, obits, u0, vG, fVel, fDisp, fGrad, fVolW, fCaustic, fExact, sv, true, false);
+                        depositSample(G, flat, rel, w, wm, obits, u0, vG, s0, sG, fVel, fDisp, fGrad, fVolW, fCaustic, fExact, sv, true, false, fScal, fSGrad);
                     }
                 }
             }
@@ -1106,7 +960,7 @@ kernel void depositFields(
         if (centroidFlat == 0xFFFFFFFFu) return;   // centroid outside this partition's box: drop
         float crel[3];
         for (int i=0; i<3; ++i) crel[i] = (Ax[0][i] + Ax[1][i] + Ax[2][i]) * 0.25f;
-        depositSample(G, centroidFlat, crel, m, mw, obits, u0, vG, fVel, fDisp, fGrad, fVolW, fCaustic, fExact, tetVol*invCellVol, fExact, true);
+        depositSample(G, centroidFlat, crel, m, mw, obits, u0, vG, s0, sG, fVel, fDisp, fGrad, fVolW, fCaustic, fExact, tetVol*invCellVol, fExact, true, fScal, fSGrad);
     }
 }
 
@@ -1123,13 +977,15 @@ kernel void depositFields(
 // A tet whose sumW stays 0 -- float-degenerate, or a window that clips empty -- deposits nothing
 // here; the host runs depositFields on those few, which falls through to the sampled path and the
 // centroid fallback, or defers to the CPU, exactly as before. Nothing here writes 'masses'.
+// Under --ps-window the items cover only the window's cells and the share is m / wFull (the whole
+// weight): a tet with no volume in the window stays at sumW 0 and depositFields drops it.
 // ------------------------------------------------------------------------------------------------
 struct ExactItemParams { uint nItems; uint phase; uint blockCells; uint pad; };
 
 // The per-tet numbers depositFields derives in its preamble, for the exact path (keep in sync).
 // False when the float recheck calls the tet degenerate.
 static inline bool exact_tet_setup(uint tet, device const float* verts, device const float* vels,
-                                   device const float* dens, constant DepositParams& P,
+                                   device const float* dens, device const float* scal, constant DepositParams& P,
                                    thread ExactTet& E, thread int iMin[3], thread int iMax[3])
 {
     device const float* R = verts + ulong(tet) * ulong(TET_STRIDE);
@@ -1160,6 +1016,14 @@ static inline bool exact_tet_setup(uint tet, device const float* verts, device c
                 E.vG[i][j]=s;
             }
     }
+    E.s0 = 0.0f;
+    for (int i=0; i<3; ++i) E.sG[i] = 0.0f;
+    if (P.fScal != 0 || P.fSGrad != 0) {
+        E.s0 = scal[ulong(tet)*4ul];
+        float ds[3];
+        for (int e=0;e<3;++e) ds[e] = scal[ulong(tet)*4ul+ulong(e+1)] - E.s0;
+        for (int i=0;i<3;++i) { float s=0.0f; for (int k=0;k<3;++k) s+=posInv[i][k]*ds[k]; E.sG[i]=s; }
+    }
     E.obits = (P.fCaustic != 0 && P.fLinear == 0) ? uint(dens[ulong(tet)*4ul]) : (d > 0.0f ? 1u : 2u);
     E.invCellVol = 1.0f / (P.dx[0]*P.dx[1]*P.dx[2]);
     E.d0 = 0.0f;
@@ -1183,6 +1047,13 @@ static inline bool exact_tet_setup(uint tet, device const float* verts, device c
             if (iMax[dd] > P.nGrid[dd]) { iMax[dd] = P.nGrid[dd]; E.straddle = true; }
         }
     }
+
+    // --ps-window: only the window's cells (the hull of its images along each axis) are items;
+    // a tet missing the window gets an empty span (no items idle on it: the host bound has the
+    // same hull)
+    if (P.windowMode != 0)
+        for (int dd=0; dd<3; ++dd)
+            if (!window_hull(iMin[dd], iMax[dd], P.nGrid[dd], P.periodic != 0, P.subOrigin[dd], P.subDims[dd])) { iMax[dd] = iMin[dd]; }
 
     E.t1 = float3(Ax[0][0], Ax[0][1], Ax[0][2]);
     E.t2 = float3(Ax[1][0], Ax[1][1], Ax[1][2]);
@@ -1213,6 +1084,9 @@ kernel void depositExactItems(
     device const uint2*        items    [[buffer(15)]], // (tet, block), tets indexing buffers 0-2 and 9 unoffset
     device atomic_float*       sumW     [[buffer(16)]], // nTet: per-tet weight total (phase 0 writes, 1 reads)
     constant ExactItemParams&  IP       [[buffer(17)]],
+    device const float*        scal     [[buffer(18)]],
+    device atomic_float*       scalGrid [[buffer(19)]],
+    device atomic_float*       sgGrid   [[buffer(20)]],
     uint iid [[thread_position_in_grid]])
 {
     if (iid >= IP.nItems) return;
@@ -1229,9 +1103,10 @@ kernel void depositExactItems(
 
     ExactTet E;
     int iMin[3], iMax[3];
-    if (!exact_tet_setup(tet, verts, vels, dens, P, E, iMin, iMax)) return;
-    // a tet cut by the grid face keeps only its inside share: normalized by its whole weight
-    float const shareFac = deposit ? m / (E.straddle ? max(s, E.wFull) : s) : 0.0f;
+    if (!exact_tet_setup(tet, verts, vels, dens, scal, P, E, iMin, iMax)) return;
+    // a tet cut by the grid face keeps only its inside share: normalized by its whole weight --
+    // as is every tet of a --ps-window run (only its window pieces are clipped)
+    float const shareFac = deposit ? m / ((E.straddle || P.windowMode != 0) ? max(s, E.wFull) : s) : 0.0f;
     ulong const n1 = ulong(max(iMax[1] - iMin[1], 0));
     ulong const n2 = ulong(max(iMax[2] - iMin[2], 0));
     ulong const n12 = n1 * n2;
@@ -1246,17 +1121,19 @@ kernel void depositExactItems(
 
     bool const fVel = P.fVel != 0, fDisp = P.fDisp != 0, fGrad = P.fGrad != 0;
     bool const fVolW = P.fVolW != 0, fCaustic = P.fCaustic != 0, fLinear = P.fLinear != 0;
-    FieldGrids G { massGrid, momGrid, m2Grid, gradGrid, strGrid, momwGrid, caustGrid, svGrid, dvGrid, dwGrid };
+    bool const fScal = P.fScal != 0, fSGrad = P.fSGrad != 0;
+    FieldGrids G { massGrid, momGrid, m2Grid, gradGrid, strGrid, momwGrid, caustGrid, svGrid, dvGrid, dwGrid, scalGrid, sgGrid };
     float acc = 0.0f;
     for (; w < wEnd; ++w) {
         int const raw[3] = { iMin[0] + a0, iMin[1] + a1, iMin[2] + a2 };
         if (ulong(++a2) == n2) { a2 = 0; if (ulong(++a1) == n1) { a1 = 0; ++a0; } }
         uint flat;
-        if (!window_flat(raw, P, flat)) continue;
+        if (window_flat(raw, P, flat) != 2) continue;   // outside the sub-box / window
         float mo[10], wt;
-        if (!exact_cell_clip(E, raw, P, deposit, fLinear, mo, wt)) continue;
+        float3 cc;
+        if (!exact_cell_clip(E, raw, P, deposit, fLinear, mo, wt, cc)) continue;
         if (!deposit) acc += wt;
-        else exact_cell_deposit(G, flat, mo, wt * shareFac, E, fVel, fDisp, fGrad, fVolW, fCaustic);
+        else exact_cell_deposit(G, flat, mo, wt * shareFac, E, fVel, fDisp, fGrad, fVolW, fCaustic, fScal, fSGrad, cc);
     }
     if (!deposit && acc > 0.0f)
         atomic_fetch_add_explicit(&sumW[tet], acc, memory_order_relaxed);

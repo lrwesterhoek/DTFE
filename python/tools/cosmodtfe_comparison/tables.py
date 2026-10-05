@@ -84,8 +84,13 @@ if bf.exists():
     STAGES = (("ps_centres", "phase-space point values, 16.8M points"),
               ("ps_slice", "phase-space slice, 4.2M points"),
               ("ps_grid_cpu", "sampled cell averages, CPU"),
-              ("ps_grid_exact", "exact cell averages, GPU"))
+              ("ps_grid_exact", "exact cell averages, GPU"),
+              ("dtfe_avg_gpu", "standard-DTFE cell averages 256³, GPU"),
+              ("dtfe_avg512_gpu", "standard-DTFE cell averages 512³, GPU"))
     NAMES = {"64": "0.26M", "128": "2.1M", "192": "7.1M", "tng": "TNG 11.8M"}
+    # the standard-DTFE GPU stages were first measured with this morning's kernel into out/before_dtfe_<tag>
+    # (the other "before" logs predate those stages)
+    BEFORE_FILE = {"dtfe_avg_gpu": "before_dtfe_{tag}.timing.jsonl", "dtfe_avg512_gpu": "before_dtfe_{tag}.timing.jsonl"}
 
     def cell(x):
         if x is None:
@@ -96,7 +101,10 @@ if bf.exists():
     t = ['<table class="num"><thead>', row(["task", "particles", "before", "after"], True), "</thead><tbody>"]
     for stage, label in STAGES:
         for tag, nm in NAMES.items():
-            b = last(bf / f"o{tag}.timing.jsonl").get(stage)
+            if stage in BEFORE_FILE:
+                b = last(Path(sys.argv[1]).parent / "out" / BEFORE_FILE[stage].format(tag=tag)).get(stage)
+            else:
+                b = last(bf / f"o{tag}.timing.jsonl").get(stage)
             a = last(Path(sys.argv[1]).parent / "out" / f"o{tag}.timing.jsonl").get(stage)
             t.append(row([label, nm, cell(b), cell(a)]))
     t.append("</tbody></table>")

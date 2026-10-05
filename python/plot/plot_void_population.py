@@ -29,7 +29,7 @@ import matplotlib.pyplot as plt
 
 import config
 from dtfelib import pipeline
-from dtfelib import make_parser
+from dtfelib import make_parser, use_data_root
 from dtfelib import environment as env
 from dtfelib import groupcat as gc
 
@@ -83,12 +83,13 @@ def main():
     if args.smooth > 0:
         config.SMOOTHING_SIGMA_CELLS = args.smooth
 
+    use_data_root(args.data_root)      # --data-root for the trees, group catalogues and ladder too (2026-10-05)
     ztab = gc.redshift_table(args.sim)
     ladder = sorted({int(d.name.split("_")[1]) for d in env.sim_dir(args.sim).glob("snapdir_*")})
 
     stats, method_used = {}, {}
     for s in ladder:
-        prod = pipeline.products(s, sim=args.sim, method=args.method)
+        prod = pipeline.products(s, sim=args.sim, method=args.method, prefix=args.prefix, data_root=args.data_root)
         try:
             cat = prod.voids()
             method_used[s] = prod.fs.method

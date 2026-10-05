@@ -19,12 +19,16 @@
 
    The consistency argument needs every periodic copy to be ONE Real +-L addition to the
    original (DTFE.cpp's global copies, subpartition.h's per-partition copies, the standard
-   binary's findParticlesInBox) -- keep it that way. */
+   binary's findParticlesInBox) -- keep it that way.
+
+   2D (a DIM=2 phase-space build, 2026-10-02): the same three tiers for a point in a TRIANGLE. The
+   frame, the canonical images and tier 1 are dimension-free; the exact predicate is the 2D
+   orientation, and its simulation of simplicity reduces to exact comparisons of coordinates. */
 
 #ifndef PS_EXACT_INSIDE_HEADER
 #define PS_EXACT_INSIDE_HEADER
 
-#if NO_DIM==3
+#if NO_DIM==3 || NO_DIM==2
 
 #include <algorithm>
 #include <cmath>
@@ -72,6 +76,7 @@ struct Frame
 };
 
 
+#if NO_DIM==3
 // 3x3 double inverse via the adjugate -- the double-precision twin of matrixInverse()
 // (math_functions.h), same relative singularity test so the kept-cell set is identical.
 inline bool inverse3x3d(double const m[NO_DIM][NO_DIM], double inv[NO_DIM][NO_DIM])
@@ -94,6 +99,22 @@ inline bool inverse3x3d(double const m[NO_DIM][NO_DIM], double inv[NO_DIM][NO_DI
     inv[2][2] = (m[0][0]*m[1][1] - m[0][1]*m[1][0]) * invDet;
     return true;
 }
+inline bool inverseNd(double const m[NO_DIM][NO_DIM], double inv[NO_DIM][NO_DIM]) { return inverse3x3d( m, inv ); }
+#else
+// 2x2 double inverse, the same relative singularity test as matrixInverse()
+inline bool inverseNd(double const m[NO_DIM][NO_DIM], double inv[NO_DIM][NO_DIM])
+{
+    double const det = m[0][0]*m[1][1] - m[0][1]*m[1][0];
+    if ( isRelativelySingular(det, m) )
+        return false;
+    double const invDet = 1.0 / det;
+    inv[0][0] =  m[1][1] * invDet;
+    inv[0][1] = -m[0][1] * invDet;
+    inv[1][0] = -m[1][0] * invDet;
+    inv[1][1] =  m[0][0] * invDet;
+    return true;
+}
+#endif
 
 
 // Canonical image of a stored Eulerian coordinate. Periodic copies are made by ONE Real
@@ -131,6 +152,7 @@ inline void canonicalQuery(Frame const &F, double const pos[NO_DIM], double pc[N
         pc[d] = pos[d] + (F.periodic ? F.canonLd[d] : 0.);
 }
 
+#if NO_DIM==3
 // Exact sign of det[a;b;c] -- the orientation of the triangle abc as seen from the query
 // point, which sits at the origin of these coordinates -- with the query point symbolically
 // perturbed by delta = (e, e^2, e^3), e -> 0+ (simulation of simplicity), so it is never 0.
@@ -183,6 +205,42 @@ inline bool exactInside(Frame const &F, Real const cv[NO_DIM+1][NO_DIM], double 
     }
     return true;
 }
+#else
+// Exact sign of det[a;b] -- the orientation of the segment ab as seen from the query point at the
+// origin -- with the point perturbed by delta = (e, e^2), e -> 0+ (simulation of simplicity):
+//     det[a-delta; b-delta] = det[a;b] - e (b_y - a_y) + e^2 (b_x - a_x) + O(e^3 terms that cancel),
+// so a zero determinant takes the sign of a_y - b_y, else of b_x - a_x: exact comparisons of doubles.
+inline int orient0Sos(double const a[NO_DIM], double const b[NO_DIM])
+{
+    typedef K::Point_2 P2;
+    CGAL::Orientation const o = CGAL::orientation( P2(0., 0.), P2(a[0], a[1]), P2(b[0], b[1]) );
+    if ( o != CGAL::COLLINEAR ) return (o == CGAL::POSITIVE) ? 1 : -1;
+    if ( a[1] != b[1] ) return ( a[1] > b[1] ) ? 1 : -1;
+    if ( a[0] != b[0] ) return ( b[0] > a[0] ) ? 1 : -1;
+    return 1;   // a zero-length edge: only a zero-area triangle has one, and none is ever kept
+}
+
+// Exact containment of the (perturbed) query point pc in the canonical triangle cv: with the point
+// at the origin, the sub-triangles (O,v1,v2), (O,v2,v0), (O,v0,v1) must all share the triangle's
+// orientation; an edge shared by two triangles is seen in opposite directions, so a point on it
+// goes to exactly one of them. Folded (negatively oriented) streams work unchanged.
+inline bool exactInside(Frame const &F, Real const cv[NO_DIM+1][NO_DIM], double const pc[NO_DIM])
+{
+    typedef K::Point_2 P2;
+    double dv[NO_DIM+1][NO_DIM];
+    for (int v = 0; v <= NO_DIM; ++v)
+        for (int d = 0; d < NO_DIM; ++d)
+            dv[v][d] = wrapRel( F, double(cv[v][d]) - pc[d], d );
+    CGAL::Orientation const ot = CGAL::orientation( P2(dv[0][0], dv[0][1]), P2(dv[1][0], dv[1][1]),
+                                                    P2(dv[2][0], dv[2][1]) );
+    if ( ot == CGAL::COLLINEAR ) return false;   // flat in the canonical frame: holds no area
+    int const o = (ot == CGAL::POSITIVE) ? 1 : -1;
+    static int const edge[NO_DIM+1][2] = { {1, 2}, {2, 0}, {0, 1} };
+    for (int i = 0; i <= NO_DIM; ++i)
+        if ( orient0Sos( dv[edge[i][0]], dv[edge[i][1]] ) != o ) return false;
+    return true;
+}
+#endif
 
 // Per-tetrahedron state of the canonical tiers, built lazily on the first undecided point.
 struct TetTest
@@ -196,6 +254,7 @@ struct TetTest
 
 // rawPos: the STORED (unwrapped) Eulerian vertex positions -- the ones canonicalCoord maps to
 // a single image per particle.
+#if NO_DIM==3
 inline void tetTestSetup(Frame const &F, Real const rawPos[NO_DIM+1][NO_DIM], TetTest &T)
 {
     for (int v = 0; v <= NO_DIM; ++v)
@@ -266,6 +325,44 @@ inline void tetTestSetup(Frame const &F, Real const rawPos[NO_DIM+1][NO_DIM], Te
     }
     T.ready = true;
 }
+#else
+inline void tetTestSetup(Frame const &F, Real const rawPos[NO_DIM+1][NO_DIM], TetTest &T)
+{
+    for (int v = 0; v <= NO_DIM; ++v)
+        for (int d = 0; d < NO_DIM; ++d)
+            T.cv[v][d] = canonicalCoord( F, rawPos[v][d], d );
+    double E[NO_DIM][NO_DIM];
+    for (int v = 0; v < NO_DIM; ++v)
+        for (int d = 0; d < NO_DIM; ++d)
+            E[v][d] = wrapRel( F, double(T.cv[v+1][d]) - double(T.cv[0][d]), d );
+    double const det = E[0][0]*E[1][1] - E[0][1]*E[1][0];
+    double const e2[3] = { E[0][0]*E[0][0] + E[0][1]*E[0][1], E[1][0]*E[1][0] + E[1][1]*E[1][1],
+                           (E[1][0]-E[0][0])*(E[1][0]-E[0][0]) + (E[1][1]-E[0][1])*(E[1][1]-E[0][1]) };
+    double const edge2 = std::max( { e2[0], e2[1], e2[2] } );
+    T.fast = false;
+    double const absDet = std::fabs(det);
+    if ( absDet > 0. && edge2 > 0. )
+    {
+        double const edge = std::sqrt(edge2);
+        double const hMin = absDet / edge;            // smallest height: twice the area over the longest edge
+        double const band = 1.e-8 + 4. * F.roundAbs / hMin
+                          + 64. * std::numeric_limits<double>::epsilon() * edge2 / absDet;
+        if ( band < 0.25 )
+        {
+            double const invDet = 1. / det;
+            // the plain inverse of the edge matrix (rows = edges), as in 3D; canonicalInside reads
+            // bary = inv^T * rel
+            T.invC[0][0] =  E[1][1] * invDet;
+            T.invC[0][1] = -E[0][1] * invDet;
+            T.invC[1][0] = -E[1][0] * invDet;
+            T.invC[1][1] =  E[0][0] * invDet;
+            T.band = band;
+            T.fast = true;
+        }
+    }
+    T.ready = true;
+}
+#endif
 
 // Barycentric margin within which the wrapped-geometry ('fine') barycentrics cannot decide
 // containment on their own: the fine and canonical geometries differ by <= epsAbs per vertex,
@@ -287,8 +384,14 @@ inline double fineBand(Frame const &F, double const Ax[NO_DIM][NO_DIM], double c
         }
     }
     if ( not (absDet > 0.) ) return std::numeric_limits<double>::infinity();
+#if NO_DIM==3
     return 1.e-8 + 4. * (F.epsAbs + F.roundAbs) * edge2 / absDet
          + 64. * std::numeric_limits<double>::epsilon() * edge2 * std::sqrt(edge2) / absDet;
+#else
+    // 2D: the smallest height is >= |det| / longest edge, and the adjugate's rounding ~ edge^2 / |det|
+    return 1.e-8 + 4. * (F.epsAbs + F.roundAbs) * std::sqrt(edge2) / absDet
+         + 64. * std::numeric_limits<double>::epsilon() * edge2 / absDet;
+#endif
 }
 
 // Tier 1: barycentrics of rel (the query's minimum-image offset from wrapped vertex 0) on the
@@ -349,6 +452,6 @@ inline bool canonicalInside(Frame const &F, Real const rawPos[NO_DIM+1][NO_DIM],
 
 }  // namespace psExactInside
 
-#endif  // NO_DIM==3
+#endif  // NO_DIM==3 || NO_DIM==2
 
 #endif  // PS_EXACT_INSIDE_HEADER

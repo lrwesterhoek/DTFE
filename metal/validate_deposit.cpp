@@ -229,7 +229,8 @@ struct Gpu {
         { std::ifstream mf("metal/ps_deposit.metallib");
           if (mf.good()) lib=dev->newLibrary(NS::URL::fileURLWithPath(NS::String::string("metal/ps_deposit.metallib",NS::UTF8StringEncoding)),&err); }
         if(!lib){
-            std::ifstream f(srcPath); std::stringstream ss; ss<<f.rdbuf(); std::string src=ss.str();
+            // the shared r3d clip helpers come first, as the Makefile prepends them when it embeds the source
+            std::ifstream inc("metal/exact_clip.metal.inc"); std::ifstream f(srcPath); std::stringstream ss; ss<<inc.rdbuf()<<"\n"<<f.rdbuf(); std::string src=ss.str();
             if(src.empty()) return false;
             lib=dev->newLibrary(NS::String::string(src.c_str(),NS::UTF8StringEncoding),(MTL::CompileOptions*)nullptr,&err);
         }
@@ -316,6 +317,7 @@ struct Gpu {
         MTL::Buffer* bSV=zbuf(P.fExact              ? nCell*4  : 4);     // exact multiplicity
         MTL::Buffer* bDV=zbuf((P.fVolW&&P.fDisp)    ? nCell*12 : 4);     // dispvel
         MTL::Buffer* bDW=zbuf((P.fVolW&&P.fDisp)    ? nCell*4  : 4);     // dispw
+        MTL::Buffer* bSc=zbuf(4), *bScal=zbuf(4), *bSG=zbuf(4);           // scalar in / moment / gradient (fScal=fSGrad=0)
         auto dispatch=[&](MTL::ComputePipelineState* pso, MTL::Buffer* massB, size_t nThreads,
                           MTL::Buffer* bI, MTL::Buffer* bSW, uint32_t phase){
             MTL::CommandBuffer* cb=q->commandBuffer();
@@ -326,6 +328,7 @@ struct Gpu {
             e->setBuffer(bG,0,6); e->setBuffer(bS,0,7); e->setBuffer(bP,0,8);
             e->setBuffer(bD,0,9); e->setBuffer(bW,0,10); e->setBuffer(bC,0,11);
             e->setBuffer(bSV,0,12); e->setBuffer(bDV,0,13); e->setBuffer(bDW,0,14);
+            e->setBuffer(bSc,0,18); e->setBuffer(bScal,0,19); e->setBuffer(bSG,0,20);
             if(bI){
                 uint32_t const IP[4]={uint32_t(nThreads),phase,itemCells,0u};
                 e->setBuffer(bI,0,15); e->setBuffer(bSW,0,16); e->setBytes(IP,sizeof IP,17);
@@ -426,6 +429,8 @@ static char detail[512];
 static void makeParams(DepositParams& P,int n,float box,int nSub,int periodic){
     for(int i=0;i<3;++i){P.boxLo[i]=0.f;P.nGrid[i]=n;P.dx[i]=box/n;P.subOrigin[i]=0;P.subDims[i]=n;}
     P.nSub=nSub;P.periodic=periodic;P.fVel=1;P.fDisp=1;P.fGrad=1;P.fLinear=0;P.fVolW=0;P.fCaustic=0;P.fExact=0;P.nTet=0;
+    P.fScal=0;P.fSGrad=0;   // the scalar buffers (18-20) are bound as dummies: no scalar test here
+    P.windowMode=0;         // the sub-grid tests are partition boxes, not windows
 }
 static std::vector<float> linVel(const std::vector<float>& verts){
     // simple linear velocity field v = (2x - y, 0.5z, -x + y) at each vertex

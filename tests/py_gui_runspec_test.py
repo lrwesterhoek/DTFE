@@ -82,6 +82,11 @@ def main():
         check("DTFE argv uses run_dtfe.sh with no PS options",
               dt.command()[0] == [str(rs.DTFE_SCRIPT), "-s", "TNG100-3-Dark", "-g", "512", "4"]
               and "FIELDS" not in dt.command()[1])
+        dte = rs.RunSpec(data_root=str(tmp), sim="TNG100-3-Dark", snapshots=[4], estimator="dtfe", gpu=False,
+                         deposit="exact")
+        check("standard DTFE with the exact choice: run_dtfe.sh -e (the exact cell average), named in the queue",
+              dte.command()[0] == [str(rs.DTFE_SCRIPT), "-s", "TNG100-3-Dark", "-g", "512", "-e", "4"]
+              and rs.job_summary("grids", dte).endswith(", exact"), str(dte.command()[0]))
         check("to_dict/from_dict round trip", rs.RunSpec.from_dict(spec.to_dict()) == spec)
 
         print("checks:")
@@ -137,7 +142,9 @@ def main():
         pipe.plan_only = False
         check("stale(): no slices yet -> every snapshot", pipe.stale("TNG100-3-Dark") == ([4, 99], 2))
         (sim / "hires_plane_z64.bin").touch()
-        (sim / "hires_plane_z64.json").touch()
+        # a sidecar as make_image_plane.py writes it (an unreadable one counts as 'differs' since 2026-10-04)
+        (sim / "hires_plane_z64.json").write_text('{"box": 100.0, "center": 50.0, "planes": 1, "thickness": 2.0, '
+                                                   '"nu": 64, "nv": 64, "u0": 0.0, "u1": 100.0, "v0": 0.0, "v1": 100.0}')
         for n in (4, 99):
             for ext in ("pts_den", "pts_velGrad"):
                 (sim / f"snapdir_{n:03d}" / f"ps_output.{ext}").touch()
@@ -163,6 +170,7 @@ def main():
         lv, msg = levels(rs.PipelineSpec(data_root=str(tmp), sims=["TNG100-3-Dark"], nu=8192))
         check("pipeline: an 8192^2 plane without scratch warns (it did not fit on 64 GB)",
               "warning" in lv and "scratch" in msg, msg)
+        pipeline_options(tmp, sim)
 
         print("plots:")
         (sim / "snapdir_099" / "ps_output.a_den").touch()
@@ -299,6 +307,40 @@ def main():
         check("wget files, merge chunks and problem lines parsed",
               p.get("downloaded") == [("/a b/snap_099.0.hdf5", 1234)] and p.get("chunk") == (2, 4)
               and p.get("problem") == 2, str(p))
+        os.environ["TNG_API_KEY"] = "k"
+        try:
+            dl_steps = [st for st in rs.DataSpec(data_root=str(tmp), sim="TNG50-4-Dark", snapshots=[67]).steps()
+                        if "download" in st.label]
+        finally:
+            os.environ.pop("TNG_API_KEY", None)
+        check("the download step carries PY (the script checks the chunks on disk with the merge's python)",
+              dl_steps and all(st.env.get("PY") == rs.PYTHON for st in dl_steps), str([st.env for st in dl_steps]))
+        os.environ["TNG_API_KEY"] = "k"
+        try:
+            both = rs.DataSpec(data_root=str(tmp), sim="TNG50-2-Dark", snapshots=[67], download_groupcats=True,
+                               merge_groupcats=True, download_trees=True, merge_trees=True).steps()     # nothing on disk
+            only = rs.DataSpec(data_root=str(tmp), sim="TNG50-4-Dark", snapshots=[67], download_snapshots=False).steps()
+        finally:
+            os.environ.pop("TNG_API_KEY", None)
+        after = {st.label: st.after for st in both}
+        check("every merge step is chained to its own download step (skipped by the launcher when that failed)",
+              after.get("merge snapshots 67") == "download snapshots 67"
+              and after.get("merge group catalogues 67") == "download group catalogues 67"
+              and after.get("merge merger trees") == "download merger trees", str(after))
+        check("a merge without a download step is chained to nothing", [st.after for st in only] == [""], str(only))
+        # a stopped merge's leftover: named, and its bytes counted as free for the merge that removes it
+        sp = rs.sim_dir("TNG50-4-Dark", str(tmp))
+        stale = sp / "snapdir_067" / "combined_067.hdf5.partial"
+        stale.parent.mkdir(parents=True, exist_ok=True)
+        stale.write_bytes(b"x" * 4096)
+        try:
+            d = rs.DataSpec(data_root=str(tmp), sim="TNG50-4-Dark", snapshots=[67], download_snapshots=False)
+            lv, msg = levels(d)
+            check("a stale .partial of a snapshot about to be merged is listed and named in a warning",
+                  [p.name for p in d.stale_partials()] == ["combined_067.hdf5.partial"] and "a stopped merge left" in msg
+                  and "combined_067.hdf5.partial" in msg, msg)
+        finally:
+            stale.unlink()
 
         print("memory check:")
         rep = rs.parse_reports("  AUTO-TUNE-REPORT snap=099 partition=5 mc=2 predicted_gb=33.75 budget_gb=34.88 "
@@ -370,6 +412,11 @@ def main():
         check("grids, pipeline and custom-snapshot jobs wait for other DTFE runs",
               set(rs.HEAVY_KINDS) == {"grids", "pipeline", "custom"})
         new_features(tmp, sim)
+        two_d(tmp)
+        bug_fixes_2026_10_05(tmp, sim)
+        cube_cache_2026_10_06()
+        type_labels_2026_10_06()
+        launcher_fixes()
     finally:
         shutil.rmtree(tmp.parent)
     print("-" * 60)
@@ -468,6 +515,80 @@ def new_features(tmp: Path, sim: Path):
               used <= knobs, str(sorted(used - knobs)))
     else:
         check("flags-exist check skipped: a binary is not built", True)
+
+    # ---- GPU advice: where the deposit pays (measured 2026-10-01), one warning per condition
+    ps_gpu, dt_gpu = rs.gpu_built("ps"), rs.gpu_built("dtfe")
+    adv = rs.gpu_advice
+    check("gpu advice: a small PS run with the GPU ticked is told the CPU is faster; a big one without it, the GPU",
+          len(adv(True, "sampled", ["density_a"], 260_000, "ps")) == 1
+          and len(adv(False, "sampled", ["density_a"], 2_100_000, "ps")) == (1 if ps_gpu else 0)
+          and adv(False, "sampled", ["density_a"], 260_000, "ps") == []
+          and adv(True, "sampled", ["density_a"], 7_100_000, "ps") == [])
+    check("gpu advice: the exact deposit without the GPU warns whatever the particle count (none known too)",
+          len(adv(False, "exact", ["density_a"], None, "ps")) == (1 if ps_gpu else 0)
+          and adv(True, "exact", ["density_a"], None, "ps") == []
+          and adv(True, "sampled", ["density_a"], None, "ps") == [])
+    check("gpu advice: standard DTFE with the GPU unticked on a fine grid is told the GPU is 1.5-2.3x faster; not at 256³",
+          adv(True, "sampled", rs.DTFE_FIELDS, 7_100_000, "dtfe", grid=512) == []
+          and adv(False, "sampled", rs.DTFE_FIELDS, 7_100_000, "dtfe", grid=256) == []
+          and len(adv(False, "sampled", rs.DTFE_FIELDS, 7_100_000, "dtfe", grid=1024)) == (1 if dt_gpu else 0))
+    rec = rs.recommended_gpu
+    check("recommended GPU: exact always (when built), sampled from ~1M particles, standard DTFE when built",
+          rec("exact", ["density_a"], 1000) == ps_gpu and rec("sampled", ["density_a"], 32 ** 3) is False
+          and rec("sampled", ["density_a"], 19_000_000) == ps_gpu and rec("sampled", ["density_a"], None) == ps_gpu
+          and rec("sampled", ["density_a"], 1e9, "dtfe") == dt_gpu)
+    ex = rs.RunSpec(sim="TNG50-4", snapshots=[99], deposit="exact", gpu=False, data_root=str(tmp))
+    msgs = [m for level, m in ex.problems() if level == "warning" and "exact" in m]
+    check("a Grids exact run without the GPU gets ONE warning (the duplicate is gone)", len(msgs) == (1 if ps_gpu else 0), str(msgs))
+    dtg = rs.RunSpec(sim="TNG50-4", snapshots=[99], estimator="dtfe", gpu=True, grid=512, data_root=str(tmp))
+    cm = rs.CustomSpec(input_file=str(snap), estimator="dtfe", gpu=True, grid=512)
+    check("a standard-DTFE 512³ run with the GPU gets no GPU warning (Grids and custom)",
+          not any("GPU" in m and level == "warning" and "METAL" not in m for level, m in dtg.problems() + cm.problems()),
+          str(dtg.problems()))
+    dtg.gpu = cm.gpu = False
+    check("... and with the GPU unticked both are told it is faster (when built)",
+          (any("faster" in m for _, m in dtg.problems()) and any("faster" in m for _, m in cm.problems())) == dt_gpu,
+          str(cm.problems()))
+    dex = rs.RunSpec(sim="TNG50-4", snapshots=[99], estimator="dtfe", deposit="exact", gpu=False, grid=256,
+                     data_root=str(tmp))
+    cex = rs.CustomSpec(input_file=str(snap), estimator="dtfe", deposit="exact", gpu=False, grid=256)
+    check("standard DTFE exact: the custom command passes --exact-average (not the PS flag), and without the GPU "
+          "both specs say the GPU is ~6.6x faster (when built)",
+          "--exact-average" in cex.command() and "--ps-exact-deposit" not in cex.command()
+          and "--exact-average" not in rs.CustomSpec(input_file=str(snap), estimator="dtfe").command()
+          and (any("6.6x" in m for _, m in dex.problems()) and any("6.6x" in m for _, m in cex.problems())) == dt_gpu,
+          str(cex.problems()))
+    # ---- precision: the double pair is a setting, picked per job; the knob and binary names
+    both_double = rs.binary_built("ps", "double") and rs.binary_built("dtfe", "double")
+    rp = rs.RunSpec(sim="TNG50-4", snapshots=[99], precision="double", data_root=str(tmp))
+    check("precision: a double Grids job sets DTFE_PRECISION=double for the script, a single one sets nothing",
+          rp.command()[1].get("DTFE_PRECISION") == "double"
+          and "DTFE_PRECISION" not in rs.RunSpec(sim="TNG50-4", snapshots=[99]).command()[1])
+    check("precision: binary names and the memory estimate (twice the bytes)",
+          rs.binary_name("ps", "double") == "PS-DTFE-double" and rs.binary_name("dtfe") == "DTFE"
+          and abs(rs.grids_gb(256, ["density_a"], "double") / rs.grids_gb(256, ["density_a"]) - 2) < 1e-9
+          and rs.RunSpec(grid=256, precision="double").grid_gb() == 2 * rs.RunSpec(grid=256).grid_gb())
+    cd = rs.CustomSpec(input_file=str(snap), estimator="dtfe", precision="double")
+    check("precision: a double custom job runs the -double binary; missing pair = a clear error naming Setup",
+          cd.binary().name == "DTFE-double"
+          and (any("double-precision" in m and level == "error" for level, m in cd.problems()) != both_double))
+    pp = rs.PipelineSpec(sims=["TNG50-4"], precision="double")
+    check("precision: the pipeline passes the knob through", pp.command()[1].get("DTFE_PRECISION") == "double")
+    check("precision: an unknown value is an error", any("precision" in m for level, m in
+          rs.RunSpec(sim="TNG50-4", snapshots=[99], precision="half", data_root=str(tmp)).problems() if level == "error"))
+    check("precision: the GPU and TBB stamps are read from the pair's own object directory",
+          rs._objdir("ps", "double").name == "o_ps_d" and rs._objdir("dtfe").name == "o"
+          and isinstance(rs.gpu_built("ps", "double"), bool) and isinstance(rs.tbb_built("double"), bool))
+
+    # ---- the Custom tab's memory check: a report-mode call keyed on what changes memory
+    c1 = rs.CustomSpec(input_file=str(snap), grid=256, output_dir=str(work), output_name="a")
+    c2 = rs.CustomSpec(input_file=str(snap), grid=256, output_dir=str(work / "elsewhere"), output_name="b")
+    c3 = rs.CustomSpec(input_file=str(snap), grid=512, output_dir=str(work), output_name="a")
+    check("custom memory key: the output folder and name do not change it, the grid does",
+          c1.memory_key() == c2.memory_key() and c1.memory_key() != c3.memory_key())
+    st = c1.check_step()
+    check("custom check step: the run's own command in report mode, named after the file",
+          st.argv[:-1] == c1.command() and st.argv[-1] == "--auto-tune-report" and "cloud.hdf5" in st.label, st.label)
     q = rs.QueuedJob.of("custom", c)
     check("custom: a queued custom-snapshot job rebuilds and has a summary",
           q.build() == c and q.title.startswith("Custom snapshot · cloud.hdf5 · PS-DTFE 64³"), q.title)
@@ -539,6 +660,31 @@ def new_features(tmp: Path, sim: Path):
     _write_log(log, np_head.replace("2026-09-30T18:00", "2026-09-30T23:00"))
     r3 = R.scan_runs(tmp)[0]
     check("stale: the same non-periodic run built after both fixes is clean", R.stale_reasons(r3) == [], str(R.stale_reasons(r3)))
+    dd_head = ("Build: PS-DTFE-double 3e0c1a6-dirty (built 2026-10-01T18:00:00Z)\n"
+               "RUNNING: ./PS-DTFE-double /x/y z/combined_099.hdf5 /x/ps_output --grid 256 --periodic --input 105 "
+               "--MpcUnit 1000 --field density_a --ps-gpu --ps-vertex-mass\n   peak memory (RSS) : 9.0 GB\n   total wall time   : 1m 2s\n")
+    _write_log(log, dd_head)
+    r5 = R.scan_runs(tmp)[0]
+    check("run logs: the double pair is recognised (estimator, precision, settings, options text)",
+          r5.estimator == "ps" and r5.precision == "double" and r5.settings()["precision"] == "double"
+          and "double" in r5.options_text() and R.stale_reasons(r5) == [], str(R.stale_reasons(r5)))
+    dt_head = ("Build: DTFE 3e0c1a6-dirty (built 2026-10-01T09:00:00Z)\n"
+               "RUNNING: ./DTFE /x/y z/combined_099.hdf5 /x/ps_output --grid 512 --periodic --input 105 --MpcUnit 1000 "
+               "--field density_a velocity_a --gpu\n"
+               "DTFE Metal: Metal command buffer failed: Impacting Interactivity -- retrying the deposit from scratch "
+               "(attempt 2/3, target 62 ms buffers, 24 ms gaps)\n"
+               "   peak memory (RSS) : 7.24 GB\n   total wall time   : 6m 37s\n")
+    _write_log(log, dt_head)
+    r4 = R.scan_runs(tmp)[0]
+    reasons = R.stale_reasons(r4)
+    check("stale: a standard-DTFE GPU run whose deposit was restarted by the GPU watchdog is flagged (built before the fix)",
+          r4.estimator == "dtfe" and r4.gpu and r4.gpu_retried and len(reasons) == 1
+          and "watchdog" in reasons[0][1] and reasons[0][0] == "warning", str(reasons))
+    _write_log(log, dt_head.replace("retrying the deposit from scratch", "nothing of the kind"))
+    check("stale: ... the same run without a restart is clean", R.stale_reasons(R.scan_runs(tmp)[0]) == [])
+    _write_log(log, dt_head.replace("2026-10-01T09:00", "2026-10-01T23:00"))
+    check("stale: ... and a restart with the fixed build is clean (its retry drains the queue first)",
+          R.stale_reasons(R.scan_runs(tmp)[0]) == [], str(R.stale_reasons(R.scan_runs(tmp)[0])))
     _write_log(log, head.split("\n", 1)[1], mtime=dt.datetime(2026, 8, 1).timestamp())
     r2 = R.scan_runs(tmp)[0]
     reasons = R.stale_reasons(r2)
@@ -627,6 +773,10 @@ def new_features(tmp: Path, sim: Path):
     check("find_outputs: the TNG-layout run, its box (h-free kpc -> Mpc) and redshift",
           o is not None and o.n == n and o.length[0] == 80.0 and o.redshift == 0.0
           and o.fields()[:2] == ["density", "streams"], str(outs))
+    check("find_outputs: a TNG-layout output knows its simulation and snapshot number; natural simulation order",
+          o is not None and o.sim == "TNG100-3-Dark" and o.snap == 99
+          and sorted(["TNG300-3-Dark", "TNG50-3-Dark", "TNG100-3-Dark"], key=G.sim_sort_key)
+          == ["TNG50-3-Dark", "TNG100-3-Dark", "TNG300-3-Dark"], f"{o and (o.sim, o.snap)}")
     check("slice: plane = cube[..., k] for the z normal", np.allclose(o.slice("density", 2, 3), den[:, :, 3]))
     check("slice: x normal, y normal", np.allclose(o.slice("density", 0, 1), den[1])
           and np.allclose(o.slice("density", 1, 5), den[:, 5, :]))
@@ -668,8 +818,8 @@ def new_features(tmp: Path, sim: Path):
     (od / "run1.gui.json").write_text(json.dumps(c.settings_sidecar()))
     outs = G.find_outputs(tmp, [od])
     mine = [x for t, x in outs if t.startswith("custom ·")]
-    check("find_outputs: a custom-snapshot run from its folder, box from its sidecar",
-          len(mine) == 1 and mine[0].length[0] == 50.0, str(outs))
+    check("find_outputs: a custom-snapshot run from its folder, box from its sidecar; no simulation or snapshot",
+          len(mine) == 1 and mine[0].length[0] == 50.0 and mine[0].sim == "" and mine[0].snap is None, str(outs))
     kw = G.server_settings(mine[0])
     check("server_settings (custom snapshot): the job's own input, units and estimator",
           kw and kw["snapshot"] == str(snap) and kw["mpc_unit"] == 1000.0 and kw["phase_space"], str(kw))
@@ -685,6 +835,614 @@ def new_features(tmp: Path, sim: Path):
     (od / "broken.a_den").write_bytes(b"\0" * 7)
     check("an unreadable grid is skipped, not an error", not G.OutputSet(od / "broken"))
 
+
+
+def two_d(tmp: Path):
+    """The 2D programs (make DIM=2) in the launcher: names, the custom-snapshot job, the grid reader."""
+    import json
+    import subprocess
+
+    import numpy as np
+    import grids as G
+    import results as R
+
+    print("2D (the -2d programs):")
+    check("binary and object-directory names: -2d before -double, _2d before _d",
+          rs.binary_name("ps", "double", 2) == "PS-DTFE-2d-double" and rs.binary_name("dtfe", dim=2) == "DTFE-2d"
+          and rs._objdir("ps", "double", 2).name == "o_ps_2d_d" and rs._objdir("dtfe", dim=2).name == "o_2d"
+          and rs.build_hint("single", 2) == "make DTFE PS-DTFE DIM=2")
+    check("a 2D run has no GPU and no parallel insertion (the kernels and CGAL's parallel build are 3D)",
+          not rs.gpu_built("ps", dim=2) and not rs.gpu_built("dtfe", dim=2) and not rs.tbb_built(dim=2)
+          and rs.gpu_backend("ps", dim=2) == "" and not rs.recommended_gpu("exact", ["density_a"], 10**8, dim=2)
+          and rs.gpu_advice(False, "exact", ["density_a"], 10**8, "ps", dim=2) == [])
+
+    work = tmp.parent / "two_d"
+    work.mkdir()
+    import h5py
+    for name, cols in (("plane.hdf5", 2), ("cube.hdf5", 3)):
+        with h5py.File(work / name, "w") as f:
+            f.create_group("Header").attrs["BoxSize"] = 100.0
+            f.create_group("PartType1").create_dataset("Coordinates", data=np.zeros((16, cols)))
+    (work / "plane.txt").write_text("2\n0 100 0 100\n1 2 1\n3 4 1\n")
+    (work / "cube.txt").write_text("1\n0 1 0 1 0 1\n0.5 0.5 0.5 1\n")
+    check("snapshot_dim: HDF5 coordinate columns, the text box line, unknown for Gadget binary",
+          rs.snapshot_dim(work / "plane.hdf5") == 2 and rs.snapshot_dim(work / "cube.hdf5") == 3
+          and rs.snapshot_dim(work / "plane.txt", 111) == 2 and rs.snapshot_dim(work / "cube.txt", 112) == 3
+          and rs.snapshot_dim(work / "plane.hdf5", 101) is None and rs.snapshot_dim(work / "nope.hdf5") is None)
+
+    c = rs.CustomSpec(input_file=str(work / "plane.hdf5"), dim=2, estimator="ps", grid=64, gpu=True,
+                      parallel_triangulation=True, fields=["density_a", "velocity_a", "tweb_a"],
+                      box=[0, 100, 0, 100], partition=2, output_dir=str(work / "out"), output_name="p")
+    a = c.command()
+    check("custom 2D: the -2d binary, a 4-number box, a 2-number split; no GPU, no parallel insertion; the T-web kept",
+          Path(a[0]).name == "PS-DTFE-2d" and a[a.index("--box") + 1:a.index("--box") + 6] == ["0", "100", "0", "100", "--field"]
+          and a[a.index("--partition") + 1:] == ["2", "2"] and "--ps-gpu" not in a
+          and "--parallel-triangulation" not in a and "tweb_a" in a and "velocity_a" in a, str(a))
+    lv = {m: lvl for lvl, m in c.problems()}
+    check("custom 2D: says the GPU and the parallel insertion do not apply; nothing about the T-web (2D has it)",
+          any("CPU" in m for m in lv) and any("parallel" in m for m in lv)
+          and not any("T-web" in m for m in lv), str(lv))
+    d = rs.CustomSpec(input_file=str(work / "plane.hdf5"), dim=2, estimator="dtfe", gpu=True,
+                      output_dir=str(work / "out"))
+    check("custom 2D standard DTFE: DTFE-2d, no GPU flag", Path(d.command()[0]).name == "DTFE-2d" and "--gpu" not in d.command())
+    bad = rs.CustomSpec(input_file=str(work / "plane.hdf5"), dim=2, box=[0, 1, 0, 1, 0, 1], output_dir=str(work / "out"))
+    wrong = rs.CustomSpec(input_file=str(work / "plane.hdf5"), dim=3, output_dir=str(work / "out"))
+    wrong3 = rs.CustomSpec(input_file=str(work / "cube.hdf5"), dim=2, output_dir=str(work / "out"))
+    check("custom 2D: a 6-number box is refused (it needs 4)",
+          any(lvl == "error" and "4 numbers" in m for lvl, m in bad.problems()), levels(bad)[1])
+    check("custom: the dimension must match the file (a 2D file run as 3D, and the reverse)",
+          any(lvl == "error" and "is 2D" in m for lvl, m in wrong.problems())
+          and any(lvl == "error" and "is 3D" in m for lvl, m in wrong3.problems()))
+    side = c.settings_sidecar()
+    check("custom 2D: the sidecar records the dimension and a 4-number box in Mpc",
+          side["dim"] == 2 and side["box_mpc"] == [0.0, 100.0, 0.0, 100.0], str(side))
+    demo = rs.CustomSpec(input_file=str(work / "demo" / "d.hdf5"), dim=2, demo_n=32, output_dir=str(work / "out"),
+                         demo_file=str(work / "demo" / "d.hdf5"))      # generated only at the demo's own path (B5)
+    gen = [st.argv for st in demo.steps() if "generate" in st.label]
+    check("custom 2D demo: the generator writes a 2D snapshot", gen and gen[0][-2:] == ["--dim", "2"], str(gen))
+    texts = [rs.DIM_TEXT[2]] + [m for _, m in c.problems() + bad.problems() + wrong.problems()]
+    check("no '--' in the 2D texts", not [t for t in texts if "--" in t], str([t for t in texts if "--" in t]))
+
+    # the grid reader on a synthetic 2D output (12^2 cells; no sidecar: the files tell)
+    n = 12
+    rng = np.random.default_rng(3)
+    od = work / "grids"
+    od.mkdir()
+    den = (rng.random((n, n)) + 0.5).astype(np.float32)
+    vel = rng.random((n, n, 2)).astype(np.float32)
+    grad = rng.random((n, n, 4)).astype(np.float32)
+    vort = rng.random((n, n)).astype(np.float32)
+    disp = rng.random((n, n, 3)).astype(np.float32)
+    for sfx, arr in (("a_den", den), ("a_vel", vel), ("a_velGrad", grad), ("a_velVort", vort),
+                     ("a_velDispTensor", disp), ("a_streams", np.ones((n, n), np.float32))):
+        (od / f"r2.{sfx}").write_bytes(arr.tobytes())
+    o = G.OutputSet(od / "r2")
+    check("OutputSet: a 2D output is told from its files (a 2-component velocity), every field kept",
+          o.dim == 2 and o.n == n and {k: f.ncomp for k, f in o.files.items()}
+          == {"density": 1, "velocity": 2, "gradient": 4, "vorticity": 1, "dispersion_tensor": 3, "streams": 1},
+          f"{o.dim} {o.n} {[(k, f.ncomp) for k, f in o.files.items()]}")
+    check("OutputSet 2D: the slice is the whole grid whatever the axis and index",
+          np.allclose(o.slice("density", 0, 5), den) and np.allclose(o.slice("density"), den))
+    check("OutputSet 2D: component menus and values (velocity x/y, gradient trace = xx + yy, tensor xy)",
+          G.components("velocity", 2, 2) == ["norm", "x", "y"]
+          and G.components("gradient", 4, 2) == ["trace (divergence)", "xx", "xy", "yx", "yy"]
+          and np.allclose(o.slice("velocity", component="y"), vel[..., 1])
+          and np.allclose(o.slice("gradient", component="trace (divergence)"), grad[..., 0] + grad[..., 3])
+          and np.allclose(o.slice("gradient", component="yx"), grad[..., 2])
+          and np.allclose(o.slice("dispersion_tensor", component="xy"), disp[..., 1]))
+    check("OutputSet 2D: the vorticity map is the curl's z (the grid stores -w_z / 2)",
+          G.components("vorticity", 1, 2) == ["value"] and np.allclose(o.slice("vorticity"), -2.0 * vort))
+    ar = o.arrow_field("velocity", per_side=6)
+    check("OutputSet 2D: velocity arrows from the two components; value and cell of (i, j)",
+          ar is not None and ar["u"].shape == (6, 6) and ar["axes"] == (0, 1)
+          and abs(o.value("density", (3, 4)) - float(den[3, 4])) < 1e-6 and list(o.plane_point(2, 0, 3, 4)) == [3, 4])
+    o.box = ((0.0, 0.0), (60.0, 30.0))
+    check("OutputSet 2D: a two-corner box; lo / length keep a third, zero-thickness entry",
+          list(o.lo) == [0.0, 0.0, 0.0] and list(o.length) == [60.0, 30.0, 0.0])
+    # scalar-only outputs: 32^2 float32 is also 8^3 float64, 256^2 float32 also 32^3 float64; 64^2 float32
+    # is also 16^3 float32. A phase-space run's stream counts tell the precision; else 3D, as before
+    (od / "s32.a_den").write_bytes(np.ones((32, 32), np.float32).tobytes())
+    (od / "s32.a_streams").write_bytes(np.ones((32, 32), np.float32).tobytes())
+    (od / "c32.a_den").write_bytes(np.ones((32, 32, 32), np.float64).tobytes())
+    (od / "c32.a_streams").write_bytes(np.ones((32, 32, 32), np.float64).tobytes())
+    (od / "d32.a_den").write_bytes(np.ones((32, 32, 32), np.float64).tobytes())
+    (od / "s64.a_den").write_bytes(np.ones((64, 64), np.float32).tobytes())
+    (od / "s64.gui.json").write_text(json.dumps({"dim": 2}))
+    s32, c32, d32 = G.OutputSet(od / "s32"), G.OutputSet(od / "c32"), G.OutputSet(od / "d32")
+    check("OutputSet: same bytes in two precisions -- the stream counts pick the reading (a 32^2 float32 plane, "
+          "a 32^3 float64 cube); without them 3D, as before; a sidecar settles any tie",
+          (s32.dim, s32.n) == (2, 32) and (c32.dim, c32.n, c32.dtype) == (3, 32, np.float64)
+          and (d32.dim, d32.n) == (3, 32) and (G.OutputSet(od / "s64").dim, G.OutputSet(od / "s64").n) == (2, 64),
+          f"{(s32.dim, s32.n)} {(c32.dim, c32.n, c32.dtype)} {(d32.dim, d32.n)}")
+    # one precision, same bytes (512^2 == 64^3): neighbouring cells decide -- the reading whose neighbour
+    # stride holds clearly the smaller differences; a field without structure stays 3D
+    def smooth(shape, ell):
+        k2 = sum(a * a for a in np.meshgrid(*[np.fft.fftfreq(m) for m in shape], indexing="ij"))
+        f = np.fft.ifftn(np.fft.fftn(rng.standard_normal(shape)) * np.exp(-0.5 * k2 * (2 * np.pi * ell) ** 2)).real
+        return (1 + 0.6 * f / f.std()).clip(0.01).astype(np.float32)
+    smooth((512, 512), 4).tofile(od / "p512.a_den")
+    smooth((64, 64, 64), 2).tofile(od / "c64.a_den")
+    np.ones((512, 512), np.float32).tofile(od / "f512.a_den")
+    p512, c64, f512 = G.OutputSet(od / "p512"), G.OutputSet(od / "c64"), G.OutputSet(od / "f512")
+    check("OutputSet: a smooth 512^2 plane and a smooth 64^3 cube of the same bytes are told apart by their "
+          "neighbours; a featureless one stays 3D", (p512.dim, p512.n) == (2, 512) and (c64.dim, c64.n) == (3, 64)
+          and f512.dim == 3, f"{(p512.dim, p512.n)} {(c64.dim, c64.n)} {f512.dim}")
+    check("custom_box / server_settings: a 2D sidecar gives two-entry corners, the 2D server and a 4-number box",
+          G.custom_box({"dim": 2, "box_mpc": [0, 50, 0, 40]}) == ((0, 0), (50, 40)))
+    (od / "c2.a_den").write_bytes(den.tobytes())
+    (od / "c2.a_vel").write_bytes(vel.tobytes())
+    (od / "c2.gui.json").write_text(json.dumps(dict(side, input_file=str(work / "plane.hdf5"))))
+    kw = G.server_settings(G.OutputSet(od / "c2"))
+    check("server_settings 2D: dim 2 and the run's 4-number box", kw and kw.get("dim") == 2
+          and kw["options"][:1] == ["--box"] and len(kw["options"]) == 5, str(kw))
+    # a 3D vorticity grid holds [W_xy, W_xz, W_yz] = [-w_z, w_y, -w_x] / 2
+    od3 = work / "v3"
+    od3.mkdir()
+    w3 = rng.random((4, 4, 4, 3)).astype(np.float32)
+    (od3 / "v.a_den").write_bytes(np.ones((4, 4, 4), np.float32).tobytes())
+    (od3 / "v.a_velVort").write_bytes(w3.tobytes())
+    o3 = G.OutputSet(od3 / "v")
+    check("OutputSet 3D: the vorticity map is the curl (x, y, z) = 2 (-W_yz, W_xz, -W_xy)",
+          np.allclose(o3.slice("vorticity", 2, 1, "x"), -2 * w3[:, :, 1, 2])
+          and np.allclose(o3.slice("vorticity", 2, 1, "y"), 2 * w3[:, :, 1, 1])
+          and np.allclose(o3.slice("vorticity", 2, 1, "z"), -2 * w3[:, :, 1, 0]))
+
+    # the binaries themselves: a rigid rotation (curl = 2 Omega along z) through DTFE-2d and DTFE
+    rot_bins = [(dim, rs.REPO_ROOT / ("DTFE-2d" if dim == 2 else "DTFE")) for dim in (2, 3)]
+    if all(b.is_file() for _, b in rot_bins):
+        sys.path.insert(0, str(ROOT / "tests"))
+        from generate_ps_test_data import write_snapshot
+        got = {}
+        for dim, b in rot_bins:
+            m = 24 if dim == 2 else 12
+            g = (np.arange(m) + 0.5) * 100.0 / m
+            pos = np.stack([x.ravel() for x in np.meshgrid(*([g] * dim), indexing="ij")], 1)
+            pos = pos + np.random.default_rng(1).uniform(-0.3, 0.3, pos.shape)
+            v = np.zeros_like(pos)
+            v[:, 0], v[:, 1] = -2.0 * (pos[:, 1] - 50), 2.0 * (pos[:, 0] - 50)
+            if dim == 3:
+                v[:, 2] = 0.3 * (pos[:, 0] - 50)                   # dv_z/dx: curl_y = -0.3
+            write_snapshot(str(work / f"rot{dim}.hdf5"), pos, pos, v, 100.0, 1.0)
+            subprocess.run([str(b), str(work / f"rot{dim}.hdf5"), str(work / f"rot{dim}"), "--grid", "8",
+                            "--input", "105", "--MpcUnit", "1", "--box", *(["0", "100"] * dim),
+                            "--field", "vorticity", "gradient", "--verbose", "1"], check=True, capture_output=True)
+            ro = G.OutputSet(work / f"rot{dim}", dim=dim)
+            got[dim] = ([ro.slice("vorticity")[4, 4]] if dim == 2 else
+                        [ro.slice("vorticity", 2, 4, k)[4, 4] for k in "xyz"]) + \
+                       [ro.slice("gradient", 2, 4, "xy")[4, 4]]
+        check("the binaries' grids on a rigid rotation: the map shows the curl (2D: 4; 3D: 0, -0.3, 4) and "
+              "gradient xy = dv_x/dy = -2", np.allclose(got[2], [4.0, -2.0], atol=1e-3)
+              and np.allclose(got[3], [0.0, -0.3, 4.0, -2.0], atol=1e-3), str(got))
+        # real outputs at the 64^2 == 16^3 tie, no sidecar: density, stream counts, all scalar
+        dims = {}
+        for dim, b, n_, grid in ((2, "PS-DTFE-2d", 48, 64), (3, "PS-DTFE", 16, 16)):
+            snap_ = work / f"tie{dim}.hdf5"
+            subprocess.run([sys.executable, str(ROOT / "tests" / "generate_ps_test_data.py"), "--out", str(snap_),
+                            "--n", str(n_), "--box", "100", "--amplitude-factor", "1.2", "--crossed-waves",
+                            "--dim", str(dim)], check=True, capture_output=True)
+            subprocess.run([str(rs.REPO_ROOT / b), str(snap_), str(work / f"tie{dim}"), "--grid", str(grid),
+                            "--periodic", "--input", "105", "--MpcUnit", "1", "--field", "density", "--verbose", "1"],
+                           check=True, capture_output=True)
+            t = G.OutputSet(work / f"tie{dim}")
+            dims[dim] = (t.dim, t.n)
+        check("real scalar-only outputs at the 64^2 == 16^3 tie (no sidecar): PS-DTFE-2d reads as 2D, PS-DTFE as 3D",
+              dims == {2: (2, 64), 3: (3, 16)}, str(dims))
+    else:
+        print("   SKIP  the rigid-rotation check (DTFE-2d or DTFE not built)")
+
+    log = work / "r2.runlog"
+    _write_log(log, "Build: PS-DTFE-2d 3e0c1a65fd-dirty (built 2026-10-02T21:34:55Z)\n"
+               "RUNNING: /x/PS-DTFE-2d in.hdf5 r2 --grid 64 --partition 2 2 --field density_a\n")
+    rec = R.parse_runlog(log)
+    check("run records: the 2D binary, its 2-number split, '²' in the run list's words",
+          rec.dim == 2 and rec.partitions == 4 and rec.partition == 2 and "2² partitions" in rec.options_text()
+          and "2D" in rec.options_text(), f"{rec.binary} {rec.partitions} {rec.options_text()}")
+    _write_log(log, "Build: DTFE 3e0c1a65fd-dirty (built 2026-10-01T10:00:00Z)\n"
+               "RUNNING: /x/DTFE in.hdf5 r2 --grid 64 --periodic --CIC --interlace\n")
+    old = R.stale_reasons(R.parse_runlog(log))
+    _write_log(log, "Build: DTFE 3e0c1a65fd-dirty (built 2026-10-03T08:00:00Z)\n"
+               "RUNNING: /x/DTFE in.hdf5 r2 --grid 64 --periodic --CIC --interlace\n")
+    new = R.stale_reasons(R.parse_runlog(log))
+    check("stale outputs: an interlaced grid made before the phase fix is flagged, a newer one is not",
+          any(lvl == "error" and "interlaced" in m for lvl, m in old) and not any("interlaced" in m for _, m in new),
+          f"{old} | {new}")
+
+
+def pipeline_options(tmp: Path, sim: Path):
+    """2026-10-04: the Pipeline tab's run options (deposit, sub-samples, GPU, vertex mass, volume weighting,
+    caustics, cusps, parallel triangulation), the plane's geometry (planes, thickness, sub-samples, window)
+    and the render step's options reach the scripts, and the memory check follows every one of them."""
+    import json
+    import subprocess
+    print("pipeline options:")
+    base = dict(data_root=str(tmp), sims=["TNG100-3-Dark"], nu=64, grid=128, scratch_dir=str(tmp.parent))
+    run_keys = ("PS_EXACT", "AVG_SUBSAMPLES", "PS_GPU", "PS_VERTEX_MASS", "PS_VOLUME_WEIGHTED", "PS_CAUSTICS",
+                "PS_CAUSTIC_CUSPS", "PS_PARALLEL_TRI", "PLANES", "SUPERSAMPLE")
+    env = rs.PipelineSpec(**base).command()[1]
+    check("defaults: every run option is spelled out for run_ps_dtfe.sh (a stray PS_* in the login shell cannot leak in)",
+          [env[k] for k in run_keys] == ["0", "3", "1", "1", "1", "0", "0", "0", "1", "1"]
+          and "THICKNESS" not in env and "WINDOW" not in env, str(env))
+    q = rs.PipelineSpec(**base, deposit="exact", nsub=1, gpu=False, vertex_mass=False, volume_weighted=False,
+                        caustics=True, caustic_cusps=True, parallel_triangulation=True, planes=16, thickness=3.5,
+                        supersample=2, window="10 60 0 25", precision="double")
+    env = q.command()[1]
+    check("every option switched: the environment follows",
+          [env[k] for k in run_keys + ("THICKNESS", "WINDOW", "DTFE_PRECISION")]
+          == ["1", "1", "0", "0", "0", "1", "1", "1", "16", "2", "3.5", "10 60 0 25", "double"], str(env))
+    st = q.check_step("TNG100-3-Dark", [99], 32)
+    check("the memory check carries the run options and the precision, and no -m without the GPU",
+          st.argv[1:] == ["-s", "TNG100-3-Dark", "-g", "128", "99"] and st.env["DTFE_PRECISION"] == "double"
+          and st.env["PS_EXACT"] == "1" and st.env["PS_CAUSTICS"] == "1" and st.env["AUTO_TUNE_REPORT"] == "1"
+          and st.env["PTS_VEL_GRAD"] == "1" and not any(k in st.env for k in rs.PIPELINE_ONLY_KEYS),
+          f"{st.argv} {st.env}")
+    # 16 planes x 32 x nv x 2^2, nv = round(32 * 25 / 50) = 16 (square pixels over the window's aspect)
+    check("a plane not made yet is sized by planes x nu x nv x K^2, nv following the window's aspect",
+          st.env.get("DTFE_AUTO_PTS_N") == str(16 * 32 * 16 * 4) and q.plane_points(32) == 16 * 32 * 16 * 4
+          and rs.PipelineSpec(**base).plane_points() == 64 * 64, str(st.env.get("DTFE_AUTO_PTS_N")))
+    keys = {name: rs.PipelineSpec(**base, **kw).memory_key() for name, kw in
+            (("plain", {}), ("caustics", dict(caustics=True)), ("super", dict(supersample=2)),
+             ("render", dict(render_smooth=3.0, render_fields="density", render_fixed_range=True, thickness=9.0)))}
+    check("the memory key follows the compute options, not the render ones (nor the thickness)",
+          len({keys["plain"], keys["caustics"], keys["super"]}) == 3 and keys["render"] == keys["plain"])
+
+    side = sim / "hires_plane_z64.json"         # an old plane's sidecar, as make_image_plane.py wrote them
+    side.write_text(json.dumps({"box": 110.7, "center": 55.35, "planes": 1, "thickness": 2.0, "nu": 64, "nv": 64,
+                                "u0": 0.0, "u1": 110.7, "v0": 0.0, "v1": 110.7}))
+    p = rs.PipelineSpec(**base)
+    check("plane_matches: the default geometry matches an old single-plane sidecar (no 'supersample' key = 1)",
+          p.plane_matches("TNG100-3-Dark") is True)
+    differ = {k: rs.PipelineSpec(**base, **kw).plane_matches("TNG100-3-Dark")
+              for k, kw in (("planes", dict(planes=4)), ("supersample", dict(supersample=2)),
+                            ("window", dict(window="0 50 0 50")), ("center", dict(center="30")))}
+    check("plane_matches: another plane count, sub-sampling, window or centre differs",
+          all(v is False for v in differ.values()), str(differ))
+    check("plane_matches: the sidecar's own centre and a window spelling the whole box both match",
+          rs.PipelineSpec(**base, center="55.35", window="0 110.7 0 110.7").plane_matches("TNG100-3-Dark") is True)
+    check("stale(): a plane of another geometry makes every snapshot stale, a matching one keeps the fresh ones",
+          p.stale("TNG100-3-Dark") == ([99], 2)
+          and rs.PipelineSpec(**base, planes=4).stale("TNG100-3-Dark") == ([4, 99], 2),
+          f"{p.stale('TNG100-3-Dark')} {rs.PipelineSpec(**base, planes=4).stale('TNG100-3-Dark')}")
+    check("check_step: a plane the script will regenerate is sized by its point count, not read from disk",
+          "SAMPLE_POINTS" in p.check_step("TNG100-3-Dark", [99], 64).env
+          and rs.PipelineSpec(**base, planes=4).check_step("TNG100-3-Dark", [99], 64).env.get("DTFE_AUTO_PTS_N")
+          == str(4 * 64 * 64))
+    tool = str(rs.REPO_ROOT / "python" / "tools" / "make_image_plane.py")
+    before = {f.name: (f.stat().st_mtime_ns, f.stat().st_size) for f in sim.iterdir()}
+    same = subprocess.run([sys.executable, tool, "--same-as", str(side), "--nu", "64"], capture_output=True, text=True)
+    diff = subprocess.run([sys.executable, tool, "--same-as", str(side), "--nu", "64", "--planes", "4"],
+                          capture_output=True, text=True)
+    bad = subprocess.run([sys.executable, tool, "--same-as", str(side), "--nu", "64", "--u0", "50", "--u1", "10"],
+                         capture_output=True, text=True)
+    gone = subprocess.run([sys.executable, tool, "--same-as", str(sim / "no_such_plane.json"), "--nu", "64"],
+                          capture_output=True, text=True)
+    check("make_image_plane.py --same-as (the script's check): exit 0 and 'same' for this geometry, 3 and 'differs' "
+          "for another or an unreadable sidecar, 1 for invalid input (not read as 'differs'); nothing written",
+          same.returncode == 0 and same.stdout.strip() == "same" and diff.returncode == 3
+          and diff.stdout.strip() == "differs" and gone.returncode == 3 and bad.returncode == 1
+          and {f.name: (f.stat().st_mtime_ns, f.stat().st_size) for f in sim.iterdir()} == before,
+          f"{same.returncode} {same.stdout!r} {same.stderr[-200:]} | {diff.returncode} {diff.stdout!r} | "
+          f"{bad.returncode} {bad.stderr[-120:]!r} | {gone.returncode}")
+    # the launcher's reading of a broken or missing sidecar agrees with the script's (regenerate = all stale)
+    good = side.read_text()
+    side.write_text("{ not json")
+    broken = (rs.PipelineSpec(**base).plane_matches("TNG100-3-Dark"), rs.PipelineSpec(**base).stale("TNG100-3-Dark"))
+    side.unlink()
+    missing = (rs.PipelineSpec(**base).plane_matches("TNG100-3-Dark"),
+               "DTFE_AUTO_PTS_N" in rs.PipelineSpec(**base).check_step("TNG100-3-Dark", [99], 64).env)
+    side.write_text(good)
+    check("an unreadable or missing sidecar reads as 'differs': every snapshot stale, the check sized by point count",
+          broken == (False, ([4, 99], 2)) and missing == (False, True), f"{broken} {missing}")
+    check("a malformed window of the job itself is not the plane's fault (None; problems() reports it)",
+          rs.PipelineSpec(**base, window="1 2").plane_matches("TNG100-3-Dark") is None)
+    # the numbers the script receives read back exactly (':g' kept six digits)
+    fine = rs.PipelineSpec(**base, window="12.3456789 50 0 50", planes=2, thickness=0.123456789)
+    env = fine.command()[1]
+    u0, u1, v0, v1 = (float(v) for v in env["WINDOW"].split())      # as make_image_plane.py stores what it got
+    side2 = dict(json.loads(good), u0=u0, u1=u1, v0=v0, v1=v1, planes=2, thickness=float(env["THICKNESS"]))
+    side.write_text(json.dumps(side2))
+    check("WINDOW/THICKNESS reach the script at full precision, so the sidecar they produce matches the job",
+          env["WINDOW"] == "12.3456789 50 0 50" and env["THICKNESS"] == "0.123456789"
+          and fine.plane_matches("TNG100-3-Dark") is True, f"{env['WINDOW']} {env['THICKNESS']}")
+    side.write_text(good)
+    check("the GPU knob is pinned in the environment too (PS_METAL / DTFE_METAL), not only by -m",
+          rs.PipelineSpec(**base).command()[1]["PS_METAL"] == "1"
+          and rs.PipelineSpec(**base, gpu=False).command()[1]["PS_METAL"] == "0"
+          and rs.RunSpec(data_root=str(tmp), sim="TNG100-3-Dark", snapshots=[99], gpu=False).command()[1]["PS_METAL"] == "0"
+          and rs.RunSpec(data_root=str(tmp), sim="TNG100-3-Dark", snapshots=[99], estimator="dtfe",
+                         gpu=False).command()[1]["DTFE_METAL"] == "0")
+
+    r = rs.PipelineSpec(**base, render_fields="density, velDiv", render_smooth=2.0, render_smooth_derivatives=0.0,
+                        render_fixed_range=True, render_force=True, planes=16, render_project="slab")
+    a = r.steps()[1].argv
+    check("the render step passes the figure options to plot_pointeval.py",
+          a[a.index("--fields") + 1] == "density,velDiv" and a[a.index("--project") + 1] == "slab"
+          and a[a.index("--smooth") + 1] == "2" and a[a.index("--smooth-derivatives") + 1] == "0"
+          and "--fixed-range" in a and "--force" in a, str(a))
+    a0 = rs.PipelineSpec(**base, render_project="slab").steps()[1].argv
+    check("... the defaults add nothing, and 'slab' of a single plane is the plane itself",
+          not any(f in a0 for f in ("--fields", "--project", "--smooth", "--smooth-derivatives", "--fixed-range",
+                                    "--force")), str(a0))
+    lv, msg = levels(rs.PipelineSpec(**base, caustic_cusps=True))
+    check("cusps without caustics is an error (the Grids tab's rule, shared)", "error" in lv and "cusps" in msg, msg)
+    lv, msg = levels(rs.PipelineSpec(**base, planes=4))
+    check("a handful of planes warns about ghosting", "warning" in lv and "ghosts" in msg, msg)
+    lv, msg = levels(rs.PipelineSpec(**base, window="0 50 0"))
+    check("a malformed window is an error", "error" in lv and "window" in msg, msg)
+    lv, msg = levels(rs.PipelineSpec(**base, render_fields="density,bogus"))
+    check("an unknown point-evaluated field is an error", "error" in lv and "bogus" in msg, msg)
+    check("the queue summary names an exact deposit",
+          ", exact" in rs.job_summary("pipeline", rs.PipelineSpec(**base, deposit="exact"))
+          and ", exact" not in rs.job_summary("pipeline", rs.PipelineSpec(**base)))
+    check("the pipeline's plan line is parsed with and without -m (PS_GPU)",
+          rs.parse_progress("+ env SAMPLE_POINTS=/p.bin PS_VOLUME_WEIGHTED=1 PTS_VEL_GRAD=1 /r/scripts/run_ps_dtfe.sh "
+                            "-s S -g 512 -m 50 99\n").get("planned") == 2
+          and rs.parse_progress("+ env SAMPLE_POINTS=/p.bin PS_VOLUME_WEIGHTED=0 PTS_VEL_GRAD=1 /r/scripts/run_ps_dtfe.sh "
+                                "-s S -g 512 50 99\n").get("planned") == 2)
+    from dtfelib import pointeval
+    check("runspec's point-eval constants mirror dtfelib.pointeval (not imported there: matplotlib)",
+          rs.POINTEVAL_FIELDS == tuple(pointeval.STYLES) and rs.POINTEVAL_DERIVATIVE_SMOOTH == pointeval.DERIVATIVE_SMOOTH)
+    old = rs.PipelineSpec.from_dict({"sims": ["TNG50-4"], "nu": 4096, "render": False})
+    check("settings saved before these options load with the scripts' defaults",
+          old.deposit == "sampled" and old.gpu and old.planes == 1 and old.render_project == "plane" and not old.render)
+
+
+def bug_fixes_2026_10_05(tmp: Path, sim: Path):
+    """The bugs of the 2026-10-05 audit: the Explore cube cache follows the file, a standard-DTFE run gets its
+    scratch folder, the demo is generated only at its own path, one lambda_th default, every products() caller
+    passes --data-root."""
+    import tempfile as tf
+    import numpy as np
+    import grids as G
+    print("bug fixes 2026-10-05:")
+    # B1: a grid written again is read again (the cache was keyed on the path alone)
+    od = Path(tf.mkdtemp(prefix="gui_cube_"))
+    try:
+        n = 8
+        np.arange(n ** 3, dtype=np.float32).tofile(od / "run.a_den")
+        o1 = G.OutputSet(od / "run")
+        before = float(o1.slice("density", 2, 3)[1, 2])
+        np.full(n ** 3, 7.0, dtype=np.float32).tofile(od / "run.a_den")       # the re-run: same size
+        st = (od / "run.a_den").stat()
+        os.utime(od / "run.a_den", ns=(st.st_atime_ns, st.st_mtime_ns + 2_000_000_000))   # a coarse clock cannot hide it
+        after = float(G.OutputSet(od / "run").slice("density", 2, 3)[1, 2])
+        keys = [k for k in G._CUBES if k[0] == (od / "run.a_den").resolve()]
+        check("Explore's cube cache follows the file: a re-run's values replace the old ones (one entry per file)",
+              before != 7.0 and after == 7.0 and len(keys) == 1, f"{before} {after} {len(keys)}")
+    finally:
+        shutil.rmtree(od)
+    # B4: the standard-DTFE Grids run carries its scratch folder (the command returned before setting it)
+    sd = tmp.parent
+    env = rs.RunSpec(data_root=str(tmp), sim="TNG100-3-Dark", snapshots=[99], estimator="dtfe", scratch_dir=str(sd)).command()[1]
+    check("a standard-DTFE Grids run passes SCRATCH_DIR (run_dtfe.sh has the hook now)", env.get("SCRATCH_DIR") == str(sd), str(env))
+    # B5: the demo is generated only at the demo's own path
+    demo = rs.demo_spec(output_dir=str(tmp / "demo"))
+    other = rs.CustomSpec.from_dict(dict(demo.to_dict(), input_file=str(tmp / "elsewhere" / "missing.hdf5")))
+    check("the demo generates its snapshot at its own path only; another missing path is 'file not found'",
+          demo.demo_pending() and any("generate the demo" in st.label for st in demo.steps())
+          and not other.demo_pending() and not any("generate" in st.label for st in other.steps())
+          and any("not found" in m for lvl, m in other.problems() if lvl == "error"),
+          str([st.label for st in other.steps()]))
+    legacy = rs.CustomSpec.from_dict({"input_file": str(tmp / "gone.hdf5"), "demo_n": 32})   # saved before demo_file
+    check("a saved demo_n without demo_file (older settings) generates nothing", not legacy.demo_pending())
+    # B13: one lambda_th default across the tabs
+    cs = rs.CustomSpec(input_file=str(sim / "snapdir_099" / "combined_099.hdf5"), fields=["density_a", "tweb_a"])
+    cs0 = rs.CustomSpec(input_file=str(sim / "snapdir_099" / "combined_099.hdf5"), fields=["density_a"])
+    a, a0 = cs.command(), cs0.command()
+    check("a Custom run with a web field passes the scripts' lambda_th (0.3), one without passes none",
+          a[a.index("--lambda_th") + 1] == "0.3" and "--lambda_th" not in a0, str(a))
+    check("the Grids/Pipeline specs pass LAMBDA_TH only when it differs from the scripts' default",
+          "LAMBDA_TH" not in rs.RunSpec(sim="TNG100-3-Dark", snapshots=[99], data_root=str(tmp)).command()[1]
+          and rs.RunSpec(sim="TNG100-3-Dark", snapshots=[99], data_root=str(tmp), lambda_th=0.2).command()[1]["LAMBDA_TH"] == "0.2"
+          and rs.PipelineSpec(sims=["TNG100-3-Dark"], data_root=str(tmp), lambda_th=0.4).command()[1]["LAMBDA_TH"] == "0.4"
+          and rs.RunSpec(sim="TNG100-3-Dark", snapshots=[99], data_root=str(tmp), lambda_th=0.2).memory_key()
+          == rs.RunSpec(sim="TNG100-3-Dark", snapshots=[99], data_root=str(tmp)).memory_key()
+          and rs.CustomSpec(input_file="x.hdf5", lambda_th=0.2).memory_key() == rs.CustomSpec(input_file="x.hdf5").memory_key())
+    # B14: no plot script asks pipeline.products() without the root it was given
+    import re
+    bad = sorted(f.name for f in (ROOT / "python" / "plot").glob("*.py")
+                 if re.search(r"pipeline\.products\((?![^)]*data_root)", f.read_text().replace("\n", " ")))
+    check("every pipeline.products() call in python/plot passes data_root", bad == [], ", ".join(bad))
+    from dtfelib import cli as dcli
+    keep = dcli.DATA_ROOT
+    try:
+        dcli.use_data_root(tmp)
+        check("use_data_root(): the helpers without a root argument (trees, group catalogues, the ladder) follow --data-root",
+              dcli.sim_dir("TNG100-3-Dark") == tmp / "TNG100" / "TNG100-3-Dark" and dcli.DATA_ROOT == tmp)
+    finally:
+        dcli.use_data_root(keep)
+
+
+def cube_cache_2026_10_06():
+    """The fast-grid review (2026-10-06): the cube cache is thread-safe and droppable, a big cube is read
+    whole only along its strided axis, a short file does not leave the lock held."""
+    import tempfile as tf
+    import threading
+    import numpy as np
+    import grids as G
+    print("cube cache 2026-10-06:")
+    od = Path(tf.mkdtemp(prefix="gui_cubes_"))
+    eager = G.CUBE_EAGER_BYTES
+    try:
+        n = 8
+        ref = np.arange(n ** 3, dtype=np.float32).reshape(n, n, n)
+        ref.tofile(od / "big.a_den")
+        key = (od / "big.a_den").resolve()
+        G.drop_cubes()
+        G.CUBE_EAGER_BYTES = 1000                                   # the 2 KB cube counts as 'big'
+        o = G.OutputSet(od / "big")
+        p0 = o.slice("density", 0, 3)
+        lazy = not any(k[0] == key for k in G._CUBES)
+        p2 = o.slice("density", 2, 5)
+        cached = any(k[0] == key for k in G._CUBES)
+        p0b = o.slice("density", 0, 3)
+        still = any(k[0] == key for k in G._CUBES)
+        check("a cube above CUBE_EAGER_BYTES: an x plane comes from the memmap (not read whole), the strided z plane "
+              "caches it, and the x plane then comes from the cache", lazy and cached and still
+              and np.array_equal(p0, ref[3]) and np.array_equal(p2, ref[:, :, 5]) and np.array_equal(p0b, ref[3]),
+              f"{lazy} {cached} {still}")
+        np.arange(32 * 32, dtype=np.float32).tofile(od / "flat.a_den")
+        G.OutputSet(od / "flat", dim=2).slice("density")
+        check("a 2D grid is always read whole and cached, whatever its size against the threshold",
+              any(k[0] == (od / "flat.a_den").resolve() for k in G._CUBES))
+        G.CUBE_EAGER_BYTES = eager
+        dropped = G.drop_cubes()
+        check("drop_cubes() returns the bytes held and empties the cache", dropped == 32 * 32 * 4 + n ** 3 * 4
+              and not G._CUBES, f"{dropped} {len(G._CUBES)}")
+        # two threads reading the same cold cube: one entry, both the right array, no exception
+        got, errs = [], []
+        go = threading.Barrier(2)
+
+        def reader():
+            try:
+                go.wait(5)
+                got.append(G.OutputSet(od / "big").slice("density", 2, 1))
+            except Exception as e:            # noqa: BLE001
+                errs.append(repr(e))
+        ts = [threading.Thread(target=reader) for _ in range(2)]
+        [t.start() for t in ts]
+        [t.join(10) for t in ts]
+        entries = [k for k in G._CUBES if k[0] == key]
+        check("two threads slicing the same cold cube at once: one cache entry, both get the plane",
+              not errs and len(got) == 2 and len(entries) == 1 and all(np.array_equal(g, ref[:, :, 1]) for g in got),
+              f"{errs} {len(got)} {len(entries)}")
+        # a file shorter than its grid (a run rewriting it): the error comes out, the lock does not stay held
+        o = G.OutputSet(od / "big")
+        G.drop_cubes()
+        with open(od / "big.a_den", "r+b") as fh:
+            fh.truncate(n ** 3 * 4 - 16)
+        raised = False
+        try:
+            o.slice("density", 2, 1)
+        except ValueError:
+            raised = True
+        ok = G._CUBES_LOCK.acquire(timeout=2)
+        if ok:
+            G._CUBES_LOCK.release()
+        again = G.OutputSet(od / "flat", dim=2).slice("density")
+        check("a short file raises ValueError from slice() and leaves the lock free (the next slice works)",
+              raised and ok and again.shape == (32, 32), f"{raised} {ok}")
+    finally:
+        G.CUBE_EAGER_BYTES = eager
+        G.drop_cubes()
+        shutil.rmtree(od)
+
+
+def type_labels_2026_10_06():
+    """The figure grid's Type column: which estimator made an output -- the sidecar, else a streams grid
+    (only the phase-space binary writes one), else the prefix; the prefix shown only when not the default."""
+    import json
+    import tempfile as tf
+    import numpy as np
+    import grids as G
+    print("type labels 2026-10-06:")
+    od = Path(tf.mkdtemp(prefix="gui_types_"))
+    try:
+        n = 4
+        def out(prefix, streams=False, estimator=None):
+            np.ones(n ** 3, dtype=np.float32).tofile(od / f"{prefix}.a_den")
+            if streams:
+                np.ones(n ** 3, dtype=np.float32).tofile(od / f"{prefix}.a_streams")
+            if estimator:
+                (od / f"{prefix}.gui.json").write_text(json.dumps({"estimator": estimator}))
+            return G.OutputSet(od / prefix)
+        got = {
+            "ps_output": G.type_label(out("ps_output")),
+            "output": G.type_label(out("output")),
+            "ps_x density only": G.type_label(out("ps_x")),
+            "foo + streams": G.type_label(out("foo", streams=True)),
+            "sidecar dtfe wins": G.type_label(out("ps_y", streams=True, estimator="dtfe")),
+            "sidecar ps wins": G.type_label(out("bar", estimator="ps")),
+        }
+        want = {"ps_output": "PS-DTFE", "output": "DTFE", "ps_x density only": "PS-DTFE · ps_x",
+                "foo + streams": "PS-DTFE · foo", "sidecar dtfe wins": "DTFE · ps_y", "sidecar ps wins": "PS-DTFE · bar"}
+        check("type labels: the default prefixes bare, others with the prefix; a ps prefix without streams is still "
+              "PS-DTFE; a streams grid makes any prefix PS-DTFE; the sidecar beats both", got == want, str(got))
+    finally:
+        shutil.rmtree(od)
+
+
+def launcher_fixes():
+    """2026-10-04: running_jobs() classifies by command line and parent, and no plot script builds
+    the flat <root>/<sim> path by hand (the T7 keeps simulations per family)."""
+    import subprocess
+    print("running jobs:")
+    me = os.getpid()
+    # pgrep names five DTFE binaries; ps shows what they are: the launcher's query server (--serve, a direct
+    # child), its exact zoom (a direct child, --ps-window), a run from another terminal (bash -> binary: a
+    # grandchild), a run whose OUTPUT PATH contains '--serve' (the token rule), a memory check from a terminal
+    # (--auto-tune-report, never counted) and someone else's query server (listed apart, with its memory)
+    pgrep_out = "100 PS-DTFE\n200 PS-DTFE\n300 DTFE-double\n400 PS-DTFE\n500 PS-DTFE\n600 PS-DTFE\n"
+    ps_out = (f"  100 {me} 24000000 /Users/x/Mobile Documents/DTFE/PS-DTFE /Volumes/T7/snap.hdf5 /tmp/s/serve --serve "
+              f"--input 105 --verbose 0 --serve-resident 4 --serve-progress\n"
+              f"  200 {me} 1500000 /Users/x/Mobile Documents/DTFE/PS-DTFE /Volumes/T7/snap.hdf5 /tmp/z/zoom --ps-window "
+              f"1 2 3 4 5 6 --field density_a\n"
+              f"  300 4242 18200000 /Users/x/Mobile Documents/DTFE/DTFE-double /Volumes/T7/snap.hdf5 out --grid 256 256 256\n"
+              f"  400 4343 900000 ./PS-DTFE snap.hdf5 /tmp/--serve-test/out --periodic\n"
+              f"  500 4444 300000 ./PS-DTFE snap.hdf5 /tmp/r/out --grid 512 --auto-tune-report\n"
+              f"  600 4545 9300000 ./PS-DTFE other.hdf5 /tmp/s2/serve --serve --input 105\n")
+    calls = []
+
+    def fake_run(argv, **kw):
+        calls.append(argv)
+        if argv[0] == "pgrep":
+            return subprocess.CompletedProcess(argv, 0, stdout=pgrep_out, stderr="")
+        if argv[0] == "ps":
+            assert argv[-1] == "100,200,300,400,500,600" and "-ww" in argv and "rss=" in argv[3], argv
+            return subprocess.CompletedProcess(argv, 0, stdout=ps_out, stderr="")
+        raise AssertionError(argv)
+
+    orig_run, orig_cache = rs.subprocess.run, rs._JOBS_CACHE
+    try:
+        rs.subprocess.run = fake_run
+        rs._JOBS_CACHE = (-1e9, {"runs": [], "servers": []})
+        rs.dtfe_processes(max_age=0)             # one classification; the two views below read the cache
+        jobs = rs.running_jobs()
+        check("runs: a run from another terminal and one whose path merely contains '--serve'; not the launcher's own "
+              "server or exact zoom, not a memory check (--auto-tune-report), not another server",
+              jobs == [(300, "DTFE-double"), (400, "PS-DTFE")], str(jobs))
+        servers = rs.running_servers()
+        check("servers: every query server, with its resident memory in GB (ps rss)",
+              [(p, n, round(g, 1)) for p, n, g in servers] == [(100, "PS-DTFE", 24.0), (600, "PS-DTFE", 9.3)], str(servers))
+        check("one pgrep, then one ps over exactly the named pids", [c[0] for c in calls] == ["pgrep", "ps"], str(calls))
+        msgs = rs._busy_problems()
+        check("the busy warning names the runs with their memory; the servers are an info line with theirs",
+              [lvl for lvl, _ in msgs] == ["warning", "info"] and "DTFE-double (pid 300, 18.2 GB)" in msgs[0][1]
+              and "PS-DTFE (pid 400, 0.9 GB)" in msgs[0][1] and "PS-DTFE (pid 100, 24.0 GB)" in msgs[1][1]
+              and "(pid 600, 9.3 GB)" in msgs[1][1], str(msgs))
+        rs._JOBS_CACHE = (-1e9, {"runs": [], "servers": []})
+        rs.subprocess.run = lambda argv, **kw: (fake_run(argv, **kw) if argv[0] == "pgrep"
+                                               else (_ for _ in ()).throw(OSError("no ps")))
+        check("without ps every named binary counts as a run (no memory known), as before",
+              rs.running_jobs(max_age=0) == [(100, "PS-DTFE"), (200, "PS-DTFE"), (300, "DTFE-double"), (400, "PS-DTFE"),
+                                             (500, "PS-DTFE"), (600, "PS-DTFE")]
+              and rs.running_servers(max_age=0) == [] and "(pid 100)" in rs._busy_problems()[0][1])
+        rs._JOBS_CACHE = (-1e9, {"runs": [], "servers": []})
+        rs.subprocess.run = lambda argv, **kw: subprocess.CompletedProcess(argv, 1, stdout="", stderr="")
+        check("nothing running: no ps call, empty lists, no message",
+              rs.running_jobs(max_age=0) == [] and rs.running_servers(max_age=0) == [] and not rs._busy_problems())
+    finally:
+        rs.subprocess.run, rs._JOBS_CACHE = orig_run, orig_cache
+    check("the kinds: server by the --serve token, report by --auto-tune-report, own by the parent, else a run",
+          rs._kind(1, "x --serve y", 99) == "server" and rs._kind(1, "x --auto-tune-report", 99) == "report"
+          and rs._kind(99, "x --grid 8", 99) == "own" and rs._kind(1, "x --grid 8", 99) == "run"
+          and rs._kind(99, "x --serve", 99) == "server")
+    check("the token rule: '--serve' alone, not --serve-resident/-progress or a path",
+          bool(rs._SERVE.search("a --serve b")) and bool(rs._SERVE.search("x --serve"))
+          and not rs._SERVE.search("a --serve-resident 4 b") and not rs._SERVE.search("/tmp/--serve/out"))
+
+    print("plot scripts:")
+    flat = sorted(f.name for f in (ROOT / "python" / "plot").glob("*.py")
+                  if "args.data_root / args.sim" in f.read_text())
+    check("no plot script builds <root>/<sim> by hand (sim_dir resolves the T7's per-family layout)",
+          flat == [], ", ".join(flat))
+    from dtfelib.cli import sim_dir
+    root = Path(tempfile.mkdtemp(prefix="gui_simdir_"))
+    try:
+        (root / "TNG100" / "TNG100-3-Dark").mkdir(parents=True)
+        check("sim_dir: a per-family simulation resolves under its family folder",
+              sim_dir("TNG100-3-Dark", root) == root / "TNG100" / "TNG100-3-Dark")
+    finally:
+        shutil.rmtree(root)
 
 
 if __name__ == "__main__":

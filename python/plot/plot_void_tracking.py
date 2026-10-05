@@ -33,7 +33,7 @@ import matplotlib.pyplot as plt
 
 import config
 from dtfelib import pipeline
-from dtfelib import make_parser
+from dtfelib import make_parser, use_data_root
 from dtfelib.trees import TreeSet
 from dtfelib import environment as env
 from dtfelib import voids as V
@@ -55,7 +55,7 @@ def unit_cos(v, w):
 
 def catalog_at(snap, args):
     """Pipeline void catalog + grid size for one snapshot (None if no fields on disk)."""
-    prod = pipeline.products(snap, sim=args.sim, method=args.method)
+    prod = pipeline.products(snap, sim=args.sim, method=args.method, prefix=args.prefix, data_root=args.data_root)
     try:
         cat = prod.voids()
         n = prod.fs.grid_n
@@ -105,6 +105,7 @@ def main():
           f"{good.size} deep+well-resolved; tracking the {picked.size} deepest")
 
     # ---- 2. tracer pool from the merger trees ------------------------------------------
+    use_data_root(args.data_root)      # --data-root for the trees, group catalogues and ladder too (2026-10-05)
     ts = TreeSet(args.sim)
     box_ckpc_h = env.box_ckpc_h(args.sim, args.snap)   # SubLink positions are ckpc/h
     pool = ts.positions_at(args.snap, min_mass=args.min_mass)

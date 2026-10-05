@@ -18,7 +18,7 @@ from dtfelib.figures import save_plot_to_multiple_paths
 import config
 from dtfelib import figures as style
 from dtfelib import pipeline
-from dtfelib import FieldSet, make_parser
+from dtfelib import FieldSet, make_parser, sim_dir
 
 style.apply()
 
@@ -55,10 +55,11 @@ def catalog_statistics(cat):
 def catalog_for(snapshot, sigma, args):
     """Void catalog for one (snapshot, sigma). Returns (catalog, fieldset)."""
     if sigma == config.SMOOTHING_SIGMA_CELLS:
-        prod = pipeline.products(snapshot, sim=args.sim, method=args.method)
+        prod = pipeline.products(snapshot, sim=args.sim, method=args.method, prefix=args.prefix,
+                                 data_root=args.data_root)
         return prod.voids(), prod.fs
 
-    fs = FieldSet(args.data_root / args.sim / f"snapdir_{snapshot}",
+    fs = FieldSet(sim_dir(args.sim, args.data_root) / f"snapdir_{snapshot}",   # flat or per-family layout
                   method=args.method, prefix=args.prefix)
     density = fs.density(units='mean')
     delta_s = dtfe.smooth_field(dtfe.calculate_density_contrast(density),

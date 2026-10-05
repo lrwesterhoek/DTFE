@@ -39,9 +39,11 @@ PY="${PYTHON:-python3}"
 command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/python3.14
 ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT}"
+source "${SCRIPT_DIR}/precision.sh"     # DTFE_TEST_PRECISION=double: the double pair
 
 N="${N:-27}"; GRID="${GRID:-48}"; BOX="${BOX:-100.0}"; K="${K:-4}"
-BIN="./PS-DTFE"
+BIN="${PS_BIN}"
+precision_require "${BIN}"
 TMP="${SCRIPT_DIR}/tmp"; mkdir -p "${TMP}"
 # input/point file names must NOT share a prefix with the output roots (rm -f "<root>".*)
 SNAP_PAN="${TMP}/pux_input_pancake.hdf5"
@@ -52,14 +54,14 @@ echo "============================================================"
 echo " PS-DTFE exact '.hidden_streams' check   N=${N}^3  grid=${GRID}^3  ${K}^3 points/cell"
 echo "============================================================"
 
-if [ "${1:-}" != "--no-build" ]; then
+if [ "${1:-}" != "--no-build" ] && ! precision_double; then
     echo ">> building PS-DTFE ..."
     BUILD_MODE="$(cat o_ps/.build_mode 2>/dev/null || true)"
     make PS-DTFE ${BUILD_MODE:+"$BUILD_MODE"} >/dev/null
 fi
 [ -x "${BIN}" ] || { echo "FAIL: ${BIN} not built"; exit 1; }
 GPU=0
-grep -q "METAL=1" o_ps/.build_mode 2>/dev/null && GPU=1
+grep -q "METAL=1\|CUDA=1\|HIP=1" o_ps/.build_mode 2>/dev/null && GPU=1
 
 echo ">> generating the pancake, the crossed waves and ${K}^3 points per cell ..."
 "${PY}" "${SCRIPT_DIR}/generate_ps_test_data.py" --out "${SNAP_PAN}" --n "${N}" --box "${BOX}" \
@@ -114,6 +116,7 @@ echo ">> checking ..."
 "${PY}" - "${TMP}" "${GRID}" "${K}" "${GPU}" <<'PY'
 import sys
 import numpy as np
+import os as _os; REAL = np.dtype(_os.environ.get("DTFE_TEST_REAL", "float32"))   # tests/precision.sh
 tmp, grid, k, gpu = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4] == "1"
 ncell = grid ** 3
 fails = []
@@ -124,7 +127,7 @@ def check(name, ok, detail=""):
         fails.append(name)
 
 def load(root, ext):
-    a = np.fromfile(root + ext, dtype=np.float32)
+    a = np.fromfile(root + ext, dtype=REAL)
     assert a.size == ncell, (root + ext, a.size)
     return a
 
@@ -168,7 +171,14 @@ for geo, title in (("pan", "pancake"), ("crw", "crossed waves")):
             check(f"Z serial == --partition 2 2 2 on {ext} (to float rounding)", d < 1e-5, f"max |diff| = {d:.1e}")
         else:
             check(f"Z serial == --partition 2 2 2 on {ext}", np.array_equal(a, b))
-        if gpu:
+        if gpu and _os.environ.get("DTFE_TEST_PRECISION") == "double" and ext == ".a_streams":
+            # double build: the GPU gets float copies of the double tetrahedra (ps_double_check D5), so a
+            # sample on a face may count differently; the integer grids and both flag grids stay exact
+            g = load(f"{base}_gpu", ext)
+            fr = float(np.mean(a != g)); d = float(np.abs(a.astype(np.float64) - g).max())
+            check(f"Z CPU ~ GPU on {ext} (double build: float kernel geometry)", fr <= 1e-4,
+                  f"{fr:.1e} of cells differ, max |diff| = {d:.1e}")
+        elif gpu:
             check(f"Z CPU == GPU on {ext}", np.array_equal(a, load(f"{base}_gpu", ext)))
 
 print("-" * 60)

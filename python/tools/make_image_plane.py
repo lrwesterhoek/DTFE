@@ -16,6 +16,12 @@ run with MpcUnit 1000; the synthetic test inputs use --mpc-unit 1).
 
     python3 tools/make_image_plane.py --combined tests/tmp/ps_regression.hdf5 \
         --mpc-unit 1 --nu 1024 -o /tmp/plane_test
+
+    python3 tools/make_image_plane.py --same-as plane_100_99.json --planes 4 --thickness 3   # exit 0: same
+        (nothing written: does an existing plane's sidecar have this geometry? run_ps_pipeline.sh asks
+        before reusing a plane. Exit 0 = same, 3 = differs or the sidecar cannot be read (the script
+        then regenerates the plane, which makes every snapshot stale); any other status is a failure
+        of the tool itself -- bad input, a missing module -- and must not be read as 'differs'.)
 """
 
 import argparse
@@ -28,6 +34,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # python/ on sys.path
 
 AXES = {"x": 0, "y": 1, "z": 2}
+SAME_AS_DIFFERS = 3        # --same-as: the geometry differs (1/2 = the tool itself failed: input, import)
 
 
 def read_header(combined: Path, mpc_unit: float) -> dict:
@@ -55,7 +62,7 @@ def read_header(combined: Path, mpc_unit: float) -> dict:
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    src = p.add_mutually_exclusive_group(required=True)
+    src = p.add_mutually_exclusive_group()          # required, except with --same-as
     src.add_argument("--sim", help="simulation name (path via dtfelib DATA_ROOT); needs --snap")
     src.add_argument("--combined", type=Path, help="explicit combined_*.hdf5 snapshot path")
     p.add_argument("--snap", type=int, help="snapshot number (with --sim)")
@@ -86,8 +93,39 @@ def main() -> None:
     p.add_argument("--u1", type=float, default=None, help="horizontal extent end (default box)")
     p.add_argument("--v0", type=float, default=None, help="vertical extent start (default 0)")
     p.add_argument("--v1", type=float, default=None, help="vertical extent end (default box)")
-    p.add_argument("-o", "--output", required=True, help="output stem: writes <stem>.bin + <stem>.json")
+    p.add_argument("-o", "--output", help="output stem: writes <stem>.bin + <stem>.json")
+    p.add_argument("--same-as", type=Path, metavar="SIDECAR.json",
+                   help="write nothing: compare the requested geometry (--center/--planes/--thickness/"
+                        "--supersample/--u0..--v1; the centre only when given) with an existing plane's "
+                        "sidecar and exit 0 when it is the same, 3 when it differs or cannot be read "
+                        "(other statuses: the tool failed, e.g. invalid input)")
     args = p.parse_args()
+
+    if args.supersample < 1:
+        sys.exit("--supersample must be >= 1")
+    if args.thickness <= 0 or args.planes < 1 or args.nu < 2:
+        sys.exit("non-positive thickness, or degenerate planes/nu")
+
+    window = (args.u0, args.u1, args.v0, args.v1)
+    if any(v is not None for v in window):
+        u0, u1, v0, v1 = (0.0 if window[0] is None else window[0]), window[1], (0.0 if window[2] is None else window[2]), window[3]
+        if (u1 is not None and u1 <= u0) or (v1 is not None and v1 <= v0) or min(u0, v0) < 0:
+            sys.exit("empty image extent (u1<=u0 or v1<=v0) or a negative start")
+    if args.same_as is not None:
+        from dtfelib.io import plane_geometry_matches
+        try:
+            side = json.loads(args.same_as.read_text())
+        except (OSError, ValueError) as e:
+            print(f"differs: cannot read {args.same_as} ({e})")
+            sys.exit(SAME_AS_DIFFERS)
+        same = plane_geometry_matches(side, center=args.center, planes=args.planes, thickness=args.thickness,
+                                      supersample=args.supersample, window=window)
+        print("same" if same else "differs")
+        sys.exit(0 if same else SAME_AS_DIFFERS)
+    if not (args.sim or args.combined):
+        p.error("one of --sim / --combined is required")
+    if args.output is None:
+        p.error("-o/--output is required")
 
     if args.sim:
         if args.snap is None:
@@ -101,11 +139,6 @@ def main() -> None:
 
     meta = read_header(combined, args.mpc_unit)
     box = meta["box"]
-
-    if args.supersample < 1:
-        sys.exit("--supersample must be >= 1")
-    if args.thickness <= 0 or args.planes < 1 or args.nu < 2:
-        sys.exit("non-positive thickness, or degenerate planes/nu")
 
     if args.axes:
         axes = [a for a in args.axes.replace(",", "") if a.strip()]

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # COMPUTE ONLY: for every snapshot of every simulation, regenerate the analysis grids
-# (current physics: --ps-vertex-mass + per-field --ps-volume-weighted) AND point-evaluate a
+# (current physics: --ps-vertex-mass + per-field --ps-volume-weighted, both defaults) AND point-evaluate a
 # full-box high-resolution image plane of the continuous phase-space field. Both share the
 # snapshot's single triangulation (run_ps_dtfe.sh SAMPLE_POINTS), so the image planes cost
 # only the point evaluation on top of the grid regen.
@@ -32,8 +32,24 @@
 #   PTS_VEL_GRAD  1 (default) = also evaluate the velocity gradient at every sample point
 #                 (.pts_velGrad), which is what makes the velDiv/velShear/velVort maps
 #                 possible. A snapshot lacking it counts as STALE, so a rerun recomputes it.
+#   PLANES, THICKNESS, SUPERSAMPLE, WINDOW
+#                 the plane's geometry, forwarded to make_image_plane.py: sampling planes across
+#                 a slab of THICKNESS Mpc (default 1 = one crisp cross-section; a handful ghosts,
+#                 use >= 16 with plot_pointeval.py --project slab), KxK sub-samples per pixel
+#                 averaged into pixel-area means (default 1), and "u0 u1 v0 v1" in Mpc to image
+#                 only that part of the plane (default: the whole box).
+#   PS_GPU        1 (default) = the deposit on the GPU (run_ps_dtfe.sh -m); 0 = CPU
+#   PS_VOLUME_WEIGHTED  1 (default) = volume-weighted velocity moments, the production convention
+# The other run options reach run_ps_dtfe.sh through the environment exactly as from a terminal:
+# PS_EXACT, AVG_SUBSAMPLES, PS_VERTEX_MASS, PS_CAUSTICS, PS_CAUSTIC_CUSPS, PS_PARALLEL_TRI,
+# PARTITION, MAX_CONCURRENT, SCRATCH_DIR, TESS_CACHE, DTFE_PRECISION, OUTPUT_PREFIX, LAMBDA_TH,
+# THREADS (see its header for each). The GUI's Pipeline tab sets all of them.
 # Snapshots are auto-discovered (snapdir_*/combined_NNN.hdf5). The plane file is generated
-# once per simulation (box size is constant across its snapshots) and reused.
+# once per simulation (box size is constant across its snapshots) and reused -- as long as its
+# sidecar has the requested geometry (make_image_plane.py --same-as, exit 3 = differs); otherwise it
+# is regenerated, which makes every snapshot of that simulation stale (the geometry changed, so it
+# must). A comparison that FAILS (no python, a bad WINDOW, a missing module) is not 'differs': the
+# plane is kept, the simulation skipped with a '!!' line, and the script exits 1.
 #
 # DISK: the per-point files are KEPT (~9 GB per snapshot at NU=8192) -- they are the input
 # to every figure. Delete <snapdir>/<prefix>.pts_vel* by hand once the figures are final.
@@ -44,15 +60,33 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"   # python/ and the binaries live on
 USER_GRID="${GRID_SIZE:-}"          # capture BEFORE config.sh, which sets its own GRID_SIZE
 source "${SCRIPT_DIR}/config.sh"
 
-PY="${PY:-/opt/homebrew/bin/python3}"
+PY="${PY:-$(command -v /opt/homebrew/bin/python3 || command -v python3)}"   # the launcher passes its own PY
 NU="${NU:-8192}"
 AXIS="${AXIS:-z}"
 CENTER="${CENTER:-}"
 GRID_SIZE="${USER_GRID:-512}"       # 512^3 analysis grids by default (figures don't depend on it)
 PTS_VEL_GRAD="${PTS_VEL_GRAD:-1}"
+PLANES="${PLANES:-1}"
+THICKNESS="${THICKNESS:-2}"
+SUPERSAMPLE="${SUPERSAMPLE:-1}"
+WINDOW="${WINDOW:-}"
+PS_GPU="${PS_GPU:-1}"
+PS_VOLUME_WEIGHTED="${PS_VOLUME_WEIGHTED:-1}"
 FORCE="${FORCE:-0}"
 DRY_RUN="${DRY_RUN:-0}"
 PREFIX="${OUTPUT_PREFIX:-ps_output}"
+
+# the plane's geometry, as make_image_plane.py takes it (shared by the generation and the --same-as check)
+plane_args=(--axis "${AXIS}" --nu "${NU}" --planes "${PLANES}" --thickness "${THICKNESS}" --supersample "${SUPERSAMPLE}")
+[ -n "${CENTER}" ] && plane_args+=(--center "${CENTER}")
+if [ -n "${WINDOW}" ]; then
+    read -r w_u0 w_u1 w_v0 w_v1 w_more <<< "${WINDOW}"
+    if [ -z "${w_v1}" ] || [ -n "${w_more:-}" ]; then
+        echo "!! WINDOW must be four numbers 'u0 u1 v0 v1' (Mpc), got '${WINDOW}'" >&2; exit 2
+    fi
+    plane_args+=(--u0 "${w_u0}" --u1 "${w_u1}" --v0 "${w_v0}" --v1 "${w_v1}")
+fi
+gpu_args=(); [ "${PS_GPU}" = "1" ] && gpu_args=(-m)
 
 if [ -z "${SIMS:-}" ]; then
     SIMS=""
@@ -62,7 +96,7 @@ if [ -z "${SIMS:-}" ]; then
     done
 fi
 echo "Simulations:${SIMS}"
-echo "Slice: axis ${AXIS}, ${NU} px, centre ${CENTER:-box/2}   Grid: ${GRID_SIZE}^3   vel-grad: ${PTS_VEL_GRAD}   force: ${FORCE}"
+echo "Slice: axis ${AXIS}, ${NU} px, centre ${CENTER:-box/2}, planes ${PLANES}$([ "${PLANES}" != "1" ] && echo " over ${THICKNESS} Mpc"), ${SUPERSAMPLE}x${SUPERSAMPLE} sub-samples${WINDOW:+, window ${WINDOW}}   Grid: ${GRID_SIZE}^3   GPU: ${PS_GPU}   vel-grad: ${PTS_VEL_GRAD}   force: ${FORCE}"
 
 run() { echo "+ $*"; [ "${DRY_RUN}" = "1" ] || "$@"; }
 
@@ -97,23 +131,29 @@ for sim in ${SIMS}; do
     # ---- one plane file per simulation ---------------------------------------------------
     plane="${simdir}/hires_plane_${AXIS}${NU}"
     plane_new=0        # set when the plane is (re)generated: invalidates every slice/figure
-    if [ -f "${plane}.json" ] && [ -n "${CENTER}" ]; then
-        # a CENTER differing from the stored geometry must regenerate the plane (and thereby
-        # invalidate every slice computed against the old one)
-        same=$("${PY}" -c "import json,sys; c=json.load(open(sys.argv[1]))['center']; \
-print(1 if abs(c-float(sys.argv[2]))<1e-9 else 0)" "${plane}.json" "${CENTER}") || same=0
-        if [ "${same}" != "1" ]; then
-            echo "-- ${sim}: CENTER=${CENTER} differs from the existing plane; regenerating"
+    if [ -f "${plane}.json" ]; then
+        # a stored geometry differing from the requested one (CENTER when given, planes, thickness,
+        # sub-samples, window) must regenerate the plane -- and thereby invalidate every slice
+        # computed against the old one. Exit 3 = differs (or an unreadable sidecar); any other failure
+        # of the tool (no python, a bad WINDOW, a missing module) keeps the plane and skips the sim.
+        same_rc=0
+        same_err="$("${PY}" "${REPO_ROOT}/python/tools/make_image_plane.py" --same-as "${plane}.json" \
+                    "${plane_args[@]}" 2>&1 >/dev/null)" || same_rc=$?
+        if [ "${same_rc}" = "3" ]; then
+            echo "-- ${sim}: the existing plane's geometry (centre, planes, thickness, sub-samples or window) differs; regenerating"
             run rm -f "${plane}.bin" "${plane}.json"
             plane_new=1
+        elif [ "${same_rc}" != "0" ]; then
+            echo "!! ${sim}: could not compare the plane's geometry (make_image_plane.py --same-as exited ${same_rc}); the plane is kept, the simulation skipped"
+            [ -n "${same_err}" ] && echo "${same_err}" | sed 's/^/   /'
+            overall_rc=1; continue
         fi
     fi
     if [ "${plane_new}" = "1" ] || [ ! -f "${plane}.bin" ] || [ ! -f "${plane}.json" ]; then
         first=$(printf "%03d" "${snaps[0]}")
-        center_args=(); [ -n "${CENTER}" ] && center_args=(--center "${CENTER}")
         run "${PY}" "${REPO_ROOT}/python/tools/make_image_plane.py" \
             --combined "${simdir}/snapdir_${first}/combined_${first}.hdf5" \
-            --axis "${AXIS}" --nu "${NU}" --planes 1 ${center_args[@]+"${center_args[@]}"} \
+            "${plane_args[@]}" \
             -o "${plane}" || { echo "!! ${sim}: plane generation failed"; overall_rc=1; continue; }
         plane_new=1
     else
@@ -138,10 +178,12 @@ print(1 if abs(c-float(sys.argv[2]))<1e-9 else 0)" "${plane}.json" "${CENTER}") 
         fi
     done
     if [ ${#compute[@]} -gt 0 ]; then
-        env_args=(SAMPLE_POINTS="${plane}.bin" PS_VOLUME_WEIGHTED=1 PTS_VEL_GRAD="${PTS_VEL_GRAD}")
+        # PS_METAL follows PS_GPU too: -m only switches the GPU ON, an exported PS_METAL=1 would otherwise leak in
+        env_args=(SAMPLE_POINTS="${plane}.bin" PS_VOLUME_WEIGHTED="${PS_VOLUME_WEIGHTED}" PTS_VEL_GRAD="${PTS_VEL_GRAD}"
+                  PS_METAL="${PS_GPU}")
         [ -n "${FIELDS:-}" ] && env_args+=(FIELDS="${FIELDS}")
         run env "${env_args[@]}" \
-            "${SCRIPT_DIR}/run_ps_dtfe.sh" -s "${sim}" -g "${GRID_SIZE}" -m "${compute[@]}" \
+            "${SCRIPT_DIR}/run_ps_dtfe.sh" -s "${sim}" -g "${GRID_SIZE}" ${gpu_args[@]+"${gpu_args[@]}"} "${compute[@]}" \
             || { echo "!! ${sim}: run_ps_dtfe.sh reported failure (continuing to plots)"; overall_rc=1; }
     else
         echo "-- ${sim}: all snapshots up to date"

@@ -62,6 +62,7 @@ void interpolatePoints_phaseSpace(DT &dt, User_options &userOptions);   // ps_po
 void interpolatePoints_standard(DT &dt, User_options &userOptions);    // ps_point_eval.cc
 #endif
 [[noreturn]] void psServe(DT &dt, User_options &userOptions);          // ps_point_eval.cc (--serve)
+void psWriteOccupancyIfMissing(DT &dt, User_options &partOpts);       // ps_point_eval.cc (partition maps)
 
 
 void delaunayTriangulation(DT *dt,
@@ -97,12 +98,22 @@ bool buildTessellation(vector<Particle_data> *p,
             printComputationTime( &t, &userOptions, "tessellation load (--tessellation-cache hit)" );
             MESSAGE::Message message( userOptions.verboseLevel );
             message << "Reused the cached tessellation (" << dt.number_of_vertices()
-                    << " vertices): triangulation and vertex-density passes skipped.\n" << MESSAGE::Flush;
+                    << " vertices, read with " << TessellationCache::chunkCodecName()
+                    << "): triangulation and vertex-density passes skipped.\n" << MESSAGE::Flush;
             // only NOW are the particles redundant -- on a miss they are the triangulation's input
             vector<Particle_data>().swap(*p);
         }
     }
 
+#ifdef PHASE_SPACE
+    // the batch loop skipped this partition's particle selection because its cache header matched:
+    // a load that fails anyway (a damaged file) must stop the run -- building from the empty
+    // particle list would leave the partition's streams silently out of the result
+    if ( not tessellationLoaded and userOptions.psCacheOnly )
+        throwError( "the cached tessellation '", TessellationCache::cachePath( userOptions ),
+                    "' matched this partition's descriptor but could not be read back (a damaged or truncated file?). "
+                    "Delete it (the run then rebuilds and rewrites it) or run without '--tessellation-cache'." );
+#endif
     if ( not tessellationLoaded )
     {
     t.start();
@@ -158,6 +169,16 @@ void DTFE_interpolation(vector<Particle_data> *p,
 
     Timer t;
     buildTessellation( p, userOptions, dt );
+#ifdef PHASE_SPACE
+    // a partition of a batch run with '--tessellation-cache': leave its occupancy map beside the
+    // cached tessellation (once), so a later --ps-window run can skip it (ps_point_eval.cc)
+    if ( userOptions.psUseSubgrid and not userOptions.tessellationCacheDir.empty() and not userOptions.psServe )
+    {
+        t.start();
+        psWriteOccupancyIfMissing( dt, userOptions );
+        printComputationTime( &t, &userOptions, "occupancy map (--tessellation-cache)" );
+    }
+#endif
 
 
     // approxPSD: form the phase-space density f_i = rho_i (spatial density) * g_i (velocity-space density, in scalar(0)).

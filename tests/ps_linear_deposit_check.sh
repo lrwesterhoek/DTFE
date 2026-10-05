@@ -30,9 +30,11 @@ PY="${PYTHON:-python3}"
 command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/python3.14
 ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT}"
+source "${SCRIPT_DIR}/precision.sh"     # DTFE_TEST_PRECISION=double: the double pair
 
 N="${N:-24}"; GRID="${GRID:-48}"; BOX="${BOX:-100.0}"
-BIN="./PS-DTFE"
+BIN="${PS_BIN}"
+precision_require "${BIN}"
 TMP="${SCRIPT_DIR}/tmp"; mkdir -p "${TMP}"
 SNAP_UNI="${TMP}/pld_input_uniform.hdf5"
 SNAP_PAN="${TMP}/pld_input_pancake.hdf5"
@@ -41,7 +43,7 @@ echo "============================================================"
 echo " PS-DTFE --ps-linear-deposit check   N=${N}^3  grid=${GRID}^3"
 echo "============================================================"
 
-if [ "${1:-}" != "--no-build" ]; then
+if [ "${1:-}" != "--no-build" ] && ! precision_double; then
     echo ">> building PS-DTFE ..."
     BUILD_MODE="$(cat o_ps/.build_mode 2>/dev/null || true)"
     make PS-DTFE ${BUILD_MODE:+"$BUILD_MODE"} >/dev/null
@@ -135,6 +137,7 @@ echo ">> checking the numbers ..."
 "${PY}" - "${TMP}" "${GRID}" "${GPU_BUILT}" "${HAVE_EXACT}" <<'PY'
 import sys
 import numpy as np
+import os as _os; REAL = np.dtype(_os.environ.get("DTFE_TEST_REAL", "float32"))   # tests/precision.sh
 
 tmp, grid, gpu, have_exact = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
 ncell = grid ** 3
@@ -146,7 +149,7 @@ def check(name, ok, detail):
         fails.append(name)
 
 def load(root, ext, ncomp=1):
-    d = np.fromfile(root + ext, dtype=np.float32).astype(np.float64)
+    d = np.fromfile(root + ext, dtype=REAL).astype(np.float64)
     assert d.size == ncell * ncomp, (root + ext, d.size)
     return d
 
@@ -165,8 +168,8 @@ for ext, tag in ((".den", "nSub=1"), (".a_den", "nSub=3")):
           f"mean rho/rho_bar = {dl.mean():.6f}")
 du = load(f"{tmp}/pld_pan_u", ".den")
 dl = load(f"{tmp}/pld_pan_l", ".den")
-su = np.fromfile(f"{tmp}/pld_pan_u.streams", dtype=np.float32)
-sl = np.fromfile(f"{tmp}/pld_pan_l.streams", dtype=np.float32)
+su = np.fromfile(f"{tmp}/pld_pan_u.streams", dtype=REAL)
+sl = np.fromfile(f"{tmp}/pld_pan_l.streams", dtype=REAL)
 check("B streams identical", np.array_equal(su, sl),
       "the weighting must not change which samples deposit")
 ratio = dl.max() / du.max()
@@ -181,7 +184,7 @@ check("B few cells change >2x", big < 0.02, f"{big*100:.3f}% of covered cells")
 # ---------- (C) GPU parity for the linear deposit ----------
 if gpu:
     dg = load(f"{tmp}/pld_pan_lg", ".den")
-    sg = np.fromfile(f"{tmp}/pld_pan_lg.streams", dtype=np.float32)
+    sg = np.fromfile(f"{tmp}/pld_pan_lg.streams", dtype=REAL)
     eq = np.mean(sl == sg)
     scale = np.abs(dl).max()
     mrel = np.abs(dl - dg).mean() / scale
@@ -203,7 +206,7 @@ if have_exact:
     # '.tetTouch': the RAW INTEGER count of tetrahedra with a nonzero cell intersection.
     # This is the field that carries the old integer-'.streams' contract -- quantities.cc
     # sums it linearly across partitions, so it stays bit-exact under any thread order.
-    tx = np.fromfile(f"{tmp}/pld_pan_ex.tetTouch", dtype=np.float32).astype(np.float64)
+    tx = np.fromfile(f"{tmp}/pld_pan_ex.tetTouch", dtype=REAL).astype(np.float64)
     # 'integer-valued' alone is vacuous -- any int < 2^24 casts exactly, so an all-zero or
     # scrambled grid would pass it. Pin the count to >= 1 as well: the periodic tessellation
     # is space-filling, so EVERY cell is touched by at least one tet (measured min = 2).
@@ -211,8 +214,8 @@ if have_exact:
           bool(np.allclose(tx, np.round(tx), atol=1e-6)) and tx.min() >= 1,
           f"max frac dev = {np.abs(tx - np.round(tx)).max():.2e}, "
           f"touch range = [{tx.min():.0f}, {tx.max():.0f}]")
-    t1 = np.fromfile(f"{tmp}/pld_pan_ex_p1.tetTouch", dtype=np.float32)
-    tN = np.fromfile(f"{tmp}/pld_pan_ex_pN.tetTouch", dtype=np.float32)
+    t1 = np.fromfile(f"{tmp}/pld_pan_ex_p1.tetTouch", dtype=REAL)
+    tN = np.fromfile(f"{tmp}/pld_pan_ex_pN.tetTouch", dtype=REAL)
     check("D partitioned tetTouch thread-invariant (bit-exact)", np.array_equal(t1, tN),
           "same split, 1 vs all threads (integer counts merge order-independently)")
 
@@ -220,7 +223,7 @@ if have_exact:
     # neither integer-valued nor bit-exact (float shares sum order-dependently). What the new
     # definition buys is that it is the ANALYTIC nSub->infinity limit, so the two properties
     # below are exact statements about the Zel'dovich pancake rather than sampling artefacts.
-    sx = np.fromfile(f"{tmp}/pld_pan_ex.streams", dtype=np.float32).astype(np.float64)
+    sx = np.fromfile(f"{tmp}/pld_pan_ex.streams", dtype=REAL).astype(np.float64)
     # The pancake folds into exactly 3 streams behind the caustic. The sampled deposit
     # overshoots this badly (a grazing sub-sample counts a full +1; run 3's 'su' reports
     # ~14), while the exact deposit weights each tet by its intersected volume and lands on 3.
@@ -241,8 +244,8 @@ if have_exact:
     check("D exact streams <= tetTouch (pointwise)", viol == 0,
           f"{viol} cells violate; min slack = {(tx - sx).min():.6f}")
     # partition split: same tolerance form as the density check just below
-    s1 = np.fromfile(f"{tmp}/pld_pan_ex_p1.streams", dtype=np.float32)
-    sN = np.fromfile(f"{tmp}/pld_pan_ex_pN.streams", dtype=np.float32)
+    s1 = np.fromfile(f"{tmp}/pld_pan_ex_p1.streams", dtype=REAL)
+    sN = np.fromfile(f"{tmp}/pld_pan_ex_pN.streams", dtype=REAL)
     smax = np.abs(s1.astype(np.float64) - sN).max() / (np.abs(s1).max() + 1e-30)
     check("D partitioned streams thread-invariant", smax < 1e-5, f"max rel = {smax:.3e}")
     d1 = load(f"{tmp}/pld_pan_ex_p1", ".den")
@@ -272,8 +275,8 @@ if have_exact:
             g = load(f"{tmp}/pld_pan_exg", ext, nc)
             mrel = np.abs(c - g).mean() / (np.abs(c).max() + 1e-30)
             check(f"D exact GPU{ext} matches CPU", mrel < tol, f"mean rel = {mrel:.3e}")
-        sc = np.fromfile(f"{tmp}/pld_pan_exd.streams", dtype=np.float32).astype(np.float64)
-        sg = np.fromfile(f"{tmp}/pld_pan_exg.streams", dtype=np.float32).astype(np.float64)
+        sc = np.fromfile(f"{tmp}/pld_pan_exd.streams", dtype=REAL).astype(np.float64)
+        sg = np.fromfile(f"{tmp}/pld_pan_exg.streams", dtype=REAL).astype(np.float64)
         srel = np.abs(sc - sg).max() / (np.abs(sc).max() + 1e-30)
         check("D exact GPU streams match CPU", srel < 1e-3,
               f"max rel = {srel:.3e} (float volume-weighted multiplicity)")

@@ -37,6 +37,7 @@ if str(REPO_ROOT / "python") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "python"))
 
 from dtfelib.cli import DATA_ROOT, find_sims, sim_dir  # noqa: E402  (after the path fix-up)
+from dtfelib.io import plane_geometry_matches  # noqa: E402
 
 PS_SCRIPT = REPO_ROOT / "scripts" / "run_ps_dtfe.sh"
 DTFE_SCRIPT = REPO_ROOT / "scripts" / "run_dtfe.sh"
@@ -63,6 +64,9 @@ PS_FIELDS = [
     ("vweb_a", "V-web"),
 ]
 PS_DEFAULT_FIELDS = [n for n, _ in PS_FIELDS[:7]]
+WEB_FIELDS = ("tweb_a", "vweb_a")        # the cosmic-web classes: the only consumers of lambda_th
+LAMBDA_TH_DEFAULT = 0.3                  # run_ps_dtfe.sh / run_dtfe.sh LAMBDA_TH (the binary alone: 0.0, so a Custom
+                                         # run classified differently from a scripted one before 2026-10-05)
 DTFE_FIELDS = ["density_a", "velocity_a", "gradient_a", "divergence_a", "shear_a", "vorticity_a"]
 
 # full-resolution accumulator bytes per grid cell, roughly (auto_tune.h has the exact model)
@@ -76,7 +80,8 @@ class RunSpec:
     sim: str = ""
     snapshots: list[int] = field(default_factory=list)
     estimator: str = "ps"            # "ps" (run_ps_dtfe.sh) | "dtfe" (run_dtfe.sh)
-    deposit: str = "sampled"         # PS only: "sampled" (nSub^3 samples/cell) | "exact" (r3d clipping)
+    deposit: str = "sampled"         # PS: "sampled" (nSub^3 samples/cell) | "exact" (r3d clipping);
+                                     # standard DTFE: "sampled" (Monte-Carlo cell means) | "exact" (--exact-average)
     grid: int = 512
     nsub: int = 3
     fields: list[str] = field(default_factory=lambda: list(PS_DEFAULT_FIELDS))
@@ -86,12 +91,14 @@ class RunSpec:
     caustics: bool = False
     caustic_cusps: bool = False
     parallel_triangulation: bool = False   # --parallel-triangulation (opt-in: faster small runs, repeats differ at rounding)
+    precision: str = "single"        # "single" (./PS-DTFE, ./DTFE) | "double" (the -double pair: float64 end to end, ~2x memory)
     slice_plane: str = ""            # a --sample-points file (hi-res slice); "" = none
     slice_vel_grad: bool = True
     partition: int = 0               # 0 = auto-tuned
     max_concurrent: int = 0          # 0 = auto-tuned (NOT the binary's "0 = all cores")
     scratch_dir: str = ""
     output_prefix: str = "ps_output"
+    lambda_th: float = LAMBDA_TH_DEFAULT   # T-web / V-web eigenvalue threshold (LAMBDA_TH; the scripts' default)
 
     # ------------------------------------------------------------------ data
     def sim_path(self) -> Path:
@@ -113,30 +120,13 @@ class RunSpec:
         if self.grid < 8 or self.grid > 4096:
             out.append(("error", f"grid {self.grid}^3 is outside 8..4096"))
         out += _scratch_problems(self.scratch_dir)
-        if self.gpu and not gpu_built(self.estimator):
-            out.append(("warning", "GPU requested, but the binary was built without METAL=1: "
+        out += _precision_problems(self.estimator, self.precision)
+        if self.gpu and not gpu_built(self.estimator, self.precision):
+            out.append(("warning", f"GPU requested, but the binary was built without GPU support ({GPU_BUILD_HINT}): "
                                    "the deposit will run on the CPU"))
 
         if self.estimator == "ps":
-            if not self.fields:
-                out.append(("error", "no fields selected"))
-            if self.caustic_cusps and not self.caustics:
-                out.append(("error", "caustic cusps need 'caustics' switched on"))
-            if self.caustic_cusps and self.gpu:
-                out.append(("warning", "caustic cusps are a CPU-deposit pass; the GPU run leaves them to the CPU"))
-            if self.deposit == "exact" and self.nsub != 3:
-                out.append(("warning", "the exact deposit ignores the sub-sample count"))
-            if self.deposit == "exact" and not self.gpu:
-                out.append(("warning", "the exact deposit is by far the most expensive; the GPU is strongly recommended"))
-            out += gpu_advice(self.gpu, self.deposit, self.fields, dm_particles(self.sim), "ps")
-            if self.parallel_triangulation and not tbb_built():
-                out.append(("warning", "parallel triangulation asked for, but the binary was built without TBB: ignored"))
-            elif self.parallel_triangulation:
-                out.append(("warning", "parallel triangulation: faster on small sets, but two identical runs then "
-                                       "differ at float rounding (the stream counts do not)"))
-            if not self.vertex_mass:
-                out.append(("warning", "without vertex masses, TNG runs (z=127 IC Lagrangian input) "
-                                       "suppress density contrast by 1 - D(127)/D(z)"))
+            out += _ps_option_problems(self, dm_particles(self.sim))
             if self.slice_plane and not Path(self.slice_plane).is_file():
                 out.append(("error", f"slice file not found: {self.slice_plane}"))
             if self.output_prefix.strip() == "" or re.search(r"[\s/]", self.output_prefix):
@@ -144,6 +134,8 @@ class RunSpec:
         else:
             if self.slice_plane:
                 out.append(("warning", "the hi-res slice is a PS-DTFE option; standard DTFE ignores it"))
+            out += gpu_advice(self.gpu, self.deposit, DTFE_FIELDS, dm_particles(self.sim), "dtfe", grid=self.grid,
+                              precision=self.precision)
 
         out += _busy_problems()
 
@@ -159,7 +151,7 @@ class RunSpec:
         return out
 
     def grid_gb(self) -> float:
-        return grids_gb(self.grid, self.fields if self.estimator == "ps" else DTFE_FIELDS)
+        return grids_gb(self.grid, self.fields if self.estimator == "ps" else DTFE_FIELDS, self.precision)
 
     def runnable(self) -> bool:
         return not any(level == "error" for level, _ in self.problems())
@@ -168,15 +160,24 @@ class RunSpec:
     def command(self) -> tuple[list[str], dict[str, str]]:
         """argv of the run script and the environment variables it adds."""
         env = {"DTFE_DATA_ROOT": str(self.data_root)}
+        if self.precision == "double":
+            env["DTFE_PRECISION"] = "double"
         if self.partition > 0:
             env["PARTITION"] = f"{self.partition} {self.partition} {self.partition}"
         if self.max_concurrent > 0:
             env["MAX_CONCURRENT"] = str(self.max_concurrent)
+        if self.scratch_dir:                # both scripts (run_dtfe.sh got its hook 2026-10-05: before, a
+            env["SCRATCH_DIR"] = str(Path(self.scratch_dir).expanduser())   # standard run silently kept the grids in RAM)
+        if self.lambda_th != LAMBDA_TH_DEFAULT:
+            env["LAMBDA_TH"] = f"{self.lambda_th:g}"
         snaps = [str(n) for n in sorted(self.snapshots)]
         if self.estimator == "dtfe":
             argv = [str(DTFE_SCRIPT), "-s", self.sim, "-g", str(self.grid)]
+            env["DTFE_METAL"] = "1" if self.gpu else "0"     # -m only switches the GPU ON; pin the env knob too
             if self.gpu:
                 argv.append("-m")
+            if self.deposit == "exact":
+                argv.append("-e")
             return argv + snaps, env
         argv = [str(PS_SCRIPT), "-s", self.sim, "-g", str(self.grid), "-n", str(self.nsub)]
         if self.gpu:
@@ -185,6 +186,7 @@ class RunSpec:
             argv.append("-e")
         env.update({
             "FIELDS": " ".join(self.fields),
+            "PS_METAL": "1" if self.gpu else "0",
             "PS_VERTEX_MASS": "1" if self.vertex_mass else "0",
             "PS_VOLUME_WEIGHTED": "1" if self.volume_weighted else "0",
             "PS_CAUSTICS": "1" if self.caustics else "0",
@@ -195,8 +197,6 @@ class RunSpec:
         if self.slice_plane:
             env["SAMPLE_POINTS"] = str(self.slice_plane)
             env["PTS_VEL_GRAD"] = "1" if self.slice_vel_grad else "0"
-        if self.scratch_dir:
-            env["SCRATCH_DIR"] = str(Path(self.scratch_dir).expanduser())
         return argv + snaps, env
 
     def shell_line(self) -> str:
@@ -204,7 +204,7 @@ class RunSpec:
         return shell(*self.command())
 
     def memory_key(self) -> str:
-        return _memory_key(self, ("snapshots",))
+        return _memory_key(self, ("snapshots", "lambda_th"))
 
     def check_step(self) -> "Step":
         """The same run_ps_dtfe.sh call in report mode: the binary's own memory prediction per
@@ -235,6 +235,7 @@ class Step:
     argv: list[str]
     env: dict[str, str]
     tee: str = ""
+    after: str = ""         # the label of a step that must have exited 0 first (a merge after its download)
 
     def line(self) -> str:
         return shell(self.argv, self.env) + (f" 2>&1 | tee {_q(self.tee)}" if self.tee else "")
@@ -312,9 +313,20 @@ def _root_problems(data_root: str) -> list[tuple[str, str]]:
 
 
 def _busy_problems() -> list[tuple[str, str]]:
-    busy = running_jobs()
-    return [("warning", "already running: " + ", ".join(f"{name} (pid {pid})" for pid, name in busy)
-                        + "; two production runs do not fit in memory together")] if busy else []
+    """Another run on the machine is a warning (two production runs do not fit in memory together); a resident
+    query server is told with its memory (a 24 GB server beside a large run made the Mac swap once), nothing
+    more -- the auto-tuner's budget already starts from the free memory."""
+    procs = dtfe_processes()
+    out = []
+    if procs["runs"]:
+        out.append(("warning", "already running: " + ", ".join(f"{name} (pid {pid}{_gb_text(gb)})"
+                                                                for pid, name, gb in procs["runs"])
+                               + "; two production runs do not fit in memory together"))
+    if procs["servers"]:
+        out.append(("info", "query server in memory: " + ", ".join(f"{name} (pid {pid}{_gb_text(gb)})"
+                                                                     for pid, name, gb in procs["servers"])
+                            + "; a large run has to fit beside it (stop the server first if it does not)"))
+    return out
 
 
 # ---------------------------------------------------------------------- memory check
@@ -353,26 +365,105 @@ ADAPTIVE_MIN_NU = 1024          # the adaptive plane size never goes below this
 
 
 # ---------------------------------------------------------------------- pipeline
+POINTEVAL_DERIVATIVE_SMOOTH = 10.0   # == dtfelib.pointeval.DERIVATIVE_SMOOTH (not imported: it pulls in matplotlib)
+POINTEVAL_FIELDS = ("density", "streams", "speed", "dispTrace", "dispMag", "velDiv", "velShear", "velVort",
+                    "denGradMag")    # == the keys of dtfelib.pointeval.STYLES (plot_pointeval.py --fields)
+PLANE_GHOSTING_MIN = 16              # make_image_plane.py: fewer planes across a slab ghost every inclined structure
+# the options that only change the figures: they do not enter the memory key
+PIPELINE_RENDER_KEYS = ("render", "render_fields", "render_project", "render_smooth", "render_smooth_derivatives",
+                        "render_fixed_range", "render_force")
+# what run_ps_pipeline.sh reads itself; everything else in command()'s environment is for run_ps_dtfe.sh
+PIPELINE_ONLY_KEYS = ("SIMS", "SNAPS", "NU", "AXIS", "CENTER", "PLANES", "THICKNESS", "SUPERSAMPLE", "WINDOW",
+                      "GRID_SIZE", "PS_GPU", "FORCE", "DRY_RUN", "PY")
+
+
+def _ps_option_problems(spec, n_particles) -> list[tuple[str, str]]:
+    """The phase-space run options' checks, shared by the Grids and Pipeline jobs (duck-typed on the
+    option names both carry: fields, deposit, nsub, gpu, caustics, caustic_cusps, parallel_triangulation,
+    vertex_mass, precision)."""
+    out: list[tuple[str, str]] = []
+    if not spec.fields:
+        out.append(("error", "no fields selected"))
+    if spec.caustic_cusps and not spec.caustics:
+        out.append(("error", "caustic cusps need 'caustics' switched on"))
+    if spec.caustic_cusps and spec.gpu:
+        out.append(("warning", "caustic cusps are a CPU-deposit pass; the GPU run leaves them to the CPU"))
+    if spec.deposit == "exact" and spec.nsub != 3:
+        out.append(("warning", "the exact deposit ignores the sub-sample count"))
+    out += gpu_advice(spec.gpu, spec.deposit, spec.fields, n_particles, "ps", precision=spec.precision)
+    if spec.parallel_triangulation and not tbb_built(spec.precision):
+        out.append(("warning", "parallel triangulation asked for, but the binary was built without TBB: ignored"))
+    elif spec.parallel_triangulation:
+        out.append(("warning", "parallel triangulation: faster on small sets, but two identical runs then "
+                               "differ at float rounding (the stream counts do not)"))
+    if not spec.vertex_mass:
+        out.append(("warning", "without vertex masses, TNG runs (z=127 IC Lagrangian input) "
+                               "suppress density contrast by 1 - D(127)/D(z)"))
+    return out
+
+
+def _num(v: float) -> str:
+    """A float for a script argument that reads back as the same float ('%g' kept six digits, so the
+    launcher compared other numbers than the sidecar held): whole numbers plain, others as repr."""
+    v = float(v)
+    return str(int(v)) if v == int(v) else repr(v)
+
+
+def _window_values(text: str) -> list[float] | None:
+    """[u0, u1, v0, v1] (Mpc) from a 'u0 u1 v0 v1' window; None when blank; ValueError when malformed."""
+    parts = text.replace(",", " ").split()
+    if not parts:
+        return None
+    if len(parts) != 4:
+        raise ValueError("the window needs four numbers: u0 u1 v0 v1 (Mpc; blank = the whole box)")
+    vals = [float(v) for v in parts]
+    if min(vals) < 0 or not (vals[1] > vals[0] and vals[3] > vals[2]):
+        raise ValueError("the window needs u1 > u0 and v1 > v0, all >= 0 (Mpc)")
+    return vals
+
+
 @dataclass
 class PipelineSpec:
     """scripts/run_ps_pipeline.sh: grids + a full-box image plane for every STALE snapshot of the
     chosen simulations (resumable; snapshots are discovered, not chosen), then optionally the
-    point-evaluated figures. The script always uses the GPU and volume-weighted moments."""
+    point-evaluated figures. The run options travel to run_ps_dtfe.sh through the environment, as
+    the Grids job's do (the script's own defaults are the production ones: GPU, vertex masses,
+    volume-weighted moments); the plane's geometry reaches tools/make_image_plane.py the same way."""
     data_root: str = str(DATA_ROOT)
     sims: list[str] = field(default_factory=list)
     nu: int = 8192                  # image-plane pixels across the box
     axis: str = "z"
     center: str = ""                # Mpc along the axis; "" = box centre
+    planes: int = 1                 # sampling planes across a slab (PLANES; 1 = one crisp cross-section)
+    thickness: float = 2.0          # the slab's depth in Mpc, used when planes > 1 (THICKNESS)
+    supersample: int = 1            # K: KxK sample points per pixel, averaged = pixel-area means (SUPERSAMPLE)
+    window: str = ""                # "u0 u1 v0 v1" in Mpc: only this part of the plane (WINDOW); "" = the whole box
     vel_grad: bool = True
     grid: int = 512
     fields: list[str] = field(default_factory=lambda: list(PS_DEFAULT_FIELDS))
+    deposit: str = "sampled"        # "sampled" (nsub^3 samples per cell) | "exact" (r3d clipping): PS_EXACT
+    nsub: int = 3                   # AVG_SUBSAMPLES
+    gpu: bool = True                # PS_GPU: the script's -m
+    vertex_mass: bool = True        # PS_VERTEX_MASS (needed for TNG IC inputs)
+    volume_weighted: bool = True    # PS_VOLUME_WEIGHTED (the production convention)
+    caustics: bool = False          # PS_CAUSTICS
+    caustic_cusps: bool = False     # PS_CAUSTIC_CUSPS
+    parallel_triangulation: bool = False   # PS_PARALLEL_TRI
+    lambda_th: float = LAMBDA_TH_DEFAULT   # LAMBDA_TH
     output_prefix: str = "ps_output"
+    precision: str = "single"       # "double" = the PS-DTFE-double binary (DTFE_PRECISION), see RunSpec
     partition: int = 0
     max_concurrent: int = 0
     scratch_dir: str = ""
     force: bool = False
     plan_only: bool = False         # DRY_RUN=1: print the plan, compute nothing
-    render: bool = True             # then plot_pointeval.py for each simulation
+    render: bool = True             # then plot_pointeval.py for each simulation, with the render_* options
+    render_fields: str = ""         # comma-separated POINTEVAL_FIELDS; "" = every field the run wrote
+    render_project: str = "plane"   # "plane" = the central plane | "slab" = the mean over every plane (planes > 1)
+    render_smooth: float = 0.0      # Gaussian smoothing of every map, in output pixels (0 = none)
+    render_smooth_derivatives: float = POINTEVAL_DERIVATIVE_SMOOTH   # the gradient maps' smoothed companions (0 = none)
+    render_fixed_range: bool = False   # the grid maps' fixed density range instead of a percentile stretch
+    render_force: bool = False      # re-render figures newer than their data
     figures_root: str = str(FIGURES_ROOT)
     # adaptive plane size: per snapshot the largest of nu, nu/2, ... (>= ADAPTIVE_MIN_NU) that the
     # memory check found to fit -- {sim: {"NNN": nu}}, filled by the GUI's "Check memory"
@@ -394,44 +485,81 @@ class PipelineSpec:
         v = self.plan.get(sim, {}).get(f"{snap:03d}")
         return int(v) if v else None
 
+    # ------------------------------------------------------------------ the plane's geometry
+    def window_values(self) -> list[float] | None:
+        return _window_values(self.window)
+
+    def plane_points(self, nu: int | None = None) -> int:
+        """Sample points of the plane file the pipeline makes: planes x nu x nv x K^2, nv following the
+        window's aspect as make_image_plane.py sizes it (square pixels). A malformed window reads as the
+        whole box here; problems() reports it."""
+        nu = nu or self.nu
+        try:
+            w = self.window_values()
+        except ValueError:
+            w = None
+        nv = nu if w is None else max(2, round(nu * (w[3] - w[2]) / (w[1] - w[0])))
+        return self.planes * nu * nv * self.supersample ** 2
+
+    def plane_matches(self, sim: str, nu: int | None = None) -> bool | None:
+        """Whether the plane file on disk has this job's geometry. False also for a missing or unreadable
+        sidecar (make_image_plane.py --same-as says 'differs' then, and the script regenerates the plane,
+        which makes every snapshot of that simulation stale); None when this job's own window or centre
+        is malformed (problems() reports that)."""
+        import json
+        try:
+            side = json.loads(self.plane_json(sim, nu).read_text())
+        except (OSError, ValueError):
+            return False
+        try:
+            w = self.window_values()
+            center = float(self.center) if self.center.strip() else None
+        except ValueError:
+            return None
+        return plane_geometry_matches(side, center=center, planes=self.planes, thickness=self.thickness,
+                                      supersample=self.supersample, window=w)
+
+    # ------------------------------------------------------------------ memory check
     def memory_key(self) -> str:
-        return _memory_key(self, ("sims", "nu", "force", "plan_only", "render", "adaptive", "plan",
-                                  "plan_key", "figures_root", "center"))
+        return _memory_key(self, ("sims", "nu", "force", "plan_only", "adaptive", "plan", "plan_key",
+                                  "figures_root", "center", "thickness", "lambda_th") + PIPELINE_RENDER_KEYS)
 
     def check_step(self, sim: str, snaps: list[int], nu: int) -> Step:
-        """run_ps_dtfe.sh in report mode with the settings run_ps_pipeline.sh would pass it (GPU,
-        volume-weighted, this plane) -- a plane not generated yet is sized by its point count."""
-        argv = [str(PS_SCRIPT), "-s", sim, "-g", str(self.grid), "-m", *[str(n) for n in sorted(snaps)]]
-        env = {"DTFE_DATA_ROOT": str(self.data_root), "AUTO_TUNE_REPORT": "1", "PS_VOLUME_WEIGHTED": "1"}
+        """run_ps_dtfe.sh in report mode with every setting run_ps_pipeline.sh would pass it (the run
+        options through the environment, the GPU flag, this plane) -- a plane not generated yet, or one
+        the script will regenerate, is sized by its point count."""
+        argv = [str(PS_SCRIPT), "-s", sim, "-g", str(self.grid)] + (["-m"] if self.gpu else []) \
+            + [str(n) for n in sorted(snaps)]
+        env = {k: v for k, v in self.command()[1].items() if k not in PIPELINE_ONLY_KEYS}
+        env["AUTO_TUNE_REPORT"] = "1"
         plane_bin = self.plane_json(sim, nu).with_suffix(".bin")
-        if plane_bin.is_file():
+        if plane_bin.is_file() and self.plane_json(sim, nu).is_file() and self.plane_matches(sim, nu) is not False:
             env["SAMPLE_POINTS"] = str(plane_bin)
-            env["PTS_VEL_GRAD"] = "1" if self.vel_grad else "0"
         else:
-            env["DTFE_AUTO_PTS_N"] = str(nu * nu)
+            env["DTFE_AUTO_PTS_N"] = str(self.plane_points(nu))
             env["DTFE_AUTO_PTS_VELGRAD"] = "1" if self.vel_grad else "0"
-        for k in ("FIELDS", "OUTPUT_PREFIX", "PARTITION", "MAX_CONCURRENT", "SCRATCH_DIR"):
-            if k in self.command()[1]:
-                env[k] = self.command()[1][k]
         return Step(f"memory check {sim} {nu}^2", argv, env)
 
     def stale(self, sim: str, nu: int | None = None) -> tuple[list[int], int]:
         """(snapshots the pipeline would compute, snapshots on disk) -- the script's own test:
-        <prefix>.pts_den newer than the combined file and the plane (+ .pts_velGrad present).
-        A CENTER change is not predicted here (the script compares it against the sidecar)."""
+        <prefix>.pts_den newer than the combined file and the plane (+ .pts_velGrad present), and a
+        plane file of this job's geometry (a differing one is regenerated: everything is stale then)."""
         sp = sim_dir(sim, self.data_root)
         plane_bin = self.plane_json(sim, nu).with_suffix(".bin")
+        plane_ok = (plane_bin.is_file() and self.plane_json(sim, nu).is_file()
+                    and self.plane_matches(sim, nu) is not False)
         todo, total = [], 0
         for f in sorted(sp.glob("snapdir_*/combined_[0-9][0-9][0-9].hdf5")):
             n, total = int(f.stem.split("_")[1]), total + 1
             den = f.parent / f"{self.output_prefix}.pts_den"
-            fresh = (not self.force and plane_bin.is_file() and self.plane_json(sim, nu).is_file()
+            fresh = (not self.force and plane_ok
                      and den.is_file() and den.stat().st_mtime > max(f.stat().st_mtime, plane_bin.stat().st_mtime)
                      and (not self.vel_grad or (f.parent / f"{self.output_prefix}.pts_velGrad").is_file()))
             if not fresh:
                 todo.append(n)
         return todo, total
 
+    # ------------------------------------------------------------------ checks
     def problems(self) -> list[tuple[str, str]]:
         out = _root_problems(self.data_root)
         if not out:
@@ -452,17 +580,43 @@ class PipelineSpec:
             else:
                 out.append(("warning", "a centre differing from an existing plane regenerates it, "
                                        "which makes EVERY snapshot of that simulation stale"))
-        if not self.fields:
-            out.append(("error", "no fields selected"))
+        if not 1 <= self.planes <= 256:
+            out.append(("error", f"planes across the slab must be 1..256 (got {self.planes})"))
+        elif self.planes > 1 and self.thickness <= 0:
+            out.append(("error", "a slab of several planes needs a positive thickness (Mpc)"))
+        elif 1 < self.planes < PLANE_GHOSTING_MIN:
+            out.append(("warning", f"{self.planes} planes across the slab: a handful of planes ghosts every inclined "
+                                   f"structure (one displaced copy per plane); use 1 for a crisp cross-section, "
+                                   f">= {PLANE_GHOSTING_MIN} for a smooth projection"))
+        if not 1 <= self.supersample <= 8:
+            out.append(("error", f"sub-samples per pixel must be 1..8 (got {self.supersample})"))
+        try:
+            self.window_values()
+        except ValueError as e:
+            out.append(("error", str(e)))
+        out += _precision_problems("ps", self.precision)
+        if self.gpu and not gpu_built("ps", self.precision):
+            out.append(("warning", f"GPU requested, but the binary was built without GPU support ({GPU_BUILD_HINT}): "
+                                   "the deposit will run on the CPU"))
+        out += _ps_option_problems(self, max((dm_particles(s) or 0 for s in self.sims), default=0) or None)
         if self.output_prefix.strip() == "" or re.search(r"[\s/]", self.output_prefix):
             out.append(("error", "output prefix must be a single word (no spaces or '/')"))
+        if self.render:
+            bad = [f for f in self.render_fields.replace(" ", "").split(",") if f and f not in POINTEVAL_FIELDS]
+            if bad:
+                out.append(("error", f"unknown point-evaluated field(s) {', '.join(bad)}; "
+                                     f"choose from {', '.join(POINTEVAL_FIELDS)}"))
+            if self.render_smooth < 0 or self.render_smooth_derivatives < 0:
+                out.append(("error", "smoothing widths must be >= 0 pixels"))
         out += _scratch_problems(self.scratch_dir)
-        pts_gb = self.nu ** 2 * 545e-9
-        gb = grids_gb(self.grid, self.fields) + pts_gb
+        pts = self.plane_points()
+        pts_gb = pts * 545e-9
+        gb = grids_gb(self.grid, self.fields, self.precision) + pts_gb
         if not self.scratch_dir and gb > 40:
-            out.append(("warning", f"~{grids_gb(self.grid, self.fields):.0f} GB of grids + ~{pts_gb:.0f} GB for the "
-                                   f"{self.nu}^2 image plane will not fit next to the triangulation on 64 GB: "
-                                   "set a scratch directory (bit-identical results)"))
+            shape = f"{self.nu}^2 image plane" + (f" ({pts / 1e6:.0f}M points)" if pts != self.nu ** 2 else "")
+            out.append(("warning", f"~{grids_gb(self.grid, self.fields, self.precision):.0f} GB of grids + "
+                                   f"~{pts_gb:.0f} GB for the {shape} will not fit next to the triangulation on "
+                                   "64 GB: set a scratch directory (bit-identical results)"))
         if self.force:
             out.append(("warning", "FORCE recomputes every snapshot, including up-to-date ones"))
         if self.adaptive:
@@ -477,16 +631,41 @@ class PipelineSpec:
             out += _busy_problems()
         return out
 
+    # ------------------------------------------------------------------ commands
     def command(self) -> tuple[list[str], dict[str, str]]:
         env = {"DTFE_DATA_ROOT": str(self.data_root), "SIMS": " ".join(self.sims),
                "NU": str(self.nu), "AXIS": self.axis, "GRID_SIZE": str(self.grid),
-               "PTS_VEL_GRAD": "1" if self.vel_grad else "0"}
+               "PTS_VEL_GRAD": "1" if self.vel_grad else "0",
+               "PLANES": str(self.planes), "SUPERSAMPLE": str(self.supersample),
+               # the run options, always spelled out (as RunSpec does): a stray PS_* exported in the
+               # login shell must not leak into a run
+               "PS_EXACT": "1" if self.deposit == "exact" else "0",
+               "AVG_SUBSAMPLES": str(self.nsub),
+               "PS_GPU": "1" if self.gpu else "0",
+               "PS_METAL": "1" if self.gpu else "0",      # -m only switches the GPU ON; pin the env knob too
+               "PS_VERTEX_MASS": "1" if self.vertex_mass else "0",
+               "PS_VOLUME_WEIGHTED": "1" if self.volume_weighted else "0",
+               "PS_CAUSTICS": "1" if self.caustics else "0",
+               "PS_CAUSTIC_CUSPS": "1" if self.caustic_cusps else "0",
+               "PS_PARALLEL_TRI": "1" if self.parallel_triangulation else "0"}
+        if self.planes > 1:
+            env["THICKNESS"] = _num(self.thickness)
+        try:
+            w = self.window_values()
+        except ValueError:
+            w = None
+        if w:
+            env["WINDOW"] = " ".join(_num(v) for v in w)
         if self.center.strip():
             env["CENTER"] = self.center.strip()
+        if self.lambda_th != LAMBDA_TH_DEFAULT:
+            env["LAMBDA_TH"] = f"{self.lambda_th:g}"
         if self.fields != PS_DEFAULT_FIELDS:
             env["FIELDS"] = " ".join(self.fields)
         if self.output_prefix != "ps_output":
             env["OUTPUT_PREFIX"] = self.output_prefix
+        if self.precision == "double":
+            env["DTFE_PRECISION"] = "double"
         if self.partition > 0:
             env["PARTITION"] = f"{self.partition} {self.partition} {self.partition}"
         if self.max_concurrent > 0:
@@ -507,6 +686,19 @@ class PipelineSpec:
             a += ["--snaps", ",".join(str(n) for n in sorted(snaps))]
         if self.output_prefix != "ps_output":
             a += ["--prefix", self.output_prefix]
+        fields = ",".join(f for f in self.render_fields.replace(" ", "").split(",") if f)
+        if fields:
+            a += ["--fields", fields]
+        if self.render_project == "slab" and self.planes > 1:     # one plane: the plane itself
+            a += ["--project", "slab"]
+        if self.render_smooth > 0:
+            a += ["--smooth", f"{self.render_smooth:g}"]
+        if self.render_smooth_derivatives != POINTEVAL_DERIVATIVE_SMOOTH:
+            a += ["--smooth-derivatives", f"{self.render_smooth_derivatives:g}"]
+        if self.render_fixed_range:
+            a.append("--fixed-range")
+        if self.render_force:
+            a.append("--force")
         if Path(self.figures_root) != FIGURES_ROOT:
             a += ["--figures-root", str(self.figures_root)]
         return Step(f"plot_pointeval.py {sim}" + (f" {nu}^2" if snaps else ""), a, _plot_env(self.data_root, sim))
@@ -546,9 +738,49 @@ class PipelineSpec:
         return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
 
 
-def grids_gb(grid: int, fields: list[str]) -> float:
+def grids_gb(grid: int, fields: list[str], precision: str = "single", dim: int = 3) -> float:
     b = 8 + sum(_FIELD_BYTES.get(f, 12) for f in fields)   # + stream counts/weights
-    return grid ** 3 * b / 1e9
+    if precision == "double":
+        b *= 2                                              # Real = double: every grid twice the bytes
+    return grid ** dim * b / 1e9
+
+
+PRECISIONS = ("single", "double")
+PRECISION_TEXT = {"single": "single precision (the default)",
+                  "double": "double precision: positions and fields in float64 from the input read onward, "
+                            "about twice the memory"}
+
+
+DIMS = (3, 2)
+DIM_TEXT = {3: "3D", 2: "2D: a snapshot in a plane (two-column coordinates; the 2D programs, CPU only)"}
+
+
+def binary_name(estimator: str, precision: str = "single", dim: int = 3) -> str:
+    """The binary a job runs: PS-DTFE / DTFE, then '-2d' for the 2D set ('make ... DIM=2') and
+    '-double' for the double-precision pair -- the Makefile's names (PS-DTFE-2d-double)."""
+    return (("PS-DTFE" if estimator == "ps" else "DTFE") + ("-2d" if dim == 2 else "")
+            + ("-double" if precision == "double" else ""))
+
+
+def binary_built(estimator: str, precision: str = "single", dim: int = 3) -> bool:
+    return (REPO_ROOT / binary_name(estimator, precision, dim)).is_file()
+
+
+def build_hint(precision: str = "single", dim: int = 3) -> str:
+    """The make call that builds a pair (the targets are DTFE and PS-DTFE whatever the set)."""
+    args = ["make", "DTFE", "PS-DTFE"] + (["DIM=2"] if dim == 2 else []) + (["DOUBLE=1"] if precision == "double" else [])
+    return " ".join(args)
+
+
+def _precision_problems(estimator: str, precision: str, dim: int = 3) -> list[tuple[str, str]]:
+    if precision not in PRECISIONS:
+        return [("error", f"unknown precision '{precision}' (single or double)")]
+    if precision == "double" and not binary_built(estimator, "double", dim):
+        gpu = "" if dim == 2 else ", with METAL=1 on Apple Silicon, CUDA=1 or HIP=1 on Linux"
+        return [("error", f"the double-precision program {binary_name(estimator, 'double', dim)} is not built: "
+                          + ("Setup builds the pair (or " if dim == 3 else "build it with ")
+                          + f"'{build_hint('double', dim)}'{gpu}" + (")" if dim == 3 else ""))]
+    return []
 
 
 def _plot_env(data_root: str, sim: str) -> dict[str, str]:
@@ -943,7 +1175,9 @@ class DataSpec:
     def steps(self) -> list[Step]:
         todo = self._todo()
         snaps, gcs = [str(n) for n in todo["snaps"]], [str(n) for n in todo["gcs"]]
-        env = {"DTFE_DATA_ROOT": str(self.data_root)}
+        # PY: the download script checks the chunks already on disk with h5py (an incomplete one is fetched
+        # again) -- the same python the merge step runs with
+        env = {"DTFE_DATA_ROOT": str(self.data_root), "PY": PYTHON}
         dl = [str(DOWNLOAD_SCRIPT)]
         out = []
         if self.download_snapshots and snaps:
@@ -956,15 +1190,35 @@ class DataSpec:
             out.append(Step("download initial conditions", dl + ["-i", "-s", self.sim], env))
         merge = [PYTHON, str(MERGE_TOOL), "-d", str(self.sim_path())]
         tail = ["--delete-chunks"] if self.delete_chunks else []
+        # a merge runs only when its download step exited 0: half a download merged is a product with
+        # missing particles (merge_HDF5.py refuses what it can detect; a missing TREE chunk it cannot)
+        have = {st.label.split(" ")[1]: st.label for st in out}        # 'snapshots', 'group', 'merger', 'initial'
         if self.merge_snapshots and snaps:
-            out.append(Step(f"merge snapshots {' '.join(snaps)}", merge + snaps + tail, {}))
+            out.append(Step(f"merge snapshots {' '.join(snaps)}", merge + snaps + tail, {}, after=have.get("snapshots", "")))
         if self.merge_groupcats and gcs:
-            out.append(Step(f"merge group catalogues {' '.join(gcs)}", merge + ["--groupcats", *gcs] + tail, {}))
+            out.append(Step(f"merge group catalogues {' '.join(gcs)}", merge + ["--groupcats", *gcs] + tail, {},
+                            after=have.get("group", "")))
         if self.merge_trees and todo["trees"]:
-            out.append(Step("merge merger trees", merge + ["--trees"] + tail, {}))
+            out.append(Step("merge merger trees", merge + ["--trees"] + tail, {}, after=have.get("merger", "")))
         if self.convert_ics and todo["ics"]:
-            out.append(Step("convert initial conditions", merge + ["--ics"] + tail, {}))
+            out.append(Step("convert initial conditions", merge + ["--ics"] + tail, {}, after=have.get("initial", "")))
         return out
+
+    def stale_partials(self) -> list:
+        """combined_*.hdf5.partial files a stopped merge left for the products about to be merged: the
+        merge removes them first, so their bytes are free for it (and worth a word)."""
+        todo = self._todo()
+        sp = self.sim_path()
+        cands = []
+        if self.merge_snapshots:
+            cands += [sp / f"snapdir_{n:03d}" / f"combined_{n:03d}.hdf5.partial" for n in todo["snaps"]]
+        if self.merge_groupcats:
+            cands += [sp / f"groups_{n:03d}" / f"combined_fof_subhalo_tab_{n:03d}.hdf5.partial" for n in todo["gcs"]]
+        if self.merge_trees and todo["trees"]:
+            cands.append(sp / "Merger Trees" / "combined_tree_extended.hdf5.partial")
+        if self.convert_ics and todo["ics"]:
+            cands.append(sp / "combined_ics.hdf5.partial")
+        return [c for c in cands if c.is_file()]
 
     def download_bytes(self) -> tuple[int, int]:
         """(estimated raw download, estimated merged output) in bytes for the chosen snapshots,
@@ -1031,8 +1285,14 @@ class DataSpec:
             out.append(("warning", "deleting the raw chunks after the merge removes "
                                    "the only copy of the fields the merge drops (potential, Subfind densities)"))
         raw, merged = self.download_bytes()
+        stale = self.stale_partials()
+        if stale:
+            gb = sum(p.stat().st_size for p in stale) / 1e9
+            out.append(("warning", f"a stopped merge left {gb:.1f} GB in " + ", ".join(p.name for p in stale)
+                                   + "; the merge removes it first"))
         try:
             free = shutil.disk_usage(self.data_root).free
+            free += sum(p.stat().st_size for p in stale)
         except OSError:
             free = None
         if free is not None and raw + merged > free:
@@ -1063,12 +1323,14 @@ class CustomSpec:
     """The binary on the user's own snapshot file: one call, every assumption the TNG scripts make
     (layout, kpc units, the IC file) spelled out as options. Writes '<output_dir>/<name>.*' and a
     run log beside it; the GUI keeps these settings next to the outputs ('<name>.gui.json') so
-    the Explore tab can query the same snapshot later."""
+    the Explore tab can query the same snapshot later. dim = 2 runs the 2D set (DTFE-2d, PS-DTFE-2d:
+    a snapshot whose coordinates have two columns), CPU only."""
     input_file: str = ""
     input_type: int = 105
+    dim: int = 3                    # 2: the 2D programs (make DIM=2) on a 2D snapshot (snapshot_dim)
     mpc_unit: float = 1.0           # 1 Mpc in the file's length unit (1 = Mpc, 1000 = kpc)
     periodic: bool = True
-    box: list[float] = field(default_factory=list)   # [] = the header's box; else xlo xhi ylo yhi zlo zhi
+    box: list[float] = field(default_factory=list)   # [] = the header's box; else xlo xhi ylo yhi [zlo zhi]
     estimator: str = "ps"
     lagrangian: str = "file"        # "file": InitialCoordinates in the snapshot; "separate": lagrangian_file
     lagrangian_file: str = ""
@@ -1082,6 +1344,7 @@ class CustomSpec:
     caustics: bool = False
     caustic_cusps: bool = False
     parallel_triangulation: bool = False   # --parallel-triangulation (opt-in, see RunSpec)
+    precision: str = "single"       # "double" = the -double binary (float64 end to end, ~2x memory), see RunSpec
     alpha_shape: float = 3.0        # --ps-alpha-shape, non-periodic clouds only: emitted when not the default 3
     scalar_dataset: str = ""
     output_dir: str = str(CUSTOM_OUT_DEFAULT)
@@ -1089,7 +1352,10 @@ class CustomSpec:
     partition: int = 0
     max_concurrent: int = 0
     scratch_dir: str = ""
-    demo_n: int = 0                 # > 0: first generate the synthetic demo snapshot (crossed waves, n^3)
+    lambda_th: float = LAMBDA_TH_DEFAULT   # --lambda_th with a web field (the binary's own default is 0.0)
+    demo_n: int = 0                 # > 0: first generate the synthetic demo snapshot (crossed waves, n^3) ...
+    demo_file: str = ""             # ... but only at THIS path (demo_spec sets it): the setting is persisted, and
+                                    # before 2026-10-05 any later missing input quietly became a demo
 
     def name(self) -> str:
         return self.output_name.strip() or (Path(self.input_file).stem if self.input_file else "output")
@@ -1110,21 +1376,24 @@ class CustomSpec:
         return [0]
 
     def binary(self) -> Path:
-        return REPO_ROOT / ("PS-DTFE" if self.estimator == "ps" else "DTFE")
+        return REPO_ROOT / binary_name(self.estimator, self.precision, self.dim)
 
     def command(self) -> list[str]:
         ps = self.estimator == "ps"
+        three = self.dim != 2           # a 2D run: no GPU, no parallel insertion (both 3D only)
         out = self.output_root()
         a = [str(self.binary()), str(Path(self.input_file).expanduser()), str(out),
              "--grid", str(self.grid), "--input", str(self.input_type), "--MpcUnit", f"{self.mpc_unit:g}"]
         if self.periodic:
             a.append("--periodic")
-        if len(self.box) == 6:
+        if len(self.box) == 2 * self.dim:
             a += ["--box"] + [f"{v:g}" for v in self.box]
         fields = list(self.fields) if ps else list(DTFE_FIELDS)
         if self.scalar_dataset and "scalar_a" not in fields:
             fields.append("scalar_a")
         a += ["--field", *fields]
+        if any(f in WEB_FIELDS for f in fields):      # the scripts' threshold, not the binary's 0.0
+            a += ["--lambda_th", f"{self.lambda_th:g}"]
         if self.scalar_dataset:
             a += ["--scalar-dataset", self.scalar_dataset]
         if ps:
@@ -1134,23 +1403,35 @@ class CustomSpec:
                 a += ["--avg-subsamples", str(self.nsub)]
             if self.lagrangian == "separate" and self.lagrangian_file:
                 a += ["--lagrangianInput", str(Path(self.lagrangian_file).expanduser())]
-            for on, flag in ((self.gpu, "--ps-gpu"), (self.vertex_mass, "--ps-vertex-mass"),
+            for on, flag in ((self.gpu and three, "--ps-gpu"), (self.vertex_mass, "--ps-vertex-mass"),
                              (self.volume_weighted, "--ps-volume-weighted"), (self.caustics, "--ps-caustics"),
                              (self.caustic_cusps, "--ps-caustic-cusps"),
-                             (self.parallel_triangulation, "--parallel-triangulation")):
+                             (self.parallel_triangulation and three, "--parallel-triangulation")):
                 if on:
                     a.append(flag)
             if not self.periodic and self.alpha_shape != 3.0:
                 a += ["--ps-alpha-shape", f"{self.alpha_shape:g}"]
-        elif self.gpu:
-            a.append("--gpu")
+        else:
+            if self.gpu and three:
+                a.append("--gpu")
+            if self.deposit == "exact":
+                a.append("--exact-average")
         if self.partition > 0:
-            a += ["--partition"] + [str(self.partition)] * 3
+            a += ["--partition"] + [str(self.partition)] * self.dim
         if self.max_concurrent > 0:
             a += ["--max-concurrent", str(self.max_concurrent)]
         if self.scratch_dir:
             a += ["--scratch-dir", str(Path(self.scratch_dir).expanduser())]
         return a
+
+    def memory_key(self) -> str:
+        return _memory_key(self, ("output_dir", "output_name", "demo_n", "demo_file", "lambda_th"))
+
+    def demo_pending(self) -> bool:
+        """The demo snapshot is to be generated first: the demo's own input path, not on disk yet."""
+        f = Path(self.input_file).expanduser() if self.input_file else None
+        return (self.demo_n > 0 and bool(self.demo_file) and f is not None
+                and f == Path(self.demo_file).expanduser() and not f.is_file())
 
     def check_step(self) -> Step:
         """The same binary call in report mode: its auto-tuner's split and memory prediction for this
@@ -1159,12 +1440,14 @@ class CustomSpec:
 
     def steps(self) -> list[Step]:
         out = []
-        if self.demo_n > 0 and not Path(self.input_file).expanduser().is_file():
+        if self.demo_pending():
             demo = Path(self.input_file).expanduser()
             out.append(Step("create the demo folder", ["mkdir", "-p", str(demo.parent)], {}))
-            out.append(Step(f"generate the demo snapshot ({self.demo_n}³ particles, crossed waves)",
+            out.append(Step(f"generate the demo snapshot ({self.demo_n}{'²' if self.dim == 2 else '³'} particles, "
+                            "crossed waves)",
                             [PYTHON, str(DEMO_GENERATOR), "--out", str(demo), "--n", str(self.demo_n),
-                             "--box", "100", "--amplitude-factor", "1.5", "--crossed-waves"], {}))
+                             "--box", "100", "--amplitude-factor", "1.5", "--crossed-waves"]
+                            + (["--dim", "2"] if self.dim == 2 else []), {}))
         root = self.output_root()
         if not root.parent.is_dir() and str(root.parent) != str(Path(self.input_file).expanduser().parent):
             out.append(Step("create the output folder", ["mkdir", "-p", str(root.parent)], {}))
@@ -1184,12 +1467,12 @@ class CustomSpec:
         if self.lagrangian != "separate":
             d["lagrangian_file"] = ""
         d["box_mpc"] = []
-        if len(self.box) == 6 and self.mpc_unit > 0:
+        if len(self.box) == 2 * self.dim and self.mpc_unit > 0:
             d["box_mpc"] = [v / self.mpc_unit for v in self.box]
         elif f.is_file() and self.input_type == 105 and self.mpc_unit > 0:
             b = hdf5_boxsize(f)
             if b:
-                d["box_mpc"] = [0.0, b / self.mpc_unit] * 3
+                d["box_mpc"] = [0.0, b / self.mpc_unit] * self.dim
         return d
 
     def problems(self) -> list[tuple[str, str]]:
@@ -1198,11 +1481,18 @@ class CustomSpec:
         f = Path(self.input_file).expanduser() if self.input_file else None
         if f is None:
             return [("error", "no snapshot file chosen")]
-        demo_pending = self.demo_n > 0 and not f.is_file()
+        demo_pending = self.demo_pending()
         if not f.is_file() and not demo_pending:
             out.append(("error", f"snapshot file not found: {f}"))
         if self.input_type not in INPUT_TYPES:
             out.append(("error", f"unknown input type {self.input_type}"))
+        d = self.dim
+        if d not in DIMS:
+            return out + [("error", f"unknown dimension {d} (2 or 3)")]
+        found = snapshot_dim(f, self.input_type) if f.is_file() else None
+        if found is not None and found != d:
+            out.append(("error", f"this snapshot is {found}D (its coordinates have {found} columns): "
+                                 f"set the dimensions to {found}D"))
         if ps and self.input_type != 105:
             out.append(("error", "the phase-space estimator needs a Gadget HDF5 snapshot (particle IDs and "
                                  "initial positions); use standard DTFE for this format"))
@@ -1210,17 +1500,24 @@ class CustomSpec:
             out.append(("error", "the length unit must be positive (1 Mpc in the file's units)"))
         if self.alpha_shape < 0:
             out.append(("error", "the alpha shape takes a number of mean particle spacings >= 0 (0 keeps the whole hull)"))
-        if ps and self.parallel_triangulation and not tbb_built():
+        out += _precision_problems(self.estimator, self.precision, d)
+        if d == 2:
+            if self.gpu:
+                out.append(("info", "the 2D programs run on the CPU (the GPU kernels are 3D): the GPU setting is ignored"))
+            if ps and self.parallel_triangulation:
+                out.append(("info", "the parallel triangulation is 3D only: a 2D run inserts sequentially"))
+        elif ps and self.parallel_triangulation and not tbb_built(self.precision):
             out.append(("warning", "parallel triangulation asked for, but the binary was built without TBB: ignored"))
         elif ps and self.parallel_triangulation:
             out.append(("warning", "parallel triangulation: faster on small sets, but two identical runs then differ "
                                    "at float rounding (the stream counts do not)"))
-        if f is not None and f.is_file() and self.input_type == 105:
-            out += gpu_advice(self.gpu, self.deposit, self.fields if ps else list(DTFE_FIELDS),
-                              hdf5_particle_count(f), self.estimator)
+        n = hdf5_particle_count(f) if (f.is_file() and self.input_type == 105) else None
+        out += gpu_advice(self.gpu, self.deposit, self.fields if ps else list(DTFE_FIELDS), n, self.estimator,
+                          grid=self.grid, precision=self.precision, dim=d)
         if self.box:
-            if len(self.box) != 6 or any(self.box[2 * i + 1] <= self.box[2 * i] for i in range(3)):
-                out.append(("error", "the box needs 6 numbers, xlo xhi ylo yhi zlo zhi, each hi > lo"))
+            if len(self.box) != 2 * d or any(self.box[2 * i + 1] <= self.box[2 * i] for i in range(d)):
+                names = "xlo xhi ylo yhi" + (" zlo zhi" if d == 3 else "")
+                out.append(("error", f"the box needs {2 * d} numbers, {names}, each hi > lo"))
             elif min(self.box) < 0:
                 out.append(("error", "box corners must be >= 0 (the binary's option parser reads a negative "
                                      "number as an option): shift the coordinates, or leave the box to the header"))
@@ -1237,8 +1534,8 @@ class CustomSpec:
                 out.append(("error", f"no dataset '{self.scalar_dataset}' in the snapshot's particle groups"))
         if self.scalar_dataset and self.input_type != 105:
             out.append(("error", "a per-particle scalar dataset needs Gadget HDF5 input"))
-        if not 8 <= self.grid <= 4096:
-            out.append(("error", f"grid {self.grid}^3 is outside 8..4096"))
+        if not 8 <= self.grid <= (65536 if d == 2 else 4096):
+            out.append(("error", f"grid {self.grid}{'²' if d == 2 else '³'} is outside 8..{65536 if d == 2 else 4096}"))
         if ps and not self.fields:
             out.append(("error", "no fields selected"))
         name = self.name()
@@ -1250,10 +1547,12 @@ class CustomSpec:
         elif "Mobile Documents" in str(od):
             out.append(("warning", "the output folder is in iCloud Drive: grids are large, and syncing them "
                                    "is slow, so a local folder is better"))
-        if self.gpu and not gpu_built(self.estimator):
-            out.append(("warning", "GPU requested, but the binary was built without METAL=1: it will use the CPU"))
-        if not self.binary().is_file():
-            out.append(("error", f"{self.binary().name} is not built (Setup, or 'make {self.binary().name}')"))
+        if self.gpu and d == 3 and not gpu_built(self.estimator, self.precision):
+            out.append(("warning", f"GPU requested, but the binary was built without GPU support ({GPU_BUILD_HINT}): "
+                                   "it will use the CPU"))
+        if not self.binary().is_file() and self.precision == "single":
+            how = f"'make {self.binary().name}'" if d == 3 else f"'{build_hint('single', 2)}'"
+            out.append(("error", f"{self.binary().name} is not built (Setup, or {how})"))
         out += _scratch_problems(self.scratch_dir)
         if (self.output_root().parent / (self.name() + ".a_den")).exists():
             out.append(("info", f"'{name}' already has outputs in this folder: they will be overwritten"))
@@ -1266,6 +1565,36 @@ class CustomSpec:
     @classmethod
     def from_dict(cls, d: dict) -> "CustomSpec":
         return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+def snapshot_dim(path, input_type: int = 105) -> int | None:
+    """2 or 3: the dimension of a snapshot file, None when the file cannot tell. Gadget HDF5: the
+    columns of its particles' Coordinates (a 2D snapshot holds (N, 2) datasets, as
+    tests/generate_ps_test_data.py --dim 2 writes); the text formats: the box on the second line
+    holds 2 x dim numbers (io/text_io.cc); Gadget binary carries no dimension (None)."""
+    p = Path(path).expanduser()
+    if not p.is_file():
+        return None
+    if input_type == 105:
+        try:
+            import h5py
+            with h5py.File(p, "r") as h:
+                for name in sorted(h.keys()):
+                    c = h[name].get("Coordinates") if name.startswith("PartType") else None
+                    if c is not None and len(c.shape) == 2 and c.shape[1] in (2, 3):
+                        return int(c.shape[1])
+        except Exception:
+            return None
+        return None
+    if input_type in (111, 112):
+        try:
+            with open(p, errors="replace") as fh:
+                fh.readline()
+                n = len(fh.readline().replace(",", " ").split())
+        except OSError:
+            return None
+        return n // 2 if n in (4, 6) else None
+    return None
 
 
 def hdf5_boxsize(path) -> float | None:
@@ -1301,15 +1630,18 @@ def hdf5_has(path, dataset: str) -> bool | None:
         return None
 
 
-def demo_spec(output_dir=None, gpu: bool = False) -> CustomSpec:
+def demo_spec(output_dir=None, gpu: bool | None = None) -> CustomSpec:
     """The first-run demo: a synthetic 32^3 crossed-wave snapshot (streams 1/3/9/27) and a quick
-    PS-DTFE run on it -- about half a minute, no download."""
+    PS-DTFE run on it -- about half a minute, no download. gpu None: where the deposit pays for
+    32^3 particles (the CPU, see recommended_gpu)."""
     od = Path(output_dir).expanduser() if output_dir else CUSTOM_OUT_DEFAULT / "demo"
+    fields = ["density_a", "velocity_a", "dispersion_a", "divergence_a"]
+    if gpu is None:
+        gpu = recommended_gpu("sampled", fields, 32 ** 3)
     return CustomSpec(input_file=str(od / "crossed_waves_32.hdf5"), input_type=105, mpc_unit=1.0,
                       periodic=True, estimator="ps", lagrangian="file", grid=64, nsub=2,
-                      fields=["density_a", "velocity_a", "dispersion_a", "divergence_a"],
-                      gpu=gpu, vertex_mass=False, volume_weighted=True, caustics=True,
-                      output_dir=str(od), output_name="demo", demo_n=32)
+                      fields=fields, gpu=gpu, vertex_mass=False, volume_weighted=True, caustics=True,
+                      output_dir=str(od), output_name="demo", demo_n=32, demo_file=str(od / "crossed_waves_32.hdf5"))
 
 
 # ---------------------------------------------------------------------- job queue
@@ -1329,13 +1661,15 @@ def job_summary(kind: str, spec) -> str:
     """One line naming what a job does, for the queue list."""
     if kind == "custom":
         est = "PS-DTFE" if spec.estimator == "ps" else "DTFE"
-        return f"Custom snapshot · {Path(spec.input_file).name} · {est} {spec.grid}³ -> {spec.output_root()}"
+        cells = "²" if getattr(spec, "dim", 3) == 2 else "³"
+        return f"Custom snapshot · {Path(spec.input_file).name} · {est} {spec.grid}{cells} -> {spec.output_root()}"
     if kind == "grids":
         est = "PS-DTFE" if spec.estimator == "ps" else "DTFE"
-        extra = ", exact" if spec.estimator == "ps" and spec.deposit == "exact" else ""
+        extra = ", exact" if spec.deposit == "exact" else ""
         return f"Grids · {spec.sim} · {_snaps_text(spec.snapshots)} · {est} {spec.grid}³{extra}"
     if kind == "pipeline":
         return (f"Pipeline · {', '.join(spec.sims)} · plane {spec.nu}² · grid {spec.grid}³"
+                + (", exact" if spec.deposit == "exact" else "")
                 + (" · plan only" if spec.plan_only else " · + figures" if spec.render else ""))
     if kind == "plots":
         names = [FIGURE_SET[k].title for k in spec.sets if k in FIGURE_SET]
@@ -1469,65 +1803,209 @@ def plane_points(path) -> int:
         return 0
 
 
-def gpu_built(estimator: str) -> bool:
-    objdir = REPO_ROOT / ("o_ps" if estimator == "ps" else "o")
+def _objdir(estimator: str, precision: str = "single", dim: int = 3) -> Path:
+    """The Makefile's object directory of a pair: o / o_ps, o_d / o_ps_d for the double pair, and
+    '_2d' before the '_d' for the 2D set (o_2d, o_ps_2d_d)."""
+    return REPO_ROOT / (("o_ps" if estimator == "ps" else "o") + ("_2d" if dim == 2 else "")
+                        + ("_d" if precision == "double" else ""))
+
+
+def gpu_built(estimator: str, precision: str = "single", dim: int = 3) -> bool:
+    if dim == 2:                    # the GPU kernels deposit tetrahedra into 3D cells: a 2D build is CPU-only
+        return False
+    objdir = _objdir(estimator, precision)
     return objdir.is_dir() and not (objdir / ".gpu_mode_off").exists()
 
 
-def tbb_built() -> bool:
-    """PS-DTFE was built with the TBB parallel insertion (o_ps/.tbb_1, the Makefile's stamp)."""
-    return (REPO_ROOT / "o_ps" / ".tbb_1").exists()
+# the make argument that gives this machine a GPU build, for messages
+GPU_BUILD_HINT = "METAL=1 on a Mac, CUDA=1 or HIP=1 on Linux"
+GPU_BACKENDS = {"metal": "Metal", "cuda": "CUDA", "hip": "HIP"}
+
+
+def gpu_backend(estimator: str, precision: str = "single", dim: int = 3) -> str:
+    """The GPU backend a pair was built with ('Metal', 'CUDA', 'HIP'), from the Makefile's
+    .gpu_mode_<mode> stamp; '' for a CPU-only build (every 2D one) or an unbuilt pair."""
+    if dim == 2:
+        return ""
+    objdir = _objdir(estimator, precision)
+    for stamp, name in GPU_BACKENDS.items():
+        if (objdir / f".gpu_mode_{stamp}").exists():
+            return name
+    return ""
+
+
+def gpu_compiler() -> str:
+    """The GPU compiler this machine offers for a build: 'METAL=1' on a Mac (the Metal host needs
+    only the system SDK), 'CUDA=1' when nvcc is on the PATH or under /usr/local/cuda, 'HIP=1' when
+    hipcc is (or under /opt/rocm); '' when there is none -- the build is then CPU-only."""
+    if sys.platform == "darwin":
+        return "METAL=1"
+    if shutil.which("nvcc") or Path("/usr/local/cuda/bin/nvcc").is_file():
+        return "CUDA=1"
+    if shutil.which("hipcc") or Path("/opt/rocm/bin/hipcc").is_file():
+        return "HIP=1"
+    return ""
+
+
+def tbb_built(precision: str = "single", dim: int = 3) -> bool:
+    """PS-DTFE was built with the TBB parallel insertion (o_ps/.tbb_1, the Makefile's stamp). The
+    parallel insertion is 3D only (CGAL's parallel Delaunay): a 2D build inserts sequentially."""
+    return dim == 3 and (_objdir("ps", precision) / ".tbb_1").exists()
 
 
 # Where the GPU deposit pays, measured on this machine (2026-10-01, 256^3 sampled grids): 0.26M
-# particles CPU 18 s vs GPU 24 s, 2.1M 51 vs 20 s, 7.1M 115 vs 40 s; the exact deposit is only
-# practical on the GPU at any size; a run that writes no grid (a slice alone) deposits nothing.
+# particles CPU 18 s vs GPU 24 s, 2.1M 51 vs 20 s, 7.1M 115 vs 40 s; the exact deposit: 0.26M CPU
+# 57 s vs GPU 29 s (the threaded CPU deposit made it feasible; the GPU's lead grows with size);
+# a run that writes no grid (a slice alone) deposits nothing.
+# Standard DTFE (2026-10-01 evening, after the work-item kernel with the threadgroup cell table):
+# 7.1M particles at 512^3 CPU 39.1 s vs GPU 17.3 s (with the velocity gradient 48.2 vs 32.0 s), 2.1M at
+# 512^3 24.6 vs 10.6 s, 0.26M at 256^3 3.8 vs 2.0 s; 7.1M at 256^3 ties (14.2 vs 14.4 s: reading,
+# triangulation and writing are the floor there). The per-tetrahedron kernel of the morning was 10x
+# SLOWER at 512^3 (396.7 s). So the GUI starts standard-DTFE jobs on the GPU when it is built and
+# says so when a fine-grid run has it unticked. Its exact cell average (--exact-average, 2026-10-02):
+# 0.26M particles at 256^3 CPU 26.9 s vs GPU 4.1 s (interpolation step).
 GPU_PAYS_FROM = 1_000_000
+DTFE_GPU_PAYS_FROM_GRID = 512
 
 
-def gpu_advice(gpu: bool, deposit: str, fields, n_particles, estimator: str) -> list[tuple[str, str]]:
-    """A warning when the GPU setting is the slower one for this run; [] when it is right or unknown."""
-    if estimator != "ps" or not fields or n_particles is None:
+def gpu_advice(gpu: bool, deposit: str, fields, n_particles, estimator: str,
+               grid: int = 0, precision: str = "single", dim: int = 3) -> list[tuple[str, str]]:
+    """A warning when the GPU setting is the slower one for this run; [] when it is right or unknown
+    (and for a 2D run, which has no GPU)."""
+    if dim == 2:
+        return []
+    if estimator == "dtfe":
+        if deposit == "exact" and not gpu and gpu_built("dtfe", precision):
+            return [("warning", "the exact cell average is ~6.6x faster on the GPU (4.1 s against 26.9 s at 256³ "
+                                "with 0.26M particles); tick the GPU")]
+        if not gpu and grid >= DTFE_GPU_PAYS_FROM_GRID and gpu_built("dtfe", precision):
+            return [("warning", f"standard DTFE on a {grid}³ grid: the GPU interpolation is 1.5-2.3x faster than "
+                                "the CPU (17 s against 39 s at 512³ with 7.1M particles); tick the GPU")]
+        return []
+    if estimator != "ps" or not fields:
         return []
     if deposit == "exact":
-        return [] if gpu else [("warning", "the exact deposit is only practical on the GPU")]
+        if gpu or not gpu_built("ps", precision):
+            return []
+        return [("warning", "the exact deposit is 2x faster on the GPU at 0.26M particles (29 s against 57 s on the "
+                            "CPU) and the gap grows with the particle count; tick the GPU")]
+    if n_particles is None:
+        return []
     if gpu and n_particles < GPU_PAYS_FROM:
         return [("warning", f"{n_particles/1e6:.2g}M particles: below ~1M the threaded CPU deposit is faster than "
                             "the GPU (measured 18 s against 24 s at 0.26M); untick the GPU")]
-    if not gpu and n_particles >= 2 * GPU_PAYS_FROM and gpu_built("ps"):
+    if not gpu and n_particles >= 2 * GPU_PAYS_FROM and gpu_built("ps", precision):
         return [("warning", f"{n_particles/1e6:.2g}M particles: the GPU deposit is 2-3x faster from ~2M particles "
                             "(measured 20 s against 51 s at 2.1M); tick the GPU")]
     return []
 
 
-def recommended_gpu(deposit: str, fields, n_particles, estimator: str = "ps") -> bool:
-    """The GPU setting a fresh job should start with (the GPU built; see gpu_advice)."""
-    if not gpu_built(estimator):
+def recommended_gpu(deposit: str, fields, n_particles, estimator: str = "ps", precision: str = "single",
+                    dim: int = 3) -> bool:
+    """The GPU setting a fresh job should start with (the GPU built; see gpu_advice). Standard DTFE:
+    the GPU (1.5-2.3x faster on fine grids, a tie on coarse ones). A double build hands the GPU float
+    copies of its tetrahedra: the deposit's sums are single precision, everything else double.
+    A 2D job: never (the 2D programs are CPU-only)."""
+    if not gpu_built(estimator, precision, dim):
         return False
     if estimator != "ps":
-        return False
+        return True
     if deposit == "exact":
         return True
     return bool(fields) and (n_particles is None or n_particles >= GPU_PAYS_FROM)
 
 
-_JOBS_CACHE: tuple[float, list] = (-1e9, [])
+_JOBS_CACHE: tuple[float, dict] = (-1e9, {"runs": [], "servers": []})
+_SERVE = re.compile(r"(^|\s)--serve(\s|$)")     # the '--serve' token itself, not --serve-resident or a path
+_REPORT_RUN = re.compile(r"(^|\s)--auto-tune-report(\s|$)")   # a memory check: the tuner's prediction, no run
 
 
-def running_jobs(max_age: float = 2.0) -> list[tuple[int, str]]:
-    """(pid, name) of DTFE / PS-DTFE binaries running on this machine (from any terminal).
-    Cached for max_age seconds: pgrep costs ~30 ms and the checks run on every click."""
+def dtfe_processes(max_age: float = 2.0) -> dict:
+    """The DTFE / PS-DTFE binaries alive on this machine (from any terminal), classified once per max_age
+    seconds (pgrep costs ~30 ms and the checks run on every click):
+      'runs'     [(pid, name, gb)]  jobs that compute and occupy the machine; gb = their resident memory
+                                    (None when ps could not say)
+      'servers'  [(pid, name, gb)]  query servers ('--serve': resident, idle between requests, but their
+                                    tessellations are real memory a large run has to live beside)
+    Not listed at all: report-mode runs ('--auto-tune-report', a memory check from any tab or terminal) and
+    this process's own direct children (the Explore tab's exact zoom). Counted as runs, the servers made every
+    tab warn while Explore's server was up and a queue with 'wait' ticked waited forever; the jobs the
+    launcher runs through a script are grandchildren (bash -> binary) and do count."""
     global _JOBS_CACHE
     now = time.monotonic()
     if now - _JOBS_CACHE[0] > max_age:
         try:
-            lines = subprocess.run(["pgrep", "-l", "^(PS-)?DTFE$"], capture_output=True, text=True,
+            # every set: PS-DTFE, DTFE-double, PS-DTFE-2d-double (Linux truncates the name to 15 characters)
+            lines = subprocess.run(["pgrep", "-l", "^(PS-)?DTFE(-.*)?$"], capture_output=True, text=True,
                                    timeout=5).stdout.splitlines()
         except (OSError, subprocess.TimeoutExpired):
             lines = []
-        jobs = [(int(pid), name) for pid, name in (ln.split(None, 1) for ln in lines if " " in ln)]
-        _JOBS_CACHE = (now, jobs)
+        names = {int(pid): name for pid, name in (ln.split(None, 1) for ln in lines if " " in ln)}
+        _JOBS_CACHE = (now, _classify(names))
     return _JOBS_CACHE[1]
+
+
+def forget_processes():
+    """Drop the cached classification (a check or job of our own just ended: its process must not linger)."""
+    global _JOBS_CACHE
+    _JOBS_CACHE = (-1e9, {"runs": [], "servers": []})
+
+
+def running_jobs(max_age: float = 2.0) -> list[tuple[int, str]]:
+    """(pid, name) of the DTFE / PS-DTFE binaries COMPUTING on this machine (dtfe_processes()['runs'])."""
+    return [(pid, name) for pid, name, _gb in dtfe_processes(max_age)["runs"]]
+
+
+def running_servers(max_age: float = 2.0) -> list[tuple[int, str, float | None]]:
+    """(pid, name, resident GB) of the query servers alive on this machine (dtfe_processes()['servers'])."""
+    return list(dtfe_processes(max_age)["servers"])
+
+
+def _classify(names: dict[int, str]) -> dict:
+    """One ps call lists pid, parent, resident set and the full command line (-ww: never truncated; the
+    repository path has spaces, so the line is matched, not split); macOS and procps spell it the same. A
+    pid gone meanwhile is simply absent; without ps every named binary counts as a run, as before."""
+    out = {"runs": [], "servers": []}
+    if not names:
+        return out
+    try:
+        text = subprocess.run(["ps", "-ww", "-o", "pid=,ppid=,rss=,args=", "-p", ",".join(map(str, names))],
+                              capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        out["runs"] = [(pid, name, None) for pid, name in names.items()]
+        return out
+    me = os.getpid()
+    for line in text.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) < 3 or not all(v.isdigit() for v in parts[:3]):
+            continue
+        pid, ppid, rss_kb = int(parts[0]), int(parts[1]), int(parts[2])
+        args = parts[3] if len(parts) > 3 else ""
+        if pid not in names:
+            continue
+        kind = _kind(ppid, args, me)
+        if kind in ("run", "server"):
+            out["runs" if kind == "run" else "servers"].append((pid, names[pid], rss_kb / 1e6))
+    return out
+
+
+def _kind(ppid: int, args: str, me: int) -> str:
+    """What a DTFE binary with this parent and command line is: 'run' (occupies the machine), 'server'
+    (a query server: resident memory, idle CPU), 'report' (a memory check: the tuner's prediction only),
+    'own' (a direct child of this launcher: its exact zoom). Decided 2026-10-05: report-mode runs are
+    never counted (the memory check from any tab or terminal is not a run), servers are listed apart with
+    their memory instead of being counted or hidden."""
+    if _SERVE.search(args):              # a server is a server, the launcher's own included (its memory counts)
+        return "server"
+    if _REPORT_RUN.search(args):
+        return "report"
+    if ppid == me:
+        return "own"
+    return "run"
+
+
+def _gb_text(gb) -> str:
+    return "" if gb is None else f", {gb:.1f} GB"
 
 
 # ---------------------------------------------------------------------- progress parsing
@@ -1541,7 +2019,7 @@ PROBLEM = re.compile(r"MISMATCH|Problem: Can't find|Error downloading|Error: |FA
 PROGRESS = re.compile(r"\s*\[partitions \d+/\d+ \| \d+%\][^\n\[]*")   # the fragment to hide in logs
 _SNAP = re.compile(r"Processing snapshot (\d+)")
 # run_ps_pipeline.sh echoes the run_ps_dtfe.sh call with the snapshots it will compute
-_PLAN = re.compile(r"^\+ .*run_ps_dtfe\.sh -s (\S+) -g \d+ -m((?: \d+)+)\s*$")
+_PLAN = re.compile(r"^\+ .*run_ps_dtfe\.sh -s (\S+) -g \d+(?: -m)?((?: \d+)+)\s*$")   # -m only with PS_GPU=1
 _SIM = re.compile(r"^== (\S+): snapshots")
 _ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 

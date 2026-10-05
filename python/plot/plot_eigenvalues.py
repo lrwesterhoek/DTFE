@@ -66,7 +66,7 @@ def visualize_eigenvalue_slice(eigenvalue_slice, field_name, slice_dim, box_size
     else:
         plt.show()
 
-def process_snapshot(snapshot, redshift, sim, method):
+def process_snapshot(snapshot, redshift, sim, method, prefix=None, data_root=None):
 
     print(f"\nProcessing snapshot {snapshot} (z={redshift:.2f})")
 
@@ -74,7 +74,7 @@ def process_snapshot(snapshot, redshift, sim, method):
     snapshot_output_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        p = pipeline.products(snapshot, redshift, sim=sim, method=method)
+        p = pipeline.products(snapshot, redshift, sim=sim, method=method, prefix=prefix, data_root=data_root)
         box_size = p.fs.meta.box_mpc
         eig_slices = p.eigen_slices()
         p.release()
@@ -198,7 +198,8 @@ def main():
         z = config.get_redshift(snap_id)
         if z is None:
             try:
-                z = pipeline.products(snap_id, sim=args.sim, method=args.method).redshift
+                z = pipeline.products(snap_id, sim=args.sim, method=args.method, prefix=args.prefix,
+                                      data_root=args.data_root).redshift
             except FileNotFoundError:
                 z = None
         if z is None:
@@ -220,7 +221,7 @@ def main():
     rows = []
 
     for snapshot, redshift in snapshot_items:
-        row = process_snapshot(snapshot, redshift, args.sim, args.method)
+        row = process_snapshot(snapshot, redshift, args.sim, args.method, args.prefix, args.data_root)
         if row is not None:
             rows.append(row)
             processed_snapshots += 1

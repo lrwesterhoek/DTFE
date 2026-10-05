@@ -16,7 +16,7 @@ from dtfelib import fields as dtfe
 from dtfelib.figures import save_plot_to_multiple_paths
 import config
 from dtfelib import figures as style
-from dtfelib import make_parser
+from dtfelib import make_parser, sim_dir
 from dtfelib.io import FieldSet
 
 style.apply()
@@ -187,7 +187,7 @@ def main():
         z_txt = f" (z={z_cfg:.2f})" if z_cfg is not None else ""
         print(f"\nProcessing snapshot {snapshot}{z_txt}")
         try:
-            fs = FieldSet(args.data_root / args.sim / f"snapdir_{snapshot}",
+            fs = FieldSet(sim_dir(args.sim, args.data_root) / f"snapdir_{snapshot}",   # flat or per-family
                           method=args.method, averaged=not args.raw, prefix=args.prefix)
             r = compute_snapshot_slices(fs)
         except FileNotFoundError:

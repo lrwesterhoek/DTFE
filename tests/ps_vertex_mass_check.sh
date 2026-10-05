@@ -30,9 +30,11 @@ PY="${PYTHON:-python3}"
 command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/python3.14
 ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT}"
+source "${SCRIPT_DIR}/precision.sh"     # DTFE_TEST_PRECISION=double: the double pair
 
 N="${N:-24}"; GRID="${GRID:-48}"; BOX="${BOX:-100.0}"; ALPHA="${ALPHA:-0.1645}"
-BIN="./PS-DTFE"
+BIN="${PS_BIN}"
+precision_require "${BIN}"
 TMP="${SCRIPT_DIR}/tmp"; mkdir -p "${TMP}"
 SNAP_UNI="${TMP}/pvm_input_uniform.hdf5"
 SNAP_PAN="${TMP}/pvm_input_pancake.hdf5"
@@ -43,7 +45,7 @@ echo "============================================================"
 echo " PS-DTFE --ps-vertex-mass check   N=${N}^3  grid=${GRID}^3  alpha=${ALPHA}"
 echo "============================================================"
 
-if [ "${1:-}" != "--no-build" ]; then
+if [ "${1:-}" != "--no-build" ] && ! precision_double; then
     echo ">> building PS-DTFE ..."
     BUILD_MODE="$(cat o_ps/.build_mode 2>/dev/null || true)"
     make PS-DTFE ${BUILD_MODE:+"$BUILD_MODE"} >/dev/null
@@ -129,6 +131,7 @@ echo ">> checking the numbers ..."
 import sys
 
 import numpy as np
+import os as _os; REAL = np.dtype(_os.environ.get("DTFE_TEST_REAL", "float32"))   # tests/precision.sh
 
 tmp, grid, gpu, alpha = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), float(sys.argv[4])
 ncell = grid ** 3
@@ -140,7 +143,7 @@ def check(name, ok, detail):
         fails.append(name)
 
 def load(root, ext, ncomp=1):
-    d = np.fromfile(root + ext, dtype=np.float32).astype(np.float64)
+    d = np.fromfile(root + ext, dtype=REAL).astype(np.float64)
     assert d.size == ncell * ncomp, (root + ext, d.size)
     return d
 
@@ -194,8 +197,8 @@ check("E crossed-waves mass survives dropped tets", abs(dc.mean() - 1.0) < 5e-5,
 if gpu:
     dc = load(f"{tmp}/pvm_pan_vm", ".den")
     dg = load(f"{tmp}/pvm_pan_vmg", ".den")
-    sc = np.fromfile(f"{tmp}/pvm_pan_vm.streams", dtype=np.float32)
-    sg = np.fromfile(f"{tmp}/pvm_pan_vmg.streams", dtype=np.float32)
+    sc = np.fromfile(f"{tmp}/pvm_pan_vm.streams", dtype=REAL)
+    sg = np.fromfile(f"{tmp}/pvm_pan_vmg.streams", dtype=REAL)
     vc = load(f"{tmp}/pvm_pan_vm", ".vel", 3)
     vg = load(f"{tmp}/pvm_pan_vmg", ".vel", 3)
     eq = float((sc == sg).mean())

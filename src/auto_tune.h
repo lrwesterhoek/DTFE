@@ -35,6 +35,10 @@
 #include <sys/stat.h>
 #include <fstream>
 #include <thread>      // hardware_concurrency: the point-evaluation HitSink blocks, one per thread
+#include <dirent.h>    // autoTuneServe: the cached partition splits of a snapshot
+#include <map>
+#include <sstream>
+#include "cache_key_lines.h"
 
 
 #ifdef __APPLE__
@@ -346,6 +350,54 @@ struct AutoTuneReport
    server's cell index; the particle array (freed once every partition is built) coexists with the
    concurrent builds. Picks the smallest n (2..8) that leaves room for two partitions next to the
    particles, then as many concurrent builds as fit. A user-given --partition is never touched. */
+/* The partition splits of THIS snapshot already in the tessellation cache folder: n -> the number of
+   cached n^3 partition files. Reads only each file's uncompressed header (magic, length, descriptor) and
+   compares the lines that name the snapshot and the build -- exactly the text tessellation_cache.h writes
+   (cache_key_lines.h) -- plus the periodicity and length unit; the rest of a partition's key follows from
+   the split. Read-only. */
+inline std::map<int,int> cachedServeSplits(User_options const &u)
+{
+    std::map<int,int> out;
+    if ( u.tessellationCacheDir.empty() ) return out;
+    std::string const wantInput = cacheFileLine( "input", u.inputFilename ) + '\n';
+#ifdef PHASE_SPACE
+    std::string const wantLag = cacheFileLine( "lagrange", u.lagrangianInputFilename ) + '\n';
+#endif
+    std::string const wantBuild = cacheBuildLines();
+    std::ostringstream other;
+    other << "MpcUnit=" << u.MpcValue << '\n' << "periodic=" << (u.periodicInput ? 1 : 0) << '\n';
+    std::string const wantOther = other.str();
+    DIR *dir = ::opendir( u.tessellationCacheDir.c_str() );
+    if ( dir == nullptr ) return out;
+    while ( struct dirent *e = ::readdir( dir ) )
+    {
+        std::string const name = e->d_name;
+        if ( name.size() < 11 or name.compare( 0, 5, "tess_" ) != 0 or name.compare( name.size() - 5, 5, ".tess" ) != 0 )
+            continue;
+        std::ifstream f( ( u.tessellationCacheDir + "/" + name ).c_str(), std::ios::binary );
+        char magic[8];
+        uint32_t len = 0;
+        if ( not f.read( magic, 8 ) or std::string( magic, 8 ) != "DTFETESS" ) continue;
+        if ( not f.read( reinterpret_cast<char*>(&len), 4 ) or len == 0 or len > (1u << 20) ) continue;
+        std::string desc( len, '\0' );
+        if ( not f.read( &desc[0], len ) ) continue;
+        if ( desc.find( wantBuild ) == std::string::npos or desc.find( wantInput ) == std::string::npos
+             or desc.find( wantOther ) == std::string::npos )
+            continue;
+#ifdef PHASE_SPACE
+        if ( desc.find( wantLag ) == std::string::npos ) continue;
+#endif
+        static char const SPLIT[] = "\npartition=1 ";
+        size_t const p = desc.find( SPLIT );
+        if ( p == std::string::npos ) continue;
+        int a = 0, b = 0, c = 0;
+        if ( std::sscanf( desc.c_str() + p + sizeof(SPLIT) - 1, "%d,%d,%d", &a, &b, &c ) == 3 and a == b and ( NO_DIM == 2 or b == c ) and a > 1 )
+            ++out[a];
+    }
+    ::closedir( dir );
+    return out;
+}
+
 inline void autoTuneServe(User_options &u, size_t const nParticles)
 {
     if ( u.partitionOn or u.partitionGiven or u.partNo >= 0 )
@@ -400,8 +452,36 @@ inline void autoTuneServe(User_options &u, size_t const nParticles)
                 << "one tessellation.\n" << MESSAGE::EndWarning;
         return;
     }
-    int n = 2;
-    while ( n < 8 and 2.*tessBytes(n) > budget - N*partBytes ) ++n;
+    // the coarsest split that leaves room for two partitions next to the particles while they are built
+    int nMin = 2;
+    while ( nMin < 8 and 2.*tessBytes(nMin) > budget - N*partBytes ) ++nMin;
+    /* Which split. A split this snapshot already has in the cache is reused -- the finest complete one, else
+       the one with the most cached partitions -- since any other means building (and storing) every
+       partition again: TNG100-3-Dark's 4^3 set took 469 s and 52 GB. With nothing cached, the split that
+       holds ~8 partitions in memory at once, the number a zoom touches: measured on TNG100-3-Dark z=0
+       (2026-10-03), 3^3 held 4 and a cold 512^2 zoom took 19.7 s, 4^3 held 10 and took 9.8 s (repeats
+       5.0 vs 4.6 s). Before then the server always took the coarsest split that fit. */
+    std::map<int,int> const cached = cachedServeSplits( u );
+    int n = -1;
+    char const *why = "";
+    for (auto it = cached.rbegin(); it != cached.rend() and n < 0; ++it)
+        if ( it->first >= nMin and it->second >= int( std::pow( double(it->first), NO_DIM ) ) )
+        { n = it->first; why = "the finest split fully in the tessellation cache"; }
+    if ( n < 0 )
+    {
+        int best = 0;
+        for (auto const &kv : cached)
+            if ( kv.first >= nMin and kv.second > best ) { best = kv.second; n = kv.first; why = "the split with the most cached partitions"; }
+    }
+    if ( n < 0 )
+    {
+        // once built the particles are gone, so the budget holds partitions only; stop where a finer split
+        // no longer shrinks them (on a small set the padding shells dominate, and 8^3 would only cost)
+        n = nMin;
+        while ( n < 8 and 8.*tessBytes(n) > budget and tessBytes(n+1) < 0.75 * tessBytes(n) ) ++n;
+        why = cached.empty() ? "nothing cached yet: about 8 partitions held in memory, as many as a zoom touches"
+                             : "the cached splits are too coarse for the memory budget: about 8 partitions held in memory";
+    }
     double const room = std::max( 0., budget - N*partBytes );
     int conc = int( std::floor( room / std::max( tessBytes(n), 1. ) ) );
     conc = std::max( 1, std::min( conc, autoTuneCores() ) );
@@ -411,8 +491,8 @@ inline void autoTuneServe(User_options &u, size_t const nParticles)
         u.maxConcurrent = conc;
     snprintf( buf, sizeof(buf),
               "AUTO-TUNE (serve): one tessellation would need ~%.1f GB, over the %.1f GB budget -> serving a "
-              "composite of %d^3 partitions (~%.1f GB each, %d built at a time); the resident set is sized "
-              "once they are built\n", single/1.e9, budget/1.e9, n, tessBytes(n)/1.e9,
+              "composite of %d^3 partitions (%s; ~%.1f GB each, %d built at a time); the resident set is sized "
+              "once they are built\n", single/1.e9, budget/1.e9, n, why, tessBytes(n)/1.e9,
               u.maxConcurrentOn ? u.maxConcurrent : conc );
     message << buf << MESSAGE::Flush;
 }
@@ -451,9 +531,12 @@ inline AutoTuneReport autoTunePartitioning(User_options &u,
     double const budget = autoTuneBudget( ramBytes, budgetWhy );   // see the header comment
     int const cores = autoTuneCores();
 
+    // the cells actually allocated and written: with --ps-window its cells, not the (virtual) full grid
+    size_t outGrid[NO_DIM];
+    u.outputGridSize( outGrid );
     double gridTotal = 1.;
     for (int d=0; d<NO_DIM; ++d)
-        gridTotal *= double(u.gridSize[d]);
+        gridTotal *= double(outGrid[d]);
 
     AutoTunePS ps;
 #ifdef PHASE_SPACE
@@ -571,7 +654,11 @@ inline AutoTuneReport autoTunePartitioning(User_options &u,
     // IRREDUCIBLE in RAM unless scratch-backed: originals + the full-grid accumulators
     // + the point-evaluation structures.
     // --partition does NOT reduce this -- partitions sum into the SHARED full grid.
-    double const fixed = partBytes*N + (scratchOn ? 0. : gridTotal*bCell) + ptsBytes;
+    // a --ps-window run that started without its particles (ps_globals_record.h) holds none: only
+    // cached partitions are loaded, so their memory goes to more partitions at once. (A late read, when
+    // a needed partition turns out uncached, adds them back: at most the particles' bytes over budget.)
+    double const particleBytes = u.psParticlesDeferred ? 0. : partBytes*N;
+    double const fixed = particleBytes + (scratchOn ? 0. : gridTotal*bCell) + ptsBytes;
     report.fixed = fixed;
     report.budget = budget;
     report.pts = ptsBytes;
@@ -646,8 +733,8 @@ inline AutoTuneReport autoTunePartitioning(User_options &u,
         // boundary-touching slab kept the full axis, making this term ~n^3 optimistic.)
         double subCells = 1.;
         for (int d=0; d<NO_DIM; ++d)
-            subCells *= std::min( double(u.gridSize[d]),
-                                  double(u.gridSize[d])/double(n) + 40. );   // crop + slop, never above the axis
+            subCells *= std::min( double(outGrid[d]),
+                                  double(u.gridSize[d])/double(n) + 40. );   // crop + slop, never above the axis (nor the window)
         if ( metalActive )
         {
             // flat tet arrays (the 16-float record 64 + masses 4 + the finite-cell ordinal 4 B/tet,
@@ -669,16 +756,25 @@ inline AutoTuneReport autoTunePartitioning(User_options &u,
             if ( psExact )
             {
                 double const nTet = 6.77*nOwn;
+                // --ps-window: items cover only the window's cells (the hull of each tet's bbox with
+                // the window), so the window's cell count sets the items, not the virtual full grid
                 double gridCells = 1.;
-                for (int d=0; d<NO_DIM; ++d) gridCells *= double(u.gridSize[d]);
+                for (int d=0; d<NO_DIM; ++d) gridCells *= double(outGrid[d]);
                 double const cellsPerTet = gridCells / (6.*double(N));
                 m += 4.*nTet + 8.*std::min( 32.e6, nTet*(1. + 20.*cellsPerTet/16.) );
             }
         }
         else
-            m += bCellDeposit*subCells              // CPU deposit sub-grids (was a hardcoded 52)
-               + std::min( psDepositThreadBytes(),   // + the deposit threads' private copies
-                           double(std::max(1, cores - 1)) * bCellDeposit*subCells );
+        {
+            // CPU deposit sub-grids (was a hardcoded 52) + the deposit threads' private copies, as many
+            // as the copy budget allows -- unless that leaves fewer than half the threads: the deposit
+            // then runs in SLAB mode (ps_interpolation.cc, the same rule) with no copies, holding a cell
+            // handle, a first-slab byte and ~2 slab-list entries per tetrahedron (+ the binning arrays)
+            double const copyOne = bCellDeposit*subCells;
+            int const copyThreads = std::min( cores, 1 + int( psDepositThreadBytes() / std::max( 1., copyOne ) ) );
+            double const slabBytes = 6.77 * nPad * ( 8. + 1. + 2.*4. + 20. );
+            m += copyOne + ( 2 * copyThreads < cores ? slabBytes : double(copyThreads - 1) * copyOne );
+        }
         return m;
     };
 
@@ -697,12 +793,36 @@ inline AutoTuneReport autoTunePartitioning(User_options &u,
     int const userC = u.maxConcurrent > 0 ? u.maxConcurrent : cores;
     int const userN = u.partition.empty() ? 1 : int(u.partition[0]);
 
+    // The GPU kernels number a partition's sub-grid cells with 32 bits: a sub-grid above 2^32 cells
+    // (1626^3 unsplit) falls back to the CPU deposit (ps_interpolation.cc, averaged_interpolation_1.cc).
+    // With the GPU on, every split chosen below keeps the sub-grid under that cap -- the same crop +
+    // slop estimate as partitionBytes() -- so a very fine grid keeps its GPU deposit; a user's own
+    // split that does not is told which one would.
+    auto gpuSubCells = [&](int n) -> double
+    {
+        double c = 1.;
+        for (int d=0; d<NO_DIM; ++d)
+            c *= std::min( double(outGrid[d]), double(u.gridSize[d])/double(n) + 40. );
+        return c;
+    };
+    double const gpuCellCap = 4294967295.;            // UINT32_MAX
+    int nGpuMin = 1;
+    if ( metalActive )
+        while ( nGpuMin < 64 and gpuSubCells(nGpuMin) > gpuCellCap ) ++nGpuMin;
+    if ( metalActive and not autoPart and gpuSubCells(userN) > gpuCellCap )
+    {
+        MESSAGE::Warning warning( u.verboseLevel );
+        warning << "AUTO-TUNE: with --partition " << userN << " each partition's sub-grid holds ~" << gpuSubCells(userN)
+                << " cells, above the 2^32 the GPU kernels number: the deposit will run on the CPU. "
+                << "--partition " << nGpuMin << " (or finer) keeps it on the GPU.\n" << MESSAGE::EndWarning;
+    }
+
     bool overBudget = false;   // set below; the split is then chosen once partitionBytes() exists
     if ( fixed > budget )
     {
         double const gridBytes = scratchOn ? 0. : gridTotal*bCell;
         // largest cubic grid whose accumulators still leave room for the particles and points
-        double const room = budget - partBytes*N - ptsBytes;
+        double const room = budget - particleBytes - ptsBytes;
         long   const maxGrid = room > 0. ? long( std::cbrt( room / bCell ) ) : 0L;
         MESSAGE::Warning warning( u.verboseLevel );
         warning << "AUTO-TUNE: this run does not fit in memory, and --partition cannot fix it.\n  ";
@@ -744,13 +864,19 @@ inline AutoTuneReport autoTunePartitioning(User_options &u,
         // tessellation (~100 GB for 94M particles) on top of an already over-budget run.
         if ( N < minN or not autoPart )
         {
-            if ( autoPart ) { u.partition.assign( NO_DIM, size_t(1) ); u.partitionOn = false; }
-            return finishReport( autoPart ? 1 : userN, autoConc ? 1 : userC );
+            int const nOne = autoPart ? nGpuMin : userN;      // one domain, or the GPU cap's split
+            if ( autoPart ) { u.partition.assign( NO_DIM, size_t(nOne) ); u.partitionOn = ( nOne > 1 ); }
+            return finishReport( nOne, autoConc ? 1 : userC );
         }
         overBudget = true;
     }
 
-    if ( N < minN )     // small particle set AND the grid fits: one domain, or a split for SPEED
+    // A small particle set triangulates cheaply in one piece -- unless that piece's DEPOSIT does not fit:
+    // on a very fine grid (1700^3 from 0.26M particles) one domain's sub-grid accumulators and the
+    // deposit threads' private copies are tens of GB, and only a split shrinks them. Such a run takes
+    // the memory-driven split below instead (it predicted 83 GB unsplit, over budget, before 2026-10-02).
+    bool const smallFits = not autoPart or fixed + partitionBytes( std::max( 1, nGpuMin ) ) <= budget;
+    if ( N < minN and smallFits )     // small particle set AND the grid fits: one domain, or a split for SPEED
     {
         if ( not autoPart )
             return finishReport( userN, autoConc ? cores : userC );
@@ -788,7 +914,15 @@ inline AutoTuneReport autoTunePartitioning(User_options &u,
         int bestN = 1, bestC = autoConc ? cores : userC;
         double const single = predictedWall( 1, cores );
         double bestT = single;
-        for (int n = 2; n <= 3; ++n)
+        if ( nGpuMin > 1 )                  // the GPU's sub-grid cap rules out one domain
+        {
+            bestN = nGpuMin;
+            bestC = std::max( 1, std::min( { nGpuMin*nGpuMin*nGpuMin, cores,
+                                               int( std::floor( (budget - fixed) / partitionBytes(nGpuMin) ) ) } ) );
+            if ( not autoConc ) bestC = std::min( bestC, userC > 0 ? userC : cores );
+            bestT = predictedWall( nGpuMin, bestC );
+        }
+        for (int n = std::max( 2, nGpuMin ); n <= std::max( 3, nGpuMin ); ++n)
         {
             int c = std::min( n*n*n, cores );
             int const cMem = int( std::floor( (budget - fixed) / partitionBytes(n) ) );
@@ -796,7 +930,7 @@ inline AutoTuneReport autoTunePartitioning(User_options &u,
             c = std::min( c, cMem );
             if ( not autoConc ) c = std::min( c, userC > 0 ? userC : cores );
             double const t = predictedWall( n, c );
-            if ( t < 0.85 * bestT ) { bestN = n; bestC = c; bestT = t; }   // a clear gain only
+            if ( t < 0.85 * bestT or ( bestN < nGpuMin ) ) { bestN = n; bestC = c; bestT = t; }   // a clear gain only
         }
         if ( bestN > 1 )
         {
@@ -804,11 +938,18 @@ inline AutoTuneReport autoTunePartitioning(User_options &u,
             u.partitionOn = true;
             u.psOrderedMerge = true;   // uniform small partitions: merge in order, bit-reproducible at no cost
             if ( autoConc ) u.maxConcurrent = bestC;
-            snprintf( buf, sizeof(buf),
-                      "%.3g particles: triangulation-bound, so --partition %d %d %d --max-concurrent %d "
-                      "(predicted %.2g s against %.2g s for one triangulation; predicted peak ~%.3g GB)",
-                      N, bestN, bestN, bestN, u.maxConcurrent, bestT, single,
-                      (fixed + double(bestC)*partitionBytes(bestN))/1.e9 );
+            if ( bestN == nGpuMin and nGpuMin > 1 )
+                snprintf( buf, sizeof(buf),
+                          "%s grid on the GPU: --partition %d %d %d --max-concurrent %d keeps each partition's "
+                          "sub-grid under the 2^32 cells the GPU kernels number (~%.3g cells; predicted peak ~%.3g GB)",
+                          MESSAGE::printElements( u.gridSize, "x" ).c_str(), bestN, bestN, bestN, u.maxConcurrent,
+                          gpuSubCells(bestN), (fixed + double(bestC)*partitionBytes(bestN))/1.e9 );
+            else
+                snprintf( buf, sizeof(buf),
+                          "%.3g particles: triangulation-bound, so --partition %d %d %d --max-concurrent %d "
+                          "(predicted %.2g s against %.2g s for one triangulation; predicted peak ~%.3g GB)",
+                          N, bestN, bestN, bestN, u.maxConcurrent, bestT, single,
+                          (fixed + double(bestC)*partitionBytes(bestN))/1.e9 );
             message << "\n" << MESSAGE::cBold() << "AUTO-TUNE:" << MESSAGE::cReset() << " " << buf
                     << ". Pass --partition 1 1 1 for one triangulation.\n" << MESSAGE::Flush;
             return finishReport( bestN, autoConc ? bestC : userC );
@@ -822,8 +963,8 @@ inline AutoTuneReport autoTunePartitioning(User_options &u,
         // over budget whatever we do (warned above): one partition at a time, split so that the
         // partition in flight is as small as the padding allows -- partitionBytes() stops falling
         // once the padding shells dominate, so take its minimum over the validated range
-        int bestN = 2;
-        for (int n = 3; n <= 6; ++n)
+        int bestN = std::max( 2, nGpuMin );
+        for (int n = bestN + 1; n <= std::max( 6, nGpuMin ); ++n)
             if ( partitionBytes(n) < partitionBytes(bestN) ) bestN = n;
         u.partition.assign( NO_DIM, size_t(bestN) );
         u.partitionOn = true;
@@ -848,8 +989,8 @@ inline AutoTuneReport autoTunePartitioning(User_options &u,
     int const targetC = cores;
 
     int bestN = -1, bestC = 0;
-    int const nLo = autoPart ? 2 : int(u.partition[0]);
-    int const nHi = autoPart ? 6 : int(u.partition[0]);   // <=6^3 keeps auto within validated territory
+    int const nLo = autoPart ? std::max( 2, nGpuMin ) : int(u.partition[0]);
+    int const nHi = autoPart ? std::max( 6, nGpuMin ) : int(u.partition[0]);   // <=6^3 keeps auto within validated territory (unless the GPU cap needs more)
     for (int n=nLo; n<=nHi; ++n)
     {
         double const m = partitionBytes(n);

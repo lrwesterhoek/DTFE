@@ -413,8 +413,12 @@ void copySubgridInformation(User_options *userOptions,
 							std::vector< std::vector<size_t> > &subgridList,
 							std::vector< Box > &subgridCoords)
 {
+	userOptions->subgridOffset.assign( NO_DIM, 0 );
 	for (int i=0; i<NO_DIM; ++i)
+	{
 		userOptions->gridSize[i] = subgridList[userOptions->partNo][2*i+1] - subgridList[userOptions->partNo][2*i];
+		userOptions->subgridOffset[i] = subgridList[userOptions->partNo][2*i];
+	}
 	userOptions->region = subgridCoords[userOptions->partNo];
 }
 

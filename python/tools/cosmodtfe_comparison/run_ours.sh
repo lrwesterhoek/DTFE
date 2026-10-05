@@ -41,3 +41,9 @@ timed ps_centres    "$PS" "$SNAP" "$OUT.ps_centres" --grid 16 --field density "$
 # standard (Eulerian) DTFE: the slice, and the grid at cell centres
 timed dtfe_slice    "$DT" "$SNAP" "$OUT.dtfe_slice" --grid 16 --field density "${COMMON[@]}" --sample-points "$SLICE"
 timed dtfe_grid     "$DT" "$SNAP" "$OUT.dtfe_grid" --grid "$G" --field density "${COMMON[@]}"
+# standard DTFE mass-conserving cell averages (the volume-averaged '_a' fields), CPU and GPU, at the
+# report grid and at 512^3 where the tetrahedra are larger than the cells (CosmoDTFE has no equivalent)
+timed dtfe_avg_cpu     "$DT" "$SNAP" "$OUT.dtfe_avg_cpu"    --grid "$G" --field density_a velocity_a "${COMMON[@]}"
+timed dtfe_avg_gpu     "$DT" "$SNAP" "$OUT.dtfe_avg_gpu"    --grid "$G" --field density_a velocity_a "${COMMON[@]}" --gpu
+timed dtfe_avg512_cpu  "$DT" "$SNAP" "$OUT.dtfe_avg512_cpu" --grid 512  --field density_a velocity_a "${COMMON[@]}"
+timed dtfe_avg512_gpu  "$DT" "$SNAP" "$OUT.dtfe_avg512_gpu" --grid 512  --field density_a velocity_a "${COMMON[@]}" --gpu

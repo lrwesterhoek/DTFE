@@ -116,6 +116,16 @@ shift $((OPTIND - 1))
 if [ "$#" -gt 0 ]; then
     SNAPSHOTS=("$@")
 fi
+# Snapshot numbers as decimal: bash's printf reads a leading zero as OCTAL, so '010' became 008 and '099'
+# an error (then 000) -- the folders are named snapdir_0NN, so typing them that way is natural (2026-10-05).
+for _k in "${!SNAPSHOTS[@]}"; do
+    _s="${SNAPSHOTS[$_k]}"
+    if ! [[ "${_s}" =~ ^[0-9]+$ ]]; then
+        echo "Error: snapshot '${_s}' is not a number." >&2
+        exit 2
+    fi
+    SNAPSHOTS[$_k]=$((10#${_s}))
+done
 
 [ -z "${DATA_DIR}" ] && DATA_DIR="$(sim_dir "${SIMULATION}")"
 
@@ -175,8 +185,21 @@ FIELDS="${FIELDS:-density_a velocity_a gradient_a divergence_a shear_a vorticity
 
 cd "$REPO_ROOT" || exit 1
 
-if [ ! -x "./PS-DTFE" ]; then
-    echo "Error: ./PS-DTFE not found or not executable. Build it with 'make PS-DTFE'." >&2
+# DTFE_PRECISION=double runs the double-precision pair (./PS-DTFE-double, 'make PS-DTFE DOUBLE=1'):
+# every position, density and field in double from the input read onward, float64 outputs, about
+# twice the memory. Default single (./PS-DTFE). Nothing falls back silently: a missing binary stops.
+DTFE_PRECISION="${DTFE_PRECISION:-single}"
+case "${DTFE_PRECISION}" in
+    single) PS_BIN="./PS-DTFE" ;;
+    double) PS_BIN="./PS-DTFE-double" ;;
+    *) echo "Error: DTFE_PRECISION must be 'single' or 'double' (got '${DTFE_PRECISION}')." >&2; exit 1 ;;
+esac
+if [ ! -x "${PS_BIN}" ]; then
+    if [ "${DTFE_PRECISION}" = "double" ]; then
+        echo "Error: ${PS_BIN} not found. Build the double-precision pair with 'make DTFE PS-DTFE DOUBLE=1' (add METAL=1 on Apple Silicon), or let the launcher's Setup do it." >&2
+    else
+        echo "Error: ${PS_BIN} not found or not executable. Build it with 'make PS-DTFE'." >&2
+    fi
     exit 1
 fi
 
@@ -305,7 +328,7 @@ for i in "${SNAPSHOTS[@]}"; do
     [ -n "${MAX_CONCURRENT}" ] && part_args+=(--max-concurrent "${MAX_CONCURRENT}")
     [ -n "${SCRATCH_DIR}" ] && part_args+=(--scratch-dir "${SCRATCH_DIR}")
 
-    ${TIME_WRAP[@]+"${TIME_WRAP[@]}"} ./PS-DTFE "${input_file}" "${output_root}" \
+    ${TIME_WRAP[@]+"${TIME_WRAP[@]}"} "${PS_BIN}" "${input_file}" "${output_root}" \
         --grid ${GRID_SIZE} \
         --padding ${PADDING} \
         --periodic \

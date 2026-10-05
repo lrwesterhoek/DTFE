@@ -617,11 +617,122 @@ def t_alternate_prefix():
         shutil.rmtree(d)
 
 
+def t_limits_store():
+    """analyze.py compute's cross-epoch limits survive a run on a subset or on nothing (2026-10-06)."""
+    import json, tempfile
+    import config
+    from dtfelib import pipeline
+    old = config.CACHE_DIR
+    config.CACHE_DIR = Path(tempfile.mkdtemp(prefix="dtfe_limits_"))     # never the real cache
+    try:
+        canon = ["050", "099"]
+        lim, cov, miss = pipeline.record_limits({"50": {"delta": 2.0, "potential": 5.0}, 99: {"delta": 3.0, "potential": 1.0}}, canon)
+        assert lim == {"delta": 3.0, "potential": 5.0} and cov == canon and miss == [], (lim, cov, miss)
+        assert pipeline.load_global_limits() == lim
+        lim2, cov2, _ = pipeline.record_limits({"099": {"delta": 0.5, "potential": 0.5}}, canon)
+        assert lim2 == {"delta": 2.0, "potential": 5.0}, lim2          # 050's maxima survive a lower 099 rerun
+        assert pipeline.load_snapshot_limits()["099"] == {"delta": 0.5, "potential": 0.5}
+        lim3, cov3, miss3 = pipeline.record_limits({}, canon + ["004"])
+        assert lim3 is None and pipeline.load_global_limits() == lim2 and miss3 == ["004"], (lim3, miss3)
+        lim4, _, _ = pipeline.record_limits({"004": {"delta": float("nan"), "potential": 9.0}}, canon + ["004"])
+        assert lim4 == {"delta": 2.0, "potential": 9.0}, lim4          # NaN amplitudes are not stored
+        assert set(json.loads((config.CACHE_DIR / pipeline._param_hash() / "snapshot_limits.json").read_text())) == {"050", "099", "004"}
+        assert pipeline.canonical_snapshot_id(99) == "099" and pipeline.canonical_snapshot_id("abc") == "abc"
+    finally:
+        config.CACHE_DIR = old
+
+
+def t_map_limits():
+    """A diverging map centred on 0, a log map that skips an empty slice (plot_DTFE's crash, 2026-10-05)."""
+    from dtfelib import figures as style
+    skew = np.concatenate([np.full(90, 1.0), np.full(10, -8.0)])
+    lo, hi = style.symmetric_limits(skew)
+    assert lo == -hi and hi > 0, (lo, hi)
+    assert style.symmetric_limits(np.zeros(16)) == (-1.0, 1.0)
+    assert style.symmetric_limits(np.array([np.nan, np.inf, 0.0])) == (-1.0, 1.0)
+    assert style.symmetric_limits(np.array([-2.0, 2.0, np.nan]), pct=100) == (-2.0, 2.0)
+    assert style.log_limits(np.zeros(8)) is None and style.log_limits(np.array([np.nan, -1.0])) is None
+    assert style.log_limits(np.array([1e-9, 4.0, np.nan, -3.0])) == (1e-6, 4.0)
+    vmin, vmax = style.log_limits(np.array([2.0, 2.0]))
+    assert vmin == 2.0 and vmax > vmin
+
+
+def t_webstreams():
+    """Stream bins and caustic class by web class on a synthetic grid with known fractions (2026-10-06)."""
+    from dtfelib import webstreams as ws
+    from dtfelib.io import CAUSTIC_PARITY_POS, CAUSTIC_PARITY_NEG, CAUSTIC_COLLAPSE
+    n = 8
+    web = np.zeros((n, n, n), dtype=np.float32)
+    web[2:4] = 1.0; web[4:6] = 2.0; web[6:] = 3.0           # two planes per class along axis 0
+    web[0, 0, 0] = 7.0                                      # a label outside 0..3 -> 'other'
+    streams = np.ones((n, n, n), dtype=np.float32)
+    streams[0, :, :2] = 0.0                                 # empty cells in the void planes (16 cells)
+    streams[1, 0, 0] = 1.0004                               # within the tolerance: single
+    streams[2, :, 0] = 1.5                                  # a fractional averaged value: 1 < s <= 3 (8 cells)
+    streams[4, 0, :] = 3.0                                  # 3.0 is in 1 < s <= 3 (8 cells)
+    streams[4, 1, :] = 4.2                                  # 3 < s <= 5 (8 cells)
+    streams[6, 0, :] = 9.0                                  # s > 5 (8 cells)
+    hidden = np.zeros((n, n, n), dtype=np.float32)
+    hidden[1, 1, 1] = 1.0                                   # bit 1 on a single cell: 'hidden multi'
+    hidden[1, 1, 2] = 2.0                                   # bit 2 only: still single
+    density = np.ones((n, n, n), dtype=np.float32)
+    density[:2] = 0.5                                       # voids lighter: mass differs from volume
+    density[6:] = 4.0
+    cc = np.zeros((n, n, n), dtype=np.int32)
+    cc[2, 0, 0] = CAUSTIC_PARITY_POS | CAUSTIC_PARITY_NEG | CAUSTIC_COLLAPSE[1]    # a fold, k = 1
+    cc[2, 0, 1] = CAUSTIC_PARITY_POS | CAUSTIC_COLLAPSE[0]                         # one parity: no fold, k = 0
+    cc[6, 0, 0] = CAUSTIC_COLLAPSE[3] | CAUSTIC_COLLAPSE[1]                        # k = 3 (the highest bit wins)
+    t = ws.environment_table(web, streams, hidden=hidden, density=density, caustic_class=cc, thickness=3)
+    c = t["classes"]
+    assert list(c) == ["void", "wall", "filament", "node", "other"], list(c)
+    assert c["other"]["cells"] == 1 and c["void"]["cells"] == 2 * 64 - 1 and c["wall"]["cells"] == 128, (c["void"]["cells"], c["other"]["cells"])
+    assert abs(sum(e["volume_fraction"] for e in c.values()) - 1.0) < 1e-12
+    assert abs(sum(e["mass_fraction"] for e in c.values()) - 1.0) < 1e-12
+    # void: 127 cells ([0,0,0] is 'other'): 15 empty, 1 hidden multi, 111 single
+    v = c["void"]["stream_bins"]
+    assert abs(v["empty"]["volume"] - 15 / 127) < 1e-12 and abs(v["single"]["volume"] - 111 / 127) < 1e-12, (v["empty"], v["single"])
+    assert abs(v["hidden multi"]["volume"] - 1 / 127) < 1e-12 and v["s > 5"]["volume"] == 0.0
+    assert c["other"]["stream_bins"]["empty"]["volume"] == 1.0
+    w = c["wall"]["stream_bins"]
+    assert abs(w["1 < s <= 3"]["volume"] - 8 / 128) < 1e-12 and abs(w["single"]["volume"] - 120 / 128) < 1e-12
+    f = c["filament"]["stream_bins"]
+    assert abs(f["1 < s <= 3"]["volume"] - 8 / 128) < 1e-12 and abs(f["3 < s <= 5"]["volume"] - 8 / 128) < 1e-12
+    assert abs(c["node"]["stream_bins"]["s > 5"]["volume"] - 8 / 128) < 1e-12
+    # mass weights: the void's mass share is 0.5 * 127 of the total 0.5*127 + 128 + 128 + 4*128 + 0.5*1
+    total_m = 0.5 * 127 + 128 + 128 + 4 * 128 + 0.5
+    assert abs(c["void"]["mass_fraction"] - 0.5 * 127 / total_m) < 1e-12 and abs(c["node"]["mass_fraction"] - 512 / total_m) < 1e-12
+    assert abs(c["void"]["stream_bins"]["single"]["mass"] - 111 / 127) < 1e-12      # uniform density within the void
+    assert abs(c["node"]["mean_streams"] - (8 * 9.0 + 120) / 128) < 1e-9 and abs(c["node"]["mean_streams_mass"] - c["node"]["mean_streams"]) < 1e-9
+    # caustic class: the wall plane 2 holds one fold (k=1) and one k=0 cell; the node plane 6 one k=3
+    assert abs(c["wall"]["fold_fraction"]["volume"] - 1 / 128) < 1e-12 and c["void"]["fold_fraction"]["volume"] == 0.0
+    cb = c["wall"]["collapse"]
+    assert abs(cb["k=1"]["volume"] - 1 / 128) < 1e-12 and abs(cb["k=0"]["volume"] - 1 / 128) < 1e-12 and abs(cb["none"]["volume"] - 126 / 128) < 1e-12
+    assert abs(c["node"]["collapse"]["k=3"]["volume"] - 1 / 128) < 1e-12
+    # chunked == unchunked (an odd thickness that does not divide n), and memmaps are fine
+    t2 = ws.environment_table(web, streams, hidden=hidden, density=density, caustic_class=cc, thickness=8)
+    assert t2 == t, "chunking changed the table"
+    # without the caustic grid and without weights: those entries are None, nothing else changes
+    t3 = ws.environment_table(web, streams, hidden=hidden)
+    assert t3["classes"]["wall"]["fold_fraction"] is None and t3["classes"]["wall"]["collapse"] is None
+    assert t3["classes"]["wall"]["mass_fraction"] is None and t3["classes"]["wall"]["stream_bins"]["single"]["mass"] is None
+    assert t3["classes"]["wall"]["stream_bins"]["single"]["volume"] == c["wall"]["stream_bins"]["single"]["volume"]
+    # without the hidden grid the hidden cell is single
+    t4 = ws.environment_table(web, streams, thickness=5)
+    assert abs(t4["classes"]["void"]["stream_bins"]["single"]["volume"] - 112 / 127) < 1e-12
+    txt = ws.table_text(t, "synthetic")
+    assert "void" in txt and "hidden multi" in txt and "k=3" in txt and "caustic class: yes" in txt
+    ssf = ws.single_stream_fraction(t)
+    assert abs(ssf["void"] - 111 / 127) < 1e-12 and abs(ssf["wall"] - 120 / 128) < 1e-12
+
+
 def main():
     print("=" * 60)
     print(" dtfelib merger-tree / void-tracking tests")
     print("=" * 60)
     print("synthetic:")
+    check("cross-epoch limits store: a subset run keeps the series' maxima (synthetic)", t_limits_store)
+    check("map ranges: symmetric about 0, log range of an empty slice (synthetic)", t_map_limits)
+    check("webstreams: stream bins + caustic class by web class, chunked == whole (synthetic)", t_webstreams)
     check("sample_grid conventions", t_sample_grid)
     check("periodic helpers", t_periodic_helpers)
     check("track_center across box wrap", t_track_center_wrap)

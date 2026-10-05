@@ -10,8 +10,14 @@ import tempfile
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(SCRIPT_DIR)
-DTFE_BIN = os.path.join(PROJECT_DIR, "DTFE")
-REFERENCE_DIR = os.path.join(SCRIPT_DIR, "reference")
+# DTFE_TEST_PRECISION=double runs the suite against ./DTFE-double (tests/precision.sh): its binary grid
+# outputs are float64; the text outputs most tests read are precision-free
+PRECISION = os.environ.get("DTFE_TEST_PRECISION", "single")
+DTFE_BIN = os.path.join(PROJECT_DIR, "DTFE-double" if PRECISION == "double" else "DTFE")
+# DTFE_TEST_REFERENCE_DIR: where the regression reference lives (tests/ci_suite.sh points it at a
+# scratch folder: the stored reference was made with macOS's CGAL, and another CGAL breaks Delaunay
+# ties in co-spherical configurations differently, so a Linux run creates its own there)
+REFERENCE_DIR = os.environ.get("DTFE_TEST_REFERENCE_DIR") or os.path.join(SCRIPT_DIR, "reference")
 
 VERBOSE = False
 PASSED = 0
@@ -568,8 +574,9 @@ def test_regression(tmpdir, update_ref=False):
 
 
 def _read_float32(filepath):
+    """a binary grid output in the build's Real type (float32, or float64 for the double pair)"""
     import array
-    values = array.array("f")
+    values = array.array("d" if PRECISION == "double" else "f")
     with open(filepath, "rb") as f:
         values.frombytes(f.read())
     return values
@@ -693,6 +700,9 @@ def main():
     args = parser.parse_args()
     VERBOSE = args.verbose
 
+    if not os.path.isfile(DTFE_BIN) and PRECISION == "double":
+        print(f"SKIP: {DTFE_BIN} is not built (make DTFE PS-DTFE DOUBLE=1 builds the double pair)")
+        sys.exit(0)
     if not os.path.isfile(DTFE_BIN):
         print(f"ERROR: DTFE binary not found at {DTFE_BIN}")
         print("Build it first with: make DTFE")

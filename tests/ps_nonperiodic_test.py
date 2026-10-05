@@ -7,6 +7,8 @@ import sys
 
 import numpy as np
 
+from ps_test_helpers import binary as test_binary, require, REAL, DOUBLE, PRECISION
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 TMP = os.path.join(HERE, "tmp")
@@ -50,24 +52,23 @@ def main():
     ap.add_argument("--binary", default=None, help="PS-DTFE binary to test (default: the repo's)")
     args = ap.parse_args()
     os.makedirs(TMP, exist_ok=True)
-    binary = args.binary or os.path.join(ROOT, "PS-DTFE")
+    binary = args.binary or test_binary("PS-DTFE")
     snap = os.path.join(TMP, "ps_np.hdf5")
     out = os.path.join(TMP, "ps_np_out")
 
     print("=" * 60)
-    print(" PS-DTFE non-periodic mass-conservation test (Tier 2.1)")
+    print(f" PS-DTFE non-periodic mass-conservation test (Tier 2.1)  precision={PRECISION}")
     print(f"   N={N}^3  box={BOX} Mpc  margin={MARGIN}  AMP={AMP} (single-stream clump)")
     print("=" * 60)
 
-    if not args.no_build and not args.binary:
+    if not args.no_build and not args.binary and not DOUBLE:
         # rebuild in the current GPU mode (see o_ps/.build_mode; a plain make strips GPU support)
         try:
             mode = open(os.path.join(ROOT, "o_ps", ".build_mode")).read().strip()
         except OSError:
             mode = ""
         run(["make", "PS-DTFE"] + ([mode] if mode else []))
-    if not (os.path.isfile(binary) and os.access(binary, os.X_OK)):
-        sys.exit(f"FAIL: '{binary}' not built")
+    require(binary)
 
     run([sys.executable, os.path.join(HERE, "generate_ps_test_data.py"),
          "--out", snap, "--n", str(N), "--box", str(BOX), "--amplitude-factor", str(AMP),
@@ -77,7 +78,7 @@ def main():
     for grid in GRIDS:
         run([binary, snap, out, "--grid", str(grid), "--field", "density",
              "--input", "105", "--MpcUnit", "1", "--verbose", "0"])
-        d = np.fromfile(out + ".den", dtype=np.float32).astype(np.float64).reshape(grid, grid, grid)
+        d = np.fromfile(out + ".den", dtype=REAL).astype(np.float64).reshape(grid, grid, grid)
         # '.den' is rho/rho_bar with rho_bar = N*m / V_lagBox for a non-periodic cloud
         # (Lagrangian bounding-box normalization); recovered/expected mass is then
         # sum(d)*cellVol / V_lagBox. The bbox spans (N-1) lattice spacings (+O(jitter)).
@@ -128,7 +129,8 @@ def region_faces(binary):
     h = subprocess.run([binary, "--full_help"], capture_output=True, text=True)
     helptext = h.stdout + h.stderr
     try:
-        gpu = "METAL=1" in open(os.path.join(ROOT, "o_ps", ".build_mode")).read()
+        mode = open(os.path.join(ROOT, "o_ps", ".build_mode")).read()
+        gpu = any(m in mode for m in ("METAL=1", "CUDA=1", "HIP=1"))
     except OSError:
         gpu = False
     variants = [("sampled", []), ("linear", ["--ps-linear-deposit"])]
@@ -154,9 +156,9 @@ def region_faces(binary):
         run([binary, snap, reg, "--grid", str(n), "--box"] + [str(x) for x in REGION_BOX * 3] + common + extra)
         worst = []
         for ext, comps in (("den", 1), ("a_den", 1), ("vel", 3), ("a_vel", 3), ("streams", 1), ("a_streams", 1)):
-            f = np.fromfile(f"{full}.{ext}", dtype=np.float32).astype(np.float64)
+            f = np.fromfile(f"{full}.{ext}", dtype=REAL).astype(np.float64)
             f = f.reshape(FULL_GRID, FULL_GRID, FULL_GRID, comps)[o:o + n, o:o + n, o:o + n]
-            r = np.fromfile(f"{reg}.{ext}", dtype=np.float32).astype(np.float64).reshape(n, n, n, comps)
+            r = np.fromfile(f"{reg}.{ext}", dtype=REAL).astype(np.float64).reshape(n, n, n, comps)
             ok = np.isfinite(f) & np.isfinite(r)   # velocity is NaN in empty cells, in both
             if not np.array_equal(np.isfinite(f), np.isfinite(r)):
                 fails.append(f"{name}: '.{ext}' empty cells differ between the region and the full grid")
@@ -203,8 +205,8 @@ def partition_split(binary):
         run([binary, snap, base + "8"] + common + extra + ["--partition", "2", "2", "2"])
         worst = (0.0, "-")
         for ext in ("den", "a_den", "vel", "a_vel", "streams", "a_streams"):
-            a = np.fromfile(f"{base}8.{ext}", dtype=np.float32).astype(np.float64)
-            b = np.fromfile(f"{base}1.{ext}", dtype=np.float32).astype(np.float64)
+            a = np.fromfile(f"{base}8.{ext}", dtype=REAL).astype(np.float64)
+            b = np.fromfile(f"{base}1.{ext}", dtype=REAL).astype(np.float64)
             ok = np.isfinite(a) & np.isfinite(b)
             d = float(np.abs(a - b)[ok].max() / max(float(np.abs(b[ok]).max()), 1e-30))
             worst = max(worst, (d, ext))

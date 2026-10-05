@@ -26,9 +26,11 @@ PY="${PYTHON:-python3}"
 command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/python3.14
 ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT}"
+source "${SCRIPT_DIR}/precision.sh"     # DTFE_TEST_PRECISION=double: the double pair
 
 N="${N:-24}"; GRID="${GRID:-48}"; BOX="${BOX:-100.0}"
-BIN="./DTFE"; PSBIN="./PS-DTFE"
+BIN="${DTFE_BIN}"; PSBIN="${PS_BIN}"
+precision_require "${BIN}" "${PSBIN}"
 TMP="${SCRIPT_DIR}/tmp"; mkdir -p "${TMP}"
 SNAP_UNI="${TMP}/dpe_input_uniform.hdf5"
 SNAP_PAN="${TMP}/dpe_input_pancake.hdf5"
@@ -42,7 +44,7 @@ echo "============================================================"
 echo " standard-DTFE --sample-points check   N=${N}^3  grid=${GRID}^3"
 echo "============================================================"
 
-if [ "${1:-}" != "--no-build" ]; then
+if [ "${1:-}" != "--no-build" ] && ! precision_double; then
     echo ">> building DTFE ..."
     BUILD_MODE="$(cat o/.build_mode 2>/dev/null || true)"
     make DTFE ${BUILD_MODE:+"$BUILD_MODE"} >/dev/null

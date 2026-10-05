@@ -126,8 +126,10 @@ CC         := $(or $(CC_OVERRIDE),$(CC))
 
 
 # paths to where to put the object files and the executables files. If you build the DTFE library than you also need to specify the directory where to put the library and the directory where to copy the header files needed by the library (choose an empty directory for the header files).
-OBJ_DIR = ./o
-OBJ_DIR_PS = ./o_ps
+# o / o_ps hold the single-precision pair's objects, o_d / o_ps_d the DOUBLE=1 pair's (OBJ_SUFFIX
+# is set in the precision block below; make expands it when the directory names are used)
+OBJ_DIR = ./o$(OBJ_SUFFIX)
+OBJ_DIR_PS = ./o_ps$(OBJ_SUFFIX)
 BIN_DIR = ./
 LIB_DIR = ./
 INC_DIR = ./DTFE_include
@@ -149,21 +151,36 @@ OPTIONS_COMMON += -DNO_DIM=$(DIM)
 #------------------------ floating-point precision: 'make PS-DTFE DOUBLE=1' builds every position,
 # density, field and accumulator in double (Real = double; outputs become float64), end to end
 # including the HDF5 reads (TNG stores Coordinates in float64, which the default float build
-# rounds on read). Costs ~2x the memory. CPU only: the Metal kernels are single precision.
-# Precision is stamped in the object directories like the backend and DIM (a switch wipes them).
+# rounds on read). Costs ~2x the memory. The double pair is a SEPARATE set of binaries,
+# DTFE-double / PS-DTFE-double, built from its own object directories o_d / o_ps_d, so both
+# precisions coexist (the run scripts pick a pair with DTFE_PRECISION=double, the GUI with its
+# precision setting). METAL=1 is allowed: the GPU deposit kernels themselves are single
+# precision, so a double build hands the GPU float copies of its tetrahedra and adds the float
+# sums into its double grids -- everything else (reading, triangulation, densities, point
+# evaluation, the CPU deposits) stays double.
 DOUBLE ?= 0
 ifeq ($(DOUBLE),1)
 OPTIONS_COMMON += -DDOUBLE
 PRECISION = double
 PREC_BUILD_ARG = DOUBLE=1
-ifeq ($(METAL),1)
-$(error DOUBLE=1 cannot be combined with METAL=1: the GPU kernels are single precision. Build the double-precision binaries CPU-only ('make PS-DTFE DOUBLE=1'))
-endif
+BIN_SUFFIX = -double
+OBJ_SUFFIX = _d
 else ifeq ($(DOUBLE),0)
 PRECISION = float
 PREC_BUILD_ARG =
+BIN_SUFFIX =
+OBJ_SUFFIX =
 else
 $(error DOUBLE must be 0 or 1 (got '$(DOUBLE)'))
+endif
+# DIM=2 builds are a set of their own as well: DTFE-2d / PS-DTFE-2d (-2d-double with DOUBLE=1), objects in
+# o_2d / o_ps_2d (_2d_d), so the 2D and 3D binaries coexist instead of a 2D build replacing ./DTFE.
+ifeq ($(DIM),2)
+BIN_SUFFIX := -2d$(BIN_SUFFIX)
+OBJ_SUFFIX := _2d$(OBJ_SUFFIX)
+DIM_BUILD_ARG = DIM=2
+else
+DIM_BUILD_ARG =
 endif
 
 ############################# Quantities to be computed ##################################
@@ -190,7 +207,8 @@ OPTIONS_COMMON += -DOUTPUT_FILE_DEFAULT=101
 OPTIONS_COMMON += -DOPEN_MP
 # enable to check if the padding gives a complete Delaunay Tesselation of the region of interest
 OPTIONS_COMMON += -DTEST_PADDING
-# enable this option to shift from position space to redshift space; You also need to activate this option during run-time using '--redshift-space arguments'
+# keeps the '--redshiftSpace' option registered; the shift itself is NOT implemented in this version (the option
+# refuses the run with a clear error since 2026-10-05 -- before, it was accepted and silently skipped)
 OPTIONS_COMMON += -DREDSHIFT_SPACE
 
 # Standard DTFE build: no PHASE_SPACE flag (triangulates in Eulerian space, standard density)
@@ -199,14 +217,39 @@ OPTIONS = $(OPTIONS_COMMON)
 # PS-DTFE build: includes PHASE_SPACE flag (triangulates in Lagrangian space, multi-stream regions)
 OPTIONS_PS = $(OPTIONS_COMMON) -DPHASE_SPACE
 
-# ---- GPU backend (optional): METAL=1 on macOS/Apple Silicon. When set, the build defines
-# DTFE_GPU / PS_GPU (the backend-neutral guards used by the callers) plus GPU_BACKEND_NAME,
-# links the Metal host object, and embeds the kernels in metal/*.metal (compiled at runtime).
-# Run with '--gpu' (standard DTFE) / '--ps-gpu' (PS-DTFE). Without METAL=1 the build is
-# CPU-only and those flags fall back to the CPU with a warning.
+# ---- GPU backend (optional, choose at most one): METAL=1 on macOS/Apple Silicon, CUDA=1 on
+# Linux with an NVIDIA GPU (needs nvcc), HIP=1 on Linux with an AMD GPU (ROCm, needs hipcc).
+# Any backend defines DTFE_GPU / PS_GPU (the backend-neutral guards used by the callers) plus
+# GPU_BACKEND_NAME, links its host object and libraries, and the binary is run with '--gpu'
+# (standard DTFE) / '--ps-gpu' (PS-DTFE). Without a backend the build is CPU-only and those
+# flags fall back to the CPU with a warning. Metal embeds + runtime-compiles the kernels in
+# metal/*.metal; CUDA/HIP compile the single-source ports src/CGAL_triangulation/{ps,dtfe}_gpu_cuda.cu
+# ahead of time (the Metal kernels are the reference: the .cu files are line-by-line ports, compiled
+# and CPU-fallback-tested on Linux, not yet validated on NVIDIA/AMD hardware -- metal/README.md).
 GPU_MODE = off
 ifeq ($(METAL),1)
 GPU_MODE = metal
+endif
+ifeq ($(CUDA),1)
+ifneq ($(GPU_MODE),off)
+$(error choose exactly one GPU backend: METAL=1, CUDA=1 or HIP=1)
+endif
+GPU_MODE = cuda
+endif
+ifeq ($(HIP),1)
+ifneq ($(GPU_MODE),off)
+$(error choose exactly one GPU backend: METAL=1, CUDA=1 or HIP=1)
+endif
+GPU_MODE = hip
+endif
+# CUDAEMU=1: the CUDA/HIP backend compiled as plain C++ against the CPU emulation of the device
+# API in gpu_cuda_compat.h / gpu_cuda_emu.h -- a validation build for machines without an NVIDIA
+# or AMD GPU (the kernels run on OS threads, one block at a time). Not a production backend.
+ifeq ($(CUDAEMU),1)
+ifneq ($(GPU_MODE),off)
+$(error choose exactly one GPU backend: METAL=1, CUDA=1, HIP=1 or CUDAEMU=1)
+endif
+GPU_MODE = cudaemu
 endif
 
 DTFE_GPU_OBJS =
@@ -216,6 +259,14 @@ PS_GPU_OBJS =
 PS_GPU_LIBS =
 GPU_BUILD_ARG =
 
+# The GPU kernels deposit tetrahedra into 3D cells: a DIM=2 build is CPU-only whatever backend is
+# asked for (its --gpu / --ps-gpu then fall back with the usual warning).
+ifeq ($(DIM),2)
+ifneq ($(GPU_MODE),off)
+$(info >> DIM=2: the GPU kernels are 3D only; this 2D build is CPU-only)
+GPU_MODE = off
+endif
+endif
 ifeq ($(GPU_MODE),metal)
 OPTIONS    += -DDTFE_GPU -DGPU_BACKEND_NAME=\"Metal\"
 OPTIONS_PS += -DPS_GPU -DGPU_BACKEND_NAME=\"Metal\"
@@ -227,19 +278,71 @@ PS_GPU_LIBS = -framework Metal -framework Foundation
 GPU_BUILD_ARG = METAL=1
 endif
 
+# GPU_ARCH: optional target architecture. CUDA: nvcc's default (PTX) is forward-portable, set
+# e.g. GPU_ARCH=sm_86 only to skip the first-launch JIT. HIP: STRONGLY recommended when building
+# on a machine that cannot see the target GPU (login nodes, containers) -- HIP has no portable IR,
+# hipcc compiles for the build machine's arch (or clang's default), and an arch-mismatched binary
+# skips the GPU or aborts at startup. Find the arch with 'rocminfo | grep gfx' (e.g.
+# GPU_ARCH=gfx90a; several: "gfx90a gfx942"). The .cu objects are built -fPIC once per object
+# directory and link into the binary AND libDTFE (no _l twin).
+GPU_ARCH ?=
+
+ifeq ($(GPU_MODE),cuda)
+CUDA_PATH ?= /usr/local/cuda
+NVCC ?= $(if $(shell command -v nvcc 2>/dev/null),nvcc,$(CUDA_PATH)/bin/nvcc)
+GPUXX = $(NVCC)
+GPUXX_FLAGS = -O3 -std=c++17 -Xcompiler -fPIC $(if $(GPU_ARCH),-arch=$(GPU_ARCH))
+OPTIONS    += -DDTFE_GPU -DGPU_BACKEND_NAME=\"CUDA\"
+OPTIONS_PS += -DPS_GPU -DGPU_BACKEND_NAME=\"CUDA\"
+DTFE_GPU_OBJS = $(OBJ_DIR)/dtfe_gpu_cuda$(OBJ_EXT)
+DTFE_GPU_L_OBJS = $(DTFE_GPU_OBJS)
+DTFE_GPU_LIBS = -L$(CUDA_PATH)/lib64 -lcudart
+PS_GPU_OBJS = $(OBJ_DIR_PS)/ps_gpu_cuda$(OBJ_EXT)
+PS_GPU_LIBS = -L$(CUDA_PATH)/lib64 -lcudart
+GPU_BUILD_ARG = CUDA=1
+endif
+
+ifeq ($(GPU_MODE),cudaemu)
+GPUXX = $(CC)
+GPUXX_FLAGS = -x c++ -std=c++20 -O2 -fPIC -DGPU_EMU -Wno-unused-function -Wno-deprecated-declarations $(MACOS_ISYSROOT)
+OPTIONS    += -DDTFE_GPU -DGPU_BACKEND_NAME=\"CUDA-emulated\"
+OPTIONS_PS += -DPS_GPU -DGPU_BACKEND_NAME=\"CUDA-emulated\"
+DTFE_GPU_OBJS = $(OBJ_DIR)/dtfe_gpu_cuda$(OBJ_EXT)
+DTFE_GPU_L_OBJS = $(DTFE_GPU_OBJS)
+DTFE_GPU_LIBS = -lpthread
+PS_GPU_OBJS = $(OBJ_DIR_PS)/ps_gpu_cuda$(OBJ_EXT)
+PS_GPU_LIBS = -lpthread
+GPU_BUILD_ARG = CUDAEMU=1
+endif
+
+ifeq ($(GPU_MODE),hip)
+ROCM_PATH ?= /opt/rocm
+HIPCC ?= $(if $(shell command -v hipcc 2>/dev/null),hipcc,$(ROCM_PATH)/bin/hipcc)
+GPUXX = $(HIPCC)
+GPUXX_FLAGS = -O3 -std=c++17 -fPIC -x hip $(foreach a,$(GPU_ARCH),--offload-arch=$(a))
+OPTIONS    += -DDTFE_GPU -DGPU_BACKEND_NAME=\"HIP\"
+OPTIONS_PS += -DPS_GPU -DGPU_BACKEND_NAME=\"HIP\"
+DTFE_GPU_OBJS = $(OBJ_DIR)/dtfe_gpu_cuda$(OBJ_EXT)
+DTFE_GPU_L_OBJS = $(DTFE_GPU_OBJS)
+DTFE_GPU_LIBS = -L$(ROCM_PATH)/lib -lamdhip64
+PS_GPU_OBJS = $(OBJ_DIR_PS)/ps_gpu_cuda$(OBJ_EXT)
+PS_GPU_LIBS = -L$(ROCM_PATH)/lib -lamdhip64
+GPU_BUILD_ARG = HIP=1
+endif
+
 # A build must never mix GPU-mode and plain objects (an incremental 'make PS-DTFE' after a
-# METAL=1 build -- or a CPU<->Metal switch -- would silently produce a binary whose
+# METAL=1/CUDA=1/HIP=1 build -- or any backend switch -- would silently produce a binary whose
 # components disagree about PS_GPU). The mode is stamped in the object dir; when it changes,
 # all its objects are wiped first. '.build_mode' records the make argument ("METAL=1",
 # empty for CPU-only) so tests can rebuild in the same mode: make PS-DTFE $$(cat o_ps/.build_mode)
 .PHONY: ps_gpu_mode_check
 ps_gpu_mode_check:
 	@$(MKDIR_P) $(OBJ_DIR_PS)
-	@if [ ! -f $(OBJ_DIR_PS)/.gpu_mode_$(GPU_MODE) ] || [ ! -f $(OBJ_DIR_PS)/.dim_$(DIM) ] || [ ! -f $(OBJ_DIR_PS)/.prec_$(PRECISION) ] || [ ! -f $(OBJ_DIR_PS)/.tbb_$(TBB_PS) ]; then \
-		echo ">> PS build mode is now '$(GPU_MODE)', $(DIM)D, $(PRECISION), TBB=$(TBB_PS); wiping $(OBJ_DIR_PS) to avoid mixed objects"; \
-		rm -f $(OBJ_DIR_PS)/*$(OBJ_EXT) $(OBJ_DIR_PS)/*.d $(OBJ_DIR_PS)/ps_deposit_msl.h $(OBJ_DIR_PS)/.gpu_mode_* $(OBJ_DIR_PS)/.dim_* $(OBJ_DIR_PS)/.prec_* $(OBJ_DIR_PS)/.tbb_* $(OBJ_DIR_PS)/.metal_mode_* $(OBJ_DIR_PS)/.build_mode; \
-		touch $(OBJ_DIR_PS)/.gpu_mode_$(GPU_MODE) $(OBJ_DIR_PS)/.dim_$(DIM) $(OBJ_DIR_PS)/.prec_$(PRECISION) $(OBJ_DIR_PS)/.tbb_$(TBB_PS); \
-		printf '%s' "$(strip $(GPU_BUILD_ARG) $(PREC_BUILD_ARG) $(TBB_BUILD_ARG))" > $(OBJ_DIR_PS)/.build_mode; \
+	@if [ ! -f $(OBJ_DIR_PS)/.gpu_mode_$(GPU_MODE) ] || [ ! -f $(OBJ_DIR_PS)/.dim_$(DIM) ] || [ ! -f $(OBJ_DIR_PS)/.prec_$(PRECISION) ] || [ ! -f $(OBJ_DIR_PS)/.tbb_$(TBB_PS) ] || [ ! -f $(OBJ_DIR_PS)/.deflate_$(HAVE_LIBDEFLATE) ] || { [ -n "$(FPC_STAMP)" ] && [ ! -f $(OBJ_DIR_PS)/$(FPC_STAMP) ]; }; then \
+		echo ">> PS build mode is now '$(GPU_MODE)', $(DIM)D, $(PRECISION), TBB=$(TBB_PS), libdeflate=$(HAVE_LIBDEFLATE)$(if $(FPC_STAMP),$(comma) no FMA contraction); wiping $(OBJ_DIR_PS) to avoid mixed objects"; \
+		rm -f $(OBJ_DIR_PS)/*$(OBJ_EXT) $(OBJ_DIR_PS)/*.d $(OBJ_DIR_PS)/ps_deposit_msl.h $(OBJ_DIR_PS)/.gpu_mode_* $(OBJ_DIR_PS)/.dim_* $(OBJ_DIR_PS)/.prec_* $(OBJ_DIR_PS)/.tbb_* $(OBJ_DIR_PS)/.deflate_* $(OBJ_DIR_PS)/.fpc_* $(OBJ_DIR_PS)/.metal_mode_* $(OBJ_DIR_PS)/.build_mode; \
+		touch $(OBJ_DIR_PS)/.gpu_mode_$(GPU_MODE) $(OBJ_DIR_PS)/.dim_$(DIM) $(OBJ_DIR_PS)/.prec_$(PRECISION) $(OBJ_DIR_PS)/.tbb_$(TBB_PS) $(OBJ_DIR_PS)/.deflate_$(HAVE_LIBDEFLATE) $(if $(FPC_STAMP),$(OBJ_DIR_PS)/$(FPC_STAMP)); \
+		printf '%s' "$(strip $(GPU_BUILD_ARG) $(PREC_BUILD_ARG) $(TBB_BUILD_ARG) $(DIM_BUILD_ARG))" > $(OBJ_DIR_PS)/.build_mode; \
 	fi
 
 # Same guard for the standard build: the mode is stamped in o/ (which also holds the *_l library
@@ -247,11 +350,11 @@ ps_gpu_mode_check:
 .PHONY: dtfe_gpu_mode_check
 dtfe_gpu_mode_check:
 	@$(MKDIR_P) $(OBJ_DIR)
-	@if [ ! -f $(OBJ_DIR)/.gpu_mode_$(GPU_MODE) ] || [ ! -f $(OBJ_DIR)/.dim_$(DIM) ] || [ ! -f $(OBJ_DIR)/.prec_$(PRECISION) ]; then \
-		echo ">> DTFE build mode is now '$(GPU_MODE)', $(DIM)D, $(PRECISION); wiping $(OBJ_DIR) to avoid mixed objects"; \
-		rm -f $(OBJ_DIR)/*$(OBJ_EXT) $(OBJ_DIR)/*.d $(OBJ_DIR)/dtfe_deposit_msl.h $(OBJ_DIR)/.gpu_mode_* $(OBJ_DIR)/.dim_* $(OBJ_DIR)/.prec_* $(OBJ_DIR)/.metal_mode_* $(OBJ_DIR)/.build_mode; \
-		touch $(OBJ_DIR)/.gpu_mode_$(GPU_MODE) $(OBJ_DIR)/.dim_$(DIM) $(OBJ_DIR)/.prec_$(PRECISION); \
-		printf '%s' "$(strip $(GPU_BUILD_ARG) $(PREC_BUILD_ARG))" > $(OBJ_DIR)/.build_mode; \
+	@if [ ! -f $(OBJ_DIR)/.gpu_mode_$(GPU_MODE) ] || [ ! -f $(OBJ_DIR)/.dim_$(DIM) ] || [ ! -f $(OBJ_DIR)/.prec_$(PRECISION) ] || [ ! -f $(OBJ_DIR)/.deflate_$(HAVE_LIBDEFLATE) ] || { [ -n "$(FPC_STAMP)" ] && [ ! -f $(OBJ_DIR)/$(FPC_STAMP) ]; }; then \
+		echo ">> DTFE build mode is now '$(GPU_MODE)', $(DIM)D, $(PRECISION), libdeflate=$(HAVE_LIBDEFLATE)$(if $(FPC_STAMP),$(comma) no FMA contraction); wiping $(OBJ_DIR) to avoid mixed objects"; \
+		rm -f $(OBJ_DIR)/*$(OBJ_EXT) $(OBJ_DIR)/*.d $(OBJ_DIR)/dtfe_deposit_msl.h $(OBJ_DIR)/.gpu_mode_* $(OBJ_DIR)/.dim_* $(OBJ_DIR)/.prec_* $(OBJ_DIR)/.deflate_* $(OBJ_DIR)/.fpc_* $(OBJ_DIR)/.metal_mode_* $(OBJ_DIR)/.build_mode; \
+		touch $(OBJ_DIR)/.gpu_mode_$(GPU_MODE) $(OBJ_DIR)/.dim_$(DIM) $(OBJ_DIR)/.prec_$(PRECISION) $(OBJ_DIR)/.deflate_$(HAVE_LIBDEFLATE) $(if $(FPC_STAMP),$(OBJ_DIR)/$(FPC_STAMP)); \
+		printf '%s' "$(strip $(GPU_BUILD_ARG) $(PREC_BUILD_ARG) $(DIM_BUILD_ARG))" > $(OBJ_DIR)/.build_mode; \
 	fi
 
 #------------------------ options usefull when using DTFE as a library
@@ -376,6 +479,35 @@ HDF5_LIBS = -lhdf5 -lhdf5_cpp
 # library on both platforms, and HDF5 already depends on it.
 BASE_LIBS += -lz
 
+# libdeflate (optional): the cache's chunked gzip members are compressed and decompressed with it when
+# it is installed (macOS: brew install libdeflate; Debian/Ubuntu: libdeflate-dev) -- 2.4x faster
+# compression than zlib, decompression 1.13x faster than macOS's tuned zlib (more against stock zlib).
+# The files stay plain gzip, so any build reads any cache. LIBDEFLATE=auto (default) uses it when found,
+# LIBDEFLATE=0 forces zlib, LIBDEFLATE=1 requires it; LIBDEFLATE_PATH_OVERRIDE=/path points elsewhere.
+LIBDEFLATE ?= auto
+ifeq ($(PLATFORM),macos)
+    LIBDEFLATE_PATH := $(or $(LIBDEFLATE_PATH_OVERRIDE),$(BREW_PREFIX)/opt/libdeflate)
+else
+    LIBDEFLATE_PATH := $(or $(LIBDEFLATE_PATH_OVERRIDE),/usr)
+endif
+HAVE_LIBDEFLATE := 0
+ifeq ($(LIBDEFLATE),1)
+    HAVE_LIBDEFLATE := 1
+endif
+ifeq ($(LIBDEFLATE),auto)
+    ifneq ($(wildcard $(LIBDEFLATE_PATH)/include/libdeflate.h),)
+        HAVE_LIBDEFLATE := 1
+    endif
+endif
+ifeq ($(HAVE_LIBDEFLATE),1)
+    OPTIONS_COMMON += -DDTFE_HAVE_LIBDEFLATE
+    ifneq ($(LIBDEFLATE_PATH),/usr)
+        INCLUDES  += -I $(LIBDEFLATE_PATH)/include
+        BASE_LIBS += -L$(LIBDEFLATE_PATH)/lib
+    endif
+    BASE_LIBS += -ldeflate
+endif
+
 # TBB-parallel Delaunay insertion for PS-DTFE (CGAL's Parallel_tag data structure + lock grid,
 # CGAL_triangulation/triangulation.cpp; used at run time only with --parallel-triangulation or
 # DTFE_TBB_THREADS -- the default insert stays sequential and bit-reproducible). 'auto': compiled in when the tbb package is installed
@@ -421,8 +553,9 @@ else ifeq ($(PLATFORM),linux)
 endif
 
 # Native-CPU tuning: let the compiler vectorise/schedule the interpolation hot loop for
-# this exact chip. Pure tuning -- no -ffast-math, so FP results stay bit-identical to a
-# generic build (safe for comparing runs). Override with ARCH_FLAGS=..., disable with ARCH_FLAGS=
+# this exact chip. Pure tuning -- no -ffast-math, and with GCC no fused multiply-adds (below),
+# so FP results stay bit-identical to a generic build (safe for comparing runs). Override with
+# ARCH_FLAGS=..., disable with ARCH_FLAGS=
 ifeq ($(PLATFORM),macos)
     ifeq ($(ARCH),arm64)
         ARCH_FLAGS ?= -mcpu=native
@@ -434,6 +567,22 @@ else
 endif
 COMPILE_FLAGS    += $(ARCH_FLAGS)
 COMPILE_FLAGS_PS += $(ARCH_FLAGS)
+
+# GCC fuses a*b + c into one rounding (FMA) ACROSS statements by default (-ffp-contract=fast)
+# wherever the target has FMA -- every arm64 machine, and x86 under -march=native -- so two code
+# paths written to do the same arithmetic round differently: on Linux arm64 the dispersion of a
+# --ps-volume-weighted run was no longer bit-identical to a mass-weighted run's
+# (tests/ps_volume_weighted_check.sh, 2026-10-02). Clang (the macOS build) only fuses within one
+# expression, which both paths do alike, and is left as it is.
+CC_IS_GCC := $(shell $(CC) --version 2>/dev/null | grep -qi 'free software foundation' && echo 1)
+ifeq ($(CC_IS_GCC),1)
+    COMPILE_FLAGS    += -ffp-contract=off
+    COMPILE_FLAGS_PS += -ffp-contract=off
+endif
+# stamped in the object dirs (the mode checks above): objects compiled before the flag existed are
+# wiped once instead of being linked with the new ones. Clang builds carry no stamp (nothing changed).
+FPC_STAMP := $(if $(filter 1,$(CC_IS_GCC)),.fpc_off,)
+comma := ,
 
 DTFE_INC = $(INCLUDES)
 
@@ -492,7 +641,7 @@ DTFE: dtfe_gpu_mode_check
 
 DTFE-build: set_directories $(OBJ_DIR)/DTFE$(OBJ_EXT) $(OBJ_DIR)/triangulation$(OBJ_EXT) $(OBJ_DIR)/main$(OBJ_EXT) $(OBJ_DIR)/kdtree2$(OBJ_EXT) $(OBJ_DIR)/r3d$(OBJ_EXT) $(DTFE_CC_OBJS) $(IO_CC_OBJS) $(TRIANG_CC_OBJS) $(DTFE_GPU_OBJS) Makefile
 	$(CC) $(COMPILE_FLAGS) $(BUILD_INFO_FLAGS) -o $(OBJ_DIR)/build_info$(OBJ_EXT) -c $(SRC)/build_info.cc
-	$(CC) $(COMPILE_FLAGS) $(OBJ_DIR)/DTFE$(OBJ_EXT) $(OBJ_DIR)/triangulation$(OBJ_EXT) $(OBJ_DIR)/main$(OBJ_EXT) $(OBJ_DIR)/kdtree2$(OBJ_EXT) $(OBJ_DIR)/r3d$(OBJ_EXT) $(OBJ_DIR)/build_info$(OBJ_EXT) $(DTFE_CC_OBJS) $(IO_CC_OBJS) $(TRIANG_CC_OBJS) $(DTFE_GPU_OBJS) $(DTFE_LIB) $(DTFE_GPU_LIBS) -o $(BIN_DIR)/DTFE$(EXE_EXT)
+	$(CC) $(COMPILE_FLAGS) $(OBJ_DIR)/DTFE$(OBJ_EXT) $(OBJ_DIR)/triangulation$(OBJ_EXT) $(OBJ_DIR)/main$(OBJ_EXT) $(OBJ_DIR)/kdtree2$(OBJ_EXT) $(OBJ_DIR)/r3d$(OBJ_EXT) $(OBJ_DIR)/build_info$(OBJ_EXT) $(DTFE_CC_OBJS) $(IO_CC_OBJS) $(TRIANG_CC_OBJS) $(DTFE_GPU_OBJS) $(DTFE_LIB) $(DTFE_GPU_LIBS) -o $(BIN_DIR)/DTFE$(BIN_SUFFIX)$(EXE_EXT)
 
 
 $(OBJ_DIR)/main$(OBJ_EXT): $(addprefix $(SRC)/, $(MAIN_SOURCES)) Makefile
@@ -585,7 +734,7 @@ PS-DTFE: ps_gpu_mode_check
 
 PS-DTFE-build: set_directories_ps $(OBJ_DIR_PS)/DTFE$(OBJ_EXT) $(OBJ_DIR_PS)/triangulation$(OBJ_EXT) $(OBJ_DIR_PS)/main$(OBJ_EXT) $(OBJ_DIR_PS)/kdtree2$(OBJ_EXT) $(OBJ_DIR_PS)/r3d$(OBJ_EXT) $(PS_DTFE_CC_OBJS) $(PS_DTFE_IO_OBJS) $(PS_DTFE_TRIANG_OBJS) $(PS_GPU_OBJS) Makefile
 	$(CC) $(COMPILE_FLAGS_PS) $(BUILD_INFO_FLAGS) -o $(OBJ_DIR_PS)/build_info$(OBJ_EXT) -c $(SRC)/build_info.cc
-	$(CC) $(COMPILE_FLAGS_PS) $(OBJ_DIR_PS)/DTFE$(OBJ_EXT) $(OBJ_DIR_PS)/triangulation$(OBJ_EXT) $(OBJ_DIR_PS)/main$(OBJ_EXT) $(OBJ_DIR_PS)/kdtree2$(OBJ_EXT) $(OBJ_DIR_PS)/r3d$(OBJ_EXT) $(OBJ_DIR_PS)/build_info$(OBJ_EXT) $(PS_DTFE_CC_OBJS) $(PS_DTFE_IO_OBJS) $(PS_DTFE_TRIANG_OBJS) $(PS_GPU_OBJS) $(DTFE_LIB) $(PS_GPU_LIBS) $(PS_TBB_LIBS) -o $(BIN_DIR)/PS-DTFE$(EXE_EXT)
+	$(CC) $(COMPILE_FLAGS_PS) $(OBJ_DIR_PS)/DTFE$(OBJ_EXT) $(OBJ_DIR_PS)/triangulation$(OBJ_EXT) $(OBJ_DIR_PS)/main$(OBJ_EXT) $(OBJ_DIR_PS)/kdtree2$(OBJ_EXT) $(OBJ_DIR_PS)/r3d$(OBJ_EXT) $(OBJ_DIR_PS)/build_info$(OBJ_EXT) $(PS_DTFE_CC_OBJS) $(PS_DTFE_IO_OBJS) $(PS_DTFE_TRIANG_OBJS) $(PS_GPU_OBJS) $(DTFE_LIB) $(PS_GPU_LIBS) $(PS_TBB_LIBS) -o $(BIN_DIR)/PS-DTFE$(BIN_SUFFIX)$(EXE_EXT)
 
 set_directories_ps:
 	@$(MKDIR_P) $(OBJ_DIR_PS)
@@ -652,18 +801,18 @@ $(OBJ_DIR_PS)/ps_point_eval$(OBJ_EXT): $(SRC)/CGAL_triangulation/ps_point_eval.c
 
 # Metal GPU deposit host (METAL=1 only). The kernel source is embedded via a generated header so
 # the binary needs no runtime file lookup; Metal compiles it once per process.
-$(OBJ_DIR_PS)/ps_deposit_msl.h: metal/ps_deposit.metal Makefile
+$(OBJ_DIR_PS)/ps_deposit_msl.h: metal/ps_deposit.metal metal/exact_clip.metal.inc Makefile
 	@$(MKDIR_P) $(OBJ_DIR_PS)
-	{ printf 'static const char PS_DEPOSIT_MSL[] = R"MSL(\n'; cat metal/ps_deposit.metal; printf '\n)MSL";\n'; } > $@.tmp
+	{ printf 'static const char PS_DEPOSIT_MSL[] = R"MSL(\n'; cat metal/exact_clip.metal.inc metal/ps_deposit.metal; printf '\n)MSL";\n'; } > $@.tmp
 	mv $@.tmp $@
 
 $(OBJ_DIR_PS)/ps_metal_host$(OBJ_EXT): $(SRC)/CGAL_triangulation/ps_metal_host.cc $(SRC)/CGAL_triangulation/gpu_host.h $(SRC)/CGAL_triangulation/ps_deposit_params.h $(OBJ_DIR_PS)/ps_deposit_msl.h Makefile
 	$(CC) $(COMPILE_FLAGS_PS) -I third_party/metal-cpp -I $(OBJ_DIR_PS) -o $@ -c $(SRC)/CGAL_triangulation/ps_metal_host.cc
 
 # Standard-DTFE Metal deposit host (METAL=1 only), same embedding scheme in $(OBJ_DIR).
-$(OBJ_DIR)/dtfe_deposit_msl.h: metal/dtfe_deposit.metal Makefile
+$(OBJ_DIR)/dtfe_deposit_msl.h: metal/dtfe_deposit.metal metal/exact_clip.metal.inc Makefile
 	@$(MKDIR_P) $(OBJ_DIR)
-	{ printf 'static const char DTFE_DEPOSIT_MSL[] = R"MSL(\n'; cat metal/dtfe_deposit.metal; printf '\n)MSL";\n'; } > $@.tmp
+	{ printf 'static const char DTFE_DEPOSIT_MSL[] = R"MSL(\n'; cat metal/exact_clip.metal.inc metal/dtfe_deposit.metal; printf '\n)MSL";\n'; } > $@.tmp
 	mv $@.tmp $@
 
 $(OBJ_DIR)/dtfe_metal_host$(OBJ_EXT): $(SRC)/CGAL_triangulation/dtfe_metal_host.cc $(SRC)/CGAL_triangulation/gpu_host.h $(OBJ_DIR)/dtfe_deposit_msl.h Makefile
@@ -671,6 +820,17 @@ $(OBJ_DIR)/dtfe_metal_host$(OBJ_EXT): $(SRC)/CGAL_triangulation/dtfe_metal_host.
 
 $(OBJ_DIR)/dtfe_metal_host_l$(OBJ_EXT): $(SRC)/CGAL_triangulation/dtfe_metal_host.cc $(SRC)/CGAL_triangulation/gpu_host.h $(OBJ_DIR)/dtfe_deposit_msl.h Makefile
 	$(CC) $(COMPILE_FLAGS) -fPIC -I third_party/metal-cpp -I $(OBJ_DIR) -o $@ -c $(SRC)/CGAL_triangulation/dtfe_metal_host.cc
+
+# CUDA/HIP GPU deposit hosts (CUDA=1 via nvcc, HIP=1 via hipcc): single-source .cu files, kernels
+# compiled ahead of time (no vendored SDK -- the CUDA toolkit / ROCm provide the headers). Ports of
+# the Metal kernels; keep them in step with metal/*.metal.
+$(OBJ_DIR_PS)/ps_gpu_cuda$(OBJ_EXT): $(SRC)/CGAL_triangulation/ps_gpu_cuda.cu $(SRC)/CGAL_triangulation/gpu_host.h $(SRC)/CGAL_triangulation/gpu_cuda_compat.h $(SRC)/CGAL_triangulation/gpu_cuda_emu.h $(SRC)/CGAL_triangulation/gpu_exact_clip.cuh $(SRC)/CGAL_triangulation/ps_deposit_params.h Makefile
+	@$(MKDIR_P) $(OBJ_DIR_PS)
+	$(GPUXX) $(GPUXX_FLAGS) -o $@ -c $(SRC)/CGAL_triangulation/ps_gpu_cuda.cu
+
+$(OBJ_DIR)/dtfe_gpu_cuda$(OBJ_EXT): $(SRC)/CGAL_triangulation/dtfe_gpu_cuda.cu $(SRC)/CGAL_triangulation/gpu_host.h $(SRC)/CGAL_triangulation/gpu_cuda_compat.h $(SRC)/CGAL_triangulation/gpu_cuda_emu.h $(SRC)/CGAL_triangulation/gpu_exact_clip.cuh Makefile
+	@$(MKDIR_P) $(OBJ_DIR)
+	$(GPUXX) $(GPUXX_FLAGS) -o $@ -c $(SRC)/CGAL_triangulation/dtfe_gpu_cuda.cu
 
 
 ############################# Shared library build ##################################
@@ -707,7 +867,7 @@ library-build: set_directories set_directories_2 $(addprefix $(SRC)/, $(LIB_FILE
 
 
 clean:
-	$(RM_RF) $(BIN_DIR)/DTFE$(EXE_EXT) $(BIN_DIR)/PS-DTFE$(EXE_EXT) $(OBJ_DIR)/*$(OBJ_EXT) $(OBJ_DIR_PS)/*$(OBJ_EXT) $(OBJ_DIR)/*.d $(OBJ_DIR_PS)/*.d $(LIB_DIR)/*DTFE$(SHARED_EXT)
+	$(RM_RF) $(BIN_DIR)/DTFE$(EXE_EXT) $(BIN_DIR)/PS-DTFE$(EXE_EXT) $(BIN_DIR)/DTFE-double$(EXE_EXT) $(BIN_DIR)/PS-DTFE-double$(EXE_EXT) $(BIN_DIR)/DTFE-2d*$(EXE_EXT) $(BIN_DIR)/PS-DTFE-2d*$(EXE_EXT) ./o_2d*/*$(OBJ_EXT) ./o_ps_2d*/*$(OBJ_EXT) ./o/*$(OBJ_EXT) ./o_ps/*$(OBJ_EXT) ./o/*.d ./o_ps/*.d ./o_d/*$(OBJ_EXT) ./o_ps_d/*$(OBJ_EXT) ./o_d/*.d ./o_ps_d/*.d $(LIB_DIR)/*DTFE$(SHARED_EXT)
 
 # ---- deps-check: verify the required headers/libraries exist BEFORE a long compile dies
 # mid-build with a cryptic missing-header error, and print the per-platform install command
@@ -745,6 +905,11 @@ deps-check:
 			fail=1; missing_brew="$$missing_brew $$brewpkg"; missing_apt="$$missing_apt $$aptpkg"; \
 		fi; \
 	done; \
+	if [ -e "$(LIBDEFLATE_PATH)/include/libdeflate.h" ]; then \
+		printf '   OK       %-12s %s (optional: the tessellation cache codec)\n' "libdeflate" "$(LIBDEFLATE_PATH)/include/libdeflate.h"; \
+	else \
+		printf '   optional %-12s not found: the tessellation cache uses zlib (brew install libdeflate / apt-get install libdeflate-dev)\n' "libdeflate"; \
+	fi; \
 	if [ "$$fail" -eq 1 ]; then \
 		echo ""; \
 		echo ">> missing dependencies -- install them with:"; \

@@ -66,13 +66,24 @@
 
 #include "../ps_point_eval.h"
 
-#if NO_DIM==3
+#if NO_DIM==3 || NO_DIM==2
 
 #include "triangulation_common.h"
 #include "ps_caustic_class.h"   // --ps-caustics: per-tetrahedron caustic stratification bits
 #include "ps_exact_inside.h"    // exact, tie-consistent containment (shared with the grid deposit)
 #include "tessellation_cache.h" // composite --serve: partitions reloaded from '--tessellation-cache'
 #include "../auto_tune.h"       // composite --serve: the memory budget that sizes the resident set
+
+// the triangulation's finite simplices: CGAL calls them faces in 2D, cells in 3D
+#if NO_DIM == 2
+typedef DT::Finite_faces_iterator PSFiniteCellIterator;
+#define PS_PE_FINITE_BEGIN(t) (t).finite_faces_begin()
+#define PS_PE_FINITE_END(t) (t).finite_faces_end()
+#else
+typedef DT::Finite_cells_iterator PSFiniteCellIterator;
+#define PS_PE_FINITE_BEGIN(t) (t).finite_cells_begin()
+#define PS_PE_FINITE_END(t) (t).finite_cells_end()
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -82,6 +93,7 @@
 #include <cerrno>
 #include <cmath>
 #include <cstdint>
+#include <cstdarg>   // --serve-progress: serveProgress(fmt, ...)
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -89,6 +101,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <condition_variable>   // composite --serve: parallel partition loads
 #include <mutex>
 #include <string>
 #include <thread>
@@ -297,6 +310,14 @@ struct HitSink
 // halo cores). Returns det; the inverse is valid when det is finite and nonzero.
 inline double inverse3x3Unguarded(double const m[NO_DIM][NO_DIM], double inv[NO_DIM][NO_DIM])
 {
+#if NO_DIM == 2
+    double const det = m[0][0]*m[1][1] - m[0][1]*m[1][0];
+    if ( det == 0. || not std::isfinite(det) ) return 0.;
+    double const invDet = 1. / det;
+    inv[0][0] =  m[1][1] * invDet; inv[0][1] = -m[0][1] * invDet;
+    inv[1][0] = -m[1][0] * invDet; inv[1][1] =  m[0][0] * invDet;
+    return det;
+#else
     double const c00 = m[1][1]*m[2][2] - m[1][2]*m[2][1];
     double const c01 = m[1][2]*m[2][0] - m[1][0]*m[2][2];
     double const c02 = m[1][0]*m[2][1] - m[1][1]*m[2][0];
@@ -313,6 +334,7 @@ inline double inverse3x3Unguarded(double const m[NO_DIM][NO_DIM], double inv[NO_
     inv[1][2] = (m[0][2]*m[1][0] - m[0][0]*m[1][2]) * invDet;
     inv[2][2] = (m[0][0]*m[1][1] - m[0][1]*m[1][0]) * invDet;
     return det;
+#endif
 }
 
 
@@ -458,7 +480,7 @@ void forEachCellParallel(DT &dt, int nThreads, Work work)
                 return;
             }
             size_t idx = 0;
-            for (DT::Finite_cells_iterator itC = dt.finite_cells_begin(); itC != dt.finite_cells_end(); ++itC, ++idx)
+            for (PSFiniteCellIterator itC = PS_PE_FINITE_BEGIN(dt); itC != PS_PE_FINITE_END(dt); ++itC, ++idx)
             {
                 if ( ( (idx / BLOCK) % nT ) != size_t(t) ) continue;
                 Cell_handle cell = itC;
@@ -517,22 +539,23 @@ static void readSamplePoints(std::string const &filename, std::vector<double> &p
     {
         file.clear();
         file.seekg( 0, std::ios::beg );
-        double x, y, z;
-        while ( file >> x )
+        double v[NO_DIM];
+        while ( file >> v[0] )
         {
-            if ( not (file >> y >> z) )
-                throwError( "The '--sample-points' text file '", filename,
-                            "' ends mid-triplet; every line must hold 'x y z'." );
-            points.push_back( x );
-            points.push_back( y );
-            points.push_back( z );
+            for (int d = 1; d < NO_DIM; ++d)
+                if ( not (file >> v[d]) )
+                    throwError( "The '--sample-points' text file '", filename,
+                                NO_DIM == 2 ? "' ends mid-point; every line must hold 'x y'."
+                                            : "' ends mid-point; every line must hold 'x y z'." );
+            for (int d = 0; d < NO_DIM; ++d) points.push_back( v[d] );
         }
     }
     else
     {
         if ( fileSize % (NO_DIM * sizeof(double)) != 0 )
             throwError( "The '--sample-points' file '", filename,
-                        "' is not text and its size is not a multiple of 24 bytes -- expected raw float64 x/y/z triplets (N x 3, no header)." );
+                        NO_DIM == 2 ? "' is not text and its size is not a multiple of 16 bytes -- expected raw float64 x/y pairs (N x 2, no header)."
+                                    : "' is not text and its size is not a multiple of 24 bytes -- expected raw float64 x/y/z triplets (N x 3, no header)." );
         points.resize( fileSize / sizeof(double) );
         file.clear();
         file.seekg( 0, std::ios::beg );
@@ -546,6 +569,8 @@ static void readSamplePoints(std::string const &filename, std::vector<double> &p
 }
 
 void setQueryPoints(std::vector<double> &&pts, int const bucketFloor);   // defined below
+void bucketQueryPoints(int const bucketFloor);                          // defined below
+void setQueryRecords();                                                 // defined below
 
 } // namespace psPointEvalDetail
 
@@ -652,10 +677,17 @@ void setQueryPoints(std::vector<double> &&pts, int const bucketFloor)
                 g_ctx.pos[i*NO_DIM+d] = g_ctx.boxLo[d] + v;
             }
 
-    // bucket the points on a uniform grid (~4 points per bucket, capped so empty-bucket
-    // overhead stays negligible for small point sets)
+    bucketQueryPoints( bucketFloor );
+    setQueryRecords();
+}
+
+// Buckets the installed points on a uniform grid (~4 points per bucket, at least 'bucketFloor' per
+// axis, capped so empty-bucket overhead stays negligible for small point sets). A composite request
+// re-buckets once when a partition walks its cells although the request was bucketed for the index.
+void bucketQueryPoints(int const bucketFloor)
+{
     {
-        int n = int( std::cbrt( double(g_ctx.nPoints) / 4. ) ) + 1;
+        int n = int( std::pow( double(g_ctx.nPoints) / 4., 1. / double(NO_DIM) ) ) + 1;   // ~4 points per bucket
         if ( n < bucketFloor ) n = bucketFloor;
         if ( n < 1 )   n = 1;
         if ( n > 256 ) n = 256;
@@ -690,7 +722,11 @@ void setQueryPoints(std::vector<double> &&pts, int const bucketFloor)
         for (size_t i = 0; i < g_ctx.nPoints; ++i)
             g_ctx.bucketPts[ fill[ bucketOf(i) ]++ ] = uint32_t(i);
     }
+}
 
+// fresh per-point records and outputs for the installed points
+void setQueryRecords()
+{
     // fresh records and outputs (finalize fills the out* arrays; the ragged ones append)
     std::vector< std::vector<unsigned char> >().swap( g_ctx.recBlocks );
     g_ctx.nRecs = 0;
@@ -709,16 +745,67 @@ void setQueryPoints(std::vector<double> &&pts, int const bucketFloor)
 
 // True when any query point lies in the bucket range [bLo, bHi] (periodic ranges wrap). The
 // cheap test that lets a tetrahedron with no point anywhere near it skip all per-tet work.
+// The buckets of a range [bLo, bHi] per axis (inclusive), in NO_DIM dimensions: the last axis runs
+// fastest -- the order of the nested 3D loops these replaced -- and a periodic index wraps.
+inline bool firstBucket(int bc[NO_DIM], int const bLo[NO_DIM], int const bHi[NO_DIM])
+{
+    for (int d = 0; d < NO_DIM; ++d)
+    {
+        if ( bLo[d] > bHi[d] ) return false;
+        bc[d] = bLo[d];
+    }
+    return true;
+}
+inline bool nextBucket(int bc[NO_DIM], int const bLo[NO_DIM], int const bHi[NO_DIM])
+{
+    int d = NO_DIM - 1;
+    while ( d >= 0 and ++bc[d] > bHi[d] ) { bc[d] = bLo[d]; --d; }
+    return d >= 0;
+}
+inline size_t bucketIndex(int const bc[NO_DIM])
+{
+    size_t b = 0;
+    for (int d = 0; d < NO_DIM; ++d)
+    {
+        int const w = g_ctx.periodic ? ((bc[d] % g_ctx.nB[d] + g_ctx.nB[d]) % g_ctx.nB[d]) : bc[d];
+        b = b * size_t(g_ctx.nB[d]) + size_t(w);
+    }
+    return b;
+}
+
+// The flat index of every bucket of [lo, hi] per axis (inclusive; n[d] buckets on axis d, periodic indices
+// wrapped), the last axis fastest: the order of the nested 3D loops it replaced, in any NO_DIM.
+template <class F>
+inline void forEachBucketIn(int const lo[NO_DIM], int const hi[NO_DIM], int const n[NO_DIM], bool const periodic,
+                            F const &f)
+{
+    int c[NO_DIM];
+    for (int d = 0; d < NO_DIM; ++d)
+    {
+        if ( lo[d] > hi[d] ) return;
+        c[d] = lo[d];
+    }
+    for (;;)
+    {
+        size_t b = 0;
+        for (int d = 0; d < NO_DIM; ++d)
+        {
+            int const w = periodic ? ((c[d] % n[d]) + n[d]) % n[d] : c[d];
+            b = b * size_t(n[d]) + size_t(w);
+        }
+        f( b );
+        int d = NO_DIM - 1;
+        while ( d >= 0 and ++c[d] > hi[d] ) { c[d] = lo[d]; --d; }
+        if ( d < 0 ) return;
+    }
+}
+
 inline bool anyPointInBuckets(int const bLo[NO_DIM], int const bHi[NO_DIM])
 {
-    for (int bi = bLo[0]; bi <= bHi[0]; ++bi)
-    for (int bj = bLo[1]; bj <= bHi[1]; ++bj)
-    for (int bk = bLo[2]; bk <= bHi[2]; ++bk)
+    int bc[NO_DIM];
+    for (bool more = firstBucket(bc, bLo, bHi); more; more = nextBucket(bc, bLo, bHi))
     {
-        int const wi = g_ctx.periodic ? ((bi % g_ctx.nB[0] + g_ctx.nB[0]) % g_ctx.nB[0]) : bi;
-        int const wj = g_ctx.periodic ? ((bj % g_ctx.nB[1] + g_ctx.nB[1]) % g_ctx.nB[1]) : bj;
-        int const wk = g_ctx.periodic ? ((bk % g_ctx.nB[2] + g_ctx.nB[2]) % g_ctx.nB[2]) : bk;
-        size_t const b = ( size_t(wi) * size_t(g_ctx.nB[1]) + size_t(wj) ) * size_t(g_ctx.nB[2]) + size_t(wk);
+        size_t const b = bucketIndex(bc);
         if ( g_ctx.bucketStart[b+1] > g_ctx.bucketStart[b] ) return true;
     }
     return false;
@@ -763,7 +850,7 @@ void interpolatePoints_phaseSpace(DT &dt, User_options &userOptions)
 
         // double-precision inverse for the evaluation (same zero criterion as above)
         double inv[NO_DIM][NO_DIM];
-        if ( not inverse3x3d(Ax, inv) ) { return; }
+        if ( not inverseNd(Ax, inv) ) { return; }
 
         // 'geometric' density: rho_bar * V_lag / V_eul (= m_tet * d! / |det Ax|), constant per tet
         double denGeo;
@@ -849,8 +936,10 @@ void interpolatePoints_phaseSpace(DT &dt, User_options &userOptions)
         {
             // constant velocity gradient of this stream: dv_j/dx_d = sum_v inv[d][v]
             // (vel_{v+1,j} - vel_{0,j}), same affine convention as the density gradient and
-            // the SAME [d*3+j] layout as the grid deposit's velGrad (ps_interpolation.cc
-            // matrixMultiplication(posMatInv, dvel)). The velocity profile is linear on every
+            // the same matrix as the grid deposit's velGrad (ps_interpolation.cc
+            // matrixMultiplication(posMatInv, dvel)), stored TRANSPOSED: the grid writes it
+            // [j*3+d] (field_computation.h velocityGradient), a point [d*3+j] (measured on a rigid
+            // rotation, 2026-10-03). The velocity profile is linear on every
             // kept cell -- hull cells included -- so there is no volume-ratio gate here.
             for (int d = 0; d < NO_DIM; ++d)
                 for (size_t j = 0; j < noVelComp; ++j)
@@ -858,14 +947,10 @@ void interpolatePoints_phaseSpace(DT &dt, User_options &userOptions)
                         rec.vgrad[d*NO_DIM + j] += inv[d][v] * (vel[v+1][j] - vel[0][j]);
         }
 
-        for (int bi = bLo[0]; bi <= bHi[0]; ++bi)
-        for (int bj = bLo[1]; bj <= bHi[1]; ++bj)
-        for (int bk = bLo[2]; bk <= bHi[2]; ++bk)
+        int bc[NO_DIM];
+        for (bool more = firstBucket(bc, bLo, bHi); more; more = nextBucket(bc, bLo, bHi))
         {
-            int const wi = g_ctx.periodic ? ((bi % g_ctx.nB[0] + g_ctx.nB[0]) % g_ctx.nB[0]) : bi;
-            int const wj = g_ctx.periodic ? ((bj % g_ctx.nB[1] + g_ctx.nB[1]) % g_ctx.nB[1]) : bj;
-            int const wk = g_ctx.periodic ? ((bk % g_ctx.nB[2] + g_ctx.nB[2]) % g_ctx.nB[2]) : bk;
-            size_t const b = ( size_t(wi) * size_t(g_ctx.nB[1]) + size_t(wj) ) * size_t(g_ctx.nB[2]) + size_t(wk);
+            size_t const b = bucketIndex(bc);
 
             for (size_t s = g_ctx.bucketStart[b]; s < g_ctx.bucketStart[b+1]; ++s)
             {
@@ -1060,14 +1145,10 @@ void interpolatePoints_standardOwn(DT &dt, User_options &userOptions, OwnBox con
                         rec.vgrad[d*NO_DIM + j] += inv[d][v] * (vel[v+1][j] - vel[0][j]);
         }
 
-        for (int bi = bLo[0]; bi <= bHi[0]; ++bi)
-        for (int bj = bLo[1]; bj <= bHi[1]; ++bj)
-        for (int bk = bLo[2]; bk <= bHi[2]; ++bk)
+        int bc[NO_DIM];
+        for (bool more = firstBucket(bc, bLo, bHi); more; more = nextBucket(bc, bLo, bHi))
         {
-            int const wi = g_ctx.periodic ? ((bi % g_ctx.nB[0] + g_ctx.nB[0]) % g_ctx.nB[0]) : bi;
-            int const wj = g_ctx.periodic ? ((bj % g_ctx.nB[1] + g_ctx.nB[1]) % g_ctx.nB[1]) : bj;
-            int const wk = g_ctx.periodic ? ((bk % g_ctx.nB[2] + g_ctx.nB[2]) % g_ctx.nB[2]) : bk;
-            size_t const b = ( size_t(wi) * size_t(g_ctx.nB[1]) + size_t(wj) ) * size_t(g_ctx.nB[2]) + size_t(wk);
+            size_t const b = bucketIndex(bc);
 
             for (size_t s = g_ctx.bucketStart[b]; s < g_ctx.bucketStart[b+1]; ++s)
             {
@@ -1366,9 +1447,10 @@ void psPointEvalWriteOutputs(User_options const &userOptions)
     writeRaw( ".pts_den",     g_ctx.outDen.data(),     g_ctx.outDen.size()     * sizeof(double),
               "point densities (float64, rho/rho_bar)" );
     writeRaw( ".pts_vel",     g_ctx.outVel.data(),     g_ctx.outVel.size()     * sizeof(double),
-              "point mean velocities (float64 x 3)" );
+              NO_DIM == 2 ? "point mean velocities (float64 x 2)" : "point mean velocities (float64 x 3)" );
     writeRaw( ".pts_velDisp", g_ctx.outDisp.data(),    g_ctx.outDisp.size()    * sizeof(double),
-              "point velocity dispersion tensors (float64 x 6, xx xy xz yy yz zz)" );
+              NO_DIM == 2 ? "point velocity dispersion tensors (float64 x 3, xx xy yy)"
+                          : "point velocity dispersion tensors (float64 x 6, xx xy xz yy yz zz)" );
     writeRaw( ".pts_streams", g_ctx.outStreams.data(), g_ctx.outStreams.size() * sizeof(int32_t),
               "point stream counts (int32)" );
     if ( g_ctx.psCaustics )
@@ -1376,10 +1458,12 @@ void psPointEvalWriteOutputs(User_options const &userOptions)
                   "point caustic masks (int32; bits as in '.causticClass', both parity bits = fold)" );
     if ( g_ctx.ptsDenGrad )
         writeRaw( ".pts_denGrad", g_ctx.outDenGrad.data(), g_ctx.outDenGrad.size() * sizeof(double),
-                  "point density gradients (float64 x 3, d(rho/rho_bar)/dx_i, 'dtfe' profile)" );
+                  NO_DIM == 2 ? "point density gradients (float64 x 2, d(rho/rho_bar)/dx_i, 'dtfe' profile)"
+                              : "point density gradients (float64 x 3, d(rho/rho_bar)/dx_i, 'dtfe' profile)" );
     if ( g_ctx.ptsVelGrad )
         writeRaw( ".pts_velGrad", g_ctx.outVelGrad.data(), g_ctx.outVelGrad.size() * sizeof(double),
-                  "point velocity gradients (float64 x 9, [d*3+j] = dv_j/dx_d, density-weighted stream mean)" );
+                  NO_DIM == 2 ? "point velocity gradients (float64 x 4, [d*2+j] = dv_j/dx_d, density-weighted stream mean)"
+                              : "point velocity gradients (float64 x 9, [d*3+j] = dv_j/dx_d, density-weighted stream mean)" );
     if ( g_ctx.ptsScalar )
         writeRaw( ".pts_scalar", g_ctx.outScalar.data(), g_ctx.outScalar.size() * sizeof(double),
                   "point scalar values (float64, density-weighted mean over the streams)" );
@@ -1390,15 +1474,18 @@ void psPointEvalWriteOutputs(User_options const &userOptions)
                   "per-stream record offsets (uint64, N+1)" );
         writeRaw( ".pts_stream_records", g_ctx.outRecords.data(),
                   g_ctx.outRecords.size() * sizeof(double),
-                  "per-stream records (float64 x 4: density, vx, vy, vz; density-descending)" );
+                  NO_DIM == 2 ? "per-stream records (float64 x 3: density, vx, vy; density-descending)"
+                              : "per-stream records (float64 x 4: density, vx, vy, vz; density-descending)" );
         if ( g_ctx.perStreamIds )
             writeRaw( ".pts_stream_ids", g_ctx.outIds.data(),
                       g_ctx.outIds.size() * sizeof(uint64_t),
-                      "per-stream identities (uint64 x 4: sorted Lagrangian-vertex ParticleIDs)" );
+                      NO_DIM == 2 ? "per-stream identities (uint64 x 3: sorted Lagrangian-vertex ParticleIDs)"
+                                  : "per-stream identities (uint64 x 4: sorted Lagrangian-vertex ParticleIDs)" );
         if ( g_ctx.ptsDenGrad )
             writeRaw( ".pts_stream_dengrad", g_ctx.outRecGrad.data(),
                       g_ctx.outRecGrad.size() * sizeof(double),
-                      "per-stream density gradients (float64 x 3, 'dtfe' profile)" );
+                      NO_DIM == 2 ? "per-stream density gradients (float64 x 2, 'dtfe' profile)"
+                                  : "per-stream density gradients (float64 x 3, 'dtfe' profile)" );
         if ( g_ctx.ptsScalar )
             writeRaw( ".pts_stream_scalar", g_ctx.outRecScalar.data(),
                       g_ctx.outRecScalar.size() * sizeof(double),
@@ -1406,7 +1493,8 @@ void psPointEvalWriteOutputs(User_options const &userOptions)
         if ( g_ctx.ptsLagrangian )
             writeRaw( ".pts_stream_lagpos", g_ctx.outRecLag.data(),
                       g_ctx.outRecLag.size() * sizeof(double),
-                      "per-stream Lagrangian coordinates (float64 x 3, the initial position of each stream's matter)" );
+                      NO_DIM == 2 ? "per-stream Lagrangian coordinates (float64 x 2, the initial position of each stream's matter)"
+                                  : "per-stream Lagrangian coordinates (float64 x 3, the initial position of each stream's matter)" );
     }
 }
 
@@ -1584,10 +1672,10 @@ static bool serveRange(ServeIndex const &I, Cell_handle const &c, int lo[NO_DIM]
 
 static void buildServeIndex(DT &dt, ServeIndex &I)
 {
-    for (DT::Finite_cells_iterator it = dt.finite_cells_begin(); it != dt.finite_cells_end(); ++it)
+    for (PSFiniteCellIterator it = PS_PE_FINITE_BEGIN(dt); it != PS_PE_FINITE_END(dt); ++it)
         I.cells.push_back( it );
     size_t const T = I.cells.size();
-    int nb = int( std::cbrt( double(T) / 8. ) );    // buckets about a few tetrahedra wide
+    int nb = int( std::pow( double(T) / 8., 1. / double(NO_DIM) ) );    // buckets about a few tetrahedra wide
     nb = std::max( 1, std::min( nb, 256 ) );
     size_t nTot = 1;
     for (int d = 0; d < NO_DIM; ++d)
@@ -1606,17 +1694,10 @@ static void buildServeIndex(DT &dt, ServeIndex &I)
         {
             int lo[NO_DIM], hi[NO_DIM];
             if ( not serveRange( I, I.cells[ci], lo, hi ) ) continue;
-            for (int bi = lo[0]; bi <= hi[0]; ++bi)
-            for (int bj = lo[1]; bj <= hi[1]; ++bj)
-            for (int bk = lo[2]; bk <= hi[2]; ++bk)
-            {
-                int const wi = g_ctx.periodic ? ((bi % I.n[0] + I.n[0]) % I.n[0]) : bi;
-                int const wj = g_ctx.periodic ? ((bj % I.n[1] + I.n[1]) % I.n[1]) : bj;
-                int const wk = g_ctx.periodic ? ((bk % I.n[2] + I.n[2]) % I.n[2]) : bk;
-                size_t const b = ( size_t(wi) * size_t(I.n[1]) + size_t(wj) ) * size_t(I.n[2]) + size_t(wk);
+            forEachBucketIn( lo, hi, I.n, g_ctx.periodic, [&](size_t b) {
                 if ( pass == 0 ) ++I.start[b+1];
                 else             I.members[ fill[b]++ ] = uint32_t(ci);
-            }
+            } );
         }
         if ( pass == 0 )
         {
@@ -1673,6 +1754,7 @@ static void serveHandshake(uint64_t const nVert, uint32_t const nPartitions, uin
     if ( g_ctx.ptsScalar )     flags |= 1u << 8;
     if ( g_ctx.ptsLagrangian ) flags |= 1u << 9;
     if ( nPartitions > 1 )     flags |= 1u << 10;
+    if ( NO_DIM == 2 )         flags |= 1u << 11;   // a 2D server: points, the region and every vector carry 2 components
     uint32_t const nScalar = g_ctx.ptsScalar ? uint32_t(noScalarComp) : 0u;
     double region[2*NO_DIM];
     for (int d = 0; d < NO_DIM; ++d)
@@ -1687,6 +1769,20 @@ static void serveHandshake(uint64_t const nVert, uint32_t const nPartitions, uin
     serveWrite( region, sizeof(region) );
     serveWrite( &nPartitions, sizeof(nPartitions) );
     serveWrite( &nResident, sizeof(nResident) );
+}
+
+// '--serve-progress': plain progress lines on stderr (the server's log), whatever '--verbose' says --
+// MESSAGE::Message prints nothing at the launcher's verbose 1, which left its progress bar blind
+static bool g_serveProgress = false;
+static void serveProgress(char const *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void serveProgress(char const *fmt, ...)
+{
+    if ( not g_serveProgress ) return;
+    va_list ap;
+    va_start( ap, fmt );
+    std::vfprintf( stderr, fmt, ap );
+    va_end( ap );
+    std::fflush( stderr );
 }
 
 /* The request loop shared by the single and the composite server. 'evaluate' collects the streams
@@ -1709,7 +1805,7 @@ template <typename Evaluate>
         {
             // drain the payload so the stream stays in sync, then refuse
             std::vector<char> sink( size_t(1) << 20 );
-            uint64_t left = n * 3 * sizeof(double);
+            uint64_t left = n * NO_DIM * sizeof(double);
             bool ok = true;
             while ( left > 0 && ok )
             {
@@ -1734,7 +1830,9 @@ template <typename Evaluate>
             continue;
         }
 
-        bool const useIndex = n * 64 < uint64_t(indexCells);
+        bool useIndex = n * 64 < uint64_t(indexCells);
+        if ( const char *env = std::getenv("DTFE_SERVE_INDEX") )   // 0 / 1: force the walk / the cell index
+            useIndex = std::atoi( env ) != 0;
         setQueryPoints( std::move(pts), useIndex ? 1 : bucketFloor );
         std::string const failure = evaluate( useIndex );
         g_cellList = nullptr;
@@ -1804,7 +1902,7 @@ template <typename Evaluate>
         printComputationTime( &t, &userOptions, "point-evaluation server cell index" );
     }
     size_t const nCells = index.cells.size();
-    int const bucketFloor = int( std::cbrt( double(nCells) / 16. ) );
+    int const bucketFloor = int( std::pow( double(nCells) / 16., 1. / double(NO_DIM) ) );
     std::vector<Cell_handle> candidates;
 
     serveHandshake( uint64_t( dt.number_of_vertices() ), 1u, 1u );
@@ -1815,8 +1913,11 @@ template <typename Evaluate>
                 << " vertices); close stdin to stop.\n" << MESSAGE::Flush;
     }
 
+    g_serveProgress = userOptions.psServeProgress;
     serveLoop( userOptions, nCells, bucketFloor, [&](bool const useIndex) -> std::string
     {
+        auto const t0 = std::chrono::steady_clock::now();
+        serveProgress( "[request 1/1] one tessellation: in memory\n" );
         if ( useIndex )
         {
             serveCandidates( index, candidates );
@@ -1827,6 +1928,8 @@ template <typename Evaluate>
 #else
         interpolatePoints_standard( dt, userOptions );
 #endif
+        serveProgress( "[request done] %zu points, 1 of 1 partitions, 0 loaded from the cache in 0.0 s, %.2f s in all\n",
+                       g_ctx.nPoints, std::chrono::duration<double>( std::chrono::steady_clock::now() - t0 ).count() );
         return std::string();
     } );
 }
@@ -1843,7 +1946,7 @@ template <typename Evaluate>
    answered partition by partition is bit-identical to one answered by a single server (the
    records are sorted before any reduction).
 
-   Routing: every partition keeps an OCCUPANCY map, one bit per bucket of a coarse OCC_N^3 grid over
+   Routing: every partition keeps an OCCUPANCY map, one bit per bucket of a coarse OCC_N^NO_DIM grid over
    the box, set wherever one of its owned tetrahedra's Eulerian bounding boxes reaches (min-image
    wrapped and padded like tetBucketRange). A tetrahedron containing a point always covers that
    point's bucket, so a request only visits the partitions whose map holds one of its points.
@@ -1860,8 +1963,25 @@ template <typename Evaluate>
 namespace psPointEvalDetail {
 
 static const int OCC_N = 64;                 // occupancy buckets per axis (32 KB per partition)
-static const size_t OCC_WORDS = size_t(OCC_N) * OCC_N * OCC_N / 64;
+// A partition's cell index is built only once the partition has answered this many requests by
+// walking its cells while in memory. Measured on TNG100-3-Dark's 14.3M-vertex partitions: the index
+// took 18-22 s to build, a walk for a 512^2 zoom (or a click) 1.1-1.4 s, a request through the index
+// 0.2-0.9 s -- so building it on the first request made the first zoom or click in a region 3-15x
+// slower, and a partition evicted again (a region needing more partitions than fit) rebuilt it every time.
+static const uint64_t INDEX_AFTER_WALKS = 8;
+// Memory of a resident partition, for the automatic resident set: its tessellation per vertex (the
+// server's RSS with 8 resident 3.65M-vertex partitions: 664 B/vertex; the same figures as
+// auto_tune.h autoTuneServe) and, before one is built, its cell index per vertex (the index's own
+// arrays are counted once it exists).
+#ifdef PHASE_SPACE
+static const double SERVE_TRI_BYTES_PER_VERTEX = 666.;
+#else
+static const double SERVE_TRI_BYTES_PER_VERTEX = 648.;
+#endif
+static const double SERVE_INDEX_BYTES_PER_VERTEX = 192.;
+static const size_t OCC_WORDS = ( NO_DIM == 2 ? size_t(OCC_N) * OCC_N : size_t(OCC_N) * OCC_N * OCC_N ) / 64;
 static const char OCC_MAGIC[8] = { 'D','T','F','E','O','C','C','1' };
+static const char OCC_ALPHA_TAG[4] = { 'O','C','C','A' };
 
 struct ServePart
 {
@@ -1869,7 +1989,9 @@ struct ServePart
     OwnBox own;                              // standard binary: the Eulerian box it owns
     std::vector<uint64_t> occ;               // occupancy bits (OCC_WORDS words); empty = owns nothing
     std::unique_ptr<DT> dt;                  // resident tessellation, or null (in the cache only)
-    std::unique_ptr<ServeIndex> index;       // its cell index, built on first small request
+    std::unique_ptr<ServeIndex> index;       // its cell index (see INDEX_AFTER_WALKS)
+    uint64_t walks = 0;                      // requests answered by walking it since it was loaded
+    double indexBytes = 0.;                  // its cell index's arrays, while it has one
     uint64_t lastUse = 0;
     uint64_t nVertices = 0;
     bool cached = false;                     // a valid cache file exists: may be dropped and reloaded
@@ -1883,6 +2005,9 @@ struct Composite
     int done = 0;
     uint64_t clock = 0;
     size_t maxResident = 1;                  // cap on resident CACHED partitions (uncached ones are pinned)
+    bool byBytes = false;                    // automatic: as many as fit in budgetBytes (else maxResident)
+    double budgetBytes = 0.;
+    double indexPerVertex = SERVE_INDEX_BYTES_PER_VERTEX;   // the last built index's, per vertex
 };
 static Composite g_comp;
 
@@ -1903,9 +2028,45 @@ inline int occBucket(double x, int d)
     return b;
 }
 
+// The bucket frame of an occupancy map: the box it covers (the run's region), its periodicity and
+// the canonical-frame slack. The server takes it from its point-evaluation context; a batch
+// partition run (its map writer, and the --ps-window partition skip) builds the same from the
+// partition's options -- the region is the box in both, from the moment the header is read.
+struct OccFrame
+{
+    double boxLo[NO_DIM], boxLen[NO_DIM];
+    bool   periodic = false;
+    double epsAbs = 0.;
+};
+
+static OccFrame occFrameFromCtx()
+{
+    OccFrame F;
+    for (int d = 0; d < NO_DIM; ++d) { F.boxLo[d] = g_ctx.boxLo[d]; F.boxLen[d] = g_ctx.boxLen[d]; }
+    F.periodic = g_ctx.periodic;
+    F.epsAbs = g_ctx.canon.epsAbs;
+    return F;
+}
+
+static OccFrame occFrameFrom(User_options const &o)
+{
+    OccFrame F;
+    for (int d = 0; d < NO_DIM; ++d)
+    {
+        F.boxLo[d]  = double( o.region.coords[2*d] );
+        F.boxLen[d] = double( o.region.coords[2*d+1] ) - double( o.region.coords[2*d] );
+    }
+    F.periodic = o.periodic;
+    User_options c = o;                // Frame::init takes a non-const reference
+    Frame canon;
+    canon.init( c );
+    F.epsAbs = canon.epsAbs;
+    return F;
+}
+
 // Marks the occupancy buckets of one tetrahedron's (wrapped) Eulerian vertices -- the same bbox
 // and slack as tetBucketRange, so no bucket the exact test could accept a point in is missed.
-static void markOccupancy(std::vector<uint64_t> &occ, Real const eulerPos[NO_DIM+1][NO_DIM])
+static void markOccupancy(std::vector<uint64_t> &occ, Real const eulerPos[NO_DIM+1][NO_DIM], OccFrame const &F)
 {
     int lo[NO_DIM], hi[NO_DIM];
     for (int d = 0; d < NO_DIM; ++d)
@@ -1917,11 +2078,11 @@ static void markOccupancy(std::vector<uint64_t> &occ, Real const eulerPos[NO_DIM
             eMin = std::min( eMin, c );
             eMax = std::max( eMax, c );
         }
-        double const margin = 1.e-5 * (eMax - eMin) + 1.e-12 + 2. * g_ctx.canon.epsAbs;
-        double const w = double(OCC_N) / g_ctx.boxLen[d];
-        lo[d] = int( std::floor( (eMin - margin - g_ctx.boxLo[d]) * w ) );
-        hi[d] = int( std::floor( (eMax + margin - g_ctx.boxLo[d]) * w ) );
-        if ( g_ctx.periodic )
+        double const margin = 1.e-5 * (eMax - eMin) + 1.e-12 + 2. * F.epsAbs;
+        double const w = double(OCC_N) / F.boxLen[d];
+        lo[d] = int( std::floor( (eMin - margin - F.boxLo[d]) * w ) );
+        hi[d] = int( std::floor( (eMax + margin - F.boxLo[d]) * w ) );
+        if ( F.periodic )
         {
             if ( hi[d] - lo[d] + 1 >= OCC_N ) { lo[d] = 0; hi[d] = OCC_N - 1; }
         }
@@ -1931,33 +2092,31 @@ static void markOccupancy(std::vector<uint64_t> &occ, Real const eulerPos[NO_DIM
             hi[d] = std::max( 0, std::min( hi[d], OCC_N - 1 ) );
         }
     }
-    for (int i = lo[0]; i <= hi[0]; ++i)
-    for (int j = lo[1]; j <= hi[1]; ++j)
-    for (int k = lo[2]; k <= hi[2]; ++k)
-    {
-        int const wi = ((i % OCC_N) + OCC_N) % OCC_N, wj = ((j % OCC_N) + OCC_N) % OCC_N, wk = ((k % OCC_N) + OCC_N) % OCC_N;
-        size_t const b = ( size_t(wi) * OCC_N + size_t(wj) ) * OCC_N + size_t(wk);
-        occ[b >> 6] |= uint64_t(1) << (b & 63);
-    }
+    int const nOcc[NO_DIM] = { OCC_N, OCC_N
+#if NO_DIM == 3
+                               , OCC_N
+#endif
+                             };
+    forEachBucketIn( lo, hi, nOcc, true, [&](size_t b) { occ[b >> 6] |= uint64_t(1) << (b & 63); } );
 }
 
 // The partition's occupancy map from its OWNED tetrahedra (the workers' own filters).
-static void computeOccupancy(DT &dt, ServePart &P)
+static void computeOccupancy(DT &dt, ServePart &P, OccFrame const &F)
 {
     P.occ.assign( OCC_WORDS, 0 );
-    for (DT::Finite_cells_iterator it = dt.finite_cells_begin(); it != dt.finite_cells_end(); ++it)
+    for (PSFiniteCellIterator it = PS_PE_FINITE_BEGIN(dt); it != PS_PE_FINITE_END(dt); ++it)
     {
         Cell_handle cell = it;
 #ifdef PHASE_SPACE
         PSCellGeometry geo;
         Box boxCoordinates = P.opts.region;
         if ( not psFilterCell( cell, P.opts, boxCoordinates, true, NULL, geo ) ) continue;
-        markOccupancy( P.occ, geo.eulerPos );
+        markOccupancy( P.occ, geo.eulerPos, F );
 #else
         double rho[NO_DIM+1], vel[NO_DIM+1][noVelComp];
         Real eulerPos[NO_DIM+1][NO_DIM], rawPos[NO_DIM+1][NO_DIM];
         if ( not standardCell( cell, P.own, rho, vel, eulerPos, rawPos ) ) continue;
-        markOccupancy( P.occ, eulerPos );
+        markOccupancy( P.occ, eulerPos, F );
 #endif
     }
 }
@@ -1980,6 +2139,16 @@ static void writeOccupancy(ServePart const &P)
     f.write( reinterpret_cast<char const*>(&P.nVertices), sizeof P.nVertices );
     f.write( reinterpret_cast<char const*>(&words), sizeof words );
     f.write( reinterpret_cast<char const*>(P.occ.data()), std::streamsize( words * sizeof(uint64_t) ) );
+    // trailer: the one cell filter the descriptor does not pin -- the non-periodic alpha shape's
+    // radius (0 = the whole hull). A --ps-window run trusts a map for skipping only when it kept at
+    // least the tetrahedra the run keeps. Readers that stop after the words (the server) ignore it.
+#ifdef PHASE_SPACE
+    double const alpha = double( P.opts.psLagAlphaRadius );
+#else
+    double const alpha = 0.;                        // the standard binary has no alpha shape
+#endif
+    f.write( OCC_ALPHA_TAG, 4 );
+    f.write( reinterpret_cast<char const*>(&alpha), sizeof alpha );
     f.close();
     if ( f ) std::rename( tmp.c_str(), path.c_str() );
     else     std::remove( tmp.c_str() );
@@ -2018,13 +2187,42 @@ static size_t residentCached()
     return k;
 }
 
+inline double serveTriBytes(ServePart const &P)
+{
+    return SERVE_TRI_BYTES_PER_VERTEX * double( std::max<uint64_t>( P.nVertices, 1 ) );
+}
+
+// the memory of the resident CACHED partitions (uncached ones are pinned and not counted, as before)
+static double residentBytes()
+{
+    double b = 0.;
+    for (ServePart const &P : g_comp.parts)
+        if ( P.dt and P.cached ) b += serveTriBytes( P ) + ( P.index ? P.indexBytes : 0. );
+    return b;
+}
+
+// may partition P be loaded next to the resident ones? (by bytes when automatic, else by count)
+static bool roomToLoad(ServePart const &P)
+{
+    if ( g_comp.byBytes ) return residentBytes() + serveTriBytes( P ) <= g_comp.budgetBytes;
+    return residentCached() < g_comp.maxResident;
+}
+
+static void dropResident(ServePart &P)
+{
+    P.index.reset();                         // its Cell_handles point into the tessellation
+    P.indexBytes = 0.;
+    P.dt.reset();
+    P.walks = 0;
+}
+
 // Loads partition p (dropping the least recently used cached ones beyond the cap). False when its
 // cached tessellation cannot be read back.
 static bool ensureResident(size_t const p, double &loadSeconds)
 {
     ServePart &P = g_comp.parts[p];
     if ( P.dt ) return true;
-    while ( residentCached() >= g_comp.maxResident )
+    while ( not roomToLoad( P ) )
     {
         size_t victim = g_comp.parts.size();
         for (size_t q = 0; q < g_comp.parts.size(); ++q)
@@ -2034,8 +2232,7 @@ static bool ensureResident(size_t const p, double &loadSeconds)
             if ( victim == g_comp.parts.size() or Q.lastUse < g_comp.parts[victim].lastUse ) victim = q;
         }
         if ( victim == g_comp.parts.size() ) break;
-        g_comp.parts[victim].index.reset();          // its Cell_handles point into the tessellation
-        g_comp.parts[victim].dt.reset();
+        dropResident( g_comp.parts[victim] );
     }
     auto const t0 = std::chrono::steady_clock::now();
     std::unique_ptr<DT> dt( new DT );
@@ -2057,6 +2254,7 @@ void psServeCompositeBegin(User_options const &userOptions, int const totalParti
     g_comp.parts.clear();
     g_comp.parts.resize( size_t( std::max( 1, totalPartitions ) ) );
     g_comp.verbose = userOptions.verboseLevel;
+    g_serveProgress = userOptions.psServeProgress;
     g_comp.done = 0;
     MESSAGE::Message message( userOptions.verboseLevel );
     message << "\n" << MESSAGE::cBold() << PTS_MSG_BINARY << MESSAGE::cReset() << " composite server over "
@@ -2118,7 +2316,7 @@ void psServeCompositeAddPartition(int const index, User_options &partOptions,
         else
         {
             P.nVertices = uint64_t( dt->number_of_vertices() );
-            computeOccupancy( *dt, P );
+            computeOccupancy( *dt, P, occFrameFromCtx() );
             if ( caching and TessellationCache::headerMatches( P.opts ) )
             {
                 writeOccupancy( P );
@@ -2133,6 +2331,8 @@ void psServeCompositeAddPartition(int const index, User_options &partOptions,
     double const sec = std::chrono::duration<double>( std::chrono::steady_clock::now() - t0 ).count();
     std::lock_guard<std::mutex> lock( g_comp.logMutex );
     ++g_comp.done;
+    serveProgress( "[partitions %d/%zu] partition %d: %s, %llu vertices, %.1f s\n", g_comp.done, g_comp.parts.size(),
+                   index, how, (unsigned long long)P.nVertices, sec );
     MESSAGE::Message prog( g_comp.verbose );
     prog << MESSAGE::cGreen() << "  [partitions " << g_comp.done << "/" << g_comp.parts.size() << "]"
          << MESSAGE::cReset() << MESSAGE::cDim() << "  partition " << index << ": " << how << ", "
@@ -2154,30 +2354,42 @@ void psServeCompositeAddPartition(int const index, User_options &partOptions,
         if ( P.cached ) ++nCached;
     }
 
-    // how many cached partitions may be in memory at once: --serve-resident, else the auto-tune
-    // memory budget over the largest partition (triangulation ~658 B/vertex + its cell index)
+    // which cached partitions may be in memory at once: --serve-resident N of them, else as many as
+    // fit in the auto-tune memory budget -- their tessellations (SERVE_TRI_BYTES_PER_VERTEX) plus the
+    // cell indexes that exist (built only when they fit too, see the request loop). Counting an index
+    // for every partition (850 B/vertex, before 2026-10-02) kept TNG100-3-Dark's server at 3 resident
+    // 14.3M-vertex partitions where 4 fit, so a zoom needing 4 reloaded one every time.
+    // DTFE_SERVE_BUDGET_GB overrides the budget (tests).
+    g_comp.byBytes = false;
     if ( userOptions.serveResident > 0 )
         g_comp.maxResident = size_t( userOptions.serveResident );
     else if ( nCached > 0 )
     {
         std::string why;
-        double const budget = autoTuneBudget( autoTunePhysicalRAM(), why );
-        double const perPart = 850. * double( std::max<uint64_t>( nVertMax, 1 ) );
-        g_comp.maxResident = size_t( std::max( 1., std::floor( budget / perPart ) ) );
+        double budget = autoTuneBudget( autoTunePhysicalRAM(), why );
+        if ( char const *e = std::getenv( "DTFE_SERVE_BUDGET_GB" ) )
+            if ( std::atof( e ) > 0. ) budget = std::atof( e ) * 1.e9;
+        g_comp.byBytes = true;
+        g_comp.budgetBytes = budget;
+        double const perPart = SERVE_TRI_BYTES_PER_VERTEX * double( std::max<uint64_t>( nVertMax, 1 ) );
+        g_comp.maxResident = size_t( std::max( 1., std::floor( budget / perPart ) ) );   // reported only
     }
     else
         g_comp.maxResident = nParts;
     g_comp.maxResident = std::max<size_t>( 1, std::min( g_comp.maxResident, nParts ) );
+    char budgetText[32];
+    std::snprintf( budgetText, sizeof budgetText, "%.1f GB", g_comp.budgetBytes / 1.e9 );
 
     message << "\n" << MESSAGE::cBold() << PTS_MSG_BINARY << MESSAGE::cReset() << " composite server ready: "
             << nParts << " partitions, " << nVertTotal << " vertices in total; "
-            << ( nCached > 0 ? std::to_string( g_comp.maxResident ) + " held in memory at once (--serve-resident"
-                               + ( userOptions.serveResident > 0 ? "" : ", automatic" ) + "), the others reloaded from the cache on demand"
-                             : std::string( "all held in memory" ) )
+            << ( nCached == 0 ? std::string( "all held in memory" )
+                 : g_comp.byBytes ? "as many held in memory at once as fit in " + std::string( budgetText )
+                                    + " (" + std::to_string( g_comp.maxResident ) + " of the largest), the others reloaded from the cache on demand"
+                 : std::to_string( g_comp.maxResident ) + " held in memory at once (--serve-resident), the others reloaded from the cache on demand" )
             << "; close stdin to stop.\n" << MESSAGE::Flush;
 
     size_t const indexCells = size_t( 6.8 * double( std::max<uint64_t>( nVertMax, 1 ) ) );
-    int const bucketFloor = int( std::cbrt( double(indexCells) / 16. ) );
+    int const bucketFloor = int( std::pow( double(indexCells) / 16., 1. / double(NO_DIM) ) );
     std::vector<Cell_handle> candidates;
     serveHandshake( nVertTotal, uint32_t(nParts), uint32_t(g_comp.maxResident) );
 
@@ -2206,21 +2418,145 @@ void psServeCompositeAddPartition(int const index, User_options &partOptions,
 
         size_t loaded = 0;
         double loadSeconds = 0.;
+        auto const tReq = std::chrono::steady_clock::now();
+
+        // PARALLEL LOADS: the needed partitions that are not in memory are read back from the cache by
+        // background threads -- as many as fit under the resident cap once the partitions this request
+        // does not need are dropped -- while the resident ones are evaluated. A load (inflate + CGAL
+        // deserialization, ~8 s for a 6M-vertex TNG100-3 partition) is independent of every other, so
+        // k loads take about one load's time on k cores. The evaluation ORDER is unchanged (resident
+        // first, then the others in 'need' order), so every answer is too. Partitions beyond the cap
+        // are loaded one at a time afterwards, as before.
+        std::vector<size_t> toLoad;
+        std::vector<char> inNeed( nParts, 0 );
+        for (size_t const p : need)
+        {
+            inNeed[p] = 1;
+            if ( not g_comp.parts[p].dt ) toLoad.push_back( p );
+        }
+        // how many of toLoad (in order) fit next to the resident ones
+        auto fittingLoads = [&]() -> size_t
+        {
+            if ( not g_comp.byBytes )
+            {
+                size_t const r = residentCached();
+                return g_comp.maxResident > r ? std::min( g_comp.maxResident - r, toLoad.size() ) : 0;
+            }
+            double free = g_comp.budgetBytes - residentBytes();
+            size_t k = 0;
+            while ( k < toLoad.size() and serveTriBytes( g_comp.parts[toLoad[k]] ) <= free )
+                free -= serveTriBytes( g_comp.parts[toLoad[k++]] );
+            return k;
+        };
+        size_t room = fittingLoads();
+        while ( room < toLoad.size() )
+        {
+            size_t victim = nParts;
+            for (size_t q = 0; q < nParts; ++q)
+            {
+                ServePart const &Q = g_comp.parts[q];
+                if ( inNeed[q] or not Q.dt or not Q.cached ) continue;
+                if ( victim == nParts or Q.lastUse < g_comp.parts[victim].lastUse ) victim = q;
+            }
+            if ( victim == nParts ) break;
+            dropResident( g_comp.parts[victim] );
+            room = fittingLoads();
+        }
+        struct Prefetch { std::unique_ptr<DT> dt; bool ok = false, done = false; double sec = 0.; };
+        size_t const nPre = std::min( room, toLoad.size() );
+        std::vector<Prefetch> pre( nPre );
+        std::vector<long> preIndex( nParts, -1 );
+        for (size_t i = 0; i < nPre; ++i) preIndex[toLoad[i]] = long(i);
+        std::mutex preMutex;
+        std::condition_variable preCv;
+        std::atomic<size_t> preNext{ 0 };
+        std::vector<std::thread> loaders;
+        struct JoinAll { std::vector<std::thread> &v; ~JoinAll() { for (std::thread &t : v) if ( t.joinable() ) t.join(); } };
+        JoinAll joinAll{ loaders };                    // every exit path waits for the loads in flight
+        if ( nPre > 0 )
+        {
+            unsigned const hw = std::max( 1u, std::thread::hardware_concurrency() );
+            size_t const nThreads = std::min<size_t>( nPre, std::max<size_t>( 1, std::min( 8u, std::max( 1u, hw / 2u ) ) ) );
+            for (size_t t = 0; t < nThreads; ++t)
+                loaders.emplace_back( [&]()
+                {
+                    for (;;)
+                    {
+                        size_t const i = preNext.fetch_add( 1 );
+                        if ( i >= nPre ) return;
+                        auto const t0 = std::chrono::steady_clock::now();
+                        std::unique_ptr<DT> dt( new DT );
+                        bool const ok = TessellationCache::tryLoad( *dt, g_comp.parts[toLoad[i]].opts );
+                        double const sec = std::chrono::duration<double>( std::chrono::steady_clock::now() - t0 ).count();
+                        std::lock_guard<std::mutex> lk( preMutex );
+                        pre[i].dt = std::move( dt );
+                        pre[i].ok = ok;
+                        pre[i].sec = sec;
+                        pre[i].done = true;
+                        preCv.notify_all();
+                    }
+                } );
+        }
+
+        size_t k = 0;
+        bool walkBucketed = not useIndex;
         for (size_t const p : need)
         {
             ServePart &P = g_comp.parts[p];
             bool const wasResident = bool( P.dt );
-            if ( not ensureResident( p, loadSeconds ) )
-                return "partition " + std::to_string(p) + "'s cached tessellation could not be read back from '"
-                       + P.opts.tessellationCacheDir + "' (deleted, or the inputs changed since the server started); restart the server";
-            if ( not wasResident ) ++loaded;
+            serveProgress( "[request %zu/%zu] partition %zu: %s\n", ++k, need.size(), p,
+                           wasResident ? "in memory" : "loading from the cache" );
+            auto const tPart = std::chrono::steady_clock::now();
+            double const loadBefore = loadSeconds;
+            double indexSeconds = 0.;
+            std::string const unreadable = "partition " + std::to_string(p) + "'s cached tessellation could not be read back from '"
+                + P.opts.tessellationCacheDir + "' (deleted, or the inputs changed since the server started); restart the server";
+            if ( not wasResident )
+            {
+                long const i = preIndex[p];
+                if ( i >= 0 )
+                {
+                    std::unique_lock<std::mutex> lk( preMutex );
+                    preCv.wait( lk, [&]{ return pre[size_t(i)].done; } );
+                    if ( not pre[size_t(i)].ok ) return unreadable;
+                    P.dt = std::move( pre[size_t(i)].dt );
+                    loadSeconds += pre[size_t(i)].sec;
+                }
+                else if ( not ensureResident( p, loadSeconds ) )
+                    return unreadable;
+                ++loaded;
+            }
             g_cellList = nullptr;
-            if ( useIndex )
+            // the index for a small request only once this partition has earned it (INDEX_AFTER_WALKS),
+            // or when it exists already; else the walk (DTFE_SERVE_INDEX=1 forces the index)
+            bool const forceIndex = std::getenv("DTFE_SERVE_INDEX") and std::atoi( std::getenv("DTFE_SERVE_INDEX") ) != 0;
+            // ... and, under the automatic resident set, only when the index fits next to the resident
+            // partitions WITHOUT evicting one (a reload costs more than the index saves); else walk
+            bool const indexFits = P.index or forceIndex or not g_comp.byBytes or not P.cached
+                or residentBytes() + g_comp.indexPerVertex * double( std::max<uint64_t>( P.nVertices, 1 ) ) <= g_comp.budgetBytes;
+            bool const partIndex = useIndex and indexFits and ( P.index or P.walks >= INDEX_AFTER_WALKS or forceIndex );
+            if ( useIndex and not indexFits and P.walks >= INDEX_AFTER_WALKS )
+                serveProgress( "[request %zu/%zu] partition %zu: its cell index would not fit in memory, walking\n",
+                               k, need.size(), p );
+            if ( not partIndex ) ++P.walks;
+            if ( useIndex and not partIndex and not walkBucketed )
+            {   // the request was bucketed for the index (1 bucket floor): a walk wants the walk's buckets
+                bucketQueryPoints( bucketFloor );
+                walkBucketed = true;
+            }
+            if ( partIndex )
             {
                 if ( not P.index )
                 {
+                    serveProgress( "[request %zu/%zu] partition %zu: building its cell index\n", k, need.size(), p );
+                    auto const tIdx = std::chrono::steady_clock::now();
                     P.index.reset( new ServeIndex );
                     buildServeIndex( *P.dt, *P.index );
+                    indexSeconds = std::chrono::duration<double>( std::chrono::steady_clock::now() - tIdx ).count();
+                    ServeIndex const &I = *P.index;
+                    P.indexBytes = double( I.cells.capacity() ) * sizeof(Cell_handle) + double( I.start.capacity() ) * sizeof(size_t)
+                                 + double( I.members.capacity() + I.stamp.capacity() ) * sizeof(uint32_t);
+                    g_comp.indexPerVertex = P.indexBytes / double( std::max<uint64_t>( P.nVertices, 1 ) );
                 }
                 serveCandidates( *P.index, candidates );
                 g_cellList = &candidates;
@@ -2232,7 +2568,13 @@ void psServeCompositeAddPartition(int const index, User_options &partOptions,
 #endif
             g_cellList = nullptr;
             P.lastUse = ++g_comp.clock;
+            double const partSeconds = std::chrono::duration<double>( std::chrono::steady_clock::now() - tPart ).count();
+            serveProgress( "[request %zu/%zu] partition %zu done in %.2f s (load %.2f s, index %.2f s)\n", k, need.size(), p,
+                           partSeconds, loadSeconds - loadBefore, indexSeconds );
         }
+        serveProgress( "[request done] %zu points, %zu of %zu partitions, %zu loaded from the cache in %.1f s, %.2f s in all\n",
+                       g_ctx.nPoints, need.size(), nParts, loaded, loadSeconds,
+                       std::chrono::duration<double>( std::chrono::steady_clock::now() - tReq ).count() );
         if ( userOptions.verboseLevel >= 2 or loaded > 0 )
         {
             MESSAGE::Message m( userOptions.verboseLevel );
@@ -2245,11 +2587,132 @@ void psServeCompositeAddPartition(int const index, User_options &partOptions,
 }
 
 
+// ======================================================================================
+// Batch partition runs and the occupancy maps (DTFE.cpp's Lagrangian partition loop).
+// --------------------------------------------------------------------------------------
+
+// --ps-window: can partition 'partOpts' deposit into the window of 'mainOpts'? 1 = its occupancy
+// map has a bucket inside the window, 0 = none (the partition's streams never reach the window, so
+// it is skipped: no particle selection, no tessellation load or build), -1 = no usable map (process
+// it). The map is the one a composite server or an earlier batch run wrote beside the partition's
+// cached tessellation, validated by the same full descriptor. The window's bucket range is widened
+// by one bucket on each side, so float rounding at its edges can never drop a partition.
+int psOccupancyTouchesWindow(User_options const &partOpts, User_options const &mainOpts)
+{
+    using namespace psPointEvalDetail;
+    if ( not mainOpts.psWindowOn or partOpts.tessellationCacheDir.empty() ) return -1;
+    std::ifstream f( occPath( partOpts ).c_str(), std::ios::binary );
+    if ( not f ) return -1;
+    char magic[8] = {0};
+    uint32_t len = 0, n = 0;
+    uint64_t nVert = 0, words = 0;
+    f.read( magic, 8 );
+    f.read( reinterpret_cast<char*>(&len), sizeof len );
+    if ( not f or std::memcmp( magic, OCC_MAGIC, 8 ) != 0 or len == 0 or len > (1u<<20) ) return -1;
+    std::string stored( size_t(len), '\0' );
+    f.read( &stored[0], std::streamsize(len) );
+    f.read( reinterpret_cast<char*>(&n), sizeof n );
+    f.read( reinterpret_cast<char*>(&nVert), sizeof nVert );
+    f.read( reinterpret_cast<char*>(&words), sizeof words );
+    if ( not f or stored != TessellationCache::makeDescriptor( partOpts ) or n != uint32_t(OCC_N)
+         or (words != OCC_WORDS and words != 0) ) return -1;
+    std::vector<uint64_t> occ( static_cast<size_t>(words) );
+    f.read( reinterpret_cast<char*>(occ.data()), std::streamsize( words * sizeof(uint64_t) ) );
+    if ( not f ) return -1;
+    char tag[4] = {0};
+    double alphaMap = -1.;
+    bool alphaKnown = false;
+    if ( f.read( tag, 4 ) and std::memcmp( tag, OCC_ALPHA_TAG, 4 ) == 0
+         and f.read( reinterpret_cast<char*>(&alphaMap), sizeof alphaMap ) )
+        alphaKnown = true;
+
+    // the map holds the tetrahedra the server's cell filter kept; the descriptor pins all of that
+    // filter except the non-periodic alpha shape (a periodic box never has one): trust the map only
+    // when it kept at least the tetrahedra this run keeps
+#ifdef PHASE_SPACE
+    double const az = double( partOpts.psLagAlphaRadius );
+#else
+    double const az = 0.;
+#endif
+    bool filterOk;
+    if ( partOpts.periodic and az <= 0. ) filterOk = true;
+    else if ( not alphaKnown )            filterOk = false;
+    else if ( az <= 0. )                  filterOk = ( alphaMap <= 0. );
+    else                                  filterOk = ( alphaMap <= 0. or alphaMap >= az * (1. - 1.e-12) );
+    if ( not filterOk ) return -1;
+    if ( words == 0 ) return 0;            // the partition owns no tetrahedron at all
+
+    OccFrame const F = occFrameFrom( partOpts );
+    Box const &b = mainOpts.regionOn ? mainOpts.region : mainOpts.boxCoordinates;
+    std::vector<int> bk[NO_DIM];
+    for (int d = 0; d < NO_DIM; ++d)
+    {
+        double const lo = double( b.coords[2*d] );
+        double const dx = ( double( b.coords[2*d+1] ) - lo ) / double( mainOpts.gridSize[d] );
+        double const x0 = lo + double( mainOpts.psWindowLo[d] ) * dx;
+        double const x1 = lo + double( mainOpts.psWindowLo[d] + mainOpts.psWindowDims[d] ) * dx;
+        double const w = double(OCC_N) / F.boxLen[d];
+        long b0 = long( std::floor( (x0 - F.boxLo[d]) * w ) ) - 1;
+        long b1 = long( std::floor( (x1 - F.boxLo[d]) * w ) ) + 1;
+        if ( F.periodic )
+        {
+            if ( b1 - b0 + 1 >= OCC_N ) { b0 = 0; b1 = OCC_N - 1; }
+            for (long q = b0; q <= b1; ++q) bk[d].push_back( int( ((q % OCC_N) + OCC_N) % OCC_N ) );
+        }
+        else
+        {
+            b0 = std::max( 0L, std::min( b0, long(OCC_N) - 1 ) );
+            b1 = std::max( 0L, std::min( b1, long(OCC_N) - 1 ) );
+            for (long q = b0; q <= b1; ++q) bk[d].push_back( int(q) );
+        }
+    }
+    // every combination of the per-axis bucket lists (an odometer over them, the last axis fastest)
+    size_t idx[NO_DIM] = {};
+    for (int d = 0; d < NO_DIM; ++d) if ( bk[d].empty() ) return 0;
+    for (;;)
+    {
+        size_t q = 0;
+        for (int d = 0; d < NO_DIM; ++d) q = q * OCC_N + size_t( bk[d][idx[d]] );
+        if ( (occ[q >> 6] >> (q & 63)) & 1u ) return 1;
+        int d = NO_DIM - 1;
+        while ( d >= 0 and ++idx[d] == bk[d].size() ) { idx[d] = 0; --d; }
+        if ( d < 0 ) break;
+    }
+    return 0;
+}
+
+bool psTessellationCached(User_options const &opts)
+{
+    return not opts.tessellationCacheDir.empty() and TessellationCache::headerMatches( opts );
+}
+
+// A batch partition run with '--tessellation-cache' leaves the partition's occupancy map beside its
+// cached tessellation when none is there yet (the server writes its own): a later --ps-window run
+// (the launcher's exact zoom) then skips the partitions that never reach its window, and a
+// composite server registers the partition without loading it. One pass of the cell filter over
+// the tessellation, seconds per partition, paid once.
+void psWriteOccupancyIfMissing(DT &dt, User_options &partOpts)
+{
+#ifdef PHASE_SPACE
+    using namespace psPointEvalDetail;
+    if ( partOpts.tessellationCacheDir.empty() or not partOpts.psUseSubgrid ) return;
+    if ( not TessellationCache::headerMatches( partOpts ) ) return;    // not cached: no map either
+    ServePart P;
+    P.opts = partOpts;
+    if ( readOccupancy( P ) ) return;                                    // already there
+    P.nVertices = uint64_t( dt.number_of_vertices() );
+    computeOccupancy( dt, P, occFrameFrom( partOpts ) );
+    writeOccupancy( P );
+#else
+    (void)dt; (void)partOpts;
+#endif
+}
+
+
 #else // NO_DIM != 3
 
-// Point evaluation is 3D-only. The per-triangulation worker must still LINK in 2D
-// (triangulation.cpp references it unconditionally; psPointEvalActive() is always false
-// here, so it can never be called).
+// Point evaluation and '--serve' exist in 2D and 3D builds (2D since 2026-10-02/03; the server's
+// handshake carries the dimension). These stubs only keep any other NO_DIM linking.
 #include "triangulation_common.h"
 #ifdef PHASE_SPACE
 void interpolatePoints_phaseSpace(DT &, User_options &) {}
@@ -2259,27 +2722,30 @@ void interpolatePoints_standard(DT &, User_options &) {}
 bool psPointEvalActive() { return false; }
 void psPointEvalInit(User_options &)
 {
-    throwError( "'--sample-points' (point evaluation) is implemented for 3D only." );
+    throwError( "'--sample-points' (point evaluation) is implemented for 2D and 3D builds only." );
 }
 void psPointEvalFinalize(User_options const &) {}
 void psPointEvalWriteOutputs(User_options const &) {}
 void psServeRedirectStdout() {}
 [[noreturn]] void psServe(DT &, User_options &)
 {
-    throwError( "'--serve' (interactive point evaluation) is implemented for 3D only." );
+    throwError( "'--serve' (interactive point evaluation) is implemented for 2D and 3D builds only." );
     std::exit( 1 );
 }
 void psServeCompositeBegin(User_options const &, int)
 {
-    throwError( "'--serve' (interactive point evaluation) is implemented for 3D only." );
+    throwError( "'--serve' (interactive point evaluation) is implemented for 2D and 3D builds only." );
 }
 void psServeCompositeAddPartition(int, User_options &, std::function<void(std::vector<Particle_data>&)> const &,
                                   double const *, double const *) {}
 [[noreturn]] void psServeCompositeRun(User_options &)
 {
-    throwError( "'--serve' (interactive point evaluation) is implemented for 3D only." );
+    throwError( "'--serve' (interactive point evaluation) is implemented for 2D and 3D builds only." );
     std::exit( 1 );
 }
+int psOccupancyTouchesWindow(User_options const &, User_options const &) { return -1; }
+bool psTessellationCached(User_options const &) { return false; }
+void psWriteOccupancyIfMissing(DT &, User_options &) {}
 
 #endif // NO_DIM
 

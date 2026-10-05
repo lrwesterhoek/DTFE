@@ -55,9 +55,11 @@ PY="${PYTHON:-python3}"
 command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/python3.14
 ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT}"
+source "${SCRIPT_DIR}/precision.sh"     # DTFE_TEST_PRECISION=double: the double pair
 
 N="${N:-24}"; GRID="${GRID:-48}"; BOX="${BOX:-100.0}"
-BIN="./PS-DTFE"
+BIN="${PS_BIN}"
+precision_require "${BIN}"
 TMP="${SCRIPT_DIR}/tmp"; mkdir -p "${TMP}"
 # input/point file names must NOT share a prefix with the output roots (rm -f "<root>".*)
 SNAP_UNI="${TMP}/ppe_input_uniform.hdf5"
@@ -72,7 +74,7 @@ echo "============================================================"
 echo " PS-DTFE point-evaluation check   N=${N}^3  grid=${GRID}^3"
 echo "============================================================"
 
-if [ "${1:-}" != "--no-build" ]; then
+if [ "${1:-}" != "--no-build" ] && ! precision_double; then
     echo ">> building PS-DTFE ..."
     # respect the current build mode (o_ps/.build_mode: METAL=1 / empty)
     BUILD_MODE="$(cat o_ps/.build_mode 2>/dev/null || true)"
@@ -252,6 +254,7 @@ echo ">> checking the numbers ..."
 "${PY}" - "${TMP}" "${GRID}" "${HAVE_IDS}" "${HAVE_GRAD}" "${HAVE_VELGRAD}" <<'PY'
 import sys
 import numpy as np
+import os as _os; REAL = np.dtype(_os.environ.get("DTFE_TEST_REAL", "float32"))   # tests/precision.sh
 
 tmp, grid = sys.argv[1], int(sys.argv[2])
 have_ids = len(sys.argv) > 3 and sys.argv[3] == "1"
@@ -293,7 +296,7 @@ check("A5 uniform velocities zero", np.abs(vel).max() == 0 and np.abs(dsp).max()
       f"max|v| = {np.abs(vel).max():.3e}, max|sigma| = {np.abs(dsp).max():.3e}")
 # the nSub=1 grid deposit conserves mass exactly -> its mean is 1; point evals are 1 pointwise
 # (the deposit grid is stored as float32, so the mean carries ~1e-5 accumulation rounding)
-gden = np.fromfile(f"{tmp}/ppe_uni_geo.den", dtype=np.float32).astype(np.float64)
+gden = np.fromfile(f"{tmp}/ppe_uni_geo.den", dtype=REAL).astype(np.float64)
 check("A6 matches deposit mean (float32 level)", abs(gden.mean() - den.mean()) < 1e-4,
       f"|mean(deposit) - mean(points)| = {abs(gden.mean() - den.mean()):.3e}")
 # 'dtfe' variant: vertex densities are rho_bar to float32 rounding
@@ -303,10 +306,10 @@ check("A7 uniform dtfe density (float32 level)", np.abs(den_b - st_b).max() < 1e
 
 # ---------- (B) pancake vs the nSub=1 grid deposit ----------
 den, vel, dsp, st = load_pts(f"{tmp}/ppe_pan_ser")
-gden = np.fromfile(f"{tmp}/ppe_pan_ser.den", dtype=np.float32).astype(np.float64)
-gst  = np.fromfile(f"{tmp}/ppe_pan_ser.streams", dtype=np.float32)
-gvel = np.fromfile(f"{tmp}/ppe_pan_ser.vel", dtype=np.float32).reshape(-1, 3).astype(np.float64)
-gunr = np.fromfile(f"{tmp}/ppe_pan_ser.hidden_streams", dtype=np.float32)
+gden = np.fromfile(f"{tmp}/ppe_pan_ser.den", dtype=REAL).astype(np.float64)
+gst  = np.fromfile(f"{tmp}/ppe_pan_ser.streams", dtype=REAL)
+gvel = np.fromfile(f"{tmp}/ppe_pan_ser.vel", dtype=REAL).reshape(-1, 3).astype(np.float64)
+gunr = np.fromfile(f"{tmp}/ppe_pan_ser.hidden_streams", dtype=REAL)
 check("B0 multi-stream present", st.max() >= 3, f"max streams {st.max()}")
 m1 = gst == 1  # single-stream cells per the deposit
 nmis = int((np.rint(gst).astype(np.int64) != st).sum())

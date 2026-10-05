@@ -38,7 +38,8 @@ BUILTIN_PRESETS: dict[str, tuple[str, dict]] = {
                      "vertex_mass": True, "volume_weighted": True, "caustics": True,
                      "caustic_cusps": False, "slice_plane": "largest", "slice_vel_grad": True}),
     "Exact deposit": ("256³ grid with the exact tetrahedron-cell clipping instead of sampling: "
-                      "noise-free cell values, for accuracy checks (GPU strongly recommended)",
+                      "noise-free cell values, for accuracy checks (on the GPU: half a minute for a "
+                      "0.26M-particle snapshot, a minute on the CPU, the GPU's lead growing with size)",
                       {"grid": 256, "deposit": "exact", "fields": ["density_a", "velocity_a"],
                        "vertex_mass": True, "volume_weighted": True, "gpu": True, "slice_plane": ""}),
 }
@@ -86,6 +87,7 @@ def apply_preset(spec, settings: dict, planes=()) -> list[str]:
 # option -> (plain-language label, flag). The flag's full description comes from the binary.
 OPTION_TEXT = {
     "gpu":             ("Use the GPU for the grid deposit", "--ps-gpu"),
+    "gpu_dtfe":        ("Use the GPU for the grid interpolation", "--gpu"),      # the standard binary's flag
     "vertex_mass":     ("Tetrahedron masses from the particles (needed for TNG initial conditions)",
                         "--ps-vertex-mass"),
     "volume_weighted": ("Volume-weighted velocities (the literature convention)", "--ps-volume-weighted"),
@@ -93,8 +95,15 @@ OPTION_TEXT = {
     "caustic_cusps":   ("Also mark cusps and swallowtails (slower, CPU)", "--ps-caustic-cusps"),
     "slice_vel_grad":  ("Velocity gradient at each slice point (divergence, shear, vorticity maps)",
                         "--pts-vel-grad"),
-    "exact":           ("Exact: analytic tetrahedron-cell clipping (noise-free, slow)", "--ps-exact-deposit"),
+    "exact":           ("Exact: analytic tetrahedron-cell clipping (noise-free; best on the GPU)", "--ps-exact-deposit"),
+    "parallel_triangulation": ("Build the triangulation in parallel (faster on small sets; identical runs then "
+                               "differ at float rounding)", "--parallel-triangulation"),
+    "alpha_shape":     ("Alpha shape: drop Lagrangian tetrahedra wider than this many mean particle spacings "
+                        "(0 keeps the whole convex hull)", "--ps-alpha-shape"),
     "sampled":         ("Sampled: nSub³ points per cell (fast, the default)", "--avg-subsamples"),
+    "sampled_dtfe":    ("Sampled: the mean over random points in each cell (fast, the default)", "--samples"),
+    "exact_dtfe":      ("Exact: each cell the exact average of the interpolated field (noise-free; best on the GPU)",
+                        "--exact-average"),
     "periodic":        ("The box is periodic (a cosmological simulation)", "--periodic"),
     "scalar":          ("Also interpolate a per-particle value", "--scalar-dataset"),
 }

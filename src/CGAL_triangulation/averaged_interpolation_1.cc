@@ -28,7 +28,7 @@
 #include <stdio.h>
 #include <gsl/gsl_qrng.h>
 
-// GPU deposit (METAL=1 build, 3D only); the CPU loop below remains the fallback. MY_SCALAR
+// GPU deposit (METAL=1 / CUDA=1 / HIP=1 build, 3D only); the CPU loop below remains the fallback. MY_SCALAR
 // evaluates arbitrary user C++ per sample, which cannot run on the GPU.
 #if defined(DTFE_GPU) && NO_DIM==3 && !defined(MY_SCALAR)
 #define DTFE_GPU_ACTIVE
@@ -38,11 +38,13 @@
 #include "gpu_host.h"
 #endif
 
-// --exact-average: analytic cell∩tet moments (vendored r3d, Powell & Abel 2015; 3D only;
-// MY_SCALAR is not linear inside a tet, so it keeps the MC loop -- rejected at parsing).
-// r3d.h carries its own extern "C" guard.
+// --exact-average: analytic cell∩tet moments (vendored r3d, Powell & Abel 2015, in 3D; the
+// triangle clipper ps_clip2d.h in 2D; MY_SCALAR is not linear inside a tet, so it keeps the MC
+// loop -- rejected at parsing). r3d.h carries its own extern "C" guard.
 #if NO_DIM==3 && !defined(MY_SCALAR)
 #include "../../third_party/r3d/r3d.h"
+#elif NO_DIM==2 && !defined(MY_SCALAR)
+#include "ps_clip2d.h"
 #endif
 
 
@@ -291,24 +293,18 @@ void interpolateGrid_averaged_1(DT &dt,
     quasiRandomSequence( quasiRandomNumbers, maxNN );
 
 
-    // GPU deposit (--gpu, Metal build): extract flat per-tetrahedron arrays using the CPU
+    // GPU deposit (--gpu, GPU build): extract flat per-tetrahedron arrays using the CPU
     // loop's own helpers (classification, sample counts, volumes -- so both paths make identical
     // decisions), dispatch metal/dtfe_deposit.metal::depositAveraged1, and copy the grids back.
     // Any failure (no device, kernel compile, buffer alloc) falls back to the CPU loop below.
     bool metalDeposited = false;
 #ifdef DTFE_GPU_ACTIVE
-    bool tryMetal = userOptions.useMetal;
-    if ( tryMetal and exactAvg )
-    {
-        MESSAGE::Warning warning( userOptions.verboseLevel );
-        warning << "--exact-average is CPU-only (analytic r3d integration); using the CPU interpolation for this pass.\n" << MESSAGE::EndWarning;
-        tryMetal = false;
-    }
+    bool tryMetal = userOptions.useMetal;   // (--exact-average runs on the GPU too: depositExactAverage)
 #ifdef SCALAR
-    if ( tryMetal and (field.scalar or field.scalar_gradient) )
+    if ( tryMetal and (field.scalar or field.scalar_gradient) and noScalarComp != 1 )
     {
         MESSAGE::Warning warning( userOptions.verboseLevel );
-        warning << "--gpu does not support the scalar fields; using the CPU interpolation for this pass.\n" << MESSAGE::EndWarning;
+        warning << "--gpu supports ONE scalar component (this build has NO_SCALARS=" << noScalarComp << "); using the CPU interpolation for this pass.\n" << MESSAGE::EndWarning;
         tryMetal = false;
     }
 #endif
@@ -328,17 +324,41 @@ void interpolateGrid_averaged_1(DT &dt,
         fGrad = field.velocity_gradient;
 #endif
         bool const needVel = fVel or fGrad;
+        bool fScal = false, fSGrad = false;     // the scalar (one component) and its gradient
+#ifdef SCALAR
+        fScal  = field.scalar;
+        fSGrad = field.scalar_gradient;
+#endif
+        bool const needScal = fScal or fSGrad;
 
         // reserve for all finite cells (upper bound; a counting pre-pass would cost a full extra
         // CGAL cell walk, which measured comparably to the whole extraction -- the padded fraction
         // outside the region is small for standard-DTFE partitions, unlike the PS Lagrangian ones)
         size_t const nKept = dt.number_of_finite_cells();
 
-        std::vector<float>    tetVerts, tetDens, tetVels, tetVols;
-        std::vector<uint32_t> tetCnts, tetFlats;
+        std::vector<float>    tetVerts, tetDens, tetVels, tetScal, tetVols;
+        std::vector<uint32_t> tetCnts, tetFlats, tetKeys;
         tetVerts.reserve( nKept*12 );
+        tetKeys.reserve( nKept );
+        // Morton key of a grid cell (sub-grid coordinates clamped into the grid; axes coarsened to
+        // <= 1024 cells so 3 x 10 bits suffice)
+        int mortonShift = 0;
+        for (int d=0; d<NO_DIM; ++d)
+            while ( (nGrid[d] >> mortonShift) > 1024 ) ++mortonShift;
+        auto spread = [](uint32_t v) {
+            v &= 0x3ff; v = (v | (v << 16)) & 0x030000ff; v = (v | (v << 8)) & 0x0300f00f;
+            v = (v | (v << 4)) & 0x030c30c3; v = (v | (v << 2)) & 0x09249249; return v; };
+        auto mortonKey = [&](int const cell[NO_DIM]) {
+            uint32_t key = 0;
+            for (int d=0; d<NO_DIM; ++d)
+            {
+                long c = cell[d]; if ( c < 0 ) c = 0; if ( c >= long(nGrid[d]) ) c = long(nGrid[d]) - 1;
+                key |= spread( uint32_t(c >> mortonShift) ) << d;
+            }
+            return key; };
         tetDens.reserve( nKept*4 );
         if ( needVel ) tetVels.reserve( nKept*12 );
+        if ( needScal ) tetScal.reserve( nKept*4 );
         tetVols.reserve( nKept );
         tetCnts.reserve( nKept );
         tetFlats.reserve( nKept );
@@ -377,9 +397,15 @@ void interpolateGrid_averaged_1(DT &dt,
                     for (size_t j=0; j<noVelComp; ++j)
                         tetVels.push_back( float(itC->vertex(v)->info().velocity(j)) );
 #endif
+#ifdef SCALAR
+            if ( needScal )
+                for (int v=0; v<NO_DIM+1; ++v)
+                    tetScal.push_back( float(itC->vertex(v)->info().myScalar()[0]) );
+#endif
             tetVols.push_back( float(cellVolume) );
             tetCnts.push_back( cnt );
             tetFlats.push_back( flat );
+            tetKeys.push_back( mortonKey( baseGridCell ) );
 
 #ifdef TEST_PADDING
             // the GPU deposits this tetrahedron's field values; replicate only the dummy-cell
@@ -408,17 +434,39 @@ void interpolateGrid_averaged_1(DT &dt,
 #endif
         }
 
-        // Sort tetrahedra by sample count before dispatch. A GPU chunk finishes when its SLOWEST
-        // thread finishes: one huge void tet (thousands of samples) mixed among single-cell halo
-        // tets leaves most of the GPU idle until the chunk boundary (measured ~5x underutilization
-        // for the PS deposit). Cost-ordering makes every chunk's threads uniformly sized; the
-        // permutation is applied one array at a time so only a single extra copy is alive at once.
+        // Order the tetrahedra along a Morton curve of their base cell before dispatch, so the
+        // threads running together deposit into neighbouring cells: the deposit is bound by its
+        // atomics, and random cells across a 2 GB grid cost 3x the throughput of local ones (TLB
+        // and cache reach), measured on the shared full grid of a 512^3 run. The old cost sort (by
+        // sample count, so that a chunk's threads were uniformly sized) is no longer needed: the
+        // work items bound every thread to itemSamples samples (the per-tet A/B kernel,
+        // DTFE_GPU_ITEMS=0, pays for that with its old imbalance). The permutation is applied one
+        // array at a time so only a single extra copy is alive at once.
         {
             size_t const nT = tetCnts.size();
             std::vector< std::pair<uint32_t,uint32_t> > order(nT);
             for (size_t t=0; t<nT; ++t)
-                order[t] = std::make_pair( tetCnts[t], uint32_t(t) );
+                order[t] = std::make_pair( tetKeys[t], uint32_t(t) );
+            std::vector<uint32_t>().swap( tetKeys );
             std::sort( order.begin(), order.end() );
+            if ( getenv("DTFE_METAL_TIMING") )
+            {   // how many distinct base cells the 32 consecutive work items of a SIMD group touch
+                // (16-sample items; a lower bound on the cell sharing a SIMD-group reduction could use)
+                size_t lane = 0, distinct = 0, groups = 0, sumDistinct = 0; uint32_t last = ~0u;
+                for (size_t i=0; i<nT; ++i)
+                {
+                    uint32_t const n = tetCnts[order[i].second];
+                    size_t const items = n ? (n + 15) / 16 : 1;
+                    for (size_t k=0; k<items; ++k)
+                    {
+                        if ( lane==0 ) { distinct = 0; last = ~0u; }
+                        if ( order[i].first != last ) { ++distinct; last = order[i].first; }
+                        if ( ++lane == 32 ) { lane = 0; ++groups; sumDistinct += distinct; }
+                    }
+                }
+                fprintf( stderr, "DTFE Metal order: %zu tetrahedra, %zu SIMD groups of 32 items, %.1f distinct base cells per group (Morton shift %d)\n",
+                         nT, groups, groups ? double(sumDistinct)/double(groups) : 0., mortonShift );
+            }
             {
                 std::vector<float> sv(nT*12);
                 for (size_t i=0; i<nT; ++i)
@@ -437,6 +485,13 @@ void interpolateGrid_averaged_1(DT &dt,
                 for (size_t i=0; i<nT; ++i)
                 { size_t const src = order[i].second; for (int k=0; k<12; ++k) su[i*12+k] = tetVels[src*12+k]; }
                 tetVels.swap(su);
+            }
+            if ( needScal )
+            {
+                std::vector<float> ss(nT*4);
+                for (size_t i=0; i<nT; ++i)
+                { size_t const src = order[i].second; for (int k=0; k<4; ++k) ss[i*4+k] = tetScal[src*4+k]; }
+                tetScal.swap(ss);
             }
             {
                 std::vector<float> so(nT);
@@ -461,8 +516,34 @@ void interpolateGrid_averaged_1(DT &dt,
         DTFEGpuGrids gpuOut;
         std::string metalErr;
         message << gpuBackendName() << " GPU (" << gpuDeviceName() << ", " << nTetsDeposited << " tetrahedra) ... " << MESSAGE::Flush;
-        if ( dtfeGpuDepositAveraged1( tetVerts, tetDens, tetVels, tetVols, tetCnts, tetFlats,
-                                        sobolTable, dxv, nGrid, fDen, fVel, fGrad, gpuOut, metalErr ) )
+
+        // The shared full grid of this DTFE_parallel call (dtfeGpuSharedBegin in DTFE.cpp): this
+        // sub-domain's samples land at full-grid cells subgridOffset + cell, and the main thread adds
+        // the grid into the output afterwards -- so this thread's own sub-grid stays ZERO. A batch the
+        // device hands back (allocation, watchdog) leaves its owner box zeroed and falls through to the
+        // per-call path below, then to the CPU loop.
+        bool sharedDone = false;
+        if ( dtfeGpuSharedActive() and userOptions.subgridOffset.size()==size_t(NO_DIM) )
+        {
+            size_t subOff[3] = { userOptions.subgridOffset[0], userOptions.subgridOffset[1], userOptions.subgridOffset[2] };
+            if ( dtfeGpuSharedDeposit( tetVerts, tetDens, tetVels, tetScal, tetVols, tetCnts, tetFlats,
+                                       sobolTable, dxv, nGrid, subOff, metalErr ) )
+                sharedDone = true;
+            else if ( not tetCnts.empty() )     // the arrays survive only when the upload itself failed
+            {
+                MESSAGE::Warning warning( userOptions.verboseLevel );
+                warning << "DTFE " << gpuBackendName() << " shared grid handed this sub-domain back (" << metalErr << "); depositing it on its own.\n" << MESSAGE::EndWarning;
+            }
+            else if ( nTetsDeposited > 0 )
+            {   // consumed by the upload but the dispatch failed: nothing left for the per-call path
+                MESSAGE::Warning warning( userOptions.verboseLevel );
+                warning << "DTFE " << gpuBackendName() << " shared grid failed for this sub-domain (" << metalErr << "); using the CPU interpolation.\n" << MESSAGE::EndWarning;
+            }
+        }
+        if ( sharedDone )
+            metalDeposited = true;
+        else if ( not tetCnts.empty() and dtfeGpuDepositAveraged1( tetVerts, tetDens, tetVels, tetScal, tetVols, tetCnts, tetFlats,
+                                                                      sobolTable, dxv, nGrid, fDen, fVel, fGrad, fScal, fSGrad, exactAvg, gpuOut, metalErr ) )
         {
             for (size_t i=0; i<gridSize; ++i)
             {
@@ -475,14 +556,20 @@ void interpolateGrid_averaged_1(DT &dt,
                     for (size_t q=0; q<noGradComp; ++q)
                         (*velocity_gradient)[i][q] = Real(gpuOut.grad[i*9+q]);
 #endif
+#ifdef SCALAR
+                if (fScal)  (*scalar)[i][0] = Real(gpuOut.scalar[i]);
+                if (fSGrad) for (int q=0; q<NO_DIM; ++q) (*scalar_gradient)[i][q] = Real(gpuOut.scalar_grad[i*3+q]);
+#endif
             }
             metalDeposited = true;
         }
-        else
+        else if ( nTetsDeposited > 0 and not tetCnts.empty() )
         {
             MESSAGE::Warning warning( userOptions.verboseLevel );
-            warning << "DTFE Metal deposit unavailable (" << metalErr << "); using the CPU interpolation.\n" << MESSAGE::EndWarning;
+            warning << "DTFE " << gpuBackendName() << " deposit unavailable (" << metalErr << "); using the CPU interpolation.\n" << MESSAGE::EndWarning;
         }
+        else if ( nTetsDeposited == 0 )
+            metalDeposited = true;              // no tetrahedra in the region: nothing to deposit either way
     }
 #else
     if ( userOptions.useMetal )
@@ -492,7 +579,7 @@ void interpolateGrid_averaged_1(DT &dt,
         {
             warned = true;
             MESSAGE::Warning warning( userOptions.verboseLevel );
-            warning << "--gpu requested but this binary was built without GPU support (rebuild with METAL=1; or NO_DIM!=3 / MY_SCALAR); using the CPU interpolation.\n" << MESSAGE::EndWarning;
+            warning << "--gpu requested but this binary was built without GPU support (rebuild with METAL=1 on a Mac, CUDA=1 or HIP=1 on Linux; or NO_DIM!=3 / MY_SCALAR); using the CPU interpolation.\n" << MESSAGE::EndWarning;
         }
     }
 #endif // DTFE_GPU_ACTIVE
@@ -656,7 +743,75 @@ void interpolateGrid_averaged_1(DT &dt,
             }
             continue;
         }
-#endif  // NO_DIM==3 (exact average)
+#elif NO_DIM==2 && !defined(MY_SCALAR)
+        // ----- exact area average (--exact-average), 2D: the same integral with the triangle clipped
+        // against each cell by ps_clip2d.h (area and first moments: the centroid of each piece) -----
+        if ( exactAvg )
+        {
+            Vertex_handle base = itC->vertex(0);
+            Real densGrad[NO_DIM];
+            densityGrad( itC, posMatrixInverse, densGrad );
+#ifdef VELOCITY
+            Real velGrad[NO_DIM][noVelComp];
+            velocityGrad( itC, posMatrixInverse, velGrad );
+#endif
+#ifdef SCALAR
+            Real sGrad[NO_DIM][noScalarComp];
+            scalarGrad( itC, posMatrixInverse, sGrad );
+#endif
+            double tri[3][2] = { {0., 0.},
+                                 {vertexMatrix[0][0], vertexMatrix[0][1]},
+                                 {vertexMatrix[1][0], vertexMatrix[1][1]} };
+            if ( determinant(vertexMatrix) < 0. )   // the clipper wants a counter-clockwise triangle
+                for (int d = 0; d < 2; ++d) std::swap( tri[1][d], tri[2][d] );
+
+            int iLo[NO_DIM], iHi[NO_DIM];
+            for (int d = 0; d < NO_DIM; ++d)
+            {
+                double lo = 0., hi = 0.;
+                for (int v = 0; v < NO_DIM; ++v)
+                {
+                    if (vertexMatrix[v][d] < lo) lo = vertexMatrix[v][d];
+                    if (vertexMatrix[v][d] > hi) hi = vertexMatrix[v][d];
+                }
+                iLo[d] = int( std::floor( (double(basePosition[d]) + lo) / double(dx[d]) ) );
+                iHi[d] = int( std::floor( (double(basePosition[d]) + hi) / double(dx[d]) ) ) + 1;
+                if (iLo[d] < 0) iLo[d] = 0;
+                if (iHi[d] > int(nGrid[d])) iHi[d] = int(nGrid[d]);
+            }
+
+            for (int gi = iLo[0]; gi < iHi[0]; ++gi)
+            for (int gj = iLo[1]; gj < iHi[1]; ++gj)
+            {
+                int const gij[2] = {gi, gj};
+                double lo[2], hi[2], mom[psClip2d::MOMENTS];
+                for (int d = 0; d < 2; ++d)
+                {
+                    lo[d] = gij[d] * double(dx[d]) - double(basePosition[d]);
+                    hi[d] = lo[d] + double(dx[d]);
+                }
+                if ( not psClip2d::clipTriangleToCell( tri, lo, hi, mom ) ) continue;
+
+                index = size_t(gi)*nGrid[1] + size_t(gj);
+                Real const dV = Real(mom[0]);
+                Point centroid( mom[1]/mom[0], mom[2]/mom[0] );
+                if (field.density) (*density)[index] += densityValue(densGrad, base, centroid) * dV;
+#ifdef VELOCITY
+                if (field.velocity) (*velocity)[index] += velocityValue(velGrad, base, centroid) * dV;
+                if (field.velocity_gradient) (*velocity_gradient)[index] += velocityGradient(velGrad) * dV;
+#endif
+#ifdef SCALAR
+                if (field.scalar) (*scalar)[index] += scalarValue(sGrad, base, centroid) * dV;
+                if (field.scalar_gradient) (*scalar_gradient)[index] += scalarGradient(sGrad) * dV;
+#endif
+#ifdef TEST_PADDING
+                if ( dummyNeighbors ) updateDummyGridCells( index, &incompleteCells_d );
+                if ( dummyVertices ) updateDummyGridCells( index, &incompleteCells );
+#endif
+            }
+            continue;
+        }
+#endif  // exact average (3D r3d / 2D ps_clip2d)
 
 
         // cell spans multiple grid cells -> MC-sample inside it

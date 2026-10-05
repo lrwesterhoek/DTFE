@@ -153,14 +153,14 @@ def plot_bbks_histograms(bbks_params, redshift=None, save_path=None):
                         stem.with_name(stem.stem + '_p.png'), redshift,
                         mark_zero=True)
 
-def process_snapshot(snapshot, redshift, sim=None, method=None):
+def process_snapshot(snapshot, redshift, sim=None, method=None, prefix=None, data_root=None):
     print(f"\nProcessing snapshot {snapshot} (z={redshift:.2f})")
 
     output_path = Path(OUTPUT_DIR) / f'snapshot_{snapshot}_z{redshift:.2f}'
     output_path.mkdir(parents=True, exist_ok=True)
 
     try:
-        p = pipeline.products(snapshot, redshift, sim=sim, method=method)
+        p = pipeline.products(snapshot, redshift, sim=sim, method=method, prefix=prefix, data_root=data_root)
         cat = p.voids()
         grid_n = p.fs.grid_n
         p.release()
@@ -268,7 +268,8 @@ def main():
 
     for snapshot, redshift in items:
         try:
-            process_snapshot(snapshot, redshift, sim=args.sim, method=args.method)
+            process_snapshot(snapshot, redshift, sim=args.sim, method=args.method, prefix=args.prefix,
+                             data_root=args.data_root)
             processed_count += 1
         except Exception as e:
             print(f"Failed to process snapshot {snapshot} (z={redshift:.2f}): {str(e)}")

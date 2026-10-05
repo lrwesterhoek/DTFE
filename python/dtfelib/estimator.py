@@ -51,13 +51,19 @@ _ERROR = b"DTFEERR1"
 
 # handshake flag bits (ps_point_eval.cc, '--serve' protocol version 2)
 (_F_PS, _F_PER_STREAM, _F_IDS, _F_DEN_GRAD, _F_VEL_GRAD, _F_CAUSTIC, _F_GEOMETRIC, _F_PERIODIC,
- _F_SCALAR, _F_LAGRANGIAN, _F_COMPOSITE) = (1 << i for i in range(11))
+ _F_SCALAR, _F_LAGRANGIAN, _F_COMPOSITE, _F_DIM2) = (1 << i for i in range(12))   # _F_DIM2: a 2D build
 
 
-def find_binary(phase_space: bool = True) -> Path:
-    """Locates the DTFE / PS-DTFE executable: $DTFE_BIN_DIR, then the repository root this
-    package lives in (python/dtfelib -> ../..), then $PATH."""
-    name = "PS-DTFE" if phase_space else "DTFE"
+def find_binary(phase_space: bool = True, precision: str = "single", dim: int = 3) -> Path:
+    """Locates the DTFE / PS-DTFE executable (precision 'double': DTFE-double / PS-DTFE-double, built by
+    'make DTFE PS-DTFE DOUBLE=1'; dim 2: DTFE-2d / PS-DTFE-2d, 'make DTFE PS-DTFE DIM=2'):
+    $DTFE_BIN_DIR, then the repository root this package lives in (python/dtfelib -> ../..), then $PATH."""
+    if precision not in ("single", "double"):
+        raise ValueError(f"precision must be 'single' or 'double', not {precision!r}")
+    if dim not in (2, 3):
+        raise ValueError(f"dim must be 2 or 3, not {dim!r}")
+    name = (("PS-DTFE" if phase_space else "DTFE") + ("-2d" if dim == 2 else "")
+            + ("-double" if precision == "double" else ""))
     candidates = []
     if os.environ.get("DTFE_BIN_DIR"):
         candidates.append(Path(os.environ["DTFE_BIN_DIR"]) / name)
@@ -76,7 +82,9 @@ def find_binary(phase_space: bool = True) -> Path:
 
 @dataclass
 class PointFields:
-    """Per-point fields of one Estimator call (the '.pts_*' outputs as arrays).
+    """Per-point fields of one Estimator call (the '.pts_*' outputs as arrays). The shapes are for a 3D
+    server; a 2D one (dim=2) has 2 velocity components, 3 dispersion components (xx xy yy), 2x2
+    velocity gradients, 3 particle IDs per stream and 2-component positions.
 
     density     (N,)      rho/rho_bar, summed over streams
     velocity    (N, 3)    density-weighted mean velocity over streams
@@ -162,8 +170,16 @@ class Estimator:
                        (FieldSet convention); False returns the binary's raw units.
     options            extra command-line arguments, passed through verbatim.
     binary             explicit path to the executable (default: find_binary()).
+    dim                2 for a 2D snapshot and build (PS-DTFE-2d / DTFE-2d): points are (N, 2), every
+                       vector has 2 components; the server's handshake says which it is.
+    precision          'single' (default) or 'double': which build find_binary() picks when no binary
+                       is given -- the double pair interpolates in float64 (its answers are float64 either way)
     verbose            the binary's '--verbose' level; its log goes to this process's stderr
                        when > 0 and is otherwise kept (and shown if the server fails).
+    progress           the server writes plain progress lines to its log ('--serve-progress'):
+                       '[partitions k/N] ...' while it builds, '[request k/P] partition p: in memory |
+                       loading from the cache' and '[request done] ...' for every request -- whatever
+                       'verbose' says. A launcher follows them for its progress bar and timings.
     log_path           write the server's log to this file instead, at the 'verbose' level (a
                        GUI follows the tessellation build there: '[partitions k/N]' lines).
     """
@@ -177,18 +193,21 @@ class Estimator:
                  lagrangian_positions: bool = False,
                  tessellation_cache=None, partition=None, resident: int | None = None,
                  max_concurrent: int | None = None, peculiar: bool = True, options=(),
-                 binary=None, verbose: int = 0, log_path=None, _owned_dir=None, _shift=None,
-                 _on_spawn=None):
+                 binary=None, precision: str = "single", dim: int = 3, verbose: int = 0, log_path=None,
+                 progress: bool = False, _owned_dir=None, _shift=None, _on_spawn=None):
         self._owned_dir = Path(_owned_dir) if _owned_dir else None   # from_arrays' temporary snapshot
         # from_arrays: the server's coordinates = the caller's + _shift (it keeps the box >= 0,
         # because the binary's option parser reads a negative '--box' value as a flag)
-        self._shift = None if _shift is None else np.asarray(_shift, dtype=np.float64).reshape(3)
+        self._shift = None if _shift is None else np.asarray(_shift, dtype=np.float64).reshape(-1)
+        if dim not in (2, 3):
+            raise ValueError(f"dim must be 2 or 3, not {dim!r}")
+        self.dim = int(dim)             # confirmed (or corrected) by the server's handshake
         self._closed = True             # until the server is up (close() is then a no-op)
         self.snapshot = Path(snapshot)
         if not self.snapshot.exists():
             raise FileNotFoundError(f"snapshot not found: {self.snapshot}")
         self.phase_space = bool(phase_space)
-        self.binary = Path(binary) if binary else find_binary(self.phase_space)
+        self.binary = Path(binary) if binary else find_binary(self.phase_space, precision, self.dim)
         if stream_density not in ("dtfe", "geometric"):
             raise ValueError("stream_density must be 'dtfe' or 'geometric'")
         if lagrangian_positions and not self.phase_space:
@@ -225,14 +244,16 @@ class Estimator:
         if tessellation_cache is not None:
             cmd += ["--tessellation-cache", str(tessellation_cache)]
         if partition is not None:
-            parts = [int(partition)] * 3 if np.ndim(partition) == 0 else [int(v) for v in partition]
-            if len(parts) != 3 or min(parts) < 1:
-                raise ValueError("partition must be a positive int or three positive ints")
+            parts = [int(partition)] * self.dim if np.ndim(partition) == 0 else [int(v) for v in partition]
+            if len(parts) != self.dim or min(parts) < 1:
+                raise ValueError(f"partition must be a positive int or {self.dim} positive ints")
             cmd += ["--partition"] + [str(v) for v in parts]
         if resident is not None:
             cmd += ["--serve-resident", str(int(resident))]
         if max_concurrent is not None:
             cmd += ["--max-concurrent", str(int(max_concurrent))]
+        if progress:
+            cmd.append("--serve-progress")
         cmd += [str(o) for o in options]
         self.command = cmd
 
@@ -305,14 +326,17 @@ class Estimator:
             raise self._server_failure("failed while building the tessellation"
                                        if not magic else f"sent an unexpected greeting {magic!r}")
         flags, n_scalar, nvert = struct.unpack("<IIQ", self._read_exact(16))
-        region = struct.unpack("<6d", self._read_exact(48))
+        dim = 2 if flags & _F_DIM2 else 3      # 3D servers never set the bit
+        region = struct.unpack(f"<{2 * dim}d", self._read_exact(16 * dim))
         n_parts, n_resident = struct.unpack("<II", self._read_exact(8))
         self.flags = flags
         self.n_scalar = int(n_scalar)
         self.n_vertices = int(nvert)
         self.n_partitions = int(n_parts)
         self.resident = int(n_resident)
-        self.region = np.asarray(region, dtype=np.float64).reshape(3, 2)
+        if dim != self.dim:
+            raise RuntimeError(f"{self.binary.name} is a {dim}D build: pass dim={dim} to the Estimator")
+        self.region = np.asarray(region, dtype=np.float64).reshape(dim, 2)
         if self._shift is not None:
             self.region = self.region - self._shift[:, None]
         if bool(flags & _F_PS) != self.phase_space:
@@ -329,16 +353,17 @@ class Estimator:
 
     # ------------------------------------------------------------------ queries
     def __call__(self, points) -> PointFields:
-        """Evaluates every field at 'points' ((N, 3) or (3,), box coordinates)."""
+        """Evaluates every field at 'points' ((N, dim) or (dim,), box coordinates; dim = 3 or 2)."""
         pts = np.ascontiguousarray(points, dtype=np.float64)
         single = pts.ndim == 1
-        pts = pts.reshape(-1, 3)
+        d = self.dim
+        pts = pts.reshape(-1, d)
         if self._shift is not None:
             pts = np.ascontiguousarray(pts + self._shift)
         n = len(pts)
         if n == 0:
             z = np.zeros(0)
-            return PointFields(z, z.reshape(0, 3), z.reshape(0, 6), np.zeros(0, np.int32),
+            return PointFields(z, z.reshape(0, d), z.reshape(0, d * (d + 1) // 2), np.zeros(0, np.int32),
                                shape=(0,))
         if self._closed:
             raise RuntimeError("the Estimator is closed")
@@ -377,26 +402,27 @@ class Estimator:
             raise self._server_failure(f"answered {n_back} points for a request of {n}")
 
         f = self.flags
+        d, nd = self.dim, self.dim * (self.dim + 1) // 2     # vector and symmetric-tensor components
         den = self._read_array(n, "<f8")
-        vel = self._read_array(3 * n, "<f8").reshape(n, 3)
-        disp = self._read_array(6 * n, "<f8").reshape(n, 6)
+        vel = self._read_array(d * n, "<f8").reshape(n, d)
+        disp = self._read_array(nd * n, "<f8").reshape(n, nd)
         streams = self._read_array(n, "<i4")
         out = PointFields(den, vel, disp, streams, shape=(n,))
         if f & _F_CAUSTIC:
             out.caustic = self._read_array(n, "<i4")
         if f & _F_DEN_GRAD:
-            out.density_gradient = self._read_array(3 * n, "<f8").reshape(n, 3)
+            out.density_gradient = self._read_array(d * n, "<f8").reshape(n, d)
         if f & _F_VEL_GRAD:
-            out.velocity_gradient = self._read_array(9 * n, "<f8").reshape(n, 3, 3)
+            out.velocity_gradient = self._read_array(d * d * n, "<f8").reshape(n, d, d)
         if f & _F_PER_STREAM:
             out.offsets = self._read_array(n + 1, "<u8")
-            rec = self._read_array(4 * R, "<f8").reshape(R, 4)
+            rec = self._read_array((1 + d) * R, "<f8").reshape(R, 1 + d)
             out.stream_density = rec[:, 0].copy()
             out.stream_velocity = rec[:, 1:].copy()
             if f & _F_IDS:
-                out.stream_ids = self._read_array(4 * R, "<u8").reshape(R, 4)
+                out.stream_ids = self._read_array((d + 1) * R, "<u8").reshape(R, d + 1)
             if f & _F_DEN_GRAD:
-                out.stream_density_gradient = self._read_array(3 * R, "<f8").reshape(R, 3)
+                out.stream_density_gradient = self._read_array(d * R, "<f8").reshape(R, d)
         if f & _F_SCALAR:
             S = self.n_scalar
             sc = self._read_array(S * n, "<f8")
@@ -405,7 +431,7 @@ class Estimator:
                 rs = self._read_array(S * R, "<f8")
                 out.stream_scalar = rs if S == 1 else rs.reshape(R, S)
         if f & _F_LAGRANGIAN:
-            out.stream_lagrangian = self._read_array(3 * R, "<f8").reshape(R, 3)
+            out.stream_lagrangian = self._read_array(d * R, "<f8").reshape(R, d)
         return out
 
     def density(self, points) -> np.ndarray:
@@ -413,31 +439,37 @@ class Estimator:
         return self(points).density
 
     def velocity(self, points) -> np.ndarray:
-        """Density-weighted mean velocity at the points, (N, 3)."""
+        """Density-weighted mean velocity at the points, (N, dim)."""
         return self(points).velocity
 
     def streams(self, points) -> np.ndarray:
         """Number of streams at the points (standard DTFE: 0/1 coverage)."""
         return self(points).streams
 
-    def grid(self, xs, ys, zs) -> PointFields:
-        """Fields on the tensor-product grid xs x ys x zs (1D coordinate arrays), returned with
-        per-point arrays shaped (nx, ny, nz[, k]) -- the analogue of CosmoDTFE's
-        estimator((xs, ys, zs)). Ragged per-stream arrays stay flat (C order over the grid)."""
-        xs, ys, zs = (np.asarray(a, dtype=np.float64).reshape(-1) for a in (xs, ys, zs))
-        X, Y, Z = np.meshgrid(xs, ys, zs, indexing="ij")
-        f = self(np.stack([X.ravel(), Y.ravel(), Z.ravel()], axis=1))
-        shape = (len(xs), len(ys), len(zs))
+    def grid(self, xs, ys, zs=None) -> PointFields:
+        """Fields on the tensor-product grid xs x ys x zs (1D coordinate arrays; a 2D server takes xs
+        and ys only), returned with per-point arrays shaped (nx, ny[, nz][, k]) -- the analogue of
+        CosmoDTFE's estimator((xs, ys, zs)). Ragged per-stream arrays stay flat (C order over the grid)."""
+        axes = (xs, ys) if self.dim == 2 else (xs, ys, zs)
+        if self.dim == 2 and zs is not None:
+            raise ValueError("a 2D server takes grid(xs, ys)")
+        if self.dim == 3 and zs is None:
+            raise ValueError("a 3D server takes grid(xs, ys, zs)")
+        axes = [np.asarray(a, dtype=np.float64).reshape(-1) for a in axes]
+        mesh = np.meshgrid(*axes, indexing="ij")
+        f = self(np.stack([m.ravel() for m in mesh], axis=1))
+        shape = tuple(len(a) for a in axes)
+        d = self.dim
         f.density = f.density.reshape(shape)
-        f.velocity = f.velocity.reshape(shape + (3,))
-        f.dispersion = f.dispersion.reshape(shape + (6,))
+        f.velocity = f.velocity.reshape(shape + (d,))
+        f.dispersion = f.dispersion.reshape(shape + (d * (d + 1) // 2,))
         f.streams = f.streams.reshape(shape)
         if f.caustic is not None:
             f.caustic = f.caustic.reshape(shape)
         if f.density_gradient is not None:
-            f.density_gradient = f.density_gradient.reshape(shape + (3,))
+            f.density_gradient = f.density_gradient.reshape(shape + (d,))
         if f.velocity_gradient is not None:
-            f.velocity_gradient = f.velocity_gradient.reshape(shape + (3, 3))
+            f.velocity_gradient = f.velocity_gradient.reshape(shape + (d, d))
         if f.scalar is not None:
             f.scalar = f.scalar.reshape(shape + f.scalar.shape[1:])
         f.shape = shape
@@ -508,7 +540,8 @@ class Estimator:
         reads (deleted again by close()), so every option of the constructor applies.
 
         positions   (N, 3) Eulerian positions, in Mpc (any consistent length unit: the box and
-                    the query points use the same one; MpcUnit is 1)
+                    the query points use the same one; MpcUnit is 1). (N, 2) builds a 2D Estimator
+                    (the DIM=2 binaries), with every array below 2-component too
         velocities  (N, 3), returned as given (no scale-factor conversion); default zeros
         masses      scalar or (N,); default 1 per particle. Densities come out as rho/rho_bar,
                     so only relative masses matter
@@ -527,7 +560,11 @@ class Estimator:
             import h5py
         except ImportError as e:        # pragma: no cover - h5py is a dtfelib dependency
             raise ImportError("Estimator.from_arrays needs h5py to write the temporary snapshot") from e
-        x = np.ascontiguousarray(positions, dtype=np.float64).reshape(-1, 3)
+        x = np.asarray(positions, dtype=np.float64)
+        dim = x.shape[-1] if x.ndim == 2 else 3
+        if dim not in (2, 3):
+            raise ValueError(f"positions must be (N, 3) or (N, 2), not {x.shape}")
+        x = np.ascontiguousarray(x).reshape(-1, dim)
         n = len(x)
         if n < 5:
             raise ValueError("a tessellation needs at least 5 particles")
@@ -545,8 +582,8 @@ class Estimator:
                 raise ValueError(f"{name} holds {len(a)} entries for {n} particles")
             return a
 
-        v = np.zeros((n, 3)) if velocities is None else per_particle(velocities, 3, "velocities")
-        q = None if lagrangian is None else per_particle(lagrangian, 3, "lagrangian")
+        v = np.zeros((n, dim)) if velocities is None else per_particle(velocities, dim, "velocities")
+        q = None if lagrangian is None else per_particle(lagrangian, dim, "lagrangian")
         if box is None:
             pts = x if q is None else np.vstack([x, q])
             lo, hi = pts.min(axis=0), pts.max(axis=0)
@@ -555,9 +592,9 @@ class Estimator:
             if periodic is None:
                 periodic = False
         elif np.ndim(box) == 0:
-            lo, hi = np.zeros(3), np.full(3, float(box))
+            lo, hi = np.zeros(dim), np.full(dim, float(box))
         else:
-            lo, hi = (np.asarray(b, dtype=np.float64).reshape(3) for b in box)
+            lo, hi = (np.asarray(b, dtype=np.float64).reshape(dim) for b in box)
         if periodic is None:
             periodic = True
         if np.any(hi <= lo):
@@ -610,7 +647,7 @@ class Estimator:
         kwargs.setdefault("peculiar", False)
         try:
             return cls(snap, phase_space=phase_space, periodic=periodic, mpc_unit=1.0,
-                       options=options, _owned_dir=work, _shift=shift, **kwargs)
+                       options=options, dim=dim, _owned_dir=work, _shift=shift, **kwargs)
         except BaseException:
             shutil.rmtree(work, ignore_errors=True)
             raise

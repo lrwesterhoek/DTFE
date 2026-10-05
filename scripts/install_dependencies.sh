@@ -113,7 +113,7 @@ install_macos() {
 
     # fftw: T-web tidal-tensor FFT; llvm + libomp: the Makefile prefers Homebrew clang++
     # (Apple's clang has no bundled OpenMP runtime, so a plain CLT setup fails on -fopenmp)
-    PACKAGES=(gsl boost cgal tbb mpfr hdf5 gmp fftw llvm libomp)
+    PACKAGES=(gsl boost cgal tbb mpfr hdf5 gmp fftw libdeflate llvm libomp)
     
     for package in "${PACKAGES[@]}"; do
         if brew list "$package" &> /dev/null; then
@@ -144,7 +144,8 @@ install_ubuntu_debian() {
         libmpfr-dev \
         libhdf5-dev \
         libgmp-dev \
-        libfftw3-dev
+        libfftw3-dev \
+        libdeflate-dev
     
     print_success "All dependencies installed successfully!"
 }
@@ -196,7 +197,8 @@ install_arch() {
         mpfr \
         hdf5 \
         gmp \
-        fftw
+        fftw \
+        libdeflate
     
     print_success "All dependencies installed successfully!"
 }
@@ -214,7 +216,8 @@ install_opensuse() {
         mpfr-devel \
         hdf5-devel \
         gmp-devel \
-        fftw3-devel
+        fftw3-devel \
+        libdeflate-devel
     
     print_success "All dependencies installed successfully!"
 }

@@ -33,6 +33,9 @@
 #endif
 #include <boost/math/special_functions/fpclassify.hpp>
 #include <fftw3.h>   // T-web tidal tensor (FFT Poisson solve of the density grid)
+#include "fftw_plans64.h"   // ... planned with 64-bit sizes
+#include <new>              // std::align_val_t (the aligned FFT buffers)
+#include <complex>          // ... into std::complex buffers (FFTW guarantees the layout of fftw_complex)
 
 
 #include "define.h"
@@ -47,11 +50,21 @@
 #include "auto_tune.h"
 #include "scratch_alloc.h"
 #include "ps_point_eval.h"
+#include "ps_globals_record.h"
+#include "io/io.h"         // readInputData: the late read of a --ps-window run that started without its particles
 
 
 using namespace std;
 
 #include "interpolations.h"
+
+// --gpu (METAL=1 build of the standard binary): the shared full-grid deposit of DTFE_parallel
+// (the PS binary partitions in Lagrangian space and never comes here; MY_SCALAR runs user C++ per
+// sample, which no kernel can; the kernels are 3D)
+#if defined(DTFE_GPU) && NO_DIM==3 && !defined(MY_SCALAR) && !defined(PHASE_SPACE)
+#define DTFE_GPU_SHARED_ACTIVE
+#include "CGAL_triangulation/gpu_host.h"
+#endif
 
 
 
@@ -277,9 +290,14 @@ DTFE_State DTFE_setup(vector<Particle_data> *allParticles,
     }
 
     // run consistency checks and finalize derived options; default the density normalization to the box average
-    userOptions.updateEntries( particlePointer->size(), not samples.empty() );
+    // (a run that started without its particles takes their count and mean density from the globals record)
+    size_t const nParticles = userOptions.psParticlesDeferred ? userOptions.psPresetN : particlePointer->size();
+    userOptions.updateEntries( nParticles, not samples.empty() );
     if ( userOptions.averageDensity<0. )
+    {
         userOptions.averageDensity = averageDensity( *particlePointer, userOptions );
+        userOptions.psAverageDensityFromParticles = true;
+    }
 
     // --scratch-dir: arm the out-of-core allocator BEFORE any full-grid allocation and before
     // auto-tune (which excludes the disk-backed grid term from its RAM model when armed). The
@@ -310,6 +328,13 @@ DTFE_State DTFE_setup(vector<Particle_data> *allParticles,
         }
     }
 
+    // --ps-window: the auto-tuner sizes the grids by the cells actually allocated -- the window's --
+    // so its cell range must be known first (the header's box is final here; DTFE() computes it again,
+    // identically). Without this it saw the whole virtual grid of a zoom (2759x3197x512 = 524 GB),
+    // called the run impossible and fell back to one partition at a time.
+    if ( userOptions.psWindowOn )
+        userOptions.computePsWindow();
+
     // auto-select --partition / --max-concurrent from the data and machine when not user-given
     {
         bool gpuActive = false;
@@ -318,7 +343,7 @@ DTFE_State DTFE_setup(vector<Particle_data> *allParticles,
 #elif defined(DTFE_GPU)
         gpuActive = userOptions.useMetal;
 #endif
-        AutoTuneReport const report = autoTunePartitioning( userOptions, particlePointer->size(),
+        AutoTuneReport const report = autoTunePartitioning( userOptions, nParticles,
                                                             not samples.empty(), gpuActive, particlePointer );
         if ( userOptions.autoTuneReport )   // the memory check: the decision and prediction, nothing else
         {
@@ -429,6 +454,26 @@ void DTFE_preparePadding(DTFE_State &state, User_options const &userOptions)
 }
 
 
+#ifdef PHASE_SPACE
+// PS-DTFE, periodic: unwrap the Eulerian positions so each displacement s = pos - lagPos lies in
+// [-L/2, L/2]; otherwise boundary particles get displacements near L and huge spurious simplices.
+static void psUnwrapEulerian(std::vector<Particle_data> &particles, User_options &options)
+{
+    Real eulerLen[NO_DIM];
+    for (int d=0; d<NO_DIM; ++d)
+        eulerLen[d] = options.boxCoordinates[2*d+1] - options.boxCoordinates[2*d];
+    for (size_t i = 0; i < particles.size(); ++i)
+        for (int d = 0; d < NO_DIM; ++d)
+        {
+            Real s = particles[i].pos[d] - particles[i].lagPos[d];
+            s = std::fmod(s + eulerLen[d] * Real(0.5), eulerLen[d]);
+            if (s < Real(0.)) s += eulerLen[d];
+            s -= eulerLen[d] * Real(0.5);
+            particles[i].pos[d] = particles[i].lagPos[d] + s;
+        }
+}
+#endif
+
 // Top-level DTFE interpolation onto a grid; dispatches to the standard, partitioned, or PS-DTFE path. Clears allParticles.
 void DTFE(vector<Particle_data> *allParticles,
           vector<Sample_point> &samples,
@@ -525,15 +570,27 @@ void DTFE(vector<Particle_data> *allParticles,
 
         // unwrap Eulerian positions so each displacement s = pos - lagPos lies in [-L/2, L/2];
         // otherwise boundary particles get displacements near L and huge spurious simplices
-        for (size_t i = 0; i < state.particles.size(); ++i)
-            for (int d = 0; d < NO_DIM; ++d)
+        psUnwrapEulerian( state.particles, state.options );
+
+        // the globals a later --ps-window run can start from without reading the particles
+        // (ps_globals_record.h): written by every partitioned run with a tessellation cache whose
+        // particles were read as they are, the mean density computed from them
+        if ( not state.options.tessellationCacheDir.empty() and userOptions.partitionOn and userOptions.partNo < 0
+             and userOptions.psAverageDensityFromParticles and not userOptions.regionOn and userOptions.poisson == 0
+             and userOptions.randomSample < Real(0.) )
+        {
+            PSGlobals::Record rec;
+            rec.n = state.particles.size();
+            rec.averageDensity = double( state.options.averageDensity );
+            for (int i = 0; i < 2*NO_DIM; ++i)
             {
-                Real s = state.particles[i].pos[d] - state.particles[i].lagPos[d];
-                s = std::fmod(s + eulerLen[d] * Real(0.5), eulerLen[d]);
-                if (s < Real(0.)) s += eulerLen[d];
-                s -= eulerLen[d] * Real(0.5);
-                state.particles[i].pos[d] = state.particles[i].lagPos[d] + s;
+                rec.box[i] = double( state.options.boxCoordinates.coords[i] );
+                rec.lagBox[i] = double( lagBoxGlobal.coords[i] );
             }
+            rec.hubble = double( state.options.hubbleParam );
+            rec.scaleFactor = double( state.options.scaleFactor );
+            PSGlobals::write( state.options, rec );
+        }
 
         msg << MESSAGE::cBold() << "PS-DTFE:" << MESSAGE::cReset()
             << " Unwrapped Eulerian positions (displacements within [-L/2, L/2]).\n" << MESSAGE::Flush;
@@ -612,9 +669,32 @@ void DTFE(vector<Particle_data> *allParticles,
                 << " periodic copies are generated per-partition (deferred) to keep peak memory low.\n" << MESSAGE::Flush;
         }
 
-        // primary periodic box: centroid ownership check keeps one image of each cell and
-        // tiles the box; overridden per-partition in the partition path
+        // primary periodic box: the centroid ownership check keeps one image of each cell and tiles
+        // the box; overridden per-partition in the partition path. It is ONE PERIOD ending at the top
+        // particle plane, [lagBox_hi - L, lagBox_hi), as the partition plan anchors its tiling -- not
+        // the snapshot box [0, L): on a lattice the box edge lies halfway between two particle planes,
+        // so a tetrahedron straddling it has its centroid exactly ON the edge, and the float-rounded
+        // periodic copies put BOTH its images outside (a single-precision 24^3 lattice lost 4.1% of
+        // its mass, the cells along the box faces; 2026-10-02, tests/tweb_check.sh). A centroid can
+        // reach the top particle plane only for a tetrahedron flat in that plane.
+        for (int d=0; d<NO_DIM; ++d)
+        {
+            state.options.lagrangianRegion[2*d]   = lagBoxGlobal[2*d+1] - eulerLen[d];
+            state.options.lagrangianRegion[2*d+1] = lagBoxGlobal[2*d+1];
+        }
+    }
+    else if ( userOptions.periodic && userOptions.psParticlesDeferred )
+    {
+        // started without the particles (ps_globals_record.h): the recorded globals stand in for the
+        // block above -- the bounding box of the initial positions, and (partitioned runs only) the
+        // periodic copies generated per partition when a partition's particles are selected
+        lagBoxGlobal = userOptions.psPresetLagBox;
+        hasLagrangianPeriodicCopies = true;
         state.options.lagrangianRegion = state.options.boxCoordinates;
+        MESSAGE::Message msg( userOptions.verboseLevel );
+        msg << MESSAGE::cBold() << "PS-DTFE:" << MESSAGE::cReset() << " Lagrangian bounding box = "
+            << MESSAGE::cMagenta() << lagBoxGlobal.print() << MESSAGE::cReset() << " (recorded; the particles are not read yet).\n"
+            << MESSAGE::Flush;
     }
 #endif
 
@@ -624,6 +704,26 @@ void DTFE(vector<Particle_data> *allParticles,
     // --serve arms the same context without points; each request supplies its own.
     if ( not state.options.psSamplePointsFile.empty() or state.options.psServe )
         psPointEvalInit( state.options );
+
+#ifdef PHASE_SPACE
+    // --ps-window: its cell range needs the final box and grid (the header's box is known only now).
+    // Both the partition path (state.options) and the single triangulation (state.options via
+    // DTFE_parallel) read it from state.options; the writers read the caller's copy, so both get it
+    if ( state.options.psWindowOn )
+    {
+        state.options.computePsWindow();
+        for (int d = 0; d < NO_DIM; ++d)
+        {
+            userOptions.psWindowLo[d]   = state.options.psWindowLo[d];
+            userOptions.psWindowDims[d] = state.options.psWindowDims[d];
+        }
+        MESSAGE::Message message( userOptions.verboseLevel );
+        message << "--ps-window: the output grid is the window of "
+                << state.options.psWindowDims[0] << "x" << state.options.psWindowDims[1] << "x" << state.options.psWindowDims[2]
+                << " cells at (" << state.options.psWindowLo[0] << ", " << state.options.psWindowLo[1] << ", " << state.options.psWindowLo[2]
+                << ") of the " << MESSAGE::printElements( state.options.gridSize, "x" ) << " grid.\n" << MESSAGE::Flush;
+    }
+#endif
 
 #ifdef PHASE_SPACE
     if ( userOptions.partitionOn and userOptions.partNo<0 )
@@ -652,6 +752,19 @@ void DTFE(vector<Particle_data> *allParticles,
             state.options.paddedBox.addPadding( state.options.paddingLength );
         }
 
+        // a partition's options: its ownership region and the partition-path switches. They are part of
+        // its tessellation-cache identity, so the composite server, the --ps-window skip and the batch
+        // loop must form them identically -- hence one definition
+        auto partitionOptions = [&](Box const &lagRegion) -> User_options
+        {
+            User_options o = state.options;
+            o.lagrangianRegion = lagRegion;    // for cell ownership check
+            o.psSuppressGridStats = true;      // per-partition stats misleading; aggregate printed after the loop
+            o.psDeferNormalization = true;     // keep fields as moments; normalize once after summing
+            o.psUseSubgrid = true;             // store only this partition's Eulerian bounding box
+            return o;
+        };
+
         // '--serve --partition': a composite server of the partition tessellations instead of grids
         if ( state.options.psServe )
         {
@@ -672,11 +785,7 @@ void DTFE(vector<Particle_data> *allParticles,
                 Box lagRegion, lagPadded;
                 plan.regions( pi, lagRegion, lagPadded );
                 // the batch loop's per-partition options (below), so the cache files are shared
-                User_options tempOpt = state.options;
-                tempOpt.lagrangianRegion = lagRegion;
-                tempOpt.psSuppressGridStats = true;
-                tempOpt.psDeferNormalization = true;
-                tempOpt.psUseSubgrid = true;
+                User_options tempOpt = partitionOptions( lagRegion );
                 int tnum = 0;
 #ifdef OPEN_MP
                 tnum = omp_get_thread_num();
@@ -693,14 +802,16 @@ void DTFE(vector<Particle_data> *allParticles,
             psServeCompositeRun( state.options );   // answers requests until stdin closes; never returns
         }
 
-        uQuantities->reserveMemory( &(state.options.gridSize[0]), state.options.uField );
-        aQuantities->reserveMemory( &(state.options.gridSize[0]), state.options.aField );
+        size_t mainGrid[NO_DIM];                       // the main grid: the --ps-window cells, else the full grid
+        state.options.outputGridSize( mainGrid );
+        uQuantities->reserveMemory( mainGrid, state.options.uField );
+        aQuantities->reserveMemory( mainGrid, state.options.aField );
 
         // pre-size the stream_count accumulators (reserveMemory does not cover them) so
         // addFromSubgrid does not write past an unsized vector
         {
             size_t totalGrid = 1;
-            for (int d=0; d<NO_DIM; ++d) totalGrid *= state.options.gridSize[d];
+            for (int d=0; d<NO_DIM; ++d) totalGrid *= mainGrid[d];
             if ( state.options.uField.selected() )
             {
                 uQuantities->stream_count.assign(totalGrid, Real(0.));
@@ -742,6 +853,65 @@ void DTFE(vector<Particle_data> *allParticles,
                 << MESSAGE::cMagenta() << psConcurrency << MESSAGE::cReset() << " partition triangulation(s) concurrently"
                 << ( userOptions.maxConcurrent > 0 ? " (--max-concurrent)" : "" ) << ".\n" << MESSAGE::Flush;
 
+        // --ps-window: a partition whose occupancy map (beside its cached tessellation: written by a
+        // composite server or an earlier batch run) has no bucket in the window deposits nothing
+        // there -- skip it whole: no particle selection, no tessellation load or build. A partition
+        // without a usable map is processed (and leaves its map for the next run).
+        std::vector<char> skipPartition( size_t(totalPartitions), 0 );
+        int nSkipped = 0;
+        if ( state.options.psWindowOn and not state.options.tessellationCacheDir.empty() )
+        {
+            int nUnknown = 0;
+            for (int pi=0; pi<totalPartitions; ++pi)
+            {
+                Box lagRegion, lagPadded;
+                plan.regions( pi, lagRegion, lagPadded );
+                int const t = psOccupancyTouchesWindow( partitionOptions( lagRegion ), state.options );
+                if ( t == 0 ) { skipPartition[size_t(pi)] = 1; ++nSkipped; }
+                if ( t < 0 ) ++nUnknown;
+            }
+            message << MESSAGE::cBold() << "PS-DTFE:" << MESSAGE::cReset() << " --ps-window: "
+                    << MESSAGE::cMagenta() << nSkipped << MESSAGE::cReset() << " of " << totalPartitions
+                    << " partitions never reach the window (their occupancy maps in the tessellation cache) and are skipped; "
+                    << (totalPartitions - nSkipped) << " to process"
+                    << ( nUnknown > 0 ? " (" + std::to_string(nUnknown) + " without a map yet)" : std::string() )
+                    << ".\n" << MESSAGE::Flush;
+        }
+        // started without the particles: every partition the window needs must be cached, or they are
+        // read now (the run is then the ordinary one) -- verified against the record before use
+        if ( state.options.psParticlesDeferred )
+        {
+            int nMissing = 0;
+            for (int pi=0; pi<totalPartitions; ++pi)
+            {
+                if ( skipPartition[size_t(pi)] ) continue;
+                Box lagRegion, lagPadded;
+                plan.regions( pi, lagRegion, lagPadded );
+                if ( not psTessellationCached( partitionOptions( lagRegion ) ) ) ++nMissing;
+            }
+            if ( nMissing == 0 )
+                message << MESSAGE::cBold() << "PS-DTFE:" << MESSAGE::cReset() << " every partition the window needs is "
+                        << "cached: the snapshot is not read (its globals come from the record).\n" << MESSAGE::Flush;
+            else
+            {
+                message << MESSAGE::cBold() << "PS-DTFE:" << MESSAGE::cReset() << " " << nMissing
+                        << " partition(s) the window needs are not cached: reading the particles after all.\n" << MESSAGE::Flush;
+                User_options readOpts = userOptions;
+                readOpts.psParticlesDeferred = false;
+                std::vector<Sample_point> noSamples;
+                readInputData( &state.particles, &noSamples, &readOpts );
+                bool same = state.particles.size() == userOptions.psPresetN;
+                for (int i = 0; i < 2*NO_DIM and same; ++i)
+                    same = readOpts.boxCoordinates.coords[i] == state.options.boxCoordinates.coords[i];
+                if ( not same )
+                    throwError( "the globals record '", PSGlobals::path( userOptions ), "' does not match the snapshot "
+                                "it names (another particle count or box); delete it -- the next run rewrites it." );
+                psUnwrapEulerian( state.particles, state.options );
+                state.options.psParticlesDeferred = false;
+            }
+        }
+        int const toProcess = std::max( 1, totalPartitions - nSkipped );
+
         // progress + ETA; updated only under mergeMutex below so it is race-free
         auto const psLoopStart = std::chrono::steady_clock::now();
         int psDone = 0;
@@ -770,21 +940,27 @@ void DTFE(vector<Particle_data> *allParticles,
 
             // select particles by Lagrangian position; when periodic, this partition's images
             // are generated on the fly so the global array stays originals-only
+            bool const skipped = skipPartition[size_t(pi)] != 0;   // --ps-window: never reaches the window
+            // a partition whose cached tessellation matches its descriptor is loaded, not built: its
+            // particles are never needed, so their selection (a scan of every particle, ~3 s for TNG100-3's
+            // 94M, plus a copy of the padded share) is skipped -- the load must then succeed (psCacheOnly)
+            User_options tempOpt = partitionOptions( lagRegion );
+            bool const cacheOnly = not skipped and not state.options.tessellationCacheDir.empty()
+                                   and psTessellationCached( tempOpt );
             vector<Particle_data> tempPart;
-            findParticlesInBoxLagrangianPeriodic( state.particles, &tempPart, lagPadded,
-                                                  plan.eulerLen, plan.periodicCopies, 0 );
+            if ( not skipped and not cacheOnly and state.options.psParticlesDeferred )
+                throwError( "internal: a partition needs its particles, but they were not read (the globals record path)." );
+            if ( not skipped and not cacheOnly )
+                findParticlesInBoxLagrangianPeriodic( state.particles, &tempPart, lagPadded,
+                                                      plan.eulerLen, plan.periodicCopies, 0 );
 
-            // an empty partition builds nothing but still takes its turn in the ordered merge
-            bool const emptyPartition = tempPart.empty();
+            // an empty (or skipped) partition builds nothing but still takes its turn in the ordered merge
+            bool const emptyPartition = skipped or ( not cacheOnly and tempPart.empty() );
             Quantities temp_uQuantities, temp_aQuantities;
             if ( not emptyPartition )
             {
             // per-partition options use the full Eulerian grid; only the master thread logs
-            User_options tempOpt = state.options;
-            tempOpt.lagrangianRegion = lagRegion;  // for cell ownership check
-            tempOpt.psSuppressGridStats = true;    // per-partition stats misleading; aggregate printed after the loop
-            tempOpt.psDeferNormalization = true;   // keep fields as moments; normalize once after summing
-            tempOpt.psUseSubgrid = true;           // store only this partition's Eulerian bounding box
+            tempOpt.psCacheOnly = cacheOnly;
             int tnum = 0;
 #ifdef OPEN_MP
             tnum = omp_get_thread_num();
@@ -801,9 +977,11 @@ void DTFE(vector<Particle_data> *allParticles,
                 if ( orderedMerge )
                     mergeCv.wait( lock, [&]{ return nextMerge == pi; } );
                 if ( not emptyPartition )
-                {
-                    uQuantities->addFromSubgrid( temp_uQuantities, &(state.options.gridSize[0]) );
-                    aQuantities->addFromSubgrid( temp_aQuantities, &(state.options.gridSize[0]) );
+                {   // with --ps-window every partition's sub-grid IS the window: the merge is window-local
+                    size_t const *wo = state.options.psWindowOn ? state.options.psWindowLo   : nullptr;
+                    size_t const *wd = state.options.psWindowOn ? state.options.psWindowDims : nullptr;
+                    uQuantities->addFromSubgrid( temp_uQuantities, &(state.options.gridSize[0]), wo, wd );
+                    aQuantities->addFromSubgrid( temp_aQuantities, &(state.options.gridSize[0]), wo, wd );
                 }
                 if ( orderedMerge )
                 {
@@ -811,16 +989,20 @@ void DTFE(vector<Particle_data> *allParticles,
                     mergeCv.notify_all();
                 }
 
+                // progress over the partitions actually processed (the skipped ones cost nothing)
+                if ( not skipped )
+                {
                 ++psDone;
                 double const elapsed = std::chrono::duration<double>( std::chrono::steady_clock::now() - psLoopStart ).count();
-                double const frac    = double(psDone) / double(totalPartitions);
-                double const eta     = ( psDone>0 ) ? elapsed * ( double(totalPartitions - psDone) / double(psDone) ) : 0.;
+                double const frac    = double(psDone) / double(toProcess);
+                double const eta     = ( psDone>0 ) ? elapsed * ( double(toProcess - psDone) / double(psDone) ) : 0.;
                 MESSAGE::Message prog( userOptions.verboseLevel );
-                prog << MESSAGE::cGreen() << "  [partitions " << psDone << "/" << totalPartitions
+                prog << MESSAGE::cGreen() << "  [partitions " << psDone << "/" << toProcess
                      << " | " << int(100.*frac + 0.5) << "%]" << MESSAGE::cReset()
                      << MESSAGE::cDim() << "  elapsed " << MESSAGE::formatDuration(elapsed)
-                     << ( psDone<totalPartitions ? ", ETA ~" + MESSAGE::formatDuration(eta) : ", done" )
+                     << ( psDone<toProcess ? ", ETA ~" + MESSAGE::formatDuration(eta) : ", done" )
                      << MESSAGE::cReset() << "\n" << MESSAGE::Flush;
+                }
             }
         }
 
@@ -1109,6 +1291,32 @@ void DTFE_parallel(vector<Particle_data> *allParticles,
     std::vector< Box > subgridCoords;
     optimalPartitionSplit( *allParticles, userOptions, pGrid, &subgridList, &subgridCoords );
 
+    // --gpu: the sub-domains deposit into ONE full grid on the device (dtfeGpuShared*, see
+    // gpu_host.h) instead of each into a sub-grid of its own -- one accumulator, one read-back,
+    // no per-sub-domain zeroing, and the dispatch controller stays warm from one sub-domain to
+    // the next. The threads' sub-grids then stay zero and the GPU grid is ADDED below.
+    bool gpuShared = false;
+#ifdef DTFE_GPU_SHARED_ACTIVE
+    bool const sharedScalarOk =
+#ifdef SCALAR
+        noScalarComp == 1;   // the kernels carry ONE scalar component (the interpolation declines the GPU otherwise)
+#else
+        true;
+#endif
+    if ( userOptions.useMetal and userOptions.DTFE and userOptions.method==1 and userOptions.aField.selected()
+         and not userOptions.exactAverage and not userOptions.redshiftConeOn and not userOptions.userDefinedSampling
+         and samples.empty() and sharedScalarOk )
+    {
+        size_t const full[3] = { userOptions.gridSize[0], userOptions.gridSize[1], userOptions.gridSize[2] };
+        std::string err;
+        gpuShared = dtfeGpuSharedBegin( full, userOptions.aField.density, userOptions.aField.velocity,
+                                        userOptions.aField.velocity_gradient, userOptions.aField.scalar,
+                                        userOptions.aField.scalar_gradient, err );
+        if ( not gpuShared and userOptions.verboseLevel>=2 )
+            message << "(GPU: no shared grid, " << err << "; each sub-domain deposits on its own)\n" << MESSAGE::Flush;
+    }
+#endif
+
 
 #pragma omp parallel num_threads( noProcessors )
     {
@@ -1151,6 +1359,53 @@ void DTFE_parallel(vector<Particle_data> *allParticles,
     }
     message << "Done.\n";
     allParticles->clear();
+
+#ifdef DTFE_GPU_SHARED_ACTIVE
+    if ( gpuShared )
+    {   // add the device's full grid (value*volume sums) into the output, divided by the cell volume
+        // exactly as the per-thread path does; a sub-domain the device handed back is zero here and
+        // its CPU result is already in the main grid
+        const float *gDen = nullptr, *gVel = nullptr, *gGrad = nullptr, *gScal = nullptr, *gSGrad = nullptr;
+        if ( dtfeGpuSharedResult( &gDen, &gVel, &gGrad, &gScal, &gSGrad ) )
+        {
+            Real cellVolume = 1.;
+            for (int d=0; d<NO_DIM; ++d)
+                cellVolume *= (userOptions.region[2*d+1] - userOptions.region[2*d]) / userOptions.gridSize[d];
+            size_t const nCell = userOptions.gridSize[0] * userOptions.gridSize[1] * userOptions.gridSize[2];
+            if ( gDen and aQuantities->density.size()==nCell )
+            {
+                #pragma omp parallel for
+                for (size_t i=0; i<nCell; ++i) aQuantities->density[i] += Real(gDen[i]) / cellVolume;
+            }
+            if ( gVel and aQuantities->velocity.size()==nCell )
+            {
+                #pragma omp parallel for
+                for (size_t i=0; i<nCell; ++i)
+                    for (size_t j=0; j<noVelComp; ++j) aQuantities->velocity[i][j] += Real(gVel[i*3+j]) / cellVolume;
+            }
+            if ( gGrad and aQuantities->velocity_gradient.size()==nCell )
+            {
+                #pragma omp parallel for
+                for (size_t i=0; i<nCell; ++i)
+                    for (size_t q=0; q<noGradComp; ++q) aQuantities->velocity_gradient[i][q] += Real(gGrad[i*9+q]) / cellVolume;
+            }
+#ifdef SCALAR
+            if ( gScal and aQuantities->scalar.size()==nCell )
+            {
+                #pragma omp parallel for
+                for (size_t i=0; i<nCell; ++i) aQuantities->scalar[i][0] += Real(gScal[i]) / cellVolume;
+            }
+            if ( gSGrad and aQuantities->scalar_gradient.size()==nCell )
+            {
+                #pragma omp parallel for
+                for (size_t i=0; i<nCell; ++i)
+                    for (int q=0; q<NO_DIM; ++q) aQuantities->scalar_gradient[i][q] += Real(gSGrad[i*3+q]) / cellVolume;
+            }
+#endif
+        }
+        dtfeGpuSharedEnd();
+    }
+#endif
 
 
     // total runtime is the slowest thread's CPU time, since the run finishes only when all threads do
@@ -1209,61 +1464,72 @@ Pvector<Real,noVortComp> velocityVorticity(Pvector<Real,noGradComp> &velGrad)
 }
 
 // Eigenvalues of a 3x3 symmetric matrix via Cardano's formula, sorted descending (lambda1 >= lambda2 >= lambda3).
-Pvector<Real,NO_DIM> symmetricEigenvalues3x3(Real a00, Real a01, Real a02,
-                                              Real a11, Real a12, Real a22)
+// Computed in DOUBLE whatever Real is: where two eigenvalues (nearly) coincide -- every cell of a field
+// that varies along one axis, and the axis-symmetric parts of walls and filaments -- r = det(B)/2 sits
+// at +-1, where acos has an infinite slope, so its rounding error eps turns into sqrt(eps) in the
+// eigenvalues: in float, 6e-4 for a cell with delta = 3 (the T-web of a 1D pancake read {3.096, 6e-4,
+// -6e-4} for {3.096, 0, 0}; tests/tweb_check.sh, 2026-10-02). In double, ~1e-8.
+Pvector<Real,NO_DIM> symmetricEigenvalues3x3(Real a00r, Real a01r, Real a02r,
+                                              Real a11r, Real a12r, Real a22r)
 {
     Pvector<Real,NO_DIM> eigenvalues;
 #if NO_DIM == 3
-    Real p1 = a01*a01 + a02*a02 + a12*a12;
-    Real q = (a00 + a11 + a22) / Real(3.);  // trace / 3
+    double const a00 = a00r, a01 = a01r, a02 = a02r, a11 = a11r, a12 = a12r, a22 = a22r;
+    double ev[3];
+    double const p1 = a01*a01 + a02*a02 + a12*a12;
+    double const q = (a00 + a11 + a22) / 3.;  // trace / 3
 
-    Real b00 = a00 - q, b11 = a11 - q, b22 = a22 - q;
-    Real p2 = b00*b00 + b11*b11 + b22*b22 + Real(2.)*p1;
-    Real p = std::sqrt(p2 / Real(6.));
+    double const b00 = a00 - q, b11 = a11 - q, b22 = a22 - q;
+    double const p2 = b00*b00 + b11*b11 + b22*b22 + 2.*p1;
+    double const p = std::sqrt(p2 / 6.);
 
-    if ( p < Real(1.e-15) )
+    if ( p < 1.e-15 )
     {
         // matrix proportional to identity, already diagonal
-        eigenvalues[0] = a00; eigenvalues[1] = a11; eigenvalues[2] = a22;
+        ev[0] = a00; ev[1] = a11; ev[2] = a22;
     }
     else
     {
-        Real inv_p = Real(1.) / p;
+        double const inv_p = 1. / p;
         // B = (1/p) * (A - q*I), compute det(B)
-        Real B00 = b00*inv_p, B01 = a01*inv_p, B02 = a02*inv_p;
-        Real B11 = b11*inv_p, B12 = a12*inv_p, B22 = b22*inv_p;
+        double const B00 = b00*inv_p, B01 = a01*inv_p, B02 = a02*inv_p;
+        double const B11 = b11*inv_p, B12 = a12*inv_p, B22 = b22*inv_p;
 
-        Real detB = B00*(B11*B22 - B12*B12) - B01*(B01*B22 - B12*B02) + B02*(B01*B12 - B11*B02);
-        Real r = detB / Real(2.);
+        double const detB = B00*(B11*B22 - B12*B12) - B01*(B01*B22 - B12*B02) + B02*(B01*B12 - B11*B02);
+        double r = detB / 2.;
 
         // clamp to [-1, 1] for numerical safety before acos
-        if (r <= Real(-1.)) r = Real(-1.);
-        else if (r >= Real(1.)) r = Real(1.);
+        if (r <= -1.) r = -1.;
+        else if (r >= 1.) r = 1.;
 
-        Real phi = std::acos(r) / Real(3.);
+        double const phi = std::acos(r) / 3.;
 
-        eigenvalues[0] = q + Real(2.) * p * std::cos(phi);
-        eigenvalues[2] = q + Real(2.) * p * std::cos(phi + Real(2.) * M_PI / Real(3.));
-        eigenvalues[1] = Real(3.) * q - eigenvalues[0] - eigenvalues[2]; // trace identity
+        ev[0] = q + 2. * p * std::cos(phi);
+        ev[2] = q + 2. * p * std::cos(phi + 2. * M_PI / 3.);
+        ev[1] = 3. * q - ev[0] - ev[2]; // trace identity
     }
 
     // sort descending
-    if (eigenvalues[0] < eigenvalues[1]) std::swap(eigenvalues[0], eigenvalues[1]);
-    if (eigenvalues[1] < eigenvalues[2]) std::swap(eigenvalues[1], eigenvalues[2]);
-    if (eigenvalues[0] < eigenvalues[1]) std::swap(eigenvalues[0], eigenvalues[1]);
+    if (ev[0] < ev[1]) std::swap(ev[0], ev[1]);
+    if (ev[1] < ev[2]) std::swap(ev[1], ev[2]);
+    if (ev[0] < ev[1]) std::swap(ev[0], ev[1]);
+    for (int i = 0; i < 3; ++i) eigenvalues[i] = Real(ev[i]);
 #elif NO_DIM == 2
-    // 2x2 symmetric matrix: eigenvalues from quadratic formula
-    Real trace = a00 + a11;
-    Real det = a00*a11 - a01*a01;
-    Real disc = std::sqrt( std::max(trace*trace / Real(4.) - det, Real(0.)) );
-    eigenvalues[0] = trace / Real(2.) + disc;
-    eigenvalues[1] = trace / Real(2.) - disc;
+    // 2x2 symmetric matrix: (a00 + a11)/2 -+ |((a00 - a11)/2, a01)|. The half-difference form, not
+    // trace^2/4 - det: that one cancels where the eigenvalues (nearly) coincide and leaves sqrt(eps).
+    double const a00 = a00r, a01 = a01r, a11 = a11r;
+    (void)a02r; (void)a12r; (void)a22r;
+    double const mid = (a00 + a11) / 2.;
+    double const disc = std::hypot( (a00 - a11) / 2., a01 );
+    eigenvalues[0] = Real(mid + disc);
+    eigenvalues[1] = Real(mid - disc);
 #endif
     return eigenvalues;
 }
 
 
-// Classifies a cell by counting eigenvalues above lambda_th: 0=void, 1=wall, 2=filament, 3=node.
+// Classifies a cell by counting eigenvalues above lambda_th: 0=void, 1=wall, 2=filament, 3=node
+// (2D: 0=void, 1=filament, 2=node -- one collapsed axis is a line there).
 int classifyWeb(Pvector<Real,NO_DIM> const &eigenvalues, Real lambda_th)
 {
     int label = 0;
@@ -1348,16 +1614,31 @@ void computeWebClassification(Field &fields,
 // fields only; smoothing is a plot-time choice in python/plot_PS_DTFE.py). Note the labels are
 // therefore sensitive to FFT ringing from point-like halo density spikes; labels are categorical,
 // so a smoothed CLASSIFICATION (not just a smoothed picture) requires re-deriving the tensor from
-// a smoothed density, i.e. a rerun. Periodic, 3D, full-box grids only; assumes cubic grid cells
-// (k ratios use per-cell wavenumbers). Runs on the merged full grid after normalization, so it is
-// independent of the partition path.
+// a smoothed density, i.e. a rerun. Periodic, full-box grids only, 2D or 3D (the kernel k_i k_j / k^2
+// is the same in any dimension; 2D has three tensor components and two eigenvalues); assumes square
+// grid cells (k ratios use per-cell wavenumbers). Runs on the merged full grid after normalization,
+// so it is independent of the partition path.
+// The FFT buffers of the T-web: as aligned as fftw_alloc makes them (64 B covers every SIMD width FFTW
+// uses), through the aligned operator new -- which '--scratch-dir' replaces too (scratch_alloc.cc), so
+// above its threshold they live in the scratch files like the grids. fftw_alloc would bypass it.
+template <class T>
+struct FftwAligned
+{
+    using value_type = T;
+    FftwAligned() = default;
+    template <class U> FftwAligned(FftwAligned<U> const &) {}
+    T *allocate(size_t n) { return static_cast<T*>( ::operator new( n * sizeof(T), std::align_val_t(64) ) ); }
+    void deallocate(T *p, size_t) noexcept { ::operator delete( p, std::align_val_t(64) ); }
+    template <class U> bool operator==(FftwAligned<U> const &) const { return true; }
+    template <class U> bool operator!=(FftwAligned<U> const &) const { return false; }
+};
+
 void computeTidalWebClassification(Field &fields,
                                    User_options const &userOptions,
                                    Quantities *q)
 {
     if ( not fields.velocity_tweb ) return;
 
-#if NO_DIM == 3
     MESSAGE::Message message( userOptions.verboseLevel );
 
     auto skip = [&](char const* why)
@@ -1368,15 +1649,14 @@ void computeTidalWebClassification(Field &fields,
     };
 
     if ( not userOptions.periodic ) { skip("the tidal tensor is FFT-Poisson-solved, which needs a periodic box."); return; }
-    size_t const nx = userOptions.gridSize[0], ny = userOptions.gridSize[1], nz = userOptions.gridSize[2];
-    size_t const N  = nx * ny * nz;
+    size_t n[NO_DIM];
+    size_t N = 1;
+    for (int d = 0; d < NO_DIM; ++d) { n[d] = userOptions.gridSize[d]; N *= n[d]; }
     if ( q->density.size() != N ) { skip("it needs the density field on the full grid (select 'density'/'density_a' too)."); return; }
-    // FFTW's basic planner takes int transform sizes: above 2^31 total cells (~1290^3, e.g.
-    // 2048^3 = 8.6e9) the int(nx*ny*nz) arithmetic inside FFTW overflows -- NULL plan or a
-    // silently wrong transform. Refuse cleanly; switching to the guru64 interface is the fix
-    // if such grids ever become reachable (today they exceed this machine's disk anyway).
-    if ( N > size_t(std::numeric_limits<int>::max()) )
-    { skip("the grid exceeds 2^31 cells, past FFTW's int-based planner (needs the guru64 interface)."); return; }
+    // Above 2^31 cells (~1290^3) FFTW's ordinary planners overflow their int sizes: the plans are made
+    // with the 64-bit guru interface (fftw_plans64.h). Every buffer below is an ordinary allocation
+    // (std::vector), so '--scratch-dir' backs it with disk like the grids: the chain needs ~48 bytes
+    // per cell at its peak (the real work array, two half-spectra, the six float tensor components).
 
     auto const tidalStart = std::chrono::steady_clock::now();
     message << "\nComputing the T-web from the tidal tensor of the raw density grid (lambda_th = "
@@ -1388,20 +1668,19 @@ void computeTidalWebClassification(Field &fields,
     mean /= double(N);
     if ( mean <= 0. ) { skip("the density grid has non-positive mean."); return; }
 
-    std::vector<double> work(N);
+    std::vector<double, FftwAligned<double> > work(N);
     for (size_t i = 0; i < N; ++i) work[i] = double(q->density[i]) / mean - 1.;
 
-    size_t const nzh = nz/2 + 1;
-    fftw_complex* deltaK = fftw_alloc_complex(nx * ny * nzh);
-    fftw_complex* tensK  = fftw_alloc_complex(nx * ny * nzh);
-    if ( !deltaK || !tensK )
-    {
-        if (deltaK) fftw_free(deltaK);
-        if (tensK)  fftw_free(tensK);
-        skip("FFT buffer allocation failed.");
-        return;
-    }
-    fftw_plan planF = fftw_plan_dft_r2c_3d(int(nx), int(ny), int(nz), work.data(), deltaK, FFTW_ESTIMATE);
+    // the half-spectra: std::complex<double> has fftw_complex's layout (FFTW manual, "Complex numbers")
+    using Spectrum = std::vector< std::complex<double>, FftwAligned< std::complex<double> > >;
+    size_t const nLast = n[NO_DIM-1], nzh = nLast/2 + 1;    // the last axis is the half-complex one
+    size_t const nOuter = N / nLast;                         // the full axes' cells, flattened
+    Spectrum deltaKBuf( nOuter * nzh ), tensKBuf( nOuter * nzh );
+    fftw_complex *deltaK = reinterpret_cast<fftw_complex*>( deltaKBuf.data() );
+    fftw_complex *tensK  = reinterpret_cast<fftw_complex*>( tensKBuf.data() );
+    // 64-bit sizes (fftw_plans64.h): the ordinary planners stop at 2^31 cells
+    fftw_plan planF = fftwPlans64::r2c(NO_DIM, n, work.data(), deltaK, FFTW_ESTIMATE);
+    if ( planF == nullptr ) { skip("FFTW could not plan the forward transform."); return; }
     fftw_execute(planF);
     fftw_destroy_plan(planF);
 
@@ -1422,33 +1701,39 @@ void computeTidalWebClassification(Field &fields,
     };
 
     double const invN   = 1. / double(N);   // FFTW round trip is unnormalized
-    static int const PAIRS[6][2] = { {0,0}, {0,1}, {0,2}, {1,1}, {1,2}, {2,2} };
-    std::vector<Real> tens[6];
+    // the upper triangle of the symmetric tensor, row by row (symmetricEigenvalues3x3's argument order)
+#if NO_DIM == 3
+    static int const NPAIRS = 6;
+    static int const PAIRS[NPAIRS][2] = { {0,0}, {0,1}, {0,2}, {1,1}, {1,2}, {2,2} };
+#else
+    static int const NPAIRS = 3;
+    static int const PAIRS[NPAIRS][2] = { {0,0}, {0,1}, {1,1} };
+#endif
+    std::vector<Real> tens[NPAIRS];
 
-    fftw_plan planB = fftw_plan_dft_c2r_3d(int(nx), int(ny), int(nz), tensK, work.data(), FFTW_ESTIMATE);
-    for (int c = 0; c < 6; ++c)
+    fftw_plan planB = fftwPlans64::c2r(NO_DIM, n, tensK, work.data(), FFTW_ESTIMATE);
+    if ( planB == nullptr ) { skip("FFTW could not plan the inverse transform."); return; }
+    for (int c = 0; c < NPAIRS; ++c)
     {
         int const a = PAIRS[c][0], b = PAIRS[c][1];
 #ifdef OPEN_MP
         #pragma omp parallel for
 #endif
-        for (size_t ix = 0; ix < nx; ++ix)
+        for (size_t o = 0; o < nOuter; ++o)     // (ix, iy) in 3D, ix in 2D: the half-spectrum's rows
         {
-            double const kv[1] = { kFull(ix, nx) };
-            for (size_t iy = 0; iy < ny; ++iy)
+            double k[NO_DIM];
+            size_t rest = o;
+            for (int d = NO_DIM - 2; d >= 0; --d) { k[d] = kFull(rest % n[d], n[d]); rest /= n[d]; }
+            for (size_t iz = 0; iz < nzh; ++iz)
             {
-                double const ky = kFull(iy, ny);
-                for (size_t iz = 0; iz < nzh; ++iz)
-                {
-                    double const kz = kHalf(iz, nz);
-                    double const k[3] = { kv[0], ky, kz };
-                    double const k2 = k[0]*k[0] + k[1]*k[1] + k[2]*k[2];
-                    size_t const idx = (ix * ny + iy) * nzh + iz;
-                    if ( k2 == 0. ) { tensK[idx][0] = 0.; tensK[idx][1] = 0.; continue; }
-                    double const f = (k[a] * k[b] / k2) * invN;
-                    tensK[idx][0] = f * deltaK[idx][0];
-                    tensK[idx][1] = f * deltaK[idx][1];
-                }
+                k[NO_DIM-1] = kHalf(iz, nLast);
+                double k2 = 0.;
+                for (int d = 0; d < NO_DIM; ++d) k2 += k[d]*k[d];
+                size_t const idx = o * nzh + iz;
+                if ( k2 == 0. ) { tensK[idx][0] = 0.; tensK[idx][1] = 0.; continue; }
+                double const f = (k[a] * k[b] / k2) * invN;
+                tensK[idx][0] = f * deltaK[idx][0];
+                tensK[idx][1] = f * deltaK[idx][1];
             }
         }
         fftw_execute(planB);          // -> work (real tensor component)
@@ -1456,8 +1741,8 @@ void computeTidalWebClassification(Field &fields,
         for (size_t i = 0; i < N; ++i) tens[c][i] = Real(work[i]);
     }
     fftw_destroy_plan(planB);
-    fftw_free(deltaK);
-    fftw_free(tensK);
+    Spectrum().swap( deltaKBuf );
+    Spectrum().swap( tensKBuf );
     work.clear(); work.shrink_to_fit();
 
     // eigenvalues (descending) and classification
@@ -1469,8 +1754,13 @@ void computeTidalWebClassification(Field &fields,
 #endif
     for (size_t i = 0; i < N; ++i)
     {
+#if NO_DIM == 3
         Pvector<Real,NO_DIM> eig = symmetricEigenvalues3x3( tens[0][i], tens[1][i], tens[2][i],
                                                             tens[3][i], tens[4][i], tens[5][i] );
+#else
+        Pvector<Real,NO_DIM> eig = symmetricEigenvalues3x3( tens[0][i], tens[1][i], Real(0.),
+                                                            tens[2][i], Real(0.), Real(0.) );
+#endif
         q->velocity_tweb_eigenvalues[i] = eig;
         int const label = classifyWeb( eig, userOptions.lambda_th );
         q->velocity_tweb[i] = Real(label);
@@ -1478,18 +1768,17 @@ void computeTidalWebClassification(Field &fields,
     }
 
     message << "Done.\n";
+#if NO_DIM == 3
     static char const* NAMES[4] = { "void", "wall", "filament", "node" };
+#else
+    static char const* NAMES[3] = { "void", "filament", "node" };     // one collapsed axis is a line in 2D
+#endif
     message << "T-web volume fractions:";
-    for (int l = 0; l < 4; ++l)
+    for (int l = 0; l <= NO_DIM; ++l)
         message << "  " << NAMES[l] << " = " << (100. * double(counts[l]) / double(N)) << "\%";
     message << "\n";
     message << "  >>> Time: " << std::chrono::duration<double>(std::chrono::steady_clock::now() - tidalStart).count()
             << " sec. (T-web tidal tensor)\n" << MESSAGE::Flush;
-#else
-    MESSAGE::Warning warning( userOptions.verboseLevel );
-    warning << "The T-web is implemented for 3D only; skipping.\n" << MESSAGE::EndWarning;
-    fields.velocity_tweb = false;
-#endif
 }
 
 

@@ -292,22 +292,45 @@ void Quantities::normalizePhaseSpace(Field const &field, Real const weightFromDe
 
 // Like addField, but 'src' is a sub-grid (dims m, global origin o) of the full grid 'full';
 // each cell is mapped to its global row-major index. o, m, full are in grid-cell units.
-template<typename T>
+// The destination may itself be a WINDOW of the full grid (--ps-window: mainOrigin/mainDims given):
+// a source cell is then mapped to its window-local index and skipped when it lies outside.
+inline bool subgridTarget(size_t const *c, size_t const *o, size_t const *full,
+                          size_t const *mainOrigin, size_t const *mainDims, size_t &g)
+{
+    g = 0;
+    for (int d = 0; d < NO_DIM; ++d)
+    {
+        // '% full[d]': the sub-box may WRAP a periodic axis (o[d]+m[d] > full[d]), which is the
+        // normal case for a partition straddling the box seam. No-op for an unwrapped box.
+        size_t gl = (c[d] + o[d]) % full[d];              // global index
+        if (mainOrigin)
+        {
+            long ml = long(gl) - long(mainOrigin[d]);
+            if (ml < 0) ml += long(full[d]);              // the window may wrap too
+            if (ml < 0 || ml >= long(mainDims[d])) return false;
+            g = g * mainDims[d] + size_t(ml);
+        }
+        else
+            g = g * full[d] + gl;                         // global row-major flat
+    }
+    return true;
+}
+
+template <typename T>
 void addFieldSubgrid(std::vector<T> const &src, std::vector<T> *dst,
-                     size_t const *o, size_t const *m, size_t const *full)
+                     size_t const *o, size_t const *m, size_t const *full,
+                     size_t const *mainOrigin = nullptr, size_t const *mainDims = nullptr)
 {
     if (src.empty()) return;
-    size_t fullTotal = 1; for (int d = 0; d < NO_DIM; ++d) fullTotal *= full[d];
-    if (dst->size() < fullTotal) dst->resize(fullTotal, T());
+    size_t dstTotal = 1; for (int d = 0; d < NO_DIM; ++d) dstTotal *= mainOrigin ? mainDims[d] : full[d];
+    if (dst->size() < dstTotal) dst->resize(dstTotal, T());
     size_t subTotal = 1; for (int d = 0; d < NO_DIM; ++d) subTotal *= m[d];
     for (size_t l = 0; l < subTotal; ++l)
     {
         size_t rem = l, c[NO_DIM];
         for (int d = NO_DIM - 1; d >= 0; --d) { c[d] = rem % m[d]; rem /= m[d]; }   // local coords
-        size_t g = 0;
-        // '% full[d]': the sub-box may WRAP a periodic axis (o[d]+m[d] > full[d]), which is the
-        // normal case for a partition straddling the box seam. No-op for an unwrapped box.
-        for (int d = 0; d < NO_DIM; ++d) g = g * full[d] + ((c[d] + o[d]) % full[d]);  // global row-major flat
+        size_t g;
+        if (!subgridTarget(c, o, full, mainOrigin, mainDims, g)) continue;
         (*dst)[g] += src[l];
     }
 }
@@ -317,28 +340,42 @@ void addFieldSubgrid(std::vector<T> const &src, std::vector<T> *dst,
 // periodic seam; a hand-rolled copy of this loop once lacked it and indexed past the end --
 // but OR instead of '+='.
 void orFieldSubgrid(std::vector<Real> const &src, std::vector<Real> *dst,
-                    size_t const *o, size_t const *m, size_t const *full)
+                    size_t const *o, size_t const *m, size_t const *full,
+                    size_t const *mainOrigin = nullptr, size_t const *mainDims = nullptr)
 {
     if (src.empty()) return;
-    size_t fullTotal = 1; for (int d = 0; d < NO_DIM; ++d) fullTotal *= full[d];
-    if (dst->size() < fullTotal) dst->resize(fullTotal, Real(0.));
+    size_t dstTotal = 1; for (int d = 0; d < NO_DIM; ++d) dstTotal *= mainOrigin ? mainDims[d] : full[d];
+    if (dst->size() < dstTotal) dst->resize(dstTotal, Real(0.));
     size_t subTotal = 1; for (int d = 0; d < NO_DIM; ++d) subTotal *= m[d];
     for (size_t l = 0; l < subTotal; ++l)
     {
         size_t rem = l, c[NO_DIM];
         for (int d = NO_DIM - 1; d >= 0; --d) { c[d] = rem % m[d]; rem /= m[d]; }
-        size_t g = 0;
-        for (int d = 0; d < NO_DIM; ++d) g = g * full[d] + ((c[d] + o[d]) % full[d]);
+        size_t g;
+        if (!subgridTarget(c, o, full, mainOrigin, mainDims, g)) continue;
         (*dst)[g] = Real( int((*dst)[g]) | int(src[l]) );
     }
 }
 
-// Accumulates 'other' (which holds only its Eulerian sub-box) into the full grid, mapping each cell by global index.
-void Quantities::addFromSubgrid(Quantities const &other, size_t const *fullGrid)
+// Accumulates 'other' (which holds only its Eulerian sub-box) into the full grid, mapping each cell by
+// global index -- or into THIS grid's own window of it (mainOrigin/mainDims, --ps-window).
+void Quantities::addFromSubgrid(Quantities const &other, size_t const *fullGrid, size_t const *mainOrigin, size_t const *mainDims)
 {
     if (other.ps_subDims[0] == 0) { this->addFrom(other); return; }   // 'other' spans the full grid
     size_t const *o = other.ps_subOrigin;
     size_t const *m = other.ps_subDims;
+    if (mainOrigin && mainDims)
+    {   // the main grid is a window: every field goes through the window-aware mapping
+        #define ADD_W(F) addFieldSubgrid(other.F, &this->F, o, m, fullGrid, mainOrigin, mainDims)
+        ADD_W(density); ADD_W(velocity); ADD_W(velocity_gradient); ADD_W(velocity_divergence);
+        ADD_W(velocity_shear); ADD_W(velocity_vorticity); ADD_W(velocity_std); ADD_W(velocity_dispersion);
+        ADD_W(scalar); ADD_W(scalar_gradient); ADD_W(velocity_tweb_eigenvalues); ADD_W(velocity_vweb_eigenvalues);
+        ADD_W(stream_count); ADD_W(tet_touch); ADD_W(mass_weight); ADD_W(disp_weight); ADD_W(disp_velocity);
+        #undef ADD_W
+        orFieldSubgrid(other.caustic_bits, &this->caustic_bits, o, m, fullGrid, mainOrigin, mainDims);
+        orFieldSubgrid(other.hidden_streams, &this->hidden_streams, o, m, fullGrid, mainOrigin, mainDims);
+        return;
+    }
     addFieldSubgrid(other.density, &this->density, o, m, fullGrid);
     addFieldSubgrid(other.velocity, &this->velocity, o, m, fullGrid);
     addFieldSubgrid(other.velocity_gradient, &this->velocity_gradient, o, m, fullGrid);

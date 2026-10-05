@@ -32,7 +32,7 @@ import sys
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QProcess, QProcessEnvironment, QRect, QSettings, QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QLocale, QProcess, QProcessEnvironment, QRect, QSettings, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (QAction, QActionGroup, QColor, QDesktopServices, QFont, QFontDatabase, QIcon,
                            QImageReader, QIntValidator, QKeySequence, QPixmap, QShortcut)
 from PySide6.QtWidgets import (
@@ -50,6 +50,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import runspec as rs  # noqa: E402
 import presets as P  # noqa: E402
 import results as R  # noqa: E402
+import grids as G  # noqa: E402
 
 ERROR_COLOR, WARN_COLOR, OK_COLOR = QColor("#c62828"), QColor("#b26a00"), QColor("#2e7d32")
 INFO_COLOR = QColor("gray")
@@ -347,7 +348,9 @@ class MainWindow(QMainWindow):
                  pipeline: rs.PipelineSpec | None = None, plots: rs.PlotSpec | None = None,
                  data: rs.DataSpec | None = None, settings: QSettings | None = None,
                  custom: rs.CustomSpec | None = None):
-        super().__init__()
+        QLocale.setDefault(QLocale.c())      # spin boxes read and show '2.00', as every label does (not the system's
+        super().__init__()                   # '2,00'); BEFORE the window exists: children inherit the parent's locale
+        self.setLocale(QLocale.c())
         self.setWindowTitle("DTFE / PS-DTFE launcher")
         self.remember = remember
         self.settings = settings or QSettings("DTFE", "launcher")
@@ -369,6 +372,7 @@ class MainWindow(QMainWindow):
         self._after_job = None                               # e.g. the demo: open Explore when it finishes
         self.proc: QProcess | None = None
         self._loading = False
+        self._own_last_file = ""        # the custom file whose particle count last set the GPU box
         self._steps: list[rs.Step] = []
         self._step_i, self._results = -1, []
         self._job_tab, self._job_start = GRIDS, None
@@ -427,7 +431,8 @@ class MainWindow(QMainWindow):
         self.tabs.setTabToolTip(OWN, "Run DTFE / PS-DTFE on a snapshot file of your own (not IllustrisTNG)")
         self.tabs.setTabToolTip(EXPLORE, "Look at any run's grids, and click to list the streams at a point")
         lv.addWidget(self.tabs, 1)
-        left.setMinimumWidth(590)
+        left.setMinimumWidth(690)           # three columns of field boxes ('velocity dispersion' ...) need it:
+                                            # at 590 the third column read 've', 'vo', 'V-' (seen 2026-10-05)
 
         self.runs = RV.RunsBrowser(lambda: self.root_edit.text().strip(), self._custom_output_dirs)
         self.runs.load_settings.connect(self._load_run_settings)
@@ -525,7 +530,7 @@ class MainWindow(QMainWindow):
             head.setSectionResizeMode(c, QHeaderView.ResizeToContents)
         self.d_table.setMinimumHeight(230)
         self.d_table.itemChanged.connect(self._changed)
-        v.addWidget(self.d_table)
+        v.addWidget(self.d_table, 1)        # grows with the window (it showed ten rows above empty space)
         sel = QHBoxLayout()
         for label, mode in (("All", "all"), ("None", "none"), ("Not merged", "missing")):
             b = QPushButton(label)
@@ -537,7 +542,7 @@ class MainWindow(QMainWindow):
         v.addLayout(sel)
         self.d_whole = _note()
         v.addWidget(self.d_whole)
-        col.addWidget(g)
+        col.addWidget(g, 1)
 
         g = QGroupBox("Download from the TNG API")
         v = QVBoxLayout(g)
@@ -571,7 +576,7 @@ class MainWindow(QMainWindow):
             cb.toggled.connect(self._changed)
             v.addWidget(cb)
         col.addWidget(g)
-        col.addStretch(1)
+        # (no trailing stretch: the snapshot table above takes the room a taller window gives)
         w = QWidget()
         w.setLayout(col)
         return w
@@ -705,6 +710,13 @@ class MainWindow(QMainWindow):
         spec = self.spec if target == "grids" else self.custom
         planes = rs.planes(self._sim_path()) if (target == "grids" and self._sim_path()) else []
         changed = P.apply_preset(spec, settings, planes)
+        if "gpu" not in settings:          # the preset leaves the GPU to the run's size (see recommended_gpu)
+            n = (rs.dm_particles(spec.sim) if target == "grids" else
+                 rs.hdf5_particle_count(Path(spec.input_file).expanduser()) if spec.input_file else None)
+            rec = rs.recommended_gpu(spec.deposit, spec.fields, n, spec.estimator, spec.precision)
+            if spec.gpu != rec:
+                spec.gpu = rec
+                changed.append("gpu")
         if target == "grids" and settings.get("slice_plane") == "largest" and not planes:
             text += "  (no image plane for this simulation yet: make one with the Pipeline tab)"
         about.setText(text)
@@ -761,7 +773,8 @@ class MainWindow(QMainWindow):
         self.deposit_combo.addItem(P.label("exact"), "exact")
         self.deposit_combo.setItemData(0, P.tooltip("sampled"), Qt.ToolTipRole)
         self.deposit_combo.setItemData(1, P.tooltip("exact"), Qt.ToolTipRole)
-        self.deposit_combo.currentIndexChanged.connect(self._changed)
+        self.deposit_combo.currentIndexChanged.connect(
+            lambda _i: self._deposit_changed(self.deposit_combo, self.gpu_check, self.spec.estimator))
         f.addRow("Deposit", self.deposit_combo)
         gr = QHBoxLayout()
         self.grid_combo = _grid_combo(self)
@@ -808,12 +821,33 @@ class MainWindow(QMainWindow):
         f.addRow("", self.vg_check)
         col.addWidget(self.slice_group)
 
-        g, (self.part_spin, self.conc_spin, self.scratch_edit, self.prefix_edit) = self._resources_group()
+        g, (self.part_spin, self.conc_spin, self.scratch_edit, self.prefix_edit,
+            self.pt_check, self.prec_combo) = self._resources_group()
         col.addWidget(g)
         col.addStretch(1)
         w = QWidget()
         w.setLayout(col)
         return w
+
+    def _deposit_changed(self, combo: QComboBox, gpu: QCheckBox, estimator: str = "ps", dim: int = 3):
+        """Picking the exact deposit ticks the GPU (PS-DTFE: 2x faster than the threaded CPU deposit at
+        0.26M particles, 29 s against 57 s on a 256³ grid, and more at larger sizes; standard DTFE's exact
+        cell average: 6.6x, 4.1 s against 26.9 s); the box stays editable. A 2D run has no GPU."""
+        if not self._loading and combo.currentData() == "exact" and rs.gpu_built(estimator, dim=dim) and not gpu.isChecked():   # (either pair has the GPU when the single one has)
+            gpu.setChecked(True)            # (its toggled signal runs _changed)
+            self.status_message("exact deposit: the GPU is ticked (2x faster than the CPU at 0.26M particles, "
+                                "more at larger sizes)" if estimator == "ps" else
+                                "exact cell averages: the GPU is ticked (6.6x faster than the CPU at 0.26M particles)")
+        self._changed()
+
+    @staticmethod
+    def _deposit_texts(combo: QComboBox, ps: bool):
+        """the deposit choice in the words of the estimator it applies to (the same two settings)"""
+        for i, key in enumerate(("sampled", "exact")):
+            k = key if ps else key + "_dtfe"
+            if combo.itemText(i) != P.label(k):
+                combo.setItemText(i, P.label(k))
+                combo.setItemData(i, P.tooltip(k) if ps else P.tooltip(k, "DTFE"), Qt.ToolTipRole)
 
     def _fields_group(self, title: str = "Fields") -> tuple[QGroupBox, dict[str, QCheckBox]]:
         g = QGroupBox(title)
@@ -824,6 +858,8 @@ class MainWindow(QMainWindow):
             cb.toggled.connect(self._changed)
             checks[name] = cb
             grid.addWidget(cb, i // 3, i % 3)
+        for c in range(3):                  # equal columns: the last one must not be starved of width
+            grid.setColumnStretch(c, 1)
         return g, checks
 
     def _resources_group(self):
@@ -842,10 +878,23 @@ class MainWindow(QMainWindow):
         scratch.setPlaceholderText("none: grids in RAM")
         scratch.editingFinished.connect(self._changed)
         f.addRow("Scratch directory", _dir_row(scratch, lambda: self._browse_scratch(scratch)))
+        ptri = QCheckBox(P.label("parallel_triangulation"))
+        ptri.setToolTip(P.tooltip("parallel_triangulation"))
+        ptri.toggled.connect(self._changed)
+        f.addRow("", ptri)
+        prec = QComboBox()
+        for key in rs.PRECISIONS:
+            prec.addItem(rs.PRECISION_TEXT[key], key)
+        prec.setToolTip("Which pair of programs runs: the single-precision one (the default), or the "
+                        "double-precision pair, which keeps every position, density and field in float64 from "
+                        "the input read onward (TNG stores its coordinates in double) and writes float64 grids, "
+                        "at about twice the memory. Setup builds the pair.")
+        prec.currentIndexChanged.connect(self._changed)
+        f.addRow("Precision", prec)
         prefix = QLineEdit()
         prefix.editingFinished.connect(self._changed)
         f.addRow("Output prefix", prefix)
-        return g, (part, conc, scratch, prefix)
+        return g, (part, conc, scratch, prefix, ptri, prec)
 
     # ================================================================ Custom snapshot tab
     def _build_own_tab(self) -> QWidget:
@@ -860,6 +909,15 @@ class MainWindow(QMainWindow):
             self.o_type.addItem(text, t)
         self.o_type.currentIndexChanged.connect(self._changed)
         f.addRow("Format", self.o_type)
+        self.o_dim = QComboBox()
+        for d in rs.DIMS:
+            self.o_dim.addItem(rs.DIM_TEXT[d], d)
+        self.o_dim.setToolTip("3D, or 2D for a snapshot in a plane (its coordinates have two columns): the 2D "
+                              "programs DTFE-2d and PS-DTFE-2d run it, on the CPU, with every field (the 2D "
+                              "T-web classes: 0 void, 1 filament, 2 node). Set from the file when you choose one "
+                              "(HDF5 and text files say which).")
+        self.o_dim.currentIndexChanged.connect(self._changed)
+        f.addRow("Dimensions", self.o_dim)
         un = QHBoxLayout()
         self.o_unit = QDoubleSpinBox(minimum=1e-6, maximum=1e9, decimals=4, value=1.0)
         self.o_unit.setToolTip("How many of the file's length units make one Mpc: 1 when the coordinates "
@@ -879,6 +937,13 @@ class MainWindow(QMainWindow):
         self.o_periodic.setToolTip(P.tooltip("periodic", "DTFE"))
         self.o_periodic.toggled.connect(self._changed)
         f.addRow("", self.o_periodic)
+        self.o_alpha = QDoubleSpinBox(minimum=0.0, maximum=50.0, decimals=1, singleStep=0.5, value=3.0)
+        self.o_alpha.setSuffix(" mean particle spacings")
+        self.o_alpha.setSpecialValueText("whole convex hull")
+        self.o_alpha.setToolTip(P.tooltip("alpha_shape"))
+        self.o_alpha.valueChanged.connect(self._changed)
+        f.addRow("Alpha shape", self.o_alpha)
+        self.o_snap_form = f
         self.o_box = QLineEdit(placeholderText="from the file header (Gadget BoxSize)")
         self.o_box.setToolTip("Optional: xlo xhi ylo yhi zlo zhi in the file's units (all >= 0)")
         self.o_box.editingFinished.connect(self._changed)
@@ -926,7 +991,8 @@ class MainWindow(QMainWindow):
         self.o_grid = _grid_combo(self)
         self.o_grid.currentTextChanged.connect(self._changed)
         gr.addWidget(self.o_grid)
-        gr.addWidget(QLabel("³ cells    sub-samples per axis"))
+        self.o_grid_cells = QLabel("³ cells    sub-samples per axis")
+        gr.addWidget(self.o_grid_cells)
         self.o_nsub = QSpinBox(minimum=1, maximum=6)
         self.o_nsub.valueChanged.connect(self._changed)
         gr.addWidget(self.o_nsub)
@@ -935,7 +1001,11 @@ class MainWindow(QMainWindow):
         self.o_deposit = QComboBox()
         self.o_deposit.addItem(P.label("sampled"), "sampled")
         self.o_deposit.addItem(P.label("exact"), "exact")
-        self.o_deposit.currentIndexChanged.connect(self._changed)
+        self.o_deposit.setItemData(0, P.tooltip("sampled"), Qt.ToolTipRole)
+        self.o_deposit.setItemData(1, P.tooltip("exact"), Qt.ToolTipRole)
+        self.o_deposit.currentIndexChanged.connect(lambda _i: self._deposit_changed(self.o_deposit, self.o_gpu,
+                                                                                    self.custom.estimator,
+                                                                                    self.custom.dim))
         f.addRow("Deposit", self.o_deposit)
         self.o_gpu = QCheckBox(P.label("gpu"))
         self.o_gpu.setToolTip(P.tooltip("gpu"))
@@ -961,7 +1031,7 @@ class MainWindow(QMainWindow):
         self.o_name.editingFinished.connect(self._changed)
         f.addRow("Name", self.o_name)
         col.addWidget(g)
-        g, (self.o_part, self.o_conc, self.o_scratch, _prefix) = self._resources_group()
+        g, (self.o_part, self.o_conc, self.o_scratch, _prefix, self.o_pt, self.o_prec) = self._resources_group()
         _prefix.hide()
         g.layout().labelForField(_prefix).hide()
         col.addWidget(g)
@@ -988,14 +1058,24 @@ class MainWindow(QMainWindow):
         self._own_file_changed()
 
     def _own_file_changed(self):
-        """A new file: guess its format from the name (the user can still change it)."""
+        """A new file: guess its format from the name and tick the GPU when its particle count says
+        the GPU deposit is the faster one (the user can still change both)."""
         f = self.o_file.text().strip()
-        if not f:
+        if not f or f == self._own_last_file:
             return
+        self._own_last_file = f
         suffix = Path(f).suffix.lower()
         guess = 105 if suffix in (".hdf5", ".h5", ".hdf") else 111 if suffix in (".txt", ".dat", ".csv") else None
         if guess is not None:
             self.o_type.setCurrentIndex(max(self.o_type.findData(guess), 0))
+        dim = rs.snapshot_dim(Path(f).expanduser(), guess) if guess is not None else None
+        if dim is not None:                 # the file says: 2D or 3D
+            self.o_dim.setCurrentIndex(max(self.o_dim.findData(dim), 0))
+        if guess == 105 and Path(f).expanduser().is_file():
+            self._read_widgets()
+            c = self.custom
+            n = rs.hdf5_particle_count(Path(f).expanduser())
+            self.o_gpu.setChecked(rs.recommended_gpu(c.deposit, c.fields, n, c.estimator, c.precision, c.dim))
         self._changed()
 
     # ================================================================ Pipeline tab
@@ -1032,9 +1112,45 @@ class MainWindow(QMainWindow):
         self.p_center.editingFinished.connect(self._changed)
         f.addRow("Position (Mpc)", self.p_center)
         self.p_vg = QCheckBox("Velocity gradient at each point")
-        self.p_vg.setToolTip("PTS_VEL_GRAD=1: the divergence, shear and vorticity maps")
+        self.p_vg.setToolTip("Also evaluate the velocity gradient at every sample point: the divergence, shear and "
+                             "vorticity maps (PTS_VEL_GRAD)")
         self.p_vg.toggled.connect(self._changed)
         f.addRow("", self.p_vg)
+        slab = QHBoxLayout()
+        self.p_planes = QSpinBox(minimum=1, maximum=256)
+        self.p_planes.setToolTip("Sampling planes spread across a slab, which the figures' 'slab' projection averages "
+                                 "(the planes option of make_image_plane.py). 1 = one crisp zero-thickness cross-section. "
+                                 "A handful of planes ghosts every inclined structure (one displaced copy per plane): "
+                                 f"use 1, or at least {rs.PLANE_GHOSTING_MIN} for a smooth projection.")
+        self.p_planes.valueChanged.connect(self._changed)
+        self.p_thick = QDoubleSpinBox(minimum=0.01, maximum=1000.0, decimals=2, singleStep=0.5)
+        self.p_thick.setSuffix(" Mpc")
+        self.p_thick.setToolTip("The slab's depth along the normal axis, over which the planes are spread "
+                                "(the thickness option of make_image_plane.py; one plane has no thickness)")
+        self.p_thick.valueChanged.connect(self._changed)
+        slab.addWidget(self.p_planes)
+        slab.addWidget(QLabel("planes across"))
+        slab.addWidget(self.p_thick)
+        slab.addStretch(1)
+        f.addRow("Slab", slab)
+        sub = QHBoxLayout()
+        self.p_super = QSpinBox(minimum=1, maximum=8)
+        self.p_super.setToolTip("K: evaluate K×K sample points per pixel and average them (the supersample option of "
+                                "make_image_plane.py). The map then estimates the pixel-AREA mean, what the deposit grid "
+                                "reports, instead of a point sample: no aliasing where structure is finer than a pixel "
+                                "(halo cores, thin caustics). Costs K² points.")
+        self.p_super.valueChanged.connect(self._changed)
+        self.p_super_note = QLabel()
+        sub.addWidget(self.p_super)
+        sub.addWidget(self.p_super_note)
+        sub.addStretch(1)
+        f.addRow("Sub-samples per pixel axis", sub)
+        self.p_window = QLineEdit(placeholderText="whole box: u0 u1 v0 v1")
+        self.p_window.setToolTip("Image only this part of the plane: horizontal u0..u1 and vertical v0..v1 in Mpc "
+                                 "(the u0, u1, v0, v1 options of make_image_plane.py); blank = the whole box. Pixels "
+                                 "stay square, so the vertical pixel count follows the window's aspect.")
+        self.p_window.editingFinished.connect(self._changed)
+        f.addRow("Window (Mpc)", self.p_window)
         col.addWidget(g)
 
         g, self.p_fields = self._fields_group("Grids")
@@ -1043,14 +1159,46 @@ class MainWindow(QMainWindow):
         self.p_grid.currentTextChanged.connect(self._changed)
         gr.addWidget(QLabel("Grid"))
         gr.addWidget(self.p_grid)
-        gr.addWidget(QLabel("³ cells"))
+        gr.addWidget(QLabel("³ cells    sub-samples per axis"))
+        self.p_nsub = QSpinBox(minimum=1, maximum=6)
+        self.p_nsub.setToolTip("nSub³ sample points per cell for the sampled deposit (AVG_SUBSAMPLES)")
+        self.p_nsub.valueChanged.connect(self._changed)
+        gr.addWidget(self.p_nsub)
         gr.addStretch(1)
         g.layout().addLayout(gr, 3, 0, 1, 3)
-        g.setToolTip("run_ps_pipeline.sh always uses the production settings: GPU, vertex masses, "
-                     "volume-weighted velocities")
+        dep = QHBoxLayout()
+        self.p_deposit = QComboBox()
+        self.p_deposit.addItem(P.label("sampled"), "sampled")
+        self.p_deposit.addItem(P.label("exact"), "exact")
+        self.p_deposit.setItemData(0, P.tooltip("sampled"), Qt.ToolTipRole)
+        self.p_deposit.setItemData(1, P.tooltip("exact"), Qt.ToolTipRole)
+        self.p_deposit.currentIndexChanged.connect(lambda _i: self._deposit_changed(self.p_deposit, self.p_gpu))
+        dep.addWidget(QLabel("Deposit"))
+        dep.addWidget(self.p_deposit, 1)
+        g.layout().addLayout(dep, 4, 0, 1, 3)
+        self.p_gpu = QCheckBox(P.label("gpu"))
+        self.p_gpu.setToolTip(P.tooltip("gpu"))
+        self.p_gpu.toggled.connect(self._changed)
+        g.layout().addWidget(self.p_gpu, 5, 0, 1, 3)
+        g.setToolTip("run_ps_pipeline.sh hands these to run_ps_dtfe.sh exactly as a Grids job does; left alone, "
+                     "the scripts' own defaults are the production settings (GPU, vertex masses, volume-weighted "
+                     "velocities)")
         col.addWidget(g)
 
-        g, (self.p_part, self.p_conc, self.p_scratch, self.p_prefix) = self._resources_group()
+        g = QGroupBox("Phase-space options")
+        v = QVBoxLayout(g)
+        self.p_vm = QCheckBox(P.label("vertex_mass"))
+        self.p_vw = QCheckBox(P.label("volume_weighted"))
+        self.p_ca = QCheckBox(P.label("caustics"))
+        self.p_cu = QCheckBox(P.label("caustic_cusps"))
+        for cb, key in ((self.p_vm, "vertex_mass"), (self.p_vw, "volume_weighted"),
+                        (self.p_ca, "caustics"), (self.p_cu, "caustic_cusps")):
+            cb.setToolTip(P.tooltip(key))
+            cb.toggled.connect(self._changed)
+            v.addWidget(cb)
+        col.addWidget(g)
+
+        g, (self.p_part, self.p_conc, self.p_scratch, self.p_prefix, self.p_pt, self.p_prec) = self._resources_group()
         col.addWidget(g)
 
         g = QGroupBox("Run")
@@ -1058,12 +1206,50 @@ class MainWindow(QMainWindow):
         self.p_force = QCheckBox("Recompute every snapshot, up to date or not")
         self.p_plan = QCheckBox("Plan only: show what would run")
         self.p_render = QCheckBox("Then render the point-evaluated figures")
-        self.p_force.setToolTip("FORCE=1")
-        self.p_plan.setToolTip("DRY_RUN=1: nothing is computed")
-        self.p_render.setToolTip("plot_pointeval.py, on this pipeline's own image plane")
+        self.p_force.setToolTip("Ignore every freshness check (FORCE)")
+        self.p_plan.setToolTip("Print the plan, compute nothing (DRY_RUN)")
+        self.p_render.setToolTip("plot_pointeval.py, on this pipeline's own image plane, with the options below")
         for cb in (self.p_force, self.p_plan, self.p_render):
             cb.toggled.connect(self._changed)
             v.addWidget(cb)
+        self.p_render_box = QWidget()
+        rf = QFormLayout(self.p_render_box)
+        rf.setContentsMargins(24, 0, 0, 0)
+        self.p_rfields = QLineEdit(placeholderText="all the run wrote: " + ", ".join(rs.POINTEVAL_FIELDS))
+        self.p_rfields.setToolTip("A comma-separated subset of the point-evaluated fields (the fields option of "
+                                  "plot_pointeval.py); blank = every field the run wrote")
+        self.p_rfields.editingFinished.connect(self._changed)
+        rf.addRow("Fields", self.p_rfields)
+        self.p_rproject = QComboBox()
+        self.p_rproject.addItem("the central plane: a zero-thickness cross-section", "plane")
+        self.p_rproject.addItem("slab: the mean over every plane of the slab", "slab")
+        self.p_rproject.setToolTip("The projection option of plot_pointeval.py; 'slab' needs several planes across the "
+                                   "slab (above)")
+        self.p_rproject.currentIndexChanged.connect(self._changed)
+        rf.addRow("Projection", self.p_rproject)
+        self.p_rsmooth = QDoubleSpinBox(minimum=0.0, maximum=1000.0, decimals=1, singleStep=0.5)
+        self.p_rsmooth.setSuffix(" px")
+        self.p_rsmooth.setToolTip("Gaussian smoothing of every map, in output pixels (the smooth option of "
+                                  "plot_pointeval.py); 0 = none. Also suppresses the smoothed gradient companions below.")
+        self.p_rsmooth.valueChanged.connect(self._changed)
+        rf.addRow("Smoothing", self.p_rsmooth)
+        self.p_rsmoothd = QDoubleSpinBox(minimum=0.0, maximum=1000.0, decimals=1, singleStep=1.0)
+        self.p_rsmoothd.setSuffix(" px")
+        self.p_rsmoothd.setToolTip("The gradient maps (divergence, shear, vorticity, density gradient) are piecewise "
+                                   "constant per tetrahedron and look faceted; each also gets a Gaussian-smoothed "
+                                   "companion figure at this width (the smooth-derivatives option of plot_pointeval.py); "
+                                   "0 = none")
+        self.p_rsmoothd.valueChanged.connect(self._changed)
+        rf.addRow("Gradient maps also smoothed at", self.p_rsmoothd)
+        self.p_rfixed = QCheckBox("Fixed density range of the grid maps (0.1 .. 1e4) instead of a percentile stretch")
+        self.p_rfixed.setToolTip("The fixed-range option of plot_pointeval.py: side-by-side comparison with the grid "
+                                 "slice maps; clips ~26% of a z=0 image to the darkest colour")
+        self.p_rforce = QCheckBox("Re-render figures newer than their data")
+        self.p_rforce.setToolTip("The force option of plot_pointeval.py")
+        for cb in (self.p_rfixed, self.p_rforce):
+            cb.toggled.connect(self._changed)
+            rf.addRow("", cb)
+        v.addWidget(self.p_render_box)
         col.addWidget(g)
         col.addStretch(1)
         w = QWidget()
@@ -1225,8 +1411,9 @@ class MainWindow(QMainWindow):
         run.addWidget(self.run_btn)
         run.addWidget(self.queue_btn)
         self.mem_btn = QPushButton("Check memory")
-        self.mem_btn.setToolTip("Ask the binary's auto-tuner what this run needs per snapshot, against "
-                                "this machine's memory budget (reads each snapshot, computes nothing)")
+        self.mem_btn.setToolTip("Ask the binary's auto-tuner what this run needs per snapshot (and how it "
+                                "would split the work), against this machine's memory budget: it reads each "
+                                "snapshot and computes nothing")
         self.mem_btn.clicked.connect(self.check_memory)
         run.addWidget(self.mem_btn)
         run.addWidget(self.stop_btn)
@@ -1348,28 +1535,51 @@ class MainWindow(QMainWindow):
         self.conc_spin.setValue(s.max_concurrent)
         self.scratch_edit.setText(s.scratch_dir)
         self.prefix_edit.setText(s.output_prefix)
+        self.pt_check.setChecked(s.parallel_triangulation)
+        self.prec_combo.setCurrentIndex(max(self.prec_combo.findData(s.precision), 0))
         # Pipeline
         self.p_nu.setCurrentText(str(p.nu))
         self.p_adaptive.setChecked(p.adaptive)
         self.p_axis.setCurrentText(p.axis)
         self.p_center.setText(p.center)
         self.p_vg.setChecked(p.vel_grad)
+        self.p_planes.setValue(p.planes)
+        self.p_thick.setValue(p.thickness)
+        self.p_super.setValue(p.supersample)
+        self.p_window.setText(p.window)
         self.p_grid.setCurrentText(str(p.grid))
         for name, cb in self.p_fields.items():
             cb.setChecked(name in p.fields)
+        self.p_deposit.setCurrentIndex(max(self.p_deposit.findData(p.deposit), 0))
+        self.p_nsub.setValue(p.nsub)
+        self.p_gpu.setChecked(p.gpu)
+        self.p_vm.setChecked(p.vertex_mass)
+        self.p_vw.setChecked(p.volume_weighted)
+        self.p_ca.setChecked(p.caustics)
+        self.p_cu.setChecked(p.caustic_cusps)
+        self.p_pt.setChecked(p.parallel_triangulation)
         self.p_part.setValue(p.partition)
         self.p_conc.setValue(p.max_concurrent)
         self.p_scratch.setText(p.scratch_dir)
         self.p_prefix.setText(p.output_prefix)
+        self.p_prec.setCurrentIndex(max(self.p_prec.findData(p.precision), 0))
         self.p_force.setChecked(p.force)
         self.p_plan.setChecked(p.plan_only)
         self.p_render.setChecked(p.render)
+        self.p_rfields.setText(p.render_fields)
+        self.p_rproject.setCurrentIndex(max(self.p_rproject.findData(p.render_project), 0))
+        self.p_rsmooth.setValue(p.render_smooth)
+        self.p_rsmoothd.setValue(p.render_smooth_derivatives)
+        self.p_rfixed.setChecked(p.render_fixed_range)
+        self.p_rforce.setChecked(p.render_force)
         # Custom snapshot
         c = self.custom
         self.o_file.setText(c.input_file)
         self.o_type.setCurrentIndex(max(self.o_type.findData(c.input_type), 0))
+        self.o_dim.setCurrentIndex(max(self.o_dim.findData(c.dim), 0))
         self.o_unit.setValue(c.mpc_unit)
         self.o_periodic.setChecked(c.periodic)
+        self.o_alpha.setValue(c.alpha_shape)
         self.o_box.setText(" ".join(f"{v:g}" for v in c.box))
         (self.o_ps if c.estimator == "ps" else self.o_dtfe).setChecked(True)
         (self.o_lag_sep if c.lagrangian == "separate" else self.o_lag_file).setChecked(True)
@@ -1389,6 +1599,9 @@ class MainWindow(QMainWindow):
         self.o_part.setValue(c.partition)
         self.o_conc.setValue(c.max_concurrent)
         self.o_scratch.setText(c.scratch_dir)
+        self.o_pt.setChecked(c.parallel_triangulation)
+        self.o_prec.setCurrentIndex(max(self.o_prec.findData(c.precision), 0))
+        self._own_last_file = c.input_file
         # Plots
         for i in range(self.fig_list.count()):
             it = self.fig_list.item(i)
@@ -1428,13 +1641,15 @@ class MainWindow(QMainWindow):
         s.vertex_mass = self.vm_check.isChecked()
         s.volume_weighted = self.vw_check.isChecked()
         s.caustics = self.ca_check.isChecked()
-        s.caustic_cusps = self.cu_check.isChecked()
+        s.caustic_cusps = self.cu_check.isChecked() and self.ca_check.isChecked()   # a greyed box cannot be unticked
         s.slice_plane = self.plane_combo.currentData() or ""
         s.slice_vel_grad = self.vg_check.isChecked()
         s.partition = self.part_spin.value()
         s.max_concurrent = self.conc_spin.value()
         s.scratch_dir = self.scratch_edit.text().strip()
         s.output_prefix = self.prefix_edit.text().strip()
+        s.parallel_triangulation = self.pt_check.isChecked()
+        s.precision = self.prec_combo.currentData() or "single"
         # Pipeline
         p.sims = _checked(self.p_sims)
         p.nu = _int(self.p_nu.currentText())
@@ -1442,21 +1657,42 @@ class MainWindow(QMainWindow):
         p.axis = self.p_axis.currentText()
         p.center = self.p_center.text().strip()
         p.vel_grad = self.p_vg.isChecked()
+        p.planes = self.p_planes.value()
+        p.thickness = self.p_thick.value()
+        p.supersample = self.p_super.value()
+        p.window = self.p_window.text().strip()
         p.grid = _int(self.p_grid.currentText())
         p.fields = [n for n, _ in rs.PS_FIELDS if self.p_fields[n].isChecked()]
+        p.deposit = self.p_deposit.currentData() or "sampled"
+        p.nsub = self.p_nsub.value()
+        p.gpu = self.p_gpu.isChecked()
+        p.vertex_mass = self.p_vm.isChecked()
+        p.volume_weighted = self.p_vw.isChecked()
+        p.caustics = self.p_ca.isChecked()
+        p.caustic_cusps = self.p_cu.isChecked() and self.p_ca.isChecked()
+        p.parallel_triangulation = self.p_pt.isChecked()
         p.partition = self.p_part.value()
         p.max_concurrent = self.p_conc.value()
         p.scratch_dir = self.p_scratch.text().strip()
         p.output_prefix = self.p_prefix.text().strip()
+        p.precision = self.p_prec.currentData() or "single"
         p.force = self.p_force.isChecked()
         p.plan_only = self.p_plan.isChecked()
         p.render = self.p_render.isChecked()
+        p.render_fields = self.p_rfields.text().strip()
+        p.render_project = self.p_rproject.currentData() or "plane"
+        p.render_smooth = self.p_rsmooth.value()
+        p.render_smooth_derivatives = self.p_rsmoothd.value()
+        p.render_fixed_range = self.p_rfixed.isChecked()
+        p.render_force = self.p_rforce.isChecked()
         # Custom snapshot
         c = self.custom
         c.input_file = self.o_file.text().strip()
         c.input_type = int(self.o_type.currentData() or 105)
+        c.dim = int(self.o_dim.currentData() or 3)
         c.mpc_unit = self.o_unit.value()
         c.periodic = self.o_periodic.isChecked()
+        c.alpha_shape = self.o_alpha.value()
         try:
             c.box = [float(t) for t in self.o_box.text().replace(",", " ").split()]
         except ValueError:
@@ -1478,6 +1714,8 @@ class MainWindow(QMainWindow):
         c.partition = self.o_part.value()
         c.max_concurrent = self.o_conc.value()
         c.scratch_dir = self.o_scratch.text().strip()
+        c.parallel_triangulation = self.o_pt.isChecked()
+        c.precision = self.o_prec.currentData() or "single"
         # Plots
         pl.sets = _checked(self.fig_list)
         pl.method = self.pl_method.currentData() or "auto"
@@ -1592,6 +1830,8 @@ class MainWindow(QMainWindow):
     def _root_changed(self):
         self.spec.data_root = self.root_edit.text().strip()
         self._fill_sims()
+        if self.explore.outputs:            # Explore lists this root's outputs: follow it (2026-10-05)
+            self.explore.refresh_outputs()
         self._changed()
 
     def _sim_changed(self, _text=""):
@@ -1669,8 +1909,9 @@ class MainWindow(QMainWindow):
         # ---- Grids tab
         s = self.spec
         ps = s.estimator == "ps"
-        for w in (self.deposit_combo, self.nsub_spin, self.ps_group, self.slice_group, self.prefix_edit):
+        for w in (self.nsub_spin, self.ps_group, self.slice_group, self.prefix_edit):
             w.setEnabled(ps)
+        self._deposit_texts(self.deposit_combo, ps)       # both estimators: standard DTFE's exact cell average
         for cb in self.field_checks.values():
             cb.setEnabled(ps)
         self.fields_note.setText("" if ps else "Standard DTFE computes a fixed set of fields.")
@@ -1678,20 +1919,52 @@ class MainWindow(QMainWindow):
         self.cu_check.setEnabled(ps and s.caustics)
         self.vg_check.setEnabled(ps and bool(s.slice_plane))
         self.nsub_spin.setEnabled(ps and s.deposit == "sampled")
-        gpu_ok = rs.gpu_built(s.estimator)
-        self.gpu_check.setText(P.label("gpu") + ("" if gpu_ok else " (this build has no GPU support)"))
+        gpu_ok = rs.gpu_built(s.estimator, s.precision)
+        self.gpu_check.setText(P.label("gpu" if ps else "gpu_dtfe") + ("" if gpu_ok else " (this build has no GPU support)"))
+        self.gpu_check.setToolTip(P.tooltip("gpu") if ps else P.tooltip("gpu_dtfe", "DTFE"))
+        tbb_note = "" if rs.tbb_built(s.precision) else " (this build has no TBB: ignored)"
+        self.pt_check.setText(P.label("parallel_triangulation") + tbb_note)
+        self.pt_check.setEnabled(ps)
+        for combo in (self.prec_combo, self.o_prec, self.p_prec):     # the double pair's state, in words
+            i = combo.findData("double")
+            built = rs.binary_built("ps", "double") and rs.binary_built("dtfe", "double")
+            combo.setItemText(i, rs.PRECISION_TEXT["double"] + ("" if built else " (not built: Setup builds the pair)"))
         # ---- Custom snapshot tab
         c = self.custom
         cps = c.estimator == "ps"
-        for w in (self.o_lag_box, self.o_vm, self.o_vw, self.o_ca, self.o_deposit):
+        flat = c.dim == 2                   # the 2D programs: CPU only, sequential insertion
+        for w in (self.o_lag_box, self.o_vm, self.o_vw, self.o_ca, self.o_pt):
             w.setEnabled(cps)
+        self._deposit_texts(self.o_deposit, cps)
         for cb in self.o_fields.values():
             cb.setEnabled(cps)
+        self.o_grid_cells.setText(("²" if flat else "³") + " cells    sub-samples per axis")
+        self.o_part.setSuffix(("²" if flat else "³") + " partitions")
+        self.o_box.setToolTip(f"Optional: xlo xhi ylo yhi{'' if flat else ' zlo zhi'} in the file's units (all >= 0)")
         self.o_lag_path.setEnabled(cps and c.lagrangian == "separate")
         self.o_nsub.setEnabled(cps and c.deposit == "sampled")
         self.o_scalar.setEnabled(c.input_type == 105)
+        self.o_pt.setText(P.label("parallel_triangulation") + (" (3D only)" if flat else "" if rs.tbb_built(c.precision)
+                                                               else " (this build has no TBB: ignored)"))
+        self.o_pt.setEnabled(cps and not flat)
+        self.o_snap_form.setRowVisible(self.o_alpha, cps and not c.periodic)
+        self.o_gpu.setEnabled(not flat)
+        self.o_gpu.setText(P.label("gpu" if cps else "gpu_dtfe") + (" (the 2D programs run on the CPU)" if flat else
+                                                                     "" if rs.gpu_built(c.estimator, c.precision)
+                                                                     else " (this build has no GPU support)"))
+        self.o_gpu.setToolTip(P.tooltip("gpu") if cps else P.tooltip("gpu_dtfe", "DTFE"))
         # ---- Pipeline tab
-        self.p_render.setEnabled(not self.pipe.plan_only)
+        p = self.pipe
+        self.p_render.setEnabled(not p.plan_only)
+        self.p_render_box.setEnabled(p.render and not p.plan_only)
+        self.p_rproject.setEnabled(p.planes > 1)              # one plane: the plane itself
+        self.p_thick.setEnabled(p.planes > 1)
+        self.p_super_note.setText(f"= {p.supersample ** 2} sample point{'s' if p.supersample > 1 else ''} per pixel")
+        self.p_nsub.setEnabled(p.deposit == "sampled")
+        self.p_cu.setEnabled(p.caustics)
+        self.p_gpu.setText(P.label("gpu") + ("" if rs.gpu_built("ps", p.precision) else " (this build has no GPU support)"))
+        self.p_pt.setText(P.label("parallel_triangulation")
+                          + ("" if rs.tbb_built(p.precision) else " (this build has no TBB: ignored)"))
         # ---- shared data panel
         for w in (self.snap_list, self.all_btn, self.none_btn, self.mark_btn):
             w.setEnabled(tab not in (PIPELINE, DATA, OWN, EXPLORE))
@@ -1729,10 +2002,12 @@ class MainWindow(QMainWindow):
         self.estimate.setText(self._estimate(tab, steps))
         self.run_btn.setEnabled(self.proc is None and not blocked and self._mcheck is None)
         self.queue_btn.setEnabled(not blocked)
-        checkable = (tab == GRIDS and self.spec.estimator == "ps" and bool(self.spec.snapshots)
-                     and bool(self.spec.sim)) or (tab == PIPELINE and bool(self.pipe.sims))
-        mem_ok = self._mcheck is not None or (checkable and self.proc is None and Path(job.data_root).is_dir())
-        self.mem_btn.setVisible(tab in (GRIDS, PIPELINE))
+        checkable = ((tab == GRIDS and self.spec.estimator == "ps" and bool(self.spec.snapshots)
+                      and bool(self.spec.sim) and Path(job.data_root).is_dir())
+                     or (tab == PIPELINE and bool(self.pipe.sims) and Path(job.data_root).is_dir())
+                     or (tab == OWN and self._custom_checkable()))
+        mem_ok = self._mcheck is not None or (checkable and self.proc is None)
+        self.mem_btn.setVisible(tab in (GRIDS, PIPELINE, OWN))
         self.mem_btn.setText("Cancel check" if self._mcheck is not None else "Check memory")
         self.mem_btn.setEnabled(mem_ok)
         self.stop_btn.setEnabled(self.proc is not None or self._queue_running)
@@ -1757,7 +2032,7 @@ class MainWindow(QMainWindow):
         if tab == GRIDS:
             s = self.spec
             n = len(s.snapshots)
-            est = f"full-resolution grids ≈ {s.grid_gb():.1f} GB"
+            est = f"full-resolution grids ≈ {s.grid_gb():.1f} GB" + ("  (float64)" if s.precision == "double" else "")
             if s.estimator == "ps" and s.slice_plane:
                 est += f"   ·   slice {rs.plane_points(s.slice_plane)/1e6:.1f}M points"
             t = R.time_estimate(self._runs(), sim=s.sim, grid=s.grid, estimator=s.estimator,
@@ -1770,8 +2045,9 @@ class MainWindow(QMainWindow):
                     + ("   ·   grids on scratch disk" if s.scratch_dir else ""))
         if tab == OWN:
             c = self.custom
-            gb = rs.grids_gb(c.grid, c.fields if c.estimator == "ps" else rs.DTFE_FIELDS)
-            return f"grids ≈ {gb:.1f} GB   ·   outputs: {c.output_root()}.*"
+            gb = rs.grids_gb(c.grid, c.fields if c.estimator == "ps" else rs.DTFE_FIELDS, c.precision)
+            return (f"grids ≈ {gb:.1f} GB" + ("  (float64)" if c.precision == "double" else "")
+                    + f"   ·   outputs: {c.output_root()}.*")
         if tab == PIPELINE:
             p = self.pipe
             parts = []
@@ -1786,7 +2062,10 @@ class MainWindow(QMainWindow):
                         parts.append("adaptive: " + ", ".join(
                             f"{' '.join(f'{n:03d}' for n in snaps)} at {nu}²" for nu, snaps in groups.items()))
             else:
-                parts.append(f"plane {p.nu}² = {p.nu**2/1e6:.1f}M points")
+                shape = (f"plane {p.nu}²" + (f" × {p.planes} planes" if p.planes > 1 else "")
+                         + (f" × {p.supersample}×{p.supersample} sub-samples" if p.supersample > 1 else "")
+                         + (" in a window" if p.window.strip() else ""))
+                parts.append(f"{shape} = {p.plane_points() / 1e6:.1f}M points")
             return "   ·   ".join(parts)
         return f"{len(steps)} script call{'s' if len(steps) != 1 else ''}" if steps else ""
 
@@ -1806,6 +2085,8 @@ class MainWindow(QMainWindow):
         """Run one job's steps: from the Run button (qjob None) or as the queue's next job."""
         self._steps, self._step_i, self._results = steps, -1, []
         self._job_text = ""
+        self._close_tee()                   # a handle left by a step that never finished must not take this job's output
+        G.drop_cubes()                      # Explore's cubes are this process's memory: the auto-tuner budgets from what is free
         self.banner.hide()
         if isinstance(spec, rs.CustomSpec):
             self._register_custom_output(spec)
@@ -1833,6 +2114,12 @@ class MainWindow(QMainWindow):
             self._finish_job()
             return
         st, n = self._steps[self._step_i], len(self._steps)
+        if st.after and any(lbl == st.after and code != 0 for lbl, code in self._results):
+            # a merge after a failed download: nothing to merge safely (half a tree set would pass)
+            self.log.appendPlainText(f"\n!! {st.label}: skipped, '{st.after}' failed; nothing merged (run the job again)")
+            self._results.append((st.label, 1))
+            self._next_step()
+            return
         self.status.setText(f"Step {self._step_i + 1}/{n}: {st.label}" if n > 1 else f"Running {st.label}")
         self.log.appendPlainText(("\n" if self._step_i else "") + "$ " + st.line() + "\n")
         if st.tee:                          # '... 2>&1 | tee <file>': the run log beside the outputs
@@ -1862,7 +2149,11 @@ class MainWindow(QMainWindow):
         raw = bytes(self.proc.readAllStandardOutput()).decode(errors="replace")
         text = rs.strip_ansi(raw)
         if self._tee is not None:
-            self._tee.write(text)
+            try:
+                self._tee.write(text)
+            except OSError as e:            # the data disk vanished or is full: the run goes on without its copy
+                self.log.appendPlainText(f"!! the run log cannot be written any more ({e}); continuing without it")
+                self._close_tee()
         self._job_text = (self._job_text + text)[-400_000:]
         self._buffer += text.replace("\r", "\n")
         *lines, self._buffer = self._buffer.split("\n")
@@ -1917,6 +2208,7 @@ class MainWindow(QMainWindow):
             st = self._steps[self._step_i]
             self.log.appendPlainText(f"!! could not start {st.argv[0]}: {self.proc.errorString()}")
             self.proc = None
+            self._close_tee()               # 'finished' never comes: the run log must not stay open into the next job
             self._results.append((st.label, 127))
             QTimer.singleShot(0, self._next_step)
 
@@ -1928,14 +2220,20 @@ class MainWindow(QMainWindow):
         self._buffer = ""
         st = self._steps[self._step_i]
         code = code if status == QProcess.NormalExit else -1
-        if self._tee is not None:
-            self._tee.close()
-            self._tee = None
+        self._close_tee()                   # never raises: the job must reach _next_step even when the disk is gone
         self._results.append((st.label, code))
         if code != 0 and not self._stopping:
             self.log.appendPlainText(f"!! {st.label}: exit {code}")
         self.proc = None
         self._next_step()
+
+    def _close_tee(self):
+        tee, self._tee = self._tee, None
+        if tee is not None:
+            try:
+                tee.close()
+            except OSError as e:
+                self.log.appendPlainText(f"!! the run log could not be closed ({e})")
 
     def _finish_job(self):
         n = len(self._steps)
@@ -1963,7 +2261,7 @@ class MainWindow(QMainWindow):
         self._runs_scanned = 0.0            # new run logs: rescan for the estimates and the Runs tab
         if self.results.currentWidget() is self.runs:
             self.runs.reload()
-        if self._job_tab in (GRIDS, OWN) and self.explore.outputs:
+        if self._job_tab in (GRIDS, OWN, PIPELINE) and self.explore.outputs:    # a pipeline writes grids too
             self.explore.refresh_outputs()
         if isinstance(self._job_spec, rs.CustomSpec) and ok == n:
             self._register_custom_output(self._job_spec)     # again: a generated input exists only now
@@ -2032,6 +2330,11 @@ class MainWindow(QMainWindow):
             proc = self.proc
             self.stop_run()
             proc.waitForFinished(8000)
+        if self._mcheck is not None:        # a running memory check: cancel its process tree, do not orphan it
+            cproc = self._mcheck.get("proc")
+            self._cancel_check()
+            if cproc is not None:
+                cproc.waitForFinished(2000)
         self.explore.shutdown()
         event.accept()
 
@@ -2110,6 +2413,8 @@ class MainWindow(QMainWindow):
         for attr, text, keys, what in (("open_output_action", "Open Output…", "Ctrl+O", "open"),
                                        ("find_outputs_action", "Look for Outputs Again", "", "find"),
                                        ("save_image_action", "Save Image…", "Ctrl+S", "save"),
+                                       ("zoom_out_action", "Zoom Out", "Ctrl+Shift+O", "zoom"),
+                                       ("grid_action", "Figure Grid", "Ctrl+G", "grid"),
                                        ("server_action", "Start Query Server", "", "server")):
             if attr == "server_action":
                 explore_menu.addSeparator()
@@ -2251,8 +2556,12 @@ class MainWindow(QMainWindow):
         x = self.explore
         if what in ("open", "find") and self.tabs.currentIndex() != EXPLORE:
             self.tabs.setCurrentIndex(EXPLORE)
+        if what == "grid" and self.tabs.currentIndex() != EXPLORE:
+            self.tabs.setCurrentIndex(EXPLORE)
         {"open": lambda: x._open_other(), "find": lambda: x.refresh_outputs(),
-         "save": lambda: x._save_image(), "server": lambda: x._server_button()}[what]()
+         "save": lambda: x._save_image(), "zoom": lambda: x.zoom_out(),
+         "grid": lambda: x.grid_toggle.setChecked(not x.grid_toggle.isChecked()),
+         "server": lambda: x._server_button()}[what]()
 
     def _sync_explore_actions(self, tab: int | None = None):
         """Save Image needs a map on screen; the server can be started from Explore and stopped
@@ -2262,6 +2571,9 @@ class MainWindow(QMainWindow):
             return
         on = (self.tabs.currentIndex() if tab is None else tab) == EXPLORE
         self.save_image_action.setEnabled(on and x.can_save())
+        self.zoom_out_action.setEnabled(on and x.is_zoomed())
+        self.grid_action.setEnabled(x.current is not None)
+        self.grid_action.setText("Back to the Map" if x._grid_shown else "Figure Grid")
         phase = x.server_phase()
         self.server_action.setText({"starting": "Cancel Server Start",
                                     "running": "Stop Query Server"}.get(phase, "Start Query Server"))
@@ -2275,7 +2587,8 @@ class MainWindow(QMainWindow):
         self.queue_action.setEnabled(panel and self.queue_btn.isEnabled())
         self.stop_action.setEnabled(self.stop_btn.isEnabled())
         self.mem_action.setText("Cancel Memory Check" if self._mcheck is not None else "Check Memory")
-        self.mem_action.setEnabled(self._mcheck is not None or (tab in (GRIDS, PIPELINE) and self.mem_btn.isEnabled()))
+        self.mem_action.setEnabled(self._mcheck is not None
+                                   or (tab in (GRIDS, PIPELINE, OWN) and self.mem_btn.isEnabled()))
         self._sync_explore_actions(tab)
         self._sync_figures_actions(tab)
         self._sync_runs_actions(tab)
@@ -2356,7 +2669,7 @@ class MainWindow(QMainWindow):
     def _banner_action(self, action: str):
         tab = self._job_tab
         if action == "check_memory":
-            self.tabs.setCurrentIndex(tab if tab in (GRIDS, PIPELINE) else GRIDS)
+            self.tabs.setCurrentIndex(tab if tab in (GRIDS, PIPELINE, OWN) else GRIDS)
             if self.mem_btn.isEnabled():
                 self.check_memory()
         elif action == "scratch":
@@ -2447,7 +2760,7 @@ class MainWindow(QMainWindow):
 
     def start_demo(self):
         """The demo (runspec.demo_spec): generate, run, then open it in Explore."""
-        demo = rs.demo_spec(gpu=rs.gpu_built("ps"))
+        demo = rs.demo_spec()               # (the CPU deposit: faster than the GPU at 32^3 particles)
         self.custom = demo
         self._load_into_widgets()
         self.tabs.setCurrentIndex(OWN)
@@ -2463,8 +2776,9 @@ class MainWindow(QMainWindow):
 
     # ================================================================ memory check
     def check_memory(self):
-        """Ask the binary's own auto-tuner (run_ps_dtfe.sh AUTO_TUNE_REPORT=1) what the current
-        Grids or Pipeline settings need per snapshot. For the pipeline, a snapshot over budget is
+        """Ask the binary's own auto-tuner (run_ps_dtfe.sh AUTO_TUNE_REPORT=1, or the binary's
+        --auto-tune-report for a custom snapshot) what the current Grids, Custom snapshot or Pipeline
+        settings need per snapshot. For the pipeline, a snapshot over budget is
         checked again at half the plane size, down to 1024^2 -- which is both the suggestion shown
         and, with 'Adaptive', the plan the pipeline then runs."""
         if self._mcheck is not None:            # the button reads "Cancel check"
@@ -2477,6 +2791,11 @@ class MainWindow(QMainWindow):
                 return
             key = self.spec.memory_key()
             passes = [(self.spec.sim, None, sorted(self.spec.snapshots))]
+        elif tab == OWN:
+            if not self._custom_checkable():
+                return
+            key = self.custom.memory_key()
+            passes = [(Path(self.custom.input_file).name, None, [0])]    # the bare report line is snapshot 0
         elif tab == PIPELINE:
             key = self.pipe.memory_key()
             passes = []
@@ -2492,10 +2811,12 @@ class MainWindow(QMainWindow):
             return
         # the settings as they are NOW: a change during the check must not mix into its later passes
         spec = (rs.RunSpec.from_dict(self.spec.to_dict()) if tab == GRIDS
+                else rs.CustomSpec.from_dict(self.custom.to_dict()) if tab == OWN
                 else rs.PipelineSpec.from_dict(self.pipe.to_dict()))
         self._mcheck = {"tab": tab, "key": key, "passes": passes, "done": 0, "spec": spec,
                         "first": {sim: list(snaps) for sim, _, snaps in passes}}
         self.mem_results.setdefault(key, {})
+        G.drop_cubes()                          # the report measures free memory: not Explore's cached cubes
         self._next_check()
         self.refresh()
 
@@ -2507,7 +2828,7 @@ class MainWindow(QMainWindow):
             self._finish_check()
             return
         sim, nu, snaps = mc["passes"].pop(0)
-        step = mc["spec"].check_step() if mc["tab"] == GRIDS else mc["spec"].check_step(sim, snaps, nu)
+        step = mc["spec"].check_step() if mc["tab"] in (GRIDS, OWN) else mc["spec"].check_step(sim, snaps, nu)
         mc["current"] = (sim, nu, snaps)
         mc["buf"] = ""
         self.status.setText(f"Checking memory: {sim}" + (f" at {nu}²" if nu else "")
@@ -2522,8 +2843,20 @@ class MainWindow(QMainWindow):
         proc.readyReadStandardOutput.connect(
             lambda: mc.__setitem__("buf", mc["buf"] + bytes(proc.readAllStandardOutput()).decode(errors="replace")))
         proc.finished.connect(lambda code, _status: self._check_pass_done(proc, code))
+        proc.errorOccurred.connect(lambda err: self._check_pass_error(proc, err, step.argv[0]))
         mc["proc"] = proc
         proc.start(step.argv[0], step.argv[1:])
+
+    def _check_pass_error(self, proc, err, program: str):
+        """The check's process could not start (no 'finished' follows then): before 2026-10-05 _mcheck stayed
+        set forever and Run stayed disabled until 'Cancel check'."""
+        mc = self._mcheck
+        if mc is None or mc.get("proc") is not proc or err != QProcess.FailedToStart:
+            return
+        self._mcheck = None
+        rs.forget_processes()
+        self.status.setText(f"Memory check failed: could not start {Path(program).name}")
+        self.refresh()
 
     def _check_pass_done(self, proc, code):
         mc = self._mcheck
@@ -2541,6 +2874,8 @@ class MainWindow(QMainWindow):
             results[(sim, n, nu)] = r
             if r.get("over_budget"):
                 over.append(n)
+        if code != 0 or not any(n in reports for n in snaps):
+            mc["failed"] = mc.get("failed", 0) + 1  # a crashed pass, or one that reported nothing, is not "fits"
         mc["done"] += 1
         # pipeline: what does not fit is tried again at half the plane size
         if nu and over and nu // 2 >= rs.ADAPTIVE_MIN_NU:
@@ -2549,7 +2884,7 @@ class MainWindow(QMainWindow):
 
     def _finish_check(self):
         mc, self._mcheck = self._mcheck, None
-        rs._JOBS_CACHE = (-1e9, [])     # the check's own PS-DTFE must not read as "already running"
+        rs.forget_processes()           # the check's own PS-DTFE must not read as "already running"
         results = self.mem_results.get(mc["key"], {})
         if mc["tab"] == PIPELINE:
             plan = {}
@@ -2564,8 +2899,10 @@ class MainWindow(QMainWindow):
             self._save()
         checked = [r for k, r in results.items()]
         over = sum(1 for r in checked if r.get("over_budget"))
+        failed = mc.get("failed", 0)
         self.status.setText(f"Memory check done: {len(checked)} prediction{'s' if len(checked) != 1 else ''}"
-                            + (f", {over} over budget" if over else ", all within budget"))
+                            + (f", {over} over budget" if over else ", all within budget" if checked else "")
+                            + (f"; {failed} pass{'es' if failed != 1 else ''} failed (see the log)" if failed else ""))
         self.refresh()
 
     def _cancel_check(self):
@@ -2579,6 +2916,12 @@ class MainWindow(QMainWindow):
                     pass
         self.status.setText("Memory check cancelled")
         self.refresh()
+
+    def _custom_checkable(self) -> bool:
+        """The Custom tab's memory check needs the phase-space binary and an existing snapshot file."""
+        c = self.custom
+        return (c.estimator == "ps" and bool(c.input_file) and Path(c.input_file).expanduser().is_file()
+                and c.binary().is_file())
 
     def _memory_lines(self, tab: int) -> list[tuple[str, str]]:
         """What the memory checks found for the CURRENT settings, as check-list lines."""
@@ -2607,6 +2950,23 @@ class MainWindow(QMainWindow):
             elif unchecked and (s.slice_plane or s.grid >= 512):
                 out.append(("info", "memory not checked for " + " ".join(f"{n:03d}" for n in unchecked)
                                     + " yet ('Check memory')"))
+        elif tab == OWN and self.custom.estimator == "ps" and self.custom.input_file:
+            c = self.custom
+            r = self.mem_results.get(c.memory_key(), {}).get((Path(c.input_file).name, 0, None))
+            if r is None:
+                if c.grid >= 512:
+                    out.append(("info", "memory not checked yet ('Check memory')"))
+            elif "predicted_gb" not in r:
+                out.append(("info", "the memory check gave no prediction for this run"))
+            elif r.get("over_budget"):
+                out.append(("warning", f"this run needs ~{r['predicted_gb']:.0f} GB, over the {r['budget_gb']:.0f} GB "
+                                       "budget: it will swap and slow the machine (a smaller grid, fewer fields "
+                                       "or a scratch directory lower it)"))
+            else:
+                split = (f"{r['partition']}{'²' if c.dim == 2 else '³'} partitions, {r['mc']} at a time"
+                         if r.get("partition", 1) > 1 else "one tessellation")
+                out.append(("ok", f"memory: fits (~{r['predicted_gb']:.0f} of the {r['budget_gb']:.0f} GB budget; "
+                                  f"the auto-tuner plans {split})"))
         elif tab == PIPELINE:
             p = self.pipe
             key = p.memory_key()
@@ -2875,6 +3235,9 @@ def smoke_report(w: MainWindow) -> str:
         f"TNG API key available: {rs.api_key_available()}",
         f"data root: {root} ({'found' if Path(root).is_dir() else 'NOT found'}), "
         f"{w.sim_combo.count()} simulations",
+        f"PS-DTFE: {'built' if (rs.REPO_ROOT / 'PS-DTFE').is_file() else 'NOT built'}, "
+        f"GPU {'yes' if rs.gpu_built('ps') else 'no'}, parallel triangulation (TBB) {'yes' if rs.tbb_built() else 'no'}; "
+        f"DTFE: {'built' if (rs.REPO_ROOT / 'DTFE').is_file() else 'NOT built'}, GPU {'yes' if rs.gpu_built('dtfe') else 'no'}",
         f"icon: {os.environ.get('DTFE_GUI_ICON', '(none)')}",
     ])
 

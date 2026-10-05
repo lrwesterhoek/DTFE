@@ -10,7 +10,7 @@
 <tr><td>per-stream records</td><td class="yes">density, velocity, velocity gradient, Lagrangian position q(x), particle IDs, any per-particle scalar</td><td class="yes">any per-particle value, but only summed over streams</td></tr>
 <tr><td>mass-conserving cell averages on a grid</td><td class="yes">sampled (nSub³), linear-profile, and exact (analytic tetrahedron–cell clipping)</td><td class="no">no: grid values are point samples at cell centres</td></tr>
 <tr><td>caustics and cosmic-web labels</td><td class="yes">fold caustics, collapse multiplicity, A3/A4/D4 indicators, hidden-streams flag, T-web and V-web</td><td class="no">no</td></tr>
-<tr><td>GPU</td><td class="yes">Metal: every grid deposit, including the exact one</td><td class="no">no</td></tr>
+<tr><td>GPU</td><td class="yes">Metal: every grid deposit of both estimators, including the exact one</td><td class="no">no</td></tr>
 <tr><td>boxes larger than memory</td><td class="yes">auto-tuned partitions, out-of-core scratch files, tessellation cache, composite point server with LRU residency</td><td class="no">composite estimator, but everything stays in RAM</td></tr>
 <tr><td>periodic boxes</td><td class="yes">yes</td><td class="yes">yes (padding fraction, no sufficiency check)</td></tr>
 <tr><td>interactive queries</td><td class="yes"><code>--serve</code> + <code>dtfelib.Estimator</code> (Python), <code>from_arrays</code> for in-memory data</td><td class="yes">native: the estimator is a Julia object you call</td></tr>

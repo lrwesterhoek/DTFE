@@ -77,6 +77,16 @@ void psServeCompositeAddPartition(int index, User_options &partOptions,
                                   double const *ownLo, double const *ownHi);
 [[noreturn]] void psServeCompositeRun(User_options &userOptions);
 
+// --ps-window in a batch partition run: 1 when partition 'partOpts' can reach the window of
+// 'mainOpts' by its occupancy map (beside its cached tessellation), 0 when it cannot (skip it),
+// -1 when no usable map exists (process it). The map writer, which needs the tessellation type,
+// psWriteOccupancyIfMissing(DT&, User_options&), is declared with the workers (triangulation.cpp).
+int psOccupancyTouchesWindow(User_options const &partOpts, User_options const &mainOpts);
+
+// Is this run's / partition's tessellation in '--tessellation-cache' (its header matches the full
+// descriptor)? The batch partition loop then skips the particle selection.
+bool psTessellationCached(User_options const &opts);
+
 // Auto-tune: the mean number of streams at a random point of the box -- sum|V_Euler| over
 // sum V_Lagrange of the Lagrangian tessellation -- estimated from up to 256 random Lagrangian
 // patches, before any triangulation of the run exists. Needs the particles' Lagrangian

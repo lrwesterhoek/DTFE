@@ -4,8 +4,9 @@
 #   ./install.sh              install any missing dependencies, wipe the build, and rebuild
 #                             BOTH binaries with the best backend for this machine:
 #                               macOS (Apple Silicon)      -> METAL=1  (GPU deposit)
+#                               Linux with nvcc / hipcc    -> CUDA=1 / HIP=1 (GPU deposit, unvalidated port)
 #                               anything else              -> CPU-only
-#   ./install.sh --cpu        force a CPU-only build (skip the Metal backend detection)
+#   ./install.sh --cpu        force a CPU-only build (skip the GPU backend detection)
 #   ./install.sh --no-deps    skip the dependency-installation step (just clean + rebuild)
 #   ./install.sh --docker     build the containerized LINUX image instead (docker build .).
 #                             NOTE: a container is a Linux VM even on a Mac -- it can NEVER
@@ -15,7 +16,8 @@
 #   ./install.sh --no-python  skip step 4 (the editable 'pip install -e python' of dtfelib)
 #   ./install.sh --no-gui     skip step 5 (the GUI's PySide6 environment; e.g. on a cluster)
 #   ./install.sh --no-app     set up the GUI, but no "DTFE Launcher" app / Desktop shortcut
-#   ./install.sh --double     build the double-precision binaries (DOUBLE=1; CPU-only)
+#   ./install.sh --double     ALSO build the double-precision pair (DTFE-double / PS-DTFE-double, DOUBLE=1,
+#                             same GPU backend): every position and field in double, ~2x the memory
 #
 # The GUI (scripts/gui.sh) gets its own virtual environment, ~/.venvs/dtfe-gui (DTFE_GUI_VENV
 # overrides), made with --system-site-packages so it sees this Python's numpy/h5py, holding
@@ -56,7 +58,7 @@ while [ $# -gt 0 ]; do
         --no-python) DO_PYTHON=0 ;;
         --no-gui)  DO_GUI=0 ;;
         --no-app)  DO_APP=0 ;;
-        --double)  PREC_ARG="DOUBLE=1"; FORCE_CPU=1 ;;   # the GPU kernels are single precision
+        --double)  PREC_ARG="DOUBLE=1" ;;   # the double pair is built in addition, with the same backend
         --jobs)    shift; JOBS="${1:?--jobs needs a number}" ;;
         -h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) fail "unknown option '$1' (see ./install.sh --help)" ;;
@@ -90,6 +92,13 @@ if [ -f "$TBB_INC/tbb/task_arena.h" ] || [ -f "$TBB_INC/oneapi/tbb/task_arena.h"
 else
     warn "tbb not found: PS-DTFE triangulates on one core (optional: brew install tbb / apt-get install libtbb-dev)"
 fi
+# optional: libdeflate compresses/decompresses the tessellation cache faster than zlib (Makefile LIBDEFLATE=auto)
+DEFL_INC="$([ "$UNAME_S" = "Darwin" ] && echo "$(brew --prefix libdeflate 2>/dev/null)/include" || echo /usr/include)"
+if [ -f "$DEFL_INC/libdeflate.h" ]; then
+    info "libdeflate found: the tessellation cache uses it (LIBDEFLATE=0 falls back to zlib)"
+else
+    warn "libdeflate not found: the tessellation cache uses zlib (optional: brew install libdeflate / apt-get install libdeflate-dev)"
+fi
 
 # ---------------------------------------------------------------- 2/6 pick the backend
 GPU_ARG=""
@@ -122,17 +131,33 @@ if [ "$FORCE_CPU" -eq 0 ]; then
                 BACKEND="Metal GPU (--gpu / --ps-gpu at runtime, automatic CPU fallback)"
             fi
         fi
+    elif [ "$UNAME_S" = "Linux" ]; then
+        # NVIDIA: the CUDA toolkit's nvcc (PATH or /usr/local/cuda); AMD: ROCm's hipcc (PATH or
+        # /opt/rocm). The kernels are ports of the Metal ones: compiled and CPU-fallback-tested on
+        # Linux, not yet validated on NVIDIA/AMD hardware -- run tests/dtfe_metal_check.sh and the
+        # PS parity suites on the first GPU machine (metal/README.md, "CUDA / HIP").
+        if command -v nvcc >/dev/null 2>&1 || [ -x /usr/local/cuda/bin/nvcc ]; then
+            GPU_ARG="CUDA=1"
+            BACKEND="CUDA GPU (--gpu / --ps-gpu at runtime, automatic CPU fallback; unvalidated port, see metal/README.md)"
+        elif command -v hipcc >/dev/null 2>&1 || [ -x /opt/rocm/bin/hipcc ]; then
+            GPU_ARG="HIP=1"
+            BACKEND="HIP GPU (--gpu / --ps-gpu at runtime, automatic CPU fallback; unvalidated port, see metal/README.md -- set GPU_ARCH for your card)"
+        fi
     fi
 fi
-[ -n "$PREC_ARG" ] && BACKEND="${BACKEND}, double precision"
+[ -n "$PREC_ARG" ] && BACKEND="${BACKEND}; plus the double-precision pair"
 info "step 2/6: build backend -> ${BACKEND}"
 
 # ---------------------------------------------------------------- 3/6 clean rebuild
 info "step 3/6: make clean + rebuild (jobs: ${JOBS})"
 make clean >/dev/null
 # shellcheck disable=SC2086  # GPU_ARG/PREC_ARG are deliberately word-split ("" or METAL=1 etc.)
-make DTFE    $GPU_ARG $PREC_ARG -j"$JOBS"
-make PS-DTFE $GPU_ARG $PREC_ARG -j"$JOBS"
+make DTFE    $GPU_ARG -j"$JOBS"
+make PS-DTFE $GPU_ARG -j"$JOBS"
+if [ -n "$PREC_ARG" ]; then        # the double pair: its own object directories and binary names
+    make DTFE    $GPU_ARG $PREC_ARG -j"$JOBS"
+    make PS-DTFE $GPU_ARG $PREC_ARG -j"$JOBS"
+fi
 
 # ---------------------------------------------------------------- 4/6 python package
 if [ "$DO_PYTHON" -eq 1 ]; then
@@ -201,13 +226,17 @@ fi
 
 # ---------------------------------------------------------------- 6/6 report + verify hints
 good "step 6/6: done -- ./DTFE and ./PS-DTFE rebuilt (${BACKEND}); GUI: ${GUI_STATE}"
-if [ -n "$GPU_ARG$PREC_ARG" ]; then
-    info "build mode stamped in o/.build_mode and o_ps/.build_mode ($GPU_ARG$PREC_ARG);"
+if [ -n "$GPU_ARG" ]; then
+    info "build mode stamped in o/.build_mode and o_ps/.build_mode ($GPU_ARG);"
     info "incremental rebuilds must keep it: make PS-DTFE \$(cat o_ps/.build_mode)"
+fi
+if [ -n "$PREC_ARG" ]; then
+    info "double-precision pair: ./DTFE-double and ./PS-DTFE-double (objects in o_d/ and o_ps_d/);"
+    info "the run scripts pick it with DTFE_PRECISION=double, the launcher with its precision setting"
 fi
 info "verify with the fast checks:"
 info "    tests/ps_smoke_test.sh --no-build"
 info "    tests/ps_point_eval_check.sh --no-build"
-[ "$UNAME_S" = "Darwin" ] && [ -n "$GPU_ARG" ] && info "    tests/dtfe_metal_check.sh   (CPU vs GPU parity)"
+[ -n "$GPU_ARG" ] && info "    tests/dtfe_metal_check.sh   (CPU vs GPU parity)"
 case "$GUI_STATE" in ready*) info "    ${GUI_PY} tests/py_gui_app_test.py   (the GUI, end to end)" ;; esac
 exit 0

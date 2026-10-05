@@ -405,7 +405,33 @@ inline TetDeformation analyzeTet(double const Ax[NO_DIM][NO_DIM],
     if ( not nullVector3( M, ev[best], td.vcrit ) ) return td;
     td.valid = true;
 #else
-    td.bits = classifyTet( Ax, Lag );   // 2D: no critical direction, only the bits
+    // 2D: the characteristic quadratic; a complex pair (a rotation) has no axis to fold along
+    double M[2][2];
+    if ( not deformationTensor( Ax, Lag, M ) ) return td;
+    double const tr  = M[0][0] + M[1][1];
+    double const det = M[0][0]*M[1][1] - M[0][1]*M[1][0];
+    double const d2  = tr*tr - 4.*det;
+    double ev[2] = {0., 0.};
+    int nReal = 0;
+    if ( d2 >= 0. )
+    {
+        double const sq = std::sqrt(d2);
+        ev[0] = 0.5*(tr + sq);
+        ev[1] = 0.5*(tr - sq);
+        nReal = 2;
+    }
+    td.bits = bitsFromSpectrum( ev, nReal );
+    if ( nReal < 2 ) return td;
+    int const best = std::fabs(ev[1]) < std::fabs(ev[0]) ? 1 : 0;
+    td.critical = ev[best];
+    td.spread = std::max( std::fabs(ev[0]), std::fabs(ev[1]) );
+    // the null vector of M - lambda I: perpendicular to its longer row
+    double const A[2][2] = { { M[0][0] - ev[best], M[0][1] }, { M[1][0], M[1][1] - ev[best] } };
+    int const r = ( A[1][0]*A[1][0] + A[1][1]*A[1][1] > A[0][0]*A[0][0] + A[0][1]*A[0][1] ) ? 1 : 0;
+    double const n = std::sqrt( A[r][0]*A[r][0] + A[r][1]*A[r][1] );
+    if ( n > 0. ) { td.vcrit[0] = -A[r][1] / n; td.vcrit[1] = A[r][0] / n; }
+    else          { td.vcrit[0] = 1.; td.vcrit[1] = 0.; }       // M = lambda I: every direction is null
+    td.valid = true;
 #endif
     return td;
 }
@@ -481,6 +507,34 @@ inline bool cuspIndicator(TetDeformation const &self,
     if ( gn <= 0. ) return std::fabs(self.critical) <= 0.02 * self.spread;
     double const along = std::fabs( g[0]*self.vcrit[0] + g[1]*self.vcrit[1] + g[2]*self.vcrit[2] );
     return along <= CUSP_REL_TOL * gn;
+#elif NO_DIM==2
+    /* 2D, the same test: in a 2D Lagrangian map the generic singularities are folds (A2, lines) and
+       cusps (A3, points) -- where the fold line turns tangent to its null direction. The gradient of
+       lambda_c is the 2x2 least-squares fit over the vertex-incident ring, judged against the largest
+       measured slope, as above. */
+    if ( not self.valid or n < 2 ) return false;
+    if ( self.spread <= 0. ) return false;
+    if ( std::fabs(self.critical) > FOLD_BAND * self.spread ) return false;   // not near a fold
+    double a00 = 0., a01 = 0., a11 = 0., b0 = 0., b1 = 0.;
+    for (int k=0; k<n; ++k)
+    {
+        a00 += dq[k][0]*dq[k][0]; a01 += dq[k][0]*dq[k][1]; a11 += dq[k][1]*dq[k][1];
+        b0  += dq[k][0]*dLambda[k]; b1 += dq[k][1]*dLambda[k];
+    }
+    double const detA = a00*a11 - a01*a01;
+    double const sc = std::max( std::fabs(a00), std::max( std::fabs(a01), std::fabs(a11) ) );
+    if ( sc <= 0. or not std::isfinite(detA) or std::fabs(detA) < 1.e-12 * sc*sc )
+        return false;                       // neighbours too collinear to fix a gradient
+    double const g[2] = { ( a11*b0 - a01*b1) / detA, (-a01*b0 + a00*b1) / detA };
+    double slope = 0.;
+    for (int k=0; k<n; ++k)
+    {
+        double const len = std::sqrt( dq[k][0]*dq[k][0] + dq[k][1]*dq[k][1] );
+        if ( len > 0. ) slope = std::max( slope, std::fabs(dLambda[k]) / len );
+    }
+    if ( slope <= 0. ) return std::fabs(self.critical) <= 0.02 * self.spread;
+    double const along = std::fabs( g[0]*self.vcrit[0] + g[1]*self.vcrit[1] );
+    return along <= CUSP_REL_TOL * slope;
 #else
     (void)self; (void)dq; (void)dLambda; (void)n;
     return false;
@@ -605,6 +659,8 @@ inline FoldDerivatives foldDerivatives(TetDeformation const &self,
 inline bool swallowtailIndicator(TetDeformation const &self,
                                  double const dq[][NO_DIM], double const dLambda[], int n)
 {
+    // 2D: never set. A swallowtail (A4) is codimension 3, so in a 2D Lagrangian map it appears only at
+    // isolated MOMENTS (a caustic metamorphosis), not at points of a generic snapshot: nothing to flag.
 #if NO_DIM==3
     if ( not self.valid or self.spread <= 0. ) return false;
     if ( std::fabs(self.critical) > FOLD_BAND * self.spread ) return false;   // not near a fold

@@ -70,35 +70,27 @@ def check_data():
 
 # ---------------------------------------------------------------- compute (phase 1)
 
-def _suggest_limits(per_snapshot):
-    import numpy as np
-    limits = {}
-    for field, values in per_snapshot.items():
-        vals = [v for v in values if v is not None and np.isfinite(v)]
-        if vals:
-            limits[field] = float(np.max(vals))
-    return limits
-
-
 def compute(snaps):
     from dtfelib import pipeline
     from dtfelib import figures as style
 
-    snaps = snaps or list(config.SNAPSHOT_TO_REDSHIFT)
+    # ids as config spells them ('99' -> '099'); an id config does not know is reported, not skipped quietly
+    snaps = [pipeline.canonical_snapshot_id(s) for s in snaps] if snaps else list(config.SNAPSHOT_TO_REDSHIFT)
     print(f"Phase 1 compute: {len(snaps)} snapshot(s)")
     print(f"  sigma = {config.SMOOTHING_SIGMA_CELLS} cells "
           f"({config.SMOOTHING_SIGMA_MPC:.2f} Mpc), footprint = "
           f"{config.FOOTPRINT_SIZE}, criterion = {config.VOID_EIGENVALUE_CRITERION}")
     print(f"  cache: {pipeline.cache_dir()}\n")
 
-    amp = {'delta': [], 'eigenvalue': [], 'potential': []}
+    per_snap = {}                       # this run's amplitudes; the series' limits come from the store
     t_total = time.time()
-    failed = []
+    failed, unknown = [], []
 
     for snap in snaps:
         z = config.get_redshift(snap)
         if z is None:
-            print(f"  !! unknown snapshot {snap}, skipped")
+            print(f"  !! unknown snapshot {snap} (not in config.SNAPSHOT_TO_REDSHIFT), skipped")
+            unknown.append(snap)
             continue
         print(f"snapshot {snap} (z={z:.2f})")
         t0 = time.time()
@@ -112,11 +104,11 @@ def compute(snaps):
             ds = p.delta_slices()
             es = p.eigen_slices()
             ps = p.phi_slices()
-            amp['delta'].append(max(style.robust_vmax(ds[d]) for d in ds))
-            amp['eigenvalue'].append(max(
-                max(style.robust_vmax(es[d][k]) for k in
-                    ('lambda1', 'lambda2', 'lambda3')) for d in es))
-            amp['potential'].append(max(style.robust_vmax(ps[d]) for d in ps))
+            per_snap[snap] = {
+                'delta': max(style.robust_vmax(ds[d]) for d in ds),
+                'eigenvalue': max(max(style.robust_vmax(es[d][k]) for k in ('lambda1', 'lambda2', 'lambda3'))
+                                  for d in es),
+                'potential': max(style.robust_vmax(ps[d]) for d in ps)}
         except Exception as e:
             print(f"    FAILED: {e}")
             failed.append(snap)
@@ -124,12 +116,22 @@ def compute(snaps):
             p.release()
         print(f"    done in {(time.time() - t0) / 60:.1f} min")
 
-    limits = _suggest_limits(amp)
-    pipeline.save_global_limits(limits)
-    print(f"\nGlobal cross-epoch limits written: {limits}")
+    # the global limits = the maximum over EVERY snapshot computed so far (the per-snapshot store), not
+    # over this run's: a subset run used to overwrite the series' limits with its own (2026-10-06)
+    limits, covered, missing = pipeline.record_limits(per_snap)
+    if limits is not None:
+        print(f"\nGlobal cross-epoch limits written: {limits}")
+        print(f"  from {len(covered)} of {len(covered) + len(missing)} canonical snapshots"
+              + (f"; not computed yet: {', '.join(missing)} (run compute for them)" if missing else ""))
+    else:
+        print("\nNothing computed: the global limits are left as they are.")
     print(f"Total: {(time.time() - t_total) / 60:.1f} min")
+    if unknown:
+        print(f"Unknown snapshot ids: {', '.join(unknown)} (config.SNAPSHOT_TO_REDSHIFT knows "
+              f"{', '.join(config.SNAPSHOT_TO_REDSHIFT)})")
     if failed:
         print(f"Failed snapshots: {', '.join(failed)}")
+    if failed or unknown or not per_snap:
         sys.exit(1)
 
 

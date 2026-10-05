@@ -50,6 +50,10 @@
 #       C4  --serve + --tessellation-cache under a memory budget too small for ONE tessellation
 #           (DTFE_MEM_BUDGET_GB): the auto-tuner makes it a composite by itself, and its answers
 #           equal --sample-points with the split it chose.
+#       C5  the automatic resident set counts BYTES (DTFE_SERVE_BUDGET_GB): with room for all 8
+#           tessellations nothing reloads, and a cell index is built only when it fits too (else
+#           the request walks); with room for 3 a request needing 8 evicts and reloads; answers
+#           bit-identical throughout.
 #  L) PER-STREAM LAGRANGIAN POSITIONS AND SCALARS (--pts-lagrangian, --pts-scalar):
 #       L1  every stream satisfies x - q(x) = v/100 (Zel'dovich: v = 100 s, and x, q, v are
 #           interpolated with the same barycentric weights) to float rounding.
@@ -70,6 +74,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT}"
+source "${SCRIPT_DIR}/precision.sh"     # DTFE_TEST_PRECISION=double: the double pair
 PY="${PYTHON:-python3}"
 
 N="${N:-32}"; GRID="${GRID:-64}"; BOX=100.0
@@ -85,12 +90,13 @@ echo "============================================================"
 echo " exact point location + --serve check   N=${N}^3  grid=${GRID}^3"
 echo "============================================================"
 
-if [ "${1:-}" != "--no-build" ]; then
+if [ "${1:-}" != "--no-build" ] && ! precision_double; then
     echo ">> building DTFE + PS-DTFE ..."
     make DTFE    $(cat o/.build_mode 2>/dev/null || true) >/dev/null
     make PS-DTFE $(cat o_ps/.build_mode 2>/dev/null || true) >/dev/null
 fi
-for b in ./DTFE ./PS-DTFE; do [ -x "$b" ] || { echo "FAIL: $b not built"; exit 1; }; done
+precision_require "${DTFE_BIN}" "${PS_BIN}"
+for b in "${DTFE_BIN}" "${PS_BIN}"; do [ -x "$b" ] || { echo "FAIL: $b not built"; exit 1; }; done
 
 echo ">> generating crossed waves (streams 1/3/9/27) + cell-centre and particle point sets ..."
 "${PY}" "${SCRIPT_DIR}/generate_ps_test_data.py" --out "${SNAP}" --n "${N}" --box "${BOX}" \
@@ -127,33 +133,34 @@ run() {  # $1 = binary, $2 = output root, rest = extra args
 }
 
 echo ">> PS-DTFE runs: serial, --partition 2 2 2, 1 thread; standard DTFE runs"
-run ./PS-DTFE "${TMP}/pxs_ps_c"    --sample-points "${CENTRES}"
-run ./PS-DTFE "${TMP}/pxs_ps_p"    --sample-points "${PARTS}"
-run ./PS-DTFE "${TMP}/pxs_ps_c_P2" --sample-points "${CENTRES}" --partition 2 2 2
-run ./PS-DTFE "${TMP}/pxs_ps_p_P2" --sample-points "${PARTS}"   --partition 2 2 2
-DTFE_PTS_THREADS=1 run ./PS-DTFE "${TMP}/pxs_ps_c_T1" --sample-points "${CENTRES}"
-run ./DTFE    "${TMP}/pxs_st_c"    --sample-points "${CENTRES}"
-run ./DTFE    "${TMP}/pxs_st_p"    --sample-points "${PARTS}"
+run "${PS_BIN}" "${TMP}/pxs_ps_c"    --sample-points "${CENTRES}"
+run "${PS_BIN}" "${TMP}/pxs_ps_p"    --sample-points "${PARTS}"
+run "${PS_BIN}" "${TMP}/pxs_ps_c_P2" --sample-points "${CENTRES}" --partition 2 2 2
+run "${PS_BIN}" "${TMP}/pxs_ps_p_P2" --sample-points "${PARTS}"   --partition 2 2 2
+DTFE_PTS_THREADS=1 run "${PS_BIN}" "${TMP}/pxs_ps_c_T1" --sample-points "${CENTRES}"
+run "${DTFE_BIN}"    "${TMP}/pxs_st_c"    --sample-points "${CENTRES}"
+run "${DTFE_BIN}"    "${TMP}/pxs_st_p"    --sample-points "${PARTS}"
 # the grid deposit on the cell-centre grid itself (nSub=1: one sample per cell, at its centre)
-RUN_GRID="${GRID}" run ./PS-DTFE "${TMP}/pxs_dep"    --partition 1 1 1
-RUN_GRID="${GRID}" run ./PS-DTFE "${TMP}/pxs_dep_P2" --partition 2 2 2
+RUN_GRID="${GRID}" run "${PS_BIN}" "${TMP}/pxs_dep"    --partition 1 1 1
+RUN_GRID="${GRID}" run "${PS_BIN}" "${TMP}/pxs_dep_P2" --partition 2 2 2
 GPU_BUILT=0
-[ -f o_ps/.gpu_mode_off ] || GPU_BUILT=1
+OBJ_PS=o_ps; precision_double && OBJ_PS=o_ps_d
+[ -f ${OBJ_PS}/.gpu_mode_off ] || GPU_BUILT=1
 if [ "${GPU_BUILT}" -eq 1 ]; then
-    RUN_GRID="${GRID}" run ./PS-DTFE "${TMP}/pxs_dep_gpu"    --partition 1 1 1 --ps-gpu
-    RUN_GRID="${GRID}" run ./PS-DTFE "${TMP}/pxs_dep_gpu_P2" --partition 2 2 2 --ps-gpu
+    RUN_GRID="${GRID}" run "${PS_BIN}" "${TMP}/pxs_dep_gpu"    --partition 1 1 1 --ps-gpu
+    RUN_GRID="${GRID}" run "${PS_BIN}" "${TMP}/pxs_dep_gpu_P2" --partition 2 2 2 --ps-gpu
 fi
 # reference outputs for the --serve round trip: every optional point output switched on
-run ./PS-DTFE "${TMP}/pxs_ps_full" --sample-points "${PARTS}" --per-stream --per-stream-ids --partition 1 1 1 \
+run "${PS_BIN}" "${TMP}/pxs_ps_full" --sample-points "${PARTS}" --per-stream --per-stream-ids --partition 1 1 1 \
     --pts-den-grad --pts-vel-grad
 # references for the composite server (C) and the per-stream Lagrangian/scalar outputs (L)
-run ./PS-DTFE "${TMP}/pxs_ps_comp_ref" --sample-points "${PARTS}" --per-stream --per-stream-ids \
+run "${PS_BIN}" "${TMP}/pxs_ps_comp_ref" --sample-points "${PARTS}" --per-stream --per-stream-ids \
     --pts-lagrangian --pts-scalar --scalar-dataset Potential --partition 2 2 2
 # (T) cache identity: a periodic run writes the cache, a non-periodic one must not load it
 TESS_T="${TESS_BASE}/T"; mkdir -p "${TESS_T}"
-run ./DTFE "${TMP}/pxs_T_per" --tessellation-cache "${TESS_T}"
+run "${DTFE_BIN}" "${TMP}/pxs_T_per" --tessellation-cache "${TESS_T}"
 set +e
-./DTFE "${SNAP}" "${TMP}/pxs_T_np" --grid 16 --field density --input 105 --MpcUnit 1 \
+"${DTFE_BIN}" "${SNAP}" "${TMP}/pxs_T_np" --grid 16 --field density --input 105 --MpcUnit 1 \
     --tessellation-cache "${TESS_T}" --verbose 1 > "${TMP}/pxs_T_np.log" 2>&1
 set -e
 
@@ -163,6 +170,7 @@ PYTHONPATH="${ROOT}/python${PYTHONPATH:+:${PYTHONPATH}}" \
 import sys
 import h5py
 import numpy as np
+import os as _os; REAL = np.dtype(_os.environ.get("DTFE_TEST_REAL", "float32"))   # tests/precision.sh
 
 tmp, snap, centres, parts = sys.argv[1:5]
 gpu_built = sys.argv[5] == "1"
@@ -192,8 +200,8 @@ same_t = all(np.array_equal(pts("pxs_ps_c", e), pts("pxs_ps_c_T1", e))
              for e in ("den", "vel", "velDisp"))
 check("X4", same_t, "1 thread vs the default pool: den/vel/velDisp byte-identical")
 
-g1 = np.fromfile(f"{tmp}/pxs_dep.streams", dtype=np.float32)
-g2 = np.fromfile(f"{tmp}/pxs_dep_P2.streams", dtype=np.float32)
+g1 = np.fromfile(f"{tmp}/pxs_dep.streams", dtype=REAL)
+g2 = np.fromfile(f"{tmp}/pxs_dep_P2.streams", dtype=REAL)
 nd = int((np.rint(g1).astype(np.int32) != s_c).sum())
 check("D1", g1.size == s_c.size and nd == 0 and np.array_equal(g1, np.rint(g1)),
       f"grid deposit '.streams' (nSub=1) vs the exact counts at the cell centres: {nd} of "
@@ -201,13 +209,23 @@ check("D1", g1.size == s_c.size and nd == 0 and np.array_equal(g1, np.rint(g1)),
 check("D2", np.array_equal(g1, g2), f"--partition 2 2 2 grid '.streams' byte-identical: "
       f"{int((g1 != g2).sum())} cells differ")
 if gpu_built:
-    u1 = np.fromfile(f"{tmp}/pxs_dep.hidden_streams", dtype=np.float32)
+    u1 = np.fromfile(f"{tmp}/pxs_dep.hidden_streams", dtype=REAL)
     for tag, root in (("D3", "pxs_dep_gpu"), ("D4", "pxs_dep_gpu_P2")):
-        gs = np.fromfile(f"{tmp}/{root}.streams", dtype=np.float32)
-        gu = np.fromfile(f"{tmp}/{root}.hidden_streams", dtype=np.float32)
-        check(tag, np.array_equal(gs, g1) and np.array_equal(gu, u1),
-              f"--ps-gpu{' --partition 2 2 2' if tag == 'D4' else ''} vs CPU: '.streams' "
-              f"{int((gs != g1).sum())} and '.hidden_streams' {int((gu != u1).sum())} cells differ (must be 0)")
+        gs = np.fromfile(f"{tmp}/{root}.streams", dtype=REAL)
+        gu = np.fromfile(f"{tmp}/{root}.hidden_streams", dtype=REAL)
+        nd = int((gs != g1).sum()) + int((gu != u1).sum())
+        if _os.environ.get("DTFE_TEST_PRECISION") == "double":
+            # the double build hands the float GPU kernels float copies of its tetrahedra, so a sample
+            # within float rounding of a face may land differently than in the CPU's double geometry
+            # (ps_double_check D5); a mapping bug (D4's guard: 91% of cells) is still far outside this
+            check(tag, nd <= 1e-4 * g1.size,
+                  f"--ps-gpu{' --partition 2 2 2' if tag == 'D4' else ''} vs CPU (double build): '.streams' "
+                  f"{int((gs != g1).sum())} and '.hidden_streams' {int((gu != u1).sum())} cells differ "
+                  f"(at most {1e-4 * g1.size:.0f}: float kernel geometry)")
+        else:
+            check(tag, nd == 0,
+                  f"--ps-gpu{' --partition 2 2 2' if tag == 'D4' else ''} vs CPU: '.streams' "
+                  f"{int((gs != g1).sum())} and '.hidden_streams' {int((gu != u1).sum())} cells differ (must be 0)")
 else:
     print("   SKIP D3/D4 (CPU-only build)")
 
@@ -218,7 +236,14 @@ check("S1", st_c.min() == 1 and st_c.max() == 1,
 check("S2", st_p.min() == 1 and st_p.max() == 1,
       f"standard DTFE coverage at particle positions: min {st_p.min()} max {st_p.max()} (must be exactly 1)")
 
-from dtfelib import Estimator
+from dtfelib import Estimator as _Estimator
+import os as _os2
+PREC = _os2.environ.get("DTFE_TEST_PRECISION", "single")      # tests/precision.sh
+PSBIN = "./PS-DTFE-double" if PREC == "double" else "./PS-DTFE"
+class Estimator(_Estimator):          # every server of this suite (from_arrays too) runs the precision under test
+    def __init__(self, *a, **kw):
+        kw.setdefault("precision", PREC)
+        super().__init__(*a, **kw)
 
 P = np.fromfile(parts).reshape(-1, 3)
 C = np.fromfile(centres).reshape(-1, 3)
@@ -322,7 +347,7 @@ try:
 finally:
     del os.environ["DTFE_MEM_BUDGET_GB"]
 side = round(nparts ** (1 / 3))
-ref = subprocess.run(["./PS-DTFE", snap, f"{tmp}/pxs_auto_ref", "--grid", "16", "--periodic", "--field", "density",
+ref = subprocess.run([PSBIN, snap, f"{tmp}/pxs_auto_ref", "--grid", "16", "--periodic", "--field", "density",
                       "--input", "105", "--MpcUnit", "1", "--sample-points", parts, "--partition",
                       str(side), str(side), str(side)], capture_output=True, text=True)
 same = ref.returncode == 0 and np.array_equal(auto.density, pts("pxs_auto_ref", "den")) \
@@ -330,6 +355,53 @@ same = ref.returncode == 0 and np.array_equal(auto.density, pts("pxs_auto_ref", 
 check("C4", nparts > 1 and side ** 3 == nparts and same,
       f"a budget too small for one tessellation: the server chose {nparts} partitions by itself; answers "
       f"== --sample-points --partition {side} {side} {side}: {same}")
+
+import re
+def budget_session(budget_gb, requests, name):
+    """a composite session from the C2 cache under DTFE_SERVE_BUDGET_GB; its answers, its reported
+    resident count and its progress log"""
+    log = f"{sys.argv[8]}/{name}.log"
+    os.environ["DTFE_SERVE_BUDGET_GB"] = repr(float(budget_gb))
+    try:
+        with Estimator(snap, partition=2, tessellation_cache=tess, progress=True, log_path=log, **kw) as est:
+            outs = [est(q) for q in requests]
+            nres = est.resident
+    finally:
+        del os.environ["DTFE_SERVE_BUDGET_GB"]
+    return outs, nres, open(log, errors="replace").read()
+def loaded_per_request(text):
+    return [int(v) for v in re.findall(r"\[request done\] \d+ points, \d+ of \d+ partitions, (\d+) loaded", text)]
+_, _, text = budget_session(1000., [P[:5]], "c5_probe")
+nv = sorted(int(v) for v in re.findall(r"\[partitions \d+/\d+\] partition \d+: [^,]+, (\d+) vertices", text))
+TB, IB = 666e-9, 192e-9                       # GB per vertex: tessellation, index estimate (ps_point_eval.cc)
+small = [P[i:i + 5] for i in range(0, 50, 5)]  # few points: the cell-index path once a partition earned it
+ok5, msg5 = len(nv) == 8, [f"{len(nv)} partitions"]
+if ok5:
+    # (a) everything fits: nothing reloads, and the indexes get built once earned
+    (ra, _, *_), nres_a, ta = budget_session(1000., [P, P] + small, "c5_all")
+    la = loaded_per_request(ta)
+    built_a = ta.count("building its cell index")
+    # (b) the 8 tessellations fit but no index on top: all stay resident, every request walks
+    gb_b = TB * sum(nv) + 0.5 * IB * nv[0]
+    (rb, _, *_), nres_b, tb = budget_session(gb_b, [P, P] + small, "c5_noindex")
+    lb = loaded_per_request(tb)
+    # (c) room for the 3 largest only: requests needing all 8 evict and reload, answers unchanged
+    gb_c = TB * sum(nv[-3:]) * 1.0001
+    (rc, rc2), nres_c, tc = budget_session(gb_c, [P, P], "c5_three")
+    # the handshake reports how many of the LARGEST partition fit
+    fits = lambda gb: max(1, min(8, int(gb * 1e9 // (666. * nv[-1]))))
+    lc = loaded_per_request(tc)
+    ok5 = (nres_a == 8 and la[1] == 0 and built_a >= 1
+           and nres_b == fits(gb_b) and lb[1] == 0 and tb.count("building its cell index") == 0
+           and tb.count("would not fit in memory, walking") >= 1
+           and nres_c == fits(gb_c) and 1 <= lc[1] <= 5
+           and same_as_ref(ra, "pxs_ps_comp_ref") and same_as_ref(rb, "pxs_ps_comp_ref")
+           and same_as_ref(rc, "pxs_ps_comp_ref") and same_as_ref(rc2, "pxs_ps_comp_ref"))
+    msg5 = [f"ample: {nres_a} resident, 2nd request loaded {la[1]}, {built_a} index(es) built",
+            f"tessellations only: all stay ({nres_b} of the largest fit), 2nd loaded {lb[1]}, indexes skipped "
+            f"{tb.count('would not fit in memory, walking')}x",
+            f"3 largest: {nres_c} of the largest fit, 2nd loaded {lc[1]}", "answers bit-identical"]
+check("C5", ok5, "automatic resident set by bytes: " + "; ".join(msg5))
 
 # ---------------- L: per-stream Lagrangian positions and scalars
 L = float(sys.argv[6])
@@ -375,8 +447,8 @@ check("A1", same and not tmpdir.exists() and lin.streams.min() == 1
 
 # ---------------- T: the cache keys on --periodic
 np_log = open(f"{tmp}/pxs_T_np.log").read()
-d_per = np.fromfile(f"{tmp}/pxs_T_per.den", dtype=np.float32)
-d_np = np.fromfile(f"{tmp}/pxs_T_np.den", dtype=np.float32)
+d_per = np.fromfile(f"{tmp}/pxs_T_per.den", dtype=REAL)
+d_np = np.fromfile(f"{tmp}/pxs_T_np.den", dtype=REAL)
 check("T1", "cache hit" not in np_log and d_np.size == d_per.size and not np.array_equal(d_np, d_per),
       "a non-periodic run does not load the tessellation a periodic run cached (its densities "
       "differ, as they must; the old cache key had no 'periodic' and served the periodic ones)")

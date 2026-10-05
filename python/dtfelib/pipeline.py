@@ -260,11 +260,12 @@ class SnapshotProducts:
     reused, and an alternate OUTPUT_PREFIX set never shares caches with the primary one.
     """
 
-    def __init__(self, snapshot, redshift=None, sim=None, method=None, prefix=None):
+    def __init__(self, snapshot, redshift=None, sim=None, method=None, prefix=None, data_root=None):
         self.snapshot = f"{int(snapshot):03d}"   # accepts 99, '99' or '099'
         self.sim = sim or DEFAULT_SIM
         self.method = method or "auto"
         self.prefix = prefix                     # alternate OUTPUT_PREFIX set, see FieldSet
+        self.data_root = data_root               # None = DATA_ROOT (DTFE_DATA_ROOT); a script's --data-root
         self._fs = None
         self._redshift = redshift
         self._ram = {}
@@ -272,7 +273,7 @@ class SnapshotProducts:
     @property
     def fs(self):
         if self._fs is None:
-            self._fs = FieldSet(sim_dir(self.sim) / f"snapdir_{self.snapshot}",
+            self._fs = FieldSet(sim_dir(self.sim, self.data_root) / f"snapdir_{self.snapshot}",
                                 method=self.method, prefix=self.prefix)
         return self._fs
 
@@ -424,8 +425,11 @@ class SnapshotProducts:
         return self
 
 
-def products(snapshot, redshift=None, sim=None, method=None):
-    return SnapshotProducts(snapshot, redshift, sim=sim, method=method)
+def products(snapshot, redshift=None, sim=None, method=None, prefix=None, data_root=None):
+    """The derived products of one snapshot. data_root: a script's --data-root (default: DATA_ROOT, so
+    DTFE_DATA_ROOT); the caches stay keyed by (sim, prefix, method, snapshot), as they are for a root
+    set through the environment."""
+    return SnapshotProducts(snapshot, redshift, sim=sim, method=method, prefix=prefix, data_root=data_root)
 
 
 def _limits_path():
@@ -435,6 +439,55 @@ def _limits_path():
 def save_global_limits(limits):
     with open(_limits_path(), 'w') as f:
         json.dump(limits, f, indent=2)
+
+
+def _snapshot_limits_path():
+    return cache_dir() / 'snapshot_limits.json'
+
+
+def load_snapshot_limits():
+    """{snapshot id ('099'): {field: amplitude}} -- what analyze.py compute measured per snapshot."""
+    p = _snapshot_limits_path()
+    if not p.exists():
+        return {}
+    with open(p) as f:
+        return json.load(f)
+
+
+def canonical_snapshot_id(snap):
+    """'99', 99, '099' -> '099' (config.SNAPSHOT_TO_REDSHIFT's keys); other text unchanged."""
+    s = str(snap)
+    return f"{int(s):03d}" if s.isdigit() else s
+
+
+def record_limits(updates, canonical=None):
+    """analyze.py compute's bookkeeping. 'updates' = {snapshot: {field: amplitude}} for the snapshots
+    just computed. They go into the per-snapshot store (snapshot_limits.json, beside global_limits.json
+    under the same parameter-hashed cache dir, so a change of smoothing or criterion invalidates both);
+    the global limits are then the MAXIMUM over every stored snapshot of the canonical series. Before
+    2026-10-06 compute wrote the maximum over the snapshots of that one run: a run on a subset, or on an
+    unknown id, shrank or emptied the cross-epoch limits every later plot used. Returns (limits, covered,
+    missing): the limits written (None when nothing was computed: the global file is left alone), the
+    canonical snapshots with an entry, and those still without one."""
+    canonical = [canonical_snapshot_id(s) for s in (canonical if canonical is not None
+                                                     else config.SNAPSHOT_TO_REDSHIFT)]
+    store = load_snapshot_limits()
+    for snap, amp in (updates or {}).items():
+        vals = {k: float(v) for k, v in amp.items() if v is not None and np.isfinite(v)}
+        if vals:
+            store[canonical_snapshot_id(snap)] = vals
+    covered = [s for s in canonical if s in store]
+    missing = [s for s in canonical if s not in store]
+    if not updates:
+        return None, covered, missing
+    with open(_snapshot_limits_path(), 'w') as f:
+        json.dump(store, f, indent=2)
+    limits = {}
+    for s in covered:
+        for field, v in store[s].items():
+            limits[field] = max(limits.get(field, v), v)
+    save_global_limits(limits)
+    return limits, covered, missing
 
 
 def load_global_limits():

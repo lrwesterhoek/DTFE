@@ -117,12 +117,12 @@ def plot_alignment_evolution(rows, combo):
     plt.close(fig)
 
 
-def analyze_snapshot(snapshot, redshift, output_root, sim, method):
+def analyze_snapshot(snapshot, redshift, output_root, sim, method, prefix=None, data_root=None):
     print(f"\nProcessing snapshot {snapshot} (z={redshift:.2f})")
     output_dir = output_root / f"snapshot_{snapshot}_z{redshift:.2f}"
     output_dir.mkdir(parents=True, exist_ok=True)
     try:
-        p = pipeline.products(snapshot, redshift, sim=sim, method=method)
+        p = pipeline.products(snapshot, redshift, sim=sim, method=method, prefix=prefix, data_root=data_root)
         cat = p.voids()
         coords = np.asarray(cat['coords'], dtype=int)
         n = len(coords)
@@ -188,7 +188,7 @@ def main():
     rows = []
     for snapshot, redshift in items:
         r = analyze_snapshot(snapshot, redshift, output_root,
-                             sim=args.sim, method=args.method)
+                             sim=args.sim, method=args.method, prefix=args.prefix, data_root=args.data_root)
         if r is not None:
             rows.append(r)
     if not rows:

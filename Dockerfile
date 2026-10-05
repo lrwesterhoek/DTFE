@@ -12,7 +12,7 @@ FROM ubuntu:24.04 AS build
 ENV DEBIAN_FRONTEND=noninteractive
 
 # the documented dependency set (README "Prerequisites"): GSL, Boost, CGAL (+GMP/MPFR),
-# HDF5, FFTW, plus python3 with numpy/h5py for the test battery
+# HDF5, FFTW, libdeflate (optional, the cache's codec), plus python3 with numpy/h5py for the test battery
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         make \
@@ -24,6 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libhdf5-dev \
         libgmp-dev \
         libfftw3-dev \
+        libdeflate-dev \
         pkg-config \
         python3 \
         python3-numpy \
@@ -34,42 +35,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /opt/dtfe
 COPY . .
 
-# build both binaries CPU-only. -march=native does not exist on all builders -> the image
-# builds for a generic CPU (override with --build-arg ARCH_FLAGS=... if wanted).
+# build the three binary pairs CPU-only (single, DOUBLE=1, DIM=2), through the same script CI uses
+# (tests/ci_suite.sh: one suite list for both, so they cannot drift). -march=native does not exist
+# on all builders -> the image builds for a generic CPU (override with --build-arg ARCH_FLAGS=...).
 ARG ARCH_FLAGS="-mtune=generic"
-RUN set -eux; \
-    make deps-check; \
-    make DTFE    ARCH_FLAGS="$ARCH_FLAGS" -j"$(nproc)"; \
-    make PS-DTFE ARCH_FLAGS="$ARCH_FLAGS" -j"$(nproc)"
+RUN set -eux; ARCH_FLAGS="$ARCH_FLAGS" tests/ci_suite.sh build
 
-# ---- build sanity stage: the fast CPU test battery must pass for the image to exist ----
-# The stored regression reference was generated on the dev machine (macOS, Homebrew clang,
-# CGAL 6); a different compiler/CGAL pair breaks Delaunay ties in degenerate (co-spherical)
-# configurations differently, so that one file is machine-specific. Delete it so the test
-# regenerates it in-image on first run -- the remaining analytic tests (mass conservation,
-# convergence, positivity, ...) are environment-independent and still gate the build.
-RUN set -eux; \
-    rm -f tests/reference/regression_density.txt; \
-    python3 tests/run_tests.py; \
-    tests/ps_smoke_test.sh --no-build
-
-# ---- suites that gate SILENT wrongness rather than crashes ----
-# A caustic mask that stops matching the fold flag, a stale tessellation served to the wrong
-# partition, a point traversal drifting from the deposit, a batch driver that skips everything and
-# exits 0. All were developed on macOS, and CI only runs on push/PR, so for an uncommitted branch
-# `docker build` is the only Linux gate. No GPU needed.
-#
+# ---- the test battery must pass for the image to exist ----
+# Every CPU suite against the single pair, again against the double pair, and the 2D suite. The
+# standard-DTFE regression reference stored in the repo was made with macOS's CGAL, which breaks
+# Delaunay ties in co-spherical configurations differently: ci_suite.sh gives that one test a fresh
+# reference folder (DTFE_TEST_REFERENCE_DIR) instead of deleting the tracked file.
 # 'rm -rf tests/tmp' must stay in THIS RUN: files written by a RUN are baked into that layer, and
-# deleting them later only adds a whiteout. These suites leave 438 MB behind, a third of the image.
+# deleting them later only adds a whiteout.
 RUN set -eux; \
-    tests/ps_caustic_class_check.sh --no-build; \
-    tests/ps_tessellation_cache_check.sh --no-build; \
-    tests/ps_point_eval_check.sh --no-build; \
-    tests/dtfe_point_eval_check.sh --no-build; \
-    tests/point_exact_serve_check.sh --no-build; \
-    tests/ps_hidden_streams_check.sh --no-build;     python3 tests/ps_nonperiodic_test.py --no-build; \
-    tests/run_scripts_check.sh --no-build; \
+    tests/ci_suite.sh core double 2d; \
     rm -rf tests/tmp
 
 # default entrypoint just documents the two binaries
-CMD ["/bin/sh", "-c", "echo 'DTFE image: binaries at /opt/dtfe/DTFE and /opt/dtfe/PS-DTFE (run with --help for options)'"]
+CMD ["/bin/sh", "-c", "echo 'DTFE image: binaries at /opt/dtfe/DTFE and /opt/dtfe/PS-DTFE (+ -double, -2d; run with --help for options)'"]

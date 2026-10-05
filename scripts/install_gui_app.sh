@@ -218,9 +218,12 @@ EOF
 } > "$B/Resources/launcher.sh"
 
 # the executable: runs launcher.sh as its CHILD and waits, so it stays the process macOS asks
-# about file access (the GUI and every job it starts inherit it)
+# about file access (the GUI and every job it starts inherit it). It also runs an (invisible) AppKit
+# event loop: a second double-click while the GUI is open makes macOS "reopen" THIS app, which has no
+# window, so it brings the GUI forward instead (before 2026-10-02 nothing appeared to happen).
 command -v cc >/dev/null 2>&1 || { echo "no C compiler (xcode-select --install)" >&2; exit 1; }
-cat > "$BUILD/launcher.c" <<'EOF'
+cat > "$BUILD/launcher.m" <<'EOF'
+#import <AppKit/AppKit.h>
 #include <errno.h>
 #include <libgen.h>
 #include <limits.h>
@@ -231,6 +234,33 @@ cat > "$BUILD/launcher.c" <<'EOF'
 #include <sys/wait.h>
 
 extern char **environ;
+static pid_t child = 0;
+
+static int exitCode(int status) { return WIFEXITED(status) ? WEXITSTATUS(status) : 1; }
+
+@interface LauncherDelegate : NSObject <NSApplicationDelegate>
+@end
+
+@implementation LauncherDelegate
+- (BOOL)applicationShouldHandleReopen:(NSApplication *)sender hasVisibleWindows:(BOOL)flag {
+    (void)flag;
+    /* the GUI is the child itself (launcher.sh and gui.sh exec into it); without that, the GUI
+       host's bundle */
+    NSRunningApplication *gui = [NSRunningApplication runningApplicationWithProcessIdentifier:child];
+    if (gui == nil)
+        gui = [[NSRunningApplication runningApplicationsWithBundleIdentifier:
+                   [NSString stringWithUTF8String:HOST_ID]] firstObject];
+    if (gui != nil) {
+        if ([sender respondsToSelector:@selector(yieldActivationToApplication:)])
+            [sender yieldActivationToApplication:gui];          /* macOS 14+: cooperative activation */
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        [gui activateWithOptions:NSApplicationActivateAllWindows];
+#pragma clang diagnostic pop
+    }
+    return NO;
+}
+@end
 
 int main(int argc, char **argv) {
     char exe[PATH_MAX], real[PATH_MAX], script[PATH_MAX + 32];
@@ -242,15 +272,33 @@ int main(int argc, char **argv) {
     args[0] = "/bin/bash";
     args[1] = script;
     for (int i = 1; i < argc; i++) args[i + 1] = argv[i];
-    pid_t pid;
-    if (posix_spawn(&pid, "/bin/bash", NULL, NULL, args, environ) != 0) return 1;
-    int status;
-    while (waitpid(pid, &status, 0) < 0)
-        if (errno != EINTR) return 1;
-    return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+    if (posix_spawn(&child, "/bin/bash", NULL, NULL, args, environ) != 0) return 1;
+
+    /* leave with the child's status as soon as it ends: a watch on its exit, armed before the
+       check below, so an end in between is caught by one or the other */
+    dispatch_source_t ended = dispatch_source_create(DISPATCH_SOURCE_TYPE_PROC, (uintptr_t)child,
+                                                     DISPATCH_PROC_EXIT, dispatch_get_main_queue());
+    dispatch_source_set_event_handler(ended, ^{
+        int status = 0;
+        while (waitpid(child, &status, 0) < 0)
+            if (errno != EINTR) exit(1);
+        exit(exitCode(status));
+    });
+    dispatch_resume(ended);
+    int status = 0;
+    if (waitpid(child, &status, WNOHANG) == child) return exitCode(status);
+
+    @autoreleasepool {
+        NSApplication *app = [NSApplication sharedApplication];
+        LauncherDelegate *delegate = [LauncherDelegate new];
+        app.delegate = delegate;
+        [app run];
+    }
+    return 0;
 }
 EOF
-cc -O2 -Wall -Wextra -o "$B/MacOS/$NAME" "$BUILD/launcher.c"
+cc -O2 -Wall -Wextra -fobjc-arc -DHOST_ID="\"$HOST_ID\"" -framework AppKit \
+    -o "$B/MacOS/$NAME" "$BUILD/launcher.m"
 
 # ad-hoc signature: a stable identity for macOS's privacy settings (the same bytes give the same
 # signature, so Full Disk Access given once survives a re-run of this script)

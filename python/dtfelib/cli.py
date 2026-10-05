@@ -42,6 +42,15 @@ def sim_dir(sim: str, root=None) -> Path:
     return flat
 
 
+def use_data_root(root) -> Path:
+    """Make `root` this process's default data root: what a script's --data-root means for every dtfelib
+    helper that is not handed a root explicitly (groupcat, trees, environment, pipeline.products without
+    data_root=...). sim_dir() reads the default at call time, so the switch reaches them all. Returns it."""
+    global DATA_ROOT
+    DATA_ROOT = Path(root)
+    return DATA_ROOT
+
+
 def find_sims(root=None, pattern: str = "snapdir_*") -> list[str]:
     """Names of the simulations under `root` (default DATA_ROOT), in either layout, whose
     directory contains something matching `pattern` (e.g. 'snapdir_*/combined_*.hdf5')."""

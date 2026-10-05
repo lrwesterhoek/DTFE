@@ -3,8 +3,20 @@
 #  Build output
 /o
 /o_ps
+/o_d
+/o_ps_d
+/o_2d
+/o_ps_2d
+/o_2d_d
+/o_ps_2d_d
 /DTFE
 /PS-DTFE
+/DTFE-double
+/PS-DTFE-double
+/DTFE-2d
+/PS-DTFE-2d
+/DTFE-2d-double
+/PS-DTFE-2d-double
 output/
 # header-copy artifact of 'make library' (copy_headers)
 /DTFE_include/

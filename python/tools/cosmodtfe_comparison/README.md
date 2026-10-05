@@ -15,3 +15,8 @@ The head-to-head of 2026-09-30 (report: `figures/cosmodtfe_comparison/report.htm
   `tables.py` adds the before/after table, `before_after.py <workdir>` prints it.
 - `rerun_tng.sh <workdir> <repo>`: re-times our TNG phase-space stages (after the 2026-09-30 region-face and
   alpha-shape fixes, which change the non-periodic region runs).
+- Standard-DTFE cell averages (`dtfe_avg_cpu`, `dtfe_avg_gpu`, `dtfe_avg512_cpu`, `dtfe_avg512_gpu` in `run_ours.sh`,
+  added 2026-10-01 evening with the rebuilt GPU kernel): the volume-averaged density and velocity at the report grid
+  and at 512^3, CPU and GPU; CosmoDTFE has no equivalent. The before/after table takes their "before" (this morning's
+  per-tetrahedron kernel) from `out/before_dtfe_<tag>.timing.jsonl`, produced by running `run_ours.sh` with a copy of
+  the old binary as `<repo>` and the other stages skipped.

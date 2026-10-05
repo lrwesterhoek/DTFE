@@ -313,7 +313,8 @@ def process_single_snapshot(snapshot, redshift, args):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        p = pipeline.products(snapshot, sim=args.sim, method=args.method)
+        p = pipeline.products(snapshot, sim=args.sim, method=args.method, prefix=args.prefix,
+                              data_root=args.data_root)
         grid_n = p.fs.grid_n
         box_size = p.fs.meta.box_mpc
         redshift = p.redshift

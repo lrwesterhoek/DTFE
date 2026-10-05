@@ -117,7 +117,7 @@ class RunsBrowser(QWidget):
                       {"error": "✖ wrong: regenerate", "warning": "⚠ stale", "info": "ℹ note"}[worst] if worst
                       else "✔ ok")
             cells = [r.sim or "custom", "" if r.snap is None else f"{r.snap:03d}", r.prefix,
-                     f"{r.grid}³" if r.grid else "—", r.options_text(),
+                     f"{r.grid}{'²' if r.dim == 2 else '³'}" if r.grid else "—", r.options_text(),
                      r.finished.strftime("%Y-%m-%d %H:%M") if r.finished else "—",
                      R.format_duration(r.wall_seconds), _gb(r.footprint_gb or r.peak_rss_gb),
                      f"{r.size_bytes / 1e9:.1f} GB", status]
@@ -173,7 +173,7 @@ class RunsBrowser(QWidget):
                   f"wall      {R.format_duration(r.wall_seconds)}    peak memory {_gb(r.footprint_gb)} footprint, "
                   f"{_gb(r.peak_rss_gb)} resident",
                   f"outputs   {len(r.outputs)} files, {r.size_bytes / 1e9:.2f} GB",
-                  f"settings  {r.options_text() or '—'}" + (f", {r.grid}³ grid" if r.grid else "")]
+                  f"settings  {r.options_text() or '—'}" + (f", {r.grid}{'²' if r.dim == 2 else '³'} grid" if r.grid else "")]
         self.detail.setPlainText("\n".join(lines))
 
     def _open_log(self):

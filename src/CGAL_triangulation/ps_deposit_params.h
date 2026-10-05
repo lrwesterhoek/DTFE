@@ -68,6 +68,10 @@ struct PSDepositParams
     int32_t  fCaustic;  // --ps-caustics: atomic-OR the per-tet orientation bits (1 = det>0, 2 = det<0) into the caustic grid
     int32_t  fExact;    // --ps-exact-deposit: analytic tet-cell clipping (float32 r3d port in the kernel) instead of nSub^3 sampling; nSub ignored
     uint32_t nTet;
+    int32_t  fScal;     // scalar field (one component): vertex scalars in buffer 18, the moment grid in 19
+    int32_t  fSGrad;    // scalar gradient (3 components): its moment grid in buffer 20
+    int32_t  windowMode; // --ps-window: the sub-box is a WINDOW of the full grid -- count every sample / clipped
+                         // piece of a tet (the full run's normalization), deposit only those inside the sub-box
 };
 
 #endif

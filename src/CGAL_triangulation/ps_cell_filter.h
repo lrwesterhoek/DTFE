@@ -49,13 +49,22 @@ struct PSCellGeometry
 // WHICH partition deposits a tet, not WHETHER it deposits, so degrees must ignore it -- while
 // the drop filters decide 'whether' and are computed identically in every partition that sees
 // the cell (padded vertices carry their full neighborhood).
+// No early rejection (the default of psFilterCell's last argument).
+struct PSNoEarlyReject { bool operator()(Real const (&)[NO_DIM+1][NO_DIM]) const { return false; } };
+
+// 'earlyReject(eulerPos)' -- given the wrapped Eulerian positions, before the edge matrix,
+// determinant and inverse -- lets a caller drop a cell it will discard anyway on its positions
+// alone (--ps-window's GPU extraction: a tetrahedron that misses the window), at a fraction of the
+// filter's cost. The default rejects nothing.
+template <class EarlyReject = PSNoEarlyReject>
 inline bool psFilterCell(Cell_handle &cell,
                          User_options &userOptions,
                          Box &boxCoordinates,
                          bool const checkSingularInverse,
                          size_t *nDegenerateInverse,
                          PSCellGeometry &g,
-                         bool const skipOwnership = false)
+                         bool const skipOwnership = false,
+                         EarlyReject const &earlyReject = EarlyReject())
 {
 #ifdef TEST_PADDING
     // Skip cells touching a dummy padding vertex.
@@ -166,6 +175,8 @@ inline bool psFilterCell(Cell_handle &cell,
                 if (diff < -boxLen[d] * Real(0.5)) g.eulerPos[v][d] += boxLen[d];
             }
     }
+
+    if ( earlyReject(g.eulerPos) ) { return false; }
 
     // Eulerian edge matrix (rows = vertices 1..NO_DIM relative to vertex 0, possibly wrapped).
     for (int v = 0; v < NO_DIM; ++v)

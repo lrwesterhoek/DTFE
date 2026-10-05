@@ -16,7 +16,7 @@ import matplotlib.colors as colors
 from scipy.stats import pearsonr
 from dtfelib import fields as dtfe
 from dtfelib.figures import save_plot_to_multiple_paths
-from dtfelib import FieldSet, make_parser
+from dtfelib import FieldSet, make_parser, sim_dir
 import config
 from dtfelib import figures as style
 
@@ -208,7 +208,7 @@ def create_residual_plot(residual_slice, slice_dim, box_size, residual_norm, red
 def process_snapshot(snapshot, redshift, args):
     print(f"\nProcessing snapshot {snapshot} (z={redshift:.2f})")
 
-    snapdir = args.data_root / args.sim / f'snapdir_{snapshot}'
+    snapdir = sim_dir(args.sim, args.data_root) / f'snapdir_{snapshot}'   # flat or per-family layout
 
     try:
         try:

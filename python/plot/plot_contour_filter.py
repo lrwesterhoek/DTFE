@@ -10,7 +10,7 @@ from dtfelib.figures import save_plot_to_multiple_paths
 import config
 from dtfelib import figures as style
 from dtfelib import pipeline
-from dtfelib import make_parser
+from dtfelib import make_parser, sim_dir
 
 style.apply()
 
@@ -89,7 +89,7 @@ def bbks_theoretical_distribution(e, p, gamma=0.6):
                             np.exp(-5/(2*(1-gamma**2)) * ((3*e[in_range])**2 + p[in_range]**2))
     return distribution
 
-def process_snapshot(snapshot, redshift, sim, method):
+def process_snapshot(snapshot, redshift, sim, method, prefix=None, data_root=None):
 
     print(f"\nProcessing snapshot {snapshot} (z={redshift:.2f})")
 
@@ -97,7 +97,7 @@ def process_snapshot(snapshot, redshift, sim, method):
     snapshot_output_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        p = pipeline.products(snapshot, redshift, sim=sim, method=method)
+        p = pipeline.products(snapshot, redshift, sim=sim, method=method, prefix=prefix, data_root=data_root)
         cat = p.voids()
         p.release()
 
@@ -594,7 +594,7 @@ def main():
     args = parser.parse_args()
 
     print("Starting void shape evolution analysis")
-    print(f"Data directory: {args.data_root / args.sim}")
+    print(f"Data directory: {sim_dir(args.sim, args.data_root)}")
     print(f"Output directory: {OUTPUT_DIR}")
     print(f"Processing {len(SNAPSHOT_TO_REDSHIFT)} snapshots")
     print(f"Method: FFT-based Hessian computation")
@@ -607,7 +607,7 @@ def main():
     snapshot_ids = []
 
     for snapshot, redshift in SNAPSHOT_TO_REDSHIFT.items():
-        result = process_snapshot(snapshot, redshift, args.sim, args.method)
+        result = process_snapshot(snapshot, redshift, args.sim, args.method, args.prefix, args.data_root)
         if result is not None:
             snapshots_data.append(result)
             snapshot_ids.append(snapshot)

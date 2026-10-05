@@ -21,7 +21,8 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as colors
 from scipy.ndimage import gaussian_filter
 
-from dtfelib import make_parser, FieldSet
+from dtfelib import make_parser, FieldSet, sim_dir
+from dtfelib import figures as style
 from dtfelib.fields import extract_2d_slice as extract_slice, extract_velocity_slice
 
 OUTPUT_DIR = Path(config.LOCAL_FIGURES_ROOT) / "dtfe"
@@ -55,8 +56,12 @@ SLICE_PLANES = {
 
 def plot_density(density_field, slice_dim, box_size, redshift=None, save_path=None):
     dens_slice = extract_slice(density_field, slice_dim).T
-    vmin = DENSITY_VMIN if DENSITY_VMIN is not None else max(np.min(dens_slice[dens_slice > 0]), 1e-6)
-    vmax = DENSITY_VMAX if DENSITY_VMAX is not None else dens_slice.max()
+    own = style.log_limits(dens_slice)          # the slice's own range when no fixed one is set
+    if own is None and (DENSITY_VMIN is None or DENSITY_VMAX is None):
+        print(f"  density: no positive value in this slice, map skipped ({save_path})")
+        return
+    vmin = DENSITY_VMIN if DENSITY_VMIN is not None else own[0]
+    vmax = DENSITY_VMAX if DENSITY_VMAX is not None else own[1]
 
     fig, ax = plt.subplots(figsize=(8, 7))
     im = ax.imshow(
@@ -138,7 +143,7 @@ def plot_velocity(velocity_field, slice_dim, box_size, quiver_step,
 
 def plot_divergence(div_field, slice_dim, box_size, redshift=None, save_path=None):
     div_slice = extract_slice(div_field, slice_dim).T
-    vmin, vmax = np.percentile(div_slice, [1, 99])
+    vmin, vmax = style.symmetric_limits(div_slice)      # centred on 0: white = no divergence
 
     fig, ax = plt.subplots(figsize=(8, 7))
     im = ax.imshow(
@@ -183,12 +188,16 @@ def plot_shear(shear_field, slice_dim, box_size, redshift=None, save_path=None):
     )
 
     shear_slice = extract_slice(shear_mag, slice_dim).T
-    vmin = max(np.min(shear_slice[shear_slice > 0]), 1e-6)
+    lim = style.log_limits(shear_slice)
+    if lim is None:                               # an empty slice crashed on the min of nothing
+        print(f"  shear: no positive value in this slice, map skipped ({save_path})")
+        return
+    vmin, vmax = lim
 
     fig, ax = plt.subplots(figsize=(8, 7))
     im = ax.imshow(
         shear_slice, origin='lower', cmap='plasma',
-        norm=colors.LogNorm(vmin=vmin, vmax=shear_slice.max()),
+        norm=colors.LogNorm(vmin=vmin, vmax=vmax),
         extent=[0, box_size, 0, box_size]
     )
 
@@ -215,7 +224,7 @@ def plot_shear(shear_field, slice_dim, box_size, redshift=None, save_path=None):
         plt.show()
 
 def process_snapshot(args, snap):
-    snap_dir = args.data_root / args.sim / f"snapdir_{snap:03d}"
+    snap_dir = sim_dir(args.sim, args.data_root) / f"snapdir_{snap:03d}"   # flat or per-family layout
 
     try:
         fs = FieldSet(snap_dir, method=args.method, averaged=not args.raw, prefix=args.prefix)
@@ -311,7 +320,7 @@ def main():
     if PROCESS_SHEAR: fields_to_process.append("shear")
 
     print("Starting DTFE field visualization")
-    print(f"Data directory: {args.data_root / args.sim}")
+    print(f"Data directory: {sim_dir(args.sim, args.data_root)}")
     print(f"Output directory: {OUTPUT_DIR}")
     print(f"Processing {len(snapshots)} snapshots (method={args.method})")
     print(f"Fields: {', '.join(fields_to_process)}")

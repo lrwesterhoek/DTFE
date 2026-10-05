@@ -103,6 +103,77 @@ def _sorted_chunks(directory, pattern):
     return sorted(Path(directory).glob(pattern), key=lambda p: int(p.stem.split(".")[-1]))
 
 
+class ChunkError(RuntimeError):
+    """A chunk file that cannot be read -- a download stopped half-way, or a file that is not HDF5."""
+
+
+# what HDF5 says about a file whose bytes stop early, and the size below which a file that does not
+# open cannot be a chunk at all (a real chunk's header alone is many KB) -- download_snapshots.sh's
+# prune_incomplete uses THE SAME two rules; keep them in step
+_INCOMPLETE = ("truncated file", "file signature not found", "bad byte number")
+_MIN_CHUNK_BYTES = 4096
+
+
+def _is_incomplete(path, exc) -> bool:
+    why = str(exc).splitlines()[0]
+    if any(k in why for k in _INCOMPLETE):
+        return True
+    try:
+        return Path(path).stat().st_size < _MIN_CHUNK_BYTES
+    except OSError:
+        return False
+
+
+def _chunk_error(path, exc):
+    why = str(exc).splitlines()[0]
+    name = Path(path).name
+    if _is_incomplete(path, exc):
+        return ChunkError(f"Error: couldn't read {name} (an incomplete download): {why}\n"
+                          "  No combined file was written. Run the download again: it removes an incomplete "
+                          "chunk and fetches it anew.")
+    return ChunkError(f"Error: couldn't read {name} (it cannot be read): {why}\n"
+                      f"  No combined file was written. Delete {name} (or fix its permissions) and run the "
+                      "download again.")
+
+
+def _open_chunk(path):
+    """h5py.File(path, 'r'), or a ChunkError that names the chunk and says what to do."""
+    try:
+        return h5py.File(path, "r")
+    except OSError as e:
+        raise _chunk_error(path, e) from e
+
+
+def _expected_chunks(found, attr):
+    """The chunk count the header of the first chunk found promises ('NumFilesPerSnapshot' for
+    snapshots, 'NumFiles' for group catalogues), or None when there is no chunk or no such attribute.
+    Counting the files on disk instead let a download that stopped early merge into a 'complete'
+    file with missing particles (2026-10-06)."""
+    if not found:
+        return None
+    with _open_chunk(found[0]) as f:
+        v = f["Header"].attrs.get(attr) if "Header" in f else None
+    return int(v) if v is not None else None
+
+
+def _report_missing(input_files, n_header):
+    missing = [f for f in input_files if not f.exists()]
+    print(f"\nProblem: Can't find {len(missing) or 'any'} subfile(s)"
+          + (f" (the header promises {n_header})" if n_header else "") + ":")
+    for f in missing:
+        print(f"  Missing: {f}")
+    print("  No combined file was written. Run the download again (it fetches what is missing), "
+          "or check -d / -n.\n")
+
+
+def _partial(output_file):
+    """The name a merge writes under until its totals verify: a stopped or failed merge never leaves
+    a combined_*.hdf5 that the launcher and the run scripts would take for a complete snapshot."""
+    partial = Path(output_file).with_name(Path(output_file).name + ".partial")
+    partial.unlink(missing_ok=True)             # a merge stopped half-way last time
+    return partial
+
+
 def _delete_chunks(files, verified, what):
     if not verified:
         print(f"  NOT deleting {what} chunks: the merged totals did not verify.")
@@ -117,32 +188,82 @@ def merge_snapshot_files(snapshot_num, num_subfiles, base_dir, h_value, datasets
     snapshot_str = f"{snapshot_num:03d}"
 
     snapshot_dir = Path(base_dir) / f"snapdir_{snapshot_str}"
-    if num_subfiles:
-        input_files = [snapshot_dir / f"snap_{snapshot_str}.{i}.hdf5"
-                       for i in range(num_subfiles)]
-    else:   # auto-detect the chunk count (it differs per simulation and snapshot)
-        input_files = _sorted_chunks(snapshot_dir, f"snap_{snapshot_str}.*.hdf5")
     output_file = snapshot_dir / f"combined_{snapshot_str}.hdf5"
 
     print(f"\n{'='*60}")
     print(f"Processing snapshot {snapshot_str}")
     print(f"Directory: {snapshot_dir}")
+    try:
+        ok = _merge_snapshot(snapshot_str, snapshot_dir, output_file, num_subfiles, h_value, datasets_info,
+                             delete_chunks)
+    except ChunkError as e:
+        print(f"\n{e}")
+        ok = False
+    print('='*60)
+    return ok
+
+
+def _merge_snapshot(snapshot_str, snapshot_dir, output_file, num_subfiles, h_value, datasets_info,
+                    delete_chunks):
+    """merge_snapshot_files' body; True when combined_NNN.hdf5 was written and verified (or is there
+    already and its chunks are gone: a merge with --delete-chunks run again)."""
+    partial = _partial(output_file)         # first: a merge stopped half-way may have left a big one
+    found = _sorted_chunks(snapshot_dir, f"snap_{snapshot_str}.*.hdf5")
+    if not found and output_file.exists():
+        print(f"  {output_file.name} already exists and no chunks are left: nothing to merge")
+        return True
+    n_header = _expected_chunks(found, "NumFilesPerSnapshot")
+    if num_subfiles:
+        if n_header is not None and n_header != num_subfiles:
+            print(f"  WARNING: -n {num_subfiles} given, but the header says {n_header} chunk(s) per snapshot")
+        n_files = num_subfiles
+    else:   # the header's count; the files on disk only when the header has none
+        n_files = n_header or len(found)
+    input_files = [snapshot_dir / f"snap_{snapshot_str}.{i}.hdf5" for i in range(n_files)]
     print(f"Merging {len(input_files)} subfiles...")
 
-    missing = [f for f in input_files if not f.exists()]
-    if missing or not input_files:
-        print(f"\nProblem: Can't find {len(missing) or 'any'} subfile(s):")
-        for f in missing:
-            print(f"  Missing: {f}")
-        print("Check your BASE_DIR and NUM_SUBFILES settings.\n")
-        return
-    
-    with h5py.File(input_files[0], 'r') as f_first:
+    if not input_files or any(not f.exists() for f in input_files):
+        _report_missing(input_files, n_header)
+        return False
+
+    with _open_chunk(input_files[0]) as f_first:
         box_size = f_first['Header'].attrs.get('BoxSize')
         box_size_physical = box_size / h_value
 
+    try:
+        total_counts, expected, types = _write_snapshot(partial, input_files, h_value, datasets_info,
+                                                        box_size_physical)
+    except ChunkError:
+        partial.unlink(missing_ok=True)
+        raise
+    except (OSError, RuntimeError) as e:    # the disk, not a chunk (full, gone, read-only); h5py's close raises RuntimeError
+        partial.unlink(missing_ok=True)
+        print(f"\nError: could not write {partial}: {e}\n  No combined file was written.")
+        return False
+    except Exception:                       # whatever else: never leave a .partial behind
+        partial.unlink(missing_ok=True)
+        raise
+    verified = all(int(expected[t]) == int(total_counts[t]) for t in types)
+    print(f"\n  Particles merged: {total_counts[total_counts > 0]}"
+          + ("" if verified else f"  (MISMATCH vs header total {expected[sorted(types)]})"))
+    if not verified:
+        partial.unlink(missing_ok=True)
+        print("  No combined file was written: the chunks do not hold what the header promises. Run the "
+              "download again, then the merge.")
+        return False
+    os.replace(partial, output_file)
+    print(f"Saved to: {output_file}")
+    print(f"  Physical box size: {box_size_physical:.2f} kpc")
+    if delete_chunks:
+        _delete_chunks(input_files, verified, "snapshot")
+    return True
+
+
+def _write_snapshot(output_file, input_files, h_value, datasets_info, box_size_physical):
+    """The merged file at 'output_file'. Returns (counts merged per type, the header's totals, the
+    particle types merged). A chunk that fails to read raises ChunkError (nothing is skipped)."""
     with h5py.File(output_file, 'w') as f_out:
-        with h5py.File(input_files[0], 'r') as f_first:
+        with _open_chunk(input_files[0]) as f_first:
             for group_name in ["Config", "Parameters"]:
                 if group_name in f_first:
                     f_out.copy(f_first[group_name], group_name)
@@ -180,46 +301,41 @@ def merge_snapshot_files(snapshot_num, num_subfiles, base_dir, h_value, datasets
             progress = f"[{file_idx + 1}/{len(input_files)}]"
             print(f"  {progress} Reading {fname.name}...")
 
-            try:
-                with h5py.File(fname, 'r') as f_in:
-                    for group_name, dsets in datasets_info.items():
-                        for dset_name in dsets:
-                            if group_name in f_in and dset_name in f_in[group_name]:
-                                data = f_in[group_name][dset_name][...]
+            with _open_chunk(fname) as f_in:
+                for group_name, dsets in datasets_info.items():
+                    for dset_name in dsets:
+                        try:                        # a chunk truncated past its superblock fails here, not at open
+                            have = group_name in f_in and dset_name in f_in[group_name]
+                            data = f_in[group_name][dset_name][...] if have else None
+                        except (OSError, RuntimeError) as e:
+                            raise _chunk_error(fname, e) from e
+                        if have:
+                            if dset_name == "Coordinates":
+                                data = data / h_value
 
-                                if dset_name == "Coordinates":
-                                    data = data / h_value
+                            out_dset = out_datasets[group_name][dset_name]
+                            old_size = out_dset.shape[0]
+                            new_size = old_size + data.shape[0]
+                            new_shape = (new_size,) + out_dset.shape[1:]
+                            out_dset.resize(new_shape)
+                            out_dset[old_size:new_size, ...] = data
 
-                                out_dset = out_datasets[group_name][dset_name]
-                                old_size = out_dset.shape[0]
-                                new_size = old_size + data.shape[0]
-                                new_shape = (new_size,) + out_dset.shape[1:]
-                                out_dset.resize(new_shape)
-                                out_dset[old_size:new_size, ...] = data
-
-                                if dset_name == "ParticleIDs":
-                                    particle_type_num = int(group_name[-1])
-                                    total_counts[particle_type_num] += data.shape[0]
-                            else:
-                                print(f"    Warning: {group_name}/{dset_name} not found in this file")
-
-            except Exception as e:
-                print(f"    Error: couldn't read {fname.name} - {e}")
-                continue
+                            if dset_name == "ParticleIDs":
+                                particle_type_num = int(group_name[-1])
+                                total_counts[particle_type_num] += data.shape[0]
+                        else:
+                            print(f"    Warning: {group_name}/{dset_name} not found in this file")
 
         header = f_out["Header"]
-        expected = np.array(header.attrs["NumPart_Total"], dtype=np.int64)  # chunk-0 global counts
+        # chunk-0 global counts; TNG splits them into a low and a high 32-bit word (the -1 runs exceed 2^32)
+        expected = np.array(header.attrs["NumPart_Total"], dtype=np.int64)
+        if "NumPart_Total_HighWord" in header.attrs:
+            expected += np.array(header.attrs["NumPart_Total_HighWord"], dtype=np.int64) << 32
+            header.attrs["NumPart_Total_HighWord"] = np.zeros(6, dtype=np.uint32)   # the totals below are int64
         header.attrs["NumPart_ThisFile"] = total_counts
         header.attrs["NumPart_Total"] = total_counts
-
-    verified = bool((expected[total_counts > 0] == total_counts[total_counts > 0]).all())
-    print(f"\nSaved to: {output_file}")
-    print(f"  Particles merged: {total_counts[total_counts > 0]}"
-          + ("" if verified else f"  (MISMATCH vs header total {expected[total_counts > 0]})"))
-    print(f"  Physical box size: {box_size_physical:.2f} kpc")
-    if delete_chunks:
-        _delete_chunks(input_files, verified, "snapshot")
-    print('='*60)
+    types = {int(g[-1]) for g in datasets_info}       # a merged type with 0 particles must verify too
+    return total_counts, expected, types
 
 
 def convert_single_file(input_path, h_value, datasets_info):
@@ -298,14 +414,17 @@ def _concat_datasets(f_out, out_group, columns, chunk_files, h_value, group_path
                   f"classify it in merge_HDF5.py before trusting its values")
     for idx, path in enumerate(chunk_files):
         print(f"  [{idx + 1}/{len(chunk_files)}] {path.name}")
-        with h5py.File(path, "r") as f_in:
-            src = f_in[group_path] if group_path else f_in
+        with _open_chunk(path) as f_in:
+            src = f_in.get(group_path) if group_path else f_in
+            if src is None:
+                continue        # a chunk with zero groups/subhalos has no such group at all
             for name, d in dsets.items():
-                if group_path and group_path not in f_in:
-                    continue
                 if name not in src:
                     continue    # a chunk with zero rows may omit the dataset entirely
-                data = src[name][...]
+                try:
+                    data = src[name][...]
+                except OSError as e:        # truncated past the superblock
+                    raise _chunk_error(path, e) from e
                 if convert[name]:
                     data = (data.astype(np.float64) / h_value).astype(d.dtype)
                 d.resize((written[name] + data.shape[0],) + d.shape[1:])
@@ -318,7 +437,7 @@ def _collect_columns(chunk_files, group_path=None):
     """{name: (shape_tail, dtype)} union across chunks (zero-row chunks omit datasets)."""
     columns = {}
     for path in chunk_files:
-        with h5py.File(path, "r") as f:
+        with _open_chunk(path) as f:
             src = f.get(group_path) if group_path else f
             if src is None:
                 continue
@@ -336,17 +455,62 @@ def merge_groupcat_files(snapshot_num, base_dir, delete_chunks=False):
     dtfelib.groupcat restores its documented raw-ckpc/h API from the markers when reading."""
     snapshot_str = f"{snapshot_num:03d}"
     group_dir = Path(base_dir) / f"groups_{snapshot_str}"
-    chunk_files = _sorted_chunks(group_dir, f"fof_subhalo_tab_{snapshot_str}.*.hdf5")
     output_file = group_dir / f"combined_fof_subhalo_tab_{snapshot_str}.hdf5"
-
     print(f"\n{'='*60}")
-    print(f"Merging group catalog {snapshot_str}: {len(chunk_files)} chunk(s)")
-    if not chunk_files:
-        print(f"  no fof_subhalo_tab_{snapshot_str}.*.hdf5 in {group_dir}, skipping")
-        return
+    try:
+        ok = _merge_groupcat(snapshot_str, group_dir, output_file, delete_chunks)
+    except ChunkError as e:
+        print(f"\n{e}")
+        ok = False
+    print('='*60)
+    return ok
 
+
+def _merge_groupcat(snapshot_str, group_dir, output_file, delete_chunks):
+    partial = _partial(output_file)
+    found = _sorted_chunks(group_dir, f"fof_subhalo_tab_{snapshot_str}.*.hdf5")
+    if not found and output_file.exists():
+        print(f"  {output_file.name} already exists and no chunks are left: nothing to merge")
+        return True
+    n_header = _expected_chunks(found, "NumFiles")
+    chunk_files = ([group_dir / f"fof_subhalo_tab_{snapshot_str}.{i}.hdf5" for i in range(n_header)]
+                   if n_header else found)
+    print(f"Merging group catalog {snapshot_str}: {len(chunk_files)} chunk(s)")
+    if not chunk_files or any(not f.exists() for f in chunk_files):
+        _report_missing(chunk_files, n_header)
+        return False
+
+    try:
+        rows, n_g, n_s, expected_g, expected_s = _write_groupcat(partial, chunk_files)
+    except ChunkError:
+        partial.unlink(missing_ok=True)
+        raise
+    except (OSError, RuntimeError) as e:    # the disk, not a chunk
+        partial.unlink(missing_ok=True)
+        print(f"\nError: could not write {partial}: {e}\n  No combined file was written.")
+        return False
+    except Exception:
+        partial.unlink(missing_ok=True)
+        raise
+    verified = (n_g == expected_g and n_s == expected_s
+                and all(v in (0, n_g) for v in rows["Group"].values())
+                and all(v in (0, n_s) for v in rows["Subhalo"].values()))
+    print(f"  Groups: {n_g}/{expected_g}  Subhalos: {n_s}/{expected_s}  "
+          f"({'verified' if verified else 'MISMATCH'})")
+    if not verified:
+        partial.unlink(missing_ok=True)
+        print("  No combined file was written: the chunks do not hold what the header promises.")
+        return False
+    os.replace(partial, output_file)
+    print(f"  Saved: {output_file}")
+    if delete_chunks:
+        _delete_chunks(chunk_files, verified, "group catalog")
+    return True
+
+
+def _write_groupcat(output_file, chunk_files):
     with h5py.File(output_file, "w") as f_out:
-        with h5py.File(chunk_files[0], "r") as f_first:
+        with _open_chunk(chunk_files[0]) as f_first:
             for name in f_first:
                 if name not in ("Group", "Subhalo"):
                     f_out.copy(f_first[name], name)     # Header, Config, Parameters, IDs, ...
@@ -365,16 +529,7 @@ def merge_groupcat_files(snapshot_num, base_dir, delete_chunks=False):
         f_out["Header"].attrs["NumFiles"] = 1
         f_out["Header"].attrs["BoxSize"] = f_out["Header"].attrs["BoxSize"] / h_value
         f_out["Header"].attrs["HFreeUnits"] = h_value
-
-    verified = (n_g == expected_g and n_s == expected_s
-                and all(v in (0, n_g) for v in rows["Group"].values())
-                and all(v in (0, n_s) for v in rows["Subhalo"].values()))
-    print(f"  Saved: {output_file}")
-    print(f"  Groups: {n_g}/{expected_g}  Subhalos: {n_s}/{expected_s}  "
-          f"({'verified' if verified else 'MISMATCH'})")
-    if delete_chunks:
-        _delete_chunks(chunk_files, verified, "group catalog")
-    print('='*60)
+    return rows, n_g, n_s, expected_g, expected_s
 
 
 def _find_h(base_dir, fallback):
@@ -402,41 +557,69 @@ def merge_tree_files(base_dir, delete_chunks=False, h_fallback=H_VALUE):
     within-tree row arithmetic dtfelib.trees relies on."""
     base = Path(base_dir)
     tree_dir = None
-    for cand in (base / "Merger Trees", base / "postprocessing" / "trees" / "SubLink"):
+    cands = (base / "Merger Trees", base / "postprocessing" / "trees" / "SubLink")
+    for cand in cands:
         if cand.is_dir() and any(cand.glob("tree_extended.*.hdf5")):
             tree_dir = cand
             break
     print(f"\n{'='*60}")
     if tree_dir is None:
-        print(f"Merging trees: no tree_extended.*.hdf5 under {base}, skipping")
-        return
+        done = next((c / "combined_tree_extended.hdf5" for c in cands if (c / "combined_tree_extended.hdf5").exists()), None)
+        if done is not None:            # merged with --delete-chunks earlier: nothing left to do
+            print(f"Merging trees: {done} already exists and no chunks are left: nothing to merge")
+            print('='*60)
+            return True
+        print(f"Merging trees: no tree_extended.*.hdf5 under {base} (download_snapshots.sh -t), nothing merged")
+        print('='*60)
+        return False
     chunk_files = _sorted_chunks(tree_dir, "tree_extended.*.hdf5")
     output_file = tree_dir / "combined_tree_extended.hdf5"
     h_value = _find_h(base_dir, h_fallback)
     print(f"Merging SubLink trees: {len(chunk_files)} chunk(s) in {tree_dir} (h = {h_value})")
-
-    expected = 0
-    for path in chunk_files:
-        with h5py.File(path, "r") as f:
-            expected += f["SubhaloID"].shape[0]
-
-    with h5py.File(output_file, "w") as f_out:
-        with h5py.File(chunk_files[0], "r") as f_first:
-            for name, obj in f_first.items():
-                if not isinstance(obj, h5py.Dataset):
-                    f_out.copy(obj, name)               # e.g. a Header group, if present
-        f_out.attrs["HFreeUnits"] = h_value
-        columns = _collect_columns(chunk_files)
-        written = _concat_datasets(f_out, f_out, columns, chunk_files, h_value)
+    # the tree chunks carry no count of themselves: an unreadable one is caught, a missing one is not
+    partial = _partial(output_file)
+    try:
+        expected = 0
+        for path in chunk_files:
+            with _open_chunk(path) as f:
+                expected += f["SubhaloID"].shape[0]
+        with h5py.File(partial, "w") as f_out:
+            with _open_chunk(chunk_files[0]) as f_first:
+                for name, obj in f_first.items():
+                    if not isinstance(obj, h5py.Dataset):
+                        f_out.copy(obj, name)               # e.g. a Header group, if present
+            f_out.attrs["HFreeUnits"] = h_value
+            columns = _collect_columns(chunk_files)
+            written = _concat_datasets(f_out, f_out, columns, chunk_files, h_value)
+    except ChunkError as e:
+        partial.unlink(missing_ok=True)
+        print(f"\n{e}")
+        print('='*60)
+        return False
+    except (OSError, RuntimeError) as e:    # the disk, not a chunk
+        partial.unlink(missing_ok=True)
+        print(f"\nError: could not write {partial}: {e}\n  No combined file was written.")
+        print('='*60)
+        return False
+    except Exception:
+        partial.unlink(missing_ok=True)
+        raise
 
     n = written.get("SubhaloID", 0)
     verified = n == expected and all(v == n for v in written.values())
-    print(f"  Saved: {output_file}")
     print(f"  Tree rows: {n}/{expected} across {len(written)} columns "
           f"({'verified' if verified else 'MISMATCH'})")
+    if not verified:
+        partial.unlink(missing_ok=True)
+        print("  No combined file was written: the columns disagree on their row counts.")
+        print('='*60)
+        return False
+    os.replace(partial, output_file)
+    print(f"  Saved: {output_file}")
     if delete_chunks:
         _delete_chunks(chunk_files, verified, "tree")
     print('='*60)
+    return True
 
 
 def convert_ics(base_dir, delete_chunks=False):
@@ -447,20 +630,28 @@ def convert_ics(base_dir, delete_chunks=False):
     print(f"\n{'='*60}")
     if output_file.exists():
         print(f"ICs: {output_file} already exists, skipping")
-        return
+        print('='*60)
+        return True
     raw = next((base / n for n in ("ics.hdf5", "snap_ics.hdf5") if (base / n).exists()), None)
     if raw is None:
-        print(f"ICs: no ics.hdf5 / snap_ics.hdf5 in {base} (download_snapshots.sh -i), skipping")
-        return
+        print(f"ICs: no ics.hdf5 / snap_ics.hdf5 in {base} (download_snapshots.sh -i), nothing converted")
+        print('='*60)
+        return False
     print(f"Converting ICs: {raw} -> {output_file}")
+    partial = _partial(output_file)         # the converter opens 'w-': a stale one must be gone
     rc = subprocess.run([sys.executable, str(SCRIPT_DIR / "convert_ic_units.py"),
-                         str(raw), str(output_file)]).returncode
-    verified = rc == 0 and output_file.exists()
+                         str(raw), str(partial)]).returncode
+    verified = rc == 0 and partial.is_file()
+    if verified:                            # the final name only once the whole conversion succeeded
+        os.replace(partial, output_file)
+    else:
+        partial.unlink(missing_ok=True)
     if delete_chunks:
         _delete_chunks([raw], verified, "IC")
     if not verified:
-        print("  ICs conversion FAILED")
+        print("  ICs conversion FAILED: no combined_ics.hdf5 was written")
     print('='*60)
+    return verified
 
 
 def fix_units(base_dir):
@@ -539,22 +730,29 @@ def main():
     if do_snapshots or args.groupcats:
         print(f"Snapshots to process: {snapshots}")
 
+    failed = []                 # what asked for a merge and got no verified combined file
     if do_snapshots:
         for snapshot_num in snapshots:
             # h from the data itself when available; the CLI value is only a fallback
             first = Path(args.data_dir) / f"snapdir_{snapshot_num:03d}" / f"snap_{snapshot_num:03d}.0.hdf5"
             h_value = args.hubble
             if first.exists():
-                with h5py.File(first, "r") as f:
-                    h_value = float(f["Header"].attrs.get("HubbleParam", args.hubble))
-            merge_snapshot_files(
+                try:
+                    with _open_chunk(first) as f:
+                        h_value = float(f["Header"].attrs.get("HubbleParam", args.hubble))
+                except ChunkError as e:
+                    print(f"\n{'=' * 60}\nProcessing snapshot {snapshot_num:03d}\n{e}\n{'=' * 60}")
+                    failed.append(f"snapshot {snapshot_num:03d}")
+                    continue
+            if not merge_snapshot_files(
                 snapshot_num,
                 args.num_subfiles,
                 args.data_dir,
                 h_value,
                 DATASETS_INFO,
                 delete_chunks=args.delete_chunks
-            )
+            ):
+                failed.append(f"snapshot {snapshot_num:03d}")
 
         for single_file in SINGLE_FILES:
             convert_single_file(
@@ -565,14 +763,20 @@ def main():
 
     if args.groupcats:
         for snapshot_num in snapshots:
-            merge_groupcat_files(snapshot_num, args.data_dir, delete_chunks=args.delete_chunks)
+            if not merge_groupcat_files(snapshot_num, args.data_dir, delete_chunks=args.delete_chunks):
+                failed.append(f"group catalogue {snapshot_num:03d}")
     if args.trees:
-        merge_tree_files(args.data_dir, delete_chunks=args.delete_chunks, h_fallback=args.hubble)
+        if not merge_tree_files(args.data_dir, delete_chunks=args.delete_chunks, h_fallback=args.hubble):
+            failed.append("merger trees")
     if args.ics:
-        convert_ics(args.data_dir, delete_chunks=args.delete_chunks)
+        if not convert_ics(args.data_dir, delete_chunks=args.delete_chunks):
+            failed.append("initial conditions")
     if args.fix_units:
         fix_units(args.data_dir)
 
+    if failed:                  # the launcher and shell chains see a failed step, not a quiet 'Done!'
+        print(f"\nDone, with problems: no combined file for {', '.join(failed)}.")
+        sys.exit(1)
     print("\nDone!")
 
 

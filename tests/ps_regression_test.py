@@ -37,7 +37,7 @@ def analytic_pancake(amp):
     return x_hi - x_lo, x_lo, x_hi
 
 
-from ps_test_helpers import load
+from ps_test_helpers import load, binary as test_binary, require, DOUBLE, PRECISION
 
 load_field = load                            # scalar grid
 
@@ -343,18 +343,18 @@ def main():
                     help="(re)write the tracked-metric baseline and exit success")
     args = ap.parse_args()
 
-    binary = os.path.join(ROOT, "PS-DTFE")
+    binary = test_binary("PS-DTFE")
     os.makedirs(TMP, exist_ok=True)
     os.makedirs(REF_DIR, exist_ok=True)
     snap = os.path.join(TMP, "ps_regression.hdf5")
     out_root = os.path.join(TMP, "ps_regression_out")
 
     print("=" * 60)
-    print(" PS-DTFE regression test (analytic Zel'dovich pancake)")
+    print(f" PS-DTFE regression test (analytic Zel'dovich pancake)  precision={PRECISION}")
     print(f"   N={N}^3  grid={GRID}^3  box={BOX} Mpc  AMP={AMP}")
     print("=" * 60)
 
-    if not args.no_build:
+    if not args.no_build and not DOUBLE:
         # rebuild in the current GPU mode (o_ps/.build_mode records METAL=1;
         # a plain 'make PS-DTFE' would wipe o_ps and silently strip the GPU support)
         try:
@@ -362,8 +362,7 @@ def main():
         except OSError:
             mode = ""
         run(["make", "PS-DTFE"] + ([mode] if mode else []), cwd=ROOT)
-    if not (os.path.isfile(binary) and os.access(binary, os.X_OK)):
-        sys.exit(f"FAIL: '{binary}' not found; build it first (make PS-DTFE).")
+    require(binary)
 
     run([sys.executable, os.path.join(HERE, "generate_ps_test_data.py"),
          "--out", snap, "--n", str(N), "--box", str(BOX),

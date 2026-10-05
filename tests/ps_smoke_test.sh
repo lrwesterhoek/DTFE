@@ -18,19 +18,22 @@ PY="${PYTHON:-python3}"
 command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/python3.14
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT_DIR}"
+source "${SCRIPT_DIR}/precision.sh"     # DTFE_TEST_PRECISION=double: the double pair
 
 # Parameters (override via environment).
 N="${N:-32}"                 # particles per side (total N^3)
 GRID="${GRID:-64}"           # output grid per side (GRID^3)
 BOX="${BOX:-100.0}"          # box size in Mpc
 AMP="${AMP:-1.8}"            # Zel'dovich amplitude factor (>1 => shell crossing)
-BIN="${BIN:-./PS-DTFE}"
+BIN="${BIN:-${PS_BIN}}"
 TMP_DIR="${TMP_DIR:-${SCRIPT_DIR}/tmp}"
 INPUT_H5="${TMP_DIR}/ps_zeldovich.hdf5"
 OUT_ROOT="${TMP_DIR}/ps_out"
 
 DO_BUILD=1
 [ "${1:-}" = "--no-build" ] && DO_BUILD=0
+precision_double && DO_BUILD=0
+precision_require "${BIN}"
 
 echo "============================================================"
 echo " PS-DTFE smoke test"

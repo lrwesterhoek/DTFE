@@ -32,6 +32,7 @@
 #include "io/io.h"
 #include "interlacing.h"
 #include "ps_point_eval.h"
+#include "ps_globals_record.h"
 
 using namespace std;
 
@@ -39,11 +40,24 @@ using namespace std;
 char const *dtfeBuildRevision();
 char const *dtfeBuildTime();
 
+// the binary's file name (Makefile BIN_SUFFIX): a DIM=2 or DOUBLE=1 set carries its dimension and
+// precision in its name, e.g. PS-DTFE-2d-double
 #ifdef PHASE_SPACE
-static char const *const BINARY_NAME = "PS-DTFE";
+#define DTFE_BINARY_BASE "PS-DTFE"
 #else
-static char const *const BINARY_NAME = "DTFE";
+#define DTFE_BINARY_BASE "DTFE"
 #endif
+#if NO_DIM == 2
+#define DTFE_BINARY_DIM "-2d"
+#else
+#define DTFE_BINARY_DIM ""
+#endif
+#ifdef DOUBLE
+#define DTFE_BINARY_PRECISION "-double"
+#else
+#define DTFE_BINARY_PRECISION ""
+#endif
+static char const *const BINARY_NAME = DTFE_BINARY_BASE DTFE_BINARY_DIM DTFE_BINARY_PRECISION;
 
 
 // Reads options/input, runs the interpolation (with optional interlacing), writes output, prints a run summary.
@@ -82,7 +96,38 @@ int main( int argc, char *argv[] )
     phase << MESSAGE::banner("READING INPUT") << MESSAGE::Flush;
     vector<Particle_data> particles;
     vector<Sample_point> samplingCoordinates; // sampling coords for non-regular-grid interpolation
-    readInputData( &particles, &samplingCoordinates, &userOptions ); // may also set box dimensions / grid size
+    // --ps-window with a tessellation cache (the launcher's exact zoom): when the snapshot's particle-
+    // derived globals are recorded beside the cached partitions, start without reading the particles --
+    // DTFE() reads them late only if a partition the window needs is not cached (ps_globals_record.h)
+    bool particlesDeferred = false;
+#if defined(PHASE_SPACE) && NO_DIM==3
+    userOptions.psGlobalsKey = PSGlobals::key( userOptions );   // before the read changes the box's units
+    if ( PSGlobals::eligible( userOptions ) )
+    {
+        PSGlobals::Record rec;
+        if ( PSGlobals::read( userOptions, rec ) )
+        {
+            for (int i = 0; i < 2*NO_DIM; ++i)
+            {
+                userOptions.boxCoordinates.coords[i] = Real( rec.box[i] );
+                userOptions.psPresetLagBox.coords[i] = Real( rec.lagBox[i] );
+            }
+            if ( userOptions.hubbleParam < Real(0.) ) userOptions.hubbleParam = Real( rec.hubble );
+            if ( userOptions.scaleFactor < Real(0.) ) userOptions.scaleFactor = Real( rec.scaleFactor );
+            userOptions.averageDensity = Real( rec.averageDensity );
+            userOptions.psPresetN = rec.n;
+            userOptions.psParticlesDeferred = true;
+            particlesDeferred = true;
+            MESSAGE::Message message( userOptions.verboseLevel );
+            message << "Particles deferred: the globals of these " << rec.n << " particles (box, mean density, "
+                    << "initial-position bounding box) are recorded in '" << PSGlobals::path( userOptions )
+                    << "'; they are read only if a partition the window needs is not in the tessellation cache.\n"
+                    << MESSAGE::Flush;
+        }
+    }
+#endif
+    if ( not particlesDeferred )
+        readInputData( &particles, &samplingCoordinates, &userOptions ); // may also set box dimensions / grid size
 
 
 

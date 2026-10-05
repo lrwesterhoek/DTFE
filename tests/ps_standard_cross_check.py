@@ -22,7 +22,7 @@ VEL_MEDIAN_TOL = 1.0e-3
 DEN_PROFILE_TOL = 0.15
 
 
-from ps_test_helpers import load
+from ps_test_helpers import load, binary as test_binary, require, DOUBLE, PRECISION
 
 
 def run(cmd):
@@ -35,18 +35,18 @@ def main():
     ap.add_argument("--no-build", action="store_true")
     args = ap.parse_args()
     os.makedirs(TMP, exist_ok=True)
-    dtfe = os.path.join(ROOT, "DTFE")
-    psdtfe = os.path.join(ROOT, "PS-DTFE")
+    dtfe = test_binary("DTFE")
+    psdtfe = test_binary("PS-DTFE")
     snap = os.path.join(TMP, "ps_xcheck.hdf5")
     std_root = os.path.join(TMP, "xcheck_std")
     ps_root = os.path.join(TMP, "xcheck_ps")
 
     print("=" * 60)
-    print(" PS-DTFE vs standard-DTFE single-stream cross-check (Tier 4.3)")
+    print(f" PS-DTFE vs standard-DTFE single-stream cross-check (Tier 4.3)  precision={PRECISION}")
     print(f"   N={N}^3  grid={GRID}^3  box={BOX} Mpc  AMP={AMP}")
     print("=" * 60)
 
-    if not args.no_build:
+    if not args.no_build and not DOUBLE:
         # respect the current build mode of each build dir: a plain 'make' after a GPU build
         # (METAL=1) flips the mode stamp and silently strips the GPU support;
         # .build_mode records the make argument of the current mode
@@ -59,8 +59,7 @@ def main():
         run(make_cmd("DTFE", "o"))
         run(make_cmd("PS-DTFE", "o_ps"))
     for b in (dtfe, psdtfe):
-        if not (os.path.isfile(b) and os.access(b, os.X_OK)):
-            sys.exit(f"FAIL: '{b}' not built")
+        require(b)
 
     run([sys.executable, os.path.join(HERE, "generate_ps_test_data.py"),
          "--out", snap, "--n", str(N), "--box", str(BOX),

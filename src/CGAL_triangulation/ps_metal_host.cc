@@ -94,11 +94,12 @@ bool psGpuDepositFields(std::vector<float>& verts,
                           std::vector<float>& vels,
                           std::vector<float>& masses,
                           std::vector<float>& dens,
+                          std::vector<float>& scal,
                           const double boxLo[3], const double dx[3],
                           const size_t nGrid[3], const size_t subOrigin[3], const size_t subDims[3],
                           int nSub, bool periodic,
                           bool fVel, bool fDisp, bool fGrad, bool fLinear,
-                          bool fVolW, bool fCaustic, bool fExact,
+                          bool fVolW, bool fCaustic, bool fExact, bool fScal, bool fSGrad, bool windowMode,
                           PSGpuGrids& out, std::vector<uint32_t>& deferred, std::string& err)
 {
     std::lock_guard<std::mutex> lock(ctxMutex());   // serialize dispatches (single queue)
@@ -117,6 +118,8 @@ bool psGpuDepositFields(std::vector<float>& verts,
     bool   const fDispOwn   = fVolW && fDisp;   // dispersion keeps its own mass-weighted mean+normalizer
     size_t const dvBytes    = fDispOwn ? nCell * 12 : 4;
     size_t const dwBytes    = fDispOwn ? nCell * 4  : 4;
+    size_t const scalBytes  = fScal  ? nCell * 4  : 4;
+    size_t const sgBytes    = fSGrad ? nCell * 12 : 4;
     out.mass.assign(nCell, 0.f);
     out.mom.assign(fVel ? nCell * 3 : 0, 0.f);
     out.m2.assign(fDisp ? nCell * 6 : 0, 0.f);
@@ -127,6 +130,8 @@ bool psGpuDepositFields(std::vector<float>& verts,
     out.streamvol.assign(fExact ? nCell : 0, 0.f);
     out.dispvel.assign(fDispOwn ? nCell * 3 : 0, 0.f);
     out.dispw.assign(fDispOwn ? nCell : 0, 0.f);
+    out.scal.assign(fScal ? nCell : 0, 0.f);
+    out.sgrad.assign(fSGrad ? nCell * 3 : 0, 0.f);
     deferred.clear();
     if (masses.empty()) return true;    // nothing to deposit (empty partition)
     if (verts.size() != masses.size() * size_t(PS_TET_STRIDE))
@@ -154,6 +159,9 @@ bool psGpuDepositFields(std::vector<float>& verts,
     P.fCaustic = fCaustic ? 1 : 0;
     P.fExact   = fExact   ? 1 : 0;
     P.nTet     = uint32_t(masses.size());
+    P.fScal    = (fScal  && not scal.empty()) ? 1 : 0;
+    P.fSGrad   = (fSGrad && not scal.empty()) ? 1 : 0;
+    P.windowMode = windowMode ? 1 : 0;
 
     NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
 
@@ -188,6 +196,13 @@ bool psGpuDepositFields(std::vector<float>& verts,
                     ? c.dev->newBuffer(dens.data(), dens.size() * sizeof(float), MTL::ResourceStorageModeShared)
                     : zeroBuf(4);
     std::vector<float>().swap(dens);
+    // the per-tet vertex scalars (fScal / fSGrad); dummy otherwise, so its per-chunk offset is keyed
+    // on the vector being real, like 'dens'
+    bool const haveScal = not scal.empty();
+    MTL::Buffer* bSc = haveScal
+                     ? c.dev->newBuffer(scal.data(), scal.size() * sizeof(float), MTL::ResourceStorageModeShared)
+                     : zeroBuf(4);
+    std::vector<float>().swap(scal);
     MTL::Buffer* bP = c.dev->newBuffer(&P, sizeof(P), MTL::ResourceStorageModeShared);
     MTL::Buffer* bMass = zeroBuf(nCell * 4);
     MTL::Buffer* bMom  = zeroBuf(momBytes);
@@ -199,10 +214,12 @@ bool psGpuDepositFields(std::vector<float>& verts,
     MTL::Buffer* bSV    = zeroBuf(svBytes);
     MTL::Buffer* bDV    = zeroBuf(dvBytes);
     MTL::Buffer* bDW    = zeroBuf(dwBytes);
-    if (!bV || !bU || !bM || !bD || !bP || !bMass || !bMom || !bM2 || !bGrad || !bStr || !bMomW || !bCaust || !bSV || !bDV || !bDW)
+    MTL::Buffer* bScal  = zeroBuf(scalBytes);
+    MTL::Buffer* bSG    = zeroBuf(sgBytes);
+    if (!bV || !bU || !bM || !bD || !bSc || !bP || !bMass || !bMom || !bM2 || !bGrad || !bStr || !bMomW || !bCaust || !bSV || !bDV || !bDW || !bScal || !bSG)
     {
         err = "Metal buffer allocation failed (out of GPU-visible memory?)";
-        for (MTL::Buffer* b : {bV,bU,bM,bD,bP,bMass,bMom,bM2,bGrad,bStr,bMomW,bCaust,bSV,bDV,bDW}) if (b) b->release();
+        for (MTL::Buffer* b : {bV,bU,bM,bD,bSc,bP,bMass,bMom,bM2,bGrad,bStr,bMomW,bCaust,bSV,bDV,bDW,bScal,bSG}) if (b) b->release();
         pool->release();
         return false;
     }
@@ -289,7 +306,7 @@ bool psGpuDepositFields(std::vector<float>& verts,
     // depositFields over the tets [0,nT) of the given records. The grids are bound whole; the
     // per-tet buffers at the chunk's offset (P.nTet = chunk size, rewritten per chunk: safe, the
     // previous chunk completed).
-    auto runPerTet = [&](MTL::Buffer* vB, MTL::Buffer* uB, MTL::Buffer* mB, MTL::Buffer* dB, size_t nT) -> bool
+    auto runPerTet = [&](MTL::Buffer* vB, MTL::Buffer* uB, MTL::Buffer* mB, MTL::Buffer* dB, MTL::Buffer* sB, size_t nT) -> bool
     {
         return runChunked(c.pso, nT, baseChunk, MIN_CHUNK, [&](MTL::ComputeCommandEncoder* enc, size_t start, uint32_t n)
         {
@@ -310,6 +327,9 @@ bool psGpuDepositFields(std::vector<float>& verts,
             enc->setBuffer(bSV,   0, 12);
             enc->setBuffer(bDV,   0, 13);
             enc->setBuffer(bDW,   0, 14);
+            enc->setBuffer(sB,    haveScal ? start * 4 * sizeof(float) : 0, 18);
+            enc->setBuffer(bScal, 0, 19);
+            enc->setBuffer(bSG,   0, 20);
         });
     };
 
@@ -350,6 +370,12 @@ bool psGpuDepositFields(std::vector<float>& verts,
                 int64_t iLo = int64_t(ic0) + int64_t(flo);
                 int64_t iHi = int64_t(ic0) + int64_t(fhi) + 1;
                 if (!periodic) { iLo = std::max<int64_t>(iLo, 0); iHi = std::min<int64_t>(iHi, int64_t(nGrid[dd])); }
+                if (windowMode)
+                {   // the kernel's items cover the window's hull only (window_hull): bound that
+                    long hl = 0, hh = 0;
+                    if (!psWindowHull(long(iLo), long(iHi), long(nGrid[dd]), periodic, long(P.subOrigin[dd]), long(P.subDims[dd]), hl, hh)) { nw = 0; break; }
+                    iLo = hl; iHi = hh;
+                }
                 nw = iHi > iLo ? nw * uint64_t(iHi - iLo) : 0;
             }
             bound[t] = nw;
@@ -409,6 +435,9 @@ bool psGpuDepositFields(std::vector<float>& verts,
             enc->setBuffer(bItems, start * 2 * sizeof(uint32_t), 15);
             enc->setBuffer(bSumW, 0, 16);
             enc->setBytes(&IP, sizeof IP, 17);
+            enc->setBuffer(bSc,   0, 18);
+            enc->setBuffer(bScal, 0, 19);
+            enc->setBuffer(bSG,   0, 20);
         });
     };
 
@@ -438,22 +467,23 @@ bool psGpuDepositFields(std::vector<float>& verts,
             return b;
         };
         MTL::Buffer* lM = nullptr;
-        MTL::Buffer *lV = bV, *lU = bU, *lD = bD;
+        MTL::Buffer *lV = bV, *lU = bU, *lD = bD, *lS = bSc;
         if (compact)
         {
             lV = gather(bV, PS_TET_STRIDE);
             lU = haveVels ? gather(bU, 12) : zeroBuf(4);
             lM = gather(bM, 1);
             lD = haveDens ? gather(bD, 4) : zeroBuf(4);
+            lS = haveScal ? gather(bSc, 4) : zeroBuf(4);
         }
         else if ((lM = zeroBuf(nTetTotal * sizeof(float))))
         {
             float* lm = static_cast<float*>(lM->contents());
             for (uint32_t t : left) lm[t] = mb[t];
         }
-        bool ok = lV && lU && lM && lD;
+        bool ok = lV && lU && lM && lD && lS;
         if (!ok) lastErr = "Metal buffer allocation failed (exact-deposit leftovers)";
-        else ok = runPerTet(lV, lU, lM, lD, compact ? nL : nTetTotal);
+        else ok = runPerTet(lV, lU, lM, lD, lS, compact ? nL : nTetTotal);
         if (ok)
         {
             float const* lm = static_cast<float const*>(lM->contents());
@@ -464,7 +494,7 @@ bool psGpuDepositFields(std::vector<float>& verts,
             }
         }
         if (lM) lM->release();
-        if (compact) for (MTL::Buffer* b : {lV, lU, lD}) if (b) b->release();
+        if (compact) for (MTL::Buffer* b : {lV, lU, lD, lS}) if (b) b->release();
         return ok;
     };
 
@@ -483,6 +513,8 @@ bool psGpuDepositFields(std::vector<float>& verts,
         std::memset(bSV->contents(),    0, svBytes);
         std::memset(bDV->contents(),    0, dvBytes);
         std::memset(bDW->contents(),    0, dwBytes);
+        std::memset(bScal->contents(),  0, scalBytes);
+        std::memset(bSG->contents(),    0, sgBytes);
 
         if (useItems)
         {
@@ -490,7 +522,7 @@ bool psGpuDepositFields(std::vector<float>& verts,
             success = runItems(0) && runItems(1) && runLeftovers();
         }
         else
-            success = runPerTet(bV, bU, bM, bD, nTetTotal);
+            success = runPerTet(bV, bU, bM, bD, bSc, nTetTotal);
 
         if (!success)
         {
@@ -512,7 +544,7 @@ bool psGpuDepositFields(std::vector<float>& verts,
     if (!success)
     {
         err = lastErr;
-        for (MTL::Buffer* b : {bV,bU,bM,bD,bP,bMass,bMom,bM2,bGrad,bStr,bMomW,bCaust,bSV,bDV,bDW}) b->release();
+        for (MTL::Buffer* b : {bV,bU,bM,bD,bSc,bP,bMass,bMom,bM2,bGrad,bStr,bMomW,bCaust,bSV,bDV,bDW,bScal,bSG}) b->release();
         pool->release();
         return false;
     }
@@ -537,8 +569,10 @@ bool psGpuDepositFields(std::vector<float>& verts,
         std::memcpy(out.dispvel.data(), bDV->contents(), nCell * 12);
         std::memcpy(out.dispw.data(),   bDW->contents(), nCell * 4);
     }
+    if (fScal)  std::memcpy(out.scal.data(),  bScal->contents(), nCell * 4);
+    if (fSGrad) std::memcpy(out.sgrad.data(), bSG->contents(),   nCell * 12);
 
-    for (MTL::Buffer* b : {bV,bU,bM,bD,bP,bMass,bMom,bM2,bGrad,bStr,bMomW,bCaust,bSV,bDV,bDW}) b->release();
+    for (MTL::Buffer* b : {bV,bU,bM,bD,bSc,bP,bMass,bMom,bM2,bGrad,bStr,bMomW,bCaust,bSV,bDV,bDW,bScal,bSG}) b->release();
     pool->release();
     return true;
 }

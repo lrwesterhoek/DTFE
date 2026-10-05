@@ -36,7 +36,7 @@ N_SERIES = [16, 24, 32, 48]
 FINEST_TOL = 0.008
 
 
-from ps_test_helpers import make_cmd
+from ps_test_helpers import make_cmd, binary as test_binary, require, REAL, PRECISION
 
 
 def run(cmd):
@@ -55,7 +55,7 @@ def analytic_single_stream_profile(x, amp):
 
 
 def single_stream_error(den_path, grid, amp):
-    d = np.fromfile(den_path, dtype=np.float32).astype(np.float64).reshape(grid, grid, grid)
+    d = np.fromfile(den_path, dtype=REAL).astype(np.float64).reshape(grid, grid, grid)
     prof = d.mean(axis=(1, 2)) / d.mean()
     x = (np.arange(grid) + 0.5) / grid
     ana = analytic_single_stream_profile(x, amp)
@@ -68,17 +68,16 @@ def main():
     ap.add_argument("--no-build", action="store_true")
     args = ap.parse_args()
     os.makedirs(TMP, exist_ok=True)
-    binary = os.path.join(ROOT, "PS-DTFE")
+    binary = test_binary("PS-DTFE")
 
     print("=" * 60)
-    print(" PS-DTFE convergence test (Tier 4.4)")
+    print(f" PS-DTFE convergence test (Tier 4.4)  precision={PRECISION}")
     print(f"   grid={GRID}^3  box={BOX} Mpc  AMP={AMP}  N series={N_SERIES}")
     print("=" * 60)
 
-    if not args.no_build:
+    if not args.no_build and make_cmd():
         run(make_cmd())
-    if not (os.path.isfile(binary) and os.access(binary, os.X_OK)):
-        sys.exit(f"FAIL: '{binary}' not built")
+    require(binary)
 
     errors = []
     for n in N_SERIES:

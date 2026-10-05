@@ -168,7 +168,9 @@ void writeTextFile_gridIndex(std::vector<Real> &dataToWrite,
     openOutputTextFile( outputFile, filename );
 
 
-    size_t const *grid = &(userOptions.gridSize[0]);
+    size_t gridArr[NO_DIM];            // the grid the files hold: the --ps-window cells, else the full grid
+    userOptions.outputGridSize( gridArr );
+    size_t const *grid = gridArr;
     size_t totalGrid = 1;
     for (int d=0; d<NO_DIM; ++d) totalGrid *= grid[d];
     for (size_t flatIdx=0; flatIdx<totalGrid; ++flatIdx)
@@ -201,7 +203,9 @@ void writeTextFile_gridIndex(std::vector< Pvector<T,N> > &dataToWrite,
     openOutputTextFile( outputFile, filename );
 
 
-    size_t const *grid = &(userOptions.gridSize[0]);
+    size_t gridArr[NO_DIM];            // the grid the files hold: the --ps-window cells, else the full grid
+    userOptions.outputGridSize( gridArr );
+    size_t const *grid = gridArr;
     size_t totalGrid = 1;
     for (int d=0; d<NO_DIM; ++d) totalGrid *= grid[d];
     for (size_t flatIdx=0; flatIdx<totalGrid; ++flatIdx)
@@ -239,7 +243,9 @@ void writeTextFile_samplingPosition(std::vector<Real> &dataToWrite,
     openOutputTextFile( outputFile, filename );
 
 
-    size_t const *grid = &(userOptions.gridSize[0]);
+    size_t gridArr[NO_DIM];            // the grid the files hold: the --ps-window cells, else the full grid
+    userOptions.outputGridSize( gridArr );
+    size_t const *grid = gridArr;
     Box boxCoordinates = userOptions.region;    // boundaries of the box the fields were interpolated on
     Real dx[NO_DIM];
     for (size_t i=0; i<NO_DIM; ++i) dx[i] = (boxCoordinates[2*i+1]-boxCoordinates[2*i]) / grid[i];
@@ -277,7 +283,9 @@ void writeTextFile_samplingPosition(std::vector< Pvector<T,N> > &dataToWrite,
     openOutputTextFile( outputFile, filename );
 
 
-    size_t const *grid = &(userOptions.gridSize[0]);
+    size_t gridArr[NO_DIM];            // the grid the files hold: the --ps-window cells, else the full grid
+    userOptions.outputGridSize( gridArr );
+    size_t const *grid = gridArr;
     Box boxCoordinates = userOptions.region;    // boundaries of the box the fields were interpolated on
     Real dx[NO_DIM];
     for (size_t i=0; i<NO_DIM; ++i) dx[i] = (boxCoordinates[2*i+1]-boxCoordinates[2*i]) / grid[i];
@@ -322,7 +330,9 @@ void writeTextFile_redshiftConePosition(std::vector<Real> &dataToWrite,
     openOutputTextFile( outputFile, filename );
 
 
-    size_t const *grid = &(userOptions.gridSize[0]);
+    size_t gridArr[NO_DIM];            // the grid the files hold: the --ps-window cells, else the full grid
+    userOptions.outputGridSize( gridArr );
+    size_t const *grid = gridArr;
     Box coneCoordinates = userOptions.redshiftCone;    // redshift cone coordinates
     std::vector<Real> origin = userOptions.originPosition;// origin of the redshift cone
     Real dx[NO_DIM];
@@ -387,7 +397,9 @@ void writeTextFile_redshiftConePosition(std::vector< Pvector<T,N> > &dataToWrite
     openOutputTextFile( outputFile, filename );
 
 
-    size_t const *grid = &(userOptions.gridSize[0]);
+    size_t gridArr[NO_DIM];            // the grid the files hold: the --ps-window cells, else the full grid
+    userOptions.outputGridSize( gridArr );
+    size_t const *grid = gridArr;
     Box coneCoordinates = userOptions.redshiftCone;    // redshift cone coordinates
     std::vector<Real> origin = userOptions.originPosition;// origin of the redshift cone
     Real dx[NO_DIM];

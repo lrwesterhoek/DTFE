@@ -101,7 +101,7 @@ struct Quantities
     // cellVolume * averageDensity so the per-cell mass is reconstructed from the summed
     // (rho/rho_bar) density; 0 keeps the historical mass_weight-only behaviour.
     void normalizePhaseSpace(Field const &field, Real const weightFromDensityScale = Real(0.));
-    void addFromSubgrid(Quantities const &other, size_t const *fullGrid); // like addFrom but 'other' stores only its Eulerian box; maps each cell into the full grid (dims fullGrid)
+    void addFromSubgrid(Quantities const &other, size_t const *fullGrid, size_t const *mainOrigin = nullptr, size_t const *mainDims = nullptr);   // mainOrigin/mainDims: this grid is itself a window of the full grid (--ps-window) // like addFrom but 'other' stores only its Eulerian box; maps each cell into the full grid (dims fullGrid)
     void finalizeHiddenStreams();   // after the merge: clear '.hidden_streams' bit 1 where '.streams' reads multi-stream (idempotent)
 #endif
 };

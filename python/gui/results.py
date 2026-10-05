@@ -17,6 +17,7 @@ and the GUI's custom-snapshot jobs, followed (macOS) by '/usr/bin/time -l'.
 from __future__ import annotations
 
 import datetime as _dt
+import math
 import re
 import shutil
 import statistics
@@ -31,7 +32,7 @@ _WALL = re.compile(r"total wall time\s*:\s*((?:\d+h\s*)?(?:\d+m\s*)?(?:[\d.]+s)?
 _RSS = re.compile(r"peak memory \(RSS\)\s*:\s*([\d.]+)\s*GB")
 _FOOTPRINT = re.compile(r"^\s*(\d+)\s+peak memory footprint", re.M)
 _GRID = re.compile(r"--grid (\d+)")
-_PARTITION = re.compile(r"--partition (\d+) (\d+) (\d+)")
+_PARTITION = re.compile(r"--partition (\d+) (\d+)(?: (\d+))?")    # a 2D run's split has two numbers
 _CONC = re.compile(r"--max-concurrent (\d+)")
 _NSUB = re.compile(r"--avg-subsamples (\d+)")
 _FIELDS = re.compile(r"--field ((?:(?!--)\S+\s*)+)")
@@ -60,11 +61,12 @@ class RunRecord:
     sim: str = ""                   # "" for a custom-snapshot run
     snap: int | None = None
     prefix: str = ""
-    binary: str = ""                # PS-DTFE | DTFE ("" when unknown)
+    binary: str = ""                # PS-DTFE | DTFE (-2d, -double; "" when unknown)
     command: str = ""               # the RUNNING line (paths unquoted, as the binary printed it)
     build_rev: str = ""
     build_time: _dt.datetime | None = None
     finished: _dt.datetime | None = None   # the log's modification time = when the run ended
+    gpu_retried: bool = False       # the GPU deposit was restarted after a watchdog kill (the log says so)
     wall_seconds: float | None = None
     peak_rss_gb: float | None = None
     footprint_gb: float | None = None
@@ -78,7 +80,17 @@ class RunRecord:
 
     @property
     def estimator(self) -> str:
-        return "ps" if self.binary == "PS-DTFE" else "dtfe" if self.binary == "DTFE" else ""
+        return "ps" if self.binary.startswith("PS-DTFE") else "dtfe" if self.binary.startswith("DTFE") else ""
+
+    @property
+    def precision(self) -> str:
+        """'double' for the DTFE-double / PS-DTFE-double pair (their Build line names it), else 'single'."""
+        return "double" if self.binary.endswith("-double") else "single"
+
+    @property
+    def dim(self) -> int:
+        """2 for the 2D programs (DTFE-2d, PS-DTFE-2d[-double]), else 3."""
+        return 2 if "-2d" in self.binary else 3
 
     @property
     def grid(self) -> int | None:
@@ -88,7 +100,7 @@ class RunRecord:
     @property
     def partitions(self) -> int:
         m = _PARTITION.search(self.command)
-        return int(m.group(1)) * int(m.group(2)) * int(m.group(3)) if m else 1
+        return math.prod(int(g) for g in m.groups() if g) if m else 1
 
     @property
     def partition(self) -> int:
@@ -148,15 +160,19 @@ class RunRecord:
                 bits.append("caustics")
         if self.gpu:
             bits.append("GPU")
+        if self.precision == "double":
+            bits.append("double")
         if self.partitions > 1:
-            bits.append(f"{self.partition}³ partitions")
+            bits.append(f"{self.partition}{'²' if self.dim == 2 else '³'} partitions")
+        if self.dim == 2:
+            bits.append("2D")
         if self.sliced:
             bits.append("slice")
         return ", ".join(bits)
 
     def settings(self) -> dict:
         """The Grids-tab (RunSpec) settings this run used, as far as its command shows them."""
-        d = {"estimator": self.estimator or "ps", "gpu": self.gpu}
+        d = {"estimator": self.estimator or "ps", "gpu": self.gpu, "precision": self.precision}
         if self.grid:
             d["grid"] = self.grid
         if self.estimator == "ps":
@@ -196,7 +212,13 @@ def parse_runlog(path: Path, sim: str = "", snap: int | None = None) -> RunRecor
     if m:
         rec.command = m.group(1).strip()
         exe = rec.command.split()[0] if rec.command else ""
-        rec.binary = rec.binary or ("PS-DTFE" if exe.endswith("PS-DTFE") else "DTFE" if exe.endswith("DTFE") else "")
+        if not rec.binary:
+            for name in ("PS-DTFE-2d-double", "DTFE-2d-double", "PS-DTFE-2d", "DTFE-2d",
+                         "PS-DTFE-double", "DTFE-double", "PS-DTFE", "DTFE"):
+                if exe.endswith(name):
+                    rec.binary = name
+                    break
+    rec.gpu_retried = "retrying the deposit from scratch" in text
     m = _WALL.search(text)
     rec.wall_seconds = parse_duration(m.group(1)) if m else None
     m = _RSS.search(text)
@@ -305,12 +327,23 @@ KNOWN_FIXES: tuple[Fix, ...] = (
         "their whole mass to the part inside, so face cells read up to 3x too dense and tetrahedra spanning "
         "many cells biased the interior too (fixed 2026-09-30): regenerate",
         lambda r: r.estimator == "ps" and not r.has("--periodic") and r.has("--box")),
+    Fix("dtfe-gpu-retry", "2026-10-01T15:43", "warning",
+        "a standard-DTFE GPU run whose deposit was restarted after the GPU watchdog killed a pass: the "
+        "killed pass's atomics could still land after the grids were re-zeroed, a whole extra sample in "
+        "sparse cells (up to 2% of the velocity peak; fixed 2026-10-01, and the new kernel never "
+        "restarts): regenerate",
+        lambda r: r.estimator == "dtfe" and r.gpu and r.gpu_retried),
     Fix("alpha-shape", "2026-09-30T21:15", "warning",
         "a non-periodic run: the flat slivers on the cloud's convex hull (particles a whole face apart) "
         "put spurious mass and streams across the grid, and differed between partitions, so split and "
         "auto-tuned runs disagreed with one triangulation at the partition seams. The Lagrangian domain "
         "is now the cloud's alpha shape (fixed 2026-09-30): regenerate",
         lambda r: r.estimator == "ps" and not r.has("--periodic")),
+    Fix("interlace-phase", "2026-10-02T23:30", "error",
+        "an interlaced grid: the half-cell phase correction used the raw FFT index, so every Fourier mode "
+        "negative along exactly one axis was shifted the wrong way (a band-limited field came back 31% "
+        "off; fixed 2026-10-02): regenerate",
+        lambda r: r.has("--interlace")),
 )
 
 
