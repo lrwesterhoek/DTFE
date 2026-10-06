@@ -323,8 +323,21 @@ class SetupDialog(QDialog):
             lambda: self.build_log.appendPlainText(
                 bytes(self._build.readAllStandardOutput()).decode(errors="replace").rstrip()))
         self._build.finished.connect(self._build_done)
+        self._build.errorOccurred.connect(self._build_error)
         self.build_btn.setEnabled(False)
         self._build.start(cmd[0], cmd[1:])
+
+    def _build_error(self, err):
+        """'finished' never comes for a program that cannot start (no make on a fresh machine): say so and
+        free the button (before 2026-10-06 it stayed disabled for good)."""
+        if err != QProcess.FailedToStart or self._build is None:
+            return
+        self.build_log.appendPlainText(f"cannot start {self._build.program()}: {self._build.errorString()} "
+                                       "(install the Xcode command-line tools: xcode-select --install)")
+        self._build_queue = []
+        self._build = None
+        self.build_btn.setEnabled(True)
+        self._programs()
 
     def _build_done(self, code, _status):
         self.build_log.appendPlainText(f"make finished with exit code {code}")

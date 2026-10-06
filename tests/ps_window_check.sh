@@ -23,7 +23,7 @@ precision_require "$PS_BIN"
 [ -x "$PS_BIN" ] || { echo "FAIL: $PS_BIN is not built"; exit 1; }
 OBJ_PS=o_ps; precision_double && OBJ_PS=o_ps_d     # the build whose GPU mode counts
 GPU=0; [ -d $OBJ_PS ] && [ ! -f $OBJ_PS/.gpu_mode_off ] && ls $OBJ_PS/.gpu_mode_* >/dev/null 2>&1 && GPU=1
-TMP="$ROOT/tests/tmp/window_check"
+TMP="${DTFE_TEST_TMP:-${TMPDIR:-/tmp}/dtfe-tests}/window_check"
 mkdir -p "$TMP"
 SNAP="$TMP/waves.hdf5"
 [ -f "$SNAP" ] || "$PY" tests/generate_ps_test_data.py --out "$SNAP" --n 32 --box 100 --seed 9 --crossed-waves >/dev/null || { echo "FAIL data gen"; exit 1; }

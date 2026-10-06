@@ -19,7 +19,7 @@ precision_require "${BIN}"
 if [ "${1:-}" != "--no-build" ] && ! precision_double; then
     make PS-DTFE $(cat o_ps/.build_mode 2>/dev/null || true) >/dev/null
 fi
-TMP="$ROOT/tests/tmp/serve_split"; rm -rf "$TMP"; mkdir -p "$TMP"
+TMP="${DTFE_TEST_TMP:-${TMPDIR:-/tmp}/dtfe-tests}/serve_split"; rm -rf "$TMP"; mkdir -p "$TMP"
 echo "============================================================"
 echo " composite server split check"
 echo "============================================================"

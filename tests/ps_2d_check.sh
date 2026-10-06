@@ -52,8 +52,11 @@ if [ "${1:-}" != "--no-build" ]; then
     echo ">> building PS-DTFE-2d and DTFE-2d (make ... DIM=2) ..."
     make PS-DTFE DTFE DIM=2 -j4 >/dev/null || { echo "FAIL: the 2D build"; exit 1; }
 fi
-for b in ./PS-DTFE-2d ./DTFE-2d; do [ -x "$b" ] || { echo "SKIP: $b is not built (make PS-DTFE DTFE DIM=2)"; exit 0; }; done
-TMP="$ROOT/tests/tmp/ps_2d"
+# (this suite does not source precision.sh: the 2D pair is its own) a missing pair is a skip, or a failure when
+# the stage requires it (DTFE_TEST_REQUIRED=1, ci_suite.sh's 2d stage after building it)
+skip_or_fail() { if [ "${DTFE_TEST_REQUIRED:-0}" = "1" ]; then echo "FAIL (required): $*" >&2; exit 1; fi; echo "SKIP: $*"; exit 0; }
+for b in ./PS-DTFE-2d ./DTFE-2d; do [ -x "$b" ] || skip_or_fail "$b is not built (make PS-DTFE DTFE DIM=2)"; done
+TMP="${DTFE_TEST_TMP:-${TMPDIR:-/tmp}/dtfe-tests}/ps_2d"
 mkdir -p "$TMP"
 CACHE="${TMPDIR:-/tmp}/dtfe-2d-cache"; rm -rf "$CACHE"; mkdir -p "$CACHE"
 GEN() { "$PY" tests/generate_ps_test_data.py --dim 2 "$@" >/dev/null || { echo "FAIL data gen $*"; exit 1; }; }

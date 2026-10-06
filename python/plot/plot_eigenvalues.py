@@ -34,12 +34,12 @@ SLICE_PLANES = config.SLICE_PLANES
 
 
 def visualize_eigenvalue_slice(eigenvalue_slice, field_name, slice_dim, box_size, redshift=None,
-                               save_path=None, colormap=style.CMAP['divergence']):
+                               save_path=None, colormap=style.CMAP['divergence'], sim=None):
     extent = [0, box_size, 0, box_size]
 
     norm = style.norm_signed_log(
         data=eigenvalue_slice, field='eigenvalue',
-        vmax=pipeline.series_vmax('eigenvalue', eigenvalue_slice))
+        vmax=pipeline.series_vmax('eigenvalue', eigenvalue_slice, sim=sim))   # this simulation's series limits
 
     fig, ax = plt.subplots(figsize=(8, 7))
     im = ax.imshow(eigenvalue_slice.T, origin='lower', cmap=colormap,
@@ -106,27 +106,27 @@ def process_snapshot(snapshot, redshift, sim, method, prefix=None, data_root=Non
             derived_fields = {'trace': es['trace'], 'determinant': es['det']}
 
             visualize_eigenvalue_slice(
-                lambda1_slice, "λ₁ (Smallest Eigenvalue)", slice_dim, box_size, redshift=redshift,
+                lambda1_slice, "λ₁ (Smallest Eigenvalue)", slice_dim, box_size, redshift=redshift, sim=sim,
                 save_path=plane_dir / f"lambda1_{plane_name}_z{redshift:.2f}.png"
             )
 
             visualize_eigenvalue_slice(
-                lambda2_slice, "λ₂ (Middle Eigenvalue)", slice_dim, box_size, redshift=redshift,
+                lambda2_slice, "λ₂ (Middle Eigenvalue)", slice_dim, box_size, redshift=redshift, sim=sim,
                 save_path=plane_dir / f"lambda2_{plane_name}_z{redshift:.2f}.png"
             )
 
             visualize_eigenvalue_slice(
-                lambda3_slice, "λ₃ (Largest Eigenvalue)", slice_dim, box_size, redshift=redshift,
+                lambda3_slice, "λ₃ (Largest Eigenvalue)", slice_dim, box_size, redshift=redshift, sim=sim,
                 save_path=plane_dir / f"lambda3_{plane_name}_z{redshift:.2f}.png"
             )
 
             visualize_eigenvalue_slice(
-                derived_fields['trace'], "Trace (∇²δ)", slice_dim, box_size, redshift=redshift,
+                derived_fields['trace'], "Trace (∇²δ)", slice_dim, box_size, redshift=redshift, sim=sim,
                 save_path=plane_dir / f"trace_{plane_name}_z{redshift:.2f}.png"
             )
 
             visualize_eigenvalue_slice(
-                derived_fields['determinant'], "Determinant", slice_dim, box_size, redshift=redshift,
+                derived_fields['determinant'], "Determinant", slice_dim, box_size, redshift=redshift, sim=sim,
                 save_path=plane_dir / f"determinant_{plane_name}_z{redshift:.2f}.png"
             )
 

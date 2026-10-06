@@ -8,8 +8,10 @@ outputs, time estimates and failure advice (results.py), presets and the binary'
 Usage: python3 tests/py_gui_runspec_test.py
 """
 
+import atexit
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -17,6 +19,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "python" / "gui"))
+FIGS_TMP = tempfile.mkdtemp(prefix="runspec_figs_")
+os.environ["DTFE_FIGURES_ROOT"] = FIGS_TMP      # BEFORE runspec is imported: never the real root (the T7)
+atexit.register(shutil.rmtree, FIGS_TMP, True)
 
 import runspec as rs  # noqa: E402
 
@@ -204,6 +209,20 @@ def main():
               by["plot_halo_tracking.py"][0][-3:] == ["--subhalo", "0", "17"], str(by["plot_halo_tracking.py"]))
         check("thesis set: analyze.py all, zero-padded snapshots, --only",
               by["analyze.py"] == [["all", "004", "099", "--only", "plot_DTFE.py"]], str(by["analyze.py"]))
+        spec_e = rs.PlotSpec.from_dict(dict(spec.to_dict(), sets=["thesis"], options={"thesis": {"mode": "export", "only": "plot_DTFE.py"}}))
+        argv_e = [st.argv for st in spec_e.steps()]
+        check("thesis set, mode 'export': analyze.py export with the snapshots and no --only (2026-10-05)",
+              [a[a.index("export"):] for a in argv_e if "export" in a] == [["export", "004", "099"]], str(argv_e))
+        thesis_grids_warning()
+        tick_helpers()
+        run_outputs_not_inputs()
+        run_options(tmp)
+        audit_claims()
+        cube_cap()
+        point_window_linear(tmp)
+        plane_reads()
+        plot_options(tmp)
+        explore_extras(tmp)
         check("every plot step sets DTFE_SIM and MPLBACKEND=Agg (several scripts call plt.show())",
               all(stp.env["DTFE_SIM"] == "TNG100-3-Dark" and stp.env["MPLBACKEND"] == "Agg"
                   for stp in every.steps()))
@@ -417,11 +436,100 @@ def main():
         cube_cache_2026_10_06()
         type_labels_2026_10_06()
         launcher_fixes()
+        figures_root_rule()
     finally:
         shutil.rmtree(tmp.parent)
     print("-" * 60)
     print(f"RESULT: {len(PASS)} passed, {len(FAIL)} failed")
     return 1 if FAIL else 0
+
+
+def tick_helpers():
+    """The Explore map's axes and colour bar (survey items 12, 13): round ticks, their labels, the scale bar."""
+    import numpy as np
+    import grids as G
+    t = G.nice_ticks(0, 51.67)
+    check("axis ticks: round values inside the range, about five (0 .. 51.7 Mpc: every 10)", t == [0, 10, 20, 30, 40, 50], str(t))
+    t = G.nice_ticks(-6.46, 6.46)
+    check("... a 2.5 step keeps its decimal ('2' for 2.5 would be wrong)",
+          [G.tick_text(v, t) for v in t] == ["-5.0", "-2.5", "0.0", "2.5", "5.0"], str(t))
+    check("... a degenerate range has none", G.nice_ticks(1, 1) == [] and G.nice_ticks(0, float("nan")) == [])
+    check("... an axis in cells keeps to whole steps (a 16-cell grid: 0, 5, 10, 15, not 2.5 apart; 4 cells: every one)",
+          G.nice_ticks(0, 16, integer=True) == [0, 5, 10, 15] and G.nice_ticks(0, 4, integer=True) == [0, 1, 2, 3, 4]
+          and G.nice_ticks(0, 16) == [0, 2.5, 5, 7.5, 10, 12.5, 15], str(G.nice_ticks(0, 16)))
+    t = G.nice_ticks(120, 120.004)
+    check("... a deep zoom far from the origin keeps the labels apart (not five '120')",
+          [G.tick_text(v, t) for v in t] == ["120.000", "120.001", "120.002", "120.003", "120.004"], str(t))
+    z = np.zeros((64, 64))
+    z[3, 4], z[10, 10] = 0.1, -0.05                 # two runs that agree in all but two cells
+    check("a 0-centred range of a difference that is 0 almost everywhere: its largest value, not (0, 1) "
+          "(which painted the whole map the scale's end)",
+          G.value_range(z, symmetric=True) == (-0.1, 0.1) and G.value_range(np.zeros((4, 4)), symmetric=True) == (-1.0, 1.0),
+          str(G.value_range(z, symmetric=True)))
+    check("the scale bar: a round length near a fifth of the width",
+          [G.nice_length(s) for s in (110.7, 51.6, 6.5)] == [20.0, 10.0, 1.0])
+    dec = G.colorbar_ticks(-1.2, 3.7, log=True)
+    check("a log colour bar over several decades: 10^k at the whole decades",
+          [tx for _, tx in dec] == ["10⁻¹", "1", "10", "10²", "10³"] and [v for v, _ in dec] == [-1, 0, 1, 2, 3], str(dec))
+    few = G.colorbar_ticks(np.log10(0.0249), np.log10(7.58), log=True)
+    check("... under three decades: 1, 2, 5 x 10^k as numbers",
+          [tx for _, tx in few] == ["0.05", "0.1", "0.2", "0.5", "1", "2", "5"], str(few))
+
+
+def thesis_grids_warning():
+    """Review 2026-10-05 [37]: the Thesis analysis set warns when a snapshot has no standard-DTFE grids in the modes
+    that READ them -- all, compute and export (analyze.export builds its FieldSet from the grids, like compute) --
+    and not in plot / check (they read python/cache). Phase-space grids do not count: compute reads the standard
+    DTFE. Its own data root: an empty snapdir_099, then PS grids only, then a standard-DTFE run. The estimator and
+    grid prefix the user set for the OTHER sets do not count either: the thesis step passes analyze.py neither."""
+    root = Path(tempfile.mkdtemp(prefix="gui_thesis_"))
+    try:
+        sd = root / "TNG100" / "TNG100-3-Dark" / "snapdir_099"
+        sd.mkdir(parents=True)
+        (sd.parent / "snapdir_050").mkdir()              # stays empty: the two-snapshot spec names it every time
+
+        def warned(snaps=(99,), **kw):
+            got, errs, msgs = set(), [], set()
+            for mode in ("all", "compute", "export", "plot", "check"):
+                spec = rs.PlotSpec(data_root=str(root), sim="TNG100-3-Dark", snapshots=list(snaps), sets=["thesis"],
+                                   options={"thesis": {"mode": mode}}, **kw)
+                probs = spec.problems()
+                errs += [m for lvl, m in probs if lvl == "error"]      # an error returns early: the warning never runs
+                hit = [m for lvl, m in probs if lvl == "warning" and "no standard-DTFE grids for" in m]
+                if [m for m in hit if "no standard-DTFE grids for 099" in m or len(snaps) > 1]:
+                    got.add(mode)
+                msgs.update(hit)
+            return got, errs, msgs
+
+        other = dict(method="ps", prefix="ps_output")    # the PS-DTFE choice for the other sets, on a PS run that exists
+        empty, e0, _ = warned()
+        two_empty, e3, m3 = warned((50, 99))
+        (sd / "ps_output.a_den").touch()
+        ps_only, e1, _ = warned()
+        ps_other, e4, _ = warned(**other)
+        (sd / "output.a_den").touch()
+        std, e2, _ = warned()
+        std_other, e5, _ = warned(**other)
+        two_std, e6, m6 = warned((50, 99))
+        check("thesis set: no standard-DTFE grids for 099 is warned in modes all, compute AND export, not in plot / check "
+              "(they read the cache)", empty == {"all", "compute", "export"} and not e0, f"{sorted(empty)} {e0}")
+        check("... phase-space grids alone do not count (compute and export read the standard DTFE)",
+              ps_only == {"all", "compute", "export"} and not e1, f"{sorted(ps_only)} {e1}")
+        check("... and a standard-DTFE run silences it in every mode", std == set() and not e2, f"{sorted(std)} {e2}")
+        # analyze.py gets no --method / --prefix: a PS estimator and prefix set for the other sets (that run exists
+        # here) must not silence it, nor make the standard-DTFE run count as missing
+        check("... the estimator and grid prefix set for the other sets change nothing (analyze.py takes neither): "
+              "PS-DTFE / ps_output still warned, the standard-DTFE run still silences it",
+              ps_other == {"all", "compute", "export"} and std_other == set() and not (e4 + e5),
+              f"{sorted(ps_other)} {sorted(std_other)} {e4 + e5}")
+        # every snapshot without them is named, and only those: 050 stays empty, 099 gets its run in between
+        check("... two snapshots: the warning names every one without them ('050 099'), then only 050 once 099 has its run",
+              two_empty == two_std == {"all", "compute", "export"} and not (e3 + e6)
+              and len(m3) == 1 and next(iter(m3)).endswith("grids for 050 099")
+              and len(m6) == 1 and next(iter(m6)).endswith("grids for 050"),
+              f"{sorted(two_empty)} {m3} {sorted(two_std)} {m6} {e3 + e6}")
+    finally:
+        shutil.rmtree(root)
 
 
 def _write_log(path: Path, text: str, mtime: float | None = None):
@@ -629,7 +737,7 @@ def new_features(tmp: Path, sim: Path):
     check("parsed: build stamp, grid, partitions, GPU, wall time, RSS, footprint, fields, outputs",
           r0.binary == "PS-DTFE" and r0.build_rev == "308f08a-dirty" and r0.build_time is not None
           and r0.grid == 512 and r0.partitions == 125 and r0.partition == 5 and r0.max_concurrent == 3
-          and r0.gpu and r0.wall_seconds == 3723 and r0.peak_rss_gb == 47.24 and abs(r0.footprint_gb - 97.19) < 0.01
+          and r0.gpu and r0.wall_seconds == 3723 and r0.peak_rss_gb == 47.24 and abs(r0.footprint_gb - 90.51) < 0.01
           and r0.fields == ["density_a", "velocity_a"] and r0.ok
           and {p.name for p in r0.outputs} >= {"ps_output.a_den", "ps_output.a_streams", "ps_output.a_vel"}
           and not any(p.suffix == ".runlog" for p in r0.outputs)
@@ -1048,6 +1156,274 @@ def two_d(tmp: Path):
           f"{old} | {new}")
 
 
+def run_outputs_not_inputs():
+    """A custom run named after its input (the default) in the input's own folder: 'X.hdf5' beside 'X.a_den'.
+    The input is never one of the run's outputs -- the Runs browser's Move to Trash takes the outputs."""
+    import json
+    import results as R
+    d = Path(tempfile.mkdtemp(prefix="gui_runs_"))
+    try:
+        for name in ("X.hdf5", "X.a_den", "X.den", "X.txt", "Y.txt", "r[1].a_den", "r1.a_den"):
+            (d / name).write_bytes(b"\0" * 8)
+        (d / "X.gui.json").write_text(json.dumps({"input_file": str(d / "X.hdf5")}))
+        (d / "X.runlog").write_text(f"RUNNING: /x/PS-DTFE {d / 'X.hdf5'} X --grid 16\ntotal wall time : 1s\n")
+        (d / "Y.runlog").write_text(f"RUNNING: /x/DTFE {d / 'Y.txt'} Y --grid 16\ntotal wall time : 1s\n")
+        (d / "r[1].runlog").write_text("RUNNING: /x/DTFE in.hdf5 r[1] --grid 16\ntotal wall time : 1s\n")
+        names = lambda log: [p_.name for p_ in R.parse_runlog(d / log).outputs]          # noqa: E731
+        check("a run's outputs never include its input snapshot, nor a file its command line reads (Move to Trash)",
+              names("X.runlog") == ["X.a_den", "X.den", "X.txt"] and names("Y.runlog") == [],
+              f"{names('X.runlog')} {names('Y.runlog')}")
+        check("... and a prefix with '[' matches only its own files", names("r[1].runlog") == ["r[1].a_den"],
+              str(names("r[1].runlog")))
+        sp = d / "My Runs"                    # the log prints paths unquoted: a space must not hide an input
+        sp.mkdir()
+        for name in ("halo.hdf5", "halo.pts", "halo.a_den"):
+            (sp / name).write_bytes(b"\0" * 8)
+        (sp / "halo.runlog").write_text(f"RUNNING: /x/PS-DTFE {sp / 'halo.hdf5'} {sp / 'halo'} --sample-points "
+                                        f"{sp / 'halo.pts'} --grid 16\ntotal wall time : 1s\n")
+        got = [p_.name for p_ in R.parse_runlog(sp / "halo.runlog").outputs]
+        check("... nor an input in a folder whose path has a space (the sample-points file of 'My Runs/halo')",
+              got == ["halo.a_den"], str(got))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def point_window_linear(tmp: Path):
+    """Sample points for Custom and standard-DTFE runs, the PS window, the linear deposit (audit items 14 + the
+    binary options, 2026-10-06)."""
+    pts = tmp / "pts.txt"
+    pts.write_text("1 2 3\n4 5 6\n")
+    snap = tmp / "TNG100" / "TNG100-3-Dark" / "snapdir_099" / "combined_099.hdf5"
+    c = rs.CustomSpec(input_file=str(snap), sample_points=str(pts), window=[0, 10, 0, 10, 0, 1], linear_deposit=True,
+                      volume_weighted=False)
+    a = c.command()
+    check("a Custom run: --sample-points (+ the velocity gradient), the PS window, the linear deposit",
+          a[a.index("--sample-points") + 1] == str(pts) and "--pts-vel-grad" in a and "--ps-linear-deposit" in a
+          and a[a.index("--ps-window") + 1:a.index("--ps-window") + 7] == ["0", "10", "0", "10", "0", "1"], str(a))
+    errs = lambda spec: [m for lv, m in spec.problems() if lv == "error"]            # noqa: E731
+    dt = rs.CustomSpec(input_file=str(snap), estimator="dtfe", sample_points=str(pts), partition=2, window=[0, 1, 0, 1, 0, 1])
+    webw = rs.CustomSpec(input_file=str(snap), fields=["density_a", "tweb_a"], window=[0, 1, 0, 1, 0, 1])
+    both = rs.CustomSpec(input_file=str(snap), linear_deposit=True, volume_weighted=True)
+    bad = rs.CustomSpec(input_file=str(snap), window=[float("nan")])
+    notes = [m for lv, m in dt.problems() if lv == "info"]
+    check("... refused where the binary would refuse: standard DTFE points with an explicit split, a window with a web "
+          "class, linear + volume weighting, an unreadable window; a window left from PS-DTFE is ignored by a "
+          "standard-DTFE run (a note, not a block: its field is greyed there)",
+          any("ONE triangulation" in m for m in errs(dt)) and not any("window" in m for m in errs(dt))
+          and any("ignores it" in m for m in notes)
+          and any("whole periodic grid" in m for m in errs(webw)) and any("linear deposit" in m for m in errs(both))
+          and any("window needs 6 numbers" in m for m in errs(bad)), f"{errs(dt)} {errs(webw)} {errs(both)} {errs(bad)}")
+    base = dict(data_root=str(tmp), sim="TNG100-3-Dark", snapshots=[99])
+    env = rs.RunSpec(estimator="dtfe", slice_plane=str(pts), **base).command()[1]
+    lin = rs.RunSpec(linear_deposit=True, volume_weighted=False, **base).command()[1]
+    check("the Grids job: a hi-res slice for standard DTFE too (SAMPLE_POINTS), PS_LINEAR_DEPOSIT spelled out",
+          env.get("SAMPLE_POINTS") == str(pts) and lin.get("PS_LINEAR_DEPOSIT") == "1"
+          and rs.RunSpec(**base).command()[1].get("PS_LINEAR_DEPOSIT") == "0", f"{env} {lin}")
+    nodt = [m for lv, m in rs.CustomSpec(input_file=str(snap), estimator="dtfe", fields=["dispersion_a"]).problems()
+            if lv == "error"]
+    check("a Custom standard-DTFE run with only the dispersion ticked is refused (it would pass a bare --field)",
+          any("no field standard DTFE computes" in m for m in nodt), str(nodt))
+    sp = rs.RunSpec(estimator="dtfe", slice_plane=str(pts), partition=2, **base).problems()
+    check("... a standard-DTFE slice with an explicit partition is an error (one triangulation)",
+          any(lv == "error" and "ONE triangulation" in m for lv, m in sp), str(sp))
+
+
+def plot_options(tmp: Path):
+    """The Plots tab: the thesis scripts as a checklist (= analyze.py's PLOT_SCRIPTS + the synthesis figure),
+    the point-eval gradient smoothing, the publication panels' range, dpi and pixel-exact images (2026-10-06)."""
+    import ast
+    import re
+    repo = Path(__file__).resolve().parents[1]
+    tree = ast.parse((repo / "python" / "analyze.py").read_text())
+    core = next(ast.literal_eval(n.value) for n in tree.body if isinstance(n, ast.Assign)
+                and any(getattr(t, "id", "") == "PLOT_SCRIPTS" for t in n.targets))
+    deriv = float(re.search(r"^DERIVATIVE_SMOOTH = ([0-9.]+)", (repo / "python" / "dtfelib" / "pointeval.py").read_text(),
+                            re.M).group(1))
+    check("the thesis checklist is analyze.py's PLOT_SCRIPTS + the synthesis figure; the point-eval default is "
+          "dtfelib's", list(rs.THESIS_SCRIPTS) == core + ["plot_conclusions_synthesis.py"]
+          and rs.POINTEVAL_DERIV_SMOOTH == deriv, f"{rs.THESIS_SCRIPTS} vs {core}; {deriv}")
+    base = dict(data_root=str(tmp), sim="TNG100-3-Dark", snapshots=[99])
+    plane = str(tmp / "TNG100" / "TNG100-3-Dark" / "hires_plane_z64.json")
+    spec = rs.PlotSpec(sets=["thesis", "pointeval", "panels"], **base,
+                       options={"thesis": {"mode": "plot", "only": "plot_DTFE.py,plot_conclusions_synthesis.py"},
+                                "pointeval": {"smooth_deriv": 4.0},
+                                "panels": {"plane": plane, "vmin": 0.05, "vmax": 300.0, "dpi": 150, "image": True}})
+    argv = {st.label.split()[0]: st.argv for st in spec.steps()}
+    a_th = next(st.argv for st in spec.steps() if "analyze.py" in st.label)
+    a_pe = next(st.argv for st in spec.steps() if "plot_pointeval.py" in " ".join(st.argv))
+    a_pa = next(st.argv for st in spec.steps() if "plot_pointeval_panels.py" in " ".join(st.argv))
+    check("... the ticked thesis scripts reach --only (the synthesis figure too); the gradient smoothing reaches "
+          "--smooth-derivatives; the panels get --vmin/--vmax/--dpi/--image",
+          a_th[a_th.index("--only") + 1:] == ["plot_DTFE.py", "plot_conclusions_synthesis.py"]
+          and a_pe[a_pe.index("--smooth-derivatives") + 1] == "4" and a_pa[a_pa.index("--vmin") + 1] == "0.05"
+          and a_pa[a_pa.index("--vmax") + 1] == "300" and a_pa[a_pa.index("--dpi") + 1] == "150" and "--image" in a_pa,
+          f"{a_th} | {a_pe} | {a_pa}")
+    plain = rs.PlotSpec(sets=["pointeval", "panels"], **base, options={"panels": {"plane": plane}})
+    flat = " ".join(" ".join(st.argv) for st in plain.steps())
+    check("... and the defaults add none of those flags", not any(f in flat for f in ("--smooth-derivatives", "--vmin",
+                                                                                     "--dpi", "--image")), flat)
+
+
+def explore_extras(tmp: Path):
+    """The hi-res slices an output offers, a snapshot chosen by hand for the server, the scalar field, the Custom
+    tab's research options (2026-10-06)."""
+    import json
+    import numpy as np
+    import grids as G
+    sim = Path(tempfile.mkdtemp(prefix="gui_extras_")) / "SIM"
+    sd = sim / "snapdir_050"
+    sd.mkdir(parents=True)
+    try:
+        np.zeros(8 ** 3, dtype=np.float32).tofile(sd / "ps_output.a_den")
+        np.ones(8 ** 3, dtype=np.float32).tofile(sd / "ps_output.a_scalar")
+        np.zeros(32 * 32, dtype=np.float64).tofile(sd / "ps_output.pts_den")       # one 32x32 plane
+        geo = {"nu": 32, "nv": 32, "planes": 1, "supersample": 1, "axis": "z", "u_axis": "x", "v_axis": "y",
+               "u0": 0, "u1": 10, "v0": 0, "v1": 10, "center": 5.0, "box": 10.0}
+        (sim / "pointeval_plane_32_z.json").write_text(json.dumps(geo))
+        (sim / "pointeval_plane_64_z.json").write_text(json.dumps(dict(geo, nu=64, nv=64)))   # another size: not this one
+        o = G.OutputSet(sd / "ps_output", box=((0, 0, 0), (10, 10, 10)))
+        planes = G.find_pts_planes(o)
+        check("an output's hi-res slices: the plane sidecars whose geometry matches its '.pts_den' (not another size)",
+              [Path(pth).name for _, pth in planes] == ["pointeval_plane_32_z.json"] and "z-plane" in planes[0][0],
+              str(planes))
+        check("the per-particle scalar is an Explore field ('.a_scalar')", "scalar" in o.fields(), str(o.fields()))
+        snap = sim / "elsewhere.hdf5"
+        snap.write_bytes(b"\0")
+        kw0, kw1 = G.server_settings(o), G.server_settings(o, str(snap))
+        check("a snapshot chosen by hand serves an output whose own is not found (and only an existing file)",
+              kw0 is None and kw1 is not None and kw1["snapshot"] == str(snap)
+              and G.server_settings(o, str(sim / "nope.hdf5")) is None, f"{kw0} {kw1}")
+    finally:
+        shutil.rmtree(sim.parent, ignore_errors=True)
+    pts = tmp / "pts.txt"
+    pts.write_text("1 2 3\n")
+    inp = tmp / "TNG100" / "TNG100-3-Dark" / "snapdir_099" / "combined_099.hdf5"
+    c = rs.CustomSpec(input_file=str(inp), sample_points=str(pts), stream_density="geometric", per_stream=True,
+                      per_stream_ids=True, halo_release=500)
+    a = c.command()
+    check("the Custom tab's research options: --ps-halo-release, and for the sample points --ps-stream-density, "
+          "--per-stream, --per-stream-ids", a[a.index("--ps-halo-release") + 1] == "500"
+          and a[a.index("--ps-stream-density") + 1] == "geometric" and "--per-stream" in a and "--per-stream-ids" in a,
+          str(a))
+    nopts = [m for lv, m in rs.CustomSpec(input_file=str(inp), per_stream=True).problems() if lv == "warning"]
+    dt = rs.CustomSpec(input_file=str(inp), estimator="dtfe", sample_points=str(pts), per_stream=True, halo_release=500)
+    check("... per-stream without sample points warns; a standard-DTFE run leaves the PS-only ones out",
+          any("apply to sample points" in m for m in nopts) and "--per-stream" not in dt.command()
+          and "--ps-halo-release" not in dt.command(), f"{nopts} {dt.command()}")
+
+
+def plane_reads():
+    """Explore reads a plane of an uncached grid with plain reads, never a memmap (a mapped page of an unplugged
+    drive kills the launcher with SIGBUS; a read raises OSError, which the slice worker reports)."""
+    import numpy as np
+    import grids as G
+    d = Path(tempfile.mkdtemp(prefix="gui_planes_"))
+    try:
+        n, rng, ok = 20, np.random.default_rng(2), True
+        for nc, sfx in ((1, "a_den"), (3, "a_vel")):
+            cube = rng.standard_normal((n, n, n, nc) if nc > 1 else (n, n, n)).astype(np.float32)
+            cube.tofile(d / f"o.{sfx}")
+            for axis in range(3):
+                for idx in (0, 9, n - 1):
+                    sl = [slice(None)] * 3
+                    sl[axis] = idx
+                    ok &= np.array_equal(G._read_plane(d / f"o.{sfx}", np.float32, n, nc, axis, idx), cube[tuple(sl)])
+        gone = False
+        try:
+            G._read_plane(d / "missing.a_den", np.float32, n, 1, 0, 0)
+        except OSError:
+            gone = True
+        check("a plane read from the file equals the cube's plane on every axis (1 and 3 components); a vanished "
+              "file is an OSError, not a crash", ok and gone)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def cube_cap():
+    """While a job runs, Explore's cube cache keeps at most RUN_CUBE_BYTES (the binary budgets from free memory)."""
+    import numpy as np
+    import grids as G
+    d = Path(tempfile.mkdtemp(prefix="gui_cubecap_"))
+    old = G.RUN_CUBE_BYTES
+    try:
+        small, big = d / "s.a_den", d / "b.a_den"
+        np.zeros(16 ** 3, dtype=np.float32).tofile(small)        # 16 kB
+        np.zeros(32 ** 3, dtype=np.float32).tofile(big)          # 128 kB
+        G.drop_cubes()
+        G.RUN_CUBE_BYTES = 100_000
+        G.cap_cubes(True)
+        capped = (G._cached_cube(small, np.float32, (16, 16, 16)) is not None,
+                  G._cached_cube(big, np.float32, (32, 32, 32)) is None)
+        G.cap_cubes(False)
+        free = G._cached_cube(big, np.float32, (32, 32, 32)) is not None
+        G._cached_cube(small, np.float32, (16, 16, 16))
+        G.cap_cubes(True)                                        # a job starts: the cache trimmed to the cap
+        held = G.drop_cubes()
+        check("Explore's cube cache: capped while a job runs (a small cube cached, a big one memory-mapped), "
+              "the cap trims what is held, lifted after", capped == (True, True) and free and held <= 100_000,
+              f"{capped} {free} {held}")
+    finally:
+        G.cap_cubes(False)
+        G.RUN_CUBE_BYTES = old
+        G.drop_cubes()
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def audit_claims():
+    """Two of the 2026-10-05 audit's confirmed claims: an output name with a dot is listed; time estimates
+    compare runs of one precision."""
+    import numpy as np
+    import results as R
+    import grids as G
+    d = Path(tempfile.mkdtemp(prefix="gui_claims_"))
+    try:
+        for name in ("snap_z0.5", "plain", "run.v1"):
+            np.zeros(8 ** 3, dtype=np.float32).tofile(d / f"{name}.a_den")
+        roots = sorted(o.prefix for _, o in G.find_outputs(d / "no-root", [str(d)]))
+        check("an output name with a dot ('snap_z0.5', 'run.v1') is an output of its own, not cut at the first dot",
+              roots == ["plain", "run.v1", "snap_z0.5"], str(roots))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    def rec(sec, binary):
+        r = R.RunRecord(path=Path(f"/x/{binary}.runlog"), sim="S", prefix="ps_output")
+        r.ok, r.wall_seconds, r.binary = True, sec, binary
+        r.command = f"/x/{binary} in.hdf5 out --grid 64"
+        return r
+    recs = [rec(100, "PS-DTFE"), rec(1000, "PS-DTFE-double"), rec(1, "PS-DTFE-2d")]
+    kw = dict(sim="S", grid=64, estimator="ps", gpu=False, sliced=False)
+    got = (R.time_estimate(recs, **kw), R.time_estimate(recs, precision="double", **kw))
+    check("time estimates: a double-precision run (2x slower) never predicts a single one, nor a 2D run a 3D one",
+          got == ((100, 1), (1000, 1)), str(got))
+
+
+def run_options(tmp: Path):
+    """The memory budget, the tessellation cache and the standard-DTFE field ticks (audit items 3, 9, 15)."""
+    base = dict(data_root=str(tmp), sim="TNG100-3-Dark", snapshots=[99])
+    env0 = rs.RunSpec(estimator="dtfe", **base).command()[1]
+    web = rs.RunSpec(estimator="dtfe", fields=["density_a", "tweb_a", "dispersion_a"], mem_budget_gb=40,
+                     tess_cache="/private/tmp/dtfe-tess", **base)
+    env1 = web.command()[1]
+    check("standard DTFE: the script's own field list by default; the ticks (the T-web) when they differ, without the "
+          "phase-space dispersion", "FIELDS" not in env0 and env1.get("FIELDS") == "density_a tweb_a", str(env1))
+    check("... the memory budget and the tessellation cache reach the run scripts (DTFE_MEM_BUDGET_GB, TESS_CACHE), "
+          "only when set", env1.get("DTFE_MEM_BUDGET_GB") == "40" and env1.get("TESS_CACHE") == "/private/tmp/dtfe-tess"
+          and "DTFE_MEM_BUDGET_GB" not in env0 and "TESS_CACHE" not in env0, str(env1))
+    pe = rs.PipelineSpec(data_root=str(tmp), sims=["TNG100-3-Dark"], mem_budget_gb=24, tess_cache="/private/tmp/t").command()[1]
+    check("... the pipeline too", pe.get("DTFE_MEM_BUDGET_GB") == "24" and pe.get("TESS_CACHE") == "/private/tmp/t", str(pe))
+    icloud = Path.home() / "Library" / "Mobile Documents" / "dtfe-tess"
+    probs = rs._run_option_problems(rs.RunSpec(tess_cache=str(icloud), mem_budget_gb=1e6, **base))
+    check("an iCloud tessellation cache is an error (the binary refuses it); a budget above the machine's memory a warning",
+          any(lv == "error" and "iCloud" in m for lv, m in probs) and any(lv == "warning" and "swap" in m for lv, m in probs),
+          str(probs))
+    nodtfe = rs.RunSpec(estimator="dtfe", fields=["dispersion_a"], **base).problems()
+    check("... standard DTFE with only the dispersion ticked has nothing to compute: an error",
+          any(lv == "error" and "no field standard DTFE computes" in m for lv, m in nodtfe), str(nodtfe))
+    a = rs.RunSpec(estimator="ps", **base)
+    check("the memory check is kept per budget, not per cache folder",
+          a.memory_key() != rs.RunSpec(estimator="ps", mem_budget_gb=8, **base).memory_key()
+          and a.memory_key() == rs.RunSpec(estimator="ps", tess_cache="/x", **base).memory_key())
+
+
 def pipeline_options(tmp: Path, sim: Path):
     """2026-10-04: the Pipeline tab's run options (deposit, sub-samples, GPU, vertex mass, volume weighting,
     caustics, cusps, parallel triangulation), the plane's geometry (planes, thickness, sub-samples, window)
@@ -1443,6 +1819,27 @@ def launcher_fixes():
               sim_dir("TNG100-3-Dark", root) == root / "TNG100" / "TNG100-3-Dark")
     finally:
         shutil.rmtree(root)
+
+
+def figures_root_rule():
+    """Every figure on the T7 (2026-10-06): DTFE_FIGURES_ROOT, else the T7 while mounted, else python/figures --
+    one rule for the launcher and its scripts; saved specs holding the old default read as today's."""
+    check("this suite's figures go to its temp folder (DTFE_FIGURES_ROOT, set before runspec is imported)",
+          rs.FIGURES_ROOT == Path(FIGS_TMP), str(rs.FIGURES_ROOT))
+    env = {k: v for k, v in os.environ.items() if k != "DTFE_FIGURES_ROOT"}
+    out = subprocess.run([sys.executable, "-c", "import config, dtfelib.cli as c; print(c.FIGURES_ROOT); "
+                          "print(config.LOCAL_FIGURES_ROOT)"], cwd=ROOT / "python", env=env,
+                         capture_output=True, text=True).stdout.split("\n")
+    t7 = Path("/Volumes/Samsung T7")
+    want = str(t7 / "DTFE figures") if t7.is_dir() else str(ROOT / "python" / "figures")
+    check("without DTFE_FIGURES_ROOT: the T7's 'DTFE figures' while it is mounted, else python/figures -- the same "
+          "for dtfelib and config", out[:2] == [want, want], str(out[:2]))
+    legacy = str(rs.LEGACY_FIGURES_ROOT)
+    pipe, plot = rs.PipelineSpec.from_dict({"figures_root": legacy}), rs.PlotSpec.from_dict({"figures_root": legacy})
+    own = rs.PlotSpec.from_dict({"figures_root": "/somewhere/else"})
+    check("settings and queued jobs saved with the old default (python/figures) load as today's root; a folder of "
+          "the user's own stays", pipe.figures_root == plot.figures_root == str(rs.FIGURES_ROOT)
+          and own.figures_root == "/somewhere/else", f"{pipe.figures_root} {plot.figures_root} {own.figures_root}")
 
 
 if __name__ == "__main__":

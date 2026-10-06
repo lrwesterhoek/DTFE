@@ -26,7 +26,7 @@ cd "${ROOT}"
 
 N="${N:-64}"; BOX="${BOX:-100.0}"
 BIN="./PS-DTFE"
-TMP="${SCRIPT_DIR}/tmp"; mkdir -p "${TMP}"
+TMP="${DTFE_TEST_TMP:-${TMPDIR:-/tmp}/dtfe-tests}"; mkdir -p "${TMP}"
 SNAP="${TMP}/scr_input_pancake.hdf5"
 SC="$(mktemp -d /private/tmp/dtfe-scratch-check.XXXXXX)"
 trap 'rm -rf "${SC}"' EXIT

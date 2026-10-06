@@ -162,7 +162,88 @@ def build_void_catalog(delta_s, hessian):
         'deep': dvals < config.DEEP_VOID_THRESHOLD,
     }
     cat.update(_ellipsoid_fits(coords, evals, evecs))
+    cat['cell_mpc'] = np.float64(config.CELL_SIZE)      # the FRAME the positions and semi-axes are in (2026-10-05)
+    cat['cuts_mpc'] = _cuts_array()                     # the ELLIPSOID_CUTS the well_resolved flag was taken with
+    cat['deep_threshold'] = np.float64(config.DEEP_VOID_THRESHOLD)   # the threshold 'deep' was taken at
     return cat
+
+
+def _cuts_array():
+    c = config.ELLIPSOID_CUTS
+    return np.array([c['min_axis_mpc'], c['max_axis_mpc'], c['max_axis_ratio']], dtype=np.float64)
+
+
+def catalog_cuts_ok(cat):
+    """Whether a catalogue's well_resolved and deep flags were taken with today's config.ELLIPSOID_CUTS and
+    DEEP_VOID_THRESHOLD (a cache without the records predates them: not ok, so it is re-derived once and
+    then carries them)."""
+    return ('cuts_mpc' in cat and np.allclose(np.asarray(cat['cuts_mpc'], dtype=np.float64), _cuts_array())
+            and 'deep_threshold' in cat and float(cat['deep_threshold']) == float(config.DEEP_VOID_THRESHOLD))
+
+
+def snapshot_frame(products):
+    """(cell_mpc, box_mpc, grid_n, source) of a snapshot: its header's box over its grid -- THE truth about
+    the frame -- which must be config.CELL_SIZE (the DTFE_SIM box over FIELD_RESOLUTION), the frame every
+    catalogue is built, cut and exported in; else ValueError, BEFORE any cache is read or written (review
+    2026-10-05: with DTFE_SIM unset the refit turned a correct TNG100 cache into TNG50's frame). It needs the
+    snapshot header: FieldSet raises FileNotFoundError without a combined file, so 'source' is always
+    'header' (kept in the tuple for the provenance)."""
+    fs = products.fs
+    n = int(fs.grid_n)
+    box = float(fs.meta.box_mpc)
+    cell = box / n
+    if abs(cell - config.CELL_SIZE) > 1e-6 * max(cell, config.CELL_SIZE):
+        why = []                                # the hint by cause: only advice that would change something
+        if products.sim != config.SIMULATION:
+            why.append(f"run with DTFE_SIM={products.sim}")
+        if n != config.FIELD_RESOLUTION:
+            why.append(f"set config.FIELD_RESOLUTION = {n} (this grid's; hard-coded in python/config.py) or regrid at "
+                       f"{config.FIELD_RESOLUTION}")
+        if not why:
+            why.append(f"the header's box {box:g} Mpc is not config.BOX_SIZE {config.BOX_SIZE:g} "
+                       f"(config.SIMULATION_BOX_MPC['{config.SIMULATION}'] or the box read for it)")
+        why = " and ".join(why)
+        raise ValueError(f"the snapshot's cell is {cell:.6g} Mpc (box {box:g} Mpc / {n}), the catalogue's frame "
+                         f"config.CELL_SIZE is {config.CELL_SIZE:.6g} (DTFE_SIM={config.SIMULATION}: box "
+                         f"{config.BOX_SIZE:g} / {config.FIELD_RESOLUTION}): {why}")
+    return cell, box, n, "header"
+
+
+def refit_catalog(cat):
+    """The ellipsoid fits of a cached catalogue re-derived in THIS frame with THESE cuts: positions_mpc,
+    the semi-axes, orientations, ellipticity, prolateness and well_resolved all follow from the cached
+    minima (coords) and Hessian eigen-decomposition (in cell units: frame-free), so a catalogue built
+    under another DTFE_SIM's cell, or before a change of config.ELLIPSOID_CUTS, is put right without the
+    field (18 s and 10 GB at 512^3 for the whole build; this is milliseconds). 'deep' is retaken from the
+    cached minima against config.DEEP_VOID_THRESHOLD; the frame, the cuts and the threshold are recorded."""
+    out = dict(cat)
+    out.update(_ellipsoid_fits(np.asarray(cat['coords']), np.asarray(cat['eigenvalues']), np.asarray(cat['eigenvectors'])))
+    out['deep'] = np.asarray(cat['delta_values']) < config.DEEP_VOID_THRESHOLD
+    out['cell_mpc'] = np.float64(config.CELL_SIZE)
+    out['cuts_mpc'] = _cuts_array()
+    out['deep_threshold'] = np.float64(config.DEEP_VOID_THRESHOLD)
+    return out
+
+
+def catalog_cell_mpc(cat):
+    """The cell size a cached catalogue was built with: its 'cell_mpc' entry, else recovered EXACTLY from
+    positions_mpc = coords x cell (the first void with a non-zero index); None for an empty catalogue."""
+    if 'cell_mpc' in cat:
+        return float(cat['cell_mpc'])
+    coords = np.asarray(cat['coords'])
+    pos = np.asarray(cat['positions_mpc'], dtype=np.float64)
+    nz = np.argwhere(coords > 0)
+    if not len(nz):
+        return None
+    i, k = nz[0]
+    return float(pos[i, k] / coords[i, k])
+
+
+def catalog_frame_ok(cat, cell_mpc=None, rtol=1e-5):
+    """Whether a catalogue's frame is 'cell_mpc' (default config.CELL_SIZE); True for an empty one."""
+    c = catalog_cell_mpc(cat)
+    want = float(config.CELL_SIZE if cell_mpc is None else cell_mpc)
+    return c is None or abs(c - want) <= rtol * max(want, c)
 
 
 def ellipsoid_fit_one(evals, evecs, cell):
@@ -337,10 +418,33 @@ class SnapshotProducts:
         return cache_dir() / f"{self.sim}_{tag}{self.fs.method}_{self.snapshot}_{name}.npz"
 
     def voids(self):
+        """The void catalogue. From the cache, whose minima and eigenvalues (cell units) never go stale; the
+        ellipsoid fits on top of them are re-derived (refit_catalog, milliseconds, no field) and the cache
+        rewritten when their FRAME is not config.CELL_SIZE -- the positions and semi-axes scale with the
+        cell of the DTFE_SIM simulation at build time, which a script's --sim does not change: the
+        TNG100-3-Dark catalogues of July were built under TNG50's frame (positions up to 51.6 Mpc in a
+        110.7 Mpc box) and read as hundreds of 'resolved' voids where the right frame leaves a handful --
+        or when config.ELLIPSOID_CUTS changed since (the cuts are not in the cache's parameter hash, so a
+        retuned cut used to need the caches deleted). Says so. (2026-10-05)"""
+        snapshot_frame(self)                    # the header's frame must be config's: refuse before any cache is touched
         p = self._cpath('voids')
         if p.exists():
             with np.load(p) as z:
-                return {k: z[k] for k in z.files}
+                cat = {k: z[k] for k in z.files}
+            frame_ok, cuts_ok = catalog_frame_ok(cat), catalog_cuts_ok(cat)
+            if frame_ok and cuts_ok:
+                return cat
+            why = []
+            if not frame_ok:
+                why.append(f"built with cell {catalog_cell_mpc(cat):.5g} Mpc, not this frame's {config.CELL_SIZE:.5g} "
+                           f"(DTFE_SIM={config.SIMULATION})")
+            if not cuts_ok:
+                why.append("its ellipsoid cuts or deep threshold are not config's" if 'cuts_mpc' in cat
+                           else "it carries no record of its ellipsoid cuts")
+            print(f"    [pipeline] cached void catalogue {p.name}: {'; '.join(why)}: re-deriving its fits")
+            cat = refit_catalog(cat)
+            _save_npz(p, **cat)
+            return cat
         cat = build_void_catalog(self.delta_smoothed, self.hessian)
         _save_npz(p, **cat)
         return cat
@@ -432,22 +536,26 @@ def products(snapshot, redshift=None, sim=None, method=None, prefix=None, data_r
     return SnapshotProducts(snapshot, redshift, sim=sim, method=method, prefix=prefix, data_root=data_root)
 
 
-def _limits_path():
-    return cache_dir() / 'global_limits.json'
+def _limits_path(sim=None):
+    # one file PER SIMULATION (2026-10-05 review): cache_dir() is hashed on the parameters only, and
+    # compute runs for two simulations used to max-merge into one global file, so a TNG300 series got
+    # the TNG50 amplitudes (sigma is in cells: a different Mpc smoothing, a different scale)
+    return cache_dir() / f'global_limits_{sim or DEFAULT_SIM}.json'
 
 
-def save_global_limits(limits):
-    with open(_limits_path(), 'w') as f:
+def save_global_limits(limits, sim=None):
+    with open(_limits_path(sim), 'w') as f:
         json.dump(limits, f, indent=2)
 
 
-def _snapshot_limits_path():
-    return cache_dir() / 'snapshot_limits.json'
+def _snapshot_limits_path(sim=None):
+    return cache_dir() / f'snapshot_limits_{sim or DEFAULT_SIM}.json'
 
 
-def load_snapshot_limits():
-    """{snapshot id ('099'): {field: amplitude}} -- what analyze.py compute measured per snapshot."""
-    p = _snapshot_limits_path()
+def load_snapshot_limits(sim=None):
+    """{snapshot id ('099'): {field: amplitude}} -- what analyze.py compute measured per snapshot of
+    'sim' (default: the DTFE_SIM simulation)."""
+    p = _snapshot_limits_path(sim)
     if not p.exists():
         return {}
     with open(p) as f:
@@ -460,18 +568,19 @@ def canonical_snapshot_id(snap):
     return f"{int(s):03d}" if s.isdigit() else s
 
 
-def record_limits(updates, canonical=None):
+def record_limits(updates, canonical=None, sim=None):
     """analyze.py compute's bookkeeping. 'updates' = {snapshot: {field: amplitude}} for the snapshots
-    just computed. They go into the per-snapshot store (snapshot_limits.json, beside global_limits.json
-    under the same parameter-hashed cache dir, so a change of smoothing or criterion invalidates both);
-    the global limits are then the MAXIMUM over every stored snapshot of the canonical series. Before
-    2026-10-06 compute wrote the maximum over the snapshots of that one run: a run on a subset, or on an
-    unknown id, shrank or emptied the cross-epoch limits every later plot used. Returns (limits, covered,
-    missing): the limits written (None when nothing was computed: the global file is left alone), the
-    canonical snapshots with an entry, and those still without one."""
+    just computed of simulation 'sim' (default DTFE_SIM). They go into the per-snapshot store
+    (snapshot_limits_<sim>.json, beside global_limits_<sim>.json under the same parameter-hashed cache
+    dir, so a change of smoothing or criterion invalidates both); the global limits are then the MAXIMUM
+    over every stored snapshot of the canonical series. Before 2026-10-05 compute wrote the maximum over
+    the snapshots of that one run: a run on a subset, or on an unknown id, shrank or emptied the
+    cross-epoch limits every later plot used. Returns (limits, covered, missing): the limits written
+    (None when nothing was computed: the global file is left alone), the canonical snapshots with an
+    entry, and those still without one."""
     canonical = [canonical_snapshot_id(s) for s in (canonical if canonical is not None
                                                      else config.SNAPSHOT_TO_REDSHIFT)]
-    store = load_snapshot_limits()
+    store = load_snapshot_limits(sim)
     for snap, amp in (updates or {}).items():
         vals = {k: float(v) for k, v in amp.items() if v is not None and np.isfinite(v)}
         if vals:
@@ -480,29 +589,32 @@ def record_limits(updates, canonical=None):
     missing = [s for s in canonical if s not in store]
     if not updates:
         return None, covered, missing
-    with open(_snapshot_limits_path(), 'w') as f:
+    with open(_snapshot_limits_path(sim), 'w') as f:
         json.dump(store, f, indent=2)
     limits = {}
     for s in covered:
         for field, v in store[s].items():
             limits[field] = max(limits.get(field, v), v)
-    save_global_limits(limits)
+    save_global_limits(limits, sim)
     return limits, covered, missing
 
 
-def load_global_limits():
-    p = _limits_path()
+def load_global_limits(sim=None):
+    p = _limits_path(sim)
     if not p.exists():
         return {}
     with open(p) as f:
         return json.load(f)
 
 
-def series_vmax(field, fallback_data=None):
+def series_vmax(field, fallback_data=None, sim=None):
+    """The cross-epoch colour amplitude of 'field' for simulation 'sim' (default DTFE_SIM): a fixed
+    config.FIELD_LIMITS entry, else what analyze.py compute recorded for that simulation, else the
+    robust maximum of 'fallback_data' (None without it)."""
     fixed = config.FIELD_LIMITS.get(field)
     if fixed is not None:
         return float(fixed)
-    gl = load_global_limits()
+    gl = load_global_limits(sim)
     if field in gl and gl[field] is not None:
         v = gl[field]
         return float(v if not isinstance(v, (list, tuple)) else v[1])

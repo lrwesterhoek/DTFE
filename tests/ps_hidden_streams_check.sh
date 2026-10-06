@@ -44,7 +44,7 @@ source "${SCRIPT_DIR}/precision.sh"     # DTFE_TEST_PRECISION=double: the double
 N="${N:-27}"; GRID="${GRID:-48}"; BOX="${BOX:-100.0}"; K="${K:-4}"
 BIN="${PS_BIN}"
 precision_require "${BIN}"
-TMP="${SCRIPT_DIR}/tmp"; mkdir -p "${TMP}"
+TMP="${DTFE_TEST_TMP:-${TMPDIR:-/tmp}/dtfe-tests}"; mkdir -p "${TMP}"
 # input/point file names must NOT share a prefix with the output roots (rm -f "<root>".*)
 SNAP_PAN="${TMP}/pux_input_pancake.hdf5"
 SNAP_CRW="${TMP}/pux_input_crossed.hdf5"

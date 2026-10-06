@@ -246,6 +246,7 @@ class Estimator:
         if partition is not None:
             parts = [int(partition)] * self.dim if np.ndim(partition) == 0 else [int(v) for v in partition]
             if len(parts) != self.dim or min(parts) < 1:
+                shutil.rmtree(self._workdir, ignore_errors=True)      # nothing started: leave no work folder
                 raise ValueError(f"partition must be a positive int or {self.dim} positive ints")
             cmd += ["--partition"] + [str(v) for v in parts]
         if resident is not None:
@@ -257,15 +258,22 @@ class Estimator:
         cmd += [str(o) for o in options]
         self.command = cmd
 
-        if log_path is not None:
-            self._log_path = Path(log_path)
-            self._log = open(self._log_path, "wb")
-        else:
-            self._log_path = self._workdir / "server.log"
-            self._log = None if verbose > 0 else open(self._log_path, "wb")
-        self._lock = threading.Lock()
-        self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                      stderr=self._log)
+        self._log = None
+        try:
+            if log_path is not None:
+                self._log_path = Path(log_path)
+                self._log = open(self._log_path, "wb")
+            else:
+                self._log_path = self._workdir / "server.log"
+                self._log = None if verbose > 0 else open(self._log_path, "wb")
+            self._lock = threading.Lock()
+            self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                          stderr=self._log)
+        except BaseException:                   # the binary missing, a log that cannot be opened: close() would
+            if self._log is not None:           # return early (nothing started), so clean up here
+                self._log.close()
+            shutil.rmtree(self._workdir, ignore_errors=True)
+            raise
         self._closed = False
         if _on_spawn is not None:       # lets a caller cancel a long tessellation build
             _on_spawn(self._proc)

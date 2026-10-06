@@ -60,7 +60,7 @@ source "${SCRIPT_DIR}/precision.sh"     # DTFE_TEST_PRECISION=double: the double
 N="${N:-24}"; GRID="${GRID:-48}"; BOX="${BOX:-100.0}"
 BIN="${PS_BIN}"
 precision_require "${BIN}"
-TMP="${SCRIPT_DIR}/tmp"; mkdir -p "${TMP}"
+TMP="${DTFE_TEST_TMP:-${TMPDIR:-/tmp}/dtfe-tests}"; mkdir -p "${TMP}"
 # input/point file names must NOT share a prefix with the output roots (rm -f "<root>".*)
 SNAP_UNI="${TMP}/ppe_input_uniform.hdf5"
 SNAP_PAN="${TMP}/ppe_input_pancake.hdf5"

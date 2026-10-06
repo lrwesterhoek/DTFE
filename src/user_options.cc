@@ -157,9 +157,9 @@ void User_options::addOptions(po::options_description &allOptions,
             ("help,h", "produce summary of help message. For more detailed help use the '--full_help' option.")
             ("full_help", "produce detailed help message. For more detailed help information consult the documentation.")
             ("grid,g", po::value< std::vector<size_t> >(&(this->gridSize))->multitoken(), "choose grid size along each direction (e.g. '-g 256' for a 256^3 grid; '-g 256 128 512' for different gridsize along each direction).")
-            ("box", po::value< std::vector<Real> >()->multitoken(), "the coordinates of the box encompasing all the particles. It needs 6 arguments for 3D (4 for 2D) which give 'x_left', 'x_right', 'y_left', 'y_right', etc... (where 'x_left' is the left box coordinates along x-direction). For example '--box 0 1 0.5 1.5 0 10'.")
-            ("input,i", po::value< std::vector<int> >()->multitoken(), "give the type of the input file (101=gadget multiple file, 102=gadget single file, 105=gadget HDF5 file, see documenation for more options). If present, a 2nd argument gives the data to be read from file (1=positions, 2=weights, 4=masses, ..., 2^n=the n+1 data) - e.g. to read positions, masses and velocities insert 1+2+4=7. If present, a 3rd argument gives the particle species to be read from file (1=1st species, 2=2nd species, ..., 2^n=the n+1 species) - e.g. to read the data of species 2,3 and 4 insert 2+4+8=14.")
-            ("output,o", po::value< int >(&(this->outputFileType)), "give the type of the output file (101=binary file, 111=text file, see documenation for more options).")
+            ("box", po::value< std::vector<Real> >()->multitoken(), "the coordinates of the box encompassing all the particles. It needs 6 arguments for 3D (4 for 2D) which give 'x_left', 'x_right', 'y_left', 'y_right', etc... (where 'x_left' is the left box coordinates along x-direction). For example '--box 0 1 0.5 1.5 0 10'.")
+            ("input,i", po::value< std::vector<int> >()->multitoken(), "give the type of the input file (101=gadget multiple file, 102=gadget single file, 105=gadget HDF5 file, see documentation for more options). If present, a 2nd argument gives the data to be read from file (1=positions, 2=weights, 4=masses, ..., 2^n=the n+1 data) - e.g. to read positions, masses and velocities insert 1+2+4=7. If present, a 3rd argument gives the particle species to be read from file (1=1st species, 2=2nd species, ..., 2^n=the n+1 species) - e.g. to read the data of species 2,3 and 4 insert 2+4+8=14.")
+            ("output,o", po::value< int >(&(this->outputFileType)), "give the type of the output file (101=binary file, 111=text file, see documentation for more options).")
             ("periodic,p", "particle data is in a periodic box with box coordinates given by option '--box' or read from input file.")
             ;
     
@@ -174,7 +174,7 @@ void User_options::addOptions(po::options_description &allOptions,
                     "  gradient = \tcompute the velocity gradient at the sampling point position (use 'gradient_a' to get the averaged velocity gradient inside the sampling cell).\n"
                     "  divergence = \tcompute velocity divergence at the sampling point position (use 'divergence_a' to get the averaged velocity divergence inside the sampling cell).\n"
                     "  shear = \tcompute velocity shear at the sampling point position (use 'shear_a' to get the averaged velocity shear inside the sampling cell).\n"
-                    "  vorticity = \tcompute velocity vorticity at the sampling point position (use 'vorticity_a' to get the averaged velocity vortivity inside the sampling cell).\n"
+                    "  vorticity = \tcompute velocity vorticity at the sampling point position (use 'vorticity_a' to get the averaged velocity vorticity inside the sampling cell).\n"
                     "  velocityStd_a = \tcompute velocity standard deviation inside the sampling cell (NOTE: there is no 'velocityStd' of this option and this option works only with averaging method 2 '--method 2').\n"
 #ifdef PHASE_SPACE
                     "  dispersion = \t[PS-DTFE only] mass-weighted multi-stream velocity dispersion. Writes the trace sigma^2 = sum(rho_s |v_s-<v>|^2)/sum(rho_s) to '.velDisp' and the full symmetric tensor sigma_ij to '.velDispTensor'. ~0 in single-stream regions (cold void interiors), large in multi-stream regions (walls/filaments). Use 'dispersion_a' for the volume-averaged version.\n"
@@ -200,7 +200,7 @@ void User_options::addOptions(po::options_description &allOptions,
     
     po::options_description partitionOptions("Partition options");
     partitionOptions.add_options()
-            ("partition", po::value< std::vector<size_t> >(&(this->partition))->multitoken(), "choose this option if the particle data is too large to compute the Delaunay triangulation for the full data at once. Specify here in how many parts to split the box along each direction (e.g. '--partition 3 3 3' splits the data in 27 chuncks; '--partition 1' keeps ONE triangulation). If NOT given, the program AUTO-SELECTS the split from the particle count, grid, requested fields and the machine's RAM/cores once the input is read (DTFE_RAM_GB env overrides the detected RAM)."
+            ("partition", po::value< std::vector<size_t> >(&(this->partition))->multitoken(), "choose this option if the particle data is too large to compute the Delaunay triangulation for the full data at once. Specify here in how many parts to split the box along each direction (e.g. '--partition 3 3 3' splits the data in 27 chunks; '--partition 1' keeps ONE triangulation). If NOT given, the program AUTO-SELECTS the split from the particle count, grid, requested fields and the machine's RAM/cores once the input is read (DTFE_RAM_GB env overrides the detected RAM)."
 #ifdef PHASE_SPACE
              " In PS-DTFE this also drives the OpenMP parallelism: partitions run in parallel (one triangulation per thread), so speedup scales up to the number of partitions. NOTE on memory: each Lagrangian partition writes the WHOLE Eulerian grid, so peak memory ~ (partitions running concurrently) x full grid x number of fields -- choose the partition count from your core budget AND available RAM."
 #endif
@@ -221,10 +221,10 @@ void User_options::addOptions(po::options_description &allOptions,
     paddingOptions.add_options()
             ("padding", po::value< std::vector<Real> >()->multitoken(), "give the size of the padding need to make sure that the Delaunay triangulation fully covers the region of interest. There are two ways to give the padding size:\n"
                     "  1) \t by giving one value which is the average number of particles that will be copied along each face of the region of interest. The actual computation uses all the particle that are within 'padding number' * 'particle grid spacing' distance from the region of interest. For example '--padding 5' will add an average of 5 particles on both the left and right sides for each dimension.\n"
-                    "  2) \t by giving the size of the padding for each face of the box of interest. This size is given with respect to the box length along each coordinate (i.e. '-padding 0.1 0.2 0.5 0.5 0.1 0.1' means that box will be padded with '0.1*x box length' on the left of the x-coordiante and by '0.2*x box length' on the right of the x-coordinate, similar for the y and z dimensions).")
+                    "  2) \t by giving the size of the padding for each face of the box of interest. This size is given with respect to the box length along each coordinate (i.e. '-padding 0.1 0.2 0.5 0.5 0.1 0.1' means that box will be padded with '0.1*x box length' on the left of the x-coordinate and by '0.2*x box length' on the right of the x-coordinate, similar for the y and z dimensions).")
             ("paddingMpc", po::value< std::vector<Real> >()->multitoken(), "give the size of the padding need to make sure that the Delaunay triangulation fully covers the region of interest. Similar to option 'padding' choice '2)' with the difference that the padding size is given in Mpc and not box lengths.")
 #ifdef TEST_PADDING
-            ("noTest", "do not test for the efficiency of the padding when computing the Delaunay tesselation. The default is to use dummy particles positioned at the boundary of the extended padded box to test if the Delaunay tesselation fully covers the region of interest (i.e. the unpadded box).")
+            ("noTest", "do not test for the efficiency of the padding when computing the Delaunay tessellation. The default is to use dummy particles positioned at the boundary of the extended padded box to test if the Delaunay tessellation fully covers the region of interest (i.e. the unpadded box).")
 #endif
             ;
     
@@ -243,7 +243,7 @@ void User_options::addOptions(po::options_description &allOptions,
             ("seed", po::value<size_t>(&(this->randomSeed)), "integer value to be used for the random seed generator when interpolating to the grid using Monte Carlo methods. Generated randomly if not supplied by the user.")
 #ifndef PHASE_SPACE
             ("gpu", po::bool_switch(&(this->gpuAlias)), "standard DTFE only: run the volume-averaged ('_a', method 1) grid interpolation on the GPU. Requires a GPU build ('make DTFE METAL=1' on macOS/Apple Silicon, 'CUDA=1' or 'HIP=1' on Linux); otherwise the option is ignored with a warning and the CPU interpolation is used. Results match the CPU interpolation to float rounding (atomic summation order). Unaveraged fields and methods 2/3 always use the CPU.")
-            ("exact-average", po::bool_switch(&(this->exactAverage)), "standard DTFE only (2D and 3D builds; 2D clips triangles itself): compute the volume-averaged ('_a') fields by integrating the LINEAR DTFE interpolant EXACTLY over every grid-cell/tetrahedron intersection (vendored r3d library, Powell & Abel 2015) instead of Monte-Carlo sampling. For a linear field the integral over each intersection is its centroid value times its volume, so order-1 moments suffice -- no sampling noise, and on a perfect particle lattice the averaged density is exactly 1 to rounding. Runs on the method-1 per-tetrahedron scatter topology with the same cell classification (the single-grid-cell fast path was already exact); '--samples' and '--method' are ignored (pass neither, or '-m 1'). Combined with '--gpu' the interpolation falls back to the CPU with a warning. An accuracy option, not a speed option.")
+            ("exact-average", po::bool_switch(&(this->exactAverage)), "standard DTFE only (2D and 3D builds; 2D clips triangles itself): compute the volume-averaged ('_a') fields by integrating the LINEAR DTFE interpolant EXACTLY over every grid-cell/tetrahedron intersection (vendored r3d library, Powell & Abel 2015) instead of Monte-Carlo sampling. For a linear field the integral over each intersection is its centroid value times its volume, so order-1 moments suffice -- no sampling noise, and on a perfect particle lattice the averaged density is exactly 1 to rounding. Runs on the method-1 per-tetrahedron scatter topology with the same cell classification (the single-grid-cell fast path was already exact); '--samples' and '--method' are ignored (pass neither, or '-m 1'). Runs on the GPU with '--gpu' (the same clipping in float32, agreeing with the CPU to float rounding). An accuracy option, not a speed option.")
 #endif
 #ifdef PHASE_SPACE
             ("ps-gpu", po::bool_switch(&(this->gpuAlias)), "PS-DTFE only: run the grid deposit (the dominant cost) on the GPU. Requires a GPU build ('make PS-DTFE METAL=1' on macOS/Apple Silicon, 'CUDA=1' or 'HIP=1' on Linux); otherwise the option is ignored with a warning and the CPU deposit is used. Results match the CPU deposit to float rounding (atomic summation order).")
@@ -293,7 +293,7 @@ void User_options::addOptions(po::options_description &allOptions,
             ("SPH", po::value<int>(&(this->SPH_neighbors)), "choose the SPH (Smoothed Particle Hydrodynamics) as the grid interpolation method instead of DTFE. This method is available only for: density, velocity and scalar fields.")
             ("Voronoi", "use Voronoi volume density estimation with NGP grid assignment. Builds the Delaunay triangulation, computes vertex densities (1/Voronoi volume), and assigns them to the grid using nearest grid point. Gives a piecewise-constant density field. Only outputs density.")
             ("interlace", "enable interlacing to reduce aliasing in the density field. Runs the grid interpolation twice with a half-cell offset and averages in Fourier space. Works with any interpolation method. Requires periodic boundary conditions.")
-            ("MpcUnit", po::value<Real>(&(this->MpcValue)), "specify the value of 1Mpc in units of the input particle position data. [DEFAULT value is the one given in the 'DMPC_UNIT' variable in the Makefile.]")
+            ("MpcUnit", po::value<Real>(&(this->MpcValue)), "specify the value of 1Mpc in units of the input particle position data. [DEFAULT value is the one given in the 'MPC_UNIT' variable in the Makefile.]")
             ("extensive", "specify that all the fields under 'scalar fields' are extensive quantities. If this option is missing than the code treats the variables as intensive fields. This option is important only when using the TSC or SPH interpolation methods applied to the scalar variable.")
             ("verbose,v", po::value<int>(&(this->verboseLevel))->default_value(verboseLevel), "choose the verbosity level of the program (a value from 0 to 3). See the documentation for additional help.")
             ("randomSample", po::value<Real>(&(this->randomSample)), "generates a random subsample of the input data. The size of the subsample is given by value supplied to the option (with values from 0. to 1.). Only this random subsample of the full data set will be used in any further computations. For example '--randomSample 0.1' will keep only 10\% of the data set for further computations.")
@@ -383,7 +383,7 @@ void User_options::shortHelp( char *progName )
             ("help,h", "produce this help message.")
             ("full_help", "produce detailed help message.")
             ("grid,g", po::value< std::vector<size_t> >(&(this->gridSize))->multitoken(), "specify grid size along each direction.")
-            ("box", po::value< Real >(&temp), "specify the coordinates of the box encompasing all the particles.")
+            ("box", po::value< Real >(&temp), "specify the coordinates of the box encompassing all the particles.")
             ("input,i", po::value< std::vector<int> >()->multitoken(), "give the type of the input file, which data to read and for which particle species. See full help for details.")
             ("output,o", po::value< std::vector<int> >(), "give the type of the output file. See full help for details.")
             ("periodic,p", "specify the data is in a periodic box.")
@@ -470,6 +470,34 @@ void User_options::shortHelp( char *progName )
             ("hubble", po::value< Real >(&temp), "Hubble parameter h for T-web/V-web normalization [DEFAULT: from file header].")
             ;
     
+    po::options_description phaseSpaceOptions("Phase space, GPU, point evaluation and the query server (one line each; '--full_help' has the details)");
+    phaseSpaceOptions.add_options()
+            ("gpu", "standard DTFE: the volume-averaged interpolation on the GPU (a GPU build; CPU fallback).")
+            ("exact-average", "standard DTFE: EXACT cell averages of the linear interpolant (no sampling noise).")
+            ("sample-points", "also evaluate the fields at the points of this file (text 'x y z' or binary float64 x3): '.pts_*' outputs.")
+            ("per-stream", "with --sample-points: every stream's own density and velocity per point (ragged '.pts_stream_*').")
+            ("pts-vel-grad", "with --sample-points: the velocity gradient per point ('.pts_velGrad').")
+            ("pts-den-grad", "with --sample-points: the density gradient per point ('.pts_denGrad').")
+            ("serve", "keep the tessellation in memory and answer point requests over stdin/stdout (dtfelib.Estimator).")
+            ("serve-progress", "with --serve: a progress line per partition built, loaded or visited (the launcher reads them).")
+            ("tessellation-cache", "write the (partition) tessellations to this directory and reuse them next time.")
+            ("auto-tune-report", "read the input, run the memory auto-tuner, print ONE 'AUTO-TUNE-REPORT ...' line and exit.")
+            ("parallel-triangulation", "build the single triangulation with several threads (opt-in: runs then differ at rounding).")
+#ifdef PHASE_SPACE
+            ("ps-gpu", "PS-DTFE: the grid deposit on the GPU (a GPU build; CPU fallback).")
+            ("ps-exact-deposit", "PS-DTFE: the exact conservative deposit of every tetrahedron instead of sub-sampling.")
+            ("ps-vertex-mass", "PS-DTFE: a tetrahedron's mass from its vertices' masses (perturbed initial positions, TNG).")
+            ("ps-volume-weighted", "PS-DTFE: volume-weighted velocity moments per stream (the production convention).")
+            ("ps-linear-deposit", "PS-DTFE: the linear (CPU) deposit; forces the CPU.")
+            ("ps-caustics", "PS-DTFE: the caustic flag ('.caustic') and class bitmask ('.causticClass') per cell.")
+            ("ps-caustic-cusps", "PS-DTFE: with --ps-caustics, the A3 cusp and A4 swallowtail indicators (CPU).")
+            ("ps-window", "PS-DTFE: deposit only a window of the full grid (the launcher's exact zoom).")
+            ("ps-alpha-shape", "PS-DTFE, non-periodic: the Lagrangian alpha shape that drops the convex-hull slivers.")
+            ("ps-stream-density", "PS-DTFE: the per-stream density estimator ('dtfe' or 'geometric').")
+            ("ps-halo-release", "PS-DTFE: release the mass of overfolded (halo) tetrahedra (D >= the given value).")
+#endif
+            ;
+
     po::options_description visibleOptions;
     visibleOptions.add(mainOptions);
 #ifdef FIELD_OPTIONS
@@ -493,6 +521,7 @@ void User_options::shortHelp( char *progName )
 #ifdef ADDITIONAL_OPTIONS
     visibleOptions.add(additionalOptions);
 #endif
+    visibleOptions.add(phaseSpaceOptions);   // the options the run scripts and the launcher use (survey rank 21, 2026-10-05)
     
     
     MESSAGE::Message message( 3 );
@@ -580,7 +609,7 @@ void User_options::printOptions()
     if ( not this->gridSize.empty() )
         message << "\t grid size              : " << MESSAGE::printElements( this->gridSize, "  " ) << (this->regionOn ? "   for the box region selected by the user\n" : "   for the full particle box\n" );
     else
-        message << "\t grid size              : none specifed at the moment";
+        message << "\t grid size              : none specified at the moment";
     if ( not boxCoordinates.isNullBox() )
         message << "\t box coordinates        : [" << MESSAGE::printElements( boxCoordinates, ", " ) << "]\n";
     if ( this->periodic )
@@ -850,7 +879,7 @@ void User_options::readOptions(int argc, char *argv[], bool getFileNames, bool s
         
         boxCoordinates.coords = vm["box"].as< std::vector<Real> >();
         for (int i=0; i<NO_DIM; ++i)
-            if( boxCoordinates[2*i+1]<boxCoordinates[2*i]) throwError( "The right coordinate of the box encompasing the data along axis " , i+1, " (1=x, 2=y, 3=z) must be larger than the left coordinate of the box. This is not the case in the arguments supplied to '--box' option." );
+            if( boxCoordinates[2*i+1]<boxCoordinates[2*i]) throwError( "The right coordinate of the box encompassing the data along axis " , i+1, " (1=x, 2=y, 3=z) must be larger than the left coordinate of the box. This is not the case in the arguments supplied to '--box' option." );
         userGivenBoxCoordinates = true;
     }
     if ( vm.count("input") )    // file type, data blocks to read, and particle species to read
@@ -1188,7 +1217,7 @@ void User_options::readOptions(int argc, char *argv[], bool getFileNames, bool s
     if ( vm.count("density0") )
         lowerBoundCheck( averageDensity, Real(0.), "the value of '--density0'" );
     if ( vm.count("seed") )
-        lowerBoundCheck( this->randomSeed, size_t(0), "value suplied with program option '--seed'" );
+        lowerBoundCheck( this->randomSeed, size_t(0), "value supplied with program option '--seed'" );
     else
     {
         std::srand( (unsigned)time(0) );
@@ -1212,7 +1241,7 @@ void User_options::readOptions(int argc, char *argv[], bool getFileNames, bool s
             intervalCheck( redshiftCone[3], Real(0.), Real(180.), "4th value of option '--redshiftCone'" );
         }
         Real tempRes = redshiftCone[2*(NO_DIM-1)+1] - redshiftCone[2*(NO_DIM-1)]; // psi_max - psi_min
-        if ( tempRes>=Real(360.) ) throwError( "The 'psi' angle interval can strech at most 360 degrees." );
+        if ( tempRes>=Real(360.) ) throwError( "The 'psi' angle interval can stretch at most 360 degrees." );
     }
     if ( vm.count("origin") )
         if ( originPosition.size()!=NO_DIM ) throwError( "The option '--origin' must be followed by ", NO_DIM, " values." );
@@ -1386,9 +1415,9 @@ void User_options::updateEntries(size_t const noTotalParticles,
 {
     // check full box size and grid values
     if ( this->boxCoordinates.size()!=2*NO_DIM )
-        throwError( "Failed a consistency check. The box encompasing the data should have ", 2*NO_DIM, " coordinates, but it has ", this->boxCoordinates.size(), " coordinates. Check again the values supplied as the coordinates of the full data box." );
+        throwError( "Failed a consistency check. The box encompassing the data should have ", 2*NO_DIM, " coordinates, but it has ", this->boxCoordinates.size(), " coordinates. Check again the values supplied as the coordinates of the full data box." );
     if ( this->boxCoordinates.volume()==0. )
-        throwError( "Failed a consistency check. The box encompasing the data has 0. volume. Probably you forget to initialize the coordinates of the full particle data box." );
+        throwError( "Failed a consistency check. The box encompassing the data has 0. volume. Probably you forget to initialize the coordinates of the full particle data box." );
     
     if ( (this->gridSize.empty() and not userSampling) or this->gridSize.size()!=NO_DIM )
         throwError( "Failed a consistency check. The array storing the interpolation grid should have ", NO_DIM, " values, but it has ", this->gridSize.empty()?0:this->gridSize.size(), " values. Check again the values supplied as the size of the interpolation grid." );
@@ -1444,7 +1473,7 @@ void User_options::updateEntries(size_t const noTotalParticles,
     if ( partitionOn and (userSampling or redshiftConeOn) )
     {
         MESSAGE::Warning warning( verboseLevel );
-        warning << "The option '--partition' is not available when interpolating the fields to a redshift cone grid or to user defined sampling points. This '--partition' option will be disabled in the rest of the program. If the computation is too large for the available RAm we advise that you mannually split the computation in manageable data portions." << MESSAGE::EndWarning;
+        warning << "The option '--partition' is not available when interpolating the fields to a redshift cone grid or to user defined sampling points. This '--partition' option will be disabled in the rest of the program. If the computation is too large for the available RAM we advise that you manually split the computation in manageable data portions." << MESSAGE::EndWarning;
         partitionOn = false;
         for (int i=0; i<NO_DIM; ++i)
             partition[i] = 1;
@@ -1461,7 +1490,7 @@ void User_options::updateEntries(size_t const noTotalParticles,
             intervalCheck( redshiftCone[3], Real(0.), Real(180.), "4th value of option '--redshiftCone'" );
         }
         Real tempRes = redshiftCone[2*(NO_DIM-1)+1] - redshiftCone[2*(NO_DIM-1)]; // psi_max - psi_min
-        if ( tempRes>=Real(360.) ) throwError( "The 'psi' angle interval can strech at most 360 degrees." );
+        if ( tempRes>=Real(360.) ) throwError( "The 'psi' angle interval can stretch at most 360 degrees." );
         if ( originPosition.empty() or originPosition.size()!=NO_DIM ) throwError( "The vector 'User_options::originPosition' must have ", NO_DIM, " entries." );
     }
     if ( randomSample>=Real(0.) )

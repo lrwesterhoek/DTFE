@@ -62,20 +62,55 @@ run_program_suites() {
     rm -rf "$ref"
 }
 
-stage_core() {
-    unset DTFE_TEST_PRECISION
-    run_program_suites
+# The oldest supported Python (pyproject: >= 3.10) must PARSE every file: a PEP 701 f-string (3.12) is a
+# SyntaxError there, and the suites run under a newer interpreter that cannot see it (plot_caustic_skeleton.py,
+# review 2026-10-05). Needs a REAL 3.10/3.11 -- ast.parse(feature_version=) under 3.12+ does not catch it.
+old_python_parse() {
+    local p
+    for p in python3.10 python3.11; do
+        if command -v "$p" >/dev/null 2>&1 && "$p" -c 'import sys; sys.exit(sys.version_info >= (3, 12))' 2>/dev/null; then
+            "$p" - python tests <<'EOF'
+import sys, pathlib
+bad = n = 0
+for root in sys.argv[1:]:
+    for f in sorted(pathlib.Path(root).rglob("*.py")):
+        if {"tmp", "__pycache__", "cache", "figures"} & set(f.parts):
+            continue
+        n += 1
+        try:
+            compile(f.read_bytes(), str(f), "exec", dont_inherit=True)
+        except SyntaxError as e:
+            print(f"  {f}:{e.lineno}: {e.msg}")
+            bad += 1
+print(f"  {n} files parsed under Python {sys.version.split()[0]}: " + (f"{bad} FAILED" if bad else "all OK"))
+sys.exit(1 if bad else 0)
+EOF
+            return
+        fi
+    done
+    echo "  no python3.10 / python3.11 on PATH: the oldest-Python parse check skipped"
 }
 
-stage_double() {
-    step "the double pair against the single pair"; tests/ps_double_check.sh --no-build
-    export DTFE_TEST_PRECISION=double
-    run_program_suites
+stage_core() {
     unset DTFE_TEST_PRECISION
+    step "every .py parses under the oldest supported Python"; old_python_parse
+    run_program_suites
+    # AFTER the program suites: ps_caustic_class_check.sh leaves the crossed-waves run (pcc_out.*) under the
+    # temp root, which the caustic-skeleton test's real-grid half reads (else it is a SKIP, not a pass)
+    step "dtfelib python suite (synthetic tier; the data-backed tier skips without the T7)"; "$PY" tests/py_dtfelib_test.py
+}
+
+# after stage_build the pairs EXIST: a suite that would skip for a missing binary or feature is a failure here
+# (DTFE_TEST_REQUIRED=1 turns every skip_or_fail into exit 1; survey rank 20, 2026-10-05)
+stage_double() {
+    step "the double pair against the single pair"; DTFE_TEST_REQUIRED=1 tests/ps_double_check.sh --no-build
+    export DTFE_TEST_PRECISION=double DTFE_TEST_REQUIRED=1
+    run_program_suites
+    unset DTFE_TEST_PRECISION DTFE_TEST_REQUIRED
 }
 
 stage_2d() {
-    step "2D phase space (PS-DTFE-2d, DTFE-2d)"; tests/ps_2d_check.sh --no-build
+    step "2D phase space (PS-DTFE-2d, DTFE-2d)"; DTFE_TEST_REQUIRED=1 tests/ps_2d_check.sh --no-build
 }
 
 stage_gui() {

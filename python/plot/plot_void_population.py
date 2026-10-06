@@ -14,7 +14,10 @@ definitions:
 Outputs (figures/void_population/<sim>/):
   population_evolution.png    counts, R_eff, e, p, central delta vs redshift
   population_distributions.png  R_eff / e / p / delta histograms at config.PANEL_SNAPSHOTS
-  population_stats.npz        every per-snapshot statistic
+  population_abundance.png    n(> R_eff) and dn/dlnR per Mpc^3 (well-resolved voids, Poisson errors) at
+                              config.PANEL_SNAPSHOTS -- with --other-estimator also the other estimator's
+                              catalogue, dashed -- and R_eff against the central delta at the latest one
+  population_stats.npz        every per-snapshot statistic, the abundance curves included
 
 Examples:
   python3 plot/plot_void_population.py --sim TNG50-3-Dark --method dtfe
@@ -28,7 +31,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 import config
-from dtfelib import pipeline
+from dtfelib import pipeline, catalog
 from dtfelib import make_parser, use_data_root
 from dtfelib import environment as env
 from dtfelib import groupcat as gc
@@ -50,7 +53,7 @@ def snapshot_stats(cat):
     deep = resolved & (cat["delta_values"] < config.DEEP_VOID_THRESHOLD)
 
     e, p = cat["bbks_params"][:, 0], cat["bbks_params"][:, 1]
-    r_eff = np.where(resolved, np.prod(cat["semi_axes"], axis=1) ** (1.0 / 3.0), np.nan)
+    r_eff = catalog.r_eff_mpc(cat)          # (a b c)^(1/3) where well resolved, NaN elsewhere: the one definition
 
     def pct(x, sel):
         x = np.asarray(x, dtype=float)[sel]
@@ -66,8 +69,9 @@ def snapshot_stats(cat):
         "e_pct": pct(e, valid),
         "p_pct": pct(p, valid),
         "delta_pct": pct(cat["delta_values"], np.ones(len(e), bool)),
-        # raw samples for the distribution figure
+        # raw samples for the distribution and abundance figures
         "_r_eff": r_eff[resolved & np.isfinite(r_eff)],
+        "_delta_resolved": np.asarray(cat["delta_values"], dtype=float)[resolved & np.isfinite(r_eff)],
         "_e": e[valid], "_p": p[valid],
         "_delta": np.asarray(cat["delta_values"], dtype=float),
     }
@@ -79,6 +83,9 @@ def main():
     parser.add_argument("--panel-snaps", type=int, nargs="+", default=None,
                         help="snapshots for the distribution overlays "
                              f"(default: config.PANEL_SNAPSHOTS = {config.PANEL_SNAPSHOTS})")
+    parser.add_argument("--other-estimator", action="store_true",
+                        help="abundance figure: overlay the OTHER estimator's catalogue (dtfe beside ps or the "
+                             "reverse) where its grids exist -- computed into the cache when not there yet")
     args = parser.parse_args()
     if args.smooth > 0:
         config.SMOOTHING_SIGMA_CELLS = args.smooth
@@ -87,20 +94,38 @@ def main():
     ztab = gc.redshift_table(args.sim)
     ladder = sorted({int(d.name.split("_")[1]) for d in env.sim_dir(args.sim).glob("snapdir_*")})
 
-    stats, method_used = {}, {}
+    stats, method_used, box, other, refused = {}, {}, {}, {}, []
+    panel_want = [int(s) for s in (args.panel_snaps or config.PANEL_SNAPSHOTS)]
     for s in ladder:
         prod = pipeline.products(s, sim=args.sim, method=args.method, prefix=args.prefix, data_root=args.data_root)
         try:
+            cell_, box[s], _n, _src = catalog.frame_of(prod)    # the header's frame must be config's (DTFE_SIM): else refused
             cat = prod.voids()
             method_used[s] = prod.fs.method
-        except (FileNotFoundError, ValueError):
+        except OSError as e:                           # no grids (FileNotFoundError: silent, as before) or an unreadable file
+            if not isinstance(e, FileNotFoundError):
+                print(f"  snap {s:3d}: unreadable, left out: {e}")
+            continue
+        except ValueError as e:                        # the frame (or a bad grid): say so, the snapshot is left out
+            print(f"  snap {s:3d}: REFUSED: {e}")
+            refused.append(s)
             continue
         finally:
             prod.release()
         stats[s] = snapshot_stats(cat)
+        if args.other_estimator and s in panel_want:   # only the panel snapshots are drawn: no catalogue for the rest
+            oth = pipeline.products(s, sim=args.sim, method="dtfe" if method_used[s] == "ps" else "ps",
+                                    data_root=args.data_root)
+            try:
+                other[s] = snapshot_stats(oth.voids())
+            except (FileNotFoundError, ValueError):
+                pass
+            finally:
+                oth.release()
 
     if not stats:
-        raise SystemExit(f"no {args.method} field grids for {args.sim} -- nothing to analyse")
+        raise SystemExit(f"no {args.method} field grids for {args.sim} -- nothing to analyse"
+                         + (f" ({len(refused)} snapshot(s) refused, see above)" if refused else ""))
     snaps = sorted(stats)
     z = np.array([ztab.get(s, np.nan) for s in snaps])
     methods = sorted(set(method_used.values()))
@@ -169,13 +194,54 @@ def main():
     fig.savefig(outdir / "population_distributions.png", dpi=200, bbox_inches="tight")
     plt.close(fig)
 
+    # ---- abundance figure (survey item 10): n(> R_eff), dn/dlnR per Mpc^3, R_eff against the central delta
+    radii = np.geomspace(0.3, 30.0, 40)
+    edges = np.geomspace(0.3, 30.0, 16)
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.6))
+    colors = plt.cm.viridis(np.linspace(0.1, 0.9, max(len(panel), 1)))
+    abund = {}
+    for c_, s in zip(colors, panel):
+        zlab = f"z={ztab.get(s, float('nan')):.2f}"
+        for st_, ls, tag in ((stats[s], "-", ""), (other.get(s), "--", " (other estimator)")):
+            if st_ is None:
+                continue
+            n_cum, err, cnt = catalog.void_abundance(st_["_r_eff"], box[s], radii)
+            dn, derr, dcnt = catalog.void_dn_dlnr(st_["_r_eff"], box[s], edges)
+            abund[f"{s}{'_other' if tag else ''}"] = (n_cum, err, dn, derr)
+            ok = cnt > 0
+            axes[0].errorbar(radii[ok], n_cum[ok], yerr=err[ok], color=c_, ls=ls, lw=1.4, capsize=2,
+                             label=f"{zlab}{tag} (n={cnt[0]})")
+            mid = np.sqrt(edges[1:] * edges[:-1])
+            okd = dcnt > 0
+            axes[1].errorbar(mid[okd], dn[okd], yerr=derr[okd], color=c_, ls=ls, lw=1.4, capsize=2, label=f"{zlab}{tag}")
+    for ax, ylab in ((axes[0], r"$n(>R_{\rm eff})$ [Mpc$^{-3}$]"), (axes[1], r"$dn/d\ln R_{\rm eff}$ [Mpc$^{-3}$]")):
+        ax.set_xscale("log"); ax.set_yscale("log"); ax.set_xlabel(r"$R_{\rm eff}$ [Mpc]"); ax.set_ylabel(ylab)
+        ax.grid(alpha=0.3, which="both"); ax.legend(fontsize=7)
+    last = max(panel, key=lambda s: -ztab.get(s, 0.0)) if panel else None
+    if last is not None and stats[last]["_r_eff"].size:
+        r_res = stats[last]["_r_eff"]
+        d_res = stats[last]["_delta_resolved"]
+        hb = axes[2].hexbin(r_res, d_res, gridsize=30, xscale="log", bins="log", cmap="viridis", mincnt=1)
+        fig.colorbar(hb, ax=axes[2], label="voids per cell (log)")
+        axes[2].axhline(config.DEEP_VOID_THRESHOLD, color="tab:red", lw=0.8, ls=":", label="deep-void threshold")
+        axes[2].set_xlabel(r"$R_{\rm eff}$ [Mpc]"); axes[2].set_ylabel(r"central $\delta$ (smoothed)")
+        axes[2].set_title(f"z={ztab.get(last, float('nan')):.2f}, well-resolved voids", fontsize=10)
+        axes[2].legend(fontsize=7, loc="lower right")
+    fig.suptitle(f"{args.sim} — void abundance ({'/'.join(methods)}, well-resolved voids, box {box[snaps[-1]]:.0f} Mpc)")
+    fig.tight_layout()
+    fig.savefig(outdir / "population_abundance.png", dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
     np.savez_compressed(
         outdir / "population_stats.npz",
-        snaps=np.array(snaps), redshift=z,
+        snaps=np.array(snaps), redshift=z, box_mpc=np.array([box[s] for s in snaps]),
+        abundance_radii_mpc=radii, abundance_edges_mpc=edges,
         **{k: np.array([stats[s][k] for s in snaps])
            for k in ("n_total", "n_bbks", "n_resolved", "n_deep",
-                     "r_eff_pct", "e_pct", "p_pct", "delta_pct")})
-    print(f"-> {outdir}/population_evolution.png, population_distributions.png, population_stats.npz")
+                     "r_eff_pct", "e_pct", "p_pct", "delta_pct")},
+        **{f"abundance_{key}_{part}": np.asarray(vals[i])
+           for key, vals in abund.items() for i, part in enumerate(("n_cum", "n_cum_err", "dn_dlnr", "dn_dlnr_err"))})
+    print(f"-> {outdir}/population_evolution.png, population_distributions.png, population_abundance.png, population_stats.npz")
 
 
 if __name__ == "__main__":

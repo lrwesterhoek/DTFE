@@ -24,7 +24,7 @@ N="${N:-32}"; GRID="${GRID:-64}"; BOX="${BOX:-100.0}"; AMP="${AMP:-1.8}"
 PARTITION="${PARTITION:-2 2 2}"   # Lagrangian partition grid; parallelism is over these
 BIN="${PS_BIN}"
 precision_require "${BIN}"
-TMP="${SCRIPT_DIR}/tmp"; mkdir -p "${TMP}"
+TMP="${DTFE_TEST_TMP:-${TMPDIR:-/tmp}/dtfe-tests}"; mkdir -p "${TMP}"
 # Input name must NOT share a prefix with the output roots (ps_serial/ps_par),
 # or the per-run 'rm -f <root>.*' would delete it.
 SNAP="${TMP}/ps_pcheck_input.hdf5"

@@ -6,8 +6,8 @@ tabs -- Grids (a two-snapshot PS-DTFE run: progress, log, exit summary, 'done' m
 then grids + image plane + plot_pointeval.py) and Data (download through a FAKE wget that copies
 local TNG-like chunks -- no network -- then merge_HDF5.py) -- and Stop killing the process tree.
 
-The slice-map script can only write into python/figures; its output for the synthetic
-simulation (python/figures/fields/GUITEST-1-Dark) is removed at the end.
+Every figure goes into a temp folder (DTFE_FIGURES_ROOT, set before the launcher is imported and inherited
+by the scripts it runs) -- never the real figures root, which is the T7 when it is mounted.
 
 Needs PySide6 and the built ./PS-DTFE (make PS-DTFE); without either it reports SKIP and exits
 0 -- unless DTFE_GUI_TEST_REQUIRED=1 (as in CI), where a skip is a failure, so a broken PySide6
@@ -16,6 +16,7 @@ install can never turn the suite silently green.
 Usage: ~/.venvs/dtfe-gui/bin/python tests/py_gui_app_test.py
 """
 
+import atexit
 import os
 import shutil
 import subprocess
@@ -30,6 +31,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "python" / "gui"))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ["DTFE_GUI_NO_NOTIFY"] = "1"          # no desktop notifications from a test run
+FIGS_TMP = tempfile.mkdtemp(prefix="gui_app_figs_")
+os.environ["DTFE_FIGURES_ROOT"] = FIGS_TMP      # BEFORE runspec is imported: no test figure on the T7
+atexit.register(shutil.rmtree, FIGS_TMP, True)
 REQUIRED = os.environ.get("DTFE_GUI_TEST_REQUIRED") == "1"
 
 try:
@@ -42,6 +46,7 @@ except ImportError as e:
 
 import app as A  # noqa: E402
 import explore as E  # noqa: E402
+import grids as G  # noqa: E402
 from PySide6.QtCore import QPointF  # noqa: E402
 import runspec as rs  # noqa: E402
 
@@ -160,8 +165,8 @@ def main():
         check("Run is enabled for a valid spec", w.run_btn.isEnabled())
         w.dtfe_radio.setChecked(True)
         qa.processEvents()
-        check("DTFE mode disables the PS-only options and switches script",
-              not w.ps_group.isEnabled() and not w.slice_group.isEnabled()
+        check("DTFE mode disables the PS-only options (the hi-res slice works with both estimators) and switches script",
+              not w.ps_group.isEnabled() and w.slice_group.isEnabled()
               and "scripts/run_dtfe.sh" in w.cmd_view.toPlainText())
         w.ps_radio.setChecked(True)
         w.snap_list.item(0).setCheckState(w.snap_list.item(0).checkState().Unchecked)
@@ -567,6 +572,14 @@ def main():
         fields_item.setCheckState(fields_item.checkState().Checked)
         w.opt_widgets[("fields", "pointeval_only")][1].setChecked(True)
         qa.processEvents()
+        vmin_w, vmax_w = w.opt_widgets[("panels", "vmin")][1], w.opt_widgets[("panels", "vmax")][1]
+        vmax_w.setValue(2.3e5)
+        vmin_w.setValue(0.003)
+        check("the panels' density limits hold real densities (TNG100 z=0 peaks at 2.3e5; voids go below 0.01; the "
+              "default float box stopped at 1000 and 0.01)", vmax_w.value() == 2.3e5 and abs(vmin_w.value() - 0.003) < 1e-9,
+              f"{vmin_w.value()} {vmax_w.value()}")
+        vmax_w.setValue(0.0)
+        vmin_w.setValue(0.0)
         check("Run > Add to Queue is offered like the button", w.queue_action.isEnabled())
         w.queue_action.trigger()                                                               # job 4, from the menu
         check("four jobs queued, all waiting", [j.state for j in w.queue] == ["waiting"] * 4
@@ -608,7 +621,8 @@ def main():
         log = w.log.toPlainText()
         check("one log for the whole queue, with a header per job",
               all(f"Queue job {k}/4" in log for k in (1, 2, 3)) and "Queue job 4/4" not in log)
-        check("the failed job's note says how far it got", w.queue[2].note == "0/1 steps OK", w.queue[2].note)
+        check("the failed job's note says how far it got, and how long it took",
+              w.queue[2].note.startswith("0/1 steps OK, took ") and w.queue[2].note.endswith(" s"), w.queue[2].note)
         w.q_stop_on_fail.setChecked(False)
         qa.processEvents()
         check("the button offers to resume (and so does the menu)", w.q_start.text() == "Resume queue"
@@ -909,6 +923,16 @@ def new_user_features(qa, w, tmp, data, sim):
           w.status.text() == "Finished" and Path(str(root) + ".a_den").is_file()
           and "total wall time" in runlog.read_text() and json.loads(side.read_text())["box_mpc"] == [0, 100] * 3,
           w.status.text())
+    keep_custom = rs.CustomSpec.from_dict(w.custom.to_dict())
+    w.custom = rs.CustomSpec()
+    w._load_into_widgets()
+    w._load_run_settings(A.R.parse_runlog(runlog))
+    check("Runs > Load settings of a custom run fills the Custom tab from its settings file",
+          w.tabs.currentIndex() == A.OWN and Path(w.custom.input_file) == Path(demo.input_file)
+          and w.custom.grid == demo.grid and w.custom.output_name == demo.output_name
+          and Path(w.o_file.text()) == Path(demo.input_file), w.custom.input_file)
+    w.custom = keep_custom
+    w._load_into_widgets()
     check("a periodic box: no alpha-shape row", not w.o_snap_form.isRowVisible(w.o_alpha)
           and "ps-alpha-shape" not in w.cmd_view.toPlainText())
     w.o_periodic.setChecked(False)
@@ -1166,6 +1190,182 @@ def new_user_features(qa, w, tmp, data, sim):
     check("looking for outputs again keeps the slice and the running server's answers",
           ok and x.index.value() == i_before and x._server_running and w.explore_view.streams.rowCount() >= 1
           and "Start the query server" not in w.explore_view.answer_title.text(), w.explore_view.answer_title.text())
+    print("map axes, colour bar, difference map:")
+    from PySide6.QtGui import QFontMetrics
+    cv, cb, o = w.explore_view.canvas, w.explore_view.colorbar, x.current
+    keep_field = x.field.currentData()
+    rest_ = [a for a in range(3) if a != x.axis.currentIndex()]
+    ax_, t_ = cv.axes, cv._target()
+    check("the map has axes in its output's frame (Mpc with a box, else cells), the image inside their margins",
+          ax_ is not None and abs(ax_["x"][0] - o.lo[rest_[0]]) < 1e-9 and abs(ax_["y"][1] - (o.lo + o.length)[rest_[1]]) < 1e-9
+          and ax_["unit"] == ("Mpc" if o.box is not None else "cells") and t_.left() > 20 and t_.bottom() < cv.height() - 20,
+          f"{ax_} {t_}")
+    fm = QFontMetrics(cb.font())
+    spans = sorted((l_, l_ + fm.horizontalAdvance(tx)) for _, l_, tx in cb.tick_labels(400))
+    check("the colour bar: round ticks plus its two ends, no two labels overlapping, the quantity on a row of its own",
+          len(spans) >= 3 and all(b[0] >= a[1] + 6 for a, b in zip(spans, spans[1:])) and cb.height() >= 14 + 2 * fm.height(),
+          str(cb.tick_labels(400)))
+    cb.set("magma", (-1.2, 3.7), "log₁₀ density", True)
+    texts = [tx for _, _, tx in cb.tick_labels(600)]
+    check("... a log map's ticks are whole decades written 10^k, the bar then drops 'log₁₀ ' (Save image keeps it)",
+          "10²" in texts and "1" in texts and cb.shown_label() == "density" and cb.label == "log₁₀ density", str(texts))
+    twin = o.dir / "cmp2"                              # the same cells, its density doubled: A - B = -A exactly
+    made = []
+    for f_ in o.dir.glob(o.prefix + ".*"):
+        dst_ = o.dir / ("cmp2" + f_.name[len(o.prefix):])
+        if f_.name.endswith(".a_den"):
+            (np.fromfile(f_, dtype=o.dtype) * 2).astype(o.dtype).tofile(dst_)
+        elif f_.suffix not in (".runlog",):
+            shutil.copy(f_, dst_)
+        else:
+            continue
+        made.append(dst_)
+    try:
+        x.refresh_outputs()
+        wait_for(lambda: not x._busy and x.current is not None and str(x.current.root) == str(root), 30)
+        x.field.setCurrentIndex(x.field.findData("density"))
+        wait_for(lambda: not x._busy, 30)
+        listed = [x.compare.itemData(i) for i in range(1, x.compare.count())]
+        check("'Compare with' lists the other runs on the same cells, and only those",
+              str(twin) in listed and all(E.ExploreControls.comparable(x.current, x._by_root[r_], "density") for r_ in listed),
+              str(listed))
+        x.compare.setCurrentIndex(x.compare.findData(str(twin)))
+        ok = wait_for(lambda: not x._busy and x._planes is not None, 30)
+        a_, b_ = x._planes if x._planes is not None else (None, None)
+        lo_, hi_ = cb.vrange
+        check("A − B: the cell-by-cell difference on a 0-centred RdBu_r scale; the colour controls are off; the "
+              "bar, the title and the hover say A − B / A and B",
+              ok and np.allclose(b_, 2 * a_, rtol=1e-6) and np.allclose(x._plane, a_ - b_) and x._req["cmap"] == "RdBu_r"
+              and not x._req["log"] and abs(lo_ + hi_) <= 1e-9 * max(1.0, abs(hi_)) and not x.cmap.isEnabled()
+              and not x.log.isEnabled() and cb.label.startswith("A − B") and "B = " in w.explore_view.title.text(),
+              f"{cb.label} {cb.vrange} {w.explore_view.title.text()}")
+        x._hover(cv._img.height() // 2, cv._img.width() // 2)
+        check("... the hover reads A and B beside the difference", "(A = " in w.explore_view.readout.text(),
+              w.explore_view.readout.text())
+        x.compare_mode.setCurrentIndex(x.compare_mode.findData("ratio"))
+        ok = wait_for(lambda: not x._busy and x._req.get("compare_mode") == "ratio", 30)
+        pos = x._planes[0] > 0
+        img_nan = ~np.isfinite(x._plane.T[::-1])
+        check("log₁₀ A/B: −log₁₀ 2 wherever A > 0, NaN elsewhere -- drawn grey, not as the scale's end",
+              ok and np.allclose(x._plane[pos], -np.log10(2.0), atol=1e-5) and np.isnan(x._plane[~pos]).all()
+              and (not img_nan.any() or (cv._buf[img_nan] == E.NAN_GREY).all()), f"{int((~pos).sum())} empty cells")
+        signed = next((f for f in ("velocity", "divergence", "vorticity") if f in x.current.files), None)
+        if signed:
+            x.field.setCurrentIndex(x.field.findData(signed))
+            wait_for(lambda: not x._busy, 30)
+            check(f"a signed field ({signed}) offers A − B only", not x.compare_mode.model().item(1).isEnabled()
+                  and x.compare_mode.currentData() == "diff")
+        x.compare.setCurrentIndex(0)
+        ok = wait_for(lambda: not x._busy and x._planes is None, 30)
+        check("compare off: the plain map and its colour controls back", ok and x.cmap.isEnabled() and x.log.isEnabled()
+              and "A − B" not in cb.label)
+        x.field.setCurrentIndex(x.field.findData("density"))
+        wait_for(lambda: not x._busy, 30)
+        x.vmin_edit.setText("0.5")
+        x.vmax_edit.setText("4")
+        x.fixed.setChecked(True)
+        ok = wait_for(lambda: not x._busy and x._req.get("vrange") is not None, 30)
+        want = (np.log10(0.5), np.log10(4.0)) if x.log.isChecked() else (0.5, 4.0)
+        check("a fixed colour range: the map and its bar on exactly that range (log10 on a log map), the clip off",
+              ok and np.allclose(cb.vrange, want) and not x.clip.isEnabled(), f"{cb.vrange} {want}")
+        st = x.state()
+        x.fixed.setChecked(False)
+        wait_for(lambda: not x._busy, 30)
+        back = x.restore_state(st)
+        wait_for(lambda: not x._busy, 30)
+        check("Explore's state round-trips (the output, field, slice and the fixed range: what a restart restores)",
+              back and x.fixed.isChecked() and x.vmin_edit.text() == "0.5" and x.field.currentData() == "density"
+              and x.index.value() == st["index"], str(st))
+        npy, csv = tmp / "slice_values.npy", tmp / "slice_values.csv"
+        x.save_values(npy)
+        x.save_values(csv)
+        arr, lines = np.load(npy), csv.read_text().splitlines()
+        check("Save image… also writes the values: .npy as drawn (rows from the bottom), .csv x, y, value per cell",
+              arr.shape == x._plane.T.shape and np.allclose(arr, x._plane.T) and lines[0].endswith(",value")
+              and len(lines) == 1 + x._plane.size, f"{arr.shape} {lines[0]} {len(lines)}")
+        x.fixed.setChecked(False)
+        wait_for(lambda: not x._busy, 30)
+    finally:
+        for f_ in made:
+            f_.unlink(missing_ok=True)
+        x.refresh_outputs()
+        wait_for(lambda: not x._busy and x.current is not None and str(x.current.root) == str(root), 30)
+        x.field.setCurrentIndex(x.field.findData(keep_field))
+        wait_for(lambda: not x._busy, 30)
+    # a point-evaluated hi-res slice ('.pts_den' + its plane sidecar) in place of the grid slice
+    import json as _json
+    pts_den, side_ = Path(str(root) + ".pts_den"), Path(str(root)).parent / "pointeval_plane_16_z.json"
+    np.arange(16 * 16, dtype=np.float64).tofile(pts_den)            # the value at (v, u) is 16 v + u
+    side_.write_text(_json.dumps({"nu": 16, "nv": 16, "planes": 1, "supersample": 1, "axis": "z", "u_axis": "x",
+                                  "v_axis": "y", "u0": 0, "u1": 100, "v0": 0, "v1": 100, "center": 50.0, "box": 100.0}))
+    keep_axis = x.axis.currentIndex()
+    try:
+        x.field.setCurrentIndex(x.field.findData("density"))
+        wait_for(lambda: not x._busy, 30)
+        x.axis.setCurrentIndex(0)               # the menu at x: a z-plane labelled from the menu would read y, z
+        wait_for(lambda: not x._busy, 30)
+        x._pts_fill()
+        j = x.pts_combo.findData(str(side_))
+        x.pts_combo.setCurrentIndex(max(j, 0))
+        ok = wait_for(lambda: not x._busy and bool(x._req.get("pts")) and x._pts_side is not None, 30)
+        check("a hi-res slice: listed when its sidecar matches, shown in place of the grid slice (plane[u, v], "
+              "its own Mpc axes; the slice axis and position greyed)",
+              ok and j > 0 and x._plane.shape == (16, 16) and np.allclose(x._plane, np.arange(256.0).reshape(16, 16).T)
+              and "hi-res slice" in w.explore_view.title.text() and w.explore_view.canvas.axes["x"][:2] == (0.0, 100.0)
+              and not x.axis.isEnabled(), w.explore_view.title.text())
+        x._hover(0, 0)
+        check("... the hover names the hi-res point at the plane's position", "hi-res point" in w.explore_view.readout.text()
+              and "z = 50.00" in w.explore_view.readout.text(), w.explore_view.readout.text())
+        running, x._server_running = x._server_running, False     # the server runs here: _click reads only this
+        try:
+            x._click(0, 0)
+        finally:
+            x._server_running = running
+        check("... a click with no server names the hi-res point, not a grid cell",
+              "hi-res point" in w.explore_view.answer_title.text(), w.explore_view.answer_title.text())
+        import types as _types
+        from matplotlib.axes import Axes as _Axes
+        labels, png = [], tmp / "pts_map.png"
+        orig_x, orig_y, orig_dlg = _Axes.set_xlabel, _Axes.set_ylabel, E.QFileDialog.getSaveFileName
+        _Axes.set_xlabel = lambda self_, s, *a, **k: (labels.append(s), orig_x(self_, s, *a, **k))[1]
+        _Axes.set_ylabel = lambda self_, s, *a, **k: (labels.append(s), orig_y(self_, s, *a, **k))[1]
+        E.QFileDialog.getSaveFileName = staticmethod(lambda *a, **k: (str(png), ""))
+        try:
+            x._save_image()
+        finally:
+            _Axes.set_xlabel, _Axes.set_ylabel, E.QFileDialog.getSaveFileName = orig_x, orig_y, orig_dlg
+        check("... Save image labels the plane's own axes (x, y of a z-plane), not the greyed menu's (y, z)",
+              png.is_file() and [s.split()[0] for s in labels[:2]] == ["x", "y"], str(labels))
+        late = {"output": x.current, "axis": 2, "index": 0, "a0": (20.0, 30.0), "a1": (40.0, 50.0), "res": 8,
+                "depth": 1, "memo": True, "seconds": 0.0}
+        x._zoomed(late, _types.SimpleNamespace(density=np.ones((8, 8, 1)), streams=None, caustic=None, velocity=None,
+                                               dispersion=None, sigma=None, velocity_gradient=None, offsets=None))
+        check("... a zoom that lands while the hi-res slice shows is kept in memory, not drawn in the slice's frame",
+              not x.is_zoomed() and w.explore_view.canvas.axes["x"][:2] == (0.0, 100.0), str(w.explore_view.canvas.axes))
+        x.pts_combo.setCurrentIndex(0)
+        ok = wait_for(lambda: not x._busy and not x._req.get("pts"), 30)
+        check("... and off again: the grid slice", ok and x._plane.shape != (16, 16) or x.current.n == 16)
+    finally:
+        pts_den.unlink(missing_ok=True)
+        side_.unlink(missing_ok=True)
+        x._pts_fill()
+        x.axis.setCurrentIndex(keep_axis)
+        x.field.setCurrentIndex(x.field.findData(keep_field))
+        wait_for(lambda: not x._busy, 30)
+    # the scalar field in a zoom (an exact zoom of a run with a scalar dataset), the server's resident partitions,
+    # and the server button after a restore (refresh_outputs judged it before the snapshots were back)
+    import types as _types
+    saved_zoom = (x._zoom, x._zoom_fields)
+    x._zoom = {"axis": 2, "output": x.current}
+    x._zoom_fields = _types.SimpleNamespace(density=np.ones((4, 4, 1)), scalar=np.full((4, 4, 1), 7.0))
+    sp = x._zoom_plane("scalar", "")
+    x._zoom, x._zoom_fields = saved_zoom
+    sroot = tmp / "scalar_zoom"
+    np.ones(8, dtype=np.float32).tofile(str(sroot) + ".a_den")
+    np.full(8, 3.0, dtype=np.float32).tofile(str(sroot) + ".a_scalar")
+    ez = E.load_exact_planes(sroot, (2, 2, 2))
+    check("a zoom shows the scalar field (the exact zoom's '.a_scalar' is read; the server's answer has none)",
+          sp is not None and np.all(sp == 7.0) and getattr(ez, "scalar", None) is not None and np.all(ez.scalar == 3.0))
     print("figure grid:")
     cur_root, cur_field = str(x.current.root), x.field.currentData()
     x.grid_set_layout(1, 2)
@@ -1274,43 +1474,368 @@ def new_user_features(qa, w, tmp, data, sim):
     r0 = [x.grid_table.cellWidget(0, c) for c in range(5)]
     check("the composer's rows: Simulation, Redshift, Type, Field, Component -- the output in three menus keyed as "
           "the Output menus are", hdr == list(E.GRID_COLS) and r0[0].currentData() == SIM and r0[1].currentData() == 50
-          and r0[2].currentData() == str(x.grid_row(0)[0].root) and r0[2].currentData(0x0101) == x.grid_row(0)[0].prefix,
-          f"{hdr} {[w_.currentText() for w_ in r0]}")
+          and r0[2].currentText() == G.type_label(x._by_root[r0[2].currentData()])
+          and r0[2].currentData(0x0101) == x.grid_row(0)[0].prefix and r0[2].toolTip().endswith(".*"),
+          f"{hdr} {[w_.currentText() for w_ in r0]} {r0[2].toolTip()!r}")
     prev_root = str(x.current.root)
-    std = sim / "snapdir_050" / "output"                  # a standard-DTFE output beside the phase-space ones
+    s50 = sim / "snapdir_050"
+    std = s50 / "output"                                  # a standard-DTFE output beside the phase-space ones
     np.full(32 ** 3, 2.0, dtype=np.float32).tofile(str(std) + ".a_den")
+    np.full(32 ** 3, 2.0, dtype=np.float32).tofile(str(s99 / "output") + ".a_den")     # ... at both snapshots
+    alt_files = []                                        # ps_alt: a phase-space run at both snapshots, never the preferred prefix
+    for sd in (s50, s99):
+        for f_ in sd.glob("ps_gui.*"):
+            if f_.suffix not in (".runlog", ".json"):
+                shutil.copy(f_, sd / f_.name.replace("ps_gui.", "ps_alt."))
+                alt_files.append(sd / f_.name.replace("ps_gui.", "ps_alt."))
+    if not (s50 / "ps_output.a_den").exists():            # the production prefix at 050 for certain (type_order's 2nd key);
+        for f_ in s50.glob("ps_gui.*"):                   # never over what the pipeline left there
+            dst_ = s50 / f_.name.replace("ps_gui.", "ps_output.")
+            if f_.suffix not in (".runlog", ".json") and not dst_.exists():
+                shutil.copy(f_, dst_)
+                alt_files.append(dst_)
     x.refresh_outputs()
-    x.select_root(str(sim / "snapdir_050" / "ps_gui"))
-    ok = wait_for(lambda: x._plane is not None and not x._busy and x.current is not None and x.current.prefix == "ps_gui", 30)
+    x.select_root(str(s50 / "ps_q2"))                     # a prefix that sorts AFTER ps_gui: the fill must keep the map's own run
+    ok = wait_for(lambda: x._plane is not None and not x._busy and x.current is not None and x.current.prefix == "ps_q2", 30)
     x.grid_set_layout(1, 2)
     x.grid_fill("types")
     rows = [x.grid_row(i) for i in range(2)]
     typ0 = x.grid_table.cellWidget(0, E._C_TYPE)
     labels = [typ0.itemText(k) for k in range(typ0.count())]
-    check("'this snapshot across outputs': the standard DTFE and the phase-space run of one snapshot side by side; the "
-          "Type menu lists every output of that snapshot", ok and [r[0].prefix for r in rows if r] == ["output", "ps_gui"]
-          and "DTFE" in labels and "PS-DTFE · ps_gui" in labels and typ0.isEnabled(),
-          f"{[r[0].prefix for r in rows if r]} {labels}")
+    # the whole menu in type_order (review 2026-10-05 [38]): DTFE, the production run, the preferred prefix (ps_q2),
+    # then the rest by name -- built from what is listed at 050, so a run an earlier section left there still fits
+    at50 = sorted({o_.prefix for _t, o_ in x.outputs if o_.sim == SIM and o_.snap == 50})
+    want_types = ["DTFE", "PS-DTFE", "PS-DTFE · ps_q2"] + [f"PS-DTFE · {p}" for p in at50
+                                                          if p not in ("output", "ps_output", "ps_q2")]
+    check("'this snapshot across outputs': the map's own run (ps_q2, not the alphabetically first ps_*) and the standard "
+          "DTFE of that snapshot side by side, DTFE first; the Type menu lists every output of that snapshot, in order: "
+          "DTFE, the production PS-DTFE, the preferred ps_q2, then the rest by name",
+          ok and [r[0].prefix for r in rows if r] == ["output", "ps_q2"] and labels == want_types and typ0.isEnabled(),
+          f"{[r[0].prefix for r in rows if r]} {labels} want {want_types} (preferred {x._pref_prefix})")
+    # type_order's 2nd key: from the standard DTFE the other estimator's pick is its DEFAULT prefix (ps_output), not
+    # the first by name (ps_alt); the preferred prefix is now 'output' (picked by name), so only that key can say so
+    x.select_root(str(std))
+    ok_std = wait_for(lambda: x._plane is not None and not x._busy and x.current is not None and x.current.prefix == "output", 30)
+    x.grid_set_layout(1, 2)
+    x.grid_fill("types")
+    std_rows = [x.grid_row(i) for i in range(2)]
+    check("... from the standard DTFE: the production PS-DTFE run (ps_output) beside it, not the first by name (ps_alt)",
+          ok_std and [r[0].prefix for r in std_rows if r] == ["output", "ps_output"],
+          f"{[r[0].prefix for r in std_rows if r]} (preferred {x._pref_prefix})")
+    # ... and the production run stays ABOVE a preferred prefix that sorts before it by name (ps_alt < ps_output): ps_q2
+    # sorts after it, so one key ranking both alike would pass the menu check above
+    x.select_root(str(s50 / "ps_alt"))
+    ok_alt = wait_for(lambda: x._plane is not None and not x._busy and x.current is not None and x.current.prefix == "ps_alt", 30)
+    x.grid_set_layout(1, 2)
+    x.grid_fill("types")
+    alt_rows = [x.grid_row(i) for i in range(2)]
+    typ0_alt = x.grid_table.cellWidget(0, E._C_TYPE)
+    alt_labels = [typ0_alt.itemText(k) for k in range(typ0_alt.count())]
+    want_alt = ["DTFE", "PS-DTFE", "PS-DTFE · ps_alt"] + [f"PS-DTFE · {p}" for p in at50
+                                                         if p not in ("output", "ps_output", "ps_alt")]
+    check("... from ps_alt (a preferred prefix that sorts BEFORE ps_output): the Type menu still reads DTFE, the "
+          "production PS-DTFE, then ps_alt, then the rest by name",
+          ok_alt and [r[0].prefix for r in alt_rows if r] == ["output", "ps_alt"] and alt_labels == want_alt,
+          f"{[r[0].prefix for r in alt_rows if r]} {alt_labels} want {want_alt} (preferred {x._pref_prefix})")
+    x.select_root(str(s50 / "ps_q2"))                     # back to the ps_q2 map and its fill: the steps below use both
+    ok = wait_for(lambda: x._plane is not None and not x._busy and x.current is not None and x.current.prefix == "ps_q2", 30)
+    x.grid_set_layout(1, 2)
+    x.grid_fill("types")
+    rows = [x.grid_row(i) for i in range(2)]
     check("... the same box: 'merge the axes' is offered", x.grid_merge.isEnabled())
     x.grid_toggle.setChecked(True)
     ok = wait_for(lambda: x._grid_shown and x._grid_index is not None and not x._grid_busy, 30)
+    tile_labels = list(w.explore_view.canvas.labels or [])
+    check("the tiles are labelled by estimator, not by the raw prefix ('DTFE' and 'PS-DTFE · ps_q2')",
+          ok and any(t[2].endswith("· DTFE") for t in tile_labels) and any(t[2].endswith("· PS-DTFE · ps_q2") for t in tile_labels),
+          str(tile_labels))
     sent = []
     x._to_render_grid.connect(lambda req: sent.append(req))
+    x.grid_set_row(1, x._by_root[str(s50 / "ps_alt")])   # row 1 = ps_alt (the preferred prefix is ps_q2): one recompose
+    ok1 = wait_for(lambda: not x._grid_busy and len(sent) >= 1, 30)
     snap1 = x.grid_table.cellWidget(1, E._C_SNAP)
-    snap1.setCurrentIndex(snap1.findData(99))             # row 1 (ps_gui) to z = 0: its type sticks
-    ok2 = wait_for(lambda: not x._grid_busy, 30)
+    snap1.setCurrentIndex(snap1.findData(99))             # row 1 (ps_alt) to z = 0: its type sticks
+    ok2 = wait_for(lambda: not x._grid_busy and len(sent) >= 2, 30)
     r1 = x.grid_row(1)
-    check("a row's redshift changed: its output type sticks (ps_gui, although snapshot 99 has ps_output too), the "
-          "field too, and the grid recomposes once", ok and ok2 and r1 is not None and r1[0].snap == 99
-          and r1[0].prefix == "ps_gui" and r1[1] == rows[1][1] and len(sent) == 1,
+    check("a row's redshift changed: its output type sticks (ps_alt, although snapshot 99 has ps_output and the preferred "
+          "ps_q2 is absent there), the field too, and each change recomposes once", ok and ok1 and ok2 and r1 is not None
+          and r1[0].snap == 99 and r1[0].prefix == "ps_alt" and r1[1] == rows[1][1] and len(sent) == 2,
           f"{r1 and (r1[0].snap, r1[0].prefix, r1[1])} {len(sent)}")
+    snap0 = x.grid_table.cellWidget(0, E._C_SNAP)
+    snap0.setCurrentIndex(snap0.findData(99))             # row 0 (DTFE) to z = 0: stays DTFE
+    wait_for(lambda: not x._grid_busy and len(sent) >= 3, 30)
+    r0_ = x.grid_row(0)
+    check("a DTFE row stepped to a snapshot that has a DTFE run stays DTFE (the preferred prefix would say ps_q2)",
+          r0_ is not None and r0_[0].snap == 99 and r0_[0].prefix == "output", f"{r0_ and (r0_[0].snap, r0_[0].prefix)}")
+    Path(str(s99 / "output") + ".a_den").unlink()         # snapshot 99 loses its DTFE run
+    x.refresh_outputs()                                   # (leaves the grid; row 0 at 099 falls back to a phase-space run)
+    wait_for(lambda: not x._busy, 30)
+    fell = x.grid_row(0)
+    snap0 = x.grid_table.cellWidget(0, E._C_SNAP)
+    snap0.setCurrentIndex(snap0.findData(50))             # back to z = 1: the row's own choice, DTFE, comes back
+    back = x.grid_row(0)
+    check("a row's chosen type survives a snapshot without it: at 099 it falls back to a phase-space run, stepped back "
+          "to 050 it is DTFE again", fell is not None and fell[0].snap == 99 and G.estimator_label(fell[0]) == "PS-DTFE"
+          and back is not None and back[0].snap == 50 and back[0].prefix == "output",
+          f"{fell and (fell[0].snap, fell[0].prefix)} {back and (back[0].snap, back[0].prefix)}")
+    x.grid_toggle.setChecked(True)
+    wait_for(lambda: x._grid_shown and not x._grid_busy, 30)
     sim1 = x.grid_table.cellWidget(1, E._C_SIM)
     sim1.setCurrentIndex(sim1.findData(E.GRID_NONE))
     wait_for(lambda: not x._grid_busy, 30)
     check("a row's simulation set to '—' leaves that panel blank (its redshift and type menus empty)",
           x.grid_row(1) is None and x.grid_table.cellWidget(1, E._C_SNAP).count() == 0
-          and x.grid_table.cellWidget(1, E._C_TYPE).count() == 0)
+          and x.grid_table.cellWidget(1, E._C_TYPE).count() == 0 and x._grid_shown)
+    sim0 = x.grid_table.cellWidget(0, E._C_SIM)
+    sim0.setCurrentIndex(sim0.findData(E.GRID_NONE))      # the last panel blanked while the grid is shown
+    wait_for(lambda: not x._grid_busy and not x._busy, 30)
+    check("the last panel blanked while the grid is shown: the map comes back with the warning, the rows stay blank "
+          "(no silent refill from the map)", not x._grid_shown and x.grid_state.text().startswith("⚠ no panel")
+          and x.grid_row(0) is None and x.grid_row(1) is None, f"{x._grid_shown} {x.grid_state.text()!r}")
+    # a file opened by hand goes straight into a panel; two opened folders of one name are told apart
+    opened = []
+    for sub_ in ("opened_a", "opened_b"):
+        d_ = tmp / sub_ / "elsewhere"
+        d_.mkdir(parents=True, exist_ok=True)
+        np.full(32 ** 3, 1.5, dtype=np.float32).tofile(str(d_ / "foo.a_den"))
+        opened.append(d_ / "foo")
+    ok = x.open_file(str(opened[0]) + ".a_den")
+    wait_for(lambda: not x._busy and x.current is not None and str(x.current.root) == str(opened[0]), 30)
+    x.grid_set_row(0, x._by_root[str(opened[0])])
+    got = x.grid_row(0)
+    check("a file opened by hand can be placed in a panel at once (its 'Opened files' group is in the row's menu)",
+          ok and got is not None and str(got[0].root) == str(opened[0])
+          and x.grid_table.cellWidget(0, E._C_SIM).currentData() == E.GROUP_OPENED, f"{ok} {got}")
+    x.open_file(str(opened[1]) + ".a_den")
+    wait_for(lambda: not x._busy and x.current is not None and str(x.current.root) == str(opened[1]), 30)
+    menu = x.grid_table.cellWidget(0, E._C_SNAP)
+    texts = [menu.itemText(k) for k in range(menu.count())]
+    check("two opened folders named 'elsewhere' read 'opened_a/elsewhere' and 'opened_b/elsewhere' in the Redshift menu, "
+          "and the row kept its output", texts == ["opened_a/elsewhere", "opened_b/elsewhere"]
+          and x.grid_row(0) is not None and str(x.grid_row(0)[0].root) == str(opened[0]), str(texts))
+    # review 2026-10-05 [38] fix 3: a refresh re-lists row 0's opened file under the custom snapshots (its folder joined
+    # them): the row follows its OUTPUT into that group -- kept on 'Opened files', which no longer holds it, the row
+    # swapped to opened_b
+    w.custom_dirs.append(str(opened[0].parent))
+    try:
+        x.refresh_outputs()
+        wait_for(lambda: not x._busy, 30)
+        moved, grp0 = x.grid_row(0), x.grid_table.cellWidget(0, E._C_SIM).currentData()
+    finally:
+        w.custom_dirs.remove(str(opened[0].parent))
+    x.refresh_outputs()                                   # opened_a left every list: opened again, opened_b shown as before
+    x.open_file(str(opened[0]) + ".a_den")
+    x.select_root(str(opened[1]))
+    wait_for(lambda: not x._busy and x.current is not None and str(x.current.root) == str(opened[1]), 30)
+    check("a row's opened file whose folder then joins the custom snapshots: after the refresh the row keeps that output, "
+          "its Simulation now 'Custom snapshots'", moved is not None and str(moved[0].root) == str(opened[0])
+          and grp0 == E.GROUP_CUSTOM, f"{moved and moved[0].root} {grp0}")
+    # the snapshot key: a simulation output with no number -> its folder; a custom run -> the snapshot FILE it read
+    kd = tmp / "keys"; kd.mkdir(exist_ok=True)
+    for nm, side_ in (("a", {"input_file": "~/snaps/one.hdf5"}), ("b", {"input_file": "~/snaps/one.hdf5"}),
+                      ("c", {"input_file": "~/snaps/two.hdf5"}), ("d", None)):
+        np.full(8, 1.0, dtype=np.float32).tofile(str(kd / f"{nm}.a_den"))
+        if side_:
+            (kd / f"{nm}.gui.json").write_text(json.dumps(side_))
+    ko = {nm: G.OutputSet(kd / nm, box=None) for nm in "abcd"}
+    weird = G.OutputSet(kd / "d", box=None, sim="X", snap=None)
+    keys = {nm: E.ExploreControls._grid_snap_key(o) for nm, o in ko.items()}
+    check("the composer's snapshot key: custom runs of ONE snapshot file share it whatever their names, another file "
+          "differs, no sidecar -> the folder, an unnumbered snapdir -> its folder (not '?')",
+          keys["a"] == keys["b"] == str(Path("~/snaps/one.hdf5").expanduser().resolve()) and keys["c"] != keys["a"]
+          and keys["d"] == str(kd) and E.ExploreControls._grid_snap_key(weird) == str(kd), str(keys))
+    # the sidecar at a job's start never overwrites one that describes grids already on disk; the finish does
+    sspec = rs.CustomSpec(input_file=str(kd / "one.hdf5"), estimator="dtfe", output_dir=str(kd), output_name="side")
+    (kd / "side.gui.json").write_text(json.dumps({"estimator": "ps", "note": "the old PS run"}))
+    w._register_custom_output(sspec)
+    kept_old = json.loads((kd / "side.gui.json").read_text()).get("note") == "the old PS run"
+    w._register_custom_output(sspec, final=True)
+    final_ = json.loads((kd / "side.gui.json").read_text())
+    (kd / "side.gui.json").unlink()
+    w._register_custom_output(sspec)
+    fresh = json.loads((kd / "side.gui.json").read_text())
+    check("a re-run under an old name keeps the old sidecar at its start (a stopped run leaves the old grids), rewrites it "
+          "when it finishes, and a fresh name gets one at the start", kept_old and final_.get("estimator") == "dtfe"
+          and "note" not in final_ and fresh.get("estimator") == "dtfe", f"{kept_old} {final_} {fresh}")
+    cli_spec = rs.CustomSpec(input_file=str(kd / "one.hdf5"), estimator="ps", output_dir=str(kd), output_name="cli")
+    np.ones(8, np.float32).tofile(str(kd / "cli.a_den"))                 # grids a CLI run left, no sidecar
+    w._register_custom_output(cli_spec)
+    no_side = not (kd / "cli.gui.json").exists()
+    w._register_custom_output(cli_spec, final=True)
+    check("grids without a sidecar are not described at a job's START (a CLI run's); the finish writes one, with no .tmp left",
+          no_side and (kd / "cli.gui.json").is_file() and not (kd / "cli.gui.json.tmp").exists())
+    bad_spec = rs.CustomSpec(input_file=str(kd / "one.hdf5"), estimator="ps", output_dir=str(kd), output_name="bad")
+    (kd / "bad.gui.json.tmp").mkdir()                                     # the temp file's name taken by a folder: the write fails
+    w.log.clear()
+    w._register_custom_output(bad_spec)
+    check("a sidecar that cannot be written is logged ('!! cannot write the settings sidecar'), not swallowed",
+          "!! cannot write the settings sidecar bad.gui.json" in w.log.toPlainText(), w.log.toPlainText()[-200:])
+    # ... and through a Run-button job's real start (review 2026-10-05 [32]): _begin clears the log FIRST, then writes
+    # the sidecar, so the line survives. _next_step held: the finish would write (and log) the sidecar again
+    idle = w.proc is None
+    w.log.appendPlainText("an earlier job's log")
+    w._next_step = lambda: None
+    try:
+        w._begin([], A.OWN, bad_spec, None)
+    finally:
+        del w._next_step
+    log_ = w.log.toPlainText()
+    check("... a job's start (_begin from the Run button) clears the old log, THEN logs the '!! cannot write' line: it survives",
+          idle and "an earlier job's log" not in log_ and log_.count("!! cannot write the settings sidecar bad.gui.json") == 1,
+          log_[-300:])
+    if str(kd) in w.custom_dirs:
+        w.custom_dirs.remove(str(kd))
+    shutil.rmtree(kd)
+    # REVIEW 2026-10-05: custom runs of one NAME in two folders (the Custom tab's default name is the input file's
+    # stem) -- the row's choice sticks by its root and estimator, duplicate labels get their folder, deep paths tell
+    in_dir = tmp / "cust_in"; in_dir.mkdir(exist_ok=True)
+    cds = {k: tmp / f"cust_{k}" for k in ("dtfe", "ps", "ps2", "z")}
+    for k, d_ in cds.items():
+        d_.mkdir(exist_ok=True)
+    for k, est in (("dtfe", "dtfe"), ("ps", "ps"), ("ps2", "ps")):
+        for nm in ("X", "Y"):
+            if k == "ps2" and nm == "Y":
+                continue
+            np.full(32 ** 3, 1.0 + 0.1 * (nm == "Y"), dtype=np.float32).tofile(str(cds[k] / f"{nm}.a_den"))
+            (cds[k] / f"{nm}.gui.json").write_text(json.dumps({"estimator": est, "input_file": str(in_dir / f"{nm}.hdf5"), "box_mpc": [0, 100] * 3}))
+    for nm, fam in (("A", "TNG50-3"), ("B", "TNG100-3")):
+        np.full(32 ** 3, 1.0, dtype=np.float32).tofile(str(cds["z"] / f"{nm}.a_den"))
+        (cds["z"] / f"{nm}.gui.json").write_text(json.dumps({"estimator": "ps", "input_file": str(in_dir / fam / "snapdir_099" / "combined_099.hdf5"), "box_mpc": [0, 100] * 3}))
+    for k in ("dupA", "dupB"):                            # two more PS runs X of X.hdf5, in two folders both named 'out':
+        cds[k] = tmp / k / "out"                          # the Type label's third stage (the full folder)
+        cds[k].mkdir(parents=True, exist_ok=True)
+        np.full(32 ** 3, 1.0, dtype=np.float32).tofile(str(cds[k] / "X.a_den"))
+        (cds[k] / "X.gui.json").write_text(json.dumps({"estimator": "ps", "input_file": str(in_dir / "X.hdf5"), "box_mpc": [0, 100] * 3}))
+    w.custom_dirs += [str(d_) for d_ in cds.values()]
+    x.refresh_outputs()
+    x.select_root(str(cds["ps"] / "X"))
+    wait_for(lambda: not x._busy and x.current is not None and str(x.current.root) == str(cds["ps"] / "X"), 30)
+    x.grid_set_layout(1, 2)
+    x.grid_fill("types")
+    rows = [x.grid_row(i) for i in range(2)]
+    typ1 = x.grid_table.cellWidget(1, E._C_TYPE)
+    labels = [typ1.itemText(k) for k in range(typ1.count())]
+    check("'across outputs' on a custom PS run named X: the DTFE run X of the same snapshot file (another folder) beside it; "
+          "two PS runs of that name are told apart by their folder in the Type menu",
+          [str(r[0].root) for r in rows if r] == [str(cds["dtfe"] / "X"), str(cds["ps"] / "X")]
+          and "PS-DTFE · X (cust_ps)" in labels and "PS-DTFE · X (cust_ps2)" in labels and "DTFE · X" in labels, f"{rows} {labels}")
+    by_label = {typ1.itemText(k): typ1.itemData(k) for k in range(typ1.count())}
+    want_dup = {f"PS-DTFE · X ({cds[k]})": str(cds[k] / "X") for k in ("dupA", "dupB")}
+    check("... two more of them in two folders both named 'out' read with their FULL folder, each entry its own run "
+          "(review 2026-10-05 [32]); the told-apart ones keep the short folder",
+          all(by_label.get(lab) == root_ for lab, root_ in want_dup.items()) and len(labels) == len(set(labels))
+          and by_label.get("PS-DTFE · X (cust_ps)") == str(cds["ps"] / "X"), str(by_label))
+    snap1 = x.grid_table.cellWidget(1, E._C_SNAP)
+    key_y = E.ExploreControls._grid_snap_key(x._by_root[str(cds["ps"] / "Y")])
+    key_x = E.ExploreControls._grid_snap_key(x._by_root[str(cds["ps"] / "X")])
+    snap1.setCurrentIndex(snap1.findData(key_y))
+    away = x.grid_row(1)
+    snap1.setCurrentIndex(snap1.findData(key_x))
+    back = x.grid_row(1)
+    check("a PS row of name X stepped to Y (PS there) and back comes back as PS X, not the DTFE run of the same name",
+          away is not None and str(away[0].root) == str(cds["ps"] / "Y") and back is not None and str(back[0].root) == str(cds["ps"] / "X"),
+          f"{away and away[0].root} {back and back[0].root}")
+    typ1.setCurrentIndex(typ1.findData(str(cds["ps2"] / "X")))           # the user's own pick: the second PS run
+    snap1.setCurrentIndex(snap1.findData(key_y))
+    snap1.setCurrentIndex(snap1.findData(key_x))
+    check("the user's pick of the second PS run X survives a step away and back (its root is remembered)",
+          x.grid_row(1) is not None and str(x.grid_row(1)[0].root) == str(cds["ps2"] / "X"), str(x.grid_row(1) and x.grid_row(1)[0].root))
+    texts = [snap1.itemText(k) for k in range(snap1.count())]
+    check("two custom runs of 'snapdir_099/combined_099.hdf5' from two simulations read with their simulation folder; X.hdf5 "
+          "and Y.hdf5 stay short", "TNG50-3/snapdir_099/combined_099.hdf5" in texts and "TNG100-3/snapdir_099/combined_099.hdf5" in texts
+          and "X.hdf5" in texts and "Y.hdf5" in texts, str(texts))
+    x.grid_fill("redshifts")
+    check("'across redshifts' from a custom PS run keeps to ITS estimator (X and Y of the PS folder, not the DTFE run of X)",
+          sorted(str(r[0].root) for r in [x.grid_row(i) for i in range(2)] if r) == sorted([str(cds["ps"] / "X"), str(cds["ps"] / "Y")]),
+          str([r and str(r[0].root) for r in [x.grid_row(i) for i in range(2)]]))
+    # the newest NUMBERED snapshot is a simulation row's default, not an unnumbered folder; numbers come first
+    backup = sim / "snapdir_backup"; backup.mkdir(exist_ok=True)
+    shutil.copy(s50 / "ps_gui.a_den", backup / "ps_gui.a_den")
+    x.refresh_outputs()
+    sim0 = x.grid_table.cellWidget(0, E._C_SIM)
+    sim0.setCurrentIndex(sim0.findData(E.GRID_NONE))
+    sim0.setCurrentIndex(sim0.findData(SIM))
+    snap0 = x.grid_table.cellWidget(0, E._C_SNAP)
+    texts = [snap0.itemText(k) for k in range(snap0.count())]
+    check("a blank row set to the simulation: the Redshift menu lists the numbers first, then '(snapdir_backup)', and "
+          "defaults to the newest number", texts[-1].endswith("(snapdir_backup)") and snap0.currentData() == 99
+          and [snap0.itemData(k) for k in range(snap0.count())][:2] == [50, 99], f"{texts} {snap0.currentData()}")
+    shutil.rmtree(backup)
+    x.refresh_outputs()
+    # two estimators at two redshifts: the tiles and the saved figure name the estimator; every cell menu has a tooltip
+    x.grid_set_row(0, x._by_root[str(std)])                                   # DTFE at 050
+    x.grid_set_row(1, x._by_root[str(s99 / "ps_gui")])                        # PS-DTFE at 099
+    x.grid_merge.setChecked(False)                                            # titles per panel (merged: inside labels)
+    x.grid_toggle.setChecked(True)
+    ok = wait_for(lambda: x._grid_shown and x._grid_index is not None and not x._grid_busy, 30)
+    tl = [t[2] for t in (w.explore_view.canvas.labels or [])]
+    titles = [a.get_title() for a in x.grid_figure()[0].axes if a.get_title()]
+    check("a DTFE panel at z = 1 beside a PS-DTFE one at z = 0: both the tiles and the saved figure's titles name the estimator",
+          ok and any("· DTFE" in t for t in tl) and any("PS-DTFE" in t for t in tl)
+          and any("DTFE" in t and "PS-DTFE" not in t for t in titles) and any("PS-DTFE" in t for t in titles), f"{tl} {titles}")
+    fld0 = x.grid_table.cellWidget(0, E._C_FLD)
+    check("every cell menu carries its text as a tooltip (the narrow columns clip it)",
+          fld0.toolTip() == fld0.currentText() and x.grid_table.cellWidget(0, E._C_SIM).toolTip() == SIM, f"{fld0.toolTip()!r}")
+    sent.clear()                                                              # (the signal is connected above: one slot)
+    x.grid_set_row(1, x._by_root[str(s50 / "ps_gui")], field="density", component="value")
+    wait_for(lambda: not x._grid_busy, 30)
+    spin(200)
+    check("grid_set_row with a field and a component while the grid is shown recomposes exactly once",
+          len(sent) == 1 and x.grid_row(1) is not None and x.grid_row(1)[1] == "density", str(len(sent)))
+    x.grid_toggle.setChecked(False)
+    wait_for(lambda: not x._grid_shown and not x._busy, 30)
+    for i in range(2):
+        simw = x.grid_table.cellWidget(i, E._C_SIM)
+        simw.setCurrentIndex(simw.findData(E.GRID_NONE))
+    x.grid_toggle.setChecked(True)
+    ok = wait_for(lambda: x._grid_shown and not x._grid_busy, 30)
+    check("the grid turned on with every panel blank is filled from the map", ok and x.grid_row(0) is not None
+          and str(x.grid_row(0)[0].root) == str(x.current.root) and x.grid_row(1) is not None, str(x.grid_row(0)))
+    x.grid_toggle.setChecked(False)
+    wait_for(lambda: not x._grid_shown and not x._busy, 30)
+    # a job's finish: the sidecar is written BEFORE Explore is refreshed, and from a COPY of the spec taken at the start
+    old_custom, old_tab = w.custom, w.tabs.currentIndex()  # restored below: the later sections run THE demo again
+    demo3 = rs.demo_spec(tmp / "demo3", gpu=False)
+    demo3.estimator = "ps"
+    root3 = demo3.output_root()
+    root3.parent.mkdir(parents=True, exist_ok=True)
+    Path(str(root3) + ".gui.json").write_text(json.dumps({"estimator": "dtfe", "note": "an old DTFE run"}))
+    w.custom = demo3
+    w._load_into_widgets()
+    w.tabs.setCurrentIndex(A.OWN)
+    qa.processEvents()
+    w.run_btn.click()
+    spin(300)
+    w.o_dtfe.setChecked(True)                              # edited WHILE the job runs: must not reach this job's sidecar
+    w.o_name.setText("demo3_edited")
+    w.o_name.editingFinished.emit()
+    dt = wait_idle(w, 300)
+    side3 = json.loads(Path(str(root3) + ".gui.json").read_text())
+    o3 = x._by_root.get(str(root3))
+    check(f"a PS re-run under an old DTFE name ({dt:.0f} s): the finished sidecar says PS, the edits made during the run "
+          "(estimator, name) reached neither it nor a stray file, and Explore's listing (refreshed after the write) calls it PS-DTFE",
+          w.status.text() == "Finished" and side3.get("estimator") == "ps" and "note" not in side3
+          and not Path(str(root3.parent / "demo3_edited") + ".gui.json").exists()
+          and o3 is not None and G.estimator_label(o3) == "PS-DTFE", f"{w.status.text()} {side3} {o3 and G.estimator_label(o3)}")
+    w.custom = old_custom
+    w._load_into_widgets()
+    w.tabs.setCurrentIndex(old_tab)                        # the zoom and server menu actions live on the Explore tab
+    qa.processEvents()
+    if str(root3.parent) in w.custom_dirs:
+        w.custom_dirs.remove(str(root3.parent))
+    shutil.rmtree(root3.parent, ignore_errors=True)
+    for d_ in cds.values():
+        if str(d_) in w.custom_dirs:
+            w.custom_dirs.remove(str(d_))
+        shutil.rmtree(d_)
+    for k in ("dupA", "dupB"):
+        shutil.rmtree(tmp / k)
+    shutil.rmtree(in_dir)
+    for o_ in opened:
+        shutil.rmtree(o_.parent.parent)
     Path(str(std) + ".a_den").unlink()
+    for f_ in alt_files:
+        f_.unlink()
     x.refresh_outputs()
     x.select_root(prev_root)
     wait_for(lambda: x._plane is not None and not x._busy and x.current is not None and str(x.current.root) == prev_root, 30)
@@ -1351,6 +1876,9 @@ def new_user_features(qa, w, tmp, data, sim):
           and z["depth"] == 1 and z["a0"][0] > 0 and z["a0"][1] < 100 and z["a1"][0] > 0 and z["a1"][1] < 100
           and "zoom 96²" in w.explore_view.title.text() and w.zoom_out_action.isEnabled() and x.zoom_out_btn.isEnabled(),
           f"{ok} {getattr(x._plane, 'shape', None)} {z}")
+    ax_ = w.explore_view.canvas.axes
+    check("... and the axes follow the zoomed region", ax_ is not None and abs(ax_["x"][0] - z["a0"][0]) < 1e-9
+          and abs(ax_["x"][1] - z["a0"][1]) < 1e-9 and abs(ax_["y"][0] - z["a1"][0]) < 1e-9, str(ax_))
     f0 = x._zoom_fields
     x.field.setCurrentIndex(x.field.findData("velocity"))
     qa.processEvents()
@@ -1408,7 +1936,17 @@ def new_user_features(qa, w, tmp, data, sim):
     # partitions they visit (--serve-progress), which the bar follows and the state line sums up
     print("zoom progress on a composite query server:")
     w.server_action.trigger()                         # stop the single-tessellation server
-    wait_for(lambda: x.server_phase() == "stopped", 30)
+    ok = wait_for(lambda: x.server_phase() == "stopped", 30)
+    # with the server stopped and no partition set: the residency and the button after a restore
+    x.resident.setValue(3)
+    kw = x.server_kwargs()
+    check("the 'Partitions in memory' value reaches the server with no partition set (the binary splits a big "
+          "snapshot itself)", ok and kw is not None and kw.get("resident") == 3 and "partition" not in kw, str(kw))
+    x.resident.setValue(0)
+    x.server_state.setText(E.NO_SNAPSHOT_TEXT)
+    x.restore_state({"snapshots": {}, "resident": 0})
+    check("a restore re-judges the server button (its stale 'no snapshot known' goes once the snapshot is known)",
+          x.server_btn.isEnabled() and x.server_state.text() != E.NO_SNAPSHOT_TEXT, x.server_state.text())
     x.server_partition = 2
     x.cache_edit.setText(str(tmp / "tess_comp"))
     w.server_action.trigger()
@@ -1472,9 +2010,11 @@ def new_user_features(qa, w, tmp, data, sim):
         np.full(4 * 4 * 1, 5.0, dtype=np.float32).tofile(str(ez) + ".a_velDisp")
         raw = E.load_exact_planes(ez, (4, 4, 1))
         at_z1 = E.load_exact_planes(ez, (4, 4, 1), redshift=1.0)
+        # the planes stay in the files' float32 (2026-10-06: no float64 copy of every component), so the factor
+        # is applied at float32 rounding
         check("an exact zoom's velocity and dispersion planes get the slice map's redshift factor, the density not",
-              float(raw.velocity.max()) == 3.0 and abs(float(at_z1.velocity.max()) - 3.0 * 0.5 ** 0.5) < 1e-12
-              and raw.sigma is not None and abs(float(at_z1.sigma.max()) - 5.0 * 0.5) < 1e-12
+              float(raw.velocity.max()) == 3.0 and abs(float(at_z1.velocity.max()) - 3.0 * 0.5 ** 0.5) < 3e-7
+              and raw.sigma is not None and abs(float(at_z1.sigma.max()) - 5.0 * 0.5) < 3e-7
               and float(at_z1.density.max()) == 2.0, f"{raw.velocity.max()} {at_z1.velocity.max()} {at_z1.sigma.max() if at_z1.sigma is not None else None}")
     finally:
         shutil.rmtree(ez.parent)
@@ -1787,6 +2327,108 @@ def new_user_features(qa, w, tmp, data, sim):
         dlg._go(1)
     check("setup: Finish creates the data folder and remembers the demo choice",
           dlg.result() == 1 and new_root.is_dir() and dlg.run_demo)
+
+    print("the job clock, the log, the window, drops:")
+    check("a job's wall clock: 'took ...' beside the bar once it ends", w.clock.text().startswith("took "), w.clock.text())
+    check("clock and duration texts", A.clock_text(7) == "0:07" and A.clock_text(760) == "12:40"
+          and A.clock_text(7509) == "2:05:09" and A.took_text(7) == "7 s" and A.took_text(760) == "12m 40s"
+          and A.took_text(7500) == "2h 05m")
+    w.log.setPlainText("alpha\nbeta one\ngamma\nBETA two\n!! step: exit 1\n")
+    found = []
+    for back in (False, False, False, True):
+        ok = w.find_in_log("beta", back=back)
+        found.append((ok, w.log.textCursor().selectedText(), w.log_find_count.text()))
+    check("find in the log: the next match (any case), the count, wrapping at the end, and backwards",
+          found == [(True, "beta", "1 of 2"), (True, "BETA", "2 of 2"), (True, "beta", "1 of 2"), (True, "BETA", "2 of 2")],
+          str(found))
+    c_ = w.log.textCursor()
+    c_.movePosition(c_.MoveOperation.Start)
+    w.log.setTextCursor(c_)
+    ok = w.find_in_log(A.PROBLEM_LINES, regex=True)
+    check("... '!' goes to the next problem line", ok and w.log.textCursor().selectedText() == "!! ",
+          w.log.textCursor().selectedText())
+    pos_before = w.log.textCursor().position()
+    check("... no match says so, and leaves the log where it was (it keeps following a run)",
+          not w.find_in_log("zeta") and w.log_find_count.text() == "no match" and w.log.textCursor().position() == pos_before)
+    w.copy_log()
+    check("Copy Log puts the whole log on the clipboard", QApplication.clipboard().text() == w.log.toPlainText())
+    check("Open Run Log is offered exactly when the newest run's log file exists",
+          w.open_log_action.isEnabled() == (bool(w._last_log_path) and Path(w._last_log_path).is_file()),
+          w._last_log_path)
+    geo_ini = str(tmp / "gui_geometry.ini")
+    wg = A.MainWindow(remember=True, settings=QSettings(geo_ini, QSettings.IniFormat))
+    wg.show()
+    wg.resize(wg.minimumSizeHint().width() + 123, 777)
+    qa.processEvents()
+    wg.close()
+    saved = QSettings(geo_ini, QSettings.IniFormat)
+    wh = A.MainWindow(remember=True, settings=QSettings(geo_ini, QSettings.IniFormat))
+    wh.show()
+    qa.processEvents()
+    wf = A.MainWindow(remember=False, settings=QSettings(geo_ini, QSettings.IniFormat))
+    # restoreGeometry fits a window onto the current screen -- offscreen that is 800 x 800, smaller than the
+    # launcher's minimum width, so the exact size is only seen on a real screen; here: saved, and used
+    check("the window's geometry and pane split are saved on close and used at the next start (not by a window "
+          "that does not remember: 1400 x 900)",
+          saved.value("geometry") is not None and saved.value("splitter") is not None
+          and wh.size().toTuple() != (1400, 900) and wf.size().toTuple() == (1400, 900),
+          f"{wh.size().toTuple()} {wf.size().toTuple()}")
+    wh.close()
+    # drops on a window of their own: a dropped folder changes the data root, which the main window's later
+    # sections must keep
+    did = wf.open_dropped(str(root) + ".a_den")
+    check("a grid file dropped on the window opens in Explore", did == "explore" and wf.tabs.currentIndex() == A.EXPLORE
+          and str(wf.explore.current.root) == str(root), did)
+    snap_file = Path(demo.input_file)
+    did = wf.open_dropped(str(snap_file))
+    check("... a snapshot file (.hdf5) becomes the Custom tab's input", did == "custom" and wf.tabs.currentIndex() == A.OWN
+          and wf.o_file.text() == str(snap_file), did)
+    did = wf.open_dropped(str(tmp))
+    check("... a folder becomes the data root", did == "root" and wf.root_edit.text() == str(tmp), did)
+    (tmp / "notes.txt").write_text("x")
+    did = wf.open_dropped(str(tmp / "notes.txt"))
+    check("... anything else is refused with a reason", did == "" and "notes.txt" in wf.status.text(), wf.status.text())
+    wf.close()                                     # closeEvent shuts its Explore threads down
+    wo = A.MainWindow(rs.RunSpec(data_root=str(data), sim=SIM, snapshots=[99]), remember=False,
+                      settings=QSettings(str(tmp / "gui_opts.ini"), QSettings.IniFormat))
+    wo.dtfe_radio.setChecked(True)
+    qa.processEvents()
+    lam = wo.fields_box.lambda_spin
+    check("standard DTFE keeps the fields it computes tickable (the T-web too); only the dispersion is greyed",
+          [n for n, cb in wo.field_checks.items() if not cb.isEnabled()] == ["dispersion_a"])
+    for web in ("tweb_a", "vweb_a"):
+        wo.field_checks[web].setChecked(False)
+    qa.processEvents()
+    off = lam.isEnabled()
+    wo.field_checks["tweb_a"].setChecked(True)
+    qa.processEvents()
+    lam.setValue(0.5)
+    wo.budget_spin.setValue(40)
+    wo.tess_edit.setText(str(tmp / "tess"))
+    wo.tess_edit.editingFinished.emit()
+    wo._read_widgets()
+    env_ = wo.spec.command()[1]
+    check("the T-web threshold is live only with a web class ticked; it, the memory budget, the tessellation cache "
+          "and the T-web reach the standard-DTFE run",
+          not off and lam.isEnabled() and env_.get("LAMBDA_TH") == "0.5" and env_.get("DTFE_MEM_BUDGET_GB") == "40"
+          and env_.get("TESS_CACHE") == str(tmp / "tess") and "tweb_a" in env_.get("FIELDS", "").split(), str(env_))
+    wo.custom = rs.CustomSpec(input_file=str(demo.input_file), mem_budget_gb=12, tess_cache=str(tmp / "tess"))
+    wo._load_into_widgets()
+    last = wo.custom.steps()[-1]
+    check("the Custom tab shows them, and its run passes --tessellation-cache and the budget in the binary's environment",
+          wo.o_budget.value() == 12 and wo.o_tess.text() == str(tmp / "tess") and "--tessellation-cache" in last.argv
+          and last.env.get("DTFE_MEM_BUDGET_GB") == "12", f"{last.argv} {last.env}")
+    import time as _time
+    now_ = _time.monotonic()
+    wo._total_snaps, wo._snap_t0s, wo._per_snap_prior = 4, [now_ - 300, now_ - 200], None
+    left2 = wo._job_left(now_)
+    wo._snap_t0s, wo._per_snap_prior = [now_ - 20], 50.0
+    left1 = wo._job_left(now_)
+    wo._total_snaps, wo._snap_t0s = 0, []
+    check("the job ETA: snapshots left at the pace of the done ones (earlier runs' pace before the first ends), "
+          "minus what the current one has run", abs(left2 - 200) < 1e-6 and abs(left1 - (3 * 50 + 30)) < 1e-6,
+          f"{left2} {left1}")
+    wo.close()
 
 
 def two_d_gui(qa, w, tmp):

@@ -31,7 +31,7 @@ source "${SCRIPT_DIR}/precision.sh"     # DTFE_TEST_PRECISION=double: the double
 N="${N:-24}"; GRID="${GRID:-48}"; BOX="${BOX:-100.0}"
 BIN="${PS_BIN}"
 precision_require "${BIN}"
-TMP="${SCRIPT_DIR}/tmp"; mkdir -p "${TMP}"
+TMP="${DTFE_TEST_TMP:-${TMPDIR:-/tmp}/dtfe-tests}"; mkdir -p "${TMP}"
 SNAP_PAN="${TMP}/pvw_input_pancake.hdf5"
 
 echo "============================================================"
@@ -49,8 +49,7 @@ GPU_BUILT=0
 # capture FIRST -- piping the binary straight into grep -q would SIGPIPE it under pipefail
 FULL_HELP="$("${BIN}" --full_help 2>/dev/null || true)"
 if ! grep -q -- '--ps-volume-weighted' <<<"${FULL_HELP}"; then
-    echo "SKIP: this PS-DTFE has no --ps-volume-weighted support."
-    exit 0
+    skip_or_fail "this PS-DTFE has no --ps-volume-weighted support."
 fi
 
 echo ">> generating test snapshot ..."

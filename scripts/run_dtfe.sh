@@ -10,6 +10,9 @@
 #     -m   run the '_a' interpolation on the Apple GPU (same as DTFE_METAL=1; needs 'make DTFE METAL=1')
 #     -e   every '_a' cell the EXACT average of the linear interpolant over the cell (--exact-average,
 #          same as DTFE_EXACT_AVERAGE=1) instead of the Monte-Carlo sample mean; ~6.6x faster on the GPU
+#   -h / --help prints this header and runs nothing; --version the repository revision.
+#   DRY_RUN=1 ./run_dtfe.sh ...   prints every snapshot's expanded command and paths, runs nothing (exit 0
+#          when at least one snapshot is planned).
 #
 set -uo pipefail
 
@@ -25,11 +28,18 @@ MAX_CONCURRENT="${MAX_CONCURRENT:-}"  # cap on concurrent triangulations to boun
                                  # EMPTY (default) = auto-tuned together with the partition split.
 DTFE_METAL="${DTFE_METAL:-0}"  # 1 = run the '_a' interpolation on the Apple GPU (--gpu; needs 'make DTFE METAL=1')
 DTFE_EXACT_AVERAGE="${DTFE_EXACT_AVERAGE:-0}"  # 1 = exact cell averages (--exact-average; noise-free, slower on the CPU)
+DRY_RUN="${DRY_RUN:-0}"          # 1 = print the commands and paths, run nothing (survey rank 19, 2026-10-05)
 DTFE_PRECISION="${DTFE_PRECISION:-single}"  # double = the double-precision binary ./DTFE-double ('make DTFE DOUBLE=1'):
                                  # everything in double from the input read onward, float64 outputs, ~2x the memory
 SCRATCH_DIR="${SCRATCH_DIR:-}"   # out-of-core mode (--scratch-dir): the full-resolution grids as mmap'ed files in this
                                  # LOCAL directory instead of RAM (bit-identical results; iCloud paths are refused) --
                                  # the same knob as run_ps_dtfe.sh; the launcher's scratch folder arrives here
+SAMPLE_POINTS="${SAMPLE_POINTS:-}"  # a --sample-points file: the standard DTFE interpolant at those points too
+                                 # ('.pts_*'); one triangulation, so not with PARTITION (the binary refuses it)
+PTS_VEL_GRAD="${PTS_VEL_GRAD:-0}"   # 1 = with SAMPLE_POINTS, also the velocity gradient at each point
+TESS_CACHE="${TESS_CACHE:-}"     # a LOCAL folder: reuse the Delaunay tessellation of an identical earlier run
+                                 # (--tessellation-cache; created if missing; a partitioned standard run does not
+                                 # cache, the binary says so) -- the same knob as run_ps_dtfe.sh
 LAMBDA_TH="${LAMBDA_TH:-0.3}"    # eigenvalue threshold of the T-web / V-web classes (--lambda_th), the SAME default as
                                  # run_ps_dtfe.sh (the binary's own default is 0.0: a run without this flag classifies
                                  # differently from a scripted one)
@@ -37,9 +47,24 @@ LAMBDA_TH="${LAMBDA_TH:-0.3}"    # eigenvalue threshold of the T-web / V-web cla
 DATA_DIR=""                # default: sim_dir $SIMULATION (config.sh); override with -d
 OUTPUT_SUBDIR="output"
 
-FIELDS="density_a velocity_a gradient_a divergence_a shear_a vorticity_a"
+# the grids to write; env-overridable as in run_ps_dtfe.sh, e.g. FIELDS="density_a tweb_a vweb_a" for the
+# T-web / V-web classes (the launcher passes its ticks here; no dispersion_a: that is a phase-space field)
+FIELDS="${FIELDS:-density_a velocity_a gradient_a divergence_a shear_a vorticity_a}"
+case " ${FIELDS} " in               # a FIELDS exported for run_ps_dtfe.sh may carry the phase-space dispersion
+    *" dispersion"*) echo "Note: the velocity dispersion is a PS-DTFE field; standard DTFE leaves it out"
+                     FIELDS=$(printf '%s\n' ${FIELDS} | grep -v '^dispersion' | tr '\n' ' ') ;;
+esac
+if [ -z "${FIELDS// }" ]; then
+    echo "Error: no field standard DTFE computes in FIELDS (the velocity dispersion is a PS-DTFE field)" >&2
+    exit 2
+fi
 
 usage() { echo "Usage: $0 [-d DATA_DIR] [-s SIMULATION] [-g GRID_SIZE] [-m] [-e] [snapshot ...]"; }
+
+case "${1:-}" in                                 # -h / --help print the header and run nothing; --version the revision
+    -h|--help) sed -n '2,/^$/p' "${BASH_SOURCE[0]}" | sed -e 's/^# \{0,1\}//'; usage; exit 0 ;;
+    --version) git -C "${REPO_ROOT}" describe --always --dirty 2>/dev/null || echo unknown; exit 0 ;;
+esac
 
 # ---- Parse arguments ------------------------------------------------------
 while getopts "d:s:g:meh" opt; do
@@ -100,7 +125,7 @@ if [ -x /usr/bin/time ]; then
 fi
 
 # Keep the Mac awake for the whole batch; caffeinate follows this PID and lifts on exit.
-if command -v caffeinate >/dev/null 2>&1; then
+if [ "${DRY_RUN}" != "1" ] && command -v caffeinate >/dev/null 2>&1; then
     caffeinate -i -m -w $$ &
 fi
 
@@ -111,7 +136,7 @@ echo "Grid size: ${GRID_SIZE}"
 [ -n "${SCRATCH_DIR}" ] && echo "Scratch directory: ${SCRATCH_DIR} (grids out of core)"
 echo ""
 
-n_ok=0; n_skipped=0; n_failed=0
+n_ok=0; n_skipped=0; n_failed=0; n_planned=0
 for i in "${SNAPSHOTS[@]}"; do
     n_str=$(printf "%03d" "$i")
 
@@ -141,6 +166,14 @@ for i in "${SNAPSHOTS[@]}"; do
     [ -n "${MAX_CONCURRENT}" ] && part_args+=(--max-concurrent "${MAX_CONCURRENT}")
     scratch_args=()
     [ -n "${SCRATCH_DIR}" ] && scratch_args=(--scratch-dir "${SCRATCH_DIR}")
+    sp_args=()
+    [ -n "${SAMPLE_POINTS}" ] && sp_args=(--sample-points "${SAMPLE_POINTS}")
+    [ -n "${SAMPLE_POINTS}" ] && [ "${PTS_VEL_GRAD}" = "1" ] && sp_args+=(--pts-vel-grad)
+    tess_args=()
+    if [ -n "${TESS_CACHE}" ]; then
+        mkdir -p "${TESS_CACHE}"
+        tess_args=(--tessellation-cache "${TESS_CACHE}")
+    fi
 
     # the tee pipe hides the terminal from the binary's isatty() check: force colours through it when
     # this script itself runs on a terminal (the runlog is de-ANSI'd below), as run_ps_dtfe.sh does
@@ -150,16 +183,28 @@ for i in "${SNAPSHOTS[@]}"; do
     # GUI's Runs browser reads the settings, build stamp, wall time and peak memory back from it
     run_log="${output_root}.runlog"
     SECONDS=0
-    ${TIME_WRAP[@]+"${TIME_WRAP[@]}"} "${DTFE_BIN}" "${input_file}" "${output_root}" \
-        --grid ${GRID_SIZE} \
-        --padding ${PADDING} \
-        --periodic \
-        ${part_args[@]+"${part_args[@]}"} \
-        --field ${FIELDS} \
-        --lambda_th ${LAMBDA_TH} \
-        ${scratch_args[@]+"${scratch_args[@]}"} \
-        ${metal_args[@]+"${metal_args[@]}"} \
-        ${exact_args[@]+"${exact_args[@]}"} 2>&1 | tee "${run_log}"
+    cmd=("${DTFE_BIN}" "${input_file}" "${output_root}"
+        --grid ${GRID_SIZE}
+        --padding ${PADDING}
+        --periodic
+        ${part_args[@]+"${part_args[@]}"}
+        --field ${FIELDS}
+        --lambda_th ${LAMBDA_TH}
+        ${scratch_args[@]+"${scratch_args[@]}"}
+        ${tess_args[@]+"${tess_args[@]}"}
+        ${sp_args[@]+"${sp_args[@]}"}
+        ${metal_args[@]+"${metal_args[@]}"}
+        ${exact_args[@]+"${exact_args[@]}"})
+    if [ "${DRY_RUN}" = "1" ]; then                 # DRY_RUN=1: the expanded command and the paths, nothing run
+        echo "  DRY RUN -- would run:"
+        printf '    %q' "${cmd[@]}"; echo
+        echo "  input:   ${input_file} (exists)"
+        echo "  outputs: ${output_root}.* and the run log ${run_log}"
+        n_planned=$((n_planned + 1))
+        echo ""
+        continue
+    fi
+    ${TIME_WRAP[@]+"${TIME_WRAP[@]}"} "${cmd[@]}" 2>&1 | tee "${run_log}"
     rc=${PIPESTATUS[0]}                 # the binary's status, taken BEFORE anything else runs a pipe
 
     # strip ANSI colour codes from the saved log (a temp file: BSD and GNU sed disagree on -i)
@@ -197,6 +242,12 @@ done
 
 # Honest exit status, as run_ps_dtfe.sh: a failed snapshot, or nothing processed, exits 1 (before 2026-10-05
 # this script always exited 0, so the launcher read a failed standard-DTFE job as done). A partial skip stays 0.
+if [ "${DRY_RUN}" = "1" ]; then
+    echo "DRY RUN: ${n_planned} snapshot(s) planned, ${n_skipped} skipped for missing inputs; nothing was run."
+    [ "${n_planned}" -gt 0 ] && exit 0
+    echo "ERROR: nothing to run (looked under '${DATA_DIR}')." >&2
+    exit 1
+fi
 echo "DTFE processing complete: ${n_ok} processed, ${n_skipped} skipped, ${n_failed} failed."
 if [ "${n_failed}" -gt 0 ]; then
     echo "ERROR: ${n_failed} snapshot(s) failed -- see the messages above and the .runlog files." >&2

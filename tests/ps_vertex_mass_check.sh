@@ -35,7 +35,7 @@ source "${SCRIPT_DIR}/precision.sh"     # DTFE_TEST_PRECISION=double: the double
 N="${N:-24}"; GRID="${GRID:-48}"; BOX="${BOX:-100.0}"; ALPHA="${ALPHA:-0.1645}"
 BIN="${PS_BIN}"
 precision_require "${BIN}"
-TMP="${SCRIPT_DIR}/tmp"; mkdir -p "${TMP}"
+TMP="${DTFE_TEST_TMP:-${TMPDIR:-/tmp}/dtfe-tests}"; mkdir -p "${TMP}"
 SNAP_UNI="${TMP}/pvm_input_uniform.hdf5"
 SNAP_PAN="${TMP}/pvm_input_pancake.hdf5"
 SNAP_LIN="${TMP}/pvm_input_linear.hdf5"       # single-stream pancake (true ICs)

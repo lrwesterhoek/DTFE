@@ -31,7 +31,7 @@ source "${SCRIPT_DIR}/precision.sh"     # DTFE_TEST_PRECISION=double: the double
 N="${N:-24}"; GRID="${GRID:-48}"; BOX="${BOX:-100.0}"
 BIN="${DTFE_BIN}"; PSBIN="${PS_BIN}"
 precision_require "${BIN}" "${PSBIN}"
-TMP="${SCRIPT_DIR}/tmp"; mkdir -p "${TMP}"
+TMP="${DTFE_TEST_TMP:-${TMPDIR:-/tmp}/dtfe-tests}"; mkdir -p "${TMP}"
 SNAP_UNI="${TMP}/dpe_input_uniform.hdf5"
 SNAP_PAN="${TMP}/dpe_input_pancake.hdf5"
 SNAP_PAN0="${TMP}/dpe_input_pancake0.hdf5"

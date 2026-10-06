@@ -18,22 +18,15 @@ from pathlib import Path
 
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.colors as colors
 from scipy.ndimage import gaussian_filter
 
 from dtfelib import make_parser, FieldSet, sim_dir
 from dtfelib import figures as style
 from dtfelib.fields import extract_2d_slice as extract_slice, extract_velocity_slice
 
+style.apply()                                   # the house style (serif, SHOW_TITLES, DPI): survey item 11, 2026-10-05
+
 OUTPUT_DIR = Path(config.LOCAL_FIGURES_ROOT) / "dtfe"
-
-AXIS_UNITS = "Mpc"
-VELOCITY_UNITS = "km/s"
-
-# density colour range in rho/rho_bar, shared with plot_PS_DTFE.py so DTFE and PS-DTFE
-# panels are directly comparable side by side (set either to None for the slice's own range)
-DENSITY_VMIN = 1e-1
-DENSITY_VMAX = 1e4
 
 # historical TNG50 output series; snapshots without fields on disk are skipped
 SNAPSHOTS = [99]
@@ -46,54 +39,23 @@ PROCESS_DIVERGENCE = True
 PROCESS_SHEAR = True
 
 VELOCITY_QUIVER_STEP = 8
-DPI = 300
+SLICE_PLANES = config.SLICE_PLANES              # (the maps' axis labels, DPI and units are config's: one copy)
 
-SLICE_PLANES = {
-    0: {'name': 'yz_plane', 'axis_labels': ('Y', 'Z')},
-    1: {'name': 'xz_plane', 'axis_labels': ('X', 'Z')},
-    2: {'name': 'xy_plane', 'axis_labels': ('X', 'Y')}
-}
+
+def _title(text, redshift):
+    return f"{text} (z={redshift:.2f})" if redshift is not None else text
 
 def plot_density(density_field, slice_dim, box_size, redshift=None, save_path=None):
     dens_slice = extract_slice(density_field, slice_dim).T
-    own = style.log_limits(dens_slice)          # the slice's own range when no fixed one is set
-    if own is None and (DENSITY_VMIN is None or DENSITY_VMAX is None):
+    if not (dens_slice > 0).any():                  # as plot_PS_DTFE: the fixed range alone would draw a flat floor
         print(f"  density: no positive value in this slice, map skipped ({save_path})")
         return
-    vmin = DENSITY_VMIN if DENSITY_VMIN is not None else own[0]
-    vmax = DENSITY_VMAX if DENSITY_VMAX is not None else own[1]
-
-    fig, ax = plt.subplots(figsize=(8, 7))
-    im = ax.imshow(
-        dens_slice, origin='lower', cmap='plasma',
-        norm=colors.LogNorm(vmin=vmin, vmax=vmax),
-        extent=[0, box_size, 0, box_size]
-    )
-
-    plane_info = SLICE_PLANES[slice_dim]
-    title = "DTFE Density"
-    if redshift is not None:
-        title += f" (z={redshift:.2f})"
-
-    ax.set_title(title, fontsize=14)
-    ax.set_xlabel(f"{plane_info['axis_labels'][0]} [{AXIS_UNITS}]", fontsize=12)
-    ax.set_ylabel(f"{plane_info['axis_labels'][1]} [{AXIS_UNITS}]", fontsize=12)
-
-    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    cbar.set_label(r"Density $\rho/\bar{\rho}$", fontsize=12)
-
-    ax.set_aspect('equal')
-    plt.tight_layout()
-
-    if save_path:
-        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(save_path, dpi=DPI, bbox_inches='tight')
-        plt.close(fig)
-    else:
-        plt.show()
+    norm = style.norm_log_range(dens_slice, config.DENSITY_MAP_RANGE)      # the fixed range, else the slice's own
+    style.slice_map(dens_slice, box_size, slice_dim, cmap=style.MAP_CMAPS['density'], norm=norm, floor=True,
+                    label=style.MAP_LABELS['density'], title=_title("DTFE Density", redshift), path=save_path)
 
 def plot_velocity(velocity_field, slice_dim, box_size, quiver_step,
-                 redshift=None, save_path=None):
+                  redshift=None, save_path=None):
     X, Y, U, V = extract_velocity_slice(velocity_field, slice_dim)
     U, V = U.T, V.T
 
@@ -114,65 +76,23 @@ def plot_velocity(velocity_field, slice_dim, box_size, quiver_step,
     Q = ax.quiver(
         X_q, Y_q, U_q, V_q, mag,
         angles='xy', scale_units='xy', scale=scale,
-        pivot='middle', cmap='viridis', alpha=0.8, width=0.003
+        pivot='middle', cmap=style.MAP_CMAPS['velocity'], alpha=0.8, width=0.003
     )
-
-    plane_info = SLICE_PLANES[slice_dim]
-    title = "DTFE Velocity"
-    if redshift is not None:
-        title += f" (z={redshift:.2f})"
-
-    ax.set_title(title, fontsize=14)
-    ax.set_xlabel(f"{plane_info['axis_labels'][0]} [{AXIS_UNITS}]", fontsize=12)
-    ax.set_ylabel(f"{plane_info['axis_labels'][1]} [{AXIS_UNITS}]", fontsize=12)
-    ax.set_xlim(0, box_size)
-    ax.set_ylim(0, box_size)
-
+    style.slice_axes(ax, slice_dim, box_size)
+    style.set_title(ax, _title("DTFE Velocity", redshift))
     cbar = fig.colorbar(Q, ax=ax, fraction=0.046, pad=0.04)
-    cbar.set_label(f"Velocity [{VELOCITY_UNITS}]", fontsize=12)
-
-    ax.set_aspect('equal')
-    plt.tight_layout()
-
+    cbar.set_label(f"velocity [{config.VELOCITY_UNITS}]")
+    fig.tight_layout()
     if save_path:
         Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(save_path, dpi=DPI, bbox_inches='tight')
-        plt.close(fig)
-    else:
-        plt.show()
+        fig.savefig(save_path, dpi=config.DPI, bbox_inches='tight')
+    plt.close(fig)
 
 def plot_divergence(div_field, slice_dim, box_size, redshift=None, save_path=None):
     div_slice = extract_slice(div_field, slice_dim).T
-    vmin, vmax = style.symmetric_limits(div_slice)      # centred on 0: white = no divergence
-
-    fig, ax = plt.subplots(figsize=(8, 7))
-    im = ax.imshow(
-        div_slice, origin='lower', cmap='RdBu_r',
-        extent=[0, box_size, 0, box_size],
-        vmin=vmin, vmax=vmax
-    )
-
-    plane_info = SLICE_PLANES[slice_dim]
-    title = "DTFE Velocity Divergence"
-    if redshift is not None:
-        title += f" (z={redshift:.2f})"
-
-    ax.set_title(title, fontsize=14)
-    ax.set_xlabel(f"{plane_info['axis_labels'][0]} [{AXIS_UNITS}]", fontsize=12)
-    ax.set_ylabel(f"{plane_info['axis_labels'][1]} [{AXIS_UNITS}]", fontsize=12)
-
-    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    cbar.set_label(f"∇·v [{VELOCITY_UNITS}/{AXIS_UNITS}]", fontsize=12)
-
-    ax.set_aspect('equal')
-    plt.tight_layout()
-
-    if save_path:
-        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(save_path, dpi=DPI, bbox_inches='tight')
-        plt.close(fig)
-    else:
-        plt.show()
+    style.slice_map(div_slice, box_size, slice_dim, cmap=style.MAP_CMAPS['divergence'],
+                    norm=style.norm_symmetric(div_slice),                   # centred on 0: white = no divergence
+                    label=style.MAP_LABELS['divergence'], title=_title("DTFE Velocity Divergence", redshift), path=save_path)
 
 def plot_shear(shear_field, slice_dim, box_size, redshift=None, save_path=None):
     σ_xx = shear_field[..., 0]
@@ -188,40 +108,12 @@ def plot_shear(shear_field, slice_dim, box_size, redshift=None, save_path=None):
     )
 
     shear_slice = extract_slice(shear_mag, slice_dim).T
-    lim = style.log_limits(shear_slice)
-    if lim is None:                               # an empty slice crashed on the min of nothing
+    norm = style.norm_log_range(shear_slice)                                # the slice's own positive range
+    if norm is None:                                                        # an empty slice crashed on the min of nothing
         print(f"  shear: no positive value in this slice, map skipped ({save_path})")
         return
-    vmin, vmax = lim
-
-    fig, ax = plt.subplots(figsize=(8, 7))
-    im = ax.imshow(
-        shear_slice, origin='lower', cmap='plasma',
-        norm=colors.LogNorm(vmin=vmin, vmax=vmax),
-        extent=[0, box_size, 0, box_size]
-    )
-
-    plane_info = SLICE_PLANES[slice_dim]
-    title = "DTFE Velocity Shear"
-    if redshift is not None:
-        title += f" (z={redshift:.2f})"
-
-    ax.set_title(title, fontsize=14)
-    ax.set_xlabel(f"{plane_info['axis_labels'][0]} [{AXIS_UNITS}]", fontsize=12)
-    ax.set_ylabel(f"{plane_info['axis_labels'][1]} [{AXIS_UNITS}]", fontsize=12)
-
-    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    cbar.set_label(f"|σ| [{VELOCITY_UNITS}/{AXIS_UNITS}]", fontsize=12)
-
-    ax.set_aspect('equal')
-    plt.tight_layout()
-
-    if save_path:
-        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(save_path, dpi=DPI, bbox_inches='tight')
-        plt.close(fig)
-    else:
-        plt.show()
+    style.slice_map(shear_slice, box_size, slice_dim, cmap=style.MAP_CMAPS['shear'], norm=norm,
+                    label=style.MAP_LABELS['shear'], title=_title("DTFE Velocity Shear", redshift), path=save_path)
 
 def process_snapshot(args, snap):
     snap_dir = sim_dir(args.sim, args.data_root) / f"snapdir_{snap:03d}"   # flat or per-family layout

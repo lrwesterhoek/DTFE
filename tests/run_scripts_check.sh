@@ -22,6 +22,12 @@
 #     and processes the simulation there, config.sh's sim_dir puts a new simulation beside its
 #     family and lets a flat <root>/<sim> win, and run_ps_pipeline.sh discovers nested sims.
 #  H) scripts/run_dtfe.sh -e / DTFE_EXACT_AVERAGE=1 passes --exact-average to the standard binary.
+#  I) download_snapshots.sh + merge_HDF5.py never turn a half-finished download into a merged snapshot.
+#  J) --help runs nothing (run_ps_pipeline.sh --help used to start the whole batch), --version prints the
+#     revision, an argument to the pipeline is an error, DRY_RUN=1 prints the drivers' commands and runs nothing.
+#  K) the binaries' own --help lists the phase-space / GPU / point-evaluation / server options the scripts and the
+#     launcher use (it listed none of them), and the help texts carry none of the survey's misspellings.
+#  L) scripts/install_lib.sh keeps a user's binaries through a failed rebuild: backup, restore, the failure hint.
 #
 # Usage: tests/run_scripts_check.sh [--no-build]
 
@@ -41,7 +47,8 @@ export PY                               # run_ps_pipeline.sh runs make_image_pla
 N="${N:-16}"
 GRID="${GRID:-24}"
 BOX="${BOX:-100.0}"
-TMP="${TMP_DIR:-${SCRIPT_DIR}/tmp}/run_scripts"
+TMP="${TMP_DIR:-${DTFE_TEST_TMP:-${TMPDIR:-/tmp}/dtfe-tests}}/run_scripts"
+export DTFE_FIGURES_ROOT="${TMP}/figures"   # the pipeline's plots: never the real figure root (the T7 when mounted)
 DRIVER="scripts/run_ps_dtfe.sh"
 
 echo "============================================================"
@@ -168,7 +175,7 @@ echo "(F) no macOS-only command sits on the critical path (so Linux/CI can run t
 # directly in front of the binary.
 check "$(lacks "${DRIVER}" '/usr/bin/time[^|]*\./PS-DTFE')" \
       "time(1) does not prefix the binary unconditionally (GNU spells -l as -v; containers have neither)"
-check "$(has   "${DRIVER}" 'TIME_WRAP\[@\].*"\${PS_BIN}"')" \
+check "$(has   "${DRIVER}" 'TIME_WRAP\[@\].*"\${cmd\[@\]}"')" \
       "the binary is invoked through the resolved-once TIME_WRAP instead (PS_BIN: the pair chosen by DTFE_PRECISION)"
 check "$(lacks "${DRIVER}" "sed .*-i +''")" \
       "no BSD-only \"sed -i ''\" (GNU sed reads the '' as the script, not as the suffix)"
@@ -265,12 +272,36 @@ if [ -x "${DTFE_BIN}" ]; then
     rc_none=0; scripts/run_dtfe.sh -s HASIC -g 16 123 >"${TMP}/h_none.log" 2>&1 || rc_none=$?
     check "$([ "${rc_none}" != "0" ] && echo 0 || echo 1)" "run_dtfe.sh exits non-zero when no snapshot was processed (${rc_none})"
     check "$(has "${TMP}/h_none.log" 'processing complete: 0 processed, 1 skipped, 0 failed')" "... and says so in its summary line"
-    SCR_DIR="$(mktemp -d /private/tmp/dtfe-scratch-check.XXXXXX)"      # local: the binary refuses iCloud paths
+    SCR_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dtfe-scratch-check.XXXXXX")"   # local: the binary refuses iCloud paths (and Linux has no /private/tmp)
     rc_scr=0; SCRATCH_DIR="${SCR_DIR}" scripts/run_dtfe.sh -s HASIC -g 16 99 >"${TMP}/h_scratch.log" 2>&1 || rc_scr=$?
     check "$([ "${rc_scr}" = "0" ] && echo 0 || echo 1)" "run_dtfe.sh with SCRATCH_DIR succeeds (exit ${rc_scr})"
     check "$(has "${TMP}/h_scratch.log" "RUNNING: .*--scratch-dir ${SCR_DIR}")" "... and hands the folder to the binary (--scratch-dir)"
     check "$(has "${TMP}/h_scratch.log" 'RUNNING: .*--lambda_th 0.3')" "run_dtfe.sh passes the scripts' lambda_th default (0.3, the binary's own is 0)"
     rm -rf "${SCR_DIR}"
+    # FIELDS reaches the standard binary (the launcher's ticks: the T-web), a phase-space dispersion is left out;
+    # TESS_CACHE hands a (created) local folder to --tessellation-cache (2026-10-06)
+    TC_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dtfe-tess-check.XXXXXX")/cache"
+    rc_f=0; FIELDS="density_a tweb_a dispersion_a" TESS_CACHE="${TC_DIR}" scripts/run_dtfe.sh -s HASIC -g 16 99 \
+        >"${TMP}/h_fields.log" 2>&1 || rc_f=$?
+    check "$([ "${rc_f}" = "0" ] && echo 0 || echo 1)" "run_dtfe.sh with FIELDS and TESS_CACHE succeeds (exit ${rc_f})"
+    check "$(has "${TMP}/h_fields.log" 'RUNNING: .*--field density_a tweb_a +--')" "... FIELDS is the field list (the T-web for standard DTFE)"
+    check "$(has "${TMP}/h_fields.log" 'standard DTFE leaves it out')" "... the phase-space dispersion is left out, and it says so"
+    check "$(has "${TMP}/h_fields.log" "RUNNING: .*--tessellation-cache ${TC_DIR}")" "... TESS_CACHE becomes --tessellation-cache"
+    check "$([ -d "${TC_DIR}" ] && echo 0 || echo 1)" "... and the cache folder is created"
+    check "$([ -f "${TMP}/HASIC/snapdir_099/output.a_tweb" ] || ls "${TMP}/HASIC/snapdir_099/"output.*tweb* >/dev/null 2>&1; echo $?)" \
+        "... and the T-web grid is written"
+    rm -rf "$(dirname "${TC_DIR}")"
+    # SAMPLE_POINTS: the standard DTFE interpolant at a points file too (the launcher's hi-res slice, 2026-10-06)
+    printf '1 1 1\n2 3 4\n5 5 5\n' > "${TMP}/h_pts.txt"
+    rc_sp=0; SAMPLE_POINTS="${TMP}/h_pts.txt" PTS_VEL_GRAD=1 scripts/run_dtfe.sh -s HASIC -g 16 99 \
+        >"${TMP}/h_pts.log" 2>&1 || rc_sp=$?
+    check "$([ "${rc_sp}" = "0" ] && echo 0 || echo 1)" "run_dtfe.sh with SAMPLE_POINTS succeeds (exit ${rc_sp})"
+    check "$(has "${TMP}/h_pts.log" "RUNNING: .*--sample-points ${TMP}/h_pts.txt +--pts-vel-grad")" \
+        "... and hands the points to the standard binary (with the velocity gradient)"
+    check "$([ -s "${TMP}/HASIC/snapdir_099/output.pts_den" ] && echo 0 || echo 1)" "... which writes the point values (.pts_den)"
+    # PS_LINEAR_DEPOSIT reaches the phase-space binary (a dry run: the command only)
+    DRY_RUN=1 PS_LINEAR_DEPOSIT=1 PS_VOLUME_WEIGHTED=0 scripts/run_ps_dtfe.sh -s HASIC -g 16 99 >"${TMP}/h_lin.log" 2>&1 || true
+    check "$(has "${TMP}/h_lin.log" '--ps-linear-deposit')" "run_ps_dtfe.sh: PS_LINEAR_DEPOSIT=1 passes --ps-linear-deposit"
     # zero-padded snapshot numbers are decimal (bash's printf read '099' as octal: an error, then snapshot 000)
     rc_oct=0; scripts/run_dtfe.sh -s HASIC -g 16 099 >"${TMP}/h_oct.log" 2>&1 || rc_oct=$?
     check "$([ "${rc_oct}" = "0" ] && echo 0 || echo 1)" "run_dtfe.sh accepts a zero-padded snapshot number (099, exit ${rc_oct})"
@@ -496,12 +527,79 @@ check "$([ "${rc}" = "0" ] && echo 0 || echo 1)" "without a python with h5py the
 check "$(has "${TMP}/i_download_nopy.log" 'has no h5py; existing chunks are not checked')" "... and says so"
 
 echo ""
+echo "(J) --help runs nothing, --version prints the revision, DRY_RUN=1 prints the commands and runs nothing (2026-10-05, survey rank 19)."
+for scr in scripts/run_dtfe.sh scripts/run_ps_dtfe.sh scripts/run_ps_pipeline.sh; do
+    rc=0; "${scr}" --help >"${TMP}/j_help_${scr##*/}.log" 2>&1 || rc=$?
+    check "$([ "${rc}" = "0" ] && echo 0 || echo 1)" "${scr##*/} --help exits 0 (${rc})"
+    check "$(lacks "${TMP}/j_help_${scr##*/}.log" 'Processing snapshot|RUNNING:|Slice: axis')" "... and starts nothing"
+done
+check "$(has "${TMP}/j_help_run_ps_pipeline.sh.log" 'COMPUTE ONLY')" "run_ps_pipeline.sh --help prints its header (it used to start the whole batch)"
+check "$(has "${TMP}/j_help_run_dtfe.sh.log" '^Usage: ')" "run_dtfe.sh --help ends with the usage line"
+rc=0; scripts/run_ps_pipeline.sh bogus >"${TMP}/j_bogus.log" 2>&1 || rc=$?
+check "$([ "${rc}" = "2" ] && echo 0 || echo 1)" "run_ps_pipeline.sh with an argument refuses with exit 2 (${rc})"
+check "$(has "${TMP}/j_bogus.log" 'takes no arguments')" "... and says why"
+rc=0; scripts/run_ps_dtfe.sh --version >"${TMP}/j_version.log" 2>&1 || rc=$?
+check "$([ "${rc}" = "0" ] && [ -s "${TMP}/j_version.log" ] && echo 0 || echo 1)" "run_ps_dtfe.sh --version exits 0 with a revision"
+rc=0; env "${COMMON_ENV[@]}" DRY_RUN=1 "${DRIVER}" -s HASIC -g 16 99 98 >"${TMP}/j_dry.log" 2>&1 || rc=$?
+check "$([ "${rc}" = "0" ] && echo 0 || echo 1)" "DRY_RUN=1 run_ps_dtfe.sh exits 0 with a planned snapshot (${rc})"
+check "$(has "${TMP}/j_dry.log" 'DRY RUN -- would run:')" "... prints the expanded command"
+check "$(has "${TMP}/j_dry.log" 'PS-DTFE.*combined_099\.hdf5.*--grid +16')" "... with the binary, the input and the grid"
+check "$(has "${TMP}/j_dry.log" 'DRY RUN: 1 snapshot\(s\) planned, 1 skipped')" "... one planned, the missing 098 skipped, nothing run"
+check "$(lacks "${TMP}/j_dry.log" 'RUNNING:')" "... the binary never ran"
+rc=0; env "${COMMON_ENV[@]}" DRY_RUN=1 "${DRIVER}" -s NOSUCH -g 16 99 >"${TMP}/j_dry2.log" 2>&1 || rc=$?
+check "$([ "${rc}" = "1" ] && echo 0 || echo 1)" "DRY_RUN=1 with nothing to run exits 1 (${rc})"
+if [ -x "${DTFE_BIN}" ]; then
+    touch "${TMP}/j_marker"; sleep 1
+    rc=0; DRY_RUN=1 scripts/run_dtfe.sh -s HASIC -g 16 99 >"${TMP}/j_dry3.log" 2>&1 || rc=$?
+    check "$([ "${rc}" = "0" ] && echo 0 || echo 1)" "DRY_RUN=1 run_dtfe.sh exits 0 (${rc})"
+    check "$(has "${TMP}/j_dry3.log" 'DTFE.*combined_099\.hdf5.*--grid +16')" "... prints the standard binary's command"
+    check "$([ ! "${TMP}/HASIC/snapdir_099/output.runlog" -nt "${TMP}/j_marker" ] && echo 0 || echo 1)" "... and leaves the run log untouched"
+fi
+
+echo ""
+echo "(K) the binaries' --help lists the phase-space, GPU, point-evaluation and server options; no known misspelling (2026-10-05, survey rank 21)."
+"${PS_BIN}" --help >"${TMP}/k_help_ps.log" 2>&1 || true
+"${DTFE_BIN}" --help >"${TMP}/k_help_dtfe.log" 2>&1 || true
+for o in ps-gpu ps-exact-deposit ps-window ps-caustics ps-vertex-mass ps-volume-weighted sample-points serve serve-progress tessellation-cache auto-tune-report; do
+    check "$(has "${TMP}/k_help_ps.log" "^ *--${o}( |$)")" "PS-DTFE --help lists --${o}"
+done
+for o in gpu exact-average sample-points serve auto-tune-report; do
+    check "$(has "${TMP}/k_help_dtfe.log" "^ *--${o}( |$)")" "DTFE --help lists --${o}"
+done
+check "$(lacks "${TMP}/k_help_dtfe.log" '^ *--ps-gpu')" "... and not PS-DTFE's own --ps-gpu"
+"${PS_BIN}" --full_help >"${TMP}/k_full_ps.log" 2>&1 || true
+check "$(lacks "${TMP}/k_full_ps.log" 'encompasing|documenation|vortivity|chuncks|coordiante|tesselation|specifed|suplied|strech|mannually|DMPC_UNIT')" \
+      "the full help carries none of the misspellings the survey listed"
+check "$(has "${TMP}/k_full_ps.log" "'MPC_UNIT'")" "... and names the Makefile's MPC_UNIT, not DMPC_UNIT"
+
+echo ""
+echo "(L) scripts/install_lib.sh: the binaries kept through a failed rebuild (2026-10-05, survey rank 24)."
+LREPO="${TMP}/fake_repo"; rm -rf "${LREPO}"; mkdir -p "${LREPO}"
+( cd "${LREPO}" && printf 'old DTFE\n' > DTFE && printf 'old PS-DTFE\n' > PS-DTFE && printf 'old 2d\n' > DTFE-2d && chmod +x DTFE PS-DTFE DTFE-2d
+  source "${ROOT_DIR}/scripts/install_lib.sh"
+  n="$(backup_binaries "${LREPO}/.backup")"
+  echo "backed up ${n}" > "${TMP}/l_backup.log"
+  rm -f DTFE PS-DTFE DTFE-2d; printf 'half-linked\n' > PS-DTFE                 # 'make clean' then a failing build
+  m="$(restore_binaries "${LREPO}/.backup")"
+  echo "restored ${m}" >> "${TMP}/l_backup.log"
+  printf 'line1\nline2\nld: symbol not found\n' > build.log
+  build_failed_hint build.log 2 > "${TMP}/l_hint.log" )
+check "$(has "${TMP}/l_backup.log" '^backed up 3$')" "backup_binaries counts the three binaries present (of the six names)"
+check "$(has "${TMP}/l_backup.log" '^restored 3$')" "restore_binaries puts the three back"
+check "$([ "$(cat "${LREPO}/PS-DTFE")" = "old PS-DTFE" ] && [ "$(cat "${LREPO}/DTFE")" = "old DTFE" ] && [ -x "${LREPO}/DTFE-2d" ] && echo 0 || echo 1)" \
+      "... byte for byte, the half-linked one replaced, the mode kept"
+check "$(has "${TMP}/l_hint.log" 'ld: symbol not found')" "build_failed_hint prints the log's tail"
+check "$(lacks "${TMP}/l_hint.log" '^line1$')" "... only the last N lines"
+check "$(has "${TMP}/l_hint.log" 'make deps-check')" "... and the usual causes"
+
+echo ""
 echo "------------------------------------------------------------"
 if [ "${fails}" -eq 0 ]; then
     rm -rf "${TMP}"
     echo "RESULT: PASS  (the batch driver honours its environment, needs no IC file when the"
     echo "               snapshot carries one, reports honest exit codes, is portable, and"
-    echo "               handles the per-family data layout; run_dtfe.sh's exact cell average)"
+    echo "               handles the per-family data layout; run_dtfe.sh's exact cell average;"
+    echo "               downloads merge only when complete; --help and DRY_RUN run nothing)"
     exit 0
 fi
 echo "RESULT: FAIL  (${fails} check(s); logs kept under ${TMP})"

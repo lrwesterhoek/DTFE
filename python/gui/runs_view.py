@@ -71,7 +71,8 @@ class RunsBrowser(QWidget):
         self.b_log = QPushButton("Open log")
         self.b_log.clicked.connect(self._open_log)
         self.b_load = QPushButton("Load settings")
-        self.b_load.setToolTip("Put this run's settings into the Grids tab, to run it again")
+        self.b_load.setToolTip("Put this run's settings into the Grids tab (a custom-snapshot run: the Custom tab), "
+                               "to run it again")
         self.b_load.clicked.connect(lambda: self._sel() and self.load_settings.emit(self._sel()))
         self.b_explore = QPushButton("Explore")
         self.b_explore.clicked.connect(lambda: self._sel() and self.explore.emit(str(self._sel().path.parent / self._sel().prefix)))
@@ -156,7 +157,7 @@ class RunsBrowser(QWidget):
             self.detail.setPlainText("Every run with a log on disk: TNG runs under the data root and custom-snapshot "
                                      "runs in their output folders. Select one for its details.")
             return
-        self.b_load.setEnabled(bool(r.sim) and r.estimator in ("ps", "dtfe"))
+        self.b_load.setEnabled((bool(r.sim) and r.estimator in ("ps", "dtfe")) or R.custom_settings(r) is not None)
         self.b_explore.setEnabled(any(p.name.endswith((".a_den", ".den")) for p in r.outputs))
         lines = [str(r.path), ""]
         stale = R.stale_reasons(r)

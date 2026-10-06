@@ -20,14 +20,22 @@ def binary(name="PS-DTFE"):
     return os.path.join(ROOT, name + ("-double" if DOUBLE else ""))
 
 
+def skip_or_fail(why):
+    """A suite that cannot run exits 0 with a SKIP line -- unless the stage requires it (DTFE_TEST_REQUIRED=1,
+    ci_suite.sh's double and 2d stages after building the pair): then a FAILURE (survey rank 20, 2026-10-05)."""
+    if os.environ.get("DTFE_TEST_REQUIRED") == "1":
+        sys.exit(f"FAIL (required): {why}")
+    print(f"SKIP: {why}")
+    sys.exit(0)
+
+
 def require(path):
     """Exit (FAIL) when a binary is not built -- in double mode with a SKIP line instead, like the shell
     suites: the double pair is optional ('make DTFE PS-DTFE DOUBLE=1')."""
     if os.path.isfile(path) and os.access(path, os.X_OK):
         return
     if DOUBLE:
-        print(f"SKIP: {path} is not built (make DTFE PS-DTFE DOUBLE=1 builds the double pair)")
-        sys.exit(0)
+        skip_or_fail(f"{path} is not built (make DTFE PS-DTFE DOUBLE=1 builds the double pair)")
     sys.exit(f"FAIL: '{path}' not built")
 
 

@@ -590,9 +590,8 @@ class FieldSet:
         # read-only memmap that mode='auto' returns for over-budget grids. The mask grids are
         # only compared against, so auto (possibly memmap) is fine there.
         vel = self.load("velocity", mode="ram")
-        multi = np.abs(self.load("streams") - 1.0) > STREAM_TOL
-        if self.has("hidden_streams"):
-            multi |= (np.rint(self.load("hidden_streams")).astype(np.int32) & 1) != 0
+        multi = ~single_stream_mask(self.load("streams"),            # THE rule, shared with webstreams and profiles
+                                    self.load("hidden_streams") if self.has("hidden_streams") else None)
         vel[multi] = np.nan
         return vel
 
@@ -847,3 +846,17 @@ class PointPlane:
         return (f"PointPlane({self.prefix.name}, {self.nu}x{self.nv}x{self.planes}{extra}, "
                 f"axis={self.side.get('axis')}, project={self.project}, "
                 f"z={self.redshift:.2f}, fields: {', '.join(self.available())})")
+
+
+def single_stream_mask(streams, hidden=None, tol: float = STREAM_TOL):
+    """Boolean (N,N,N): the cells that are single-stream -- |streams - 1| <= tol (the float contract of
+    '.streams': a sub-sample mean or the exact volume-weighted multiplicity, see velocity_single_stream)
+    AND, when a 'hidden_streams' grid is given, bit 1 clear (multi-stream volume the count does not show).
+    THE one rule: velocity_single_stream masks its complement, webstreams.stream_bins names its bins by it,
+    profiles samples it on the voids' shells (2026-10-05)."""
+    import numpy as np
+    s = np.asarray(streams, dtype=np.float32)
+    out = np.abs(s - 1.0) <= tol
+    if hidden is not None:
+        out &= (np.rint(np.asarray(hidden, dtype=np.float32)).astype(np.int32) & 1) == 0
+    return out

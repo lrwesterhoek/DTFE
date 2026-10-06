@@ -190,7 +190,7 @@ def redshift_table(sim: str) -> dict[int, float]:
         try:
             snap = int(d.name.split("_")[1])
             anchors[snap] = header(sim, snap)["redshift"]
-        except (ValueError, FileNotFoundError):
+        except (ValueError, OSError, KeyError):         # OSError incl. missing; an unreadable or headerless file
             pass
     for d in sorted(root.glob("snapdir_*")):
         snap = int(d.name.split("_")[1])
@@ -199,8 +199,11 @@ def redshift_table(sim: str) -> dict[int, float]:
         for pat in (f"snap_{snap:03d}.*.hdf5", f"combined_{snap:03d}.hdf5"):
             files = sorted(d.glob(pat))
             if files:
-                with h5py.File(files[0], "r") as f:
-                    anchors[snap] = float(f["Header"].attrs["Redshift"])
+                try:                                    # an unreadable file is no anchor: interpolated like a missing one
+                    with h5py.File(files[0], "r") as f:
+                        anchors[snap] = float(f["Header"].attrs["Redshift"])
+                except (OSError, KeyError):
+                    pass
                 break
     if len(anchors) >= 2:
         snaps = np.array(sorted(anchors))

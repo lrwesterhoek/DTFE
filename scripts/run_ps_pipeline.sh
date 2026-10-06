@@ -12,6 +12,7 @@
 #   ./run_ps_pipeline.sh                            # everything: all sims, all snapshots on disk
 #   SIMS="TNG100-3-Dark" ./run_ps_pipeline.sh       # one simulation
 #   DRY_RUN=1 ./run_ps_pipeline.sh                  # print the plan, run nothing
+#   ./run_ps_pipeline.sh --help                     # this header, nothing run (--version: the revision)
 #
 # RESUMABLE: a snapshot is skipped when its <prefix>.pts_den exists and is newer than both
 # its combined_*.hdf5 and the plane file (and, with PTS_VEL_GRAD=1, its .pts_velGrad exists).
@@ -33,9 +34,9 @@
 #                 (.pts_velGrad), which is what makes the velDiv/velShear/velVort maps
 #                 possible. A snapshot lacking it counts as STALE, so a rerun recomputes it.
 #   PLANES, THICKNESS, SUPERSAMPLE, WINDOW
-#                 the plane's geometry, forwarded to make_image_plane.py: sampling planes across
-#                 a slab of THICKNESS Mpc (default 1 = one crisp cross-section; a handful ghosts,
-#                 use >= 16 with plot_pointeval.py --project slab), KxK sub-samples per pixel
+#                 the plane's geometry, forwarded to make_image_plane.py: PLANES sampling planes
+#                 (default 1 = one crisp cross-section; a handful ghosts, use >= 16 with
+#                 plot_pointeval.py --project slab) across a slab of THICKNESS Mpc (default 2), KxK sub-samples per pixel
 #                 averaged into pixel-area means (default 1), and "u0 u1 v0 v1" in Mpc to image
 #                 only that part of the plane (default: the whole box).
 #   PS_GPU        1 (default) = the deposit on the GPU (run_ps_dtfe.sh -m); 0 = CPU
@@ -57,6 +58,14 @@
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"   # python/ and the binaries live one level up
+# -h / --help print this header and run nothing (a '--help' used to START THE WHOLE BATCH: the script took no
+# arguments at all); --version the revision; anything else is an error -- the knobs are environment variables
+case "${1:-}" in
+    -h|--help) sed -n '2,/^$/p' "${BASH_SOURCE[0]}" | sed -e 's/^# \{0,1\}//'; exit 0 ;;
+    --version) git -C "${REPO_ROOT}" describe --always --dirty 2>/dev/null || echo unknown; exit 0 ;;
+    "") ;;
+    *) echo "Error: run_ps_pipeline.sh takes no arguments (its knobs are environment variables; --help lists them)" >&2; exit 2 ;;
+esac
 USER_GRID="${GRID_SIZE:-}"          # capture BEFORE config.sh, which sets its own GRID_SIZE
 source "${SCRIPT_DIR}/config.sh"
 
@@ -184,7 +193,7 @@ for sim in ${SIMS}; do
         [ -n "${FIELDS:-}" ] && env_args+=(FIELDS="${FIELDS}")
         run env "${env_args[@]}" \
             "${SCRIPT_DIR}/run_ps_dtfe.sh" -s "${sim}" -g "${GRID_SIZE}" ${gpu_args[@]+"${gpu_args[@]}"} "${compute[@]}" \
-            || { echo "!! ${sim}: run_ps_dtfe.sh reported failure (continuing to plots)"; overall_rc=1; }
+            || { echo "!! ${sim}: run_ps_dtfe.sh reported failure (continuing with the next simulation)"; overall_rc=1; }
     else
         echo "-- ${sim}: all snapshots up to date"
     fi

@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -63,6 +65,73 @@ def default_cache_dir(near: str) -> Path:
     return base / "DTFE" / "tessellations"
 
 
+# ==================================================================== the difference map (survey item 17)
+COMPARE_MODES = (("A − B", "diff"), ("log₁₀ A/B", "ratio"))
+NAN_GREY = (150, 150, 150)                 # a cell without a value (a ratio where A or B <= 0): not the scale's end
+
+
+def compare_planes(a, b, mode: str) -> np.ndarray:
+    """The difference map of two slices of the same grid: A - B, or log10(A/B) where both are positive
+    (NaN elsewhere, drawn grey)."""
+    a, b = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
+    if a.shape != b.shape:
+        raise ValueError(f"the two outputs' slices differ in shape: {a.shape} and {b.shape}")
+    if mode == "ratio":
+        ok = (a > 0) & (b > 0)
+        return np.where(ok, np.log10(np.where(ok, a, 1.0) / np.where(ok, b, 1.0)), np.nan)
+    return a - b
+
+
+# Explore field -> dtfelib.io.PointPlane field of a point-evaluated hi-res slice (2026-10-06)
+PTS_FIELDS = {"density": "density", "streams": "streams", "velocity": "velocity", "dispersion": "dispersion",
+              "divergence": "velDiv", "shear": "velShear", "vorticity": "velVort", "caustic": "caustic"}
+PTS_MAX_SIDE = 4096                        # an 8192^2 plane is shown block-averaged to 4096^2 (screen and memory)
+NO_SNAPSHOT_TEXT = "no snapshot known for this output (its input file is not beside it): choose it with Snapshot…"
+
+
+def pts_plane(o, side, field: str, component: str):
+    """(plane[u, v] for the map, the sidecar dict, the block factor) of a point-evaluated hi-res slice: the same
+    quantity as the grid field where both exist -- the dispersion as the trace sigma^2 (the grid's '.velDisp'),
+    the caustic as the fold flag, the velocity as its norm or a component; the shear and the vorticity as the
+    magnitudes PointPlane derives."""
+    from dtfelib.io import PointPlane
+    pp = PointPlane(o.root, side, redshift=o.redshift)
+    name = PTS_FIELDS.get(field)
+    if name is None or name not in pp.available():
+        raise ValueError(f"this hi-res slice has no {G.FIELD_LABELS.get(field, field)}"
+                         + (" (it needs the velocity gradient points)" if field in ("divergence", "shear", "vorticity")
+                            else ""))
+    arr = pp.field(name)
+    if field == "dispersion":
+        arr = arr[..., 0] + arr[..., 3] + arr[..., 5]          # xx + yy + zz = sigma^2
+    elif field == "caustic":
+        arr = ((np.asarray(arr).astype(np.int64) & 3) == 3).astype(np.float64)
+    elif arr.ndim == 3:
+        comps = G.components("velocity", 3, 3)
+        if component in comps[1:]:
+            arr = arr[..., comps.index(component) - 1]
+        else:
+            arr = np.sqrt((np.asarray(arr, dtype=np.float64) ** 2).sum(axis=-1))
+    arr = np.asarray(arr, dtype=np.float64)
+    f = max(1, int(np.ceil(max(arr.shape) / PTS_MAX_SIDE)))
+    if f > 1:                                  # block mean (a mask: any)
+        nv, nu = (arr.shape[0] // f) * f, (arr.shape[1] // f) * f
+        blocks = arr[:nv, :nu].reshape(nv // f, f, nu // f, f)
+        arr = blocks.max(axis=(1, 3)) if field == "caustic" else blocks.mean(axis=(1, 3))
+    return np.ascontiguousarray(arr.T), pp.side, f       # [u, v]: the slice map's plane[row = first in-plane axis]
+
+
+def _smoothed(plane, sigma: float):
+    """Gaussian smoothing in cells (periodic); unchanged without scipy."""
+    if sigma > 0:
+        try:
+            from scipy.ndimage import gaussian_filter
+            return gaussian_filter(plane, sigma, mode="wrap")
+        except ImportError:
+            pass
+    return plane
+
+
 # ==================================================================== workers
 class SliceWorker(QObject):
     """Reads and colours one slice off the GUI thread; only the latest request is served. The figure
@@ -86,21 +155,29 @@ class SliceWorker(QObject):
     def render(self, req: dict):
         try:
             out: G.OutputSet = req["output"]
-            plane = out.slice(req["field"], req["axis"], req["index"], req["component"])
-            if req.get("smooth", 0) > 0:
-                try:
-                    from scipy.ndimage import gaussian_filter
-                    plane = gaussian_filter(plane, req["smooth"], mode="wrap")
-                except ImportError:
-                    pass
+            pts_side = pts_factor = None
+            if req.get("pts"):                      # the point-evaluated hi-res slice in place of the grid's
+                plane, pts_side, pts_factor = pts_plane(out, req["pts"], req["field"], req["component"])
+                plane = _smoothed(plane, req.get("smooth", 0))
+            else:
+                plane = _smoothed(out.slice(req["field"], req["axis"], req["index"], req["component"]),
+                                  req.get("smooth", 0))
+            planes = None
+            if req.get("compare") is not None:      # B read and smoothed the same way; the map is A - B or log10 A/B
+                b = _smoothed(req["compare"].slice(req["field"], req["axis"], req["index"], req["component"]),
+                              req.get("smooth", 0))
+                planes = (plane, b)
+                plane = compare_planes(plane, b, req["compare_mode"])
             # image: horizontal = the first remaining axis, vertical = the second, increasing upward
             img = np.ascontiguousarray(plane.T[::-1])
             rgb, vrange = G.colorize(img, req["cmap"], log=req["log"], clip=(req["clip"], 100 - req["clip"]),
-                                     symmetric=req["symmetric"])
+                                     symmetric=req["symmetric"], vrange=req.get("vrange"))
+            if planes is not None:
+                rgb[~np.isfinite(img)] = NAN_GREY   # colorize paints NaN as vmin: on RdBu_r that would read 'A >> B'
             arrows = out.arrow_field(req["field"], req["axis"], req["index"], smooth=req.get("smooth", 0)) \
-                if req.get("arrows") else None
+                if req.get("arrows") and not req.get("pts") else None
             self.done.emit({"rgb": np.ascontiguousarray(rgb), "plane": plane, "vrange": vrange, "request": req,
-                            "arrows": arrows})
+                            "arrows": arrows, "planes": planes, "pts_side": pts_side, "pts_factor": pts_factor})
         except Exception as e:                  # a partial file, a vanished disk
             self.failed.emit(f"{type(e).__name__}: {e}")
 
@@ -364,7 +441,8 @@ def load_exact_planes(root, grid, redshift=None):
             if n == 0 or size % n or size // n not in (4, 8):
                 continue
             dt = np.float32 if size // n == 4 else np.float64
-            arr = np.fromfile(p, dtype=dt).astype(np.float64)
+            arr = np.fromfile(p, dtype=dt)  # the file's precision: the renderer up-casts the ONE plotted component
+                                            # (float64 of a 9-component gradient at 4096^2 was 2.4 GB)
             planes[name] = arr.reshape(shape + ((ncomp,) if ncomp > 1 else ()))
     if redshift is not None:
         for name in list(planes):
@@ -373,7 +451,8 @@ def load_exact_planes(root, grid, redshift=None):
                 planes[name] = planes[name] * (1.0 / (1.0 + float(redshift))) ** exp
     f = types.SimpleNamespace(density=planes.get("density"), streams=planes.get("streams"),
                               caustic=None, velocity=planes.get("velocity"), dispersion=planes.get("dispersion_tensor"),
-                              sigma=planes.get("dispersion"), velocity_gradient=None, offsets=None)
+                              sigma=planes.get("dispersion"), velocity_gradient=None, offsets=None,
+                              scalar=planes.get("scalar"))
     if "caustic" in planes:
         f.caustic = np.rint(planes["caustic"]).astype(np.int64)
     if "gradient" in planes:   # the grid's [j*D+i] = dv_j/dx_i -> the point evaluation's [d, j] = dv_j/dx_d
@@ -441,22 +520,35 @@ def panel_names(it: dict) -> tuple[str, str, str, str]:
     return label, ctext, who, when
 
 
+def type_tag(o) -> str:
+    """What tells two runs apart in a panel's label: the estimator with a non-default prefix
+    (grids.type_label: 'DTFE', 'PS-DTFE', 'PS-DTFE · ps_mw' -- the Type column's words, not the raw
+    prefix 'output' that says nothing to a reader of the saved figure); the prefix for a bare object."""
+    if hasattr(o, "files") and getattr(o, "prefix", ""):
+        return G.type_label(o)
+    return getattr(o, "prefix", "") or ""
+
+
 def grid_differences(items: list) -> dict:
-    """What differs between the panels: the sets of outputs, simulations, quantities and (who, when)."""
+    """What differs between the panels: the sets of outputs, simulations, quantities and (who, when);
+    'by_prefix' = the run has to be named: outputs of one snapshot (the prefix tells them apart), or
+    two estimators in the grid (a DTFE panel next to a PS-DTFE one at another redshift said nothing)."""
     live = [it for it in items if it is not None]
     outs = {str(it["output"].root) for it in live}
     moments = {panel_names(it)[2:] for it in live}
+    types = {type_tag(it["output"]) for it in live}
     return {"outs": outs, "sims": {panel_names(it)[2] for it in live},
             "quantities": {(it["field"], it["component"]) for it in live},
-            "by_prefix": len(outs) > len(moments)}     # outputs of one snapshot: the prefix tells them apart
+            "by_prefix": len(outs) > len(moments) or len(types) > 1}
 
 
 def panel_label(it: dict, diff: dict) -> str:
     """The short text inside a panel: only what differs between the panels (the redshift, the simulation
-    when several, the field when several, the output prefix when two runs of one snapshot are shown)."""
+    when several, the field when several, the run -- its estimator and prefix -- when two runs of one
+    snapshot or two estimators are shown)."""
     label, ctext, who, when = panel_names(it)
     o = it["output"]
-    tag = f" · {getattr(o, 'prefix', '')}" if diff["by_prefix"] and getattr(o, "prefix", "") else ""
+    tag = f" · {type_tag(o)}" if diff["by_prefix"] and type_tag(o) else ""
     parts = []
     if len(diff["outs"]) > 1:
         parts.append((f"{who} · " if len(diff["sims"]) > 1 else "") + (when or who) + tag)
@@ -468,7 +560,7 @@ def panel_label(it: dict, diff: dict) -> str:
 def grid_tiles(req: dict, items: list, max_tile: int = 1024) -> tuple[np.ndarray, list, tuple | None]:
     """The screen's picture: every panel coloured straight to pixels (colorize, the single map's way) and
     tiled, thin white gaps unless merged, resampled to one tile size (nearest). Returns (rgb, labels,
-    bar): labels = [(x, y, text)] in image pixels, bar = (cmap, vrange, label) when every panel shows one
+    bar): labels = [(x, y, text)] in image pixels, bar = (cmap, vrange, label, log) when every panel shows one
     quantity on one range (shown below the picture), else None."""
     rows, cols, clip = req["rows"], req["cols"], req["clip"]
     sizes = [it["img"].shape[0] for it in items if it is not None]
@@ -500,7 +592,7 @@ def grid_tiles(req: dict, items: list, max_tile: int = 1024) -> tuple[np.ndarray
     if len(diff["quantities"]) == 1 and (req["shared"] or req["merged"] or len(diff["outs"]) == 1):
         it0 = next(it for it in items if it is not None)
         label, ctext, _w, _t = panel_names(it0)
-        bar = (it0["cmap"], (it0["lo"], it0["hi"]), ("log₁₀ " if it0["log"] else "") + label + ctext)
+        bar = (it0["cmap"], (it0["lo"], it0["hi"]), ("log₁₀ " if it0["log"] else "") + label + ctext, it0["log"])
     return out, labels, bar
 
 
@@ -552,7 +644,7 @@ def grid_figure(req: dict, items: list, dpi: float = 200.0):
         ax.set_xlabel(f"{AXES[it['rest'][0]]} [{unit}]", fontsize=8 * fs)
         ax.set_ylabel(f"{AXES[it['rest'][1]]} [{unit}]", fontsize=8 * fs)
         ax.tick_params(labelsize=7 * fs)
-        tag = f" · {getattr(o, 'prefix', '')}" if diff["by_prefix"] and getattr(o, "prefix", "") else ""
+        tag = f" · {type_tag(o)}" if diff["by_prefix"] and type_tag(o) else ""
         if merged:
             bars.setdefault((it["field"], it["component"]), (im, it))
             ax.text(0.03, 0.97, panel_label(it, diff), transform=ax.transAxes, va="top", ha="left",
@@ -629,12 +721,15 @@ class ImageCanvas(QLabel):
         self.marker: tuple[int, int] | None = None
         self.arrows: dict | None = None     # grids.OutputSet.arrow_field(), drawn over the map
         self.labels: list | None = None     # [(x, y, text)] in image pixels: the figure grid's panel labels
+        # {"x": (lo, hi, name), "y": (lo, hi, name), "unit": "Mpc"|"cells"}: the axes drawn around the image
+        # (x increasing to the right, y UPWARD) and the scale bar; None for the figure grid's tiles
+        self.axes: dict | None = None
         self.setText("Choose an output on the left.")
         self.setStyleSheet("color: gray")
 
     def set_rgb(self, rgb: np.ndarray | None):
         if rgb is None:
-            self._img, self._buf = None, None
+            self._img, self._buf, self.axes = None, None, None
             self.setPixmap(QPixmap())
             return
         self._buf = rgb                    # keep the bytes alive for the QImage
@@ -642,18 +737,45 @@ class ImageCanvas(QLabel):
         self._img = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888)
         self._redraw()
 
+    def _axes_font(self):
+        f = self.font()
+        f.setPointSizeF(9.0)
+        return f
+
+    def _margins(self) -> tuple[float, float, float, float]:
+        """(left, top, right, bottom) kept free around the image for the axes: the tick labels (as wide as
+        the widest one) and the axis names."""
+        a = self.axes
+        if not a:
+            return 0.0, 0.0, 0.0, 0.0
+        fm = QFontMetrics(self._axes_font())
+        whole = a["unit"] == "cells"
+        yt, xt = G.nice_ticks(*a["y"][:2], integer=whole), G.nice_ticks(*a["x"][:2], integer=whole)
+        yw = max((fm.horizontalAdvance(G.tick_text(v, yt)) for v in yt), default=0)
+        xw = max((fm.horizontalAdvance(G.tick_text(v, xt)) for v in xt), default=0)
+        h = fm.height()
+        return yw + h + 12.0, h / 2 + 2.0, xw / 2 + 4.0, 2 * h + 10.0
+
     def _target(self) -> QRectF | None:
+        """Where the image is drawn: scaled to fit (aspect kept) inside the margins the axes need."""
         if self._img is None:
             return None
         w, h = self._img.width(), self._img.height()
-        s = min(self.width() / w, self.height() / h)
-        return QRectF((self.width() - w * s) / 2, (self.height() - h * s) / 2, w * s, h * s)
+        left, top, right, bottom = self._margins()
+        W, H = self.width() - left - right, self.height() - top - bottom
+        if W < 40 or H < 40:                        # too small for axes: the whole widget
+            left = top = 0.0
+            W, H = self.width(), self.height()
+        s = min(W / w, H / h)
+        return QRectF(left + (W - w * s) / 2, top + (H - h * s) / 2, w * s, h * s)
 
     def _redraw(self):
         t = self._target()
         if t is None:
             return
-        pm = QPixmap(self.size())
+        dpr = self.devicePixelRatioF()          # the axes' text at the screen's resolution (Retina: 2x)
+        pm = QPixmap(self.size() * dpr)
+        pm.setDevicePixelRatio(dpr)
         pm.fill(QColor(0, 0, 0, 0))
         p = QPainter(pm)
         # smooth when shrinking a big slice; crisp cells when a small grid is blown up
@@ -663,6 +785,8 @@ class ImageCanvas(QLabel):
             self._draw_arrows(p, t)
         if self.labels:
             self._draw_labels(p, t)
+        if self.axes:
+            self._draw_axes(p, t)
         if self.marker is not None:
             r, c = self.marker
             s = t.width() / self._img.width()
@@ -697,6 +821,59 @@ class ImageCanvas(QLabel):
             p.drawRoundedRect(box, 3, 3)
             p.setPen(QPen(QColor("white")))
             p.drawText(box.adjusted(4, 2, 0, 0), Qt.AlignLeft | Qt.AlignTop, text)
+
+    def _draw_axes(self, p: QPainter, t: QRectF):
+        """The axes around the image (ticks at round values, labels that would collide dropped, the axis
+        names) and a scale bar of a round length in its lower-left corner (survey item 12)."""
+        (x0, x1, xn), (y0, y1, yn), unit = self.axes["x"], self.axes["y"], self.axes["unit"]
+        if not (x1 > x0 and y1 > y0):
+            return
+        f = self._axes_font()
+        p.setFont(f)
+        fm = QFontMetrics(f)
+        h = fm.height()
+        p.setRenderHint(QPainter.Antialiasing, False)
+        p.setPen(QPen(self.palette().windowText().color(), 1))
+        p.setBrush(Qt.NoBrush)
+        p.drawRect(t)
+        whole = unit == "cells"                 # whole cells: no tick between two
+        xt, last = G.nice_ticks(x0, x1, integer=whole), -1e9
+        for v in xt:
+            x = t.left() + (v - x0) / (x1 - x0) * t.width()
+            p.drawLine(QPointF(x, t.bottom()), QPointF(x, t.bottom() + 4))
+            text = G.tick_text(v, xt)
+            w_ = fm.horizontalAdvance(text)
+            if x - w_ / 2 >= last + 6:
+                p.drawText(QRectF(x - w_ / 2 - 1, t.bottom() + 5, w_ + 2, h), Qt.AlignCenter, text)
+                last = x + w_ / 2
+        yt, last = G.nice_ticks(y0, y1, integer=whole), 1e9
+        yw = max((fm.horizontalAdvance(G.tick_text(v, yt)) for v in yt), default=0)
+        for v in yt:
+            y = t.bottom() - (v - y0) / (y1 - y0) * t.height()
+            p.drawLine(QPointF(t.left() - 4, y), QPointF(t.left(), y))
+            if y + h / 2 <= last - 2:
+                p.drawText(QRectF(0, y - h / 2, t.left() - 6, h), Qt.AlignRight | Qt.AlignVCenter, G.tick_text(v, yt))
+                last = y - h / 2
+        p.drawText(QRectF(t.left(), t.bottom() + 6 + h, t.width(), h), Qt.AlignHCenter | Qt.AlignTop, f"{xn} [{unit}]")
+        p.save()
+        p.translate(max(2.0, t.left() - 10 - yw - h), t.center().y())      # just left of the tick labels
+        p.rotate(-90)
+        p.drawText(QRectF(-t.height() / 2, 0, t.height(), h), Qt.AlignCenter, f"{yn} [{unit}]")
+        p.restore()
+        length = G.nice_length(x1 - x0)
+        px = length / (x1 - x0) * t.width()
+        if t.width() >= 120 and px >= 8:
+            label = f"{length:g} {unit}"
+            bx, by = t.left() + 10, t.bottom() - 10
+            wide = max(px, fm.horizontalAdvance(label))
+            p.setRenderHint(QPainter.Antialiasing, True)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(0, 0, 0, 135))
+            p.drawRoundedRect(QRectF(bx - 4, by - h - 7, wide + 8, h + 11), 3, 3)
+            p.setPen(QPen(QColor("white"), 3, Qt.SolidLine, Qt.FlatCap))
+            p.drawLine(QPointF(bx, by), QPointF(bx + px, by))
+            p.setPen(QPen(QColor("white")))
+            p.drawText(QRectF(bx, by - h - 4, wide, h), Qt.AlignLeft | Qt.AlignBottom, label)
 
     def _draw_arrows(self, p: QPainter, t: QRectF):
         """The vector field: one arrow per block, the longest 0.9 block long, in white over a
@@ -777,28 +954,68 @@ class ImageCanvas(QLabel):
 
 
 class ColorBar(QWidget):
+    """The map's colour scale (survey item 13): the gradient; ticks at round values -- whole decades,
+    written 10^k, on a log map -- with the two ends as the lowest-priority labels (they say where the bar
+    stops); the quantity on a row of its own, elided."""
+    BAR = 14                                # the gradient's height; ticks below it, then two text rows
+
     def __init__(self):
         super().__init__()
-        self.setFixedHeight(34)
-        self.cmap, self.vrange, self.label = "viridis", (0.0, 1.0), ""
+        self.setFixedHeight(self.BAR + 4 + 2 * QFontMetrics(self.font()).height() + 6)
+        self.cmap, self.vrange, self.label, self.log = "viridis", (0.0, 1.0), "", False
 
-    def set(self, cmap: str, vrange, label: str):
-        self.cmap, self.vrange, self.label = cmap, vrange, label
+    def set(self, cmap: str, vrange, label: str, log: bool = False):
+        """'label' is the full text ('log₁₀ ' included: Save image labels its log10 data with it);
+        'log': the range is in log10 units, the ticks read 10^k."""
+        self.cmap, self.vrange, self.label, self.log = cmap, vrange, label, bool(log)
         self.update()
+
+    def shown_label(self) -> str:
+        """The bar's own text: on a log map the ticks already read 10^k, so 'log₁₀ ' is dropped."""
+        if self.log and self.label.startswith("log₁₀ "):
+            return self.label[len("log₁₀ "):]
+        return self.label
+
+    def tick_labels(self, width: int | None = None) -> list[tuple[float, float, str]]:
+        """(tick x, label left, label text) of every label drawn: the round ticks first, then the two ends
+        where they do not collide (6 px apart at least)."""
+        W = float(width if width is not None else self.width())
+        fm = QFontMetrics(self.font())
+        lo, hi = self.vrange
+        span = (hi - lo) if hi > lo else 1.0
+        placed, out = [], []
+
+        def place(x, text, left=None):
+            w_ = fm.horizontalAdvance(text)
+            l_ = min(max(x - w_ / 2, 0.0), W - w_) if left is None else left
+            if all(l_ + w_ + 6 <= a or l_ >= b + 6 for a, b in placed):
+                placed.append((l_, l_ + w_))
+                out.append((x, l_, text))
+        for v, text in G.colorbar_ticks(lo, hi, self.log):
+            place((v - lo) / span * W, text)
+        end = (lambda v: f"{10.0 ** v:.3g}") if self.log else (lambda v: f"{v:.3g}")
+        place(0.0, end(lo), left=0.0)
+        place(W, end(hi), left=W - fm.horizontalAdvance(end(hi)))
+        return out
 
     def paintEvent(self, _e):
         p = QPainter(self)
+        W, B = self.width(), self.BAR
         lut = G.lut(self.cmap)
-        g = QLinearGradient(0, 0, self.width(), 0)
+        g = QLinearGradient(0, 0, W, 0)
         for i in range(0, 256, 16):
             g.setColorAt(i / 255, QColor(*[int(v) for v in lut[i]]))
         g.setColorAt(1.0, QColor(*[int(v) for v in lut[255]]))
-        p.fillRect(0, 0, self.width(), 14, g)
+        p.fillRect(0, 0, W, B, g)
         p.setPen(self.palette().windowText().color())
-        lo, hi = self.vrange
-        p.drawText(0, 30, f"{lo:.3g}")
-        p.drawText(QRectF(0, 16, self.width(), 18), Qt.AlignHCenter, self.label)
-        p.drawText(QRectF(0, 16, self.width(), 18), Qt.AlignRight, f"{hi:.3g}")
+        fm = QFontMetrics(self.font())
+        h = fm.height()
+        for x, left, text in self.tick_labels(W):
+            if 0 < x < W:
+                p.drawLine(QPointF(x, B), QPointF(x, B + 4))
+            p.drawText(QRectF(left, B + 4, fm.horizontalAdvance(text) + 1, h), Qt.AlignLeft | Qt.AlignTop, text)
+        p.drawText(QRectF(0, B + 6 + h, W, h), Qt.AlignHCenter | Qt.AlignTop,
+                   fm.elidedText(self.shown_label(), Qt.ElideRight, W))
         p.end()
 
 
@@ -856,6 +1073,7 @@ class ExploreControls(QWidget):
         self.outputs: list[tuple[str, G.OutputSet]] = []
         self.current: G.OutputSet | None = None
         self._plane = None
+        self._planes = None                     # (A, B) of a difference map: the hover reads both
         self._arrows = None
         self._req = None
         self._pending = None
@@ -869,6 +1087,7 @@ class ExploreControls(QWidget):
         self._grid_index = None                 # the slice index the shown grid was composed at
         self._grid_busy = False                 # a tile request is with the worker; only the latest is served
         self._grid_pending = None
+        self._grid_type_pref: dict = {}         # row -> (prefix, estimator) the user chose; a rebuild's fallback never replaces it
 
         col = QVBoxLayout(self)
         g = QGroupBox("Output")
@@ -915,6 +1134,7 @@ class ExploreControls(QWidget):
 
         g = QGroupBox("Map")
         f = QFormLayout(g)
+        self._out_form_map = f
         self.field = QComboBox()
         self.field.currentIndexChanged.connect(self._field_changed)
         f.addRow("Field", self.field)
@@ -958,10 +1178,56 @@ class ExploreControls(QWidget):
         self.clip.valueChanged.connect(self.render)
         rg.addWidget(self.clip)
         f.addRow("Range", rg)
+        fx = QHBoxLayout()
+        self.fixed = QCheckBox("fixed")
+        self.fixed.setToolTip("Colour every map on this range (the field's own values; a log map takes positive "
+                              "ones): the colours then compare between snapshots, outputs and slices")
+        self.fixed.toggled.connect(self._fixed_toggled)
+        fx.addWidget(self.fixed)
+        self.vmin_edit, self.vmax_edit = QLineEdit(placeholderText="min"), QLineEdit(placeholderText="max")
+        self._fixed_for = None              # the field the fixed range was set for: another field drops it
+        self._fixed_warned = False
+        for e in (self.vmin_edit, self.vmax_edit):
+            e.setMaximumWidth(90)
+            e.editingFinished.connect(self._fixed_edited)
+            fx.addWidget(e)
+        take = QToolButton(text="this map's")
+        take.setToolTip("Fill in the range of the map on screen and fix it")
+        take.clicked.connect(self._take_range)
+        fx.addWidget(take)
+        self.take_range_btn = take
+        fx.addStretch(1)
+        f.addRow("", fx)
         self.smooth = QDoubleSpinBox(minimum=0.0, maximum=20.0, decimals=1, singleStep=0.5)
         self.smooth.setSuffix(" cells (Gaussian)")
         self.smooth.valueChanged.connect(self.render)
         f.addRow("Smoothing", self.smooth)
+        cmp_row = QHBoxLayout()
+        self.compare = QComboBox()
+        self.compare.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.compare.setMinimumContentsLength(12)
+        self.compare.setToolTip("Show this map minus another output of the same grid (the same cells: another "
+                                "estimator, prefix, precision or deposit of this snapshot, or another snapshot), "
+                                "on a diverging scale centred on 0. Slice maps only: a zoom shows A alone")
+        self.compare.currentIndexChanged.connect(self._compare_changed)
+        cmp_row.addWidget(self.compare, 1)
+        self.compare_mode = QComboBox()
+        for text, mode in COMPARE_MODES:
+            self.compare_mode.addItem(text, mode)
+        self.compare_mode.setToolTip("A − B, or log₁₀ A/B where both are positive (grey where not): for density-like fields")
+        self.compare_mode.currentIndexChanged.connect(self.render)
+        cmp_row.addWidget(self.compare_mode)
+        f.addRow("Compare with", cmp_row)
+        self.pts_combo = QComboBox()
+        self.pts_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.pts_combo.setMinimumContentsLength(12)
+        self.pts_combo.setToolTip("Show the point-evaluated hi-res slice of this output ('.pts_*', the Pipeline's "
+                                  "image plane: the field at each pixel centre, no grid) in place of the grid slice. "
+                                  "Planes of one size are listed with their axis: the files do not say which they are")
+        self.pts_combo.currentIndexChanged.connect(self._pts_changed)
+        f.addRow("Hi-res slice", self.pts_combo)
+        f.setRowVisible(self.pts_combo, False)
+        self._pts_side = None
         col.addWidget(g)
 
         g = QGroupBox("Compare: a figure grid")
@@ -1060,10 +1326,22 @@ class ExploreControls(QWidget):
         crow.addWidget(cb)
         cf.addRow("Cache folder", crow)
         v.addLayout(cf)
+        self.resident = QSpinBox(minimum=0, maximum=512)
+        self.resident.setSpecialValueText("auto (the memory budget)")
+        self.resident.setToolTip("A partitioned server keeps this many partition tessellations in memory (the rest "
+                                 "stay in the cache folder and are reloaded when a click or zoom needs them). More "
+                                 "keeps repeated zooms fast at the cost of memory; auto fits them to free memory")
+        cf.addRow("Partitions in memory", self.resident)
+        self._snapshots: dict[str, str] = {}    # output root -> a snapshot file chosen by hand
         brow = QHBoxLayout()
         self.server_btn = QPushButton("Start query server")
         self.server_btn.clicked.connect(self._server_button)
         brow.addWidget(self.server_btn)
+        snap_btn = QToolButton(text="Snapshot…")
+        snap_btn.setToolTip("The snapshot file this output was computed from, when the launcher cannot find it "
+                            "(the input moved, or an output opened by hand): the server and the exact zoom read it")
+        snap_btn.clicked.connect(self._choose_snapshot)
+        brow.addWidget(snap_btn)
         self.server_state = QLabel("not running")
         self.server_state.setWordWrap(True)
         brow.addWidget(self.server_state, 1)
@@ -1387,7 +1665,7 @@ class ExploreControls(QWidget):
     def open_file(self, f) -> bool:
         """Open any output by one of its grid files: an output already listed is shown where it is;
         another is listed under 'Opened files' (once) and shown."""
-        root = Path(f).parent / Path(f).name.split(".")[0]
+        root = Path(f).parent / Path(f).stem          # 'snap_z0.5.a_den' -> 'snap_z0.5' (no grid suffix has a dot)
         if str(root) in self._by_root:
             return self._select_output(str(root))
         o = G.OutputSet(root, box=G.custom_box(G.sidecar(root) or {}), title=f"opened · {root}")
@@ -1398,6 +1676,7 @@ class ExploreControls(QWidget):
         self.outputs.append((o.title, o))
         self._by_root[str(o.root)] = o
         self._rebuild_sims()
+        self._grid_sync_rows()                  # the composer's menus list it too (as after a refresh)
         return self._select_output(str(o.root))
 
     def _show_output(self, o):
@@ -1436,6 +1715,7 @@ class ExploreControls(QWidget):
             w.setValue(0 if flat else slice_now if same_grid else o.n // 2)
             w.setEnabled(not flat)
             w.blockSignals(False)
+        self._pts_fill()                    # BEFORE the field's render: it reads the menu (this output's planes)
         self._field_changed()
         self._refresh_server_button()
 
@@ -1444,6 +1724,12 @@ class ExploreControls(QWidget):
         name = self.field.currentData()
         if o is None or name is None:
             return
+        if self.fixed.isChecked() and self._fixed_for not in (None, name):    # a range belongs to its field
+            self.fixed.blockSignals(True)
+            self.fixed.setChecked(False)
+            self.fixed.blockSignals(False)
+            self.status.emit(f"the fixed range was set for {G.FIELD_LABELS.get(self._fixed_for, self._fixed_for)}: off "
+                             "for this field (tick 'fixed' to use it here)")
         ff = o.files[name]
         self.component.blockSignals(True)
         self.component.clear()
@@ -1452,6 +1738,7 @@ class ExploreControls(QWidget):
         self.component.blockSignals(False)
         vec = name in G.VECTOR_FIELDS and ff.ncomp == o.dim
         self.vectors.blockSignals(True)
+        self.vectors.setProperty("can", vec)
         self.vectors.setEnabled(vec)
         self.vectors.setChecked(vec and name == "velocity")     # the velocity map opens as a vector field
         self.vectors.blockSignals(False)
@@ -1464,6 +1751,7 @@ class ExploreControls(QWidget):
         self.cmap.blockSignals(True)
         self.cmap.setCurrentText(cmap)
         self.cmap.blockSignals(False)
+        self._compare_fill()
         self.render()
 
     def _axis_changed(self, *_):
@@ -1498,11 +1786,26 @@ class ExploreControls(QWidget):
         o, name = self.current, self.field.currentData()
         if o is None or name is None:
             return None
-        return {"output": o, "field": name, "axis": self.axis.currentIndex(), "index": self.index.value(),
-                "component": self.component.currentText(), "cmap": self.cmap.currentText(),
-                "log": self.log.isChecked(), "clip": self.clip.value(), "smooth": self.smooth.value(),
-                "symmetric": name in G.DIVERGING and not self.log.isChecked(),
-                "arrows": self.vectors.isEnabled() and self.vectors.isChecked()}
+        req = {"output": o, "field": name, "axis": self.axis.currentIndex(), "index": self.index.value(),
+               "component": self.component.currentText(), "cmap": self.cmap.currentText(),
+               "log": self.log.isChecked(), "clip": self.clip.value(), "smooth": self.smooth.value(),
+               "symmetric": name in G.DIVERGING and not self.log.isChecked(),
+               "arrows": self.vectors.isEnabled() and self.vectors.isChecked()}
+        if self.pts_combo.currentData():
+            req.update(pts=self.pts_combo.currentData(), arrows=False)
+            if name in ("shear", "vorticity"):  # the hi-res slice holds their magnitudes (>= 0): no component, no
+                req.update(component="magnitude", symmetric=False,     # scale centred on 0
+                           cmap="viridis" if req["cmap"] == "RdBu_r" else req["cmap"])
+        fixed = self._fixed_range(req["log"])
+        self._sync_fixed(req["log"])
+        if fixed is not None:
+            req["vrange"] = fixed
+        other = self._compare_output()
+        if other is not None:                   # the difference map: its own scale, so Save image and the bar agree
+            req.pop("vrange", None)
+            req.update(compare=other, compare_mode=self.compare_mode.currentData(), log=False, symmetric=True,
+                       cmap="RdBu_r", arrows=False)
+        return req
 
     def render(self, *_):
         req = self.request()
@@ -1519,6 +1822,7 @@ class ExploreControls(QWidget):
                 self._grid_refresh_soon()
                 return
             self._leave_grid()                  # another field or output: the map
+            req = self.request()                # ... with the comparison, which the grid left out
         self._grid_update_merge()               # the slice axis decides which box edges the panels share
         o = req["output"]
         self._set_position(req)
@@ -1530,6 +1834,7 @@ class ExploreControls(QWidget):
                     self._render_zoom()
                 return
             self._clear_zoom()                          # another slice or output: back to its map
+            req = self.request()                        # ... with the comparison, which the zoom left out
         if self._busy:
             self._pending = req             # only the latest request is served
             return
@@ -1537,6 +1842,184 @@ class ExploreControls(QWidget):
         self._req = req
         self._threads()
         self._to_render.emit(req)
+
+    def _fixed_range(self, log: bool):
+        """The fixed colour range in the bar's units (log10 on a log map), or None: off, unreadable, empty, or
+        a log map with a bound <= 0."""
+        if not self.fixed.isChecked():
+            return None
+        try:
+            lo, hi = float(self.vmin_edit.text()), float(self.vmax_edit.text())
+        except ValueError:
+            return None
+        if not hi > lo or (log and lo <= 0):
+            return None
+        return (float(np.log10(lo)), float(np.log10(hi))) if log else (lo, hi)
+
+    def _fixed_toggled(self, on: bool):
+        if on:
+            self._fixed_for = self.field.currentData()
+        if on and not (self.vmin_edit.text().strip() and self.vmax_edit.text().strip()):
+            self._take_range()              # nothing typed yet: start from the map on screen
+            return
+        self.render()
+
+    def _fixed_edited(self):
+        if self.fixed.isChecked():
+            self._fixed_for = self.field.currentData()
+            self.render()
+
+    def _sync_fixed(self, log: bool) -> None:
+        """The clip spin is greyed only while a fixed range is IN USE (not for a range that cannot apply -- a
+        log map with a bound <= 0 -- nor while the figure grid shows: the grid uses the clip); a fixed range that
+        cannot apply says so once."""
+        usable = self.fixed.isChecked() and self._fixed_range(log) is not None
+        self.clip.setEnabled(not usable or self._grid_shown)
+        if self.fixed.isChecked() and not usable:
+            if not self._fixed_warned:
+                self.status.emit("the fixed range does not apply to this map (a log map needs min > 0): its own "
+                                 "percentile range is shown")
+                self._fixed_warned = True
+        else:
+            self._fixed_warned = False
+
+    def _take_range(self):
+        """The map's current colour range into the fields (linear values), fixed from now on."""
+        lo, hi = self.view.colorbar.vrange
+        if self.view.colorbar.log:
+            lo, hi = 10.0 ** lo, 10.0 ** hi
+        self._fixed_for = self.field.currentData()
+        self.vmin_edit.setText(f"{lo:.4g}")
+        self.vmax_edit.setText(f"{hi:.4g}")
+        if not self.fixed.isChecked():
+            self.fixed.setChecked(True)         # _fixed_toggled renders
+        else:
+            self.render()
+
+    def state(self) -> dict:
+        """What the window remembers of Explore across restarts."""
+        return {"root": str(self.current.root) if self.current is not None else "",
+                "field": self.field.currentData(), "component": self.component.currentText(),
+                "axis": self.axis.currentIndex(), "index": self.index.value(),
+                "fixed": self.fixed.isChecked(), "vmin": self.vmin_edit.text(), "vmax": self.vmax_edit.text(),
+                "snapshots": dict(self._snapshots), "resident": self.resident.value()}
+
+    def restore_state(self, d: dict) -> bool:
+        """Back to a remembered state when its output is still listed (selected first by refresh_outputs)."""
+        if isinstance(d, dict):                 # the hand-chosen snapshots and the server's residency: for every output
+            self._snapshots.update({k: v for k, v in (d.get("snapshots") or {}).items() if Path(v).is_file()})
+            self.resident.setValue(int(d.get("resident", 0) or 0))
+            self._refresh_server_button()       # refresh_outputs ran first: it judged the server with no snapshots
+        if not d or self.current is None or str(self.current.root) != d.get("root"):
+            return False
+        j = self.field.findData(d.get("field"))
+        if j >= 0:
+            self.field.setCurrentIndex(j)
+        k = self.component.findText(d.get("component", ""))
+        if k >= 0:
+            self.component.setCurrentIndex(k)
+        if self.axis.isEnabled() and d.get("axis") in (0, 1, 2):
+            self.axis.setCurrentIndex(int(d["axis"]))
+        if self.index.isEnabled():
+            self.index.setValue(int(d.get("index", self.index.value())))
+        self.vmin_edit.setText(str(d.get("vmin", "")))
+        self.vmax_edit.setText(str(d.get("vmax", "")))
+        self.fixed.setChecked(bool(d.get("fixed")))
+        return True
+
+    def _canvas_axes(self) -> dict | None:
+        """The axes of what the map shows (the slice, or the zoomed region): Mpc, or cells without a box."""
+        g = self._geometry()
+        if g is None:
+            return None
+        _axis, _index, rest, lo, hi, _n0, _n1 = g
+        return {"x": (float(lo[0]), float(hi[0]), AXES[rest[0]]), "y": (float(lo[1]), float(hi[1]), AXES[rest[1]]),
+                "unit": "Mpc" if self._req["output"].box is not None else "cells"}
+
+    @staticmethod
+    def comparable(a, b, field: str) -> bool:
+        """B can be subtracted from A cell by cell: another output on the same cells (dim, grid, box) holding
+        the field with the same components."""
+        return (a is not None and b is not None and str(a.root) != str(b.root) and a.dim == b.dim and a.n == b.n
+                and (a.box is None) == (b.box is None) and np.allclose(a.lo, b.lo) and np.allclose(a.length, b.length)
+                and field in b.files and field in a.files and b.files[field].ncomp == a.files[field].ncomp)
+
+    def _compare_fill(self):
+        """The 'Compare with' menu: off, then every comparable output -- this snapshot's other runs first."""
+        o, name = self.current, self.field.currentData()
+        keep = self.compare.currentData()
+        self.compare.blockSignals(True)
+        self.compare.clear()
+        self.compare.addItem("(off)", None)
+        if o is not None and name is not None:
+            cands = [b for _, b in self.outputs if self.comparable(o, b, name)]
+            cands.sort(key=lambda b: (b.dir != o.dir, b.sim, -1 if b.snap is None else b.snap, str(b.root)))
+            for b in cands:
+                where = b.sim or b.dir.name
+                z = f" · z = {b.redshift:.2f}" if b.redshift is not None else ""
+                self.compare.addItem(f"{where}{z} · {G.type_label(b)}", str(b.root))
+                self.compare.setItemData(self.compare.count() - 1, str(b.root) + ".*", Qt.ToolTipRole)
+        j = self.compare.findData(keep) if keep is not None else 0
+        self.compare.setCurrentIndex(max(j, 0))
+        self.compare.blockSignals(False)
+        signed = name in G.DIVERGING or name in ("velocity", "tweb", "vweb")
+        self.compare_mode.model().item(1).setEnabled(not signed)      # log A/B: positive fields only
+        if signed:
+            self.compare_mode.blockSignals(True)
+            self.compare_mode.setCurrentIndex(0)
+            self.compare_mode.blockSignals(False)
+        self._compare_sync()
+
+    def _compare_output(self):
+        """B of the difference map, or None (off, or a zoom / the figure grid on screen)."""
+        root = self.compare.currentData()
+        if root is None or self.is_zoomed() or self._grid_shown or self.pts_combo.currentData():
+            return None
+        return self._by_root.get(root)
+
+    def _compare_sync(self):
+        """The colour controls do not apply to a difference map (its own diverging scale); the menu itself
+        not to a zoom or the figure grid."""
+        on = self.compare.currentData() is not None
+        free = not self.is_zoomed() and not self._grid_shown and not self.pts_combo.currentData()
+        self.compare.setEnabled(free and self.compare.count() > 1)
+        self.compare_mode.setEnabled(free and on)
+        for w in (self.cmap, self.log, self.fixed, self.take_range_btn):
+            w.setEnabled(not (on and free))
+        self.vectors.setEnabled(self.vectors.property("can") is not False and not (on and free))
+
+    def _pts_fill(self):
+        """The hi-res slice menu for the output shown: off + every matching plane; hidden without one."""
+        keep = self.pts_combo.currentData()
+        planes = G.find_pts_planes(self.current) if self.current is not None else []
+        self.pts_combo.blockSignals(True)
+        self.pts_combo.clear()
+        self.pts_combo.addItem("off: the grid slice", None)
+        for label, side in planes:
+            self.pts_combo.addItem(label, str(side))
+        j = self.pts_combo.findData(keep) if keep else 0
+        self.pts_combo.setCurrentIndex(max(j, 0))
+        self.pts_combo.blockSignals(False)
+        self._out_form_map.setRowVisible(self.pts_combo, bool(planes))
+        self._pts_sync()
+
+    def _pts_sync(self):
+        """With the hi-res slice shown the slice axis and position do not apply (the plane is the sidecar's)."""
+        on = bool(self.pts_combo.currentData())
+        flat = self.current is not None and self.current.dim == 2
+        for w in (self.axis, self.index, self.slider):
+            w.setEnabled(not on and not flat)
+
+    def _pts_changed(self, *_):
+        if self.pts_combo.currentData() and self.is_zoomed():
+            self._clear_zoom()
+        self._pts_sync()
+        self._compare_sync()
+        self.render()
+
+    def _compare_changed(self, *_):
+        self._compare_sync()
+        self.render()
 
     def _set_position(self, req: dict):
         o = req["output"]
@@ -1555,16 +2038,30 @@ class ExploreControls(QWidget):
         self._arrows = res.get("arrows")
         if self._grid_shown:                    # a slice in flight when the grid was shown: keep the picture
             return
+        self._planes = res.get("planes")
+        self._pts_side = res.get("pts_side")
         self.view.canvas.setStyleSheet("")
         self.view.canvas.marker = None
         self.view.canvas.labels = None
         self.view.canvas.arrows = self._arrows
+        self.view.canvas.axes = self._canvas_axes()      # BEFORE the image: its first drawing has the margins
         self.view.canvas.set_rgb(res["rgb"])
         label = G.FIELD_LABELS.get(req["field"], req["field"])
         comp = "" if req["component"] in ("value", "") else f" [{req['component']}]"
-        self.view.colorbar.set(req["cmap"], res["vrange"], ("log₁₀ " if req["log"] else "") + label + comp)
         o = req["output"]
-        self.view.title.setText(f"<b>{label}{comp}</b> — {o.title} — {self.position.text()}")
+        if req.get("compare") is not None:
+            mode = dict((m, t) for t, m in COMPARE_MODES)[req["compare_mode"]]
+            self.view.colorbar.set(req["cmap"], res["vrange"], f"{mode}: {label}{comp}")
+            self.view.title.setText(f"<b>{mode}: {label}{comp}</b> — A = {o.title}, B = {req['compare'].title} — "
+                                    f"{self.position.text()}")
+        else:
+            self.view.colorbar.set(req["cmap"], res["vrange"], ("log₁₀ " if req["log"] else "") + label + comp, req["log"])
+            where = self.position.text()
+            if req.get("pts") and self._pts_side is not None:
+                sd, fct = self._pts_side, res.get("pts_factor") or 1
+                where = (f"hi-res slice: {sd.get('axis')} = {float(sd.get('center', 0)):.2f} Mpc, {sd['nu']}×{sd['nv']} "
+                         f"points" + (f" (shown {fct}×{fct}-averaged)" if fct > 1 else "") + ", point evaluation")
+            self.view.title.setText(f"<b>{label}{comp}</b> — {o.title} — {where}")
         self.changed.emit()
 
     def render_request(self, req):
@@ -1591,10 +2088,15 @@ class ExploreControls(QWidget):
 
     def _geometry(self):
         """What the map shows: (axis, index, rest axes, lo and hi of the rest axes, n0, n1) -- the
-        whole slice, or the zoomed region at its own resolution."""
+        whole slice, the zoomed region at its own resolution, or a hi-res slice's plane."""
         req, plane = self._req, self._plane
         if req is None or plane is None:
             return None
+        if req.get("pts") and self._pts_side is not None:
+            sd = self._pts_side
+            rest = [AXES.index(sd["u_axis"]), AXES.index(sd["v_axis"])]
+            return (AXES.index(sd["axis"]), 0, rest, np.array([sd["u0"], sd["v0"]], float),
+                    np.array([sd["u1"], sd["v1"]], float), plane.shape[0], plane.shape[1])
         o, axis = req["output"], req["axis"]
         rest = [a for a in range(3) if a != axis]
         if self.is_zoomed():
@@ -1616,6 +2118,8 @@ class ExploreControls(QWidget):
         o = self._req["output"]
         x = np.zeros(3)
         x[axis] = o.lo[axis] + (index + 0.5) * o.length[axis] / o.n
+        if self._req.get("pts") and self._pts_side is not None:
+            x[axis] = float(self._pts_side.get("center", x[axis]))      # the hi-res plane's own position
         x[rest[0]] = lo[0] + (row + 0.5) / n0 * (hi[0] - lo[0])
         x[rest[1]] = lo[1] + (col + 0.5) / n1 * (hi[1] - lo[1])
         return x, float(plane[row, col]), (row, col)
@@ -1642,9 +2146,14 @@ class ExploreControls(QWidget):
         o = self._req["output"]
         unit = "Mpc" if o.box is not None else "cells"
         where = f"zoom point ({row}, {col})" if self.is_zoomed() else \
+            f"hi-res point ({row}, {col})" if self._req.get("pts") else \
             f"cell {tuple(int(v) for v in o.plane_point(self._req['axis'], self._req['index'], row, col))}"
         xyz = "   ".join(f"{a} = {v:.2f}" for a, v in zip(AXES[:o.dim], x))
-        self.view.readout.setText(f"{xyz} {unit}      {where}      value = {value:.5g}")
+        both = ""
+        if self._planes is not None and not self.is_zoomed():
+            a, b = self._planes
+            both = f"   (A = {float(a[row, col]):.5g}, B = {float(b[row, col]):.5g})"
+        self.view.readout.setText(f"{xyz} {unit}      {where}      value = {value:.5g}{both}")
 
     def _save_image(self):
         if self._grid_shown:
@@ -1652,8 +2161,16 @@ class ExploreControls(QWidget):
             return
         if self._plane is None:
             return
-        f, _ = QFileDialog.getSaveFileName(self, "Save the map", str(Path.home() / "explore.png"), "PNG (*.png)")
+        f, _ = QFileDialog.getSaveFileName(self, "Save the map", str(Path.home() / "explore.png"),
+                                           "PNG image (*.png);;NumPy array of the values (*.npy);;"
+                                           "CSV table: x, y, value (*.csv)")
         if not f:
+            return
+        if Path(f).suffix.lower() in (".npy", ".csv"):
+            try:
+                self.status.emit(f"saved {self.save_values(f)}")
+            except OSError as e:
+                self.status.emit(f"could not save {f}: {e}")
             return
         req = self._req
         try:
@@ -1661,11 +2178,10 @@ class ExploreControls(QWidget):
             matplotlib.use("Agg", force=False)
             import matplotlib.pyplot as plt
             o = req["output"]
-            rest = [a for a in range(3) if a != req["axis"]]
             data = self._plane.T
             if req["log"]:
                 data = np.log10(np.where(data > 0, data, np.nan))
-            _, _, _, glo, ghi, _, _ = self._geometry()
+            _, _, rest, glo, ghi, _, _ = self._geometry()    # a hi-res slice's axes are its file's, not the menu's
             ext = [glo[0], ghi[0], glo[1], ghi[1]]
             fig, ax = plt.subplots(figsize=(7, 6))
             lo, hi = self.view.colorbar.vrange
@@ -1688,6 +2204,28 @@ class ExploreControls(QWidget):
         except Exception:
             self.view.canvas.grab().save(f)
         self.status.emit(f"saved {f}")
+
+    def save_values(self, path) -> str:
+        """The map's VALUES (not its colours): '.npy' = the 2D array as drawn, rows along the vertical axis from
+        the bottom (values[iy, ix]); '.csv' = one row per cell, 'x,y,value' at the cell centres in Mpc (cells
+        without a box). The field's own units -- not log10 -- and the difference for a difference map."""
+        path = Path(path)
+        g = self._geometry()
+        if g is None or self._plane is None:
+            raise OSError("no map on screen")
+        _axis, _index, rest, lo, hi, n0, n1 = g
+        values = np.asarray(self._plane, dtype=np.float64).T            # [iy, ix], origin at the bottom
+        if path.suffix.lower() == ".npy":
+            np.save(path, values)
+            return str(path)
+        xs = lo[0] + (np.arange(n0) + 0.5) / n0 * (hi[0] - lo[0])
+        ys = lo[1] + (np.arange(n1) + 0.5) / n1 * (hi[1] - lo[1])
+        X, Y = np.meshgrid(xs, ys)
+        unit = "Mpc" if self._req["output"].box is not None else "cells"
+        head = f"{AXES[rest[0]]}_{unit},{AXES[rest[1]]}_{unit},value"
+        np.savetxt(path, np.column_stack([X.ravel(), Y.ravel(), values.ravel()]), delimiter=",", header=head,
+                   comments="", fmt="%.8g")
+        return str(path)
 
     # ---------------------------------------------------------------- the figure grid (compare)
     def _grid_layout_changed(self, *_):
@@ -1736,24 +2274,58 @@ class ExploreControls(QWidget):
         cw = self.grid_table.cellWidget
         cw(i, _C_SIM).currentIndexChanged.connect(lambda _j, i=i: self._grid_row_snaps(i))
         cw(i, _C_SNAP).currentIndexChanged.connect(lambda _j, i=i: self._grid_row_types(i))
-        cw(i, _C_TYPE).currentIndexChanged.connect(lambda _j, i=i: self._grid_fields_changed(i, keep_field=True))
+        cw(i, _C_TYPE).currentIndexChanged.connect(lambda _j, i=i: self._grid_type_picked(i))
         cw(i, _C_FLD).currentIndexChanged.connect(lambda _j, i=i: self._grid_components_changed(i))
-        cw(i, _C_CMP).currentIndexChanged.connect(lambda _j: self._grid_row_edited())
+        cw(i, _C_CMP).currentIndexChanged.connect(lambda _j, i=i: (self._grid_row_tips(i), self._grid_row_edited()))
+
+    def _grid_type_picked(self, i: int):
+        """The user chose a row's Type: remembered apart from the menu, so a rebuild's fallback (a snapshot
+        without that run) never replaces the choice and stepping back to one that has it brings it back.
+        Rebuilds block the menu's signals, so only a user's pick lands here."""
+        typ = self.grid_table.cellWidget(i, _C_TYPE)
+        if typ.currentData():
+            self._grid_type_pref[i] = (typ.currentData(Qt.UserRole + 1), typ.currentData(Qt.UserRole + 2), typ.currentData())
+        self._grid_fields_changed(i, keep_field=True)
+
+    def _grid_row_tips(self, i: int):
+        """Each cell menu's tooltip = its full text: the five columns share the pane, and a closed Type menu
+        clips 'PS-DTFE · ps_vwsh' to the estimator -- the part that tells two runs apart. Type adds the root."""
+        for c in range(len(GRID_COLS)):
+            w = self.grid_table.cellWidget(i, c)
+            if w is None:
+                continue
+            tip = w.currentText()
+            if c == _C_TYPE and w.currentData():
+                tip += f"\n{w.currentData()}.*"
+            w.setToolTip(tip)
 
     @staticmethod
     def _grid_snap_key(o):
-        """The Redshift menu's key of an output: the snapshot number in a simulation, else its folder --
-        the custom runs of one snapshot (the demo's DTFE and PS-DTFE runs) share a folder and meet in the
-        Type menu."""
+        """The Redshift menu's key of an output: the snapshot number in a simulation (a folder whose name
+        gives none: the folder itself, so two renamed snapdirs never share one '(?)' entry); for a custom
+        run the snapshot FILE it read (the sidecar's input_file: the DTFE and PS-DTFE runs of one snapshot
+        meet in the Type menu whatever folder they wrote to, and two snapshots run into one folder --
+        the Custom tab's default ~/DTFE-output -- stay apart); else the folder (a file opened by hand
+        without a sidecar). Cached on the object (a refresh makes new objects)."""
+        cached = getattr(o, "_grid_key", None)
+        if cached is not None:
+            return cached
         if o.sim:
-            return o.snap if o.snap is not None else -1
-        return str(o.dir)
+            key = o.snap if o.snap is not None else str(o.dir)
+        else:
+            f = (G.sidecar(o.root) or {}).get("input_file")
+            key = str(Path(f).expanduser().resolve()) if f else str(o.dir)
+        o._grid_key = key
+        return key
 
     def _grid_row_sims(self, i: int):
         """Row i's Simulation menu: the simulations in natural order, then the custom snapshots and the
         opened files; '—' leaves the panel blank. Keeps the row's choice, and (a refresh) its exact output."""
         sim, typ = self.grid_table.cellWidget(i, _C_SIM), self.grid_table.cellWidget(i, _C_TYPE)
         keep, keep_root = sim.currentData(), typ.currentData()
+        kept = self._by_root.get(keep_root or "")
+        if kept is not None:                    # a refresh re-lists an opened file under its simulation or the
+            keep = self._group(kept)            # custom snapshots: the row follows its output, not its old group
         outs = [o for _, o in self.outputs]
         sim.blockSignals(True)
         sim.clear()
@@ -1783,45 +2355,68 @@ class ExploreControls(QWidget):
         for o in outs:
             first.setdefault(self._grid_snap_key(o), o)
         if grp in (GROUP_CUSTOM, GROUP_OPENED):
-            for key in sorted(first, key=lambda k: Path(k).name.lower()):
-                snap.addItem(Path(key).name, key)
+            keys = sorted(first, key=lambda k: (G.sim_sort_key(Path(k).name), k))
+            labels = [Path(k).name for k in keys]
+            depth = 1                           # two 'snapdir_099/combined_099.hdf5' read with as many parents as it takes
+            while len(set(labels)) < len(labels) and depth < 8:
+                depth += 1
+                labels = [lab if Counter(labels)[lab] == 1 else "/".join(Path(k).parts[-depth:]) for lab, k in zip(labels, keys)]
+            for key, lab in zip(keys, labels):
+                snap.addItem(lab if len(set(labels)) == len(labels) else key, key)
                 snap.setItemData(snap.count() - 1, key, Qt.ToolTipRole)
-        else:
-            for key in sorted(first):
+        else:                                   # snapshot numbers first, then the folders a number was not read from
+            for key in sorted(first, key=lambda k: (isinstance(k, str), k if isinstance(k, int) else 0, str(k))):
                 o = first[key]
                 z = f"z = {o.redshift:.2f} " if o.redshift is not None else ""
-                snap.addItem(z + (f"({key:03d})" if key >= 0 else "(?)"), key)
-                snap.setItemData(snap.count() - 1, f"snapshot {key:03d}" if key >= 0 else "snapshot ?", Qt.ToolTipRole)
+                snap.addItem(z + (f"({key:03d})" if isinstance(key, int) else f"({Path(key).name})"), key)
+                snap.setItemData(snap.count() - 1, f"snapshot {key:03d}" if isinstance(key, int) else str(key), Qt.ToolTipRole)
         j = snap.findData(want) if want is not None else -1
-        snap.setCurrentIndex(j if j >= 0 else snap.count() - 1)
+        if j < 0:                               # the default: the newest NUMBERED snapshot (today), not an unnumbered folder
+            nums = [k for k in range(snap.count()) if isinstance(snap.itemData(k), int)]
+            j = nums[-1] if nums else snap.count() - 1
+        snap.setCurrentIndex(j)
         snap.setEnabled(snap.count() > 0)
         snap.blockSignals(False)
         self._grid_row_types(i, keep_root=keep_root)
 
     def _grid_row_types(self, i: int, keep_root: str | None = None):
         """Row i's Type menu: the outputs of its snapshot -- the standard DTFE, the phase-space run, other
-        prefixes (grids.type_label). Keeps the exact output ('keep_root': a refresh, a fill), else the
-        row's prefix, else its estimator, else the Output menus' preference (ps_output first): a row set
-        to DTFE stays DTFE when its redshift changes. Ends in the field menu, which recomposes once."""
+        prefixes (grids.type_label; two runs with one label get their folder). Keeps the exact output
+        ('keep_root': a refresh, a fill), else the row's remembered choice (_grid_type_pref: the user's
+        pick or the fill's) by its root, else its prefix WITH its estimator, else its estimator, else its
+        prefix, else the Output menus' preference (ps_output first): a row set to DTFE stays DTFE when its
+        redshift changes, and a run of the same name as another estimator's (custom runs in two folders)
+        comes back after a snapshot without it. Ends in the field menu, which recomposes once."""
         sim, snap, typ = (self.grid_table.cellWidget(i, c) for c in (_C_SIM, _C_SNAP, _C_TYPE))
         grp, key = sim.currentData(), snap.currentData()
-        prev_prefix, prev_kind = typ.currentData(Qt.UserRole + 1), typ.currentData(Qt.UserRole + 2)
+        prev_prefix, prev_kind, prev_root = self._grid_type_pref.get(
+            i, (typ.currentData(Qt.UserRole + 1), typ.currentData(Qt.UserRole + 2), typ.currentData()))
         outs = [o for _, o in self.outputs if grp and grp != GRID_NONE and key is not None
                 and self._group(o) == grp and self._grid_snap_key(o) == key]
-        outs.sort(key=lambda o: (G.estimator_label(o), o.prefix))
+        outs.sort(key=lambda o: G.type_order(o, self._pref_prefix))
+        labels = [G.type_label(o) for o in outs]
+        dup = Counter(labels)
+        if any(c > 1 for c in dup.values()):            # two runs of one name and estimator: their folders tell
+            labels = [lab if dup[lab] == 1 else f"{lab} ({o.dir.name})" for lab, o in zip(labels, outs)]
+            dup2 = Counter(labels)
+            labels = [lab if dup2[lab] == 1 else f"{G.type_label(o)} ({o.dir})" for lab, o in zip(labels, outs)]
         typ.blockSignals(True)
         typ.clear()
-        for o in outs:
-            typ.addItem(G.type_label(o), str(o.root))
+        for o, lab in zip(outs, labels):
+            typ.addItem(lab, str(o.root))
             k = typ.count() - 1
             typ.setItemData(k, o.prefix, Qt.UserRole + 1)
             typ.setItemData(k, G.estimator_label(o), Qt.UserRole + 2)
             typ.setItemData(k, str(o.root) + ".*", Qt.ToolTipRole)
         j = typ.findData(keep_root) if keep_root else -1
-        if j < 0 and prev_prefix:
-            j = next((k for k, o in enumerate(outs) if o.prefix == prev_prefix), -1)
+        if j < 0 and prev_root:
+            j = typ.findData(prev_root)
+        if j < 0 and prev_prefix and prev_kind:
+            j = next((k for k, o in enumerate(outs) if o.prefix == prev_prefix and G.estimator_label(o) == prev_kind), -1)
         if j < 0 and prev_kind:
             j = next((k for k, o in enumerate(outs) if G.estimator_label(o) == prev_kind), -1)
+        if j < 0 and prev_prefix:
+            j = next((k for k, o in enumerate(outs) if o.prefix == prev_prefix), -1)
         if j < 0 and outs:
             j = self._preferred_prefix([o.prefix for o in outs])
         typ.setCurrentIndex(j)
@@ -1857,6 +2452,7 @@ class ExploreControls(QWidget):
             cmp.setCurrentText(keep)
         cmp.setEnabled(cmp.count() > 1)
         cmp.blockSignals(False)
+        self._grid_row_tips(i)
         self._grid_row_edited()
 
     def _grid_row_edited(self):
@@ -1920,20 +2516,30 @@ class ExploreControls(QWidget):
         """Row i = the output o (None: blank), its simulation, snapshot and type menus set to it, then
         the field and component when given (else the row's own, kept when o has them)."""
         sim, fld, cmp = (self.grid_table.cellWidget(i, c) for c in (_C_SIM, _C_FLD, _C_CMP))
-        sim.blockSignals(True)
-        j = sim.findData(self._group(o)) if o is not None else 0
-        sim.setCurrentIndex(j if j >= 0 else 0)
-        sim.blockSignals(False)
-        self._grid_row_snaps(i, keep_root=str(o.root) if o is not None else None)
-        if field is not None and fld.findData(field) >= 0:
-            fld.blockSignals(True)
-            fld.setCurrentIndex(fld.findData(field))
-            fld.blockSignals(False)
-            self._grid_components_changed(i)
-        if component is not None and cmp.findText(component) >= 0:
-            cmp.blockSignals(True)
-            cmp.setCurrentText(component)
-            cmp.blockSignals(False)
+        hold, self._grid_shown_hold = getattr(self, "_grid_shown_hold", False), True
+        try:                                    # held: the cascade's recomposes (the old field, the first component) wait
+            if o is not None:
+                self._grid_type_pref[i] = (o.prefix, G.estimator_label(o), str(o.root))
+            else:
+                self._grid_type_pref.pop(i, None)
+            sim.blockSignals(True)
+            j = sim.findData(self._group(o)) if o is not None else 0
+            sim.setCurrentIndex(j if j >= 0 else 0)
+            sim.blockSignals(False)
+            self._grid_row_snaps(i, keep_root=str(o.root) if o is not None else None)
+            if field is not None and fld.findData(field) >= 0:
+                fld.blockSignals(True)
+                fld.setCurrentIndex(fld.findData(field))
+                fld.blockSignals(False)
+                self._grid_components_changed(i)
+            if component is not None and cmp.findText(component) >= 0:
+                cmp.blockSignals(True)
+                cmp.setCurrentText(component)
+                cmp.blockSignals(False)
+                self._grid_row_tips(i)
+        finally:
+            self._grid_shown_hold = hold
+        self._grid_row_edited()                 # once, from the final state (nothing under a fill's own hold)
 
     def grid_panels(self) -> list:
         rows, cols = self.grid_dims()
@@ -1952,8 +2558,11 @@ class ExploreControls(QWidget):
         plan: list = []
         if mode == "redshifts":
             sims = [x for _t, x in self.outputs if self._group(x) == self._group(o) and name in x.fields()]
-            same = [x for x in sims if getattr(x, "prefix", None) == getattr(o, "prefix", None)]
-            if len(same) > 1:                   # one output per snapshot: the map's prefix (ps_output, ...)
+            if o.sim:                           # one output per snapshot: the map's prefix AND estimator
+                same = [x for x in sims if x.prefix == o.prefix and G.estimator_label(x) == G.estimator_label(o)]
+            else:                               # custom/opened runs: the series run into THIS folder with this estimator
+                same = [x for x in sims if str(x.dir) == str(o.dir) and G.estimator_label(x) == G.estimator_label(o)]
+            if len(same) > 1:                   # (a custom run's prefix is its name: X in two folders is one snapshot twice)
                 sims = same
             sims.sort(key=lambda x: (self._snap_key(x) if x.sim else 0, str(x.root)))
             plan = [(x, name, comp) for x in sims[-n:]]
@@ -1965,8 +2574,16 @@ class ExploreControls(QWidget):
         elif mode == "types":                   # this snapshot's outputs: DTFE, PS-DTFE, other prefixes
             outs = [x for _t, x in self.outputs if self._group(x) == self._group(o)
                     and self._grid_snap_key(x) == self._grid_snap_key(o) and name in x.fields()]
-            outs.sort(key=lambda x: (G.estimator_label(x), x.prefix))
-            plan = [(x, name, comp) for x in outs[:n]]
+            order = lambda x: G.type_order(x, self._pref_prefix)      # noqa: E731
+            outs.sort(key=order)
+            # the map's own run first, then the other estimator's best (its default prefix, else the preferred
+            # one), then the rest: a 1x2 used to show 'output' beside ps_mw (an A/B run) while the map was on
+            # ps_output -- the production run and the map's own run both dropped
+            pick = [x for x in outs if self._same(x, o)]
+            pick += [x for x in outs if G.estimator_label(x) != G.estimator_label(o)][:1]
+            roots = {str(x.root) for x in pick}
+            pick += [x for x in outs if str(x.root) not in roots]
+            plan = [(x, name, comp) for x in sorted(pick[:n], key=order)]
         else:
             plan = [(o, name, comp)] * n
         with_signals = self._grid_shown
@@ -2026,9 +2643,9 @@ class ExploreControls(QWidget):
             self.grid_toggle.setChecked(False)
             self.grid_toggle.blockSignals(False)
             return
-        if not any(self.grid_panels()):
-            self.grid_fill("map")
-        req = self.grid_request()
+        if not self._grid_shown and not any(self.grid_panels()):
+            self.grid_fill("map")               # turned on with nothing chosen: the map in every panel; shown and
+        req = self.grid_request()               # every panel blanked by hand: the warning below, not a refill
         if req is None:
             self.grid_state.setText("⚠ no panel has an output (use a Fill button, or choose outputs in the table)")
             if self._grid_shown:
@@ -2047,6 +2664,7 @@ class ExploreControls(QWidget):
             self.grid_toggle.setText("Back to the map")
             self.view.streams.setVisible(False)     # the picture gets the height; a click lists no streams here
             self.view.readout.setText(" ")
+            self._compare_sync()
         if self._grid_busy:
             self._grid_pending = req                # only the latest request is served
             return
@@ -2067,11 +2685,12 @@ class ExploreControls(QWidget):
         self.view.canvas.marker = None
         self.view.canvas.arrows = None
         self.view.canvas.labels = res["labels"]
+        self.view.canvas.axes = None                # tiles of several frames: the saved figure has the axes
         self.view.canvas.set_rgb(np.ascontiguousarray(res["rgb"]))
         bar = res["bar"]
         if bar is not None:                         # one quantity: its bar below, as the single map has
-            cmap, vrange, label = bar
-            self.view.colorbar.set(cmap, vrange, label)
+            cmap, vrange, label, log = bar
+            self.view.colorbar.set(cmap, vrange, label, log)
             self.view.colorbar.setVisible(True)
         else:                                       # several: the saved figure carries one bar per quantity
             self.view.colorbar.setVisible(False)
@@ -2107,6 +2726,7 @@ class ExploreControls(QWidget):
         self.view.canvas.labels = None
         self.view.colorbar.setVisible(True)
         self.view.streams.setVisible(True)
+        self._compare_sync()
         self.changed.emit()                     # the Explore menu's Figure Grid text follows
 
     def grid_figure(self):
@@ -2151,7 +2771,7 @@ class ExploreControls(QWidget):
         o = self.current
         if o is None:
             return None
-        kw = G.server_settings(o)
+        kw = G.server_settings(o, self._snapshots.get(str(o.root)))
         if kw is None:
             return None
         cache = Path(self.cache_edit.text().strip() or default_cache_dir(str(o.dir))).expanduser()
@@ -2160,7 +2780,20 @@ class ExploreControls(QWidget):
                   tessellation_cache=str(cache), verbose=1, progress=True)
         if self.server_partition:
             kw["partition"] = int(self.server_partition)
+        if self.resident.value() > 0:           # also for the composite the binary splits a big snapshot into
+            kw["resident"] = int(self.resident.value())
         return kw
+
+    def _choose_snapshot(self):
+        o = self.current
+        if o is None:
+            return
+        f, _ = QFileDialog.getOpenFileName(self, "The snapshot of this output", str(o.dir),
+                                           "Snapshots (*.hdf5 *.h5 *.hdf);;All files (*)")
+        if f:
+            self._snapshots[str(o.root)] = f
+            self.status.emit(f"{Path(f).name}: the snapshot of {o.title} (the server and the exact zoom read it)")
+            self._refresh_server_button()
 
     def server_phase(self) -> str:
         return "starting" if self._server_starting else "running" if self._server_running else "stopped"
@@ -2175,10 +2808,13 @@ class ExploreControls(QWidget):
             self.server_btn.setEnabled(True)
         else:
             self.server_btn.setText("Start query server")
-            ok = self.current is not None and G.server_settings(self.current) is not None
+            ok = self.current is not None and G.server_settings(self.current,
+                                                                 self._snapshots.get(str(self.current.root))) is not None
             self.server_btn.setEnabled(ok)
             if self.current is not None and not ok:
-                self.server_state.setText("no snapshot known for this output (its input file is not beside it)")
+                self.server_state.setText(NO_SNAPSHOT_TEXT)
+            elif self.server_state.text() == NO_SNAPSHOT_TEXT:      # a snapshot chosen or restored since
+                self.server_state.setText("not running")
         self.changed.emit()
 
     def _set_server_state(self, text):
@@ -2223,7 +2859,11 @@ class ExploreControls(QWidget):
             self.server_state.setText(f"cannot create the cache folder: {e}")
             return
         import tempfile
-        self._server_log = Path(tempfile.mkstemp(prefix="dtfe-explore-", suffix=".log")[1])
+        if self._server_log is not None:            # the previous server's log: one file per start piled up
+            self._server_log.unlink(missing_ok=True)
+        fd, log = tempfile.mkstemp(prefix="dtfe-explore-", suffix=".log")
+        os.close(fd)                                # the Estimator opens it by name; the descriptor leaked per start
+        self._server_log = Path(log)
         kw["log_path"] = str(self._server_log)
         self._server_output = self.current
         # point zooms remembered from another server are dropped (a new server, perhaps other options);
@@ -2294,7 +2934,7 @@ class ExploreControls(QWidget):
         x, value, (row, col) = pt
         o = self._req["output"]
         if not self._server_running or not self._same(self._server_output, o):
-            what = "zoom point" if self.is_zoomed() else \
+            what = f"hi-res point ({row}, {col})" if self._req.get("pts") else "zoom point" if self.is_zoomed() else \
                 f"cell {tuple(int(v) for v in o.plane_point(self._req['axis'], self._req['index'], row, col))}"
             self.view.answer_title.setText(f"<b>{what}</b>: {value:.5g}. "
                                            "Start the query server (left) to see the streams at this point.")
@@ -2308,6 +2948,9 @@ class ExploreControls(QWidget):
         """A rectangle dragged on the map: evaluate that region through the server on a res x res
         plane of points (inside a zoom: a deeper zoom of the same slice)."""
         if self._grid_shown:                 # the grid is a picture: no cells under the mouse
+            return
+        if self._req is not None and self._req.get("pts"):
+            self.status.emit("the hi-res slice is already point-evaluated at its own resolution: zoom on the grid slice")
             return
         g = self._geometry()
         if g is None or self._shut:
@@ -2393,7 +3036,7 @@ class ExploreControls(QWidget):
         plan = {"cmd": None, "note": "", "root": None, "grid": None, "edges": None, "window": None,
                 "ps": False, "cache_dir": None, "partition": None, "sets": {}, "snapshot": None,
                 "lagrangian": None}
-        kw = G.server_settings(o)
+        kw = G.server_settings(o, self._snapshots.get(str(o.root)))
         if kw is None:
             plan["note"] = "no snapshot known for this output (its input file is not beside it)"
             return plan
@@ -2439,6 +3082,7 @@ class ExploreControls(QWidget):
                 dx = (hi_a - lo_a) / res
                 if not (dx > 0.0 and length > 0.0):
                     plan["note"] = "the dragged region has no extent"
+                    shutil.rmtree(out_dir, ignore_errors=True)
                     return plan
                 n_a = max(res, min(WINDOW_GRID_MAX, int(round(length / dx))))
                 dxp = length / n_a
@@ -2668,6 +3312,8 @@ class ExploreControls(QWidget):
         self._zoom_pending = False
         if self._shut or self._req is None or not self._same(req["output"], self._req["output"]):
             return
+        if self._req.get("pts"):                 # a hi-res slice went on while the zoom ran: it is memoised, the
+            return                               # map stays the slice (drawn in the zoom's frame it misplaced clicks)
         if self._zoom is not None and self._zoom_fields is not None and req["depth"] > self._zoom["depth"]:
             self._zoom_history.append((self._zoom, self._zoom_fields))   # Back returns here
         self._zoom, self._zoom_fields = req, f
@@ -2689,6 +3335,9 @@ class ExploreControls(QWidget):
             return sq(f.density)
         if name == "streams":
             return None if f.streams is None else sq(f.streams)
+        if name == "scalar":                    # an exact zoom of a run with a scalar dataset; the server has none
+            sc = getattr(f, "scalar", None)
+            return None if sc is None else sq(sc)
         if name == "caustic" and f.caustic is not None:
             return sq(((np.asarray(f.caustic) & 3) == 3).astype(np.float64))
         if name == "caustic_class" and f.caustic is not None:
@@ -2742,7 +3391,8 @@ class ExploreControls(QWidget):
         return None
 
     def _render_zoom(self):
-        req, z = self._req, self._zoom
+        req = self.request() or self._req       # zoomed: request() leaves the comparison's colours out
+        self._req, z = req, self._zoom
         note = ""
         plane = self._zoom_plane(req["field"], req["component"])
         if plane is None:
@@ -2750,15 +3400,19 @@ class ExploreControls(QWidget):
         plane = np.ascontiguousarray(np.asarray(plane, dtype=np.float64))
         img = np.ascontiguousarray(plane.T[::-1])
         rgb, vrange = G.colorize(img, req["cmap"], log=req["log"], clip=(req["clip"], 100 - req["clip"]),
-                                 symmetric=req["symmetric"])
-        self._plane, self._arrows = plane, None
+                                 symmetric=req["symmetric"], vrange=req.get("vrange"))
+        self._plane, self._arrows, self._planes = plane, None, None
         self.view.canvas.setStyleSheet("")
         self.view.canvas.marker = None
         self.view.canvas.arrows = None
+        self.view.canvas.axes = self._canvas_axes()
         self.view.canvas.set_rgb(np.ascontiguousarray(rgb))
+        self._compare_sync()
+        if self.compare.currentData() is not None:
+            note += " · the comparison applies to the slice map: the zoom shows A"
         label = G.FIELD_LABELS.get(req["field"], req["field"])
         comp = "" if req["component"] in ("value", "") else f" [{req['component']}]"
-        self.view.colorbar.set(req["cmap"], vrange, ("log₁₀ " if req["log"] else "") + label + comp)
+        self.view.colorbar.set(req["cmap"], vrange, ("log₁₀ " if req["log"] else "") + label + comp, req["log"])
         o, rest = req["output"], z["rest"]
         unit = "Mpc" if o.box is not None else "cells"
         where = (f"{AXES[rest[0]]} {z['a0'][0]:.2f}–{z['a0'][1]:.2f}, {AXES[rest[1]]} {z['a1'][0]:.2f}–{z['a1'][1]:.2f} {unit}")
@@ -2784,8 +3438,18 @@ class ExploreControls(QWidget):
     # ---------------------------------------------------------------- zoom progress, history, memory
     @staticmethod
     def _memo_key(o, axis, index, a0, a1, res, exact: bool) -> tuple:
+        """A zoom remembered for this output AS IT IS ON DISK: a re-run under the same name (other settings, a
+        rebuilt binary) rewrites its grids and sidecar, and the memory must not answer for it any more."""
         r = lambda t: tuple(round(float(v), 9) for v in t)
-        return (str(o.root), int(axis), int(index), r(a0), r(a1), int(res), bool(exact))
+        stamp = []
+        for p in [ff.path for ff in o.files.values()] + [Path(str(o.root) + ".gui.json")]:
+            try:
+                st = p.stat()
+                stamp.append((p.name, st.st_mtime_ns, st.st_size))
+            except OSError:
+                pass
+        return (str(o.root), int(axis), int(index), r(a0), r(a1), int(res), tuple(sorted(stamp)), bool(exact))   # exact LAST:
+                                                                                     # start_server keeps k[-1]
 
     def _memo_get(self, key):
         hit = self._zoom_memo.get(key)
@@ -2886,6 +3550,7 @@ class ExploreControls(QWidget):
         self.zoom_out_btn.setEnabled(False)
         self.zoom_back_btn.setEnabled(False)
         self.zoom_state.setText("")
+        self._compare_sync()
 
     def zoom_out(self):
         """Back to the slice from disk (the zoom's evaluation is dropped)."""
@@ -2928,6 +3593,11 @@ class ExploreControls(QWidget):
     def shutdown(self):
         """Stop the server and the threads (the window is closing). Idempotent."""
         self._shut = True
+        if self._server_log is not None:
+            try:
+                self._server_log.unlink(missing_ok=True)
+            except OSError:
+                pass
         self._zoom_tick.stop()
         self._server.kill()                            # a build OR a running request: the thread must come back
         self._exact_worker.cancel()                    # a running exact zoom would hold the thread

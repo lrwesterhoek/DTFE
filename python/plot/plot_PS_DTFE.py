@@ -14,12 +14,11 @@ import config
 from pathlib import Path
 
 import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.colors as colors
 from scipy.ndimage import gaussian_filter
 
 from dtfelib import STREAM_TOL, make_fieldset
 from dtfelib import pointeval
+from dtfelib import figures as style
 from dtfelib.fields import extract_2d_slice as extract_slice
 
 # which field families to plot (PS-only ones are skipped automatically under --method dtfe)
@@ -32,21 +31,14 @@ PROCESS_WEB = True          # web volume-fraction stats + eigenvalue maps (no cl
 SLICE_PLANES_TO_PLOT = [0, 1, 2]
 PROCESS_POINTEVAL = True    # point-evaluated ('--sample-points') maps, when present
 
-SLICE_PLANES = {
-    0: {'name': 'yz_plane', 'axis_labels': ('Y', 'Z')},
-    1: {'name': 'xz_plane', 'axis_labels': ('X', 'Z')},
-    2: {'name': 'xy_plane', 'axis_labels': ('X', 'Y')}
-}
-AXIS_UNITS = "Mpc"
-DPI = 300
+SLICE_PLANES = config.SLICE_PLANES              # (the maps' axis labels, DPI, units and the density range are config's)
 FIGURE_ROOT = Path(config.LOCAL_FIGURES_ROOT)
 
-# density colour range in rho/rho_bar, shared with plot_DTFE.py so DTFE and PS-DTFE
-# panels are directly comparable side by side (set either to None for the slice's own range)
-DENSITY_VMIN = 1e-1
-DENSITY_VMAX = 1e4
-
 _SMOOTH = 0.0   # set from --smooth in main()
+
+
+def _title(text, redshift):
+    return f"{text} (z={redshift:.2f})" if redshift is not None else text
 
 def smooth(field):
     """Plot-time Gaussian smoothing (--smooth, grid cells); identity when 0."""
@@ -65,232 +57,68 @@ def smooth_components(field):
 
 def plot_density(density_field, slice_dim, box_size, redshift=None, save_path=None, label="PS-DTFE"):
     dens_slice = extract_slice(density_field, slice_dim).T
-
-    positive = dens_slice[dens_slice > 0]
-    if positive.size == 0:
+    if not (dens_slice > 0).any():
         print(f"    Warning: No positive density values in slice (dim={slice_dim})")
         return
-    vmin = DENSITY_VMIN if DENSITY_VMIN is not None else max(np.min(positive), 1e-6)
-    vmax = DENSITY_VMAX if DENSITY_VMAX is not None else dens_slice.max()
-
-    fig, ax = plt.subplots(figsize=(8, 7))
-    cmap = plt.cm.plasma.copy()
-    cmap.set_bad(cmap(0))
-    cmap.set_under(cmap(0))
-    im = ax.imshow(
-        dens_slice, origin='lower', cmap=cmap,
-        norm=colors.LogNorm(vmin=vmin, vmax=vmax),
-        extent=[0, box_size, 0, box_size]
-    )
-
-    plane_info = SLICE_PLANES[slice_dim]
-    title = f"{label} Density"
-    if redshift is not None:
-        title += f" (z={redshift:.2f})"
-
-    ax.set_title(title, fontsize=14)
-    ax.set_xlabel(f"{plane_info['axis_labels'][0]} [{AXIS_UNITS}]", fontsize=12)
-    ax.set_ylabel(f"{plane_info['axis_labels'][1]} [{AXIS_UNITS}]", fontsize=12)
-
-    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    cbar.set_label(r"Density $\rho/\bar{\rho}$", fontsize=12)
-
-    ax.set_aspect('equal')
-    plt.tight_layout()
-
-    if save_path:
-        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(save_path, dpi=DPI, bbox_inches='tight')
-        plt.close(fig)
-    else:
-        plt.show()
+    norm = style.norm_log_range(dens_slice, config.DENSITY_MAP_RANGE)      # the fixed range, else the slice's own
+    style.slice_map(dens_slice, box_size, slice_dim, cmap=style.MAP_CMAPS['density'], norm=norm, floor=True,
+                    label=style.MAP_LABELS['density'], title=_title(f"{label} Density", redshift), path=save_path)
 
 
 def plot_streams(stream_field, slice_dim, box_size, redshift=None, save_path=None, label="PS-DTFE"):
     stream_slice = extract_slice(stream_field, slice_dim).T
-
-    # '.streams' is a float multiplicity, not an integer count (see dtfelib.STREAM_TOL), so
-    # every comparison here carries a tolerance: truncating with int() would read a
-    # single-stream 0.99999 cell as an empty slice.
-    max_streams = float(stream_slice.max())
-    if max_streams < STREAM_TOL:
+    # '.streams' is a float multiplicity, not an integer count (see dtfelib.STREAM_TOL): every comparison
+    # carries a tolerance (figures.norm_streams), truncating with int() would read a 0.99999 cell as empty
+    rule = style.norm_streams(stream_slice)
+    if rule is None:
         print(f"    Warning: No streams in slice (dim={slice_dim})")
         return
-
-    fig, ax = plt.subplots(figsize=(8, 7))
-
-    if max_streams <= 1 + STREAM_TOL:
-        cmap = plt.cm.viridis.copy()
-        cmap.set_bad(cmap(0))
-        im = ax.imshow(
-            stream_slice, origin='lower', cmap=cmap,
-            extent=[0, box_size, 0, box_size],
-            vmin=0, vmax=1
-        )
-    else:
-        cmap = plt.cm.inferno.copy()
-        cmap.set_bad(cmap(0))
-        cmap.set_under(cmap(0))
-        im = ax.imshow(
-            stream_slice, origin='lower', cmap=cmap,
-            norm=colors.LogNorm(vmin=0.5, vmax=max(max_streams, 2)),
-            extent=[0, box_size, 0, box_size]
-        )
-
-    plane_info = SLICE_PLANES[slice_dim]
-    title = f"Stream Count ({label})"
-    if redshift is not None:
-        title += f" (z={redshift:.2f})"
-
-    ax.set_title(title, fontsize=14)
-    ax.set_xlabel(f"{plane_info['axis_labels'][0]} [{AXIS_UNITS}]", fontsize=12)
-    ax.set_ylabel(f"{plane_info['axis_labels'][1]} [{AXIS_UNITS}]", fontsize=12)
-
-    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    cbar.set_label("Number of streams", fontsize=12)
-
+    cmap, norm = rule
+    max_streams = float(stream_slice.max())
     multi = stream_slice[stream_slice > 1 + STREAM_TOL]
-    total = stream_slice.size
-    ax.text(
-        0.02, 0.98,
-        f"max={max_streams:.2f}, multi-stream={100*multi.size/total:.1f}%",
-        transform=ax.transAxes, fontsize=9, verticalalignment='top',
-        bbox=dict(boxstyle='round', facecolor='white', alpha=0.7)
-    )
-
-    ax.set_aspect('equal')
-    plt.tight_layout()
-
-    if save_path:
-        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(save_path, dpi=DPI, bbox_inches='tight')
-        plt.close(fig)
-    else:
-        plt.show()
+    style.slice_map(stream_slice, box_size, slice_dim, cmap=cmap, norm=norm, floor=True,
+                    label=style.MAP_LABELS['streams'], title=_title(f"Stream Count ({label})", redshift), path=save_path,
+                    text=f"max={max_streams:.2f}, multi-stream={100 * multi.size / stream_slice.size:.1f}%")
 
 
 def plot_density_comparison(density_field, stream_field, slice_dim, box_size,
                             redshift=None, save_path=None, label="PS-DTFE"):
     dens_slice = extract_slice(density_field, slice_dim).T
     stream_slice = extract_slice(stream_field, slice_dim).T
-
-    positive = dens_slice[dens_slice > 0]
-    if positive.size == 0:
+    if not (dens_slice > 0).any():
         return
-    vmin_dens = DENSITY_VMIN if DENSITY_VMIN is not None else max(np.min(positive), 1e-6)
-    vmax_dens = DENSITY_VMAX if DENSITY_VMAX is not None else dens_slice.max()
-    max_streams = float(stream_slice.max())
-
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
-    plane_info = SLICE_PLANES[slice_dim]
-
-    cmap_dens = plt.cm.plasma.copy()
-    cmap_dens.set_bad(cmap_dens(0))
-    cmap_dens.set_under(cmap_dens(0))
-    im1 = ax1.imshow(
-        dens_slice, origin='lower', cmap=cmap_dens,
-        norm=colors.LogNorm(vmin=vmin_dens, vmax=vmax_dens),
-        extent=[0, box_size, 0, box_size]
-    )
-    ax1.set_title(f"{label} Density", fontsize=14)
-    ax1.set_xlabel(f"{plane_info['axis_labels'][0]} [{AXIS_UNITS}]", fontsize=12)
-    ax1.set_ylabel(f"{plane_info['axis_labels'][1]} [{AXIS_UNITS}]", fontsize=12)
-    ax1.set_aspect('equal')
-    fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04, label=r"Density $\rho/\bar{\rho}$")
-
-    if max_streams > 1 + STREAM_TOL:
-        cmap_str = plt.cm.inferno.copy()
-        cmap_str.set_bad(cmap_str(0))
-        cmap_str.set_under(cmap_str(0))
-        im2 = ax2.imshow(
-            stream_slice, origin='lower', cmap=cmap_str,
-            norm=colors.LogNorm(vmin=0.5, vmax=max(max_streams, 2)),
-            extent=[0, box_size, 0, box_size]
-        )
-    else:
-        cmap_str = plt.cm.viridis.copy()
-        cmap_str.set_bad(cmap_str(0))
-        im2 = ax2.imshow(
-            stream_slice, origin='lower', cmap=cmap_str,
-            extent=[0, box_size, 0, box_size],
-            vmin=0, vmax=max(max_streams, 1)
-        )
-    ax2.set_title("Stream Count", fontsize=14)
-    ax2.set_xlabel(f"{plane_info['axis_labels'][0]} [{AXIS_UNITS}]", fontsize=12)
-    ax2.set_ylabel(f"{plane_info['axis_labels'][1]} [{AXIS_UNITS}]", fontsize=12)
-    ax2.set_aspect('equal')
-    fig.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04, label="Number of streams")
-
-    suptitle = f"PS-DTFE: {plane_info['name']}"
-    if redshift is not None:
-        suptitle += f" (z={redshift:.2f})"
-    fig.suptitle(suptitle, fontsize=16, y=1.02)
-
-    plt.tight_layout()
-
-    if save_path:
-        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(save_path, dpi=DPI, bbox_inches='tight')
-        plt.close(fig)
-    else:
-        plt.show()
+    rule = style.norm_streams(stream_slice)
+    cmap_str, norm_str = rule if rule is not None else (style.MAP_CMAPS['streams_single'], None)
+    panels = [dict(data=dens_slice, cmap=style.MAP_CMAPS['density'], floor=True, title=f"{label} Density",
+                   norm=style.norm_log_range(dens_slice, config.DENSITY_MAP_RANGE), label=style.MAP_LABELS['density']),
+              dict(data=stream_slice, cmap=cmap_str, floor=True, title="Stream Count", label=style.MAP_LABELS['streams'],
+                   norm=norm_str, vmin=0.0, vmax=max(float(stream_slice.max()), 1.0))]
+    style.slice_row(panels, box_size, slice_dim, path=save_path, figsize=(16, 7),
+                    suptitle=_title(f"PS-DTFE: {SLICE_PLANES[slice_dim]['name']}", redshift))
 
 def plot_scalar_log(field, slice_dim, box_size, title, cbar_label, redshift=None, save_path=None):
-    """Log-scale slice plot for positive scalar fields (dispersion trace, tensor magnitude)."""
+    """Log-scale slice plot for positive scalar fields (dispersion trace, tensor magnitude, |v|)."""
     fslice = extract_slice(field, slice_dim).T
     positive = fslice[fslice > 0]
     if positive.size == 0:
         print(f"    Warning: no positive values in slice (dim={slice_dim})")
         return
-    vmin = np.percentile(positive, 1)
-
-    fig, ax = plt.subplots(figsize=(10, 8.5))
-    cmap = plt.get_cmap('magma')
-    im = ax.imshow(
-        fslice, origin='lower', cmap=cmap,
-        norm=colors.LogNorm(vmin=vmin, vmax=fslice.max()),
-        extent=[0, box_size, 0, box_size]
-    )
-    plane_info = SLICE_PLANES[slice_dim]
-    full_title = f"{title} (z={redshift:.2f})" if redshift is not None else title
-    ax.set_title(full_title, fontsize=16)
-    ax.set_xlabel(f"{plane_info['axis_labels'][0]} [{AXIS_UNITS}]", fontsize=12)
-    ax.set_ylabel(f"{plane_info['axis_labels'][1]} [{AXIS_UNITS}]", fontsize=12)
-    cbar = fig.colorbar(im, ax=ax)
-    cbar.set_label(cbar_label, fontsize=12)
-    if save_path:
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(save_path, dpi=DPI, bbox_inches='tight')
-        plt.close(fig)
+    norm = style.norm_log_range(fslice, (float(np.percentile(positive, 1)), float(fslice.max())))
+    style.slice_map(fslice, box_size, slice_dim, cmap=style.MAP_CMAPS['velDisp'], norm=norm, figsize=(10, 8.5),
+                    label=cbar_label, title=_title(title, redshift), path=save_path)
 
 
-WEB_CLASS_NAMES = ['void', 'wall', 'filament', 'node']
-WEB_CLASS_COLORS = ['#1a1a40', '#3b7ea1', '#e8843c', '#f7e463']   # void/wall/filament/node
+WEB_CLASS_NAMES = ['void', 'wall', 'filament', 'node']      # (the web COLOURS are figures.WEB_COLORS: one definition)
 
 
 def plot_web_eigenvalues(eig_field, slice_dim, box_size, title, redshift=None, save_path=None):
-    """Triptych of the (descending-sorted) eigenvalue maps, diverging colormap, symlog scale."""
+    """Triptych of the (descending-sorted) eigenvalue maps: the house rule for a signed field
+    (figures.norm_signed_log at the field's linthresh), the same as plot_cosmic_web's triptych."""
     eslice = extract_slice(eig_field, slice_dim)          # (N, N, 3)
-    fig, axes = plt.subplots(1, 3, figsize=(21, 6.5))
-    plane_info = SLICE_PLANES[slice_dim]
-    for i, ax in enumerate(axes):
-        lam = eslice[..., i].T
-        vmax = np.percentile(np.abs(lam), 99.5)
-        if vmax <= 0: vmax = 1.0
-        norm = colors.SymLogNorm(linthresh=vmax / 1e3, vmin=-vmax, vmax=vmax, base=10)
-        im = ax.imshow(lam, origin='lower', cmap='RdBu_r', norm=norm,
-                       extent=[0, box_size, 0, box_size])
-        ax.set_title(rf"$\lambda_{i+1}$", fontsize=14)
-        ax.set_xlabel(f"{plane_info['axis_labels'][0]} [{AXIS_UNITS}]", fontsize=11)
-        if i == 0:
-            ax.set_ylabel(f"{plane_info['axis_labels'][1]} [{AXIS_UNITS}]", fontsize=11)
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    full_title = f"{title} (z={redshift:.2f})" if redshift is not None else title
-    fig.suptitle(full_title, fontsize=16)
-    if save_path:
-        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(save_path, dpi=DPI, bbox_inches='tight')
-        plt.close(fig)
+    panels = [dict(data=eslice[..., i].T, cmap=style.MAP_CMAPS['eigenvalue'], title=rf"$\lambda_{i+1}$",
+                   label=f"{title} " + rf"$\lambda_{i+1}$",          # the bar names the panel: titles are off
+                   norm=style.norm_signed_log(data=eslice[..., i].T, field='eigenvalue')) for i in range(3)]
+    style.slice_row(panels, box_size, slice_dim, path=save_path, figsize=(21, 6.5), suptitle=_title(title, redshift))
 
 
 # ---------------------------------------------------------------- point-evaluated maps
@@ -313,9 +141,10 @@ def main():
     print(f"plot smoothing: {_SMOOTH} cells | figures -> {out_base}")
 
     if PROCESS_POINTEVAL and fs.method == "ps":
-        pointeval.render_fields(fs, out_base, label=label)
+        pointeval.render_fields(fs, out_base, label=label)     # BEFORE the house style: plot_pointeval.py draws these too
     if args.pointeval_only:
         return
+    style.apply()                                   # the house style for the grid maps (serif, SHOW_TITLES, DPI): survey item 11
 
     fields = {}
 

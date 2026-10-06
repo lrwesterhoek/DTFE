@@ -17,8 +17,11 @@ and the GUI's custom-snapshot jobs, followed (macOS) by '/usr/bin/time -l'.
 from __future__ import annotations
 
 import datetime as _dt
+import glob as _glob
+import json
 import math
 import re
+import shlex
 import shutil
 import statistics
 import sys
@@ -192,6 +195,54 @@ class RunRecord:
         return d
 
 
+def custom_settings(rec: RunRecord) -> dict | None:
+    """The settings a custom-snapshot run was made with: its '<prefix>.gui.json' sidecar (CustomSpec keys),
+    None for a TNG run or a custom run without one."""
+    if rec.sim:
+        return None
+    try:
+        d = json.loads(Path(str(rec.path.parent / rec.prefix) + ".gui.json").read_text())
+    except (OSError, ValueError):
+        return None
+    return d if isinstance(d, dict) and d.get("input_file") else None
+
+
+INPUT_SUFFIXES = (".hdf5", ".h5", ".hdf")      # snapshots: the binaries read them, never write them
+
+
+def run_inputs(rec: RunRecord) -> set[Path]:
+    """The files a run READ that sit beside its outputs: every existing file named on its command line and
+    the settings sidecar's input_file. A custom run named after its input (the default) in the input's own
+    folder has 'X.hdf5' beside 'X.a_den': the input must never be one of the run's outputs (the Runs
+    browser's Move to Trash takes the outputs)."""
+    found = set()
+    try:
+        words = shlex.split(rec.command)
+    except ValueError:
+        words = rec.command.split()
+    # the log prints the command UNQUOTED: a path with a space (anything under iCloud's 'Mobile Documents') splits
+    # above, so the file options' values are also read up to the next ' --', and the sidecar names the rest
+    for m in re.finditer(r"--(?:sample-points|lagrangianInput|scalar-file)\s+(.+?)(?=\s--|$)", rec.command):
+        words.append(m.group(1).strip())
+    side = Path(str(rec.path.parent / rec.prefix) + ".gui.json")
+    try:
+        sd = json.loads(side.read_text())
+        for key in ("input_file", "sample_points", "lagrangian_file"):
+            if sd.get(key):
+                words.append(str(sd[key]))
+    except (OSError, ValueError, AttributeError):
+        pass
+    for w in words:
+        f = Path(w).expanduser()
+        f = f if f.is_absolute() else rec.path.parent / f
+        try:
+            if f.is_file():
+                found.add(f.resolve())
+        except OSError:
+            pass
+    return found
+
+
 def parse_runlog(path: Path, sim: str = "", snap: int | None = None) -> RunRecord:
     path = Path(path)
     rec = RunRecord(path=path, sim=sim, snap=snap, prefix=path.name[: -len(".runlog")])
@@ -224,10 +275,12 @@ def parse_runlog(path: Path, sim: str = "", snap: int | None = None) -> RunRecor
     m = _RSS.search(text)
     rec.peak_rss_gb = float(m.group(1)) if m else None
     feet = _FOOTPRINT.findall(text)
-    rec.footprint_gb = int(feet[-1]) / 1e9 if feet else None
+    rec.footprint_gb = int(feet[-1]) / 2**30 if feet else None     # GiB: the unit of the RSS line and of the run scripts
     rec.ok = bool(m or rec.wall_seconds is not None) and "~~~ ERROR ~~~" not in text
-    rec.outputs = sorted(p for p in path.parent.glob(rec.prefix + ".*")
-                         if p.is_file() and p.suffix not in (".runlog", ".json"))
+    inputs = run_inputs(rec)
+    rec.outputs = sorted(p for p in path.parent.glob(_glob.escape(rec.prefix) + ".*")       # escaped: '[' in a name
+                         if p.is_file() and p.suffix not in (".runlog", ".json")
+                         and p.suffix.lower() not in INPUT_SUFFIXES and p.resolve() not in inputs)
     return rec
 
 
@@ -372,12 +425,14 @@ def stale_reasons(rec: RunRecord) -> list[tuple[str, str]]:
 
 # ---------------------------------------------------------------------- time estimates
 def time_estimate(records, *, sim: str, grid: int, estimator: str, gpu: bool,
-                  sliced: bool) -> tuple[float, int] | None:
+                  sliced: bool, precision: str = "single", dim: int = 3) -> tuple[float, int] | None:
     """(median seconds per snapshot, number of runs) of successful earlier runs with the same
-    simulation, grid, estimator, GPU use and slice/no slice; None without any."""
+    simulation, grid, estimator, GPU use, slice/no slice, precision and dimension; None without any
+    (a double-precision run takes about twice as long: it must not predict a single one)."""
     times = [r.wall_seconds for r in records
              if r.ok and r.wall_seconds and r.sim == sim and r.grid == grid
-             and r.estimator == estimator and r.gpu == gpu and r.sliced == sliced]
+             and r.estimator == estimator and r.gpu == gpu and r.sliced == sliced
+             and r.precision == precision and r.dim == dim]
     return (statistics.median(times), len(times)) if times else None
 
 

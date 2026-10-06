@@ -28,7 +28,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT / "python") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "python"))
 
-from dtfelib.io import FIELDS, LEGACY_SUFFIX, _VELOCITY_SCALE_EXP  # noqa: E402
+from dtfelib.io import FIELDS as _IO_FIELDS, LEGACY_SUFFIX, _VELOCITY_SCALE_EXP  # noqa: E402
+
+# the launcher's field table: dtfelib's + the per-particle scalar a run with a scalar dataset writes ('.a_scalar',
+# '--field scalar_a'; dtfelib's analysis never reads it, the Explore map can)
+FIELDS = {**_IO_FIELDS, "scalar": ("scalar", 1, False)}
 
 # the fields worth a map, in menu order, with their labels
 FIELD_LABELS = {
@@ -38,7 +42,7 @@ FIELD_LABELS = {
     "dispersion_tensor": "dispersion tensor", "caustic": "caustic (fold) cells",
     "caustic_class": "caustic class", "tet_touch": "tetrahedra touching",
     "tweb": "T-web class", "tweb_eigenvalues": "T-web eigenvalues", "vweb": "V-web class",
-    "vweb_eigenvalues": "V-web eigenvalues",
+    "vweb_eigenvalues": "V-web eigenvalues", "scalar": "per-particle scalar",
 }
 # what a map's values mean, where the label cannot say it (the field list's tooltips)
 FIELD_HELP = {
@@ -47,6 +51,7 @@ FIELD_HELP = {
                       "thinner than the sampling).\n2 = a tetrahedron too small to be sampled "
                       "left its mass here (usually of the same stream).\n3 = both.",
     "caustic": "1 = a fold caustic crosses the cell.",
+    "scalar": "The particles' own value (the run's scalar dataset, e.g. a potential), interpolated like the density.",
 }
 # vector fields that can be drawn as arrows (their in-plane components) over the colour map
 VECTOR_FIELDS = {"velocity", "vorticity"}
@@ -210,6 +215,25 @@ CUBE_EAGER_BYTES = min(int(2e9), CUBE_CACHE_BYTES)
 # Run button must never wait on the T7).
 _CUBES: dict[tuple, np.ndarray] = {}
 _CUBES_LOCK = threading.Lock()
+# While the launcher runs a job the cache keeps at most RUN_CUBE_BYTES: the binary's auto-tuner budgets from the
+# memory free at ITS start, and Explore stepping through slices meanwhile must not refill 16 GB under it (a
+# 512^3 float32 cube, 0.5 GB, still fits: stepping stays smooth). cap_cubes() is the launcher's switch.
+RUN_CUBE_BYTES = int(1e9)
+_CAPPED = False
+
+
+def cap_cubes(on: bool) -> None:
+    """The run-time cap on (a job starts: the cache is trimmed to it) or off (the job ended)."""
+    global _CAPPED
+    with _CUBES_LOCK:
+        _CAPPED = bool(on)
+        budget = _cube_budget()
+        while _CUBES and sum(a.nbytes for a in _CUBES.values()) > budget:
+            _CUBES.pop(next(iter(_CUBES)))
+
+
+def _cube_budget() -> int:
+    return min(CUBE_CACHE_BYTES, RUN_CUBE_BYTES) if _CAPPED else CUBE_CACHE_BYTES
 
 
 def _cube_key(path: Path, dtype, shape) -> tuple | None:
@@ -226,7 +250,8 @@ def _cached_cube(path: Path, dtype, shape, axis: int | None = None) -> np.ndarra
     axis the caller slices next, 0 or 1 of a 3D grid) is one a memmap reads cheaply. axis None = the
     caller reads the whole array (a 2D grid) or slices along the last axis."""
     nbytes = int(np.prod(shape)) * np.dtype(dtype).itemsize
-    if nbytes > CUBE_CACHE_BYTES:
+    budget = _cube_budget()
+    if nbytes > budget:
         return None
     key = _cube_key(path, dtype, shape)
     if key is None:
@@ -236,7 +261,7 @@ def _cached_cube(path: Path, dtype, shape, axis: int | None = None) -> np.ndarra
         if cube is not None:
             _CUBES[key] = _CUBES.pop(key)     # most recently used last
             return cube
-    if nbytes > CUBE_EAGER_BYTES and axis is not None and axis < 2:
+    if nbytes > min(CUBE_EAGER_BYTES, budget) and axis is not None and axis < 2:
         return None
     cube = np.fromfile(path, dtype=dtype).reshape(shape)         # outside the lock: nobody waits on the disk
     with _CUBES_LOCK:
@@ -246,10 +271,44 @@ def _cached_cube(path: Path, dtype, shape, axis: int | None = None) -> np.ndarra
             return other
         for stale in [k for k in _CUBES if k[0] == key[0]]:      # the same file, another version: drop it
             _CUBES.pop(stale)
-        while _CUBES and sum(a.nbytes for a in _CUBES.values()) + nbytes > CUBE_CACHE_BYTES:
+        if nbytes > _cube_budget():           # the cap came on while this was read (a job started): use it, keep none
+            return cube
+        while _CUBES and sum(a.nbytes for a in _CUBES.values()) + nbytes > _cube_budget():
             _CUBES.pop(next(iter(_CUBES)))
         _CUBES[key] = cube
     return cube
+
+
+def _read_plane(path: Path, dtype, n: int, ncomp: int, axis: int, index: int) -> np.ndarray:
+    """One plane of an (n, n, n[, ncomp]) C-order grid file by plain reads (no memmap: see OutputSet._memmap):
+    axis 0 is one contiguous block, axis 1 one block per row, axis 2 the file in slabs of whole x-layers (the
+    same bytes a memmap would touch), keeping one plane. Raises ValueError for a short file, OSError when
+    the file cannot be read (a drive gone)."""
+    dt = np.dtype(dtype)
+    if not 0 <= index < n:
+        raise ValueError(f"plane {index} outside 0..{n - 1}")
+    row = n * ncomp                         # values per (i, j) row along the last axis
+    layer = n * row                         # values per x-layer i
+    out = np.empty((n, n, ncomp) if ncomp > 1 else (n, n), dtype=dt)
+    with open(path, "rb") as f:
+        def block(offset_values: int, count: int) -> np.ndarray:
+            f.seek(offset_values * dt.itemsize)
+            a = np.fromfile(f, dtype=dt, count=count)
+            if a.size != count:
+                raise ValueError(f"{Path(path).name} is shorter than its grid (an interrupted write?)")
+            return a
+        if axis == 0:
+            return block(index * layer, layer).reshape(out.shape)
+        if axis == 1:
+            for i in range(n):
+                out[i] = block(i * layer + index * row, row).reshape(out.shape[1:])
+            return out
+        step = max(1, int(64e6 // (layer * dt.itemsize)))      # ~64 MB of x-layers per read
+        for i0 in range(0, n, step):
+            k = min(step, n - i0)
+            slab = block(i0 * layer, k * layer).reshape((k, n, n, ncomp) if ncomp > 1 else (k, n, n))
+            out[i0:i0 + k] = slab[:, :, index]
+        return out
 
 
 def drop_cubes() -> int:
@@ -329,13 +388,19 @@ class OutputSet:
             out[2] = 0.0
         return out
 
-    def _memmap(self, name: str, axis: int | None = None) -> np.ndarray:
-        """The field's array: the cached cube when _cached_cube() keeps one, else a read-only memmap.
-        'axis' = the plane axis slice() takes next (3D only; a 2D grid is read whole)."""
+    def _memmap(self, name: str, axis: int | None = None, index: int = 0) -> np.ndarray:
+        """The field's array -- the cached cube when _cached_cube() keeps one -- or, for a 3D grid, just the
+        plane 'index' along 'axis', read from the file. NEVER a memmap: a mapped page of a drive unplugged
+        meanwhile (the T7) kills the whole launcher with SIGBUS, which Python cannot catch; a read fails with
+        an OSError the slice worker reports (2026-10-06). A 2D grid is read whole."""
         ff = self.files[name]
         shape = (self.n,) * self.dim + ((ff.ncomp,) if ff.ncomp > 1 else ())
         cube = _cached_cube(ff.path, self.dtype, shape, axis if self.dim == 3 else None)
-        return cube if cube is not None else np.memmap(ff.path, dtype=self.dtype, mode="r", shape=shape)
+        if cube is not None:
+            return cube
+        if self.dim == 2 or axis is None:
+            return np.fromfile(ff.path, dtype=self.dtype).reshape(shape)
+        return _read_plane(ff.path, self.dtype, self.n, ff.ncomp, int(axis), int(index))
 
     def _velocity_factor(self, name: str) -> float:
         exp = _VELOCITY_SCALE_EXP.get(name)
@@ -350,32 +415,39 @@ class OutputSet:
         velocity: the binary stores the antisymmetric part of the gradient, W_ab = (dv_a/dx_b -
         dv_b/dx_a)/2 for a < b (xy, xz, yz), which this turns into the curl's x, y, z (a 2D grid: its
         z, a single number); measured on a rigid rotation (curl = 2 Omega), 2026-10-03."""
-        mm = self._memmap(name, int(axis))
+        index = self.n // 2 if index is None else int(index)
+        mm = self._memmap(name, int(axis), index)
         if self.dim == 2:
-            plane = np.array(mm, dtype=np.float64)
-        else:
-            index = self.n // 2 if index is None else int(index)
+            plane = np.array(mm)            # the file's precision: only the component shown is up-cast (below)
+        elif mm.ndim == self.dim + (1 if self.files[name].ncomp > 1 else 0):     # the cached cube: cut the plane
             sl = [slice(None)] * 3
             sl[axis] = index
-            plane = np.array(mm[tuple(sl)], dtype=np.float64)
+            plane = np.array(mm[tuple(sl)])
+        else:                               # already the plane (read from the file)
+            plane = mm
         del mm
         ff = self.files[name]
+        f64 = lambda a: np.asarray(a, dtype=np.float64)        # noqa: E731
         if name == "vorticity":         # [W_xy, W_xz, W_yz] = [-w_z, w_y, -w_x] / 2 -> the curl w
-            plane = -2.0 * plane if ff.ncomp == 1 else \
-                2.0 * np.stack([-plane[..., 2], plane[..., 1], -plane[..., 0]], -1)
+            plane = -2.0 * f64(plane) if ff.ncomp == 1 else \
+                2.0 * np.stack([-f64(plane[..., 2]), f64(plane[..., 1]), -f64(plane[..., 0])], -1)
         if ff.ncomp > 1:
             comps = components(name, ff.ncomp, self.dim)
             if component not in comps:
                 component = comps[0]
-            if component == "norm":
-                plane = np.sqrt((plane ** 2).sum(axis=-1))
+            if component == "norm":     # component by component in float64: never the whole plane at once
+                acc = np.zeros(plane.shape[:-1])
+                for i in range(plane.shape[-1]):
+                    c = f64(plane[..., i])
+                    acc += c * c
+                plane = np.sqrt(acc)
             elif component.startswith("trace"):
                 d = int(round(ff.ncomp ** 0.5))
-                plane = sum(plane[..., i * d + i] for i in range(d))
+                plane = sum(f64(plane[..., i * d + i]) for i in range(d))
             else:
                 idx = comps.index(component) - (1 if comps[0] == "norm" or comps[0].startswith("trace") else 0)
-                plane = plane[..., idx]
-        return plane * self._velocity_factor(name)
+                plane = f64(plane[..., idx])
+        return f64(plane) * self._velocity_factor(name)
 
     def arrow_field(self, name: str, axis: int = 2, index: int | None = None, per_side: int = 32,
                     smooth: float = 0.0) -> dict | None:
@@ -471,8 +543,8 @@ def value_range(plane: np.ndarray, log: bool = False, clip: tuple = (1.0, 99.0),
         vmin, vmax = np.percentile(finite, clip)
     else:
         vmin, vmax = 0.0, 1.0
-    if symmetric:
-        m = max(abs(vmin), abs(vmax))
+    if symmetric:                   # the percentiles of a map that is 0 almost everywhere are 0: then the largest
+        m = max(abs(vmin), abs(vmax)) or (float(np.abs(finite).max()) if finite.size else 0.0) or 1.0   # value
         vmin, vmax = -m, m
     if not vmax > vmin:
         vmax = vmin + 1.0
@@ -489,7 +561,7 @@ def colorize(plane: np.ndarray, cmap: str = "viridis", log: bool = False,
     if vrange is not None:
         vmin, vmax = vrange
         if symmetric:
-            m = max(abs(vmin), abs(vmax))
+            m = max(abs(vmin), abs(vmax)) or 1.0
             vmin, vmax = -m, m
         if not vmax > vmin:
             vmax = vmin + 1.0
@@ -498,6 +570,75 @@ def colorize(plane: np.ndarray, cmap: str = "viridis", log: bool = False,
     idx = np.clip((data - vmin) / (vmax - vmin) * 255.0, 0, 255)
     idx = np.where(np.isfinite(idx), idx, 0).astype(np.uint8)
     return lut(cmap)[idx], (float(vmin), float(vmax))
+
+
+# ---------------------------------------------------------------------- ticks (the Explore axes and colour bar)
+TICK_STEPS = (1.0, 2.0, 2.5, 5.0, 10.0)        # the round steps, per decade
+
+
+def nice_ticks(lo: float, hi: float, n: int = 5, integer: bool = False) -> list[float]:
+    """About n round values inside [lo, hi], a step of TICK_STEPS x 10^k apart (0, 20, 40 ...; 0.25, 0.5 ...).
+    'integer': whole steps of 1, 2, 5 x 10^k only -- an axis in cells (0, 5, 10 on a 16-cell grid, not 0, 2.5,
+    5: a cell boundary means nothing). Empty for a degenerate range."""
+    if not (np.isfinite(lo) and np.isfinite(hi)) or hi <= lo or n < 1:
+        return []
+    raw = (hi - lo) / n
+    mag = 10.0 ** np.floor(np.log10(raw))
+    steps = [m * mag for m in TICK_STEPS if not (integer and m == 2.5)]
+    if integer:
+        steps = [max(st, 1.0) for st in steps]
+    step = min(steps, key=lambda st: abs(np.log(st / raw)))    # the nearest round step
+    k0, k1 = int(np.ceil(lo / step - 1e-9)), int(np.floor(hi / step + 1e-9))
+    digits = max(0, 2 - int(np.floor(np.log10(step))))
+    return [float(round(k * step, digits)) + 0.0 for k in range(k0, k1 + 1)]   # + 0.0: no '-0'
+
+
+def tick_text(v: float, ticks: list[float]) -> str:
+    """A tick label with the decimals the step needs (and no more): 0.25 / 0.5 -> '0.25', '0.50'."""
+    if len(ticks) > 1:
+        step = float(f"{min(abs(b - a) for a, b in zip(ticks, ticks[1:])):.3g}")   # 0.000999.. is 0.001
+        if step >= 1e5 or step <= 0:
+            return f"{v:.3g}"
+        d = next((k for k in range(13) if abs(step * 10 ** k - round(step * 10 ** k)) < 1e-6 * max(1.0, step * 10 ** k)), 12)
+        return f"{v:.{d}f}"                         # the fewest decimals that show every tick exactly (2.5 -> 1)
+    return f"{v:.3g}"
+
+
+def nice_length(span: float, frac: float = 0.2) -> float:
+    """The scale bar's round length (1, 2 or 5 x 10^k) nearest frac * span (log distance)."""
+    if not (np.isfinite(span) and span > 0):
+        return 0.0
+    target = frac * span
+    mag = 10.0 ** np.floor(np.log10(target))
+    cands = [m * mag for m in (1.0, 2.0, 5.0, 10.0)]
+    return float(min(cands, key=lambda c: abs(np.log(c / target))))
+
+
+_SUPERSCRIPT = str.maketrans("-0123456789", "⁻⁰¹²³⁴⁵⁶⁷⁸⁹")
+
+
+def decade_text(k: int) -> str:
+    """10^k as the colour bar writes it: '1', '10', '10²', '10⁻¹'."""
+    return {0: "1", 1: "10"}.get(k, "10" + str(k).translate(_SUPERSCRIPT))
+
+
+def colorbar_ticks(lo: float, hi: float, log: bool = False, n: int = 5) -> list[tuple[float, str]]:
+    """(position in the bar's units, label) for a colour bar spanning lo..hi. On a log map (lo, hi are
+    log10 values) the whole decades inside, labelled 10^k (thinned to about n); with fewer than two
+    decades, round log values labelled with their linear value."""
+    if log:
+        ks = list(range(int(np.ceil(lo - 1e-9)), int(np.floor(hi + 1e-9)) + 1))
+        if len(ks) >= 3:
+            every = max(1, int(np.ceil(len(ks) / n)))
+            return [(float(k), decade_text(k)) for k in ks if k % every == 0]
+        # under three decades: 1, 2, 5 x 10^k as plain numbers (0.05, 0.1, 0.2), else round log values
+        sub = [(np.log10(m) + k, m, k) for k in range(int(np.floor(lo)) - 1, int(np.ceil(hi)) + 1) for m in (1, 2, 5)]
+        sub = [(float(v), f"{m * 10.0 ** k:g}") for v, m, k in sub if lo - 1e-9 <= v <= hi + 1e-9]
+        if len(sub) >= 2:
+            return sub
+        return [(v, f"{10.0 ** v:.3g}") for v in nice_ticks(lo, hi, n)]
+    ticks = nice_ticks(lo, hi, n)
+    return [(v, tick_text(v, ticks)) for v in ticks]
 
 
 # ---------------------------------------------------------------------- discovery
@@ -555,6 +696,17 @@ def type_label(o) -> str:
     return lab if o.prefix == default else f"{lab} · {o.prefix}"
 
 
+def type_order(o, pref=None) -> tuple:
+    """Sort key of a snapshot's outputs for the Type menu and the composer's fills: the estimator (DTFE
+    first), then that estimator's default prefix, then the user's preferred one ('pref'), then the rest
+    by prefix -- plain text order put ps_mw (an A/B run kept beside ps_output) before the production
+    run, so 'this snapshot across outputs' compared the standard DTFE with the wrong phase-space run
+    (review 2026-10-05)."""
+    lab = estimator_label(o)
+    default = PS_PREFIX if lab == "PS-DTFE" else DTFE_PREFIX
+    return (lab, o.prefix != default, o.prefix != pref, o.prefix)
+
+
 def custom_box(settings: dict) -> tuple | None:
     """A custom-snapshot run's box in Mpc: 'box_mpc', else its --box (file units) / MpcUnit, else the
     input snapshot's header BoxSize / MpcUnit. Two corners of 'dim' (the sidecar's, 3 if absent) entries."""
@@ -591,7 +743,7 @@ def find_outputs(data_root, extra_dirs=()) -> list[tuple[str, OutputSet]]:
     if root.is_dir():
         for pattern in ("*/snapdir_*/*.a_den", "*/*/snapdir_*/*.a_den", "*/snapdir_*/*.den", "*/*/snapdir_*/*.den"):
             for f in sorted(root.glob(pattern)):
-                prefix = f.name.split(".")[0]
+                prefix = f.stem                 # 'snap_z0.5.a_den' -> 'snap_z0.5' (no grid suffix has a dot)
                 key = f.parent / prefix
                 if key in seen:
                     continue
@@ -605,7 +757,7 @@ def find_outputs(data_root, extra_dirs=()) -> list[tuple[str, OutputSet]]:
                     out.append((title, o))
     for d in extra_dirs:
         for f in sorted(Path(d).glob("*.a_den")) + sorted(Path(d).glob("*.den")):
-            prefix = f.name.split(".")[0]
+            prefix = f.stem
             key = f.parent / prefix
             if key in seen:
                 continue
@@ -810,12 +962,44 @@ def occupancy_touches(occ_bits, region, periodic: bool, window) -> bool:
     return bool(occ_bits[np.ix_(*idx)].any())
 
 
-def server_settings(out: OutputSet) -> dict | None:
+def find_pts_planes(o) -> list[tuple[str, Path]]:
+    """The point-evaluated hi-res slices of an output: '<root>.pts_den' and every plane sidecar (tools/
+    make_image_plane.py, in the simulation's folder or beside the output) whose geometry matches the file's
+    size -- (label, sidecar). The '.pts_*' files carry no axis, so planes of one size (the x, y, z views)
+    are all listed, each with its axis: the user picks."""
+    den = Path(str(o.root) + ".pts_den")
+    if not den.is_file():
+        return []
+    size = den.stat().st_size
+    out, seen = [], set()
+    for side in (sorted(o.dir.parent.glob("pointeval_plane_*.json")) + sorted(o.dir.parent.glob("hires_plane_*.json"))
+                 + sorted(o.dir.glob("*plane*.json"))):
+        if side in seen:
+            continue
+        seen.add(side)
+        try:
+            d = json.loads(side.read_text())
+            k = int(d.get("supersample", 1))
+            n = int(d["planes"]) * int(d["nu"]) * k * int(d["nv"]) * k
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        if n * 8 == size:
+            out.append((f"{d['nu']}×{d['nv']} {d.get('axis', '?')}-plane at {float(d.get('center', 0.0)):.1f} Mpc "
+                        f"({side.stem})", side))
+    return out
+
+
+def server_settings(out: OutputSet, snapshot: str | None = None) -> dict | None:
     """dtfelib.Estimator arguments for the snapshot behind an output set, or None when unknown.
     TNG layout: the snapdir's combined file (+ the simulation's converted ICs when present);
-    a custom-snapshot run: the job's own settings sidecar."""
+    a custom-snapshot run: the job's own settings sidecar. 'snapshot': a file chosen by hand (Explore's
+    'Snapshot…', when the input moved or the output has no sidecar) -- it replaces the one found."""
     s = sidecar(out.root)
+    if snapshot and not Path(snapshot).is_file():
+        return None
     if s:
+        if snapshot:
+            s = dict(s, input_file=str(snapshot))
         if not s.get("input_file") or not Path(s["input_file"]).is_file():
             return None
         dim = s.get("dim") if s.get("dim") in (2, 3) else 3
@@ -833,11 +1017,11 @@ def server_settings(out: OutputSet) -> dict | None:
         if not kw["periodic"] and kw["phase_space"] and float(s.get("alpha_shape", 3.0)) != 3.0:
             kw["options"] = list(kw.get("options", [])) + ["--ps-alpha-shape", f"{float(s['alpha_shape']):g}"]
         return kw
-    combined = sorted(out.dir.glob("combined_[0-9][0-9][0-9].hdf5"))
+    combined = [Path(snapshot)] if snapshot else sorted(out.dir.glob("combined_[0-9][0-9][0-9].hdf5"))
     if not combined:
         return None
     kw = {"snapshot": str(combined[0]), "phase_space": not out.prefix == "output", "periodic": True}
-    ics = out.dir.parent / "combined_ics.hdf5"
+    ics = combined[0].parent.parent / "combined_ics.hdf5"
     if kw["phase_space"] and ics.is_file():
         kw["lagrangian_input"] = str(ics)
     return kw

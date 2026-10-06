@@ -24,6 +24,13 @@ from .io import FieldSet
 # sim_dir() resolves that layout and the flat one (e.g. DTFE_DATA_ROOT=~/output).
 DATA_ROOT = Path(os.environ.get("DTFE_DATA_ROOT", "/Volumes/Samsung T7/Illustris TNG"))
 DEFAULT_SIM = os.environ.get("DTFE_SIM", "TNG50-4-Dark")
+# Where every figure goes (config.LOCAL_FIGURES_ROOT, the launcher's figure browser): DTFE_FIGURES_ROOT, else
+# the T7 while it is mounted (since 2026-10-06; python/figures had grown to 8.8 GB inside iCloud), else
+# python/figures. NOT derived from DATA_ROOT: the launcher hands its data root only to the scripts it runs, so
+# the launcher and its scripts would look in different places. The tests set DTFE_FIGURES_ROOT to a temp dir.
+_T7 = Path("/Volumes/Samsung T7")
+FIGURES_ROOT = Path(os.environ.get("DTFE_FIGURES_ROOT") or
+                    (_T7 / "DTFE figures" if _T7.is_dir() else Path(__file__).resolve().parents[1] / "figures"))
 DEFAULT_SNAP = 99
 
 

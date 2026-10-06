@@ -26,7 +26,7 @@ source "${SCRIPT_DIR}/precision.sh"     # DTFE_TEST_PRECISION=double: the double
 N="${N:-20}"; GRID="${GRID:-40}"; BOX="${BOX:-100.0}"
 BIN="${PS_BIN}"
 precision_require "${BIN}"
-TMP="${SCRIPT_DIR}/tmp"; mkdir -p "${TMP}"
+TMP="${DTFE_TEST_TMP:-${TMPDIR:-/tmp}/dtfe-tests}"; mkdir -p "${TMP}"
 SNAP="${TMP}/psl_crossed.hdf5"
 SNAP_NP="${TMP}/psl_clump.hdf5"
 SNAP_2D="${TMP}/psl_2d.hdf5"

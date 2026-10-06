@@ -41,7 +41,7 @@ STRICT="${STRICT:-1}"                    # 0: the 1D premise and (B) are reporte
 PS_ARGS="${PS_ARGS:---ps-exact-deposit}" # the PS-DTFE run's deposit
 EXTRA="${EXTRA:-}"                       # extra flags for both runs (e.g. --scratch-dir <dir>)
 precision_require "${PS_BIN}" "${DTFE_BIN}"
-TMP="${TWEB_TMP:-${SCRIPT_DIR}/tmp}"; mkdir -p "${TMP}"
+TMP="${TWEB_TMP:-${DTFE_TEST_TMP:-${TMPDIR:-/tmp}/dtfe-tests}}"; mkdir -p "${TMP}"
 SNAP="${TMP}/tweb_pancake.hdf5"
 SNAP2="${TMP}/tweb_pancake_2d.hdf5"
 

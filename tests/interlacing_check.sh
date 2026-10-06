@@ -15,7 +15,7 @@ else
     for p in /opt/homebrew /usr/local; do [ -d "$p/include" ] && FLAGS+=( -I"$p/include" -L"$p/lib" ); done
     FLAGS+=( -lfftw3 -lfftw3f )
 fi
-TMP="$ROOT/tests/tmp"; mkdir -p "$TMP"
+TMP="${DTFE_TEST_TMP:-${TMPDIR:-/tmp}/dtfe-tests}"; mkdir -p "$TMP"
 echo "============================================================"
 echo " interlacing check (exact samples of a band-limited field)"
 echo "============================================================"

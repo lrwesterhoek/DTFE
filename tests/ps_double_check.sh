@@ -22,7 +22,7 @@ command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/
 for b in DTFE PS-DTFE DTFE-double PS-DTFE-double; do
     [ -x "./$b" ] || { echo "SKIP: ./$b is not built (make DTFE PS-DTFE DOUBLE=1 builds the double pair)"; exit 0; }
 done
-TMP="$ROOT/tests/tmp/double_check"
+TMP="${DTFE_TEST_TMP:-${TMPDIR:-/tmp}/dtfe-tests}/double_check"
 mkdir -p "$TMP"
 SNAP="$TMP/waves.hdf5"
 [ -f "$SNAP" ] || "$PY" tests/generate_ps_test_data.py --out "$SNAP" --n 48 --box 100 --amplitude-factor 1.8 \

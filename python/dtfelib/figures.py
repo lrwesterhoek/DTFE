@@ -226,6 +226,8 @@ def symmetric_limits(data, pct=None):
     centre whenever the slice was skewed (plot_DTFE's divergence map, found 2026-10-05)."""
     a = _finite(data)
     m = float(_np.percentile(_np.abs(a), config.PERCENTILE_CLIP[1] if pct is None else pct)) if a.size else 0.0
+    if not m > 0 and a.size:            # a MOSTLY-zero slice: its percentile is 0, its few values are not
+        m = float(_np.abs(a).max())     # (sparse or zero-padded data; (-1, 1) would hide every pixel)
     if not m > 0:
         m = 1.0
     return -m, m
@@ -262,12 +264,16 @@ def delta_contour_levels(field_slice, norm, num_contours=20):
     return _np.unique(_np.asarray(levels))
 
 
-def save_plot_to_multiple_paths(fig, primary_path, dpi=300, **kwargs):
+def save_plot_to_multiple_paths(fig, primary_path, dpi=300, mirror=True, **kwargs):
     """Save a figure to its primary path and mirror it into the thesis Figures/ tree
-    (config.THESIS_FIGURES_DIR, read at call time), preserving the path below 'figures/'."""
+    (config.THESIS_FIGURES_DIR, read at call time), preserving the path below 'figures/'. mirror=False
+    saves the primary path only: a script run with --out (a path with no 'figures/' in it) would otherwise
+    drop its files FLAT into the thesis tree's root, where simulations' names collide (review 2026-10-05)."""
     primary_path = Path(primary_path)
     primary_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(primary_path, dpi=dpi, **kwargs)
+    if not mirror:
+        return
 
     primary_str = str(primary_path)
     if '/figures/' in primary_str or '\\figures\\' in primary_str:
@@ -279,3 +285,172 @@ def save_plot_to_multiple_paths(fig, primary_path, dpi=300, **kwargs):
     additional_path = Path(str(config.THESIS_FIGURES_DIR)) / relative_path
     additional_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(additional_path, dpi=dpi, **kwargs)
+
+
+# ---------------------------------------------------------------- slice maps in the house style (survey item 11, 2026-10-05)
+# plot_DTFE.py, plot_PS_DTFE.py and plot_cosmic_web.py drew their maps by hand: matplotlib's default sans
+# font, titles that ignored SHOW_TITLES, colour maps and ranges as literals, three private copies of the
+# axis-label and DPI constants. They are thin calls of slice_map / slice_row now. The scripts keep their
+# transposes (the data is passed rows-as-vertical, as imshow wants it), their file names and their choices
+# of which maps to write; the look changed in four stated ways: serif text and no titles (SHOW_TITLES),
+# lowercase axis letters from config.SLICE_PLANES, ONE rule per quantity (the web colours of
+# plot_cosmic_web, the eigenvalue triptychs on norm_signed_log at the field's linthresh), and the
+# density/streams colour floors (set_bad / set_under at the map's lowest colour) applied by both scripts.
+from .io import STREAM_TOL as _STREAM_TOL
+
+MAP_LABELS = {
+    'density': r'$\rho / \bar\rho$',
+    'divergence': r'$\nabla \cdot v$ [km/s/Mpc]',
+    'shear': r'$|\sigma|$ [km/s/Mpc]',
+    'streams': 'number of streams',
+    'velDisp': r'Tr $\sigma^2$  [(km/s)$^2$]',
+    'velDispTensor': r'$|\sigma^2|$  [(km/s)$^2$]',
+    'velMag': r'$|v|$  [km/s]',
+    'velocity': r'$|v|$  [km/s]',
+    'eigenvalue': r'$\lambda$',
+}
+MAP_CMAPS = {'density': 'plasma', 'divergence': 'RdBu_r', 'shear': 'plasma', 'streams': 'inferno',
+             'streams_single': 'viridis', 'velDisp': 'magma', 'velDispTensor': 'magma', 'velMag': 'magma',
+             'velocity': 'viridis', 'eigenvalue': 'RdBu_r'}
+WEB_NAMES = ('Void', 'Wall', 'Filament', 'Node')
+WEB_COLORS = ['#1a1a2e', '#e0c97f', '#d4563e', '#f5f5dc']       # void, wall, filament, node (plot_cosmic_web's)
+RESIDUAL_COLORS = ['#08306b', '#2171b5', '#6baed6', '#f0f0f0', '#fb6a4a', '#cb181d', '#67000d']   # T-web - V-web, -3..3
+
+
+def web_cmap_norm():
+    """The categorical colour map and norm of a web classification (0 void .. 3 node)."""
+    return _mcolors.ListedColormap(WEB_COLORS), _mcolors.BoundaryNorm([-0.5, 0.5, 1.5, 2.5, 3.5], 4)
+
+
+def residual_cmap_norm():
+    """The colour map and norm of a class difference (-3 .. 3)."""
+    return _mcolors.ListedColormap(RESIDUAL_COLORS), _mcolors.BoundaryNorm(_np.arange(-3.5, 4.5, 1.0), 7)
+
+
+def cmap_floored(name):
+    """A copy of the named colour map whose 'bad' (NaN) and 'under' colours are its lowest colour: an empty
+    or sub-range cell on a log map shows as the darkest, not white."""
+    import matplotlib.pyplot as _plt
+    cmap = _plt.get_cmap(name).copy()
+    cmap.set_bad(cmap(0))
+    cmap.set_under(cmap(0))
+    return cmap
+
+
+def norm_log_range(data, fixed=None, floor=1e-6):
+    """A LogNorm for a positive field: 'fixed' = (vmin, vmax) with a None end taken from the slice's own
+    log_limits; None only when an end must come from a slice with no positive value (a caller with a fixed
+    range checks for an empty slice itself: plot_DTFE / plot_PS_DTFE.plot_density). The explicit range
+    wins over config.FIELD_LIMITS (norm_positive_log's lookup): the map scripts pass DENSITY_MAP_RANGE."""
+    own = log_limits(data, floor)
+    lo, hi = (None, None) if fixed is None else fixed
+    if (lo is None or hi is None) and own is None:
+        return None
+    vmin = float(lo) if lo is not None else own[0]
+    vmax = float(hi) if hi is not None else own[1]
+    if not vmax > vmin:
+        vmax = vmin * 10.0
+    return _mcolors.LogNorm(vmin=vmin, vmax=vmax)
+
+
+def norm_symmetric(data, pct=None):
+    """A linear norm centred on 0 (symmetric_limits): a divergence, a residual."""
+    lo, hi = symmetric_limits(data, pct)
+    return _mcolors.Normalize(vmin=lo, vmax=hi)
+
+
+def norm_streams(data):
+    """The stream-count map's rule: (cmap name, norm) -- a slice with no multi-stream cell (max <= 1 + tol)
+    on a linear 0..1 viridis, else inferno on a log scale from 0.5 to max(max, 2); None for a slice
+    without streams (max < tol). '.streams' is a float (STREAM_TOL), never compared as an integer."""
+    a = _finite(data)
+    smax = float(a.max()) if a.size else 0.0
+    if smax < _STREAM_TOL:
+        return None
+    if smax <= 1.0 + _STREAM_TOL:
+        return MAP_CMAPS['streams_single'], _mcolors.Normalize(vmin=0.0, vmax=1.0)
+    return MAP_CMAPS['streams'], _mcolors.LogNorm(vmin=0.5, vmax=max(smax, 2.0))
+
+
+def slice_axes(ax, plane, box_mpc, ylabel=True):
+    """Axis labels from config.SLICE_PLANES[plane] in config.AXIS_UNITS, equal aspect, the box as limits."""
+    labels = config.SLICE_PLANES[plane]['axis_labels']
+    ax.set_xlabel(f"{labels[0]} [{config.AXIS_UNITS}]")
+    if ylabel:
+        ax.set_ylabel(f"{labels[1]} [{config.AXIS_UNITS}]")
+    ax.set_xlim(0, box_mpc)
+    ax.set_ylim(0, box_mpc)
+    ax.set_aspect('equal')
+
+
+def _draw_panel(fig, ax, panel, box_mpc, plane, ylabel=True):
+    """One map into 'ax' from a panel dict: data (rows vertical), cmap (a name or a Colormap), norm or
+    vmin/vmax, label (the colour bar's), title, interpolation, cbar_ticks / cbar_ticklabels, floor, text."""
+    cmap = panel.get('cmap', 'viridis')
+    if isinstance(cmap, str):
+        cmap = cmap_floored(cmap) if panel.get('floor') else cmap
+    kw = {'norm': panel['norm']} if panel.get('norm') is not None else {'vmin': panel.get('vmin'), 'vmax': panel.get('vmax')}
+    im = ax.imshow(panel['data'], origin='lower', cmap=cmap, extent=[0, box_mpc, 0, box_mpc],
+                   interpolation=panel.get('interpolation'), **kw)
+    slice_axes(ax, plane, box_mpc, ylabel=ylabel)
+    set_title(ax, panel.get('title', ''))
+    cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, ticks=panel.get('cbar_ticks'))
+    if panel.get('cbar_ticklabels') is not None:
+        cb.ax.set_yticklabels(panel['cbar_ticklabels'])
+    if panel.get('label'):
+        cb.set_label(panel['label'])
+    if panel.get('text'):
+        ax.text(0.02, 0.98, panel['text'], transform=ax.transAxes, va='top', fontsize=9,
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
+    return im
+
+
+def _save(fig, path, mirror):
+    import matplotlib.pyplot as _plt
+    if path is not None:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if mirror:
+            save_plot_to_multiple_paths(fig, path, dpi=config.DPI, bbox_inches='tight')
+        else:
+            fig.savefig(path, dpi=config.DPI, bbox_inches='tight')
+    _plt.close(fig)
+
+
+def slice_map(data, box_mpc, plane, cmap, norm=None, label='', title='', path=None, vmin=None, vmax=None,
+              interpolation=None, text=None, footnote=None, cbar_ticks=None, cbar_ticklabels=None, floor=False,
+              figsize=(8, 7), mirror=False):
+    """One slice map in the house style, saved to 'path' (config.DPI, tight; mirror=True also into the
+    thesis Figures tree) and closed. 'data' is passed as imshow wants it (rows vertical: the scripts keep
+    their .T); 'text' = a boxed note in the corner, 'footnote' = a line under the axes. Returns
+    {'path', 'vmin', 'vmax'} -- the range drawn, for tests and logs."""
+    import matplotlib.pyplot as _plt
+    fig, ax = _plt.subplots(figsize=figsize)
+    im = _draw_panel(fig, ax, dict(data=data, cmap=cmap, norm=norm, vmin=vmin, vmax=vmax, label=label, title=title,
+                                   interpolation=interpolation, text=text, cbar_ticks=cbar_ticks,
+                                   cbar_ticklabels=cbar_ticklabels, floor=floor), box_mpc, plane)
+    if footnote:
+        ax.text(0.5, -0.12, footnote, transform=ax.transAxes, ha='center', fontsize=9, style='italic')
+    fig.tight_layout()
+    lo, hi = im.norm.vmin, im.norm.vmax
+    _save(fig, path, mirror)
+    return {'path': None if path is None else Path(path), 'vmin': lo, 'vmax': hi}
+
+
+def slice_row(panels, box_mpc, plane, path=None, suptitle='', footnote=None, figsize=None, mirror=False):
+    """A row of maps of one plane (a triptych of eigenvalues, the density next to the streams, the two webs
+    and their residual): 'panels' = the dicts _draw_panel takes; only the first carries the y label.
+    'footnote' goes under the row. Returns {'path', 'ranges': [(vmin, vmax), ...]}."""
+    import matplotlib.pyplot as _plt
+    n = len(panels)
+    fig, axes = _plt.subplots(1, n, figsize=figsize or (6.6 * n + 1.0, 6.0), squeeze=False)
+    ranges = []
+    for i, (ax, panel) in enumerate(zip(axes[0], panels)):
+        im = _draw_panel(fig, ax, panel, box_mpc, plane, ylabel=(i == 0))
+        ranges.append((im.norm.vmin, im.norm.vmax))
+    if footnote:
+        fig.text(0.5, -0.02, footnote, ha='center', style='italic')
+    set_suptitle(fig, suptitle, y=1.02)
+    fig.tight_layout()
+    _save(fig, path, mirror)
+    return {'path': None if path is None else Path(path), 'ranges': ranges}

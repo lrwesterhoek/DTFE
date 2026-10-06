@@ -39,7 +39,7 @@ source "${SCRIPT_DIR}/precision.sh"     # DTFE_TEST_PRECISION=double: the double
 N="${N:-32}"; GRID="${GRID:-64}"; BOX="${BOX:-100.0}"; D="${D:-2}"
 BIN="${PS_BIN}"
 precision_require "${BIN}"
-TMP="${SCRIPT_DIR}/tmp"; mkdir -p "${TMP}"
+TMP="${DTFE_TEST_TMP:-${TMPDIR:-/tmp}/dtfe-tests}"; mkdir -p "${TMP}"
 SNAP_PAN="${TMP}/phr_input_pancake.hdf5"
 SNAP_CRW="${TMP}/phr_input_crossed.hdf5"
 NPROC="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)"

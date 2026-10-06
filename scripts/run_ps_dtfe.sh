@@ -7,6 +7,9 @@
 #   ./run_ps_dtfe.sh [-d DATA_DIR] [-s SIMULATION] [-g GRID_SIZE] [-n AVG_SUBSAMPLES] [-m] [-e] [snapshot ...]
 #     -m   run the deposit on the Apple GPU (same as PS_METAL=1; needs 'make PS-DTFE METAL=1')
 #     -e   exact conservative deposit (same as PS_EXACT=1; --ps-exact-deposit, GPU-capable, slower)
+#   -h / --help prints this header and runs nothing; --version the repository revision.
+#   DRY_RUN=1 ./run_ps_dtfe.sh ...   prints every snapshot's expanded command and paths, runs nothing
+#          (exit 0 when at least one snapshot is planned).
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"   # the binaries and Makefile live one level up
@@ -87,6 +90,8 @@ PS_EXACT="${PS_EXACT:-0}"  # 1 = exact conservative deposit (--ps-exact-deposit)
                            # the nSub->infinity limit, so '.den' == '.a_den'). Override: -e
 
 DATA_DIR=""                # default: sim_dir $SIMULATION (config.sh); override with -d
+PS_LINEAR_DEPOSIT="${PS_LINEAR_DEPOSIT:-0}"  # 1 = --ps-linear-deposit: each tetrahedron's mass spread by the linear
+                                 # density profile inside it (renormalized: mass-conserving); NOT with PS_VOLUME_WEIGHTED=1
 PS_PARALLEL_TRI="${PS_PARALLEL_TRI:-0}"  # 1 = build each tessellation's Delaunay triangulation in parallel
                            # (--parallel-triangulation; needs the TBB build, 'make' detects the library).
                            # Faster on small sets; OFF by default because two identical runs then
@@ -98,6 +103,12 @@ OUTPUT_PREFIX="${OUTPUT_PREFIX:-ps_output}"   # -> <snapdir>/<prefix>.*  Overrid
 
 usage() { echo "Usage: $0 [-d DATA_DIR] [-s SIMULATION] [-g GRID_SIZE] [-n AVG_SUBSAMPLES] [-m] [-e] [snapshot ...]"; }
 
+case "${1:-}" in                                 # -h / --help print the header and run nothing; --version the revision
+    -h|--help) sed -n '2,/^$/p' "${BASH_SOURCE[0]}" | sed -e 's/^# \{0,1\}//'; usage; exit 0 ;;
+    --version) git -C "${REPO_ROOT}" describe --always --dirty 2>/dev/null || echo unknown; exit 0 ;;
+esac
+
+DRY_RUN="${DRY_RUN:-0}"          # 1 = print the commands and paths, run nothing (survey rank 19, 2026-10-05)
 while getopts "d:s:g:n:meh" opt; do
     case "$opt" in
         d) DATA_DIR="$OPTARG" ;;
@@ -203,7 +214,7 @@ if [ ! -x "${PS_BIN}" ]; then
     exit 1
 fi
 
-n_ok=0; n_skipped=0; n_failed=0   # summarised at the end; see the exit-status note there
+n_ok=0; n_skipped=0; n_failed=0; n_planned=0   # summarised at the end; see the exit-status note there
 
 # Peak-RSS wrapper, resolved once and OPTIONAL: macOS spells the flag -l, GNU -v, and a bare Ubuntu
 # container has no /usr/bin/time at all. Without one the run is identical, just with no RSS line.
@@ -218,7 +229,7 @@ fi
 [ -n "$THREADS" ] && export OMP_NUM_THREADS="$THREADS"
 
 # Keep the Mac awake for the whole batch; caffeinate follows this PID and lifts on exit.
-if command -v caffeinate >/dev/null 2>&1; then
+if [ "${DRY_RUN}" != "1" ] && command -v caffeinate >/dev/null 2>&1; then
     caffeinate -i -m -w $$ &
 fi
 
@@ -275,6 +286,7 @@ for i in "${SNAPSHOTS[@]}"; do
     # Parallel Delaunay insertion (PS_PARALLEL_TRI=1, opt-in -- see the comment at the top).
     ptri_args=()
     [ "${PS_PARALLEL_TRI}" = "1" ] && ptri_args=(--parallel-triangulation)
+    [ "${PS_LINEAR_DEPOSIT}" = "1" ] && ptri_args+=(--ps-linear-deposit)     # (PS_LINEAR_DEPOSIT, see the top)
 
     # Point evaluation on top of the grid run (SAMPLE_POINTS=<file>, see the comment at the top).
     sp_args=()
@@ -328,26 +340,36 @@ for i in "${SNAPSHOTS[@]}"; do
     [ -n "${MAX_CONCURRENT}" ] && part_args+=(--max-concurrent "${MAX_CONCURRENT}")
     [ -n "${SCRATCH_DIR}" ] && part_args+=(--scratch-dir "${SCRATCH_DIR}")
 
-    ${TIME_WRAP[@]+"${TIME_WRAP[@]}"} "${PS_BIN}" "${input_file}" "${output_root}" \
-        --grid ${GRID_SIZE} \
-        --padding ${PADDING} \
-        --periodic \
-        ${part_args[@]+"${part_args[@]}"} \
-        --avg-subsamples ${AVG_SUBSAMPLES} \
-        --input 105 \
-        --MpcUnit ${MPC_UNIT} \
-        --field ${FIELDS} \
-        --lambda_th ${LAMBDA_TH} \
-        ${metal_args[@]+"${metal_args[@]}"} \
-        ${exact_args[@]+"${exact_args[@]}"} \
-        ${vmass_args[@]+"${vmass_args[@]}"} \
-        ${ptri_args[@]+"${ptri_args[@]}"} \
-        ${vw_args[@]+"${vw_args[@]}"} \
-        ${sp_args[@]+"${sp_args[@]}"} \
-        ${caustic_args[@]+"${caustic_args[@]}"} \
-        ${tess_args[@]+"${tess_args[@]}"} \
-        ${report_args[@]+"${report_args[@]}"} \
-        "${lag_args[@]}" 2>&1 | tee "${run_log}"
+    cmd=("${PS_BIN}" "${input_file}" "${output_root}"
+        --grid ${GRID_SIZE}
+        --padding ${PADDING}
+        --periodic
+        ${part_args[@]+"${part_args[@]}"}
+        --avg-subsamples ${AVG_SUBSAMPLES}
+        --input 105
+        --MpcUnit ${MPC_UNIT}
+        --field ${FIELDS}
+        --lambda_th ${LAMBDA_TH}
+        ${metal_args[@]+"${metal_args[@]}"}
+        ${exact_args[@]+"${exact_args[@]}"}
+        ${vmass_args[@]+"${vmass_args[@]}"}
+        ${ptri_args[@]+"${ptri_args[@]}"}
+        ${vw_args[@]+"${vw_args[@]}"}
+        ${sp_args[@]+"${sp_args[@]}"}
+        ${caustic_args[@]+"${caustic_args[@]}"}
+        ${tess_args[@]+"${tess_args[@]}"}
+        ${report_args[@]+"${report_args[@]}"}
+        "${lag_args[@]}")
+    if [ "${DRY_RUN}" = "1" ]; then                 # DRY_RUN=1: the expanded command and the paths, nothing run
+        echo "  DRY RUN -- would run:"
+        printf '    %q' "${cmd[@]}"; echo
+        echo "  input:   ${input_file} (exists)"
+        echo "  outputs: ${output_root}.* and the run log ${run_log}"
+        n_planned=$((n_planned + 1))
+        echo ""
+        continue
+    fi
+    ${TIME_WRAP[@]+"${TIME_WRAP[@]}"} "${cmd[@]}" 2>&1 | tee "${run_log}"
     rc=${PIPESTATUS[0]}
 
     if [ "${AUTO_TUNE_REPORT}" = "1" ]; then
@@ -413,6 +435,12 @@ done
 
 # Honest exit status: processing NOTHING, or failing a snapshot that was attempted, exits 1. A
 # partial skip stays exit 0 -- a partly-downloaded snapshot ladder is normal.
+if [ "${DRY_RUN}" = "1" ]; then
+    echo "DRY RUN: ${n_planned} snapshot(s) planned, ${n_skipped} skipped for missing inputs; nothing was run."
+    [ "${n_planned}" -gt 0 ] && exit 0
+    echo "ERROR: nothing to run (looked under '${DATA_DIR}')." >&2
+    exit 1
+fi
 echo "PS-DTFE processing complete: ${n_ok} processed, ${n_skipped} skipped, ${n_failed} failed."
 if [ "${n_failed}" -gt 0 ]; then
     echo "ERROR: ${n_failed} snapshot(s) failed -- see the messages above and the .runlog files." >&2

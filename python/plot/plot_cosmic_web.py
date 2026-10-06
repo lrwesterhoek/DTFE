@@ -14,32 +14,26 @@ from pathlib import Path
 
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap, BoundaryNorm
 
 from dtfelib import make_parser, snapdir, FieldSet
+from dtfelib import figures as style
+
+style.apply()                                   # the house style (serif, SHOW_TITLES, DPI): survey item 11, 2026-10-05
 
 FIGURE_ROOT = Path(config.LOCAL_FIGURES_ROOT)
 OUTPUT_DIR = FIGURE_ROOT / "cosmic_web"
-
-AXIS_UNITS = "Mpc"
 
 SLICE_PLANES_TO_PLOT = [0, 1, 2]
 
 PROCESS_TWEB = True
 PROCESS_VWEB = True
 
-DPI = 300
+SLICE_PLANES = config.SLICE_PLANES              # (the maps' axis labels, DPI and units are config's; the web colours figures')
+WEB_LABELS = dict(enumerate(style.WEB_NAMES))
 
-SLICE_PLANES = {
-    0: {'name': 'yz_plane', 'axis_labels': ('Y', 'Z')},
-    1: {'name': 'xz_plane', 'axis_labels': ('X', 'Z')},
-    2: {'name': 'xy_plane', 'axis_labels': ('X', 'Y')}
-}
 
-WEB_LABELS = {0: 'Void', 1: 'Wall', 2: 'Filament', 3: 'Node'}
-WEB_COLORS = ['#1a1a2e', '#e0c97f', '#d4563e', '#f5f5dc']
-WEB_CMAP = ListedColormap(WEB_COLORS)
-WEB_NORM = BoundaryNorm([-0.5, 0.5, 1.5, 2.5, 3.5], WEB_CMAP.N)
+def _title(text, redshift):
+    return f"{text} (z={redshift:.2f})" if redshift is not None else text
 
 
 def extract_slice(field, slice_dim=2):
@@ -50,194 +44,66 @@ def extract_slice(field, slice_dim=2):
 
 def plot_classification(class_field, slice_dim, box_size, web_type,
                         redshift=None, save_path=None):
-    class_slice = extract_slice(class_field, slice_dim).T
-
-    class_slice = np.rint(class_slice).astype(int)
-    class_slice = np.clip(class_slice, 0, 3)
-
-    fig, ax = plt.subplots(figsize=(8, 7))
-    im = ax.imshow(
-        class_slice, origin='lower', cmap=WEB_CMAP, norm=WEB_NORM,
-        extent=[0, box_size, 0, box_size], interpolation='nearest'
-    )
-
-    plane_info = SLICE_PLANES[slice_dim]
-    title = f"{web_type} Classification"
-    if redshift is not None:
-        title += f" (z={redshift:.2f})"
-
-    ax.set_title(title, fontsize=14)
-    ax.set_xlabel(f"{plane_info['axis_labels'][0]} [{AXIS_UNITS}]", fontsize=12)
-    ax.set_ylabel(f"{plane_info['axis_labels'][1]} [{AXIS_UNITS}]", fontsize=12)
-
-    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, ticks=[0, 1, 2, 3])
-    cbar.ax.set_yticklabels(['Void', 'Wall', 'Filament', 'Node'])
-
+    class_slice = np.clip(np.rint(extract_slice(class_field, slice_dim).T).astype(int), 0, 3)
+    cmap, norm = style.web_cmap_norm()
     unique, counts = np.unique(class_slice, return_counts=True)
-    total = class_slice.size
-    frac_text = "  ".join(
-        f"{WEB_LABELS.get(u, '?')}: {c/total*100:.1f}%"
-        for u, c in zip(unique, counts)
-    )
-    ax.text(0.5, -0.12, frac_text, transform=ax.transAxes,
-            ha='center', fontsize=9, style='italic')
-
-    ax.set_aspect('equal')
-    plt.tight_layout()
-
-    if save_path:
-        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(save_path, dpi=DPI, bbox_inches='tight')
-        plt.close(fig)
-    else:
-        plt.show()
+    frac_text = "  ".join(f"{WEB_LABELS.get(u, '?')}: {c / class_slice.size * 100:.1f}%" for u, c in zip(unique, counts))
+    style.slice_map(class_slice, box_size, slice_dim, cmap=cmap, norm=norm, interpolation='nearest',
+                    cbar_ticks=[0, 1, 2, 3], cbar_ticklabels=list(style.WEB_NAMES),
+                    title=_title(f"{web_type} Classification", redshift), path=save_path, footnote=frac_text)
 
 
 def plot_eigenvalues(eig_field, slice_dim, box_size, web_type,
                      redshift=None, save_path=None):
-    eig_labels = [r'$\lambda_1$', r'$\lambda_2$', r'$\lambda_3$']
-
-    fig, axes = plt.subplots(1, 3, figsize=(20, 6))
-
-    plane_info = SLICE_PLANES[slice_dim]
-
-    for i, (ax, label) in enumerate(zip(axes, eig_labels)):
+    """Triptych of the eigenvalue maps: the house rule for a signed field (figures.norm_signed_log at the
+    field's linthresh), the same as plot_PS_DTFE's triptych -- it was a linear (1, 99) percentile pair here."""
+    panels = []
+    for i, label in enumerate((r'$\lambda_1$', r'$\lambda_2$', r'$\lambda_3$')):
         eig_slice = extract_slice(eig_field[..., i], slice_dim).T
-        vmin, vmax = np.percentile(eig_slice, [1, 99])
-
-        vlim = max(abs(vmin), abs(vmax))
-
-        im = ax.imshow(
-            eig_slice, origin='lower', cmap='RdBu_r',
-            extent=[0, box_size, 0, box_size],
-            vmin=-vlim, vmax=vlim
-        )
-
-        subtitle = f"{label}"
-        ax.set_title(subtitle, fontsize=14)
-        ax.set_xlabel(f"{plane_info['axis_labels'][0]} [{AXIS_UNITS}]", fontsize=11)
-        if i == 0:
-            ax.set_ylabel(f"{plane_info['axis_labels'][1]} [{AXIS_UNITS}]", fontsize=11)
-
-        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        ax.set_aspect('equal')
-
-    suptitle = f"{web_type} Eigenvalues"
-    if redshift is not None:
-        suptitle += f" (z={redshift:.2f})"
-    fig.suptitle(suptitle, fontsize=16, y=1.02)
-
-    plt.tight_layout()
-
-    if save_path:
-        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(save_path, dpi=DPI, bbox_inches='tight')
-        plt.close(fig)
-    else:
-        plt.show()
+        panels.append(dict(data=eig_slice, cmap=style.MAP_CMAPS['eigenvalue'], title=label, label=f"{web_type} {label}",
+                           norm=style.norm_signed_log(data=eig_slice, field='eigenvalue')))   # the bar names the panel: titles are off
+    style.slice_row(panels, box_size, slice_dim, path=save_path, figsize=(20, 6),
+                    suptitle=_title(f"{web_type} Eigenvalues", redshift))
 
 
 def plot_eigenvalue_histogram(eig_field, web_type, redshift=None, save_path=None):
     eig_labels = [r'$\lambda_1$', r'$\lambda_2$', r'$\lambda_3$']
-
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-
     for i, (ax, label) in enumerate(zip(axes, eig_labels)):
         vals = eig_field[..., i].ravel()
         vmin, vmax = np.percentile(vals, [0.5, 99.5])
         bins = np.linspace(vmin, vmax, 200)
-
         ax.hist(vals, bins=bins, color='steelblue', alpha=0.7, density=True)
         ax.axvline(0, color='red', linestyle='--', linewidth=1.0, alpha=0.7)
-
         pos_frac = np.mean(vals > 0) * 100
-        ax.text(0.95, 0.95, f"{pos_frac:.1f}% > 0",
-                transform=ax.transAxes, ha='right', va='top', fontsize=10)
-
-        ax.set_xlabel(label, fontsize=12)
-        ax.set_ylabel('PDF' if i == 0 else '', fontsize=12)
-        ax.set_title(label, fontsize=13)
-
-    suptitle = f"{web_type} Eigenvalue Distributions"
-    if redshift is not None:
-        suptitle += f" (z={redshift:.2f})"
-    fig.suptitle(suptitle, fontsize=15, y=1.02)
-
-    plt.tight_layout()
-
+        ax.text(0.95, 0.95, f"{pos_frac:.1f}% > 0", transform=ax.transAxes, ha='right', va='top')
+        ax.set_xlabel(label)
+        ax.set_ylabel('PDF' if i == 0 else '')
+        style.set_title(ax, label)
+    style.set_suptitle(fig, _title(f"{web_type} Eigenvalue Distributions", redshift), y=1.02)
+    fig.tight_layout()
     if save_path:
         Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(save_path, dpi=DPI, bbox_inches='tight')
-        plt.close(fig)
-    else:
-        plt.show()
+        fig.savefig(save_path, dpi=config.DPI, bbox_inches='tight')
+    plt.close(fig)
 
 
 def plot_tweb_vweb_residual(tweb_class, vweb_class, slice_dim, box_size,
                             redshift=None, save_path=None):
     tweb_slice = np.rint(extract_slice(tweb_class, slice_dim)).astype(int).T
     vweb_slice = np.rint(extract_slice(vweb_class, slice_dim)).astype(int).T
-
     residual = tweb_slice - vweb_slice
-
-    res_colors = [
-        '#08306b',
-        '#2171b5',
-        '#6baed6',
-        '#f0f0f0',
-        '#fb6a4a',
-        '#cb181d',
-        '#67000d',
-    ]
-    res_cmap = ListedColormap(res_colors)
-    res_norm = BoundaryNorm(np.arange(-3.5, 4.5, 1), res_cmap.N)
-
-    fig, axes = plt.subplots(1, 3, figsize=(22, 6))
-    plane_info = SLICE_PLANES[slice_dim]
-    extent = [0, box_size, 0, box_size]
-
-    im0 = axes[0].imshow(tweb_slice, origin='lower', cmap=WEB_CMAP, norm=WEB_NORM,
-                          extent=extent, interpolation='nearest')
-    axes[0].set_title("T-web", fontsize=14)
-    cbar0 = fig.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04, ticks=[0, 1, 2, 3])
-    cbar0.ax.set_yticklabels(['Void', 'Wall', 'Filament', 'Node'])
-
-    im1 = axes[1].imshow(vweb_slice, origin='lower', cmap=WEB_CMAP, norm=WEB_NORM,
-                          extent=extent, interpolation='nearest')
-    axes[1].set_title("V-web", fontsize=14)
-    cbar1 = fig.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04, ticks=[0, 1, 2, 3])
-    cbar1.ax.set_yticklabels(['Void', 'Wall', 'Filament', 'Node'])
-
-    im2 = axes[2].imshow(residual, origin='lower', cmap=res_cmap, norm=res_norm,
-                          extent=extent, interpolation='nearest')
-    axes[2].set_title("T-web − V-web", fontsize=14)
-    cbar2 = fig.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04,
-                          ticks=[-3, -2, -1, 0, 1, 2, 3])
-    cbar2.ax.set_yticklabels(['-3', '-2', '-1', '0', '+1', '+2', '+3'])
-
-    for ax in axes:
-        ax.set_xlabel(f"{plane_info['axis_labels'][0]} [{AXIS_UNITS}]", fontsize=11)
-        ax.set_aspect('equal')
-    axes[0].set_ylabel(f"{plane_info['axis_labels'][1]} [{AXIS_UNITS}]", fontsize=11)
-
+    web_cmap, web_norm = style.web_cmap_norm()
+    res_cmap, res_norm = style.residual_cmap_norm()
+    web = dict(cmap=web_cmap, norm=web_norm, interpolation='nearest', cbar_ticks=[0, 1, 2, 3], cbar_ticklabels=list(style.WEB_NAMES))
+    panels = [dict(data=tweb_slice, title="T-web", label="T-web class", **web), dict(data=vweb_slice, title="V-web", label="V-web class", **web),
+              dict(data=residual, cmap=res_cmap, norm=res_norm, interpolation='nearest', title="T-web − V-web", label="T-web − V-web",
+                   cbar_ticks=[-3, -2, -1, 0, 1, 2, 3], cbar_ticklabels=['-3', '-2', '-1', '0', '+1', '+2', '+3'])]
     agree_frac = np.mean(residual == 0) * 100
     mean_abs = np.mean(np.abs(residual))
-    stat_text = f"Agreement: {agree_frac:.1f}%   |  Mean |residual|: {mean_abs:.2f}"
-    fig.text(0.5, -0.02, stat_text, ha='center', fontsize=11, style='italic')
-
-    suptitle = "T-web vs V-web Comparison"
-    if redshift is not None:
-        suptitle += f" (z={redshift:.2f})"
-    fig.suptitle(suptitle, fontsize=16, y=1.02)
-
-    plt.tight_layout()
-
-    if save_path:
-        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(save_path, dpi=DPI, bbox_inches='tight')
-        plt.close(fig)
-    else:
-        plt.show()
+    style.slice_row(panels, box_size, slice_dim, path=save_path, figsize=(22, 6),
+                    suptitle=_title("T-web vs V-web Comparison", redshift),
+                    footnote=f"Agreement: {agree_frac:.1f}%   |  Mean |residual|: {mean_abs:.2f}")
 
 def process_snapshot(fs, snapshot):
     redshift = fs.meta.redshift

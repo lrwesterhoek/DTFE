@@ -32,7 +32,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential libgsl-dev libboost-all-dev libcgal-dev libtbb-dev \
             libmpfr-dev libhdf5-dev libgmp-dev libfftw3-dev libdeflate-dev \
-            python3 python3-numpy python3-h5py
+            python3 python3-numpy python3-h5py python3-scipy python3-matplotlib
 
       # single + DOUBLE=1 + DIM=2: each is a separate compile of every translation unit, so only a
       # build catches a float-only or 3D-only construct creeping in (the 2D build was broken for a

@@ -28,7 +28,7 @@ PANEL_SNAPSHOTS = ['000', '017', '050', '099']
 # ---- Active simulation & box geometry ---------------------------------------------------
 # One simulation is analysed at a time: DTFE_SIM env var, else dtfelib's default. Every
 # script that opens fields via dtfelib.cli can also override per run with --sim.
-from dtfelib.cli import DATA_ROOT, DEFAULT_SIM, sim_dir
+from dtfelib.cli import DATA_ROOT, DEFAULT_SIM, FIGURES_ROOT, sim_dir
 SIMULATION = os.environ.get("DTFE_SIM", DEFAULT_SIM)
 
 # Comoving box sizes in h-free Mpc (raw BoxSize[ckpc/h] / h / 1000). Known simulations are
@@ -140,9 +140,12 @@ def _find_thesis_dir():
 
 
 _THESIS_DIR = _find_thesis_dir()
-THESIS_FIGURES_DIR = (_THESIS_DIR / 'Figures') if _THESIS_DIR else (_REPO_ROOT.parent / 'Figures')
+# The fallback is the 'Figures' folder NEXT TO the repo. _REPO_ROOT is DTFE/python (config.py moved there
+# 2026-07-10), so that folder is two levels up: one level up is DTFE/Figures, which on macOS's case-insensitive
+# disk IS the repo's own figures/ folder -- every mirrored figure from the move to 2026-10-06 landed there.
+THESIS_FIGURES_DIR = (_THESIS_DIR / 'Figures') if _THESIS_DIR else (_REPO_ROOT.parent.parent / 'Figures')
 
-LOCAL_FIGURES_ROOT = str(_REPO_ROOT / 'figures')
+LOCAL_FIGURES_ROOT = str(FIGURES_ROOT)     # dtfelib.cli: DTFE_FIGURES_ROOT, else the T7, else python/figures
 
 ANALYSIS_DIRS = {
     'dtfe': 'dtfe_analysis',
@@ -209,6 +212,11 @@ VELOCITY_UNITS = "km/s"
 DPI = 300
 
 SHOW_TITLES = False
+
+# the density slice maps' colour range in rho/rho_bar, the same for both estimators so DTFE and PS-DTFE
+# panels compare side by side (None for either end: the slice's own range); plot_DTFE.py and
+# plot_PS_DTFE.py used to carry this pair each (survey item 11, 2026-10-05)
+DENSITY_MAP_RANGE = (1e-1, 1e4)
 
 SLICE_PLANES = {
     0: {'name': 'yz_plane', 'axis_labels': ('y', 'z'), 'axes': (1, 2)},

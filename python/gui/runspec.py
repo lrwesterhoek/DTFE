@@ -23,6 +23,7 @@ Pure Python (no Qt), so it is testable headless: tests/py_gui_runspec_test.py.
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import shutil
@@ -36,7 +37,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT / "python") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "python"))
 
-from dtfelib.cli import DATA_ROOT, find_sims, sim_dir  # noqa: E402  (after the path fix-up)
+from dtfelib.cli import DATA_ROOT, FIGURES_ROOT, find_sims, sim_dir  # noqa: E402  (after the path fix-up)
 from dtfelib.io import plane_geometry_matches  # noqa: E402
 
 PS_SCRIPT = REPO_ROOT / "scripts" / "run_ps_dtfe.sh"
@@ -44,7 +45,18 @@ DTFE_SCRIPT = REPO_ROOT / "scripts" / "run_dtfe.sh"
 PIPELINE_SCRIPT = REPO_ROOT / "scripts" / "run_ps_pipeline.sh"
 PLOT_DIR = REPO_ROOT / "python" / "plot"
 ANALYZE = REPO_ROOT / "python" / "analyze.py"
-FIGURES_ROOT = REPO_ROOT / "python" / "figures"          # config.LOCAL_FIGURES_ROOT
+# FIGURES_ROOT (dtfelib.cli, = config.LOCAL_FIGURES_ROOT): DTFE_FIGURES_ROOT, else the T7, else python/figures
+LEGACY_FIGURES_ROOT = REPO_ROOT / "python" / "figures"     # the default until 2026-10-06, saved verbatim in specs
+
+
+def _current_figures_root(d: dict) -> dict:
+    """A saved spec's figures_root with the OLD default (python/figures, stored as a plain path because the
+    field saved the default it showed) read as today's default: settings and queued jobs from before the
+    move to the T7 would otherwise keep writing into the repo."""
+    root = d.get("figures_root")
+    if root and Path(root) == LEGACY_FIGURES_ROOT:
+        d = dict(d, figures_root=str(FIGURES_ROOT))
+    return d
 # the interpreter for the figure scripts (numpy/scipy/matplotlib/h5py): $PY as in the
 # pipeline script, else the python3 on PATH -- NOT the GUI's own venv interpreter
 PYTHON = os.environ.get("PY") or shutil.which("python3") or sys.executable
@@ -68,6 +80,13 @@ WEB_FIELDS = ("tweb_a", "vweb_a")        # the cosmic-web classes: the only cons
 LAMBDA_TH_DEFAULT = 0.3                  # run_ps_dtfe.sh / run_dtfe.sh LAMBDA_TH (the binary alone: 0.0, so a Custom
                                          # run classified differently from a scripted one before 2026-10-05)
 DTFE_FIELDS = ["density_a", "velocity_a", "gradient_a", "divergence_a", "shear_a", "vorticity_a"]
+DTFE_ALLOWED_FIELDS = DTFE_FIELDS + list(WEB_FIELDS)   # what the standard binary computes (no dispersion: PS only)
+
+
+def dtfe_fields(fields) -> list[str]:
+    """The ticked fields a standard-DTFE run computes, in the list's order (the velocity dispersion is a
+    phase-space field: left out)."""
+    return [f for f in DTFE_ALLOWED_FIELDS if f in fields]
 
 # full-resolution accumulator bytes per grid cell, roughly (auto_tune.h has the exact model)
 _FIELD_BYTES = {"density_a": 4, "velocity_a": 12, "gradient_a": 36, "divergence_a": 36,
@@ -99,6 +118,9 @@ class RunSpec:
     scratch_dir: str = ""
     output_prefix: str = "ps_output"
     lambda_th: float = LAMBDA_TH_DEFAULT   # T-web / V-web eigenvalue threshold (LAMBDA_TH; the scripts' default)
+    mem_budget_gb: float = 0.0       # DTFE_MEM_BUDGET_GB: the auto-tuner's memory budget; 0 = its own (free RAM)
+    tess_cache: str = ""             # TESS_CACHE: reuse the tessellation across runs (a local folder); "" = none
+    linear_deposit: bool = False     # PS_LINEAR_DEPOSIT: --ps-linear-deposit (density-weighted inside each tet)
 
     # ------------------------------------------------------------------ data
     def sim_path(self) -> Path:
@@ -120,7 +142,13 @@ class RunSpec:
         if self.grid < 8 or self.grid > 4096:
             out.append(("error", f"grid {self.grid}^3 is outside 8..4096"))
         out += _scratch_problems(self.scratch_dir)
+        out += _run_option_problems(self)
         out += _precision_problems(self.estimator, self.precision)
+        if self.estimator == "dtfe":
+            if not dtfe_fields(self.fields):
+                out.append(("error", "no field standard DTFE computes is ticked (the velocity dispersion is PS-DTFE's)"))
+            elif "dispersion_a" in self.fields:
+                out.append(("info", "the velocity dispersion is a phase-space field: standard DTFE leaves it out"))
         if self.gpu and not gpu_built(self.estimator, self.precision):
             out.append(("warning", f"GPU requested, but the binary was built without GPU support ({GPU_BUILD_HINT}): "
                                    "the deposit will run on the CPU"))
@@ -132,16 +160,19 @@ class RunSpec:
             if self.output_prefix.strip() == "" or re.search(r"[\s/]", self.output_prefix):
                 out.append(("error", "output prefix must be a single word (no spaces or '/')"))
         else:
-            if self.slice_plane:
-                out.append(("warning", "the hi-res slice is a PS-DTFE option; standard DTFE ignores it"))
-            out += gpu_advice(self.gpu, self.deposit, DTFE_FIELDS, dm_particles(self.sim), "dtfe", grid=self.grid,
-                              precision=self.precision)
+            if self.slice_plane and not Path(self.slice_plane).is_file():
+                out.append(("error", f"slice file not found: {self.slice_plane}"))
+            if self.slice_plane and self.partition > 0:
+                out.append(("error", "a hi-res slice with standard DTFE evaluates ONE triangulation: set Partition to "
+                                     "auto (the binary refuses an explicit split)"))
+            out += gpu_advice(self.gpu, self.deposit, dtfe_fields(self.fields) or DTFE_FIELDS, dm_particles(self.sim),
+                              "dtfe", grid=self.grid, precision=self.precision)
 
         out += _busy_problems()
 
         # memory: the full-resolution grids are irreducible (partitions share them)
         gb = self.grid_gb()
-        slice_pts = plane_points(self.slice_plane) if (self.estimator == "ps" and self.slice_plane) else 0
+        slice_pts = plane_points(self.slice_plane) if self.slice_plane else 0
         if not self.scratch_dir and gb + slice_pts * 545e-9 > 40:
             out.append(("warning", f"~{gb:.0f} GB of full-resolution grids"
                                    + (f" + ~{slice_pts * 545e-9:.0f} GB for {slice_pts/1e6:.0f}M slice points"
@@ -151,7 +182,7 @@ class RunSpec:
         return out
 
     def grid_gb(self) -> float:
-        return grids_gb(self.grid, self.fields if self.estimator == "ps" else DTFE_FIELDS, self.precision)
+        return grids_gb(self.grid, self.fields if self.estimator == "ps" else dtfe_fields(self.fields), self.precision)
 
     def runnable(self) -> bool:
         return not any(level == "error" for level, _ in self.problems())
@@ -170,9 +201,15 @@ class RunSpec:
             env["SCRATCH_DIR"] = str(Path(self.scratch_dir).expanduser())   # standard run silently kept the grids in RAM)
         if self.lambda_th != LAMBDA_TH_DEFAULT:
             env["LAMBDA_TH"] = f"{self.lambda_th:g}"
+        env.update(_run_option_env(self))
         snaps = [str(n) for n in sorted(self.snapshots)]
         if self.estimator == "dtfe":
             argv = [str(DTFE_SCRIPT), "-s", self.sim, "-g", str(self.grid)]
+            if dtfe_fields(self.fields) != DTFE_FIELDS:     # the ticks (T-web / V-web, a lighter set); else the script's
+                env["FIELDS"] = " ".join(dtfe_fields(self.fields))
+            if self.slice_plane:                            # the hi-res slice: the standard interpolant at the points
+                env["SAMPLE_POINTS"] = str(self.slice_plane)
+                env["PTS_VEL_GRAD"] = "1" if self.slice_vel_grad else "0"
             env["DTFE_METAL"] = "1" if self.gpu else "0"     # -m only switches the GPU ON; pin the env knob too
             if self.gpu:
                 argv.append("-m")
@@ -192,6 +229,7 @@ class RunSpec:
             "PS_CAUSTICS": "1" if self.caustics else "0",
             "PS_CAUSTIC_CUSPS": "1" if self.caustic_cusps else "0",
             "PS_PARALLEL_TRI": "1" if self.parallel_triangulation else "0",
+            "PS_LINEAR_DEPOSIT": "1" if self.linear_deposit else "0",
             "OUTPUT_PREFIX": self.output_prefix,
         })
         if self.slice_plane:
@@ -204,7 +242,7 @@ class RunSpec:
         return shell(*self.command())
 
     def memory_key(self) -> str:
-        return _memory_key(self, ("snapshots", "lambda_th"))
+        return _memory_key(self, ("snapshots", "lambda_th", "tess_cache"))
 
     def check_step(self) -> "Step":
         """The same run_ps_dtfe.sh call in report mode: the binary's own memory prediction per
@@ -307,6 +345,45 @@ def _scratch_problems(scratch_dir: str) -> list[tuple[str, str]]:
     return []
 
 
+def machine_ram_gb() -> float:
+    """This machine's physical memory in GB (0 when the OS will not say)."""
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9
+    except (ValueError, OSError, AttributeError):
+        return 0.0
+
+
+def _run_option_problems(spec) -> list[tuple[str, str]]:
+    """The shared run options: the tessellation cache folder (local, existing: the binary refuses iCloud and
+    does not create it -- the scripts do, the Custom run does not) and the memory budget."""
+    out = []
+    tc = getattr(spec, "tess_cache", "")
+    if tc:
+        d = Path(tc).expanduser()
+        if "Mobile Documents" in str(d.resolve()):
+            out.append(("error", "the tessellation cache is on iCloud Drive; the binary refuses it (use a local "
+                                 "folder, e.g. ~/Library/Caches/DTFE/tessellations)"))
+        elif not d.is_dir() and isinstance(spec, CustomSpec):
+            out.append(("error", f"tessellation cache folder does not exist: {d}"))
+    budget = getattr(spec, "mem_budget_gb", 0.0)
+    ram = machine_ram_gb()
+    if budget and ram and budget > ram:
+        out.append(("warning", f"memory budget {budget:g} GB is more than this machine's {ram:.0f} GB: the run "
+                               "may swap"))
+    return out
+
+
+def _run_option_env(spec) -> dict[str, str]:
+    """DTFE_MEM_BUDGET_GB (the auto-tuner's budget; read by the binary itself, through any script) and
+    TESS_CACHE (the run scripts' --tessellation-cache hook), only when set."""
+    env = {}
+    if getattr(spec, "mem_budget_gb", 0.0) > 0:
+        env["DTFE_MEM_BUDGET_GB"] = f"{spec.mem_budget_gb:g}"
+    if getattr(spec, "tess_cache", ""):
+        env["TESS_CACHE"] = str(Path(spec.tess_cache).expanduser())
+    return env
+
+
 def _root_problems(data_root: str) -> list[tuple[str, str]]:
     root = Path(data_root)
     return [] if root.is_dir() else [("error", f"data root not found: {root} (is the T7 plugged in?)")]
@@ -390,6 +467,13 @@ def _ps_option_problems(spec, n_particles) -> list[tuple[str, str]]:
         out.append(("warning", "caustic cusps are a CPU-deposit pass; the GPU run leaves them to the CPU"))
     if spec.deposit == "exact" and spec.nsub != 3:
         out.append(("warning", "the exact deposit ignores the sub-sample count"))
+    if getattr(spec, "linear_deposit", False):
+        if spec.volume_weighted:
+            out.append(("error", "the linear deposit weights by density inside each tetrahedron, the volume-weighted "
+                                 "velocities by volume: untick one (the binary refuses both)"))
+        if spec.caustics and spec.gpu:
+            out.append(("warning", "the linear deposit on the GPU keeps only the fold parity of the caustic classes "
+                                   "(no collapse counts): run it on the CPU for the full classification"))
     out += gpu_advice(spec.gpu, spec.deposit, spec.fields, n_particles, "ps", precision=spec.precision)
     if spec.parallel_triangulation and not tbb_built(spec.precision):
         out.append(("warning", "parallel triangulation asked for, but the binary was built without TBB: ignored"))
@@ -450,6 +534,9 @@ class PipelineSpec:
     caustic_cusps: bool = False     # PS_CAUSTIC_CUSPS
     parallel_triangulation: bool = False   # PS_PARALLEL_TRI
     lambda_th: float = LAMBDA_TH_DEFAULT   # LAMBDA_TH
+    mem_budget_gb: float = 0.0      # DTFE_MEM_BUDGET_GB, see RunSpec
+    tess_cache: str = ""            # TESS_CACHE (run_ps_pipeline.sh forwards it to run_ps_dtfe.sh)
+    linear_deposit: bool = False    # PS_LINEAR_DEPOSIT, see RunSpec
     output_prefix: str = "ps_output"
     precision: str = "single"       # "double" = the PS-DTFE-double binary (DTFE_PRECISION), see RunSpec
     partition: int = 0
@@ -561,8 +648,8 @@ class PipelineSpec:
 
     # ------------------------------------------------------------------ checks
     def problems(self) -> list[tuple[str, str]]:
-        out = _root_problems(self.data_root)
-        if not out:
+        out = _root_problems(self.data_root) + _run_option_problems(self)
+        if not _root_problems(self.data_root):
             if not self.sims:
                 out.append(("error", "no simulations selected"))
             for sim in self.sims:
@@ -647,7 +734,8 @@ class PipelineSpec:
                "PS_VOLUME_WEIGHTED": "1" if self.volume_weighted else "0",
                "PS_CAUSTICS": "1" if self.caustics else "0",
                "PS_CAUSTIC_CUSPS": "1" if self.caustic_cusps else "0",
-               "PS_PARALLEL_TRI": "1" if self.parallel_triangulation else "0"}
+               "PS_PARALLEL_TRI": "1" if self.parallel_triangulation else "0",
+               "PS_LINEAR_DEPOSIT": "1" if self.linear_deposit else "0"}
         if self.planes > 1:
             env["THICKNESS"] = _num(self.thickness)
         try:
@@ -660,6 +748,7 @@ class PipelineSpec:
             env["CENTER"] = self.center.strip()
         if self.lambda_th != LAMBDA_TH_DEFAULT:
             env["LAMBDA_TH"] = f"{self.lambda_th:g}"
+        env.update(_run_option_env(self))
         if self.fields != PS_DEFAULT_FIELDS:
             env["FIELDS"] = " ".join(self.fields)
         if self.output_prefix != "ps_output":
@@ -735,7 +824,7 @@ class PipelineSpec:
 
     @classmethod
     def from_dict(cls, d: dict) -> "PipelineSpec":
-        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+        return cls(**{k: v for k, v in _current_figures_root(d).items() if k in cls.__dataclass_fields__})
 
 
 def grids_gb(grid: int, fields: list[str], precision: str = "single", dim: int = 3) -> float:
@@ -792,13 +881,26 @@ def _plot_env(data_root: str, sim: str) -> dict[str, str]:
 # ---------------------------------------------------------------------- figures
 @dataclass(frozen=True)
 class Opt:
-    """One option of a figure set. kind: bool | int | float | choice | text | plane."""
+    """One option of a figure set. kind: bool | int | float | choice | text | plane | multi (a checklist of
+    'choices', the value a comma-separated string of the ticked ones). limits: a float's (min, max, decimals)
+    when the default box (0-1000, 2 decimals) cannot hold its values."""
     key: str
     label: str
     kind: str
     default: object
     choices: tuple = ()
     help: str = ""
+    limits: tuple = ()
+
+
+# analyze.py's core plot scripts (its PLOT_SCRIPTS: kept equal by the runspec test) + the synthesis figure,
+# which analyze.py runs only when named in --only
+THESIS_SCRIPTS = ("plot_DTFE.py", "plot_velDiv_den.py", "plot_eigenvalues.py", "plot_shear_triaxial.py",
+                  "plot_PDF_CDF.py", "plot_contour_filter.py", "plot_shape_filter.py", "plot_ellipses_contour_3D.py",
+                  "plot_marked_correlation_BBKS.py", "plot_smoothing_comparison.py", "plot_phi_delta.py",
+                  "plot_tidal_correlation.py", "plot_conclusions_synthesis.py")
+POINTEVAL_DERIV_SMOOTH = 10.0   # dtfelib.pointeval.DERIVATIVE_SMOOTH (plot_pointeval's own default): the runspec test
+DENSITY_LIMITS = (0.0, 1e7, 4)  # rho/rho_bar: TNG100-3-Dark z=0 reaches 2.3e5 (99.99th pct 913); voids go below 0.01
 
 
 @dataclass(frozen=True)
@@ -808,7 +910,7 @@ class FigureSet:
     script: str             # path under python/
     per: str                # "snapshot" (one call each) | "series" (one call, all) | "sim"
     about: str
-    output: str             # where under python/figures the figures land
+    output: str             # where under FIGURES_ROOT the figures land
     common: bool = True     # takes dtfelib's --method/--prefix/--smooth
     opts: tuple = ()
 
@@ -842,6 +944,8 @@ FIGURE_SETS: tuple[FigureSet, ...] = (
                     Opt("project", "Projection", "choice", "plane", ("plane", "slab"),
                         help="'slab' averages every plane in the file"),
                     Opt("smooth_px", "Smoothing (output pixels)", "float", 0.0),
+                    Opt("smooth_deriv", "Gradient maps also smoothed at (output pixels)", "float", POINTEVAL_DERIV_SMOOTH,
+                        help="the smoothed variant of the divergence, shear and vorticity maps (0 = none)"),
                     Opt("fixed_range", "Fixed density range of the grid maps", "bool", False),
                     Opt("force", "Re-render up-to-date figures", "bool", False))),
     FigureSet("panels", "Publication panels", "plot/plot_pointeval_panels.py", "snapshot",
@@ -850,7 +954,14 @@ FIGURE_SETS: tuple[FigureSet, ...] = (
               "pointeval_panels/<sim>", common=False,
               opts=(_PLANE,
                     Opt("panels", "Panels", "text", "density,sheet,streams"),
-                    Opt("project", "Projection", "choice", "plane", ("plane", "mean")))),
+                    Opt("project", "Projection", "choice", "plane", ("plane", "mean")),
+                    Opt("vmin", "Density scale minimum (0 = auto)", "float", 0.0,
+                        help="rho/rho_bar; auto = the 0.1th percentile, which adapts to each snapshot's contrast",
+                        limits=DENSITY_LIMITS),
+                    Opt("vmax", "Density scale maximum (0 = auto)", "float", 0.0, help="rho/rho_bar; auto = the 99.99th percentile",
+                        limits=DENSITY_LIMITS),
+                    Opt("dpi", "Output dpi (0 = native: one image pixel per sample)", "int", 0),
+                    Opt("image", "Pixel-exact PNGs, one per panel (no axes; for zooming and posters)", "bool", False))),
     FigureSet("voidpop", "Void population", "plot/plot_void_population.py", "sim",
               "Counts, sizes, shapes and depths of all voids at every snapshot with grids.",
               "void_population/<sim>",
@@ -872,11 +983,13 @@ FIGURE_SETS: tuple[FigureSet, ...] = (
     FigureSet("thesis", "Thesis analysis set", "analyze.py", "series",
               "The core analysis figures (eigenvalues, void shapes, correlations, ...) through "
               "analyze.py: 'compute' fills python/cache from the standard-DTFE grids with the "
-              "smoothing of python/config.py, 'plot' draws from that cache.", "<analysis>/",
+              "smoothing of python/config.py, 'plot' draws from that cache, 'export' writes the void "
+              "catalogues (CSV + HDF5, under void_catalog/<sim>).", "<analysis>/",
               common=False,
-              opts=(Opt("mode", "Mode", "choice", "all", ("all", "compute", "plot", "check")),
-                    Opt("only", "Only these scripts", "text", "",
-                        help="comma-separated plot_*.py names; blank = the full core set"))),
+              opts=(Opt("mode", "Mode", "choice", "all", ("all", "compute", "plot", "check", "export")),
+                    Opt("only", "Only these scripts", "multi", "", THESIS_SCRIPTS,
+                        help="tick some to run only those; none ticked = the full core set (the synthesis figure "
+                             "is run only when ticked)"))),
 )
 FIGURE_SET = {fs.key: fs for fs in FIGURE_SETS}
 
@@ -941,6 +1054,8 @@ class PlotSpec:
                     a += ["--project", str(self.opt(key, "project"))]
                 if float(self.opt(key, "smooth_px")) > 0:
                     a += ["--smooth", f"{float(self.opt(key, 'smooth_px')):g}"]
+                if float(self.opt(key, "smooth_deriv")) != POINTEVAL_DERIV_SMOOTH:
+                    a += ["--smooth-derivatives", f"{float(self.opt(key, 'smooth_deriv')):g}"]
                 if self.opt(key, "fixed_range"):
                     a.append("--fixed-range")
                 if self.opt(key, "force"):
@@ -960,6 +1075,13 @@ class PlotSpec:
                         a += ["--panels", str(self.opt(key, "panels")).replace(" ", "")]
                     if self.opt(key, "project") != "plane":
                         a += ["--project", str(self.opt(key, "project"))]
+                    for opt_key, flag in (("vmin", "--vmin"), ("vmax", "--vmax")):
+                        if float(self.opt(key, opt_key)) > 0:
+                            a += [flag, f"{float(self.opt(key, opt_key)):g}"]
+                    if int(self.opt(key, "dpi")) > 0:
+                        a += ["--dpi", str(int(self.opt(key, "dpi")))]
+                    if self.opt(key, "image"):
+                        a.append("--image")
                     out.append(Step(f"{name} snap {n:03d}", a, env))
             elif key == "voidpop":
                 a = base + ["--sim", self.sim] + self._common()
@@ -981,7 +1103,7 @@ class PlotSpec:
             elif key == "thesis":
                 mode = str(self.opt(key, "mode"))
                 a = base + [mode]
-                if mode in ("all", "compute"):
+                if mode in ("all", "compute", "export"):
                     a += [f"{n:03d}" for n in snaps]
                 only = [s.strip() for s in str(self.opt(key, "only")).split(",") if s.strip()]
                 if only and mode in ("all", "plot"):
@@ -1044,7 +1166,7 @@ class PlotSpec:
             if not (sp / "Merger Trees").is_dir() and not any(sp.glob("trees*")):
                 out.append(("warning", f"no merger trees under {sp}; the tracking figures need them "
                                        "(Data tab: merger trees)"))
-        if "thesis" in self.sets and self.opt("thesis", "mode") in ("all", "compute"):
+        if "thesis" in self.sets and self.opt("thesis", "mode") in ("all", "compute", "export"):
             missing = [n for n in snaps if not has_grids(sp / f"snapdir_{n:03d}", "dtfe", "")]
             if missing:
                 out.append(("warning", "Thesis analysis set: no standard-DTFE grids for "
@@ -1060,7 +1182,7 @@ class PlotSpec:
 
     @classmethod
     def from_dict(cls, d: dict) -> "PlotSpec":
-        known = {k: v for k, v in d.items() if k in cls.__dataclass_fields__}
+        known = {k: v for k, v in _current_figures_root(d).items() if k in cls.__dataclass_fields__}
         known["sets"] = [k for k in known.get("sets", []) if k in FIGURE_SET]
         return cls(**known)
 
@@ -1353,6 +1475,16 @@ class CustomSpec:
     max_concurrent: int = 0
     scratch_dir: str = ""
     lambda_th: float = LAMBDA_TH_DEFAULT   # --lambda_th with a web field (the binary's own default is 0.0)
+    mem_budget_gb: float = 0.0      # DTFE_MEM_BUDGET_GB in the binary's environment, see RunSpec
+    tess_cache: str = ""            # --tessellation-cache <folder>; "" = none
+    linear_deposit: bool = False    # --ps-linear-deposit (PS only; not with the volume-weighted velocities)
+    sample_points: str = ""         # --sample-points <file>: the fields at these points too ('.pts_*'); "" = none
+    pts_vel_grad: bool = True       # ... with the velocity gradient at each point (--pts-vel-grad)
+    window: list[float] = field(default_factory=list)   # --ps-window x0 x1 y0 y1 [z0 z1] in Mpc: only these cells
+    halo_release: float = 0.0       # --ps-halo-release D: tetrahedra denser than D x rho_bar deposited at their centroid
+    stream_density: str = "dtfe"    # --ps-stream-density for the sample points: 'dtfe' (interpolated) | 'geometric'
+    per_stream: bool = False        # --per-stream: the sample points' values stream by stream (ragged '.pts_*')
+    per_stream_ids: bool = False    # --per-stream-ids: ... with each stream's tetrahedron particle IDs
     demo_n: int = 0                 # > 0: first generate the synthetic demo snapshot (crossed waves, n^3) ...
     demo_file: str = ""             # ... but only at THIS path (demo_spec sets it): the setting is persisted, and
                                     # before 2026-10-05 any later missing input quietly became a demo
@@ -1388,7 +1520,7 @@ class CustomSpec:
             a.append("--periodic")
         if len(self.box) == 2 * self.dim:
             a += ["--box"] + [f"{v:g}" for v in self.box]
-        fields = list(self.fields) if ps else list(DTFE_FIELDS)
+        fields = list(self.fields) if ps else dtfe_fields(self.fields)
         if self.scalar_dataset and "scalar_a" not in fields:
             fields.append("scalar_a")
         a += ["--field", *fields]
@@ -1396,6 +1528,8 @@ class CustomSpec:
             a += ["--lambda_th", f"{self.lambda_th:g}"]
         if self.scalar_dataset:
             a += ["--scalar-dataset", self.scalar_dataset]
+        if self.tess_cache:
+            a += ["--tessellation-cache", str(Path(self.tess_cache).expanduser())]
         if ps:
             if self.deposit == "exact":
                 a.append("--ps-exact-deposit")
@@ -1411,6 +1545,12 @@ class CustomSpec:
                     a.append(flag)
             if not self.periodic and self.alpha_shape != 3.0:
                 a += ["--ps-alpha-shape", f"{self.alpha_shape:g}"]
+            if self.linear_deposit:
+                a.append("--ps-linear-deposit")
+            if self.halo_release > 0:
+                a += ["--ps-halo-release", _num(self.halo_release)]
+            if len(self.window) == 2 * self.dim:
+                a += ["--ps-window"] + [_num(v) for v in self.window]
         else:
             if self.gpu and three:
                 a.append("--gpu")
@@ -1422,10 +1562,20 @@ class CustomSpec:
             a += ["--max-concurrent", str(self.max_concurrent)]
         if self.scratch_dir:
             a += ["--scratch-dir", str(Path(self.scratch_dir).expanduser())]
+        if self.sample_points:
+            a += ["--sample-points", str(Path(self.sample_points).expanduser())]
+            if self.pts_vel_grad:
+                a.append("--pts-vel-grad")
+            if ps and self.stream_density != "dtfe":
+                a += ["--ps-stream-density", self.stream_density]
+            if ps and self.per_stream:
+                a.append("--per-stream")
+            if ps and self.per_stream_ids:
+                a.append("--per-stream-ids")
         return a
 
     def memory_key(self) -> str:
-        return _memory_key(self, ("output_dir", "output_name", "demo_n", "demo_file", "lambda_th"))
+        return _memory_key(self, ("output_dir", "output_name", "demo_n", "demo_file", "lambda_th", "tess_cache"))
 
     def demo_pending(self) -> bool:
         """The demo snapshot is to be generated first: the demo's own input path, not on disk yet."""
@@ -1436,7 +1586,12 @@ class CustomSpec:
     def check_step(self) -> Step:
         """The same binary call in report mode: its auto-tuner's split and memory prediction for this
         file, nothing computed or written (the report line parses as snapshot 0)."""
-        return Step(f"memory check {Path(self.input_file).name or '?'}", self.command() + ["--auto-tune-report"], {})
+        return Step(f"memory check {Path(self.input_file).name or '?'}", self.command() + ["--auto-tune-report"],
+                    self.run_env())
+
+    def run_env(self) -> dict[str, str]:
+        """The binary's environment: the memory budget (the cache is an argument here, not TESS_CACHE)."""
+        return {k: v for k, v in _run_option_env(self).items() if k != "TESS_CACHE"}
 
     def steps(self) -> list[Step]:
         out = []
@@ -1451,7 +1606,7 @@ class CustomSpec:
         root = self.output_root()
         if not root.parent.is_dir() and str(root.parent) != str(Path(self.input_file).expanduser().parent):
             out.append(Step("create the output folder", ["mkdir", "-p", str(root.parent)], {}))
-        out.append(Step(f"{self.binary().name} {Path(self.input_file).name or '?'}", self.command(), {},
+        out.append(Step(f"{self.binary().name} {Path(self.input_file).name or '?'}", self.command(), self.run_env(),
                         tee=str(root) + ".runlog"))
         return out
 
@@ -1512,7 +1667,8 @@ class CustomSpec:
             out.append(("warning", "parallel triangulation: faster on small sets, but two identical runs then differ "
                                    "at float rounding (the stream counts do not)"))
         n = hdf5_particle_count(f) if (f.is_file() and self.input_type == 105) else None
-        out += gpu_advice(self.gpu, self.deposit, self.fields if ps else list(DTFE_FIELDS), n, self.estimator,
+        out += gpu_advice(self.gpu, self.deposit, self.fields if ps else (dtfe_fields(self.fields) or DTFE_FIELDS), n,
+                          self.estimator,
                           grid=self.grid, precision=self.precision, dim=d)
         if self.box:
             if len(self.box) != 2 * d or any(self.box[2 * i + 1] <= self.box[2 * i] for i in range(d)):
@@ -1538,6 +1694,8 @@ class CustomSpec:
             out.append(("error", f"grid {self.grid}{'²' if d == 2 else '³'} is outside 8..{65536 if d == 2 else 4096}"))
         if ps and not self.fields:
             out.append(("error", "no fields selected"))
+        if not ps and not dtfe_fields(self.fields):
+            out.append(("error", "no field standard DTFE computes is ticked (the velocity dispersion is PS-DTFE's)"))
         name = self.name()
         if re.search(r"[\s/]", name):
             out.append(("error", "output name must be a single word (no spaces or '/')"))
@@ -1554,6 +1712,32 @@ class CustomSpec:
             how = f"'make {self.binary().name}'" if d == 3 else f"'{build_hint('single', 2)}'"
             out.append(("error", f"{self.binary().name} is not built (Setup, or {how})"))
         out += _scratch_problems(self.scratch_dir)
+        out += _run_option_problems(self)
+        if self.sample_points:
+            if not Path(self.sample_points).expanduser().is_file():
+                out.append(("error", f"sample-points file not found: {self.sample_points}"))
+            if not ps and self.partition > 0:
+                out.append(("error", "sample points with standard DTFE evaluate ONE triangulation: set Partition to "
+                                     "auto (the binary refuses an explicit split)"))
+        if self.window:
+            if not ps:
+                out.append(("info", "the window is a PS-DTFE option: this standard-DTFE run ignores it"))
+            elif (len(self.window) != 2 * d or not all(math.isfinite(v) for v in self.window)
+                  or any(self.window[2 * i + 1] <= self.window[2 * i] for i in range(d))):
+                out.append(("error", f"the window needs {2 * d} numbers in Mpc, each upper > lower"))
+            elif any(f in WEB_FIELDS for f in self.fields):
+                out.append(("error", "the T-web / V-web classes need the whole periodic grid: not with a window"))
+            elif self.linear_deposit:
+                out.append(("error", "the window cannot be combined with the linear deposit (the binary refuses it)"))
+        if (self.per_stream or self.per_stream_ids or self.stream_density != "dtfe") and not self.sample_points:
+            out.append(("warning", "the per-stream outputs and the stream density apply to sample points: choose a "
+                                   "points file (or they do nothing)"))
+        if not ps and (self.per_stream or self.per_stream_ids or self.halo_release > 0):
+            out.append(("info", "per-stream outputs and the halo release are PS-DTFE options: this standard-DTFE run "
+                                "leaves them out"))
+        if ps and self.linear_deposit and self.volume_weighted:
+            out.append(("error", "the linear deposit weights by density inside each tetrahedron, the volume-weighted "
+                                 "velocities by volume: untick one (the binary refuses both)"))
         if (self.output_root().parent / (self.name() + ".a_den")).exists():
             out.append(("info", f"'{name}' already has outputs in this folder: they will be overwritten"))
         out += _busy_problems()

@@ -41,7 +41,7 @@ source "${SCRIPT_DIR}/precision.sh"     # DTFE_TEST_PRECISION=double: the double
 N="${N:-24}"; GRID="${GRID:-48}"; BOX="${BOX:-100.0}"
 BIN="${PS_BIN}"
 precision_require "${BIN}"
-TMP="${SCRIPT_DIR}/tmp"; mkdir -p "${TMP}"
+TMP="${DTFE_TEST_TMP:-${TMPDIR:-/tmp}/dtfe-tests}"; mkdir -p "${TMP}"
 SNAP="${TMP}/ptc_input.hdf5"
 # The cache must live on a LOCAL volume -- the repo itself is in iCloud, which the binary rejects.
 # ${TMPDIR:-/tmp} keeps this working on Linux CI, where /private/tmp does not exist and the binary

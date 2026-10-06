@@ -9,9 +9,11 @@ filament, 3 node; 'none' = no collapse bit at all, a cell never deposited into).
 
 '.streams' is a FLOAT (dtfelib.STREAM_TOL): the averaged 'a_streams' grid is a sub-sample MEAN, so a
 partly multi-stream cell reads 1.5 and the bins are named by THRESHOLD, not by a stream count:
-    empty         s < 1 - tol            no deposit at all (a spuriously empty cell: 7.9% of the box at
-                                         the production sampled deposit, mostly in voids -- counted apart,
-                                         never as multi-stream)
+    empty         s < 1 - tol            fewer than one stream on average: no sub-sample saw one (a cell
+                                         the sampled deposit never reached, 0) or only some did (an averaged
+                                         2/3). Counted apart, never as single or multi-stream. How many there
+                                         are depends on the run: the TNG300 z=0 sampled run of 2026-07-20 had
+                                         7.9% (mostly voids), the production TNG100-3-Dark 512^3 grids 12 cells.
     single        |s - 1| <= tol and no hidden-streams bit 1
     hidden multi  |s - 1| <= tol with the bit: multi-stream volume the count does not show (a fold
                                          thinner than the sampling; velocity_single_stream masks it too)
@@ -19,7 +21,9 @@ partly multi-stream cell reads 1.5 and the bins are named by THRESHOLD, not by a
 Mass weights are the density grid as stored (rho/rho_bar or the physical density: both are the cell
 mass up to one constant, which cancels in every fraction). The grids may be memmaps: the accumulation
 runs in slabs along axis 0, every grid sliced with the SAME [start:stop] (FieldSet.iter_slabs picks a
-thickness per dtype, so it is not used here), and a 1024^3 run stays within a few hundred MB.
+thickness per dtype, so it is not used here): 256 MB of float32 per grid and slab, and add()'s temporaries
+(the float64 copies of the streams and the density, the int label arrays, the bincount indices) take
+about ten times that, so a run of any size stays within a few GB.
 
     from dtfelib import webstreams as ws
     table = ws.environment_table(fs.load("tweb", mode="memmap"), fs.load("streams", mode="memmap"),
@@ -35,7 +39,7 @@ import math
 
 import numpy as np
 
-from .io import STREAM_TOL, caustic_collapse_max, caustic_is_fold
+from .io import STREAM_TOL, caustic_collapse_max, caustic_is_fold, single_stream_mask
 
 WEB_NAMES = ("void", "wall", "filament", "node", "other")
 STREAM_BINS = ("empty", "single", "hidden multi", "1 < s <= 3", "3 < s <= 5", "s > 5")
@@ -57,13 +61,10 @@ def stream_bins(streams, hidden=None, tol: float = STREAM_TOL) -> np.ndarray:
     s = np.asarray(streams, dtype=np.float32)
     out = np.full(s.shape, 3, dtype=np.int8)                 # 1 < s <= 3
     out[s < 1.0 - tol] = 0
-    single = np.abs(s - 1.0) <= tol
-    if hidden is not None:                                   # bit 1, decoded as velocity_single_stream does
-        hb = (np.rint(np.asarray(hidden, dtype=np.float32)).astype(np.int32) & 1) != 0
-        out[single & ~hb] = 1
-        out[single & hb] = 2
-    else:
-        out[single] = 1
+    near = np.abs(s - 1.0) <= tol                            # one stream by the count ...
+    single = single_stream_mask(s, hidden, tol)              # ... and no hidden bit: THE rule (io.single_stream_mask)
+    out[single] = 1
+    out[near & ~single] = 2
     out[s > 3.0 + tol] = 4
     out[s > 5.0 + tol] = 5
     return out
@@ -203,12 +204,14 @@ def table_text(table: dict, title: str = "") -> str:
 
 
 def save_table(table: dict, path, title: str = "") -> None:
-    """'<path>.json' (the dict, None where undefined) and '<path>.txt' (table_text)."""
+    """'<path>.json' (the dict, None where undefined) and '<path>.txt' (table_text). The suffix is
+    APPENDED: a path named by its redshift ('..._z0.50') must not lose '.50' to with_suffix (z = 0 and
+    z = 0.5 landed on one file, found on the first real run 2026-10-05)."""
     from pathlib import Path
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.with_suffix(".json").write_text(json.dumps(table, indent=1))
-    p.with_suffix(".txt").write_text(table_text(table, title))
+    Path(f"{p}.json").write_text(json.dumps(table, indent=1))
+    Path(f"{p}.txt").write_text(table_text(table, title))
 
 
 def single_stream_fraction(table: dict, weighting: str = "volume") -> dict:

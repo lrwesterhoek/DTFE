@@ -28,7 +28,7 @@ DPI = config.DPI
 SNAPSHOT_TO_REDSHIFT = config.SNAPSHOT_TO_REDSHIFT
 
 
-def plot_axis_ratios(axis_ratios, density_values=None, redshift=None, save_path=None):
+def plot_axis_ratios(axis_ratios, density_values=None, redshift=None, save_path=None, sim=None):
     if len(axis_ratios) == 0:
         print("  No data to plot for axis ratios")
         return
@@ -40,7 +40,7 @@ def plot_axis_ratios(axis_ratios, density_values=None, redshift=None, save_path=
 
     if density_values is not None:
         dnorm = style.norm_signed_log(field='delta',
-                                      vmax=pipeline.series_vmax('delta', density_values))
+                                      vmax=pipeline.series_vmax('delta', density_values, sim=sim))
         sc = plt.scatter(b_a, c_a, c=density_values, cmap=style.CMAP['delta'],
                          norm=dnorm, s=30, alpha=0.7)
         cbar = plt.colorbar(sc)
@@ -68,7 +68,7 @@ def plot_axis_ratios(axis_ratios, density_values=None, redshift=None, save_path=
     else:
         plt.show()
 
-def plot_bbks_parameters(bbks_params, density_values=None, redshift=None, save_path=None):
+def plot_bbks_parameters(bbks_params, density_values=None, redshift=None, save_path=None, sim=None):
     if len(bbks_params) == 0:
         print("  No data to plot for BBKS parameters")
         return
@@ -80,7 +80,7 @@ def plot_bbks_parameters(bbks_params, density_values=None, redshift=None, save_p
 
     if density_values is not None:
         dnorm = style.norm_signed_log(field='delta',
-                                      vmax=pipeline.series_vmax('delta', density_values))
+                                      vmax=pipeline.series_vmax('delta', density_values, sim=sim))
         sc = plt.scatter(e_values, p_values, c=density_values, cmap=style.CMAP['delta'],
                          norm=dnorm, s=30, alpha=0.7)
         cbar = plt.colorbar(sc)
@@ -190,10 +190,10 @@ def process_snapshot(snapshot, redshift, sim=None, method=None, prefix=None, dat
             print(f"  Prolate: {prolate_pct:.1f}%, Oblate: {oblate_pct:.1f}%")
         
         print("Creating visualizations")
-        plot_axis_ratios(axis_ratios, density_values, redshift=redshift, 
+        plot_axis_ratios(axis_ratios, density_values, redshift=redshift, sim=sim,
                         save_path=output_path / f'void_axis_ratios_z{redshift:.2f}.png')
         
-        plot_bbks_parameters(bbks_params, density_values, redshift=redshift, 
+        plot_bbks_parameters(bbks_params, density_values, redshift=redshift, sim=sim,
                            save_path=output_path / f'void_bbks_params_z{redshift:.2f}.png')
         
         plot_bbks_histograms(bbks_params, redshift=redshift, 

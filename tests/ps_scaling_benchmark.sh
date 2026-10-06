@@ -26,7 +26,7 @@ PARTITION="${PARTITION:-2 2 2}"   # Lagrangian partition grid; parallelism is ov
 FIELDS="${FIELDS:-density velocity density_a}"
 MIN_EFFICIENCY="${MIN_EFFICIENCY:-0.4}"   # require speedup >= MIN_EFFICIENCY * cores at top core count
 BIN="./PS-DTFE"
-TMP="${SCRIPT_DIR}/tmp"; mkdir -p "${TMP}"
+TMP="${DTFE_TEST_TMP:-${TMPDIR:-/tmp}/dtfe-tests}"; mkdir -p "${TMP}"
 SNAP="${TMP}/ps_scaling_input.hdf5"
 
 NPROC="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)"

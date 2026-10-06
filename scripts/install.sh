@@ -35,6 +35,7 @@
 
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."   # run from the repo root (this script lives in scripts/)
+source scripts/install_lib.sh            # backup_binaries / restore_binaries / build_failed_hint
 
 BLUE='\033[0;34m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
 info()  { echo -e "${BLUE}[install]${NC} $1"; }
@@ -80,7 +81,14 @@ fi
 UNAME_S="$(uname -s)"
 if [ "$DO_DEPS" -eq 1 ]; then
     info "step 1/6: installing missing dependencies (skip with --no-deps)"
-    bash scripts/install_dependencies.sh
+    rc=0; bash scripts/install_dependencies.sh || rc=$?
+    if [ "$rc" -eq 3 ]; then                 # the Xcode Command Line Tools install was just started
+        warn "finish the Xcode Command Line Tools installation (its own window), then rerun ./scripts/install.sh"
+        exit 3
+    elif [ "$rc" -ne 0 ]; then
+        warn "install_dependencies.sh failed (exit $rc); nothing was built"
+        exit "$rc"
+    fi
 else
     info "step 1/6: skipped (--no-deps)"
 fi
@@ -149,15 +157,34 @@ fi
 info "step 2/6: build backend -> ${BACKEND}"
 
 # ---------------------------------------------------------------- 3/6 clean rebuild
+# The binaries already there are kept aside until the new ones have LINKED: 'make clean' then a failing
+# compile used to leave a user (re-running install.sh to add --double, say) with no ./PS-DTFE at all. The
+# build goes through a log; on a failure its tail and the usual causes are printed and the old binaries
+# come back. (survey rank 24, 2026-10-05)
 info "step 3/6: make clean + rebuild (jobs: ${JOBS})"
+BUILD_LOG="$(mktemp -t dtfe-install-build.XXXXXX)"
+BACKUP_DIR="$(mktemp -d -t dtfe-install-backup.XXXXXX)"
+kept="$(backup_binaries "$BACKUP_DIR")"
+[ "$kept" -gt 0 ] && info "the $kept binar$([ "$kept" = 1 ] && echo y || echo ies) already built are kept aside until the new ones link"
+on_build_error() {
+    warn "the build FAILED (log: ${BUILD_LOG})"
+    build_failed_hint "$BUILD_LOG" 20
+    if [ "$(restore_binaries "$BACKUP_DIR")" -gt 0 ]; then
+        warn "the previous binaries are back in place (nothing of yours was lost)"
+    fi
+    exit 1
+}
+trap on_build_error ERR
 make clean >/dev/null
 # shellcheck disable=SC2086  # GPU_ARG/PREC_ARG are deliberately word-split ("" or METAL=1 etc.)
-make DTFE    $GPU_ARG -j"$JOBS"
-make PS-DTFE $GPU_ARG -j"$JOBS"
+make DTFE    $GPU_ARG -j"$JOBS" 2>&1 | tee -a "$BUILD_LOG"
+make PS-DTFE $GPU_ARG -j"$JOBS" 2>&1 | tee -a "$BUILD_LOG"
 if [ -n "$PREC_ARG" ]; then        # the double pair: its own object directories and binary names
-    make DTFE    $GPU_ARG $PREC_ARG -j"$JOBS"
-    make PS-DTFE $GPU_ARG $PREC_ARG -j"$JOBS"
+    make DTFE    $GPU_ARG $PREC_ARG -j"$JOBS" 2>&1 | tee -a "$BUILD_LOG"
+    make PS-DTFE $GPU_ARG $PREC_ARG -j"$JOBS" 2>&1 | tee -a "$BUILD_LOG"
 fi
+trap - ERR
+rm -rf "$BACKUP_DIR"
 
 # ---------------------------------------------------------------- 4/6 python package
 if [ "$DO_PYTHON" -eq 1 ]; then

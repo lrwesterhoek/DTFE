@@ -78,7 +78,7 @@ source "${SCRIPT_DIR}/precision.sh"     # DTFE_TEST_PRECISION=double: the double
 PY="${PYTHON:-python3}"
 
 N="${N:-32}"; GRID="${GRID:-64}"; BOX=100.0
-TMP="${SCRIPT_DIR}/tmp"; mkdir -p "${TMP}"
+TMP="${DTFE_TEST_TMP:-${TMPDIR:-/tmp}/dtfe-tests}"; mkdir -p "${TMP}"
 # tessellation caches must live on a LOCAL, non-synced volume (the repo may sit in iCloud Drive)
 TESS_BASE="$(mktemp -d "${TMPDIR:-/tmp}/dtfe-pxs-tess.XXXXXX")"
 trap 'rm -rf "${TESS_BASE}"' EXIT

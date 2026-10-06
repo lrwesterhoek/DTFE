@@ -99,7 +99,7 @@ install_macos() {
         xcode-select --install
         print_warning "Please complete the Xcode Command Line Tools installation"
         print_warning "Then run this script again"
-        exit 0
+        exit 3                      # 'pending', not success: install.sh stops instead of failing at make
     else
         print_success "Xcode Command Line Tools already installed"
     fi

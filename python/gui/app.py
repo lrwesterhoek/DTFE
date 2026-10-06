@@ -32,9 +32,10 @@ import sys
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QLocale, QProcess, QProcessEnvironment, QRect, QSettings, QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import (QLocale, QProcess, QProcessEnvironment, QRect, QRegularExpression, QSettings, QSize, Qt,
+                            QTimer, QUrl, Signal)
 from PySide6.QtGui import (QAction, QActionGroup, QColor, QDesktopServices, QFont, QFontDatabase, QIcon,
-                           QImageReader, QIntValidator, QKeySequence, QPixmap, QShortcut)
+                           QImageReader, QIntValidator, QKeySequence, QPixmap, QShortcut, QTextCursor, QTextDocument)
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
     QFileDialog, QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel,
@@ -58,6 +59,24 @@ CHECK_ICON = {"error": "✖  ", "warning": "⚠  ", "ok": "✔  ", "info": "ℹ 
 CHECK_COLOR = {"error": ERROR_COLOR, "warning": WARN_COLOR, "ok": OK_COLOR, "info": INFO_COLOR,
                "hint": INFO_COLOR}
 DATA, GRIDS, OWN, PIPELINE, PLOTS, EXPLORE = range(6)
+PROBLEM_LINES = r"(?i)\berror\b|\bwarning\b|failed|mismatch|out of memory|^!! "    # the log's 'next problem'
+
+
+def clock_text(sec: float) -> str:
+    """A running clock: '0:07', '12:40', '2:05:09'."""
+    sec = int(max(0.0, sec))
+    h, m, s_ = sec // 3600, sec % 3600 // 60, sec % 60
+    return f"{h}:{m:02d}:{s_:02d}" if h else f"{m}:{s_:02d}"
+
+
+def took_text(sec: float) -> str:
+    """How long a job took: '7 s', '12m 40s', '2h 05m'."""
+    sec = int(round(max(0.0, sec)))
+    if sec < 60:
+        return f"{sec} s"
+    if sec < 3600:
+        return f"{sec // 60}m {sec % 60:02d}s"
+    return f"{sec // 3600}h {sec % 3600 // 60:02d}m"
 KIND_OF_TAB = {DATA: "data", GRIDS: "grids", OWN: "custom", PIPELINE: "pipeline", PLOTS: "plots"}
 TAB_OF_KIND = {k: t for t, k in KIND_OF_TAB.items()}
 TAB_NAMES = ["data", "grids", "custom", "pipeline", "plots", "explore"]
@@ -164,6 +183,12 @@ def _dir_row(edit: QLineEdit, on_browse) -> QHBoxLayout:
     return row
 
 
+def _exclusive(a: QCheckBox, b: QCheckBox):
+    """Two options the binary refuses together: ticking one unticks the other."""
+    a.toggled.connect(lambda on: on and b.setChecked(False))
+    b.toggled.connect(lambda on: on and a.setChecked(False))
+
+
 def _checked(lst: QListWidget) -> list:
     return [lst.item(i).data(Qt.UserRole) for i in range(lst.count())
             if lst.item(i).checkState() == Qt.Checked]
@@ -200,7 +225,7 @@ def _hint(level: str, msg: str) -> tuple[str, str]:
 
 # ==================================================================== figure browser
 class FigureBrowser(QWidget):
-    """Figures under python/figures: the ones the last run wrote, or all of them, with a preview."""
+    """Figures under the figures root (rs.FIGURES_ROOT): the ones the last run wrote, or all of them, with a preview."""
     changed = Signal()          # the selection (what Open / Show in Finder act on): the menu bar follows
 
     def __init__(self):
@@ -365,6 +390,7 @@ class MainWindow(QMainWindow):
         self.custom_dirs: list[str] = [d for d in self._restore_json("custom_dirs", []) if isinstance(d, str)]
         self.user_presets: dict = self._restore_json("presets", {})
         self.show_commands = str(self._restore_json("show_commands", False)).lower() == "true"
+        self._explore_saved: dict = self._restore_json("explore", {}) if remember else {}   # restored on first show
         self.runs_cache: list[R.RunRecord] = []            # for the time estimates
         self._runs_scanned = 0.0
         self._job_text = ""                                  # this job's output, for the failure advice
@@ -376,6 +402,13 @@ class MainWindow(QMainWindow):
         self._steps: list[rs.Step] = []
         self._step_i, self._results = -1, []
         self._job_tab, self._job_start = GRIDS, None
+        self._total_known = False                          # the job's snapshot count known at its start
+        self._job_t0 = self._step_t0 = None               # monotonic clock of the job / its step (survey item 14)
+        self._snap_t0s: list[float] = []                   # when each snapshot of the job started (the ETA)
+        self._per_snap_prior = None                        # seconds per snapshot from earlier runs, before one is done
+        self._queue_est: tuple[float, float, int] | None = None   # (when, seconds, jobs without an estimate): the
+                                                           # clock ticks every second, the estimate is redone every minute
+        self._last_log_path = ""                           # the newest run log written beside the outputs
         self._panel_tab = GRIDS                              # the last tab with the run panel (not Explore)
         self._buffer, self._summary, self._stopping = "", "", False
         self._snaps_started = self._snaps_ok = self._total_snaps = 0
@@ -448,7 +481,15 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         self.setCentralWidget(splitter)
+        self.splitter = splitter
         self.resize(1400, 900)
+        if remember:                        # the size, place and pane split of the last session (survey item 15);
+            geo, split = self.settings.value("geometry"), self.settings.value("splitter")   # restoreGeometry fits
+            if geo is not None:             # a window from a screen no longer attached onto the current one
+                self.restoreGeometry(geo)
+            if split is not None:
+                splitter.restoreState(split)
+        self.setAcceptDrops(True)           # a grid file, a snapshot or a folder dropped on the window (item 18)
 
         self._load_into_widgets()
         self._read_widgets()            # the shared data (root, simulation, snapshots) into every job
@@ -793,8 +834,9 @@ class MainWindow(QMainWindow):
         col.addWidget(g)
 
         g, self.field_checks = self._fields_group()
+        self.fields_box = g
         self.fields_note = _note()
-        g.layout().addWidget(self.fields_note, 3, 0, 1, 3)
+        g.layout().addWidget(self.fields_note, g.layout().rowCount(), 0, 1, 3)      # below the threshold row
         col.addWidget(g)
 
         self.ps_group = QGroupBox("Phase-space options")
@@ -803,11 +845,13 @@ class MainWindow(QMainWindow):
         self.vw_check = QCheckBox(P.label("volume_weighted"))
         self.ca_check = QCheckBox(P.label("caustics"))
         self.cu_check = QCheckBox(P.label("caustic_cusps"))
+        self.ld_check = QCheckBox(P.label("linear_deposit"))
         for cb, key in ((self.vm_check, "vertex_mass"), (self.vw_check, "volume_weighted"),
-                        (self.ca_check, "caustics"), (self.cu_check, "caustic_cusps")):
+                        (self.ca_check, "caustics"), (self.cu_check, "caustic_cusps"), (self.ld_check, "linear_deposit")):
             cb.setToolTip(P.tooltip(key))
             cb.toggled.connect(self._changed)
             v.addWidget(cb)
+        _exclusive(self.ld_check, self.vw_check)
         col.addWidget(self.ps_group)
 
         self.slice_group = QGroupBox("Hi-res slice (point evaluation)")
@@ -822,7 +866,7 @@ class MainWindow(QMainWindow):
         col.addWidget(self.slice_group)
 
         g, (self.part_spin, self.conc_spin, self.scratch_edit, self.prefix_edit,
-            self.pt_check, self.prec_combo) = self._resources_group()
+            self.pt_check, self.prec_combo, self.budget_spin, self.tess_edit) = self._resources_group()
         col.addWidget(g)
         col.addStretch(1)
         w = QWidget()
@@ -860,6 +904,24 @@ class MainWindow(QMainWindow):
             grid.addWidget(cb, i // 3, i % 3)
         for c in range(3):                  # equal columns: the last one must not be starved of width
             grid.setColumnStretch(c, 1)
+        row = QHBoxLayout()                 # the T-web / V-web eigenvalue threshold: only with a web class ticked
+        lam = QDoubleSpinBox(minimum=0.0, maximum=10.0, decimals=2, singleStep=0.05, value=rs.LAMBDA_TH_DEFAULT)
+        lam.setToolTip("λ_th of the T-web / V-web classes: an eigenvalue above it counts as collapsing (a void "
+                       "has none, a wall one, a filament two, a node three). 0.3 is the scripts' default; the "
+                       "binary alone would use 0.")
+        lam.valueChanged.connect(self._changed)
+        row.addWidget(QLabel("T-web / V-web threshold λ_th"))
+        row.addWidget(lam)
+        row.addStretch(1)
+        grid.addLayout(row, (len(rs.PS_FIELDS) + 2) // 3, 0, 1, 3)
+        g.lambda_spin = lam
+
+        def web_on(_on=False):
+            lam.setEnabled(any(checks[w].isChecked() and checks[w].isEnabled() for w in rs.WEB_FIELDS))
+        for w in rs.WEB_FIELDS:
+            checks[w].toggled.connect(web_on)
+        g.sync_lambda = web_on
+        web_on()
         return g, checks
 
     def _resources_group(self):
@@ -883,6 +945,8 @@ class MainWindow(QMainWindow):
         ptri.toggled.connect(self._changed)
         f.addRow("", ptri)
         prec = QComboBox()
+        prec.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)   # its long double-precision text
+        prec.setMinimumContentsLength(24)       # made the tab wider than the pane: the '…' buttons were cut off
         for key in rs.PRECISIONS:
             prec.addItem(rs.PRECISION_TEXT[key], key)
         prec.setToolTip("Which pair of programs runs: the single-precision one (the default), or the "
@@ -894,7 +958,23 @@ class MainWindow(QMainWindow):
         prefix = QLineEdit()
         prefix.editingFinished.connect(self._changed)
         f.addRow("Output prefix", prefix)
-        return g, (part, conc, scratch, prefix, ptri, prec)
+        budget = QDoubleSpinBox(minimum=0.0, maximum=4096.0, decimals=0, singleStep=4.0)
+        budget.setSpecialValueText("auto (free memory)")
+        budget.setSuffix(" GB")
+        budget.setToolTip("The memory the auto-tuner plans the partitions and concurrency for "
+                          "(DTFE_MEM_BUDGET_GB). Auto: what is free when the run starts. Set it lower to leave room "
+                          "for other work, higher when you know the memory will be free (it may swap).")
+        budget.valueChanged.connect(self._changed)
+        f.addRow("Memory budget", budget)
+        tess = QLineEdit()
+        tess.setPlaceholderText("none: triangulate every run")
+        tess.setToolTip("Reuse the Delaunay tessellation of an identical earlier run (the binary's tessellation "
+                        "cache): the "
+                        "dominant fixed cost of a rerun with other fields, grids or sample points (measured "
+                        "10.9 s -> 4.6 s). A LOCAL folder (iCloud is refused); about 0.15 KB per vertex of disk.")
+        tess.editingFinished.connect(self._changed)
+        f.addRow("Tessellation cache", _dir_row(tess, lambda: self._browse_dir(tess, "Tessellation cache folder")))
+        return g, (part, conc, scratch, prefix, ptri, prec, budget, tess)
 
     # ================================================================ Custom snapshot tab
     def _build_own_tab(self) -> QWidget:
@@ -1015,11 +1095,55 @@ class MainWindow(QMainWindow):
         self.o_vw.setToolTip(P.tooltip("volume_weighted"))
         self.o_ca = QCheckBox(P.label("caustics"))
         self.o_ca.setToolTip(P.tooltip("caustics"))
-        for cb in (self.o_gpu, self.o_vm, self.o_vw, self.o_ca):
+        self.o_cu = QCheckBox(P.label("caustic_cusps"))
+        self.o_cu.setToolTip(P.tooltip("caustic_cusps"))
+        self.o_ld = QCheckBox(P.label("linear_deposit"))
+        self.o_ld.setToolTip(P.tooltip("linear_deposit"))
+        for cb in (self.o_gpu, self.o_vm, self.o_vw, self.o_ca, self.o_cu, self.o_ld):
             cb.toggled.connect(self._changed)
             f.addRow("", cb)
+        _exclusive(self.o_ld, self.o_vw)
+        col.addWidget(g)
+        g = QGroupBox("Points and window")
+        f = QFormLayout(g)
+        self.o_points = QLineEdit(placeholderText="none: the grid only")
+        self.o_points.setToolTip(P.tooltip("sample_points"))
+        self.o_points.editingFinished.connect(self._changed)
+        f.addRow("Sample points", _dir_row(self.o_points, lambda: (self._browse_file(self.o_points, "Sample points file"),
+                                                                    self._changed())))
+        self.o_pvg = QCheckBox(P.label("slice_vel_grad"))
+        self.o_pvg.setToolTip(P.tooltip("slice_vel_grad"))
+        self.o_pvg.toggled.connect(self._changed)
+        f.addRow("", self.o_pvg)
+        self.o_window = QLineEdit(placeholderText="none: the whole grid")
+        self.o_window.setToolTip(P.tooltip("window") + "\n\nGive x0 x1 y0 y1 z0 z1 in Mpc (2D: four numbers).")
+        self.o_window.editingFinished.connect(self._changed)
+        f.addRow("Window (Mpc)", self.o_window)
+        self.o_sdens = QComboBox()
+        self.o_sdens.addItem("DTFE interpolation of the vertex densities (default)", "dtfe")
+        self.o_sdens.addItem("geometric: the tetrahedron's mass over its volume", "geometric")
+        self.o_sdens.setToolTip(P.tooltip("stream_density"))
+        self.o_sdens.currentIndexChanged.connect(self._changed)
+        f.addRow("Stream density", self.o_sdens)
+        self.o_pstream = QCheckBox(P.label("per_stream"))
+        self.o_pstream.setToolTip(P.tooltip("per_stream"))
+        self.o_pids = QCheckBox(P.label("per_stream_ids"))
+        self.o_pids.setToolTip(P.tooltip("per_stream_ids"))
+        for cb in (self.o_pstream, self.o_pids):
+            cb.toggled.connect(self._changed)
+            f.addRow("", cb)
+        hr = QHBoxLayout()
+        self.o_halo = QDoubleSpinBox(minimum=0.0, maximum=1e7, decimals=0, singleStep=100.0)
+        self.o_halo.setSpecialValueText("off")
+        self.o_halo.setToolTip(P.tooltip("halo_release"))
+        self.o_halo.valueChanged.connect(self._changed)
+        hr.addWidget(self.o_halo)
+        hr.addStretch(1)
+        f.addRow("Halo release (ρ/ρ̄)", hr)
+        self.o_points_box = g
         col.addWidget(g)
         g, self.o_fields = self._fields_group()
+        self.o_fields_box = g
         col.addWidget(g)
 
         g = QGroupBox("Output")
@@ -1031,7 +1155,8 @@ class MainWindow(QMainWindow):
         self.o_name.editingFinished.connect(self._changed)
         f.addRow("Name", self.o_name)
         col.addWidget(g)
-        g, (self.o_part, self.o_conc, self.o_scratch, _prefix, self.o_pt, self.o_prec) = self._resources_group()
+        g, (self.o_part, self.o_conc, self.o_scratch, _prefix, self.o_pt, self.o_prec,
+            self.o_budget, self.o_tess) = self._resources_group()
         _prefix.hide()
         g.layout().labelForField(_prefix).hide()
         col.addWidget(g)
@@ -1086,6 +1211,9 @@ class MainWindow(QMainWindow):
         self.p_sims = QListWidget()
         self.p_sims.setMaximumHeight(100)
         self.p_sims.itemChanged.connect(self._changed)
+        self.p_sims.setDragDropMode(QAbstractItemView.InternalMove)     # the run order: drag a simulation up or down
+        self.p_sims.setToolTip("Tick the simulations to run. They run from the top down: drag one to change the order")
+        self.p_sims.model().rowsMoved.connect(lambda *_: self._changed())
         v.addWidget(self.p_sims)
         v.addWidget(_note("Computes every snapshot whose slice is missing or out of date."))
         col.addWidget(g)
@@ -1154,6 +1282,7 @@ class MainWindow(QMainWindow):
         col.addWidget(g)
 
         g, self.p_fields = self._fields_group("Grids")
+        self.p_fields_box = g
         gr = QHBoxLayout()
         self.p_grid = _grid_combo(self)
         self.p_grid.currentTextChanged.connect(self._changed)
@@ -1161,7 +1290,7 @@ class MainWindow(QMainWindow):
         gr.addWidget(self.p_grid)
         gr.addWidget(QLabel("³ cells    sub-samples per axis"))
         self.p_nsub = QSpinBox(minimum=1, maximum=6)
-        self.p_nsub.setToolTip("nSub³ sample points per cell for the sampled deposit (AVG_SUBSAMPLES)")
+        self.p_nsub.setToolTip("nSub³ sample points per cell for the sampled deposit")
         self.p_nsub.valueChanged.connect(self._changed)
         gr.addWidget(self.p_nsub)
         gr.addStretch(1)
@@ -1191,14 +1320,17 @@ class MainWindow(QMainWindow):
         self.p_vw = QCheckBox(P.label("volume_weighted"))
         self.p_ca = QCheckBox(P.label("caustics"))
         self.p_cu = QCheckBox(P.label("caustic_cusps"))
+        self.p_ld = QCheckBox(P.label("linear_deposit"))
         for cb, key in ((self.p_vm, "vertex_mass"), (self.p_vw, "volume_weighted"),
-                        (self.p_ca, "caustics"), (self.p_cu, "caustic_cusps")):
+                        (self.p_ca, "caustics"), (self.p_cu, "caustic_cusps"), (self.p_ld, "linear_deposit")):
             cb.setToolTip(P.tooltip(key))
             cb.toggled.connect(self._changed)
             v.addWidget(cb)
+        _exclusive(self.p_ld, self.p_vw)
         col.addWidget(g)
 
-        g, (self.p_part, self.p_conc, self.p_scratch, self.p_prefix, self.p_pt, self.p_prec) = self._resources_group()
+        g, (self.p_part, self.p_conc, self.p_scratch, self.p_prefix, self.p_pt, self.p_prec,
+            self.p_budget, self.p_tess) = self._resources_group()
         col.addWidget(g)
 
         g = QGroupBox("Run")
@@ -1206,8 +1338,9 @@ class MainWindow(QMainWindow):
         self.p_force = QCheckBox("Recompute every snapshot, up to date or not")
         self.p_plan = QCheckBox("Plan only: show what would run")
         self.p_render = QCheckBox("Then render the point-evaluated figures")
-        self.p_force.setToolTip("Ignore every freshness check (FORCE)")
-        self.p_plan.setToolTip("Print the plan, compute nothing (DRY_RUN)")
+        self.p_force.setToolTip("Ignore every freshness check: recompute even snapshots whose grids are newer than "
+                                "their inputs")
+        self.p_plan.setToolTip("Print what would run for each snapshot, and compute nothing")
         self.p_render.setToolTip("plot_pointeval.py, on this pipeline's own image plane, with the options below")
         for cb in (self.p_force, self.p_plan, self.p_render):
             cb.toggled.connect(self._changed)
@@ -1220,6 +1353,11 @@ class MainWindow(QMainWindow):
                                   "plot_pointeval.py); blank = every field the run wrote")
         self.p_rfields.editingFinished.connect(self._changed)
         rf.addRow("Fields", self.p_rfields)
+        self.p_froot = QLineEdit(placeholderText=f"default: {rs.FIGURES_ROOT}")
+        self.p_froot.setToolTip("Where the rendered figures go")
+        self.p_froot.editingFinished.connect(self._changed)
+        rf.addRow("Figures folder", _dir_row(self.p_froot, lambda: (self._browse_dir(self.p_froot, "Figures folder"),
+                                                                    self._changed())))
         self.p_rproject = QComboBox()
         self.p_rproject.addItem("the central plane: a zero-thickness cross-section", "plane")
         self.p_rproject.addItem("slab: the mean over every plane of the slab", "slab")
@@ -1241,7 +1379,7 @@ class MainWindow(QMainWindow):
                                    "0 = none")
         self.p_rsmoothd.valueChanged.connect(self._changed)
         rf.addRow("Gradient maps also smoothed at", self.p_rsmoothd)
-        self.p_rfixed = QCheckBox("Fixed density range of the grid maps (0.1 .. 1e4) instead of a percentile stretch")
+        self.p_rfixed = QCheckBox("Fixed density range of the grid maps (0.1 .. 1e4)")
         self.p_rfixed.setToolTip("The fixed-range option of plot_pointeval.py: side-by-side comparison with the grid "
                                  "slice maps; clips ~26% of a z=0 image to the darkest colour")
         self.p_rforce = QCheckBox("Re-render figures newer than their data")
@@ -1293,6 +1431,11 @@ class MainWindow(QMainWindow):
         self.pl_smooth.setSuffix(" cells")
         self.pl_smooth.valueChanged.connect(self._changed)
         f.addRow("Smoothing", self.pl_smooth)
+        self.pl_froot = QLineEdit(placeholderText=f"default: {rs.FIGURES_ROOT}")
+        self.pl_froot.setToolTip(f"Where the point-evaluated maps go (the other figure sets write under {rs.FIGURES_ROOT})")
+        self.pl_froot.editingFinished.connect(self._changed)
+        f.addRow("Figures folder", _dir_row(self.pl_froot, lambda: (self._browse_dir(self.pl_froot, "Figures folder"),
+                                                                     self._changed())))
         col.addWidget(g)
         col.addStretch(1)
         w = QWidget()
@@ -1305,7 +1448,7 @@ class MainWindow(QMainWindow):
         f.setContentsMargins(4, 4, 4, 4)
         about = QLabel(fs.about)
         about.setWordWrap(True)
-        about.setToolTip(f"python/{fs.script}, {PER_TEXT[fs.per]}  →  python/figures/{fs.output}")
+        about.setToolTip(f"python/{fs.script}, {PER_TEXT[fs.per]}  →  {rs.FIGURES_ROOT / fs.output}")
         f.addRow(about)
         for o in fs.opts:
             if o.kind == "bool":
@@ -1315,7 +1458,9 @@ class MainWindow(QMainWindow):
                 w = QSpinBox(minimum=0, maximum=1_000_000)
                 w.valueChanged.connect(self._changed)
             elif o.kind == "float":
-                w = QDoubleSpinBox(minimum=0.0, maximum=1000.0, decimals=2, singleStep=0.5)
+                lo, hi, dec = o.limits or (0.0, 1000.0, 2)
+                w = QDoubleSpinBox(decimals=dec, singleStep=0.5)     # decimals FIRST: the range rounds to them
+                w.setRange(lo, hi)
                 w.valueChanged.connect(self._changed)
             elif o.kind == "choice":
                 w = QComboBox()
@@ -1324,6 +1469,16 @@ class MainWindow(QMainWindow):
             elif o.kind == "plane":
                 w = QComboBox()
                 w.currentIndexChanged.connect(self._changed)
+            elif o.kind == "multi":
+                w = QListWidget()
+                for choice in o.choices:
+                    it = QListWidgetItem(choice)
+                    it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
+                    it.setCheckState(Qt.Unchecked)
+                    w.addItem(it)
+                w.setMaximumHeight(min(len(o.choices), 8) * 20 + 8)
+                w.itemChanged.connect(self._changed)
+                _checkable(w)
             else:
                 w = QLineEdit(placeholderText=o.help)
                 w.editingFinished.connect(self._changed)
@@ -1345,6 +1500,10 @@ class MainWindow(QMainWindow):
             w.setCurrentText(str(value))
         elif o.kind == "plane":
             w.setCurrentIndex(max(w.findData(str(value)), 0))
+        elif o.kind == "multi":
+            want = {v.strip() for v in str(value).split(",") if v.strip()}
+            for i in range(w.count()):
+                w.item(i).setCheckState(Qt.Checked if w.item(i).text() in want else Qt.Unchecked)
         else:
             w.setText(str(value))
 
@@ -1358,6 +1517,8 @@ class MainWindow(QMainWindow):
             return w.currentText()
         if o.kind == "plane":
             return w.currentData() or ""
+        if o.kind == "multi":
+            return ",".join(w.item(i).text() for i in range(w.count()) if w.item(i).checkState() == Qt.Checked)
         return w.text().strip()
 
     # ================================================================ run panel
@@ -1426,9 +1587,14 @@ class MainWindow(QMainWindow):
         self.bar.setValue(0)
         self.bar.setFormat("")
         self.eta = QLabel("")
+        self.clock = QLabel("")             # the job's wall clock: 'mm:ss elapsed', then 'took 12m 40s'
+        self.clock.setStyleSheet("color: gray")
+        self._clock_timer = QTimer(self, interval=1000)
+        self._clock_timer.timeout.connect(self._tick_clock)
         prog.addWidget(self.snap_label)
         prog.addWidget(self.bar, 1)
         prog.addWidget(self.eta)
+        prog.addWidget(self.clock)
         v.addLayout(prog)
 
         # after a failed job: what probably went wrong, and a button that fixes it where one can
@@ -1460,10 +1626,88 @@ class MainWindow(QMainWindow):
         self.results.setTabToolTip(self.results.indexOf(self.runs),
                                    "Every run on disk: settings, time, memory, size, and outputs made before a fix")
         self.results.currentChanged.connect(self._results_tab_changed)
+        self.results.setCornerWidget(self._build_log_find(), Qt.TopRightCorner)
         v.addWidget(self.results, 1)
         w = QWidget()
         w.setLayout(v)
         return w
+
+    def _focus_log_find(self):
+        if self.right.currentIndex() != 0:          # Explore shows its own pane: back to the run panel
+            self.tabs.setCurrentIndex(self._panel_tab)
+        self.results.setCurrentIndex(self.results.indexOf(self.log))
+        self.log_find.setFocus()
+        self.log_find.selectAll()
+
+    def _build_log_find(self) -> QWidget:
+        """Find in the log (survey item 16): a field in the result tabs' corner, shown with the Log tab;
+        Enter / the arrows step through the matches (wrapping), '!' to the next error, warning or FAILED."""
+        w = QWidget()
+        h = QHBoxLayout(w)
+        h.setContentsMargins(0, 0, 4, 0)
+        h.setSpacing(2)
+        self.log_find = QLineEdit(placeholderText="Find in the log")
+        self.log_find.setClearButtonEnabled(True)
+        self.log_find.setMaximumWidth(220)
+        self.log_find.returnPressed.connect(lambda: self.find_in_log(self.log_find.text()))
+        self.log_find.textChanged.connect(lambda _t: self.log_find_count.setText(""))
+        h.addWidget(self.log_find)
+        for text, tip, fn in (("▲", "Previous match", lambda: self.find_in_log(self.log_find.text(), back=True)),
+                              ("▼", "Next match (Enter)", lambda: self.find_in_log(self.log_find.text())),
+                              ("!", "Next error, warning or failure", lambda: self.find_in_log(PROBLEM_LINES, regex=True))):
+            b = QToolButton(text=text)
+            b.setToolTip(tip)
+            b.clicked.connect(fn)
+            h.addWidget(b)
+        self.log_find_count = QLabel("")
+        self.log_find_count.setStyleSheet("color: gray")
+        h.addWidget(self.log_find_count)
+        return w
+
+    def find_in_log(self, text: str, back: bool = False, regex: bool = False) -> bool:
+        """Select the next (previous) match after (before) the cursor, wrapping at the end; the count of
+        matches beside the field. False when there is none."""
+        if not text:
+            return False
+        self.results.setCurrentIndex(self.results.indexOf(self.log))
+        pattern = QRegularExpression(text if regex else QRegularExpression.escape(text),
+                                     QRegularExpression.MultilineOption
+                                     | QRegularExpression.CaseInsensitiveOption)
+        if not pattern.match(self.log.toPlainText()).hasMatch():
+            self.log_find_count.setText("no match")     # before the cursor moves: the log keeps following the run
+            return False
+        flags = QTextDocument.FindBackward if back else QTextDocument.FindFlag(0)
+        found = self.log.find(pattern, flags)
+        if not found:                       # wrap: from the other end
+            c = self.log.textCursor()
+            c.movePosition(QTextCursor.End if back else QTextCursor.Start)
+            self.log.setTextCursor(c)
+            found = self.log.find(pattern, flags)
+        doc = self.log.toPlainText()
+        it = pattern.globalMatch(doc)
+        starts = []
+        while it.hasNext():
+            starts.append(it.next().capturedStart())
+        if found:
+            k = sum(1 for s_ in starts if s_ < self.log.textCursor().selectionStart()) + 1
+            self.log_find_count.setText(f"{k} of {len(starts)}")
+            self.log.centerCursor()
+        else:
+            self.log_find_count.setText("no match")
+        return found
+
+    def copy_log(self):
+        QApplication.clipboard().setText(self.log.toPlainText())
+        self.status_message("the log is on the clipboard")
+
+    def open_run_log(self):
+        """The newest run's full log file (the Log tab keeps the last 20000 lines)."""
+        if self._last_log_path and Path(self._last_log_path).is_file():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self._last_log_path))
+
+    def _sync_log_actions(self):
+        if hasattr(self, "open_log_action"):
+            self.open_log_action.setEnabled(bool(self._last_log_path) and Path(self._last_log_path).is_file())
 
     def _build_queue_tab(self) -> QWidget:
         w = QWidget()
@@ -1530,10 +1774,14 @@ class MainWindow(QMainWindow):
         self.vw_check.setChecked(s.volume_weighted)
         self.ca_check.setChecked(s.caustics)
         self.cu_check.setChecked(s.caustic_cusps)
+        self.ld_check.setChecked(s.linear_deposit)
         self.vg_check.setChecked(s.slice_vel_grad)
         self.part_spin.setValue(s.partition)
         self.conc_spin.setValue(s.max_concurrent)
         self.scratch_edit.setText(s.scratch_dir)
+        self.budget_spin.setValue(s.mem_budget_gb)
+        self.tess_edit.setText(s.tess_cache)
+        self.fields_box.lambda_spin.setValue(s.lambda_th)
         self.prefix_edit.setText(s.output_prefix)
         self.pt_check.setChecked(s.parallel_triangulation)
         self.prec_combo.setCurrentIndex(max(self.prec_combo.findData(s.precision), 0))
@@ -1557,16 +1805,21 @@ class MainWindow(QMainWindow):
         self.p_vw.setChecked(p.volume_weighted)
         self.p_ca.setChecked(p.caustics)
         self.p_cu.setChecked(p.caustic_cusps)
+        self.p_ld.setChecked(p.linear_deposit)
         self.p_pt.setChecked(p.parallel_triangulation)
         self.p_part.setValue(p.partition)
         self.p_conc.setValue(p.max_concurrent)
         self.p_scratch.setText(p.scratch_dir)
+        self.p_budget.setValue(p.mem_budget_gb)
+        self.p_tess.setText(p.tess_cache)
+        self.p_fields_box.lambda_spin.setValue(p.lambda_th)
         self.p_prefix.setText(p.output_prefix)
         self.p_prec.setCurrentIndex(max(self.p_prec.findData(p.precision), 0))
         self.p_force.setChecked(p.force)
         self.p_plan.setChecked(p.plan_only)
         self.p_render.setChecked(p.render)
         self.p_rfields.setText(p.render_fields)
+        self.p_froot.setText("" if Path(p.figures_root) == rs.FIGURES_ROOT else p.figures_root)
         self.p_rproject.setCurrentIndex(max(self.p_rproject.findData(p.render_project), 0))
         self.p_rsmooth.setValue(p.render_smooth)
         self.p_rsmoothd.setValue(p.render_smooth_derivatives)
@@ -1592,6 +1845,15 @@ class MainWindow(QMainWindow):
         self.o_vm.setChecked(c.vertex_mass)
         self.o_vw.setChecked(c.volume_weighted)
         self.o_ca.setChecked(c.caustics)
+        self.o_cu.setChecked(c.caustic_cusps)
+        self.o_ld.setChecked(c.linear_deposit)
+        self.o_points.setText(c.sample_points)
+        self.o_pvg.setChecked(c.pts_vel_grad)
+        self.o_window.setText(" ".join(f"{v:g}" for v in c.window))
+        self.o_sdens.setCurrentIndex(max(self.o_sdens.findData(c.stream_density), 0))
+        self.o_pstream.setChecked(c.per_stream)
+        self.o_pids.setChecked(c.per_stream_ids)
+        self.o_halo.setValue(c.halo_release)
         for name, cb in self.o_fields.items():
             cb.setChecked(name in c.fields)
         self.o_outdir.setText(c.output_dir)
@@ -1599,6 +1861,9 @@ class MainWindow(QMainWindow):
         self.o_part.setValue(c.partition)
         self.o_conc.setValue(c.max_concurrent)
         self.o_scratch.setText(c.scratch_dir)
+        self.o_budget.setValue(c.mem_budget_gb)
+        self.o_tess.setText(c.tess_cache)
+        self.o_fields_box.lambda_spin.setValue(c.lambda_th)
         self.o_pt.setChecked(c.parallel_triangulation)
         self.o_prec.setCurrentIndex(max(self.o_prec.findData(c.precision), 0))
         self._own_last_file = c.input_file
@@ -1610,6 +1875,7 @@ class MainWindow(QMainWindow):
         self.pl_method.setCurrentIndex(max(self.pl_method.findData(pl.method), 0))
         self.pl_prefix.setText(pl.prefix)
         self.pl_smooth.setValue(pl.smooth)
+        self.pl_froot.setText("" if Path(pl.figures_root) == rs.FIGURES_ROOT else pl.figures_root)
         for (set_key, key), (o, w) in self.opt_widgets.items():
             self._set_opt(o, w, pl.opt(set_key, key))
         self._loading = False
@@ -1642,11 +1908,15 @@ class MainWindow(QMainWindow):
         s.volume_weighted = self.vw_check.isChecked()
         s.caustics = self.ca_check.isChecked()
         s.caustic_cusps = self.cu_check.isChecked() and self.ca_check.isChecked()   # a greyed box cannot be unticked
+        s.linear_deposit = self.ld_check.isChecked()
         s.slice_plane = self.plane_combo.currentData() or ""
         s.slice_vel_grad = self.vg_check.isChecked()
         s.partition = self.part_spin.value()
         s.max_concurrent = self.conc_spin.value()
         s.scratch_dir = self.scratch_edit.text().strip()
+        s.mem_budget_gb = self.budget_spin.value()
+        s.tess_cache = self.tess_edit.text().strip()
+        s.lambda_th = self.fields_box.lambda_spin.value()
         s.output_prefix = self.prefix_edit.text().strip()
         s.parallel_triangulation = self.pt_check.isChecked()
         s.precision = self.prec_combo.currentData() or "single"
@@ -1670,16 +1940,21 @@ class MainWindow(QMainWindow):
         p.volume_weighted = self.p_vw.isChecked()
         p.caustics = self.p_ca.isChecked()
         p.caustic_cusps = self.p_cu.isChecked() and self.p_ca.isChecked()
+        p.linear_deposit = self.p_ld.isChecked()
         p.parallel_triangulation = self.p_pt.isChecked()
         p.partition = self.p_part.value()
         p.max_concurrent = self.p_conc.value()
         p.scratch_dir = self.p_scratch.text().strip()
+        p.mem_budget_gb = self.p_budget.value()
+        p.tess_cache = self.p_tess.text().strip()
+        p.lambda_th = self.p_fields_box.lambda_spin.value()
         p.output_prefix = self.p_prefix.text().strip()
         p.precision = self.p_prec.currentData() or "single"
         p.force = self.p_force.isChecked()
         p.plan_only = self.p_plan.isChecked()
         p.render = self.p_render.isChecked()
         p.render_fields = self.p_rfields.text().strip()
+        p.figures_root = self.p_froot.text().strip() or str(rs.FIGURES_ROOT)
         p.render_project = self.p_rproject.currentData() or "plane"
         p.render_smooth = self.p_rsmooth.value()
         p.render_smooth_derivatives = self.p_rsmoothd.value()
@@ -1708,12 +1983,27 @@ class MainWindow(QMainWindow):
         c.vertex_mass = self.o_vm.isChecked()
         c.volume_weighted = self.o_vw.isChecked()
         c.caustics = self.o_ca.isChecked()
+        c.caustic_cusps = self.o_cu.isChecked() and self.o_ca.isChecked()
+        c.linear_deposit = self.o_ld.isChecked()
+        c.sample_points = self.o_points.text().strip()
+        c.pts_vel_grad = self.o_pvg.isChecked()
+        c.stream_density = self.o_sdens.currentData() or "dtfe"
+        c.per_stream = self.o_pstream.isChecked()
+        c.per_stream_ids = self.o_pids.isChecked()
+        c.halo_release = self.o_halo.value()
+        try:
+            c.window = [float(t) for t in self.o_window.text().replace(",", " ").split()]
+        except ValueError:
+            c.window = [float("nan")]               # unreadable: problems() says so (not silently 'no window')
         c.fields = [n for n, _ in rs.PS_FIELDS if self.o_fields[n].isChecked()]
         c.output_dir = self.o_outdir.text().strip()
         c.output_name = self.o_name.text().strip()
         c.partition = self.o_part.value()
         c.max_concurrent = self.o_conc.value()
         c.scratch_dir = self.o_scratch.text().strip()
+        c.mem_budget_gb = self.o_budget.value()
+        c.tess_cache = self.o_tess.text().strip()
+        c.lambda_th = self.o_fields_box.lambda_spin.value()
         c.parallel_triangulation = self.o_pt.isChecked()
         c.precision = self.o_prec.currentData() or "single"
         # Plots
@@ -1721,6 +2011,7 @@ class MainWindow(QMainWindow):
         pl.method = self.pl_method.currentData() or "auto"
         pl.prefix = self.pl_prefix.text().strip()
         pl.smooth = self.pl_smooth.value()
+        pl.figures_root = self.pl_froot.text().strip() or str(rs.FIGURES_ROOT)
         opts: dict[str, dict] = {}
         for (set_key, key), (o, w) in self.opt_widgets.items():
             opts.setdefault(set_key, {})[key] = self._get_opt(o, w)
@@ -1741,7 +2032,11 @@ class MainWindow(QMainWindow):
             self.sim_combo.setCurrentText(self.spec.sim)
         wanted = set(self.pipe.sims) or {self.sim_combo.currentText()}
         self.p_sims.clear()
-        for sim in sims:
+        # the run order: the pipeline's simulations as saved (the user's drag order), then the rest in natural
+        # order -- TNG50 before TNG100 before TNG300 (text order ran TNG300 first)
+        order = [s_ for s_ in self.pipe.sims if s_ in sims] + sorted((s_ for s_ in sims if s_ not in self.pipe.sims),
+                                                                    key=G.sim_sort_key)
+        for sim in order:
             it = QListWidgetItem(sim)
             it.setData(Qt.UserRole, sim)
             it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
@@ -1859,7 +2154,10 @@ class MainWindow(QMainWindow):
         for field in (self.sim_combo, self.snap_list, self._snap_buttons):
             f.setRowVisible(field, shared)
         if tab == EXPLORE and not self.explore.outputs:
-            self.explore.refresh_outputs()
+            saved, self._explore_saved = self._explore_saved, {}
+            self.explore.refresh_outputs(select=(saved or {}).get("root") or None)
+            if saved:
+                self.explore.restore_state(saved)       # the output, field, slice and range of last time
 
     def _explore_keys(self, *_, tab: int | None = None):
         """The Explore arrow keys are on only on the Explore tab. Up / down also step off while a
@@ -1909,15 +2207,16 @@ class MainWindow(QMainWindow):
         # ---- Grids tab
         s = self.spec
         ps = s.estimator == "ps"
-        for w in (self.nsub_spin, self.ps_group, self.slice_group, self.prefix_edit):
-            w.setEnabled(ps)
+        for w in (self.nsub_spin, self.ps_group, self.prefix_edit):
+            w.setEnabled(ps)                # the hi-res slice works with both estimators (2026-10-06)
         self._deposit_texts(self.deposit_combo, ps)       # both estimators: standard DTFE's exact cell average
-        for cb in self.field_checks.values():
-            cb.setEnabled(ps)
-        self.fields_note.setText("" if ps else "Standard DTFE computes a fixed set of fields.")
+        for name, cb in self.field_checks.items():
+            cb.setEnabled(ps or name in rs.DTFE_ALLOWED_FIELDS)
+        self.fields_note.setText("" if ps else "Standard DTFE: the velocity dispersion is a phase-space field.")
         self.fields_note.setVisible(not ps)
+        self.fields_box.sync_lambda()
         self.cu_check.setEnabled(ps and s.caustics)
-        self.vg_check.setEnabled(ps and bool(s.slice_plane))
+        self.vg_check.setEnabled(bool(s.slice_plane))
         self.nsub_spin.setEnabled(ps and s.deposit == "sampled")
         gpu_ok = rs.gpu_built(s.estimator, s.precision)
         self.gpu_check.setText(P.label("gpu" if ps else "gpu_dtfe") + ("" if gpu_ok else " (this build has no GPU support)"))
@@ -1933,13 +2232,19 @@ class MainWindow(QMainWindow):
         c = self.custom
         cps = c.estimator == "ps"
         flat = c.dim == 2                   # the 2D programs: CPU only, sequential insertion
-        for w in (self.o_lag_box, self.o_vm, self.o_vw, self.o_ca, self.o_pt):
+        for w in (self.o_lag_box, self.o_vm, self.o_vw, self.o_ca, self.o_pt, self.o_ld, self.o_window, self.o_halo):
             w.setEnabled(cps)
+        for w in (self.o_sdens, self.o_pstream, self.o_pids):      # the sample points' phase-space options
+            w.setEnabled(cps and bool(c.sample_points))
+        self.o_cu.setEnabled(cps and c.caustics)
+        self.o_pvg.setEnabled(bool(c.sample_points))
         self._deposit_texts(self.o_deposit, cps)
-        for cb in self.o_fields.values():
-            cb.setEnabled(cps)
+        for name, cb in self.o_fields.items():
+            cb.setEnabled(cps or name in rs.DTFE_ALLOWED_FIELDS)
+        self.o_fields_box.sync_lambda()
         self.o_grid_cells.setText(("²" if flat else "³") + " cells    sub-samples per axis")
         self.o_part.setSuffix(("²" if flat else "³") + " partitions")
+        self.o_grid.validator().setTop(65536 if flat else 4096)        # a 2D grid may be 65536² (4096³ in 3D)
         self.o_box.setToolTip(f"Optional: xlo xhi ylo yhi{'' if flat else ' zlo zhi'} in the file's units (all >= 0)")
         self.o_lag_path.setEnabled(cps and c.lagrangian == "separate")
         self.o_nsub.setEnabled(cps and c.deposit == "sampled")
@@ -2037,7 +2342,7 @@ class MainWindow(QMainWindow):
                 est += f"   ·   slice {rs.plane_points(s.slice_plane)/1e6:.1f}M points"
             t = R.time_estimate(self._runs(), sim=s.sim, grid=s.grid, estimator=s.estimator,
                                 gpu=s.gpu and rs.gpu_built(s.estimator),
-                                sliced=s.estimator == "ps" and bool(s.slice_plane))
+                                sliced=bool(s.slice_plane), precision=s.precision)
             if t and n:
                 est += (f"   ·   ≈ {R.format_duration(t[0])} per snapshot (median of {t[1]} earlier run"
                         f"{'s' if t[1] != 1 else ''}), ≈ {R.format_duration(t[0] * n)} in all")
@@ -2045,7 +2350,7 @@ class MainWindow(QMainWindow):
                     + ("   ·   grids on scratch disk" if s.scratch_dir else ""))
         if tab == OWN:
             c = self.custom
-            gb = rs.grids_gb(c.grid, c.fields if c.estimator == "ps" else rs.DTFE_FIELDS, c.precision)
+            gb = rs.grids_gb(c.grid, c.fields if c.estimator == "ps" else rs.dtfe_fields(c.fields), c.precision)
             return (f"grids ≈ {gb:.1f} GB" + ("  (float64)" if c.precision == "double" else "")
                     + f"   ·   outputs: {c.output_root()}.*")
         if tab == PIPELINE:
@@ -2087,26 +2392,104 @@ class MainWindow(QMainWindow):
         self._job_text = ""
         self._close_tee()                   # a handle left by a step that never finished must not take this job's output
         G.drop_cubes()                      # Explore's cubes are this process's memory: the auto-tuner budgets from what is free
+        G.cap_cubes(True)                   # ... and they stay small while the job runs (lifted in _finish_job)
         self.banner.hide()
         if isinstance(spec, rs.CustomSpec):
-            self._register_custom_output(spec)
-        self._job_tab, self._job_spec, self._current_job = tab, spec, qjob
+            spec = rs.CustomSpec.from_dict(spec.to_dict())    # a COPY: the Custom tab keeps editing the live one while
+        self._job_tab, self._job_spec, self._current_job = tab, spec, qjob      # the job runs, and the finish must describe THIS run
         self._job_start = time.time()
+        self._job_t0 = self._step_t0 = time.monotonic()
+        self._snap_t0s = []
+        self._queue_est = None
+        self._per_snap_prior = self._job_estimate(spec, tab, per_snapshot=True)
+        self._clock_timer.start()
         self._job_sim = getattr(spec, "sim", "")
         self._buffer, self._summary, self._stopping = "", "", False
         self._snaps_started = self._snaps_ok = 0
         self._dl_files = self._dl_bytes = self._problems = 0
         self._total_snaps = len(spec.snapshots) if tab == GRIDS else 0
+        self._total_known = tab == GRIDS
+        if tab == PIPELINE and isinstance(spec, rs.PipelineSpec):     # every simulation's snapshots, for the ETA: the
+            try:                                                       # script announces each one when it starts
+                self._total_snaps = sum(len(spec.stale(sim)[0]) for sim in spec.sims
+                                        if rs.sim_dir(sim, spec.data_root).is_dir())
+                self._total_known = self._total_snaps > 0
+            except (OSError, ValueError):
+                self._total_snaps = 0
         if qjob is None:
             self.log.clear()
         else:
             k = self.queue.index(qjob) + 1
             self.log.appendPlainText(("\n" if self.log.blockCount() > 1 else "")
                                      + f"{'=' * 72}\nQueue job {k}/{len(self.queue)}: {qjob.title}\n{'=' * 72}")
+        if isinstance(spec, rs.CustomSpec):
+            self._register_custom_output(spec)                 # AFTER the log is cleared: its "!! cannot write" line must survive
         self.results.setCurrentIndex(self.results.indexOf(self.log))
         self.snap_label.setText("")
         self.eta.setText("")
+        self._tick_clock()
         self._next_step()
+
+    def _tick_clock(self):
+        """Every second while a job runs: its elapsed time, the step's when there are several, and what is
+        left: of the job (its snapshots) and of the queue (the waiting jobs that have an estimate)."""
+        if self._job_t0 is None:
+            return
+        now = time.monotonic()
+        text = f"{clock_text(now - self._job_t0)} elapsed"
+        if len(self._steps) > 1 and self._step_t0 is not None and 0 <= self._step_i < len(self._steps):
+            text += f" (step {self._step_i + 1}: {clock_text(now - self._step_t0)})"
+        left = self._job_left(now)
+        if left is not None:
+            text += f" · ~{took_text(left)} left (done ~{time.strftime('%H:%M', time.localtime(time.time() + left))})"
+        if self._queue_running:
+            if self._queue_est is None or now - self._queue_est[0] > 60:     # it reads the run logs: not every tick
+                self._queue_est = (now, *self._queue_left())
+            _, q, unknown = self._queue_est
+            if q or unknown:
+                total = (left or 0.0) + q
+                text += f" · queue ~{took_text(total)}" + (f" + {unknown} job{'s' if unknown > 1 else ''} without an "
+                                                          "estimate" if unknown else "")
+        self.clock.setText(text)
+
+    def _job_left(self, now: float) -> float | None:
+        """Seconds left of this job: the snapshots still to go at the pace of the ones done (earlier runs' pace
+        until one is), minus the time the current one has already run. None when the job has no snapshot count."""
+        total, started = self._total_snaps, len(self._snap_t0s)
+        if not total or not started:
+            return None
+        per = (self._snap_t0s[-1] - self._snap_t0s[0]) / (started - 1) if started >= 2 else self._per_snap_prior
+        if per is None:
+            return None
+        return per * max(0, total - started) + max(0.0, per - (now - self._snap_t0s[-1]))
+
+    def _job_estimate(self, spec, kind_or_tab, per_snapshot: bool = False) -> float | None:
+        """Seconds a Grids job will take (per snapshot, or all of it) from earlier runs of the same settings;
+        None for other jobs or without earlier runs."""
+        if not isinstance(spec, rs.RunSpec) or kind_or_tab not in (GRIDS, "grids"):
+            return None
+        t = R.time_estimate(self._runs(), sim=spec.sim, grid=spec.grid, estimator=spec.estimator,
+                            gpu=spec.gpu and rs.gpu_built(spec.estimator),
+                            sliced=bool(spec.slice_plane), precision=spec.precision)
+        if t is None:
+            return None
+        return t[0] if per_snapshot else t[0] * max(1, len(spec.snapshots))
+
+    def _queue_left(self) -> tuple[float, int]:
+        """(seconds of the waiting jobs that have an estimate, how many have none)."""
+        total, unknown = 0.0, 0
+        for job in self.queue:
+            if job.state != "waiting":
+                continue
+            try:
+                est = self._job_estimate(job.build(), job.kind)
+            except (TypeError, ValueError):
+                est = None
+            if est is None:
+                unknown += 1
+            else:
+                total += est
+        return total, unknown
 
     def _next_step(self):
         self._step_i += 1
@@ -2121,10 +2504,13 @@ class MainWindow(QMainWindow):
             self._next_step()
             return
         self.status.setText(f"Step {self._step_i + 1}/{n}: {st.label}" if n > 1 else f"Running {st.label}")
+        self._step_t0 = time.monotonic()
         self.log.appendPlainText(("\n" if self._step_i else "") + "$ " + st.line() + "\n")
         if st.tee:                          # '... 2>&1 | tee <file>': the run log beside the outputs
             try:
                 self._tee = open(st.tee, "w")
+                self._last_log_path = str(st.tee)
+                self._sync_log_actions()
             except OSError as e:
                 self._tee = None
                 self.log.appendPlainText(f"!! cannot write the run log {st.tee}: {e}")
@@ -2164,13 +2550,14 @@ class MainWindow(QMainWindow):
         keep = []
         for line in lines:
             info = rs.parse_progress(line)
-            if "planned" in info:                        # the pipeline announcing its snapshots
+            if "planned" in info and not self._total_known:     # the pipeline announcing its snapshots
                 self._total_snaps += info["planned"]
                 self.snap_label.setText(f"snapshot {self._snaps_started}/{self._total_snaps}")
             if "sim" in info:
                 self.status.setText(f"{self._steps[self._step_i].label}: {info['sim']}")
             if "snapshot" in info:
                 self._snaps_started += 1
+                self._snap_t0s.append(time.monotonic())
                 if self._total_snaps:
                     self.snap_label.setText(f"snapshot {self._snaps_started}/{self._total_snaps}")
                 sim = f"{self._job_sim} " if self._job_tab == GRIDS else ""
@@ -2238,6 +2625,11 @@ class MainWindow(QMainWindow):
     def _finish_job(self):
         n = len(self._steps)
         ok = sum(1 for _, c in self._results if c == 0)
+        self._clock_timer.stop()
+        G.cap_cubes(False)
+        took = took_text(time.monotonic() - self._job_t0) if self._job_t0 is not None else ""
+        self._job_t0 = self._step_t0 = None
+        self.clock.setText(f"took {took}" if took else "")
         if self._stopping:
             self.status.setText("Stopped")
         elif ok == n and self._problems:
@@ -2261,10 +2653,10 @@ class MainWindow(QMainWindow):
         self._runs_scanned = 0.0            # new run logs: rescan for the estimates and the Runs tab
         if self.results.currentWidget() is self.runs:
             self.runs.reload()
-        if self._job_tab in (GRIDS, OWN, PIPELINE) and self.explore.outputs:    # a pipeline writes grids too
-            self.explore.refresh_outputs()
         if isinstance(self._job_spec, rs.CustomSpec) and ok == n:
-            self._register_custom_output(self._job_spec)     # again: a generated input exists only now
+            self._register_custom_output(self._job_spec, final=True)     # again: a generated input exists only now --
+        if self._job_tab in (GRIDS, OWN, PIPELINE) and self.explore.outputs:    # BEFORE the refresh reads the sidecars
+            self.explore.refresh_outputs()
         failed_codes = [c for _, c in self._results if c != 0]
         if failed_codes and not self._stopping:
             self._show_banner(R.diagnose(self._job_text, failed_codes))
@@ -2276,7 +2668,8 @@ class MainWindow(QMainWindow):
         if qjob is not None:
             qjob.state = "stopped" if self._stopping else "done" if ok == n else "failed"
             qjob.note = (self._summary or f"{ok}/{n} steps OK") + (
-                f", {self._problems} problem line{'s' if self._problems > 1 else ''} in the log" if self._problems else "")
+                f", {self._problems} problem line{'s' if self._problems > 1 else ''} in the log" if self._problems else "") + (
+                f", took {took}" if took else "")
             self._save_queue()
             self._refresh_queue()
         if self._queue_running:
@@ -2286,13 +2679,13 @@ class MainWindow(QMainWindow):
             elif qjob is not None and qjob.state == "failed" and self.q_stop_on_fail.isChecked():
                 self._queue_running = False
                 self.status.setText(f"Queue stopped: '{qjob.title}' failed")
-                self._notify("Queue stopped", f"'{qjob.title}' failed")
+                self._notify("Queue stopped", f"'{qjob.title}' failed after {took}")
             else:
                 QTimer.singleShot(0, self._next_queued)
         else:
             if not self._stopping:
                 self._notify("Finished" if ok == n else "Failed", self.status.text()
-                             + (f": {self._steps[0].label}" if self._steps else ""))
+                             + (f": {self._steps[0].label}" if self._steps else "") + (f" (took {took})" if took else ""))
             if count and ok == n and not self._stopping:
                 self.results.setCurrentIndex(fig_tab)
         after, self._after_job = self._after_job, None
@@ -2318,7 +2711,8 @@ class MainWindow(QMainWindow):
         self.proc.terminate()
         # after a grace period, force every process of the run that is still there -- not only
         # the script's shell: a child that outlived its parent would run on unseen
-        QTimer.singleShot(5000, lambda: _kill_leftovers(tree))
+        started = _start_times(tree)                   # a pid freed and reused in the grace period is not ours
+        QTimer.singleShot(5000, lambda: _kill_leftovers(tree, started))
         self.status.setText("Stopping…")
 
     def closeEvent(self, event):
@@ -2336,7 +2730,44 @@ class MainWindow(QMainWindow):
             if cproc is not None:
                 cproc.waitForFinished(2000)
         self.explore.shutdown()
+        if self.remember:
+            self._save()                            # Explore's state changes without a _changed()
+            self.settings.setValue("geometry", self.saveGeometry())
+            self.settings.setValue("splitter", self.splitter.saveState())
         event.accept()
+
+    # ---------------------------------------------------------------- drag and drop (survey item 18)
+    def dragEnterEvent(self, event):
+        urls = event.mimeData().urls() if event.mimeData().hasUrls() else []
+        if urls and urls[0].isLocalFile():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        urls = event.mimeData().urls() if event.mimeData().hasUrls() else []
+        if urls and urls[0].isLocalFile():
+            self.open_dropped(urls[0].toLocalFile())
+            event.acceptProposedAction()
+
+    def open_dropped(self, path: str) -> str:
+        """What a dropped path is for: a folder becomes the data root, a snapshot file (.hdf5) the Custom
+        tab's input, a grid file opens in Explore. Returns 'root', 'custom', 'explore' or '' (says why)."""
+        f = Path(path).expanduser()
+        if f.is_dir():
+            self.root_edit.setText(str(f))
+            self._root_changed()
+            self.status_message(f"data root: {f}")
+            return "root"
+        if f.suffix.lower() in (".hdf5", ".h5", ".hdf"):
+            self.tabs.setCurrentIndex(OWN)
+            self.o_file.setText(str(f))
+            self._own_file_changed()
+            self.status_message(f"custom snapshot: {f.name}")
+            return "custom"
+        if f.is_file() and self.explore.open_file(str(f)):
+            self.tabs.setCurrentIndex(EXPLORE)
+            return "explore"
+        self.status_message(f"{f.name}: not a folder, a snapshot (.hdf5) or a grid file the launcher can show")
+        return ""
 
     # ================================================================ helpers for the new panels
     def status_message(self, text: str):
@@ -2356,20 +2787,28 @@ class MainWindow(QMainWindow):
             dirs.append(cur)
         return [d for d in dirs if Path(d).is_dir()]
 
-    def _register_custom_output(self, spec: rs.CustomSpec):
-        """A custom-snapshot job is starting: remember its folder, and keep its settings beside the
-        outputs ('<name>.gui.json') -- the Explore tab's query server reads the snapshot from them."""
+    def _register_custom_output(self, spec: rs.CustomSpec, final: bool = False):
+        """A custom-snapshot job is starting (or, 'final', has finished): remember its folder, and keep
+        its settings beside the outputs ('<name>.gui.json') -- the Explore tab's query server reads the
+        snapshot from them, the figure grid's Type column its estimator. At the start the file is written
+        only when there is none yet: a re-run under the same name that is stopped or fails leaves the
+        grids of the old run on disk, and its sidecar must keep describing THOSE (review 2026-10-05)."""
         root = spec.output_root()
         d = str(root.parent)
         if d not in self.custom_dirs:
             self.custom_dirs.append(d)
             self._save()
+        side_path = Path(str(root) + ".gui.json")
+        if not final and (side_path.is_file() or any(Path(str(root) + sfx).is_file() for sfx in (".a_den", ".den"))):
+            return                              # grids already there (with or without a sidecar): the finish describes them
         side = spec.settings_sidecar()
+        tmp = Path(str(side_path) + ".tmp")
         try:
             root.parent.mkdir(parents=True, exist_ok=True)
-            Path(str(root) + ".gui.json").write_text(json.dumps(side, indent=1))
-        except OSError:
-            pass
+            tmp.write_text(json.dumps(side, indent=1))
+            os.replace(tmp, side_path)          # never a truncated sidecar
+        except OSError as e:
+            self.log.appendPlainText(f"!! cannot write the settings sidecar {side_path.name}: {e}")
 
     def _build_menus(self):
         """The menu bar: Setup, running (Run, Add to Queue, Stop, the memory check), the Explore
@@ -2391,7 +2830,21 @@ class MainWindow(QMainWindow):
         file_menu.addAction(self.export_action)
         self.copy_action = QAction("Copy Commands", self)
         self.copy_action.triggered.connect(self.copy_commands)
-        bar.addMenu("Edit").addAction(self.copy_action)
+        edit_menu = bar.addMenu("Edit")
+        edit_menu.addAction(self.copy_action)
+        edit_menu.addSeparator()
+        self.find_log_action = QAction("Find in Log", self)
+        self.find_log_action.setShortcut(QKeySequence.Find)
+        self.find_log_action.triggered.connect(self._focus_log_find)
+        edit_menu.addAction(self.find_log_action)
+        self.copy_log_action = QAction("Copy Log", self)
+        self.copy_log_action.triggered.connect(self.copy_log)
+        edit_menu.addAction(self.copy_log_action)
+        self.open_log_action = QAction("Open Run Log", self)
+        self.open_log_action.setToolTip("The newest run's full log file, beside its outputs")
+        self.open_log_action.triggered.connect(self.open_run_log)
+        self.open_log_action.setEnabled(False)
+        edit_menu.addAction(self.open_log_action)
         self.show_cmds_action = QAction("Show Commands", self, checkable=True)
         self.show_cmds_action.setShortcut(QKeySequence("Ctrl+Shift+C"))
         self.show_cmds_action.setChecked(self.show_commands)
@@ -2617,7 +3070,19 @@ class MainWindow(QMainWindow):
         self._sync_figures_actions()
 
     def _load_run_settings(self, rec: R.RunRecord):
-        """The Runs browser's 'Load settings': the run's options into the Grids tab."""
+        """The Runs browser's 'Load settings': a TNG run's options into the Grids tab; a custom-snapshot run's
+        (its settings sidecar) into the Custom tab."""
+        if not rec.sim:
+            side = R.custom_settings(rec)
+            if side is None:
+                self.status_message(f"{rec.prefix}: no settings file beside its log (made before 2026-09-30?)")
+                return
+            self.custom = rs.CustomSpec.from_dict(side)
+            self._load_into_widgets()
+            self.tabs.setCurrentIndex(OWN)
+            self._changed()
+            self.status_message(f"loaded the settings of the custom run {rec.prefix}")
+            return
         for k, v in rec.settings().items():
             if hasattr(self.spec, k):
                 setattr(self.spec, k, list(v) if isinstance(v, list) else v)
@@ -2709,7 +3174,8 @@ class MainWindow(QMainWindow):
         for label, w in rows:
             f.addRow(label, w)
         t = R.time_estimate(self._runs(), sim=self.spec.sim, grid=self.spec.grid, estimator=self.spec.estimator,
-                            gpu=False, sliced=bool(self.spec.slice_plane)) if self.tabs.currentIndex() == GRIDS else None
+                            gpu=False, sliced=bool(self.spec.slice_plane), precision=self.spec.precision) \
+            if self.tabs.currentIndex() == GRIDS else None
         f.addRow(_note("No GPU on a cluster: GPU options fall back to the CPU. Set REPO and the data paths "
                        "in the script." + (f" Earlier CPU runs: ≈ {R.format_duration(t[0])} per snapshot." if t else "")))
 
@@ -3165,6 +3631,8 @@ class MainWindow(QMainWindow):
         self.settings.setValue("presets", json.dumps(self.user_presets))
         self.settings.setValue("show_commands", json.dumps(self.show_commands))
         self.settings.setValue("tab_name", TAB_NAMES[self.tabs.currentIndex()])
+        if self.explore.current is not None:
+            self.settings.setValue("explore", json.dumps(self.explore.state()))
 
     def _save_queue(self, *_):
         if not self.remember:
@@ -3198,8 +3666,30 @@ class MainWindow(QMainWindow):
             return cls()
 
 
-def _kill_leftovers(pids: list[int]):
+def _start_times(pids: list[int]) -> dict[int, str] | None:
+    """{pid: start time as ps prints it} for the live ones; None when ps cannot say."""
+    if not pids:
+        return {}
+    try:
+        out = subprocess.run(["ps", "-o", "pid=,lstart=", "-p", ",".join(map(str, pids))],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    times = {}
+    for line in out.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2 and parts[0].isdigit():
+            times[int(parts[0])] = parts[1].strip()
+    return times
+
+
+def _kill_leftovers(pids: list[int], started: dict[int, str] | None = None):
+    """SIGKILL what is left of a stopped run's process tree: only a pid that still is the SAME process (its
+    start time unchanged since Stop) -- a pid freed and reused meanwhile belongs to someone else."""
+    now = _start_times(pids) if started is not None else None
     for pid in pids:
+        if started is not None and now is not None and (pid not in started or now.get(pid) != started[pid]):
+            continue
         try:
             os.kill(pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
