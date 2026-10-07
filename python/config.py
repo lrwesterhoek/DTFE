@@ -38,6 +38,7 @@ SIMULATION = os.environ.get("DTFE_SIM", DEFAULT_SIM)
 SIMULATION_BOX_MPC = {
     "TNG50-3-Dark":  51.668142899320934,
     "TNG50-4-Dark":  51.668142899320934,
+    "TNG100-3-Dark": 110.71744906997343,    # 75 Mpc/h / 0.6774 (added 2026-10-07: CI has no snapshot to read it from)
     "TNG300-3-Dark": 302.62769412459404,
 }
 
