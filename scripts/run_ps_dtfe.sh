@@ -67,9 +67,11 @@ PS_VOLUME_WEIGHTED="${PS_VOLUME_WEIGHTED:-0}"  # 1 = volume-weighted velocity mo
                            # bit-identical to a default run, so this ONE config is the literature-standard
                            # estimator for every field at once. Works with the CPU and GPU (-m) deposits.
 PS_CAUSTICS="${PS_CAUSTICS:-0}"      # 1 = flag fold-caustic cells (--ps-caustics): writes '.caustic'
-                           # (0/1 fold flag) and, on the CPU deposit, '.causticClass' -- the caustic
-                           # stratification bitmask (fold parity, how many principal axes have
-                           # collapsed, and the umbilic-degeneracy indicator).
+                           # (0/1 fold flag) and '.causticClass' -- the caustic stratification bitmask
+                           # (fold parity, how many principal axes have collapsed, and the umbilic-
+                           # degeneracy indicator) -- on the CPU AND the GPU deposit (byte-identical:
+                           # tests/ps_caustic_class_check.sh); the linear deposit on the GPU writes the
+                           # fold parity only (and says so): run that combination on the CPU.
 PS_CAUSTIC_CUSPS="${PS_CAUSTIC_CUSPS:-0}"  # 1 = also estimate the A3 CUSP (bit 7) and A4
                            # SWALLOWTAIL (bit 8) indicators of '.causticClass'; requires
                            # PS_CAUSTICS=1, CPU deposit. Opt-in: both are finite differences over

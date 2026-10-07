@@ -5,8 +5,9 @@ volume and mass fractions, the fold / cusp / swallowtail / umbilic indicator fra
 class -- sheet k >= 1, line k >= 2, node k = 3 -- the periodic components: count, the largest one's share,
 the top sizes) as JSON + text, and a figure: the class map of the middle slice (k = 0 .. 3 with the fold
 outlined), the component size distributions, and -- with --voids, from the pipeline's void catalogue --
-the fold fraction of each void's 1.0-1.3 R_eff shell and its distance to the nearest sheet in units of
-R_eff. The cusp and swallowtail rows are '--' unless the grid carries bit 7/8 (only --ps-caustic-cusps on
+the fold fraction of each distinct void's shells (--shells, default 0.8-1.2 R_v: around the wall, R_v being the
+measured void radius; --radius r_eff for the ellipsoid's, ~1.75 R_v, with 1.0-1.3) and its distance to the nearest
+sheet in units of that radius (searched within --cutout cells, default 10 smoothing lengths). The cusp and swallowtail rows are '--' unless the grid carries bit 7/8 (only --ps-caustic-cusps on
 the CPU deposit sets them); a parity-only grid (--ps-linear-deposit --ps-gpu: the fold flag without the
 collapse bits) is refused. No TNG run on the T7 carries a caustic_class grid yet (2026-10-05): the
 crossed-waves test run under the suites' temp root is the only real input so far.
@@ -66,18 +67,24 @@ def _median_or_none(a):
     return float(np.median(a)) if a.size else None
 
 
-def void_block(cc, cat, cell_c, n_grid, cutout):
-    """--voids: per well-resolved void of the catalogue, the fold / sheet fractions of its 1.0-1.3 R_eff
-    shells and the distance to the nearest sheet (cells, and in R_eff; NaN + bounded beyond the cut-out).
+def void_block(cc, cat, cell_c, n_grid, cutout, shells=(1.0, 1.1, 1.2, 1.3), radius="r_eff", distinct=False):
+    """--voids: per well-resolved void of the catalogue with that radius ('r_eff', or 'r_v' the measured one; only
+    the distinct ones with distinct=True), the fold / sheet fractions of its shells (x the radius) and the distance
+    to the nearest sheet (cells, and in units of the radius; NaN + bounded beyond the cut-out, which is at most half
+    the grid). The keys keep their names ('dist_reff', 'r_eff_cells') whatever the radius: 'radius' says which.
     Returns (the arrays for the _voids.npz, the summary's 'voids' entry -- medians None when undefined:
     no well-resolved void, or every one beyond the cut-out)."""
-    res = np.asarray(cat["well_resolved"]).astype(bool)
+    r_all = catalog.r_v_mpc(cat) if radius == "r_v" else catalog.r_eff_mpc(cat)
+    res = np.asarray(cat["well_resolved"]).astype(bool) & np.isfinite(r_all)
+    if distinct:
+        res = catalog.distinct_mask(cat, res, n_grid)
     coords = np.asarray(cat["coords"])[res]
-    r_eff = catalog.r_eff_mpc(cat)[res] / cell_c
-    sh = sk.void_shell_fractions(cc, (coords + 0.5) / n_grid, r_eff)
-    dist, bounded = sk.nearest_wall_distance(sk.class_masks(cc)["cumulative"]["sheet"], coords, cutout_cells=cutout)
+    r_eff = r_all[res] / cell_c
+    sh = sk.void_shell_fractions(cc, (coords + 0.5) / n_grid, r_eff, shells=tuple(shells))
+    dist, bounded = sk.nearest_wall_distance(sk.class_masks(cc)["cumulative"]["sheet"], coords,
+                                             cutout_cells=min(int(cutout), int(n_grid) // 2))
     voids = {"fold": sh["fold"], "sheet": sh["sheet"], "dist_cells": dist, "dist_reff": dist / r_eff, "bounded": bounded,
-             "index": np.nonzero(res)[0], "r_eff_cells": r_eff}
+             "index": np.nonzero(res)[0], "r_eff_cells": r_eff, "radius": radius, "shells": np.asarray(shells, float)}
     summary = {"n": int(res.sum()), "fold_shell_median": _median_or_none(sh["fold"]),
                "dist_reff_median": _median_or_none(dist / r_eff), "beyond_cutout": int(bounded.sum())}
     return voids, summary
@@ -112,10 +119,14 @@ def plot_skeleton(cc, summ, fold, voids, title, path):
         ax = axes[2]
         ok = np.isfinite(voids["dist_reff"])
         ax.scatter(voids["fold"], voids["dist_reff"][ok] if ok.all() else np.where(ok, voids["dist_reff"], np.nan), s=8, alpha=0.6, color="#1f5fa8")
-        ax.set_xlabel("fold fraction of the 1.0-1.3 R_eff shell")
-        ax.set_ylabel(r"distance to the nearest sheet [$R_{\rm eff}$]")
+        rl = r"$R_v$" if voids.get("radius") == "r_v" else r"$R_{\rm eff}$"
+        sh_ = voids.get("shells", np.array([1.0, 1.3]))
+        ax.set_xlabel(f"fold fraction of the {sh_[0]:g}-{sh_[-1]:g} {rl} shells")
+        ax.set_ylabel(f"distance to the nearest sheet [{rl}]")
         ax.grid(alpha=0.3)
-        style.set_title(ax, f"{len(voids['fold'])} well-resolved voids ({int((~ok).sum())} beyond the cut-out)")
+        style.set_title(ax, f"{len(voids['fold'])} well-resolved voids ({int((~ok).sum())} beyond the cut-out)"
+                        if voids.get("radius", "r_eff") == "r_eff" else
+                        f"{len(voids['fold'])} distinct well-resolved voids ({int((~ok).sum())} beyond the cut-out)")
     style.set_suptitle(fig, title)
     fig.tight_layout()
     style.save_plot_to_multiple_paths(fig, path, mirror=MIRROR)
@@ -128,10 +139,23 @@ def main():
     parser.add_argument("--snaps", type=int, nargs="*", default=None, help="snapshots (default: --snap)")
     parser.add_argument("--connectivity", type=int, choices=(6, 18, 26), default=26)
     parser.add_argument("--voids", action="store_true", help="per void: the shell's fold fraction and the nearest sheet (pipeline catalogue)")
-    parser.add_argument("--cutout", type=int, default=32, help="half-width in cells of the cut-out for the wall distance")
+    parser.add_argument("--cutout", type=int, default=None,
+                        help="half-width in cells of the cut-out for the wall distance (default 10 smoothing lengths: "
+                             "R_eff is 5-7 sigma, so the old 32 cells left almost every void 'beyond the cut-out')")
+    parser.add_argument("--radius", choices=("r_v", "r_eff"), default="r_v",
+                        help="the void radius the shells and the wall distance are in: r_v, the measured one (default), "
+                             "or r_eff, the ellipsoid's (~1.75 r_v)")
+    parser.add_argument("--shells", default=None,
+                        help="the shells' radii in units of --radius for the fold / sheet fractions, comma-separated "
+                             "(default 0.8-1.2 R_v around the wall, or 1.0-1.3 R_eff)")
+    parser.add_argument("--keep-overlaps", action="store_true", help="--voids: every resolved void, not only the distinct ones")
+    pipeline.add_smoothing_mpc_arg(parser)
     parser.add_argument("--out", default=None, help=f"output folder (default {OUTPUT_DIR}/<sim>)")
     args = parser.parse_args()
     style.apply()
+    pipeline.apply_smoothing_args(args, "caustic-skeleton")    # --smooth / --smooth-mpc: the --voids catalogue's
+    if args.shells is None:
+        args.shells = "0.8,0.9,1.0,1.1,1.2" if args.radius == "r_v" else "1.0,1.1,1.2,1.3"
     out_dir = Path(args.out).expanduser() if args.out else OUTPUT_DIR / args.sim
     MIRROR = args.out is None
     method = "ps" if args.method == "auto" else args.method
@@ -159,14 +183,20 @@ def main():
             try:
                 cell_c, _box, n_grid, _src = catalog.frame_of(p)
                 cat = p.voids()
-                voids, summ["voids"] = void_block(cc, cat, cell_c, n_grid, args.cutout)
+                cutout = args.cutout if args.cutout is not None else int(round(10 * pipeline.smoothing_length_mpc() / cell_c))
+                shells = [float(x) for x in args.shells.split(",") if x.strip()]
+                voids, summ["voids"] = void_block(cc, cat, cell_c, n_grid, cutout, shells=shells, radius=args.radius,
+                                                  distinct=not args.keep_overlaps)
+                summ["voids"].update(radius=args.radius, shells=shells, distinct=not args.keep_overlaps,
+                                     sigma_mpc=pipeline.smoothing_length_mpc(), footprint_cells=int(config.FOOTPRINT_SIZE))
             except (FileNotFoundError, ValueError, OSError) as e:   # asked for and not delivered: a failed snapshot, exit 1
                 print(f"    voids: FAILED: {e}")
                 summ["voids_error"] = str(e)
                 failed.append(snap)
             finally:
                 p.release()
-        base = out_dir / f"caustic_skeleton_z{z:.2f}"      # suffixes APPENDED
+        tag = pipeline.smoothing_tag() if args.voids else ""   # --voids at a non-default sigma: its own files
+        base = out_dir / (f"caustic_skeleton_z{z:.2f}" + (f"_{tag}" if tag else ""))      # suffixes APPENDED
         base.parent.mkdir(parents=True, exist_ok=True)
         title = f"{args.sim}  z = {z:.2f}  caustic skeleton (prefix {fs.prefix.rstrip('.')})"
         Path(f"{base}.json").write_text(json.dumps(sk.json_safe(summ), indent=1))   # no bare NaN in the JSON

@@ -14,6 +14,7 @@ working set is returned to the OS before the plot scripts start.
 
 import argparse
 import subprocess
+import os
 import sys
 import time
 from pathlib import Path
@@ -146,7 +147,8 @@ def export(snaps, out_dir=None, formats=("csv", "hdf5")):
     an unknown id, a failed snapshot or nothing exported (the honest-exit rule)."""
     from dtfelib import pipeline, catalog
     snaps = [pipeline.canonical_snapshot_id(s) for s in snaps] if snaps else list(config.SNAPSHOT_TO_REDSHIFT)
-    out = Path(out_dir).expanduser() if out_dir else Path(config.LOCAL_FIGURES_ROOT) / "void_catalog" / config.SIMULATION
+    out = Path(out_dir).expanduser() if out_dir else \
+        Path(config.LOCAL_FIGURES_ROOT) / "void_catalog" / config.SIMULATION / pipeline.smoothing_tag()   # DTFE_SIGMA_MPC: own folder
     print(f"Export: void catalogues of {len(snaps)} snapshot(s) of {config.SIMULATION} -> {out}")
     print(f"  sigma = {config.SMOOTHING_SIGMA_CELLS} cells, footprint = {config.FOOTPRINT_SIZE}, "
           f"criterion = {config.VOID_EIGENVALUE_CRITERION}; cache: {pipeline.cache_dir()}")
@@ -230,6 +232,14 @@ def main():
     if args.mode == 'export':
         export(args.snaps, args.out, ('csv', 'hdf5') if args.format == 'both' else (args.format,))
         return
+    from dtfelib import pipeline as _pl
+    if _pl.smoothing_tag():
+        # the thesis scripts save under the PRODUCTION names (and into the thesis Figures/ tree): a left-over
+        # DTFE_SIGMA_MPC would overwrite them with another smoothing's figures and void_shape_table.txt
+        sys.exit(f"refused: the smoothing is {config.SMOOTHING_SIGMA_CELLS:g} cells / footprint {config.FOOTPRINT_SIZE} "
+                 f"(DTFE_SIGMA_MPC={os.environ.get('DTFE_SIGMA_MPC', '')!r}), not the production "
+                 f"{config.PRODUCTION_SMOOTHING}: '{args.mode}' writes the thesis figures under their production names. "
+                 f"Unset DTFE_SIGMA_MPC; it is for the void scripts and 'export' (both tag their outputs).")
     if args.mode == 'compute':
         compute(args.snaps)
         return

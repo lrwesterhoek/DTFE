@@ -367,13 +367,42 @@ or `output.a_den` ... (standard DTFE) beside their `.runlog`.
 3. **Analyse**: `DTFE_SIM=TNG100-3-Dark python3 python/analyze.py all` (the standard-DTFE thesis set:
    `compute` caches the smoothed density, Hessian and void catalogue, `plot` draws from the cache, `export`
    writes the void catalogues as CSV + HDF5), and the phase-space scripts in `python/plot/` take `--sim`:
-   `plot_PS_DTFE.py --snap 99`, `plot_web_streams.py --snaps 99 67`, `plot_void_profiles.py`, `plot_pk_compare.py`.
+   `plot_PS_DTFE.py --snap 99`, `plot_web_streams.py --snaps 99 67`, `plot_void_profiles.py`, `plot_pk_compare.py`,
+   `plot_void_population.py`, `plot_caustic_skeleton.py` (the last needs a run with `PS_CAUSTICS=1`).
    Set `DTFE_SIM` for every analysis run: the cached void catalogue's lengths are in that simulation's frame.
+
+**Voids.** The catalogue's voids are the minima of the density contrast smoothed with a Gaussian of
+`SMOOTHING_SIGMA_CELLS` = 10 cells (`python/config.py`). Each has two sizes:
+- **R_eff**, the ellipsoid fit's (a b c)^(1/3), a curvature length from the Hessian at the minimum. It sets the
+  resolution cut (`config.ELLIPSOID_CUT_RULES`: largest semi-axis within 10 smoothing lengths and half the box) and
+  the shapes.
+- **R_v**, the *measured* radius, where the spherically averaged smoothed density around the minimum first rises back
+  to the mean: about 0.57 R_eff. In units of R_v the stacked density reaches the mean at 1.0 R_v and the
+  outflow turns to infall just beyond it.
+
+The profile, abundance and skeleton scripts use R_v and the *distinct* voids by default: deepest first, a void whose
+centre lies inside the region of a deeper one (min(R_v, R_eff)) is left out. `--radius r_eff` and
+`--keep-overlaps` give the R_eff-based, overlapping sample instead.
+
+The smoothing in cells is a different physical scale in every box: 1.0, 2.2 and 5.9 Mpc in TNG50-3, TNG100-3 and
+TNG300-3. To compare boxes, smooth them all at the same physical scale with `--smooth-mpc 2.1625` on the void
+scripts (or `DTFE_SIGMA_MPC=2.1625`; the minima finder's window follows). At that common scale TNG100 and TNG300
+agree on the resolved fraction, the number density of distinct voids and their R_v to within 5%.
+
+Products made at a non-default smoothing get their own names (e.g. `void_profiles_ps_resolved_s2.1625Mpc_f5_z0.00`)
+and never go into the thesis `Figures/` tree. `analyze.py compute|plot|all` refuses to run under `DTFE_SIGMA_MPC`,
+because those scripts write under the production names.
+
+`plot_pk_compare.py` draws:
+- the chi^2 cosmic-variance band;
+- a panel divided by the same box's early spectrum grown linearly (`--ref-snap`, default snapshot 0), where a single
+  realisation's low-k scatter cancels.
 
 | knob (environment) | meaning | default |
 |---|---|---|
 | `DTFE_DATA_ROOT`, `DTFE_SIM` | the data root and the simulation | `config.sh` |
-| `DTFE_FIGURES_ROOT` | where every figure goes (the plot scripts, `analyze.py`, the launcher) | `/Volumes/Samsung T7/DTFE figures` while that drive is mounted, else `python/figures` |
+| `DTFE_FIGURES_ROOT` | where every figure goes (the plot scripts, `analyze.py`, the launcher) | `/Volumes/Samsung T7/Illustris TNG/figures` while that drive is mounted, else `python/figures` |
+| `DTFE_SIGMA_MPC` | the void catalogue's smoothing in Mpc, the same in every box (for the void scripts and `analyze.py export`) | unset: 10 cells |
 | `GRID_SIZE` (or `-g`) | cells per axis of the grids | 512 (`config.sh`) |
 | `PS_METAL`/`DTFE_METAL` (`-m`) | the deposit / interpolation on the GPU | 0 |
 | `PS_EXACT`/`DTFE_EXACT_AVERAGE` (`-e`) | the exact deposit / exact cell averages | 0 |

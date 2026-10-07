@@ -920,6 +920,15 @@ _RAW = Opt("raw", "Unaveraged fields", "bool", False,
            help="The raw fields instead of the volume-averaged ones")
 _PLANE = Opt("plane", "Image plane", "plane", "",
              help="the plane sidecar (.json) the .pts_* files were evaluated on")
+# the void scripts' smoothing in Mpc (2026-10-07): the same physical scale in every box, the minima window following
+_SMOOTH_MPC = Opt("smooth_mpc", "Void smoothing in Mpc (0 = the default 10 cells)", "float", 0.0,
+                  help="e.g. 2.1625, TNG100's 10 cells: TNG50, TNG100 and TNG300 then find the same voids; "
+                       "the outputs get their own names", limits=(0.0, 100.0, 4))
+_RADIUS = Opt("radius", "Void radius", "choice", "r_v", ("r_v", "r_eff"),
+              help="r_v: the measured radius, where the smoothed density around the void rises back to the mean; "
+                   "r_eff: the ellipsoid fit's curvature length, about 1.75 r_v")
+_OVERLAPS = Opt("keep_overlaps", "Keep overlapping voids", "bool", False,
+                help="also the voids whose centre lies inside the region of a deeper void")
 
 FIGURE_SETS: tuple[FigureSet, ...] = (
     FigureSet("fields", "Field slice maps", "plot/plot_PS_DTFE.py", "snapshot",
@@ -966,7 +975,7 @@ FIGURE_SETS: tuple[FigureSet, ...] = (
               "Counts, sizes, shapes and depths of all voids at every snapshot with grids.",
               "void_population/<sim>",
               opts=(Opt("panel_selected", "Distribution panels at the selected snapshots", "bool", False,
-                        help="default: config.PANEL_SNAPSHOTS"),)),
+                        help="default: config.PANEL_SNAPSHOTS"), _OVERLAPS, _SMOOTH_MPC)),
     FigureSet("voidtrack", "Void tracking", "plot/plot_void_tracking.py", "sim",
               "Size, BBKS shape and orientation of the deepest voids followed back in time "
               "through the merger trees.", "void_tracking/<sim>",
@@ -980,6 +989,26 @@ FIGURE_SETS: tuple[FigureSet, ...] = (
                         help="SubfindIDs at the reference snapshot, space-separated (replaces the top N)"),
                     Opt("environment", "Field environment", "bool", True),
                     Opt("min_ratio", "Merger ratio to mark", "float", 0.1))),
+    FigureSet("voidprof", "Void profiles", "plot/plot_void_profiles.py", "series",
+              "Stacked density, radial velocity and single-stream fraction around the voids, in units of each "
+              "void's radius, per size bin, at the selected snapshots.", "void_profiles/<sim>",
+              opts=(_RADIUS, Opt("sample", "Voids", "choice", "resolved", ("resolved", "deep"),
+                                 help="deep: only the voids whose centre is below the deep-void threshold"),
+                    _OVERLAPS, _SMOOTH_MPC)),
+    FigureSet("webstreams", "Streams by web environment", "plot/plot_web_streams.py", "series",
+              "Volume and mass fractions of every T-web and V-web class by stream multiplicity, per snapshot "
+              "and across redshift.", "web_streams/<sim>",
+              opts=(Opt("web", "Web", "choice", "both", ("both", "tweb", "vweb")),)),
+    FigureSet("pk", "Power spectrum", "plot/plot_pk_compare.py", "series",
+              "P(k) of the density grids against linear theory, with the cosmic-variance band, and divided by "
+              "the same box's early spectrum grown linearly (its random fluctuations cancel there).",
+              "power_spectrum/<sim>",
+              opts=(Opt("nbins", "k bins (0 = one per fundamental mode)", "int", 40),
+                    Opt("ref", "Same-box panel (from the first snapshot)", "bool", True))),
+    FigureSet("skeleton", "Caustic skeleton", "plot/plot_caustic_skeleton.py", "series",
+              "Walls, filaments and nodes from the collapse classes of a run with caustics on, and per void the "
+              "fold fraction around its wall and the distance to the nearest wall.", "caustic_skeleton/<sim>",
+              opts=(Opt("voids", "Per-void statistics", "bool", True), _RADIUS, _OVERLAPS, _SMOOTH_MPC)),
     FigureSet("thesis", "Thesis analysis set", "analyze.py", "series",
               "The core analysis figures (eigenvalues, void shapes, correlations, ...) through "
               "analyze.py: 'compute' fills python/cache from the standard-DTFE grids with the "
@@ -1022,6 +1051,18 @@ class PlotSpec:
             a += ["--prefix", self.prefix]
         if self.smooth > 0:
             a += ["--smooth", f"{self.smooth:g}"]
+        return a
+
+    def _void_args(self, key) -> list[str]:
+        """The void options a set has: the radius, overlapping voids, the smoothing in Mpc."""
+        names = {o.key for o in FIGURE_SET[key].opts}
+        a = []
+        if "radius" in names and self.opt(key, "radius") != "r_v":
+            a += ["--radius", str(self.opt(key, "radius"))]
+        if "keep_overlaps" in names and self.opt(key, "keep_overlaps"):
+            a.append("--keep-overlaps")
+        if "smooth_mpc" in names and float(self.opt(key, "smooth_mpc")) > 0:
+            a += ["--smooth-mpc", f"{float(self.opt(key, 'smooth_mpc')):g}"]
         return a
 
     def steps(self) -> list[Step]:
@@ -1087,7 +1128,21 @@ class PlotSpec:
                 a = base + ["--sim", self.sim] + self._common()
                 if self.opt(key, "panel_selected") and snaps:
                     a += ["--panel-snaps", *map(str, snaps)]
-                out.append(Step(name, a, env))
+                out.append(Step(name, a + self._void_args(key), env))
+            elif key in ("voidprof", "webstreams", "pk", "skeleton"):
+                a = base + ["--sim", self.sim, "--snaps", *map(str, snaps)] + self._common()
+                if key == "voidprof" and self.opt(key, "sample") != "resolved":
+                    a += ["--sample", str(self.opt(key, "sample"))]
+                if key == "webstreams" and self.opt(key, "web") != "both":
+                    a += ["--web", str(self.opt(key, "web"))]
+                if key == "pk":
+                    if int(self.opt(key, "nbins")) != 40:
+                        a += ["--nbins", str(int(self.opt(key, "nbins")))]
+                    if not self.opt(key, "ref"):
+                        a += ["--ref-snap", "-1"]
+                if key == "skeleton" and self.opt(key, "voids"):
+                    a.append("--voids")
+                out.append(Step(f"{name} {len(snaps)} snapshots", a + self._void_args(key), env))
             elif key == "voidtrack":
                 out.append(Step(name, base + ["--sim", self.sim, "--snap", str(self.opt(key, "ref"))]
                                 + self._common() + ["--n-voids", str(self.opt(key, "n_voids"))], env))
@@ -1173,6 +1228,16 @@ class PlotSpec:
                                        + " ".join(f"{n:03d}" for n in missing)))
         if self.smooth < 0:
             out.append(("error", "smoothing must be >= 0"))
+        mpc = [FIGURE_SET[k].title for k in self.sets if any(o.key == "smooth_mpc" for o in FIGURE_SET[k].opts)
+               and float(self.opt(k, "smooth_mpc")) > 0]
+        if mpc and self.smooth > 0:
+            out.append(("error", "the smoothing is given in cells and in Mpc (" + ", ".join(mpc) + "): use one"))
+        if "skeleton" in self.sets:
+            cc = (self.prefix or "ps_output") + ".causticClass"
+            missing = [n for n in snaps if not (sp / f"snapdir_{n:03d}" / cc).is_file()]
+            if missing:
+                out.append(("warning", f"Caustic skeleton: no {cc} for " + " ".join(f"{n:03d}" for n in missing)
+                                       + " (it needs a run with caustics on)"))
         if self.prefix and re.search(r"[\s/]", self.prefix):
             out.append(("error", "grid prefix must be a single word (no spaces or '/')"))
         return out

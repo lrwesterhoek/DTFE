@@ -264,25 +264,37 @@ def delta_contour_levels(field_slice, norm, num_contours=20):
     return _np.unique(_np.asarray(levels))
 
 
+def mirror_relative_path(primary_path) -> str:
+    """Where a figure goes below the thesis Figures/ tree: its path below config.LOCAL_FIGURES_ROOT (read at
+    call time) when it lies under it, else below its first 'figures/' folder, else its bare name. The root
+    comes first since 2026-10-07: DTFE_FIGURES_ROOT may name any folder, and under one without '/figures/' in
+    its path (the T7 default was briefly 'DTFE figures') the folder test alone dropped every mirrored file flat
+    into Figures/, simulations' names colliding."""
+    p = Path(primary_path).expanduser()
+    try:
+        return p.resolve().relative_to(Path(str(config.LOCAL_FIGURES_ROOT)).expanduser().resolve()).as_posix()
+    except (ValueError, OSError):
+        pass
+    s = str(p).replace('\\', '/')
+    return s.split('/figures/', 1)[1] if '/figures/' in s else p.name
+
+
 def save_plot_to_multiple_paths(fig, primary_path, dpi=300, mirror=True, **kwargs):
     """Save a figure to its primary path and mirror it into the thesis Figures/ tree
-    (config.THESIS_FIGURES_DIR, read at call time), preserving the path below 'figures/'. mirror=False
-    saves the primary path only: a script run with --out (a path with no 'figures/' in it) would otherwise
-    drop its files FLAT into the thesis tree's root, where simulations' names collide (review 2026-10-05)."""
+    (config.THESIS_FIGURES_DIR, read at call time), preserving its path below the figure root
+    (mirror_relative_path). mirror=False saves the primary path only: a script run with --out (a path outside
+    the figure root) would otherwise drop its files FLAT into the thesis tree's root, where simulations' names
+    collide (review 2026-10-05)."""
     primary_path = Path(primary_path)
     primary_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(primary_path, dpi=dpi, **kwargs)
     if not mirror:
         return
+    from . import pipeline as _pl                         # here: pipeline imports this module's package at load
+    if _pl.smoothing_tag():
+        return                                            # the thesis tree holds production-smoothing figures only
 
-    primary_str = str(primary_path)
-    if '/figures/' in primary_str or '\\figures\\' in primary_str:
-        parts = primary_str.replace('\\', '/').split('/figures/')
-        relative_path = parts[1] if len(parts) > 1 else primary_path.name
-    else:
-        relative_path = primary_path.name
-
-    additional_path = Path(str(config.THESIS_FIGURES_DIR)) / relative_path
+    additional_path = Path(str(config.THESIS_FIGURES_DIR)) / mirror_relative_path(primary_path)
     additional_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(additional_path, dpi=dpi, **kwargs)
 

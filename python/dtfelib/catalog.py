@@ -14,7 +14,7 @@ eigenvalues (ASCENDING, as numpy.linalg.eigh gives them), the BBKS shape (e, p) 
 from those eigenvalues, the ellipsoid fit (semi-axes a >= b >= c -- sorted by |lambda|, which is NOT the
 eigenvalue order -- the effective radius (a b c)^(1/3), the fit's ellipticity 1 - c/a and prolateness,
 the major and minor axis directions) and the two sample flags (well_resolved: passes
-config.ELLIPSOID_CUTS; deep: central delta below config.DEEP_VOID_THRESHOLD). Fit columns are NaN for a
+pipeline.ellipsoid_cuts_mpc() from config.ELLIPSOID_CUT_RULES; deep: central delta below config.DEEP_VOID_THRESHOLD). Fit columns are NaN for a
 void that is not well resolved, as plot_void_population treats them. R_eff is r_eff_mpc(), the one
 definition in the code base (plot_void_population.snapshot_stats uses it).
 
@@ -53,12 +53,14 @@ COLUMNS = (
     ("p_bbks", "", "BBKS prolateness (lambda1 - 2 lambda2 + lambda3) / (2 tr); NaN when tr <= 0"),
     ("b_over_a", "", "axis ratio b/a from 1/sqrt(lambda); NaN when lambda1 <= 0 or the ratios are not ordered"),
     ("c_over_a", "", "axis ratio c/a from 1/sqrt(lambda)"),
-    ("well_resolved", "0/1", "ellipsoid fit within config.ELLIPSOID_CUTS (the fit columns are NaN otherwise)"),
+    ("well_resolved", "0/1", "ellipsoid fit within the resolution cuts (cut_* in the header; the fit columns are NaN otherwise)"),
     ("deep", "0/1", "central delta below config.DEEP_VOID_THRESHOLD"),
     ("a_mpc", "Mpc", "ellipsoid semi-axis 2 cell / sqrt(|lambda|), largest (a >= b >= c: sorted by |lambda|)"),
     ("b_mpc", "Mpc", "ellipsoid semi-axis, middle"),
     ("c_mpc", "Mpc", "ellipsoid semi-axis, smallest"),
     ("r_eff_mpc", "Mpc", "effective radius (a b c)^(1/3)"),
+    ("r_v_mpc", "Mpc", "MEASURED void radius: where the spherically averaged smoothed delta around the minimum first rises to 0 (NaN without a crossing within 15 sigma / half the box; ~0.57 R_eff)"),
+    ("distinct", "0/1", "among the well-resolved voids with an R_v, none deeper holds this centre inside its R_v (deepest first): the profile / abundance sample"),
     ("ellipticity_fit", "", "1 - c/a of the ellipsoid fit"),
     ("prolateness_fit", "", "(a^2 - b^2) / (a^2 - c^2) of the ellipsoid fit"),
     ("major_x", "", "unit vector of the major axis (a), component 0"),
@@ -68,7 +70,7 @@ COLUMNS = (
     ("minor_y", "", "minor axis, component 1"),
     ("minor_z", "", "minor axis, component 2"),
 )
-_BOOL = ("well_resolved", "deep")
+_BOOL = ("well_resolved", "deep", "distinct")
 _INT = ("id", "ix", "iy", "iz")
 
 
@@ -104,9 +106,10 @@ def void_dn_dlnr(r_eff_mpc, box_mpc: float, edges_mpc) -> tuple[np.ndarray, np.n
     return counts / (vol * dln), np.sqrt(counts) / (vol * dln), counts.astype(np.int64)
 
 
-def void_table(cat) -> dict:
+def void_table(cat, n_grid: int | None = None) -> dict:
     """The catalogue dict (pipeline.build_void_catalog's keys) as named columns, one 1-D array per
-    COLUMNS entry, in that order. Pure: no file, no config lookups (the frame is already in the dict)."""
+    COLUMNS entry, in that order. Pure: no file (the frame is already in the dict); 'n_grid' -- the grid the
+    periodic distances of 'distinct' wrap at -- defaults to config.FIELD_RESOLUTION, the frame's own."""
     coords = np.asarray(cat["coords"])
     n = len(coords)
     resolved = np.asarray(cat["well_resolved"]).astype(bool)
@@ -130,6 +133,8 @@ def void_table(cat) -> dict:
         "deep": np.asarray(cat["deep"]).astype(bool),
         "a_mpc": axes[:, 0] * nanfit, "b_mpc": axes[:, 1] * nanfit, "c_mpc": axes[:, 2] * nanfit,
         "r_eff_mpc": r_eff_mpc(cat).astype(np.float64),
+        "r_v_mpc": r_v_mpc(cat).astype(np.float64),
+        "distinct": distinct_mask(cat, resolved & np.isfinite(r_v_mpc(cat)), int(n_grid or config.FIELD_RESOLUTION)),
         "ellipticity_fit": np.asarray(cat["fit_ellipticity"], dtype=np.float64) * nanfit,
         "prolateness_fit": np.asarray(cat["fit_prolateness"], dtype=np.float64) * nanfit,
         "major_x": orient[:, 0, 0] * nanfit, "major_y": orient[:, 1, 0] * nanfit, "major_z": orient[:, 2, 0] * nanfit,
@@ -156,10 +161,36 @@ def assert_frame(cat, cell_mpc: float) -> None:
                          f"which re-derives its fits in this frame")
 
 
+def r_v_mpc(cat) -> np.ndarray:
+    """The measured void radius R_v in Mpc per catalogue row (pipeline.void_radius_cells: where the spherically
+    averaged smoothed density contrast around the minimum first rises to 0), in the catalogue's frame; NaN where it
+    has none -- and for a catalogue built before R_v existed (2026-10-07)."""
+    if "r_v_cells" not in cat:
+        return np.full(len(np.asarray(cat["coords"])), np.nan)
+    cell = pipeline.catalog_cell_mpc(cat)
+    return np.asarray(cat["r_v_cells"], dtype=np.float64) * (np.nan if cell is None else cell)
+
+
+def distinct_mask(cat, sample, n_grid: int) -> np.ndarray:
+    """Within the voids where 'sample' (bool per row) is True: the DISTINCT ones (pipeline.distinct_voids:
+    deepest first, none whose centre lies inside the region a deeper one claims, min(R_v, R_eff)). A per-sample
+    choice, made when the sample is -- so it follows the cuts, and nothing about it is cached."""
+    sample = np.asarray(sample, dtype=bool)
+    rows = np.nonzero(sample)[0]
+    out = np.zeros(len(sample), dtype=bool)
+    if rows.size and "r_v_cells" in cat:
+        cell = pipeline.catalog_cell_mpc(cat)
+        r_eff_cells = r_eff_mpc(cat)[rows] / cell if cell else None     # each claims min(R_v, R_eff) (distinct_voids)
+        keep = pipeline.distinct_voids(np.asarray(cat["coords"])[rows], np.asarray(cat["delta_values"])[rows],
+                                       np.asarray(cat["r_v_cells"])[rows], int(n_grid), r_eff_cells)
+        out[rows[keep]] = True
+    return out
+
+
 def provenance(products, n_voids: int, frame) -> dict:
     """What the catalogue was built from and with: the HDF5 root attributes, the CSV's '#' lines."""
     cell, box, n, source = frame
-    cuts = config.ELLIPSOID_CUTS
+    cuts = pipeline.ellipsoid_cuts_mpc()
     z = products.redshift
     return {
         "catalogue": "DTFE void catalogue: minima of the smoothed density contrast (dtfelib.pipeline.build_void_catalog)",
@@ -181,6 +212,10 @@ def provenance(products, n_voids: int, frame) -> dict:
         "cut_min_axis_mpc": float(cuts["min_axis_mpc"]),
         "cut_max_axis_mpc": float(cuts["max_axis_mpc"]),
         "cut_max_axis_ratio": float(cuts["max_axis_ratio"]),
+        # the RULES the Mpc cuts came from (config.ELLIPSOID_CUT_RULES): which of 10 sigma and L/2 set the limit
+        "cut_min_axis_cells": float(config.ELLIPSOID_CUT_RULES["min_axis_cells"]),
+        "cut_max_axis_sigma": float(config.ELLIPSOID_CUT_RULES["max_axis_sigma"]),
+        "cut_max_axis_box_frac": float(config.ELLIPSOID_CUT_RULES["max_axis_box_frac"]),
         "param_hash": pipeline._param_hash(),         # the cache directory the catalogue lives in
         "n_voids": int(n_voids),
         "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -281,7 +316,7 @@ def export_voids(products, out_dir, formats=("csv", "hdf5"), stem: str | None = 
     cat = products.voids()
     frame = frame_of(products)
     assert_frame(cat, frame[0])
-    table = void_table(cat)
+    table = void_table(cat, frame[2])
     prov = provenance(products, len(table["id"]), frame)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)

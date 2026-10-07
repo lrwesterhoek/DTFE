@@ -83,14 +83,11 @@ def main():
     parser = make_parser("Track void size / BBKS shape (e,p) / orientation along merger-tree tracers, "
                          "using the pipeline's own void catalogs at every snapshot.")
     extra(parser)
+    pipeline.add_smoothing_mpc_arg(parser)
     args = parser.parse_args()
-    if args.smooth > 0:
-        # keep the pipeline's cache/param hash in charge of consistency: an explicit --smooth
-        # changes SMOOTHING_SIGMA_CELLS exactly the way a pipeline run with that value would
-        default_sigma = config.SMOOTHING_SIGMA_CELLS
-        config.SMOOTHING_SIGMA_CELLS = args.smooth
-        print(f"[void-tracking] smoothing overridden to {args.smooth} cells "
-              f"(cache namespace follows; pipeline default is {default_sigma})")
+    # keep the pipeline's cache/param hash in charge of consistency: an explicit --smooth / --smooth-mpc changes
+    # SMOOTHING_SIGMA_CELLS (and, in Mpc, the footprint) exactly the way a pipeline run with that value would
+    pipeline.apply_smoothing_args(args, "void-tracking")
 
     # ---- 1. reference-snapshot void catalog (the pipeline's own) ------------------------
     cat0, n0 = catalog_at(args.snap, args)
@@ -125,7 +122,7 @@ def main():
             catalogs[s] = (cat, n)
     print(f"pipeline void catalogs available at {len(catalogs)} snapshots: {sorted(catalogs)}")
 
-    outdir = FIGURE_ROOT / args.sim
+    outdir = FIGURE_ROOT / args.sim / pipeline.smoothing_tag()     # a non-default sigma: its own folder
     outdir.mkdir(parents=True, exist_ok=True)
     summary = []
 
@@ -176,7 +173,7 @@ def main():
             t["delta_min"][i] = cat["delta_values"][j]
             t["match_dist_mpc"][i] = dist * config.BOX_SIZE
             # sizes/orientation from the SAME fit formula as the catalog, but without the
-            # ELLIPSOID_CUTS resolution gate: shallow high-z proto-voids exceed max_axis_mpc
+            # resolution gate (config.ELLIPSOID_CUT_RULES): shallow high-z proto-voids exceed its max axis
             # and would otherwise vanish from the track; well_resolved records the gate.
             fit = pipeline.ellipsoid_fit_one(cat["eigenvalues"][j], cat["eigenvectors"][j],
                                              config.BOX_SIZE / n)
@@ -215,7 +212,7 @@ def _open_markers(ax, x, y, tree_identity, **kw):
 
 
 def _sub_res_markers(ax, x, y, well_resolved, **kw):
-    """Overlay open diamonds where the fit fails the ELLIPSOID_CUTS resolution gate."""
+    """Overlay open diamonds where the fit fails the resolution gate (config.ELLIPSOID_CUT_RULES)."""
     x, y = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
     sub = ~np.asarray(well_resolved) & np.isfinite(x) & np.isfinite(y)
     if sub.any():
@@ -242,7 +239,7 @@ def plot_void(t, k, args, outdir, r_eff0):
     ax1.set_ylabel("size [Mpc]"); ax1b.set_ylabel(r"central $\delta$")
     ax1.set_title(f"{args.sim}  void {k} (snap {args.snap}, {args.method}) — size / shape / orientation\n"
                   "pipeline-catalog measurements; open circles: frozen identity, "
-                  "open diamonds: below ELLIPSOID_CUTS resolution")
+                  "open diamonds: below the resolution cut")
     h1, l1 = ax1.get_legend_handles_labels(); h2, l2 = ax1b.get_legend_handles_labels()
     ax1.legend(h1 + h2, l1 + l2, fontsize=9, loc="upper left")
 

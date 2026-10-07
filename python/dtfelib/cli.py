@@ -26,11 +26,13 @@ DATA_ROOT = Path(os.environ.get("DTFE_DATA_ROOT", "/Volumes/Samsung T7/Illustris
 DEFAULT_SIM = os.environ.get("DTFE_SIM", "TNG50-4-Dark")
 # Where every figure goes (config.LOCAL_FIGURES_ROOT, the launcher's figure browser): DTFE_FIGURES_ROOT, else
 # the T7 while it is mounted (since 2026-10-06; python/figures had grown to 8.8 GB inside iCloud), else
-# python/figures. NOT derived from DATA_ROOT: the launcher hands its data root only to the scripts it runs, so
-# the launcher and its scripts would look in different places. The tests set DTFE_FIGURES_ROOT to a temp dir.
-_T7 = Path("/Volumes/Samsung T7")
+# python/figures. On the T7 it is a folder INSIDE the user's 'Illustris TNG': the volume root is root's (APFS with
+# owners), so the first choice, '/Volumes/Samsung T7/DTFE figures', could not be created (2026-10-07). NOT derived
+# from DATA_ROOT: the launcher hands its data root only to the scripts it runs, so the launcher and its scripts
+# would look in different places. The tests set DTFE_FIGURES_ROOT to a temp dir.
+_T7_DATA = Path("/Volumes/Samsung T7/Illustris TNG")
 FIGURES_ROOT = Path(os.environ.get("DTFE_FIGURES_ROOT") or
-                    (_T7 / "DTFE figures" if _T7.is_dir() else Path(__file__).resolve().parents[1] / "figures"))
+                    (_T7_DATA / "figures" if _T7_DATA.is_dir() else Path(__file__).resolve().parents[1] / "figures"))
 DEFAULT_SNAP = 99
 
 

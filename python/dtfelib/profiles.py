@@ -1,15 +1,22 @@
-"""Void-centred stacked profiles in r / R_eff (survey item 8, 2026-10-05): the density, the radial
+"""Void-centred stacked profiles in r / R (survey item 8, 2026-10-05): the density, the radial
 velocity and the single-stream fraction around the catalogue's voids, averaged over spherical shells,
-stacked in bins of R_eff with bootstrap bands.
+stacked in bins of R with bootstrap bands. R is the MEASURED void radius R_v by default (2026-10-07:
+pipeline.void_radius_cells, where the spherically averaged smoothed density contrast first rises to 0), or the
+ellipsoid's R_eff (radius='r_eff'; with distinct=False and the old bins the profiles before 2026-10-07): R_eff is a
+curvature length, ~1.75x R_v
+(median R_v/R_eff 0.53-0.65 in TNG100 and TNG300 at z = 0, 1, 5), and in the R_eff stacks the density reached
+the mean, v_r turned to infall and the single-stream fraction bottomed out all at 0.5-0.7 R_eff -- at R_v.
 
     from dtfelib import pipeline, profiles
     p = pipeline.products("099", 0.0)
     prof = profiles.void_profiles(p)                           # per void: rho/rho_bar, v_r, single-stream fraction
     st = profiles.stack(prof, edges_mpc=(0, 2, 4, 8))          # per R_eff bin: mean, 16-84% bootstrap band, count
 
-WHAT IS SAMPLED. Every well-resolved void of the catalogue (its ellipsoid fit within config.ELLIPSOID_CUTS;
-sample='deep' narrows to a central delta below config.DEEP_VOID_THRESHOLD, the tracking sample) is taken as
-a sphere of radius R_eff = (a b c)^(1/3) (catalog.r_eff_mpc, the one definition) around its catalogue cell
+WHAT IS SAMPLED. Every well-resolved void of the catalogue (its ellipsoid fit within config.ELLIPSOID_CUT_RULES;
+sample='deep' narrows to a central delta below config.DEEP_VOID_THRESHOLD, the tracking sample) with a radius,
+by default only the DISTINCT ones of that sample (catalog.distinct_mask: deepest first, none whose centre lies
+inside a deeper one's R_v -- neighbouring minima of one void would be stacked twice), is taken as a sphere of
+radius R (R_v from catalog.r_v_mpc, or R_eff = (a b c)^(1/3) from catalog.r_eff_mpc) around its catalogue cell
 -- the cell's CENTRE, (i + 0.5) / N in environment.sample_grid's convention; the catalogue's positions_mpc
 are the cells' corners i x cell, half a cell apart, far below any R_eff. On each shell r = x R_eff (x in
 'bins'), M points of a Fibonacci sphere sample
@@ -25,7 +32,7 @@ by trilinear interpolation (the mask: nearest cell) through sample_grid, vectori
 void. A void whose outermost shell (max(bins) R_eff) would reach beyond half the box is dropped and
 counted ('dropped'): in a periodic box it would sample its own interior through the wrap.
 
-STACKING. stack() bins the voids by R_eff (fixed edges in Mpc, comparable across snapshots), and gives
+STACKING. stack() bins the voids by R (fixed edges in Mpc, comparable across snapshots), and gives
 per bin the mean profile over its voids, the 16th-84th percentile band of 'n_boot' bootstrap resamples of
 the voids (NaN with fewer than two voids), and the count; a bin below 'min_count' voids is left NaN.
 
@@ -45,8 +52,25 @@ from .environment import sample_grid
 from .io import single_stream_mask
 
 DEFAULT_BINS = tuple(np.round(np.linspace(0.1, 3.0, 30), 4).tolist())   # r / R_eff of the shells
-DEFAULT_EDGES = (0.0, 2.0, 4.0, 8.0, 16.0)                               # R_eff bins in Mpc
+DEFAULT_EDGES = (0.0, 2.0, 4.0, 8.0, 16.0)                               # R_eff bins in Mpc (stack()'s default)
+DEFAULT_EDGES_SIGMA = {"r_v": (0.0, 2.5, 3.5, 5.0),     # the scripts' default bins, in smoothing lengths (+ the wrap
+                       "r_eff": (0.0, 5.0, 6.0, 7.0)}   # cap); R_v of distinct resolved voids: 16/50/84% ~ 2 / 3.3 / 7.5 sigma
+RADII = ("r_v", "r_eff")
 DEFAULT_M = 400                                                          # points per shell
+
+
+def default_edges_mpc(sigma_mpc: float, box_mpc: float, radius: str = "r_v") -> tuple:
+    """Bin edges in R for a stack in this simulation: DEFAULT_EDGES_SIGMA[radius] x sigma, closed at the wrap
+    rule's cap L/6 (3 R <= L/2: a void beyond it is dropped anyway). Both radii scale with the smoothing (R_eff is a
+    curvature length, 5-7 sigma for most voids passing the 10-sigma cut; R_v of the distinct ones 2-7.5 sigma), in
+    EVERY simulation, while the old Mpc edges 0-2-4-8-16 put no TNG300 void in any bin (2026-10-07)."""
+    if not float(sigma_mpc) > 0:
+        raise ValueError(f"the smoothing length must be positive, got {sigma_mpc!r} (pipeline.smoothing_length_mpc)")
+    if radius not in DEFAULT_EDGES_SIGMA:
+        raise ValueError(f"radius must be one of {RADII}, got {radius!r}")
+    cap = float(box_mpc) / 6.0
+    edges = [k * float(sigma_mpc) for k in DEFAULT_EDGES_SIGMA[radius] if k * float(sigma_mpc) < cap]
+    return tuple(edges + [cap])
 
 
 def fibonacci_sphere(m: int) -> np.ndarray:
@@ -112,21 +136,35 @@ def profile_grids(grids: dict, centers_frac, r_eff_cells, bins=DEFAULT_BINS, m: 
     return out
 
 
-def void_profiles(products, bins=DEFAULT_BINS, m: int = DEFAULT_M, sample: str = "resolved") -> dict:
+def void_profiles(products, bins=DEFAULT_BINS, m: int = DEFAULT_M, sample: str = "resolved", radius: str = "r_v",
+                  distinct: bool = True) -> dict:
     """profile_grids() on one snapshot's grids and catalogue (pipeline.SnapshotProducts): the voids of the
-    'sample' ('resolved': well_resolved; 'deep': well_resolved and deep) with R_eff from catalog.r_eff_mpc,
-    the frame checked by catalog.frame_of. Adds 'r_eff_mpc', 'delta_c', 'sample', 'cell_mpc', 'n_grid'."""
+    'sample' ('resolved': well_resolved; 'deep': well_resolved and deep) with a finite 'radius' ('r_v', the
+    measured catalog.r_v_mpc, or 'r_eff', catalog.r_eff_mpc), only the distinct ones of them unless distinct=False,
+    the frame checked by catalog.frame_of. Adds 'r_mpc' (the radius the shells are in), 'r_v_mpc', 'r_eff_mpc',
+    'radius', 'distinct', 'delta_c', 'sample', 'cell_mpc', 'n_grid'."""
     cat = products.voids()
     cell, box, n_grid, _source = catalog.frame_of(products)
     catalog.assert_frame(cat, cell)
+    if radius not in RADII:
+        raise ValueError(f"radius must be one of {RADII}, got {radius!r}")
     resolved = np.asarray(cat["well_resolved"]).astype(bool)
     if sample == "deep":
         resolved &= np.asarray(cat["deep"]).astype(bool)
     elif sample != "resolved":
         raise ValueError(f"sample must be 'resolved' or 'deep', got {sample!r}")
+    r_v_all, r_eff_all = catalog.r_v_mpc(cat), catalog.r_eff_mpc(cat)
+    r_all = r_v_all if radius == "r_v" else r_eff_all
+    n_sample = int(resolved.sum())
+    resolved &= np.isfinite(r_all)
+    n_no_radius = n_sample - int(resolved.sum())             # said, not silent: they are the larger, deeper ones
+    n_with = int(resolved.sum())
+    if distinct:
+        resolved = catalog.distinct_mask(cat, resolved, n_grid)
+    n_overlapping = n_with - int(resolved.sum())
     rows = np.nonzero(resolved)[0]
     coords = np.asarray(cat["coords"])[rows]
-    r_eff_mpc = catalog.r_eff_mpc(cat)[rows]
+    r_mpc = r_all[rows]
     fs = products.fs
     grids = {"density": fs.density(units="mean"), "velocity": None, "single": None}
     if fs.has("velocity"):
@@ -134,10 +172,14 @@ def void_profiles(products, bins=DEFAULT_BINS, m: int = DEFAULT_M, sample: str =
     if fs.method == "ps" and fs.has("streams"):
         hidden = fs.load("hidden_streams") if fs.has("hidden_streams") else None
         grids["single"] = single_stream_mask(fs.load("streams"), hidden)
-    out = profile_grids(grids, (coords + 0.5) / n_grid, r_eff_mpc / cell, bins=bins, m=m)
+    out = profile_grids(grids, (coords + 0.5) / n_grid, r_mpc / cell, bins=bins, m=m)
     local = out["index"]                        # rows of the sample kept by profile_grids (the wrap rule)
     out["index"] = rows[local]                  # -> rows of the catalogue
-    out["r_eff_mpc"] = r_eff_mpc[local]
+    out["r_mpc"] = r_mpc[local]
+    out["r_v_mpc"] = r_v_all[rows[local]]
+    out["r_eff_mpc"] = r_eff_all[rows[local]]
+    out["radius"], out["distinct"] = radius, bool(distinct)
+    out["n_no_radius"], out["n_overlapping"] = n_no_radius, n_overlapping
     out["delta_c"] = np.asarray(cat["delta_values"], dtype=np.float64)[rows[local]]
     out.update(sample=sample, cell_mpc=float(cell), box_mpc=float(box), n_grid=int(n_grid), method=str(fs.method))
     return out
@@ -154,10 +196,10 @@ def _band(values: np.ndarray, n_boot: int, rng) -> tuple[np.ndarray, np.ndarray]
 
 
 def stack(prof: dict, edges_mpc=DEFAULT_EDGES, n_boot: int = 200, seed: int = 0, min_count: int = 5) -> dict:
-    """The profiles stacked in bins of R_eff: {'edges', 'count': (nbin,), 'bins': x, and per field
+    """The profiles stacked in bins of their radius (prof['r_mpc'], else 'r_eff_mpc'): {'edges', 'count': (nbin,), 'bins': x, and per field
     ('density', 'v_r', 'single' when present) {'mean', 'lo', 'hi'}: (nbin, nb)} -- see the module docstring."""
     edges = np.asarray(edges_mpc, dtype=np.float64)
-    r_eff = np.asarray(prof["r_eff_mpc"], dtype=np.float64)
+    r_eff = np.asarray(prof["r_mpc"] if "r_mpc" in prof else prof["r_eff_mpc"], dtype=np.float64)   # the shells' radius
     nb = len(prof["bins"])
     nbin = len(edges) - 1
     rng = np.random.default_rng(seed)

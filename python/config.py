@@ -76,7 +76,6 @@ COSMOLOGY = {
 # catalog was built with (cache namespaces r512_s10_*); at 0 the catalogs degenerate into
 # single-cell noise dips.
 SMOOTHING_SIGMA_CELLS = 10.0
-SMOOTHING_SIGMA_MPC = SMOOTHING_SIGMA_CELLS * CELL_SIZE
 
 RAW_MAPS_SIGMA = 0.0
 VIS_SMOOTHING_SIGMA = RAW_MAPS_SIGMA
@@ -84,13 +83,45 @@ VIS_SMOOTHING_SIGMA = RAW_MAPS_SIGMA
 SMOOTHING_COMPARISON_SIGMAS = [5.0, 10.0, 20.0]
 
 FOOTPRINT_SIZE = 11
+# what every default figure and catalogue is made with: a run at another smoothing tags its outputs
+# (dtfelib.pipeline.smoothing_tag) instead of overwriting these
+PRODUCTION_SMOOTHING = (SMOOTHING_SIGMA_CELLS, FOOTPRINT_SIZE)
+
+
+def footprint_for(sigma_cells):
+    """The minima finder's footprint for a smoothing length in cells: the odd number of cells nearest 1.1 sigma
+    (11 at the production 10), at least 3 -- so a smoothing fixed in Mpc finds minima in the same PHYSICAL window
+    in every box (a fixed 11 cells is 3 sigma at TNG300's 3.66-cell 2.16 Mpc and suppresses minima TNG100 keeps)."""
+    return max(3, 2 * int(round((1.1 * float(sigma_cells) - 1.0) / 2.0)) + 1)
+
+
+# A smoothing length FIXED IN Mpc (2026-10-07): DTFE_SIGMA_MPC=2.16 smooths every box at the same physical scale --
+# 10 cells is 1.0 / 2.2 / 5.9 Mpc in TNG50 / 100 / 300, so their catalogues were different voids -- and the footprint
+# follows it (footprint_for). Here, at import, so every module-level copy follows; the void scripts' --smooth-mpc
+# does the same at run time (dtfelib.pipeline.set_smoothing). FOR THE VOID SCRIPTS AND 'analyze.py export' (which
+# tag their outputs): analyze.py compute/plot/all refuse to run under it, and no figure made under it is copied
+# into the thesis Figures/ tree. The cells are rounded to 1e-9, so 10 x CELL_SIZE gives exactly 10.0 cells,
+# footprint 11 and today's caches.
+if os.environ.get("DTFE_SIGMA_MPC"):
+    SMOOTHING_SIGMA_CELLS = round(float(os.environ["DTFE_SIGMA_MPC"]) / CELL_SIZE, 9)
+    FOOTPRINT_SIZE = footprint_for(SMOOTHING_SIGMA_CELLS)
+SMOOTHING_SIGMA_MPC = SMOOTHING_SIGMA_CELLS * CELL_SIZE
 
 GRADIENT_THRESHOLD = 0.1
 
 DEEP_VOID_THRESHOLD = -0.1
-ELLIPSOID_CUTS = {
-    'min_axis_mpc': 0.1,
-    'max_axis_mpc': 10.0,
+# The ellipsoid fit's resolution gate (a void's well_resolved flag) as RULES in the field's own scales; in Mpc
+# only at call time, through dtfelib.pipeline.ellipsoid_cuts_mpc(), so a script's --smooth reaches it. Until
+# 2026-10-07 the gate was a fixed 10 Mpc -- TNG50's 10 sigma -- which kept 2 of 495 TNG100 voids and 0 of 650
+# TNG300 voids at z = 0: the semi-axes are curvature lengths of the smoothed field and grow with the smoothing.
+# 10 sigma reproduces the TNG50 sample (+72/-0 of 8433 flags over the thesis snapshots; no thesis number used
+# the gate: its tables average ALL voids) and keeps 103 (TNG100) and 409 (TNG300) voids at z = 0. The box
+# clause: a semi-axis beyond L/2 overlaps its own periodic image (inert at sigma = 10 cells, binding above 25.6).
+# The minimum axis (was 0.1 Mpc, one TNG50 cell) and the axis ratio never decide a void at sigma = 10 cells.
+ELLIPSOID_CUT_RULES = {
+    'min_axis_cells': 1.0,
+    'max_axis_sigma': 10.0,
+    'max_axis_box_frac': 0.5,
     'max_axis_ratio': 10.0,
 }
 

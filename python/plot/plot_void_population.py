@@ -8,7 +8,7 @@ definitions:
 
   * 'bbks'      : the correlation sample -- finite e/p with e >= 0 and |p| <= e
                   (identical to void_sample() in plot_marked_correlation_BBKS.py)
-  * 'resolved'  : well_resolved (passes ELLIPSOID_CUTS) -- sizes/orientation defined
+  * 'resolved'  : well_resolved (passes config.ELLIPSOID_CUT_RULES) -- sizes/orientation defined
   * 'deep'      : well_resolved AND central delta < DEEP_VOID_THRESHOLD -- the tracking sample
 
 Outputs (figures/void_population/<sim>/):
@@ -46,14 +46,21 @@ def bbks_valid(cat):
     return np.isfinite(e) & np.isfinite(p) & (e >= 0) & (np.abs(p) <= e)
 
 
-def snapshot_stats(cat):
-    """Per-snapshot population statistics from one pipeline void catalog."""
+def snapshot_stats(cat, n_grid=None, keep_overlaps=False):
+    """Per-snapshot population statistics from one pipeline void catalog. The abundance sample (2026-10-07): the
+    resolved voids with a measured radius R_v (catalog.r_v_mpc), only the DISTINCT ones (catalog.distinct_mask) unless
+    keep_overlaps -- neighbouring minima of one void counted once."""
     valid = bbks_valid(cat)
     resolved = cat["well_resolved"].astype(bool)
     deep = resolved & (cat["delta_values"] < config.DEEP_VOID_THRESHOLD)
 
     e, p = cat["bbks_params"][:, 0], cat["bbks_params"][:, 1]
     r_eff = catalog.r_eff_mpc(cat)          # (a b c)^(1/3) where well resolved, NaN elsewhere: the one definition
+    r_v = catalog.r_v_mpc(cat)              # the measured radius (NaN for a catalogue built before it)
+    with_rv = resolved & np.isfinite(r_v)
+    counted = with_rv if keep_overlaps else catalog.distinct_mask(cat, with_rv, int(n_grid or config.FIELD_RESOLUTION))
+    # said, not silent (review 2026-10-07): the resolved voids without R_v (no crossing within 15 sigma: the larger,
+    # deeper ones -- the large-R end of n(>R_v) is low by them) and those inside a deeper void's region
 
     def pct(x, sel):
         x = np.asarray(x, dtype=float)[sel]
@@ -65,13 +72,19 @@ def snapshot_stats(cat):
         "n_bbks": int(valid.sum()),
         "n_resolved": int(resolved.sum()),
         "n_deep": int(deep.sum()),
+        "n_counted": int(counted.sum()),
+        "n_no_rv": int((resolved & ~np.isfinite(r_v)).sum()),
+        "n_overlapping": int(with_rv.sum() - counted.sum()),
         "r_eff_pct": pct(r_eff, resolved),
+        "r_v_pct": pct(r_v, counted),
         "e_pct": pct(e, valid),
         "p_pct": pct(p, valid),
         "delta_pct": pct(cat["delta_values"], np.ones(len(e), bool)),
         # raw samples for the distribution and abundance figures
         "_r_eff": r_eff[resolved & np.isfinite(r_eff)],
         "_delta_resolved": np.asarray(cat["delta_values"], dtype=float)[resolved & np.isfinite(r_eff)],
+        "_r_v": r_v[counted],
+        "_delta_counted": np.asarray(cat["delta_values"], dtype=float)[counted],
         "_e": e[valid], "_p": p[valid],
         "_delta": np.asarray(cat["delta_values"], dtype=float),
     }
@@ -86,9 +99,11 @@ def main():
     parser.add_argument("--other-estimator", action="store_true",
                         help="abundance figure: overlay the OTHER estimator's catalogue (dtfe beside ps or the "
                              "reverse) where its grids exist -- computed into the cache when not there yet")
+    parser.add_argument("--keep-overlaps", action="store_true",
+                        help="abundance: count every resolved void with a radius, not only the distinct ones")
+    pipeline.add_smoothing_mpc_arg(parser)
     args = parser.parse_args()
-    if args.smooth > 0:
-        config.SMOOTHING_SIGMA_CELLS = args.smooth
+    pipeline.apply_smoothing_args(args, "void-population")
 
     use_data_root(args.data_root)      # --data-root for the trees, group catalogues and ladder too (2026-10-05)
     ztab = gc.redshift_table(args.sim)
@@ -112,12 +127,12 @@ def main():
             continue
         finally:
             prod.release()
-        stats[s] = snapshot_stats(cat)
+        stats[s] = snapshot_stats(cat, _n, args.keep_overlaps)
         if args.other_estimator and s in panel_want:   # only the panel snapshots are drawn: no catalogue for the rest
             oth = pipeline.products(s, sim=args.sim, method="dtfe" if method_used[s] == "ps" else "ps",
                                     data_root=args.data_root)
             try:
-                other[s] = snapshot_stats(oth.voids())
+                other[s] = snapshot_stats(oth.voids(), _n, args.keep_overlaps)
             except (FileNotFoundError, ValueError):
                 pass
             finally:
@@ -138,7 +153,7 @@ def main():
               f"R_eff={st['r_eff_pct'][1]:5.2f} Mpc  e={st['e_pct'][1]:.3f}  "
               f"p={st['p_pct'][1]:+.3f}  delta={st['delta_pct'][1]:+.3f}")
 
-    outdir = FIGURE_ROOT / args.sim
+    outdir = FIGURE_ROOT / args.sim / pipeline.smoothing_tag()     # a non-default sigma: its own folder
     outdir.mkdir(parents=True, exist_ok=True)
 
     # ---- evolution figure ---------------------------------------------------------------
@@ -195,8 +210,11 @@ def main():
     plt.close(fig)
 
     # ---- abundance figure (survey item 10): n(> R_eff), dn/dlnR per Mpc^3, R_eff against the central delta
-    radii = np.geomspace(0.3, 30.0, 40)
-    edges = np.geomspace(0.3, 30.0, 16)
+    # the abundance in the MEASURED radius R_v of the distinct voids (2026-10-07; R_eff, ~1.75 R_v, is a curvature
+    # length); radii in smoothing lengths, 0.3-30 sigma: fixed Mpc radii saturated n(>R) in TNG300
+    sig = pipeline.smoothing_length_mpc()          # sigma = 0 counts as one cell
+    radii = np.geomspace(0.3 * sig, 30.0 * sig, 40)
+    edges = np.geomspace(0.3 * sig, 30.0 * sig, 16)
     fig, axes = plt.subplots(1, 3, figsize=(15, 4.6))
     colors = plt.cm.viridis(np.linspace(0.1, 0.9, max(len(panel), 1)))
     abund = {}
@@ -205,8 +223,8 @@ def main():
         for st_, ls, tag in ((stats[s], "-", ""), (other.get(s), "--", " (other estimator)")):
             if st_ is None:
                 continue
-            n_cum, err, cnt = catalog.void_abundance(st_["_r_eff"], box[s], radii)
-            dn, derr, dcnt = catalog.void_dn_dlnr(st_["_r_eff"], box[s], edges)
+            n_cum, err, cnt = catalog.void_abundance(st_["_r_v"], box[s], radii)
+            dn, derr, dcnt = catalog.void_dn_dlnr(st_["_r_v"], box[s], edges)
             abund[f"{s}{'_other' if tag else ''}"] = (n_cum, err, dn, derr)
             ok = cnt > 0
             axes[0].errorbar(radii[ok], n_cum[ok], yerr=err[ok], color=c_, ls=ls, lw=1.4, capsize=2,
@@ -214,20 +232,21 @@ def main():
             mid = np.sqrt(edges[1:] * edges[:-1])
             okd = dcnt > 0
             axes[1].errorbar(mid[okd], dn[okd], yerr=derr[okd], color=c_, ls=ls, lw=1.4, capsize=2, label=f"{zlab}{tag}")
-    for ax, ylab in ((axes[0], r"$n(>R_{\rm eff})$ [Mpc$^{-3}$]"), (axes[1], r"$dn/d\ln R_{\rm eff}$ [Mpc$^{-3}$]")):
-        ax.set_xscale("log"); ax.set_yscale("log"); ax.set_xlabel(r"$R_{\rm eff}$ [Mpc]"); ax.set_ylabel(ylab)
+    for ax, ylab in ((axes[0], r"$n(>R_v)$ [Mpc$^{-3}$]"), (axes[1], r"$dn/d\ln R_v$ [Mpc$^{-3}$]")):
+        ax.set_xscale("log"); ax.set_yscale("log"); ax.set_xlabel(r"$R_v$ [Mpc]"); ax.set_ylabel(ylab)
         ax.grid(alpha=0.3, which="both"); ax.legend(fontsize=7)
     last = max(panel, key=lambda s: -ztab.get(s, 0.0)) if panel else None
-    if last is not None and stats[last]["_r_eff"].size:
-        r_res = stats[last]["_r_eff"]
-        d_res = stats[last]["_delta_resolved"]
+    if last is not None and stats[last]["_r_v"].size:
+        r_res = stats[last]["_r_v"]
+        d_res = stats[last]["_delta_counted"]
         hb = axes[2].hexbin(r_res, d_res, gridsize=30, xscale="log", bins="log", cmap="viridis", mincnt=1)
         fig.colorbar(hb, ax=axes[2], label="voids per cell (log)")
         axes[2].axhline(config.DEEP_VOID_THRESHOLD, color="tab:red", lw=0.8, ls=":", label="deep-void threshold")
-        axes[2].set_xlabel(r"$R_{\rm eff}$ [Mpc]"); axes[2].set_ylabel(r"central $\delta$ (smoothed)")
-        axes[2].set_title(f"z={ztab.get(last, float('nan')):.2f}, well-resolved voids", fontsize=10)
+        axes[2].set_xlabel(r"$R_v$ [Mpc]"); axes[2].set_ylabel(r"central $\delta$ (smoothed)")
+        axes[2].set_title(f"z={ztab.get(last, float('nan')):.2f}, {'' if args.keep_overlaps else 'distinct '}well-resolved voids", fontsize=10)
         axes[2].legend(fontsize=7, loc="lower right")
-    fig.suptitle(f"{args.sim} — void abundance ({'/'.join(methods)}, well-resolved voids, box {box[snaps[-1]]:.0f} Mpc)")
+    fig.suptitle(f"{args.sim} — void abundance in R_v ({'/'.join(methods)}, {'' if args.keep_overlaps else 'distinct '}"
+                 f"well-resolved voids, box {box[snaps[-1]]:.0f} Mpc)")
     fig.tight_layout()
     fig.savefig(outdir / "population_abundance.png", dpi=200, bbox_inches="tight")
     plt.close(fig)
@@ -237,8 +256,9 @@ def main():
         snaps=np.array(snaps), redshift=z, box_mpc=np.array([box[s] for s in snaps]),
         abundance_radii_mpc=radii, abundance_edges_mpc=edges,
         **{k: np.array([stats[s][k] for s in snaps])
-           for k in ("n_total", "n_bbks", "n_resolved", "n_deep",
-                     "r_eff_pct", "e_pct", "p_pct", "delta_pct")},
+           for k in ("n_total", "n_bbks", "n_resolved", "n_deep", "n_counted", "n_no_rv", "n_overlapping",
+                     "r_eff_pct", "r_v_pct", "e_pct", "p_pct", "delta_pct")},
+        abundance_radius="r_v", abundance_distinct=not args.keep_overlaps,
         **{f"abundance_{key}_{part}": np.asarray(vals[i])
            for key, vals in abund.items() for i, part in enumerate(("n_cum", "n_cum_err", "dn_dlnr", "dn_dlnr_err"))})
     print(f"-> {outdir}/population_evolution.png, population_distributions.png, population_abundance.png, population_stats.npz")

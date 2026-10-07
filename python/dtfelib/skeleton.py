@@ -173,35 +173,46 @@ def void_shell_fractions(caustic_class, centers_frac, r_eff_cells, shells=(1.0, 
     return out
 
 
-def nearest_wall_distance(sheet_mask, centers_cells, cutout_cells: int = 32) -> tuple[np.ndarray, np.ndarray]:
-    """(distance, bounded): per centre (cells, (n, 3)), the Euclidean distance in cells to the nearest
-    True cell of 'sheet_mask', from the distance transform of a periodic cut-out of half-width
-    'cutout_cells'; with no sheet cell inside the cut-out the distance is NaN and 'bounded' True (the
-    half-width is a lower bound)."""
-    mask = np.asarray(sheet_mask, dtype=bool)
+def _wall_distance_in(mask, ci, half):
+    """The distance (cells) from integer centre 'ci' to the nearest True cell of 'mask' within a periodic cut-out
+    of half-width 'half', or None when none lies within 'half' (one there could sit outside the cut-out)."""
     n = mask.shape[0]
-    centers = np.asarray(centers_cells, dtype=np.float64).reshape(-1, 3)
-    half = int(cutout_cells)
-    dist = np.full(len(centers), np.nan)
-    bounded = np.zeros(len(centers), dtype=bool)
     offs = np.arange(-half, half + 1)
-    for i, c in enumerate(centers):
-        ci = np.rint(c).astype(np.int64)
-        idx = [(ci[k] + offs) % n for k in range(3)]
-        cut = mask[np.ix_(idx[0], idx[1], idx[2])]
-        if not cut.any():
-            bounded[i] = True
-            continue
-        if cut[half, half, half]:
-            dist[i] = 0.0
-            continue
-        edt = ndimage.distance_transform_edt(~cut)
-        d = float(edt[half, half, half])
-        if d > half:                                          # the nearest sheet cell may sit outside the cut-out
-            bounded[i] = True
-            dist[i] = np.nan
-        else:
-            dist[i] = d
+    idx = [(ci[k] + offs) % n for k in range(3)]
+    cut = mask[np.ix_(idx[0], idx[1], idx[2])]
+    if not cut.any():
+        return None
+    if cut[half, half, half]:
+        return 0.0
+    d = float(ndimage.distance_transform_edt(~cut)[half, half, half])
+    return d if d <= half else None                          # beyond 'half': the nearest may sit outside the cut-out
+
+
+def nearest_wall_distance(sheet_mask, centers_cells, cutout_cells: int = 32, start_cells: int = 32) -> tuple[np.ndarray, np.ndarray]:
+    """(distance, bounded): per centre (cells, (n, 3)), the Euclidean distance in cells to the nearest
+    True cell of 'sheet_mask', searched in periodic cut-outs of half-width 'start_cells', doubled for the
+    centres not yet resolved, up to 'cutout_cells'; with no sheet cell within that the distance is NaN and
+    'bounded' True (the half-width is a lower bound). A wall found at d <= the half-width is THE nearest (every
+    closer cell lies inside the cube), so the result is the one of a single search at 'cutout_cells' -- at a
+    fraction of the cost: a 100-cell cut-out for every void was 31x slower than 32 (2026-10-07)."""
+    mask = np.asarray(sheet_mask, dtype=bool)
+    centers = np.asarray(centers_cells, dtype=np.float64).reshape(-1, 3)
+    full = int(cutout_cells)
+    dist = np.full(len(centers), np.nan)
+    bounded = np.ones(len(centers), dtype=bool)
+    todo = np.arange(len(centers))
+    half = max(1, min(int(start_cells), full))
+    while todo.size:
+        left = []
+        for i in todo:
+            d = _wall_distance_in(mask, np.rint(centers[i]).astype(np.int64), half)
+            if d is None:
+                left.append(i)
+            else:
+                dist[i], bounded[i] = d, False
+        if half >= full:
+            break
+        todo, half = np.asarray(left, dtype=np.int64), min(2 * half, full)
     return dist, bounded
 
 

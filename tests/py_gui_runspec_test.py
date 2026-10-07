@@ -222,6 +222,7 @@ def main():
         point_window_linear(tmp)
         plane_reads()
         plot_options(tmp)
+        plot_void_sets(tmp)
         explore_extras(tmp)
         check("every plot step sets DTFE_SIM and MPLBACKEND=Agg (several scripts call plt.show())",
               all(stp.env["DTFE_SIM"] == "TNG100-3-Dark" and stp.env["MPLBACKEND"] == "Agg"
@@ -1264,6 +1265,53 @@ def plot_options(tmp: Path):
                                                                                      "--dpi", "--image")), flat)
 
 
+def plot_void_sets(tmp: Path):
+    """The Plots tab's void and phase-space sets (2026-10-07): void profiles, streams by web environment, P(k) and the
+    caustic skeleton, with the void radius, overlapping voids and the smoothing in Mpc; every flag one the script's own
+    parser knows; the thesis set stays last (the app test picks it as the list's last item)."""
+    import subprocess as _sp
+    repo = Path(__file__).resolve().parents[1]
+    base = dict(data_root=str(tmp), sim="TNG100-3-Dark", snapshots=[50, 99])
+    sets = ["voidpop", "voidprof", "webstreams", "pk", "skeleton"]
+    plain = {st.argv[1].split("/")[-1]: st.argv for st in rs.PlotSpec(sets=sets, **base).steps()}
+    flat = " ".join(" ".join(a) for a in plain.values())
+    check("the void sets: one call each over the selected snapshots, the defaults adding no option flag (the skeleton "
+          "its per-void statistics); the thesis set still last",
+          len(plain) == 5 and all(a[a.index("--snaps") + 1:a.index("--snaps") + 3] == ["50", "99"]
+                                  for k, a in plain.items() if k != "plot_void_population.py")
+          and not any(f in flat for f in ("--radius", "--keep-overlaps", "--smooth-mpc", "--web", "--nbins", "--ref-snap",
+                                          "--sample"))
+          and "--voids" in plain["plot_caustic_skeleton.py"] and rs.FIGURE_SETS[-1].key == "thesis", flat)
+    opts = {"voidpop": {"keep_overlaps": True, "smooth_mpc": 2.1625},
+            "voidprof": {"radius": "r_eff", "sample": "deep", "keep_overlaps": True, "smooth_mpc": 2.1625},
+            "webstreams": {"web": "tweb"}, "pk": {"nbins": 0, "ref": False},
+            "skeleton": {"voids": False, "radius": "r_eff"}}
+    got = {st.argv[1].split("/")[-1]: st.argv for st in rs.PlotSpec(sets=sets, options=opts, **base).steps()}
+    def has(name, *flags):
+        a = got[name]
+        return all(f in a and (i + 1 == len(flags) or True) for i, f in enumerate(flags))
+    pv, pp = got["plot_void_profiles.py"], got["plot_void_population.py"]
+    check("... the options reach their flags (radius, deep sample, overlaps, smoothing in Mpc, web, k bins, no same-box "
+          "panel, no per-void block)",
+          pv[pv.index("--radius") + 1] == "r_eff" and pv[pv.index("--sample") + 1] == "deep" and "--keep-overlaps" in pv
+          and pv[pv.index("--smooth-mpc") + 1] == "2.1625" and "--keep-overlaps" in pp and "--smooth-mpc" in pp
+          and has("plot_web_streams.py", "--web", "tweb") and got["plot_pk_compare.py"][-2:] in (["--ref-snap", "-1"],)
+          and "--nbins" in got["plot_pk_compare.py"] and "--voids" not in got["plot_caustic_skeleton.py"]
+          and "--radius" in got["plot_caustic_skeleton.py"], str(got))
+    unknown = []
+    for name, a in got.items():
+        helptext = _sp.run([rs.PYTHON, str(repo / "python" / "plot" / name), "--help"], capture_output=True, text=True,
+                           cwd=repo / "python").stdout
+        unknown += [f"{name} {f}" for f in a if f.startswith("--") and f not in helptext]
+    check("... and every flag is one the script's own parser knows (--help)", not unknown, str(unknown))
+    both = rs.PlotSpec(sets=["voidprof"], smooth=5.0, options={"voidprof": {"smooth_mpc": 2.0}}, **base)
+    sk = rs.PlotSpec(sets=["skeleton"], **base)
+    check("... the smoothing in cells AND in Mpc is an error; the skeleton without caustic grids a warning",
+          any(lvl == "error" and "cells and in Mpc" in m for lvl, m in both.problems())
+          and any(lvl == "warning" and "causticClass" in m for lvl, m in sk.problems()),
+          f"{both.problems()} | {sk.problems()}")
+
+
 def explore_extras(tmp: Path):
     """The hi-res slices an output offers, a snapshot chosen by hand for the server, the scalar field, the Custom
     tab's research options (2026-10-06)."""
@@ -1830,10 +1878,10 @@ def figures_root_rule():
     out = subprocess.run([sys.executable, "-c", "import config, dtfelib.cli as c; print(c.FIGURES_ROOT); "
                           "print(config.LOCAL_FIGURES_ROOT)"], cwd=ROOT / "python", env=env,
                          capture_output=True, text=True).stdout.split("\n")
-    t7 = Path("/Volumes/Samsung T7")
-    want = str(t7 / "DTFE figures") if t7.is_dir() else str(ROOT / "python" / "figures")
-    check("without DTFE_FIGURES_ROOT: the T7's 'DTFE figures' while it is mounted, else python/figures -- the same "
-          "for dtfelib and config", out[:2] == [want, want], str(out[:2]))
+    t7 = Path("/Volumes/Samsung T7/Illustris TNG")
+    want = str(t7 / "figures") if t7.is_dir() else str(ROOT / "python" / "figures")
+    check("without DTFE_FIGURES_ROOT: the T7's 'Illustris TNG/figures' while it is mounted (the volume root is root's), "
+          "else python/figures -- the same for dtfelib and config", out[:2] == [want, want], str(out[:2]))
     legacy = str(rs.LEGACY_FIGURES_ROOT)
     pipe, plot = rs.PipelineSpec.from_dict({"figures_root": legacy}), rs.PlotSpec.from_dict({"figures_root": legacy})
     own = rs.PlotSpec.from_dict({"figures_root": "/somewhere/else"})

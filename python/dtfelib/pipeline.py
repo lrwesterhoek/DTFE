@@ -136,6 +136,76 @@ def find_critical_points(delta_s, hessian, grad_mag):
     return out
 
 
+R_V_STEP_SIGMA = 0.2      # radial step of the R_v search, in smoothing lengths (the crossing is interpolated)
+R_V_MAX_SIGMA = 15.0      # how far out it looks (capped at half the box)
+R_V_DIRS = 128            # Fibonacci directions per shell
+
+
+def void_radius_cells(delta_s, coords, sigma_cells):
+    """R_v per minimum, in cells (NaN when there is none): the radius at which the spherically averaged SMOOTHED
+    density contrast around the minimum first rises to 0 -- the underdense region the void is, MEASURED. The
+    ellipsoid's 2 / sqrt|lambda| is where a QUADRATIC rises by a fixed 2 whatever the void's depth, ~1.6x the radius
+    where the stacked density reaches the mean, v_r turns to infall and the single-stream fraction bottoms out
+    (TNG100 z = 0, 2026-10-07). Shell means of delta_s (trilinear, R_V_DIRS directions, centred on the minimum's
+    cell centre) every R_V_STEP_SIGMA sigma out to R_V_MAX_SIGMA sigma or half the box; the crossing linearly
+    interpolated from the last negative shell (from r = 0: the minimum itself). Defined at every redshift (delta_s
+    < 0 at a void's minimum); NaN for a minimum that is not underdense or never reaches 0 within reach."""
+    from .profiles import fibonacci_sphere, shell_means          # here: profiles imports catalog, which imports this module
+    coords = np.asarray(coords, dtype=np.int64).reshape(-1, 3)
+    out = np.full(len(coords), np.nan)
+    if not len(coords):
+        return out
+    n = delta_s.shape[0]
+    step = R_V_STEP_SIGMA * max(float(sigma_cells), 1.0)
+    radii = np.arange(1, int(min(R_V_MAX_SIGMA * max(float(sigma_cells), 1.0), 0.5 * n) / step) + 1) * step
+    centers = (coords + 0.5) / n
+    dirs = fibonacci_sphere(R_V_DIRS)
+    prev_v = np.asarray(delta_s[coords[:, 0], coords[:, 1], coords[:, 2]], dtype=np.float64)
+    prev_r = np.zeros(len(coords))
+    todo = np.nonzero(prev_v < 0)[0]                            # an overdense 'minimum' has no underdense region
+    for r in radii:
+        if not todo.size:
+            break
+        v = shell_means(delta_s, centers[todo], np.full(todo.size, r), dirs)
+        hit = v >= 0
+        i = todo[hit]
+        out[i] = prev_r[i] + (r - prev_r[i]) * (-prev_v[i]) / (v[hit] - prev_v[i])
+        stay = todo[~hit]
+        prev_v[stay], prev_r[stay] = v[~hit], r
+        todo = stay
+    return out
+
+
+def distinct_voids(coords, delta_values, r_v_cells, n_grid, r_eff_cells=None):
+    """Which of the given voids are DISTINCT: deepest first, a void whose centre lies inside the R_v sphere of a
+    deeper void already kept is a sub-minimum of the same underdense region (periodic distances, cells). A void
+    without R_v is not distinct and claims no region -- unless r_eff_cells is given: then each void CLAIMS the
+    region of min(R_v, R_eff) (a missing one ignored), so a void without R_v still takes part with its R_eff, and the
+    tail of the deepest voids, whose R_v reaches 1.2-3 R_eff (84th percentile R_v/R_eff 1.2-1.5), no longer swallows
+    20-27% of the sample (review 2026-10-07: TNG300 z=0, 11 voids with R_v > 10 sigma dropped 99 of 365). Meant for
+    the voids of ONE sample (catalog.distinct_mask):
+    the smoothed field's minima within an 11-cell footprint often share one void -- 63% of the TNG100 z=0
+    resolved voids had another centre within R_eff -- while over ALL minima a few deep ones that fail the cut,
+    with R_v up to 14 sigma, would swallow three quarters of the resolved sample (2026-10-07: 24 of 103 left)."""
+    coords = np.asarray(coords, dtype=np.float64).reshape(-1, 3)
+    r_v = np.asarray(r_v_cells, dtype=np.float64).reshape(-1)
+    if r_eff_cells is not None:
+        r_v = np.fmin(r_v, np.asarray(r_eff_cells, dtype=np.float64).reshape(-1))   # fmin: a NaN side is ignored
+    keep = np.zeros(len(coords), dtype=bool)
+    kept_c, kept_r = np.zeros((0, 3)), np.zeros(0)
+    for i in np.argsort(np.asarray(delta_values, dtype=np.float64), kind="stable"):
+        if not np.isfinite(r_v[i]):
+            continue
+        if kept_r.size:
+            d = coords[i] - kept_c
+            d -= n_grid * np.rint(d / n_grid)
+            if (np.sqrt((d * d).sum(axis=1)) < kept_r).any():
+                continue
+        keep[i] = True
+        kept_c, kept_r = np.vstack([kept_c, coords[i]]), np.append(kept_r, r_v[i])
+    return keep
+
+
 def build_void_catalog(delta_s, hessian):
     fp = config.FOOTPRINT_SIZE
     _, coords = dtfe.find_local_minima(delta_s, footprint_size=fp)
@@ -162,19 +232,87 @@ def build_void_catalog(delta_s, hessian):
         'deep': dvals < config.DEEP_VOID_THRESHOLD,
     }
     cat.update(_ellipsoid_fits(coords, evals, evecs))
+    # the MEASURED radius (2026-10-07): in cells, frame-free like coords, so a refit keeps it
+    cat['r_v_cells'] = void_radius_cells(delta_s, coords, config.SMOOTHING_SIGMA_CELLS)
     cat['cell_mpc'] = np.float64(config.CELL_SIZE)      # the FRAME the positions and semi-axes are in (2026-10-05)
-    cat['cuts_mpc'] = _cuts_array()                     # the ELLIPSOID_CUTS the well_resolved flag was taken with
+    cat['cuts_mpc'] = _cuts_array()                     # the cuts (in Mpc) the well_resolved flag was taken with
     cat['deep_threshold'] = np.float64(config.DEEP_VOID_THRESHOLD)   # the threshold 'deep' was taken at
     return cat
 
 
+def set_smoothing(cells=None, mpc=None):
+    """Set the smoothing length for this process: in cells (a script's --smooth: the footprint stays as it is, the
+    thesis's r512_s5_f11 / s20_f11 caches rely on that) or in Mpc (--smooth-mpc: the same physical scale in every
+    box, the footprint following it -- config.footprint_for). Keeps config.SMOOTHING_SIGMA_MPC in step (it went
+    stale under --smooth before). In cells the footprint is the PRODUCTION one even after an Mpc setting or under
+    DTFE_SIGMA_MPC (else '--smooth 10' gave r512_s10_f5, neither the thesis's s10_f11 nor the Mpc run). Returns sigma
+    in cells. Neither given (or <= 0): nothing changes."""
+    if cells and mpc:
+        raise ValueError("give the smoothing in cells or in Mpc, not both")
+    if mpc and float(mpc) > 0:
+        config.SMOOTHING_SIGMA_CELLS = round(float(mpc) / float(config.CELL_SIZE), 9)
+        config.FOOTPRINT_SIZE = config.footprint_for(config.SMOOTHING_SIGMA_CELLS)
+    elif cells and float(cells) > 0:
+        config.SMOOTHING_SIGMA_CELLS = float(cells)
+        config.FOOTPRINT_SIZE = int(config.PRODUCTION_SMOOTHING[1])     # cells: the production footprint, whatever was set
+    config.SMOOTHING_SIGMA_MPC = float(config.SMOOTHING_SIGMA_CELLS) * float(config.CELL_SIZE)
+    return config.SMOOTHING_SIGMA_CELLS
+
+
+def add_smoothing_mpc_arg(parser):
+    """The void scripts' --smooth-mpc (beside make_parser's --smooth in cells)."""
+    parser.add_argument("--smooth-mpc", type=float, default=0.0, metavar="MPC",
+                        help="the void catalogue's smoothing length in Mpc, the same physical scale in every box (the "
+                             "minima footprint follows); instead of --smooth in cells (also: DTFE_SIGMA_MPC)")
+
+
+def apply_smoothing_args(args, tag="pipeline"):
+    """A void script's --smooth (cells) or --smooth-mpc into set_smoothing, said when it changes anything."""
+    cells, mpc = getattr(args, "smooth", 0.0) or 0.0, getattr(args, "smooth_mpc", 0.0) or 0.0
+    if cells > 0 and mpc > 0:
+        raise SystemExit("give --smooth (cells) or --smooth-mpc, not both")
+    if cells > 0 or mpc > 0:
+        set_smoothing(cells=cells or None, mpc=mpc or None)
+        print(f"[{tag}] smoothing: {config.SMOOTHING_SIGMA_CELLS:g} cells = {config.SMOOTHING_SIGMA_MPC:.3g} Mpc, "
+              f"footprint {config.FOOTPRINT_SIZE} (cache namespace {_param_hash()})")
+    return config.SMOOTHING_SIGMA_CELLS
+
+
+def smoothing_tag() -> str:
+    """'' at the production smoothing (config.PRODUCTION_SMOOTHING: 10 cells, footprint 11), else a tag for file
+    and folder names -- 's2.1625Mpc_f5' -- so a --smooth / --smooth-mpc run never overwrites the default products.
+    Six significant digits: '.3g' made 2.16 and 2.1625 Mpc one tag over two different caches (review 2026-10-07)."""
+    sig0, fp0 = config.PRODUCTION_SMOOTHING
+    if (float(config.SMOOTHING_SIGMA_CELLS), int(config.FOOTPRINT_SIZE)) == (float(sig0), int(fp0)):
+        return ""
+    return f"s{smoothing_length_mpc():.6g}Mpc_f{int(config.FOOTPRINT_SIZE)}"
+
+
+def smoothing_length_mpc():
+    """The smoothing length sigma in Mpc as set NOW (config.SMOOTHING_SIGMA_CELLS x CELL_SIZE; a script's --smooth
+    changes it after import) -- the unit of the void cut, the profile bins, the abundance radii and the skeleton's
+    cut-out. sigma = 0 (no smoothing: an r512_s0 cache exists) counts as ONE cell, so none of them collapses to 0."""
+    return max(float(config.SMOOTHING_SIGMA_CELLS), 1.0) * float(config.CELL_SIZE)
+
+
+def ellipsoid_cuts_mpc():
+    """config.ELLIPSOID_CUT_RULES in Mpc for today's simulation and smoothing, read at CALL time (the plot
+    scripts' --smooth sets config.SMOOTHING_SIGMA_CELLS after import, so an import-time value would hold the
+    gate at 100 cells): min_axis_mpc = rule x cell, max_axis_mpc = min(rule x sigma, rule x box), the ratio."""
+    r, cell = config.ELLIPSOID_CUT_RULES, float(config.CELL_SIZE)
+    return {'min_axis_mpc': float(r['min_axis_cells']) * cell,
+            'max_axis_mpc': min(float(r['max_axis_sigma']) * smoothing_length_mpc(),
+                                float(r['max_axis_box_frac']) * float(config.BOX_SIZE)),
+            'max_axis_ratio': float(r['max_axis_ratio'])}
+
+
 def _cuts_array():
-    c = config.ELLIPSOID_CUTS
+    c = ellipsoid_cuts_mpc()
     return np.array([c['min_axis_mpc'], c['max_axis_mpc'], c['max_axis_ratio']], dtype=np.float64)
 
 
 def catalog_cuts_ok(cat):
-    """Whether a catalogue's well_resolved and deep flags were taken with today's config.ELLIPSOID_CUTS and
+    """Whether a catalogue's well_resolved and deep flags were taken with today's cuts (ellipsoid_cuts_mpc) and
     DEEP_VOID_THRESHOLD (a cache without the records predates them: not ok, so it is re-derived once and
     then carries them)."""
     return ('cuts_mpc' in cat and np.allclose(np.asarray(cat['cuts_mpc'], dtype=np.float64), _cuts_array())
@@ -213,7 +351,7 @@ def refit_catalog(cat):
     """The ellipsoid fits of a cached catalogue re-derived in THIS frame with THESE cuts: positions_mpc,
     the semi-axes, orientations, ellipticity, prolateness and well_resolved all follow from the cached
     minima (coords) and Hessian eigen-decomposition (in cell units: frame-free), so a catalogue built
-    under another DTFE_SIM's cell, or before a change of config.ELLIPSOID_CUTS, is put right without the
+    under another DTFE_SIM's cell, or before a change of the cuts (ellipsoid_cuts_mpc), is put right without the
     field (18 s and 10 GB at 512^3 for the whole build; this is milliseconds). 'deep' is retaken from the
     cached minima against config.DEEP_VOID_THRESHOLD; the frame, the cuts and the threshold are recorded."""
     out = dict(cat)
@@ -252,7 +390,7 @@ def ellipsoid_fit_one(evals, evecs, cell):
     The single source of the fit formulas: semi-axes 2*cell/sqrt(|lambda|) ordered a>=b>=c,
     orientation columns in the same order (major axis first), ell = 1-c/a and
     prol = (a^2-b^2)/(a^2-c^2). Used by _ellipsoid_fits (which then applies the
-    ELLIPSOID_CUTS resolution gate) and by the void tracker (which reports sub-resolution
+    ellipsoid_cuts_mpc resolution gate) and by the void tracker (which reports sub-resolution
     epochs explicitly instead of dropping them). Returns None for degenerate eigenvalues."""
     ev = np.asarray(evals, dtype=np.float64)
     if np.any(np.abs(ev) < 1e-10):
@@ -271,10 +409,10 @@ def ellipsoid_fit_one(evals, evecs, cell):
 
 def _ellipsoid_fits(coords, evals, evecs):
     # Batched twin of ellipsoid_fit_one (same formulas, thresholds and argsort tie order --
-    # keep them in lockstep) + the ELLIPSOID_CUTS resolution gate, vectorized over voids.
+    # keep them in lockstep) + the ellipsoid_cuts_mpc() resolution gate, vectorized over voids.
     # Bit-equivalence with the per-void path is covered by tests/py_dtfelib_test.py.
     cell = config.CELL_SIZE
-    cuts = config.ELLIPSOID_CUTS
+    cuts = ellipsoid_cuts_mpc()
     n = len(coords)
     valid = np.zeros(n, dtype=bool)
     semi_axes = np.zeros((n, 3), dtype=np.float32)
@@ -350,6 +488,7 @@ class SnapshotProducts:
         self._fs = None
         self._redshift = redshift
         self._ram = {}
+        self._stamp = None                       # (size, mtime_ns) of the density grid, taken BEFORE it is read
 
     @property
     def fs(self):
@@ -417,6 +556,57 @@ class SnapshotProducts:
         tag = "" if self.prefix is None else f"{str(self.prefix).rstrip('.')}_"
         return cache_dir() / f"{self.sim}_{tag}{self.fs.method}_{self.snapshot}_{name}.npz"
 
+    def _grid_path(self):
+        """The density grid every product derives from; None for a cache-only test double (no FieldSet paths)."""
+        fp = getattr(self.fs, "_field_path", None)
+        return None if fp is None else fp("density")
+
+    def _grid_stamp(self):
+        """(size, mtime_ns) of the density grid, taken once -- the first time a cache is looked up, i.e. BEFORE
+        the grid is read for a build, so a grid rewritten during the build cannot pass as the one built from.
+        Empty when there is no grid to stamp."""
+        if self._stamp is None:
+            self._stamp = np.zeros(0, dtype=np.int64)
+            grid = self._grid_path()
+            if grid is not None:
+                try:
+                    st = grid.stat()
+                    self._stamp = np.array([st.st_size, st.st_mtime_ns], dtype=np.int64)
+                except OSError:
+                    pass
+        return self._stamp
+
+    def _save(self, p, arrays):
+        """Write a product's cache with the stamp of the grid it came from."""
+        _save_npz(p, **dict(arrays, grid_stamp=self._grid_stamp()))
+
+    def _cached(self, name):
+        """The cache file of product 'name' when it may be used: present AND from the density grid on disk now.
+        Every product is a function of that grid, and the cache key holds only the parameters: the 2026-10-03/04
+        rerun rewrote the grids under July's TNG300 caches (5% of the minima moved) and nothing noticed. A cache
+        carries the grid's (size, mtime_ns) since 2026-10-07 and must match it exactly (a copied cache, a future
+        grid mtime, a grid rewritten mid-build: none fools an equality); an older cache without the stamp is
+        judged by modification time (older than the grid = stale). A stale cache is rebuilt, and says so; None
+        then (and when there is no cache)."""
+        p = self._cpath(name)
+        if not p.exists():
+            return None
+        stamp = self._grid_stamp()
+        if stamp.size == 0:
+            return p                            # no grid to compare with (a cache-only test double): use it
+        with np.load(p) as z:
+            have = z["grid_stamp"] if "grid_stamp" in z.files else None
+        if have is not None and have.size:
+            stale = not np.array_equal(have, stamp)
+            why = "was built from another version of the grid"
+        else:
+            stale = int(stamp[1]) > p.stat().st_mtime_ns
+            why = f"is older than {self._grid_path().name} (the grid was rewritten since)"
+        if stale:
+            print(f"    [pipeline] cached {p.name} {why}: rebuilding it")
+            return None
+        return p
+
     def voids(self):
         """The void catalogue. From the cache, whose minima and eigenvalues (cell units) never go stale; the
         ellipsoid fits on top of them are re-derived (refit_catalog, milliseconds, no field) and the cache
@@ -424,13 +614,19 @@ class SnapshotProducts:
         cell of the DTFE_SIM simulation at build time, which a script's --sim does not change: the
         TNG100-3-Dark catalogues of July were built under TNG50's frame (positions up to 51.6 Mpc in a
         110.7 Mpc box) and read as hundreds of 'resolved' voids where the right frame leaves a handful --
-        or when config.ELLIPSOID_CUTS changed since (the cuts are not in the cache's parameter hash, so a
+        or when the cuts (ellipsoid_cuts_mpc) changed since (they are not in the cache's parameter hash, so a
         retuned cut used to need the caches deleted). Says so. (2026-10-05)"""
         snapshot_frame(self)                    # the header's frame must be config's: refuse before any cache is touched
         p = self._cpath('voids')
-        if p.exists():
+        if self._cached('voids') is not None:
             with np.load(p) as z:
                 cat = {k: z[k] for k in z.files}
+            if 'r_v_cells' not in cat and self._grid_path() is not None:
+                # R_v needs the smoothed field, which a refit does not have: rebuild (once per cache, ~18 s at 512^3)
+                print(f"    [pipeline] cached void catalogue {p.name} has no measured radius R_v (2026-10-07): rebuilding it")
+                cat = build_void_catalog(self.delta_smoothed, self.hessian)
+                self._save(p, cat)
+                return cat
             frame_ok, cuts_ok = catalog_frame_ok(cat), catalog_cuts_ok(cat)
             if frame_ok and cuts_ok:
                 return cat
@@ -443,15 +639,15 @@ class SnapshotProducts:
                            else "it carries no record of its ellipsoid cuts")
             print(f"    [pipeline] cached void catalogue {p.name}: {'; '.join(why)}: re-deriving its fits")
             cat = refit_catalog(cat)
-            _save_npz(p, **cat)
+            self._save(p, cat)
             return cat
         cat = build_void_catalog(self.delta_smoothed, self.hessian)
-        _save_npz(p, **cat)
+        self._save(p, cat)
         return cat
 
     def critical_points(self):
         p = self._cpath('critical')
-        if p.exists():
+        if self._cached('critical') is not None:
             with np.load(p) as z:
                 flat = {k: z[k] for k in z.files}
         else:
@@ -463,7 +659,7 @@ class SnapshotProducts:
                     flat[f"{t}_{k}"] = cp[t][k]
             flat['field_mean'] = np.array(cp['field_mean'])
             flat['field_std'] = np.array(cp['field_std'])
-            _save_npz(p, **flat)
+            self._save(p, flat)
         out = {'field_mean': float(flat['field_mean']),
                'field_std': float(flat['field_std'])}
         for t in ('minima', 'maxima', 'saddle1', 'saddle2'):
@@ -472,7 +668,7 @@ class SnapshotProducts:
 
     def eigen_slices(self):
         p = self._cpath('eigslices')
-        if p.exists():
+        if self._cached('eigslices') is not None:
             with np.load(p) as z:
                 return {d: {k: z[f"{d}_{k}"] for k in
                             ('lambda1', 'lambda2', 'lambda3', 'trace', 'det')}
@@ -482,39 +678,39 @@ class SnapshotProducts:
             out[d] = hessian_slice(self.hessian, d)
             for k, v in out[d].items():
                 flat[f"{d}_{k}"] = v
-        _save_npz(p, **flat)
+        self._save(p, flat)
         return out
 
     def delta_slices(self):
         p = self._cpath('deltaslices')
-        if p.exists():
+        if self._cached('deltaslices') is not None:
             with np.load(p) as z:
                 return {d: z[str(d)] for d in (0, 1, 2)}
         out = {d: dtfe.extract_2d_slice(self.delta_smoothed, d).astype(np.float32)
                for d in (0, 1, 2)}
-        _save_npz(p, **{str(d): v for d, v in out.items()})
+        self._save(p, {str(d): v for d, v in out.items()})
         return out
 
     def phi_slices(self):
         p = self._cpath('phislices')
-        if p.exists():
+        if self._cached('phislices') is not None:
             with np.load(p) as z:
                 return {d: z[str(d)] for d in (0, 1, 2)}
         out = {d: dtfe.extract_2d_slice(self.phi, d).astype(np.float32)
                for d in (0, 1, 2)}
-        _save_npz(p, **{str(d): v for d, v in out.items()})
+        self._save(p, {str(d): v for d, v in out.items()})
         return out
 
     def phi_maxima(self):
         p = self._cpath('phimaxima')
-        if p.exists():
+        if self._cached('phimaxima') is not None:
             with np.load(p) as z:
                 return {k: z[k] for k in z.files}
         mask = (self.phi == maximum_filter(self.phi, size=config.FOOTPRINT_SIZE,
                                            mode='wrap'))
         coords = np.argwhere(mask)
         cat = {'coords': coords, 'values': self.phi[mask]}
-        _save_npz(p, **cat)
+        self._save(p, cat)
         return cat
 
 

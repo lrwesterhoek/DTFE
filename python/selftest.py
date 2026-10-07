@@ -98,6 +98,7 @@ def run_one(target, tmp):
     config.SMOOTHING_SIGMA_CELLS = 3.0
     config.SMOOTHING_SIGMA_MPC = 3.0 * config.CELL_SIZE
     config.FOOTPRINT_SIZE = 5
+    config.PRODUCTION_SMOOTHING = (3.0, 5)       # the sandbox's smoothing IS its production: untagged names, the mirror
     config.SNAPSHOT_TO_REDSHIFT = dict(REDSHIFTS)
     config.PANEL_SNAPSHOTS = SNAPS
     config.CACHE_DIR = tmp / 'cache'

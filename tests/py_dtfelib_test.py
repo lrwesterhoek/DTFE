@@ -113,7 +113,7 @@ def t_match_catalog_void():
 
 def t_shape_estimators():
     """Vectorized BBKS/ellipsoid-fit estimators must reproduce the original per-void
-    loops bit-for-bit: NaN rows (trace/lambda1 thresholds, sanity gate), ELLIPSOID_CUTS
+    loops bit-for-bit: NaN rows (trace/lambda1 thresholds, sanity gate), the ellipsoid cuts
     gating, the |lambda| argsort tie order, and the exact float32 roundings."""
     from dtfelib import fields, pipeline
 
@@ -135,7 +135,7 @@ def t_shape_estimators():
         return axis_ratios, bbks
 
     def ref_fits(coords, evals, evecs):  # the pre-vectorization loop around ellipsoid_fit_one
-        cell, cuts = pipeline.config.CELL_SIZE, pipeline.config.ELLIPSOID_CUTS
+        cell, cuts = pipeline.config.CELL_SIZE, pipeline.ellipsoid_cuts_mpc()
         n = len(coords)
         out = {"well_resolved": np.zeros(n, bool),
                "semi_axes": np.zeros((n, 3), np.float32),
@@ -172,9 +172,24 @@ def t_shape_estimators():
     ])
     guaranteed_pass = (2.0 * cell / np.array([[1.0, 2.0, 3.0], [2.0, 2.5, 3.0]])) ** 2
     ev64 = np.vstack([rng.normal(0.0, 1.0, (200, 3)), crafted, guaranteed_pass])
+    # The reference loop's scalar arithmetic ('1.0 / np.sqrt(float32 scalar)', '2 * tr') stays float32 under numpy 2's
+    # promotion rules (NEP 50), as the vectorized code's arrays do; numpy 1.x (CI's Ubuntu 1.26) promotes it to
+    # float64, and the BBKS ratios divide by a trace that can nearly cancel, so no tolerance fits. numpy 1.24-1.26 can
+    # opt into NEP 50 (np._set_promotion_state('weak'), the transition switch): the reference runs under it, and the
+    # comparison stays bit-for-bit on both (CI, 2026-10-07).
+    def nep50(fn, *args):
+        get = getattr(np, "_get_promotion_state", None)
+        if get is None or get() == "weak":
+            return fn(*args)
+        old = get()
+        np._set_promotion_state("weak")
+        try:
+            return fn(*args)
+        finally:
+            np._set_promotion_state(old)
     for ev in (ev64, ev64.astype(np.float32)):
         got = fields.calculate_shape_parameters(list(ev))
-        ref_ar, ref_bbks = ref_shapes(list(ev))
+        ref_ar, ref_bbks = nep50(ref_shapes, list(ev))
         assert np.array_equal(got["axis_ratios"], ref_ar, equal_nan=True), "axis_ratios drifted"
         assert np.array_equal(got["bbks_params"], ref_bbks, equal_nan=True), "bbks_params drifted"
 
@@ -182,7 +197,7 @@ def t_shape_estimators():
         coords = rng.integers(0, 64, (n, 3))
         evecs = rng.normal(0.0, 1.0, (n, 3, 3)).astype(ev.dtype)
         got_f = pipeline._ellipsoid_fits(coords, ev, evecs)
-        ref_f = ref_fits(coords, ev, evecs)
+        ref_f = nep50(ref_fits, coords, ev, evecs)
         for k in ref_f:
             assert np.array_equal(got_f[k], ref_f[k]), f"_ellipsoid_fits[{k}] drifted"
         assert got_f["well_resolved"].any() and not got_f["well_resolved"].all()
@@ -737,24 +752,27 @@ def t_webstreams():
     assert abs(c["node"]["stream_bins"]["s > 5"]["volume"] - 8 / 128) < 1e-12
     # mass weights, against boolean indexing of the same arrays (another code path than the bincounts)
     wcls = ws.web_classes(web)
-    total_m = float(density.sum())
+    # the expectations in float64: a float32 sum ratio rounds at ~5e-9, and under numpy 1.x (CI's Ubuntu 1.26)
+    # 'python float - float32 scalar' is float64 -- only numpy 2's NEP 50 hid that (CI, 2026-10-07)
+    d64 = density.astype(np.float64)
+    total_m = float(d64.sum())
     for name, lab in (("void", 0), ("wall", 1), ("node", 3)):
-        assert abs(c[name]["mass_fraction"] - density[wcls == lab].sum() / total_m) < 1e-9, name
+        assert abs(c[name]["mass_fraction"] - d64[wcls == lab].sum() / total_m) < 1e-9, name
     assert abs(c["void"]["stream_bins"]["single"]["mass"] - 111 / 127) < 1e-12      # uniform density within the void
     wall, node = wcls == 1, wcls == 3
-    assert abs(c["wall"]["stream_bins"]["1 < s <= 3"]["mass"] - density[wall & (streams == 1.5)].sum() / density[wall].sum()) < 1e-9
-    assert abs(c["node"]["stream_bins"]["s > 5"]["mass"] - density[node & (streams == 9.0)].sum() / density[node].sum()) < 1e-9
+    assert abs(c["wall"]["stream_bins"]["1 < s <= 3"]["mass"] - d64[wall & (streams == 1.5)].sum() / d64[wall].sum()) < 1e-9
+    assert abs(c["node"]["stream_bins"]["s > 5"]["mass"] - d64[node & (streams == 9.0)].sum() / d64[node].sum()) < 1e-9
     assert abs(c["node"]["mean_streams"] - (8 * 9.0 + 120) / 128) < 1e-9
-    assert abs(c["node"]["mean_streams_mass"] - (density[node] * streams[node]).sum() / density[node].sum()) < 1e-9
+    assert abs(c["node"]["mean_streams_mass"] - (d64[node] * streams[node]).sum() / d64[node].sum()) < 1e-9
     assert c["node"]["mean_streams_mass"] > c["node"]["mean_streams"]                   # the heavy cell has 9 streams
     # caustic class: the wall plane 2 holds one fold (k=1) and one k=0 cell; the node plane 6 one k=3 -- in both weightings
     assert abs(c["wall"]["fold_fraction"]["volume"] - 1 / 128) < 1e-12 and c["void"]["fold_fraction"]["volume"] == 0.0
-    assert abs(c["wall"]["fold_fraction"]["mass"] - 3.0 / density[wall].sum()) < 1e-12 and c["void"]["fold_fraction"]["mass"] == 0.0
+    assert abs(c["wall"]["fold_fraction"]["mass"] - 3.0 / d64[wall].sum()) < 1e-12 and c["void"]["fold_fraction"]["mass"] == 0.0
     cb = c["wall"]["collapse"]
     assert abs(cb["k=1"]["volume"] - 1 / 128) < 1e-12 and abs(cb["k=0"]["volume"] - 1 / 128) < 1e-12 and abs(cb["none"]["volume"] - 126 / 128) < 1e-12
-    assert abs(cb["k=1"]["mass"] - 3.0 / density[wall].sum()) < 1e-12 and abs(cb["k=0"]["mass"] - 1.0 / density[wall].sum()) < 1e-12
-    assert abs(cb["none"]["mass"] - (density[wall].sum() - 4.0) / density[wall].sum()) < 1e-12
-    assert abs(c["node"]["collapse"]["k=3"]["volume"] - 1 / 128) < 1e-12 and abs(c["node"]["collapse"]["k=3"]["mass"] - 8.0 / density[node].sum()) < 1e-12
+    assert abs(cb["k=1"]["mass"] - 3.0 / d64[wall].sum()) < 1e-12 and abs(cb["k=0"]["mass"] - 1.0 / d64[wall].sum()) < 1e-12
+    assert abs(cb["none"]["mass"] - (d64[wall].sum() - 4.0) / d64[wall].sum()) < 1e-12
+    assert abs(c["node"]["collapse"]["k=3"]["volume"] - 1 / 128) < 1e-12 and abs(c["node"]["collapse"]["k=3"]["mass"] - 8.0 / d64[node].sum()) < 1e-12
     # the bins' edges and the hidden bit, cell by cell (tol = STREAM_TOL = 1e-3)
     from dtfelib.io import STREAM_TOL
     s_ = np.array([1.0, 1.5, 0.0, 1.0 - 4e-4, np.nextafter(np.float32(1), np.float32(0)), 0.5, 2 / 3, 3.0005, 3.002, 5.0, 5.0005, 5.002, 1.0], np.float32)
@@ -799,11 +817,12 @@ def t_void_catalog_export():
     from dtfelib import pipeline, catalog
     from dtfelib import fields as dtfe
     d = Path(tempfile.mkdtemp(prefix="dtfe_cat_"))
-    old_cuts, old_cache, old_deep = config.ELLIPSOID_CUTS, config.CACHE_DIR, config.DEEP_VOID_THRESHOLD
+    old_cuts, old_cache, old_deep = config.ELLIPSOID_CUT_RULES, config.CACHE_DIR, config.DEEP_VOID_THRESHOLD
     # cuts no other provenance entry shares (by default min_axis = the gradient threshold = 0.1 and max_axis =
     # max_ratio = 10), a deep threshold off its default (a constant -0.1 would pass at the default): a swapped or
     # hard-coded provenance value cannot pass by coincidence. Set before the build: cuts_mpc / deep_threshold agree
-    config.ELLIPSOID_CUTS = {"min_axis_mpc": 0.11, "max_axis_mpc": 9.5, "max_axis_ratio": 7.25}
+    # (rules: 1.1 cells, 9.5 sigma, L/2, 7.25 -- about the 0.11 / 9.5 Mpc this check pinned before the rules)
+    config.ELLIPSOID_CUT_RULES = {"min_axis_cells": 1.1, "max_axis_sigma": 9.5, "max_axis_box_frac": 0.5, "max_axis_ratio": 7.25}
     config.DEEP_VOID_THRESHOLD = -0.12
     config.CACHE_DIR = d / "cache"                      # a real SnapshotProducts below: never python/cache
     try:
@@ -842,7 +861,7 @@ def t_void_catalog_export():
 
         _t_void_catalog_export_body(d, cat, n_voids, n, _Prod, catalog, pipeline, config)
     finally:
-        config.ELLIPSOID_CUTS, config.CACHE_DIR, config.DEEP_VOID_THRESHOLD = old_cuts, old_cache, old_deep
+        config.ELLIPSOID_CUT_RULES, config.CACHE_DIR, config.DEEP_VOID_THRESHOLD = old_cuts, old_cache, old_deep
         shutil.rmtree(d, ignore_errors=True)
 
 
@@ -907,6 +926,8 @@ def _t_void_catalog_export_body(d, cat, n_voids, n, _Prod, catalog, pipeline, co
            "well_resolved": res, "deep": np.asarray(cat["deep"]).astype(bool),
            "a_mpc": axes[:, 0] * nanfit, "b_mpc": axes[:, 1] * nanfit, "c_mpc": axes[:, 2] * nanfit,
            "r_eff_mpc": f64(np.where(res, np.prod(cat["semi_axes"], axis=1) ** (1.0 / 3.0), np.nan)),
+           "r_v_mpc": f64(cat["r_v_cells"]) * config.CELL_SIZE,
+           "distinct": catalog.distinct_mask(cat, res & np.isfinite(f64(cat["r_v_cells"])), config.FIELD_RESOLUTION),
            "ellipticity_fit": f64(cat["fit_ellipticity"]) * nanfit, "prolateness_fit": f64(cat["fit_prolateness"]) * nanfit,
            "major_x": orient[:, 0, 0] * nanfit, "major_y": orient[:, 1, 0] * nanfit, "major_z": orient[:, 2, 0] * nanfit,
            "minor_x": orient[:, 0, 2] * nanfit, "minor_y": orient[:, 1, 2] * nanfit, "minor_z": orient[:, 2, 2] * nanfit}
@@ -937,7 +958,7 @@ def _t_void_catalog_export_body(d, cat, n_voids, n, _Prod, catalog, pipeline, co
     ax = np.stack([to["a_mpc"], to["b_mpc"], to["c_mpc"]], 1)[res]
     assert np.allclose(ax ** 2 * lam, 4.0, rtol=1e-5), ("void_table in the dict's own cell", ax[:2] ** 2 * lam[:2])
     per_void = ("coords", "eigenvalues", "eigenvectors", "axis_ratios", "bbks_params", "delta_values", "deep", "well_resolved",
-                "semi_axes", "orientations", "fit_ellipticity", "fit_prolateness", "positions_mpc")
+                "semi_axes", "orientations", "fit_ellipticity", "fit_prolateness", "positions_mpc", "r_v_cells")
     empty = {k: (np.asarray(v)[:0] if k in per_void else v) for k, v in cat.items() if k != "cell_mpc"}
     assert all(len(v) == 0 for v in catalog.void_table(empty).values())
     # the major axis IS the eigenvector of the smallest |lambda| (the longest semi-axis), the minor that of the largest
@@ -947,14 +968,17 @@ def _t_void_catalog_export_body(d, cat, n_voids, n, _Prod, catalog, pipeline, co
         want = vecs[np.arange(len(vecs)), :, pick(ev_abs, axis=1)]
         assert np.allclose(np.abs(np.einsum("ij,ij->i", axis, want)), 1.0, atol=1e-5), (k, np.einsum("ij,ij->i", axis, want))
     # every provenance value, in both files; the key SET equal (nothing dropped or added; hdf5 also lists 'columns')
-    cuts = config.ELLIPSOID_CUTS
+    cuts = pipeline.ellipsoid_cuts_mpc()
     expected = {"catalogue": None, "sim": "SYN", "snapshot": "050", "redshift": 0.5, "method": "dtfe", "prefix": "output",
                 "box_mpc": config.CELL_SIZE * n, "box_source": "header", "grid_n": n, "cell_mpc": config.CELL_SIZE,
                 "sigma_cells": config.SMOOTHING_SIGMA_CELLS, "sigma_mpc": config.SMOOTHING_SIGMA_CELLS * config.CELL_SIZE,
                 "footprint_cells": config.FOOTPRINT_SIZE, "criterion": config.VOID_EIGENVALUE_CRITERION,
                 "gradient_threshold": config.GRADIENT_THRESHOLD, "deep_void_threshold": config.DEEP_VOID_THRESHOLD,
                 "cut_min_axis_mpc": cuts["min_axis_mpc"], "cut_max_axis_mpc": cuts["max_axis_mpc"],
-                "cut_max_axis_ratio": cuts["max_axis_ratio"], "param_hash": pipeline._param_hash(), "n_voids": n_voids,
+                "cut_max_axis_ratio": cuts["max_axis_ratio"], "cut_min_axis_cells": config.ELLIPSOID_CUT_RULES["min_axis_cells"],
+                "cut_max_axis_sigma": config.ELLIPSOID_CUT_RULES["max_axis_sigma"],
+                "cut_max_axis_box_frac": config.ELLIPSOID_CUT_RULES["max_axis_box_frac"],
+                "param_hash": pipeline._param_hash(), "n_voids": n_voids,
                 "created": None}
     assert set(pc) == set(expected), sorted(set(pc) ^ set(expected))
     assert set(ph) == set(expected) | {"columns"}, sorted(set(ph) ^ (set(expected) | {"columns"}))
@@ -1115,7 +1139,7 @@ def t_void_cache_frame():
         path = p._cpath("voids")
         assert len(cat["coords"]) == 2 and cat["deep"].all(), (cat["coords"], cat["delta_values"])   # the fixture
         assert path.is_file() and "cell_mpc" in cat and abs(float(cat["cell_mpc"]) - config.CELL_SIZE) < 1e-12
-        assert np.allclose(cat["cuts_mpc"], [config.ELLIPSOID_CUTS[k] for k in ("min_axis_mpc", "max_axis_mpc", "max_axis_ratio")])
+        assert np.allclose(cat["cuts_mpc"], [pipeline.ellipsoid_cuts_mpc()[k] for k in ("min_axis_mpc", "max_axis_mpc", "max_axis_ratio")])
         assert float(cat["deep_threshold"]) == config.DEEP_VOID_THRESHOLD
         same, said = load(0)
         assert said == "", said                                      # the build's records: read as it is, no refit or re-save every load
@@ -1191,13 +1215,13 @@ def t_void_cache_frame():
         back, said = load(1)                                         # back to the thesis threshold: the flag returns
         assert "deep threshold" in said and np.array_equal(back["deep"], cat["deep"]) and float(back["deep_threshold"]) == old_deep, said
         # the cuts retuned: the flag follows without a rebuild
-        old_cuts = config.ELLIPSOID_CUTS
-        config.ELLIPSOID_CUTS = dict(old_cuts, max_axis_mpc=1e-3)
+        old_cuts = config.ELLIPSOID_CUT_RULES
+        config.ELLIPSOID_CUT_RULES = dict(old_cuts, max_axis_sigma=1e-6)
         try:
             tight, said = load(1)
             assert "ellipsoid cuts" in said and not tight["well_resolved"].any() and not calls, said
         finally:
-            config.ELLIPSOID_CUTS = old_cuts
+            config.ELLIPSOID_CUT_RULES = old_cuts
         back, said = load(1)
         assert "ellipsoid cuts" in said and np.array_equal(back["well_resolved"], cat["well_resolved"]), said
     finally:
@@ -1227,7 +1251,7 @@ def t_export_driver():
     cat = pipeline.build_void_catalog(delta_s, pipeline.hessian_from_field(delta_s))
     assert len(cat["coords"]) >= 2, len(cat["coords"])
     per_void = ("coords", "eigenvalues", "eigenvectors", "axis_ratios", "bbks_params", "delta_values", "deep", "well_resolved",
-                "semi_axes", "orientations", "fit_ellipticity", "fit_prolateness", "positions_mpc")
+                "semi_axes", "orientations", "fit_ellipticity", "fit_prolateness", "positions_mpc", "r_v_cells")
     none = {k: (np.asarray(v)[:0] if k in per_void else v) for k, v in cat.items()}     # a snapshot without a void
     k0, k1, k2, k3 = list(config.SNAPSHOT_TO_REDSHIFT)[:4]
     good = config.CELL_SIZE * n
@@ -1445,7 +1469,7 @@ def t_void_profiles():
             return cat
 
     wb = (0.1, 0.5, 1.0, 2.0, 3.0)
-    pf = profiles.void_profiles(_Prod(), bins=wb, m=200)
+    pf = profiles.void_profiles(_Prod(), bins=wb, m=200, radius="r_eff", distinct=False)
     assert list(pf["index"]) == [1, 3] and pf["dropped"] == 1 and pf["method"] == "ps", (pf["index"], pf["dropped"])
     assert np.array_equal(pf["delta_c"], np.array([-0.8, -0.6], np.float32).astype(np.float64)), pf["delta_c"]
     assert np.allclose(pf["r_eff_mpc"], np.array([8.0, 6.0]) * cs, rtol=1e-6, atol=0.0), pf["r_eff_mpc"]
@@ -1456,7 +1480,7 @@ def t_void_profiles():
     # and 4 cells, 1 on the shell at 8 cells (streams 1, only bit 2 there), 0 beyond 1.2 R (streams 3)
     assert pf["single"] is not None and list(pf["single"][0]) == [0.0, 0.0, 1.0, 0.0, 0.0], pf["single"]
     # the deep sample: rows 1 and 2 are deep, 2 is wrap-dropped
-    pd_ = profiles.void_profiles(_Prod(), bins=wb, m=50, sample="deep")
+    pd_ = profiles.void_profiles(_Prod(), bins=wb, m=50, sample="deep", radius="r_eff", distinct=False)
     assert list(pd_["index"]) == [1] and pd_["dropped"] == 1, (list(pd_["index"]), pd_["dropped"])
     # the centre convention, axis by axis: a density linear along axis k has the cell CENTRE value on every shell that
     # does not wrap, 1 + 0.01 (c_k + 0.5): 1.325 for row 1 (cell 32), 1.025 / 1.615 / 1.055 on row 3's first shell
@@ -1465,12 +1489,12 @@ def t_void_profiles():
     for k, c3, tol in ((0, 1.025, 2e-4), (1, 1.615, 1e-6), (2, 1.055, 2e-4)):
         fr = _FS()
         fr.den = 1.0 + 0.01 * (idx[k] + 0.5)
-        pr = profiles.void_profiles(_Prod(fr), bins=wb, m=200)
+        pr = profiles.void_profiles(_Prod(fr), bins=wb, m=200, radius="r_eff", distinct=False)
         assert np.abs(pr["density"][0] - 1.325).max() < tol and abs(pr["density"][1, 0] - c3) < tol, (k, pr["density"])
     # the method gate: a standard-DTFE set has no single-stream fraction, even from a fake that claims a streams grid
     fd = _FS()
     fd.method = "dtfe"
-    assert profiles.void_profiles(_Prod(fd), bins=wb, m=50)["single"] is None
+    assert profiles.void_profiles(_Prod(fd), bins=wb, m=50, radius="r_eff", distinct=False)["single"] is None
     try:
         profiles.void_profiles(_Prod(), sample="all")
         raise AssertionError("an unknown sample must refuse")
@@ -1484,12 +1508,13 @@ def t_void_profiles():
         @property
         def fs(self):
             return _FS()
-    old_cache, old_deep, old_cuts = config.CACHE_DIR, config.DEEP_VOID_THRESHOLD, config.ELLIPSOID_CUTS
+    old_cache, old_deep, old_cuts = config.CACHE_DIR, config.DEEP_VOID_THRESHOLD, config.ELLIPSOID_CUT_RULES
     config.CACHE_DIR = Path(tempfile.mkdtemp(prefix="dtfe_vprof_"))
     try:
         # the cuts in CELLS (a fresh dict, never the live one mutated): rows 1-3 (6-11 cells) resolved, row 0 (200
         # cells) not, whatever DTFE_SIM or a retune of the Mpc cuts says
-        config.ELLIPSOID_CUTS = {"min_axis_mpc": 0.5 * cs, "max_axis_mpc": 20.0 * cs, "max_axis_ratio": 10.0}
+        config.ELLIPSOID_CUT_RULES = {"min_axis_cells": 0.5, "max_axis_sigma": 20.0 / config.SMOOTHING_SIGMA_CELLS,
+                                      "max_axis_box_frac": 0.5, "max_axis_ratio": 10.0}
         config.DEEP_VOID_THRESHOLD = -0.5
         built = pipeline.refit_catalog({"coords": cat["coords"], "eigenvalues": ev, "eigenvectors": np.tile(np.eye(3), (4, 1, 1)),
                                         "delta_values": cat["delta_values"], "deep": cat["delta_values"] < -0.5})
@@ -1499,15 +1524,15 @@ def t_void_profiles():
         np.savez_compressed(p._cpath("voids"), **built)
         buf = _io.StringIO()
         with redirect_stdout(buf):
-            assert list(profiles.void_profiles(p, bins=wb, m=50, sample="deep")["index"]) == [1, 3]      # the cache as it is
+            assert list(profiles.void_profiles(p, bins=wb, m=50, sample="deep", radius="r_eff", distinct=False)["index"]) == [1, 3]      # the cache as it is
             config.DEEP_VOID_THRESHOLD = -0.75
-            got = profiles.void_profiles(p, bins=wb, m=50, sample="deep")
+            got = profiles.void_profiles(p, bins=wb, m=50, sample="deep", radius="r_eff", distinct=False)
             config.DEEP_VOID_THRESHOLD = -0.5
-            back = profiles.void_profiles(p, bins=wb, m=50, sample="deep")
+            back = profiles.void_profiles(p, bins=wb, m=50, sample="deep", radius="r_eff", distinct=False)
         assert list(got["index"]) == [1] and list(back["index"]) == [1, 3], (list(got["index"]), list(back["index"]), buf.getvalue())
     finally:
         shutil.rmtree(config.CACHE_DIR, ignore_errors=True)
-        config.CACHE_DIR, config.DEEP_VOID_THRESHOLD, config.ELLIPSOID_CUTS = old_cache, old_deep, old_cuts
+        config.CACHE_DIR, config.DEEP_VOID_THRESHOLD, config.ELLIPSOID_CUT_RULES = old_cache, old_deep, old_cuts
 
 
 def _void_pin_config(root, saved, n=64, box=64.0):
@@ -1519,7 +1544,10 @@ def _void_pin_config(root, saved, n=64, box=64.0):
     pins = {"CACHE_DIR": Path(root) / "cache", "THESIS_FIGURES_DIR": Path(root) / "mirror",
             "LOCAL_FIGURES_ROOT": str(Path(root) / "figures"),
             "CELL_SIZE": box / n, "BOX_SIZE": box, "FIELD_RESOLUTION": n, "SMOOTHING_SIGMA_CELLS": 1.5,
-            "ELLIPSOID_CUTS": {"min_axis_mpc": 0.1, "max_axis_mpc": 10.0, "max_axis_ratio": 10.0},
+            "PRODUCTION_SMOOTHING": (1.5, 11),                    # the fixture's sigma IS its production: untagged names
+            # 0.1 / 10 Mpc in this 1 Mpc cell with sigma = 1.5 cells: 0.1 cells, 10/1.5 sigma (L/2 = 32 Mpc does not bind)
+            "ELLIPSOID_CUT_RULES": {"min_axis_cells": 0.1, "max_axis_sigma": 10.0 / 1.5, "max_axis_box_frac": 0.5,
+                                    "max_axis_ratio": 10.0},
             "FOOTPRINT_SIZE": 11, "GRADIENT_THRESHOLD": 0.1, "VOID_EIGENVALUE_CRITERION": "trace",
             "DEEP_VOID_THRESHOLD": -0.1, "PANEL_SNAPSHOTS": ["000", "017", "050", "099"]}
     saved.update({k: getattr(config, k) for k in pins})
@@ -1639,16 +1667,32 @@ def t_void_scripts():
         assert need <= set(f), sorted(need - set(f))
         assert str(f["prefix"]) == "" and float(f["sigma_cells"]) == 1.5 and float(f["cell_mpc"]) == 1.0 and float(f["box_mpc"]) == 64.0, f
         assert int(f["n_grid"]) == 64 and int(f["n_boot"]) == 37 and int(f["min_count"]) == 5 and str(f["method"]) == "ps" and str(f["sample"]) == "resolved", f
-        assert list(f["count"]) == [6, 0] and np.isfinite(f["density_mean"][0]).all() and np.isnan(f["density_mean"][1]).all(), f["count"]
         assert float(f["redshift"]) == 0.0 and float(npz(out / "void_profiles_ps_resolved_z0.50.npz")["redshift"]) == 0.5
         cat99 = npz(cached(99))
         assert np.array_equal(f["r_eff_mpc"], catalog.r_eff_mpc(cat99)[f["index"]]) and np.allclose(f["delta_c"], cat99["delta_values"][f["index"]])
+        # the default (2026-10-07): the DISTINCT resolved voids with a measured R_v, the shells in r / R_v
+        rv99 = catalog.r_v_mpc(cat99)
+        dist99 = catalog.distinct_mask(cat99, cat99["well_resolved"].astype(bool) & np.isfinite(rv99), 64)
+        want = np.nonzero(dist99 & (3.0 * rv99 <= 32.0))[0]                # and the wrap rule: 3 R_v <= L/2 = 32 cells
+        assert str(f["radius"]) == "r_v" and bool(f["distinct"]) and list(f["index"]) == list(want), (list(f["index"]), list(want))
+        assert np.allclose(f["r_mpc"], rv99[f["index"]]) and list(f["count"]) == [len(want), 0] and 0 < len(want) <= 6, f["count"]
+        assert np.isfinite(f["density_mean"][0]).all() and np.isnan(f["density_mean"][1]).all()
+        # --radius r_eff --keep-overlaps: the stack before 2026-10-07 (every resolved void, in r / R_eff), its own file
+        code, text = run(pvp, ["--snaps", "99", "--edges", "0,10,20", "--radius", "r_eff", "--keep-overlaps"])
+        g = npz(out / "void_profiles_ps_resolved_reff_overlaps_z0.00.npz")
+        assert code == 0 and list(g["count"]) == [6, 0] and str(g["radius"]) == "r_eff" and np.array_equal(g["r_mpc"], g["r_eff_mpc"]), (code, text[-300:])
         # --prefix: the file is named by the set it holds, the primary set's file untouched
         before = (out / "void_profiles_ps_resolved_z0.00.npz").read_bytes()
         code, text = run(pvp, ["--snaps", "99", "--prefix", "ps_mw"])
         assert code == 0 and (out / "void_profiles_ps_mw_resolved_z0.00.npz").is_file() and (out / "void_profiles_ps_mw_resolved_z0.00.png").is_file(), (code, sorted(q.name for q in out.iterdir()), text[-400:])
         assert str(npz(out / "void_profiles_ps_mw_resolved_z0.00.npz")["prefix"]) == "ps_mw"
         assert (out / "void_profiles_ps_resolved_z0.00.npz").read_bytes() == before
+        # --out: the user's folder and nothing into the thesis tree; without --edges the bins are in smoothing lengths
+        from dtfelib import profiles as _prof
+        own, mirrored = root / "own_out", sorted((root / "mirror").rglob("*.png"))
+        code, text = run(pvp, ["--snaps", "99", "--out", str(own)])
+        assert code == 0 and (own / "void_profiles_ps_resolved_z0.00.png").is_file() and sorted((root / "mirror").rglob("*.png")) == mirrored, (code, text[-400:])
+        assert np.allclose(npz(own / "void_profiles_ps_resolved_z0.00.npz")["edges"], _prof.default_edges_mpc(1.5 * 1.0, 64.0))
         # an unreadable snapshot file FIRST: counted failed, the next snapshot still profiled, exit 1; a missing one too
         d98 = garbage(98)
         shutil.rmtree(out)
@@ -1680,13 +1724,19 @@ def t_void_scripts():
         for part in parts:
             assert f"abundance_99_{part}" in st and f"abundance_99_other_{part}" in st and f"abundance_50_{part}" not in st, (part, sorted(st))
         assert list(st["snaps"]) == [50, 99] and np.array_equal(st["box_mpc"], [box, box]) and list(st["n_resolved"]) == [6, 6], (st["snaps"], st["box_mpc"], st["n_resolved"])
-        # the abundance from each estimator's OWN cached catalogue (R_eff the one definition) and the header's box
-        # (config's frame): the PS set has six voids, the standard-DTFE set (one dip fewer) five
+        # the abundance from each estimator's OWN cached catalogue and the header's box (config's frame): the PS set
+        # has six resolved voids, the standard-DTFE set (one dip fewer) five; counted since 2026-10-07 in R_v, the
+        # distinct ones (catalog.distinct_mask)
         cat99 = npz(cached(99))
         r = catalog.r_eff_mpc(cat99)
         rd = catalog.r_eff_mpc(npz(cached(99, "dtfe")))
         assert np.isfinite(r).sum() == 6 and np.isfinite(rd).sum() == 5, (r, rd)
-        for tag, rr in (("", r), ("_other", rd)):
+
+        def counted(c):
+            rv_ = catalog.r_v_mpc(c)
+            return rv_[catalog.distinct_mask(c, c["well_resolved"].astype(bool) & np.isfinite(rv_), 64)]
+        assert counted(cat99).size and np.array_equal(pop.snapshot_stats(cat99, 64)["_r_v"], counted(cat99))
+        for tag, rr in (("", counted(cat99)), ("_other", counted(npz(cached(99, "dtfe"))))):
             want = catalog.void_abundance(rr, box, st["abundance_radii_mpc"])[:2] + catalog.void_dn_dlnr(rr, box, st["abundance_edges_mpc"])[:2]
             for part, w in zip(parts, want):
                 assert np.array_equal(st[f"abundance_99{tag}_{part}"], w), (tag, part, st[f"abundance_99{tag}_{part}"][:4], w[:4])
@@ -1906,6 +1956,10 @@ def t_pk_script():
         assert code == 0 and "pk_ps_mw_z0.50.png" in names and str(np.load(root / "out" / "pk_ps_mw_z0.50.npz")["prefix"]) == "ps_mw"
         code, text, names = run(["--snaps", "98"])
         assert code == 1 and "failed: [98]" in text, (code, text[-200:])
+        code, text, names = run(["--snaps", "99", "--ref-snap", "50"])
+        assert code == 0 and "reference snapshot 050" in text, text[-300:]
+        lo, hi = ppk.chi2_interval(np.array([1.0]), np.array([6]))      # M = 6: the truth 0.65-2.19x the measurement
+        assert 0.6 < lo[0] < 0.7 and 2.1 < hi[0] < 2.3, (lo, hi)
         # mixed grid sizes: each estimator's own k_Ny and k_Ny/2 lines; the same size: one grey pair
         rng = np.random.default_rng(1)
         p32 = spectra.power_spectrum(rng.normal(size=(32, 32, 32)), 100.0)
@@ -1930,6 +1984,21 @@ def t_pk_script():
             xs = sorted(round(float(ln.get_xdata()[0]), 6) for ln in ax.lines if len(set(ln.get_xdata())) == 1)
             assert xs == sorted(round(v, 6) for v in (p32["k_nyquist"], p32["k_nyquist"] / 2)), xs
             assert held["fig"].axes[1].get_yscale() == "log"
+            # the same-realisation panel: an early spectrum grown linearly divides out (exactly 1 here), and the band
+            held.clear()
+            g = (float(spectra.growth_factor(0.0)) / float(spectra.growth_factor(20.0))) ** 2
+            ppk.plot_pk({"ps": p32}, 0.0, 100.0, "t", root / "ref.png", ref=({"ps": dict(p32, P=p32["P"] / g)}, 20.0))
+            axes = held["fig"].axes
+            assert len(axes) == 3 and np.allclose(axes[2].lines[0].get_ydata(), 1.0), len(axes)
+            assert len(axes[1].collections) >= 1                         # the 95% Gaussian band where Delta^2_lin < 1
+            held.clear()
+            ppk.plot_pk({"ps": p32}, 0.0, 100.0, "t", root / "noref.png", ref=({"ps": p32}, 0.0))   # same z: no panel
+            assert len(held["fig"].axes) == 2
+            held.clear()
+            p16 = spectra.power_spectrum(rng.normal(size=(16, 16, 16)), 100.0, nbins=None)   # other bins: no crash, no panel
+            ppk.plot_pk({"ps": spectra.power_spectrum(rng.normal(size=(32, 32, 32)), 100.0, nbins=None)}, 0.0, 100.0, "t",
+                        root / "otherbins.png", ref=({"ps": p16}, 20.0))
+            assert len(held["fig"].axes) == 2 and not ppk.same_edges(p16["edges"], p32["edges"])
         finally:
             plt.close = real_close
             for f in held.values():
@@ -2272,7 +2341,7 @@ def t_caustic_skeleton_script():
             assert "no caustic_class grid" in text and "parity-only" in text, text[-600:]
             # --voids asked for and refused (the header's 100 Mpc / 8 cell is not config.CELL_SIZE: the frame guard)
             assert abs(100.0 / n - config.CELL_SIZE) > 1e-3 * config.CELL_SIZE, config.CELL_SIZE
-            code, text, names = run(["--snaps", "50", "--voids"])
+            code, text, names = run(["--snaps", "50", "--voids", "--radius", "r_eff", "--keep-overlaps"])
             assert code == 1 and names == base and "failed: [50]" in text and "voids: FAILED" in text, (code, names, text[-600:])
             j = strict(root / "out" / "caustic_skeleton_z0.50.json")
             assert "cell" in j.get("voids_error", "") and "voids" not in j, j.get("voids_error")
@@ -2290,16 +2359,22 @@ def t_caustic_skeleton_script():
                                 well_resolved=np.array([True, False]))
                 def release(self):
                     pass
-            pcs.pipeline = types.SimpleNamespace(products=lambda *a, **kw: _Prod())
+            real = saved[2]
+            pcs.pipeline = types.SimpleNamespace(products=lambda *a, **kw: _Prod(), add_smoothing_mpc_arg=real.add_smoothing_mpc_arg,
+                                                 apply_smoothing_args=real.apply_smoothing_args,
+                                                 smoothing_length_mpc=real.smoothing_length_mpc, smoothing_tag=real.smoothing_tag)
             with warnings.catch_warnings():             # undefined medians: None, not an all-NaN / empty (nan)median (review [26]);
                 # only numpy's two messages: matplotlib's own autoscaling on the all-NaN column is not under test
                 warnings.filterwarnings("error", category=RuntimeWarning, message=r"(All-NaN slice|Mean of empty slice)")
-                code, text, names = run(["--snaps", "50", "--voids", "--cutout", "2"])
+                code, text, names = run(["--snaps", "50", "--voids", "--cutout", "2", "--radius", "r_eff", "--keep-overlaps"])
             assert code == 0 and names == sorted(base + ["caustic_skeleton_z0.50_voids.npz"]), (code, names, text[-600:])
             j = strict(root / "out" / "caustic_skeleton_z0.50.json")
-            assert j["voids"] == {"n": 1, "fold_shell_median": 0.0, "dist_reff_median": None, "beyond_cutout": 1} and "voids_error" not in j, j
+            assert j["voids"] == {"n": 1, "fold_shell_median": 0.0, "dist_reff_median": None, "beyond_cutout": 1, "radius": "r_eff",
+                                  "shells": [1.0, 1.1, 1.2, 1.3], "distinct": False, "sigma_mpc": real.smoothing_length_mpc(),
+                                  "footprint_cells": config.FOOTPRINT_SIZE} and "voids_error" not in j, j
             with np.load(root / "out" / "caustic_skeleton_z0.50_voids.npz") as zv:
-                assert sorted(zv.files) == ["bounded", "dist_cells", "dist_reff", "fold", "index", "r_eff_cells", "sheet"], zv.files
+                assert sorted(zv.files) == ["bounded", "dist_cells", "dist_reff", "fold", "index", "r_eff_cells", "radius", "sheet",
+                                            "shells"], zv.files
                 assert list(zv["index"]) == [0] and bool(zv["bounded"][0]) and np.isnan(zv["dist_cells"][0]) and np.isnan(zv["dist_reff"][0])
             assert not (root / "mirror").exists() and not (root / "default_out").exists()
     finally:
@@ -2820,6 +2895,199 @@ def t_pointeval_style():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def t_science_fixes_2026_10_07():
+    """The 2026-10-07 science fixes: the thesis mirror keeps the sim folder under a figure root with no
+    'figures' in its path (any DTFE_FIGURES_ROOT); the ellipsoid cuts are rules turned into Mpc at CALL
+    time (10 sigma, L/2, 1 cell); a cache older than its density grid is rebuilt; the profile bins are in
+    smoothing lengths, closed at the wrap cap L/6."""
+    import os as _os, tempfile as _tf
+    from matplotlib.figure import Figure
+    import config
+    from dtfelib import figures as F, pipeline, profiles as prof
+    tmp = Path(_tf.mkdtemp(prefix="dtfe_sci_"))
+    old = (config.LOCAL_FIGURES_ROOT, config.THESIS_FIGURES_DIR, config.SMOOTHING_SIGMA_CELLS, config.CACHE_DIR)
+    try:
+        # the mirror: relative to the figure root first, then below a 'figures/' folder, then the bare name
+        root = tmp / "DTFE figures"
+        config.LOCAL_FIGURES_ROOT, config.THESIS_FIGURES_DIR = str(root), tmp / "mirror"
+        assert F.mirror_relative_path(root / "void_profiles" / "TNG100-3-Dark" / "a.png") == "void_profiles/TNG100-3-Dark/a.png"
+        assert F.mirror_relative_path(tmp / "x" / "figures" / "b" / "c.png") == "b/c.png"
+        assert F.mirror_relative_path(tmp / "elsewhere" / "d.png") == "d.png"
+        F.save_plot_to_multiple_paths(Figure(figsize=(1, 1)), root / "void_profiles" / "SIM" / "e.png", dpi=20)
+        assert (tmp / "mirror" / "void_profiles" / "SIM" / "e.png").is_file() and not (tmp / "mirror" / "e.png").exists()
+        # the cuts at call time: 10 sigma with sigma as set NOW (a --smooth override), L/2 when that binds
+        cell, box = float(config.CELL_SIZE), float(config.BOX_SIZE)
+        for sig, want in ((10.0, 100.0 * cell), (5.0, 50.0 * cell), (30.0, 0.5 * box)):
+            config.SMOOTHING_SIGMA_CELLS = sig
+            c = pipeline.ellipsoid_cuts_mpc()
+            assert abs(c["max_axis_mpc"] - want) < 1e-9 * want and abs(c["min_axis_mpc"] - cell) < 1e-12 \
+                and c["max_axis_ratio"] == 10.0, (sig, c, want)
+            assert np.allclose(pipeline._cuts_array(), [cell, want, 10.0])
+        config.SMOOTHING_SIGMA_CELLS = old[2]
+        # a cache older than the density grid it came from is rebuilt; a newer one is used
+        config.CACHE_DIR = tmp / "cache"
+        grid = tmp / "ps_output.a_den"
+        grid.write_bytes(b"0")
+
+        class _FS:
+            method = "ps"
+
+            def _field_path(self, name):
+                return grid
+        sp = pipeline.SnapshotProducts(50, sim="SYN")
+        sp._fs = _FS()
+        cp = sp._cpath("voids")
+        np.savez_compressed(cp, a=np.arange(3))
+        t = cp.stat().st_mtime
+        _os.utime(grid, (t - 100, t - 100))
+        assert sp._cached("voids") == cp
+        _os.utime(grid, (t + 100, t + 100))
+        sp._stamp = None                                          # the stamp is taken once per products object
+        import io as _io
+        from contextlib import redirect_stdout
+        buf = _io.StringIO()
+        with redirect_stdout(buf):
+            assert sp._cached("voids") is None
+        assert "older than ps_output.a_den" in buf.getvalue(), buf.getvalue()
+        assert sp._cached("critical") is None                     # no cache at all
+        # a cache WITH the grid's stamp: equality decides, not the clock (a copy with a new mtime, a future grid)
+        sp = pipeline.SnapshotProducts(50, sim="SYN")
+        sp._fs = _FS()
+        sp._save(cp, {"a": np.arange(3)})
+        assert np.array_equal(np.load(cp)["grid_stamp"], [grid.stat().st_size, grid.stat().st_mtime_ns])
+        _os.utime(cp, (t - 1000, t - 1000))                      # the cache now OLDER than the grid: the stamp still matches
+        assert sp._cached("voids") == cp
+        grid.write_bytes(b"01")                                   # another grid (size and time): the stamp no longer does
+        _os.utime(cp, (t + 1000, t + 1000))
+        sp2 = pipeline.SnapshotProducts(50, sim="SYN")
+        sp2._fs = _FS()
+        buf = _io.StringIO()
+        with redirect_stdout(buf):
+            assert sp2._cached("voids") is None
+        assert "another version of the grid" in buf.getvalue(), buf.getvalue()
+
+        class _NoPaths:                                           # a cache-only double: no grid to judge by
+            method = "ps"
+        sp3 = pipeline.SnapshotProducts(50, sim="SYN")
+        sp3._fs = _NoPaths()
+        assert sp3._cached("voids") == cp
+        # sigma = 0 (no smoothing) counts as one cell: no zero-size cut, bins or radii
+        config.SMOOTHING_SIGMA_CELLS = 0.0
+        assert abs(pipeline.smoothing_length_mpc() - cell) < 1e-12 and abs(pipeline.ellipsoid_cuts_mpc()["max_axis_mpc"] - 10 * cell) < 1e-9
+        config.SMOOTHING_SIGMA_CELLS = old[2]
+        try:
+            prof.default_edges_mpc(0.0, 60.0)
+            raise AssertionError("a zero smoothing length gave bins")
+        except ValueError:
+            pass
+        # the wall search in growing cut-outs equals one search at the full half-width
+        from dtfelib import skeleton as _sk
+        m = np.zeros((48, 48, 48), dtype=bool)
+        m[0, 0, 0] = True                                         # one wall cell; near, far (doubling) and unreachable voids
+        cen = np.array([[3, 0, 0], [10, 5, 0], [15, 0, 0], [47, 47, 47], [24, 24, 24]])
+        d1, b1 = _sk.nearest_wall_distance(m, cen, 20, start_cells=2)
+        d2, b2 = _sk.nearest_wall_distance(m, cen, 20, start_cells=20)
+        assert np.array_equal(b1, b2) and np.allclose(d1, d2, equal_nan=True), (d1, d2, b1, b2)
+        assert np.allclose(d1[:4], [3.0, np.sqrt(125.0), 15.0, np.sqrt(3.0)]) and list(b1) == [False] * 4 + [True], (d1, b1)
+        # profile bins in sigma, closed at the wrap cap
+        e = prof.default_edges_mpc(2.1625, 110.717449, "r_eff")
+        assert np.allclose(e, (0.0, 10.8125, 12.975, 15.1375, 110.717449 / 6)), e
+        e = prof.default_edges_mpc(2.1625, 110.717449)                # R_v (the default): 0, 2.5, 3.5, 5 sigma
+        assert np.allclose(e, (0.0, 5.40625, 7.56875, 10.8125, 110.717449 / 6)), e
+        assert prof.default_edges_mpc(5.0, 60.0) == (0.0, 10.0), prof.default_edges_mpc(5.0, 60.0)
+    finally:
+        config.LOCAL_FIGURES_ROOT, config.THESIS_FIGURES_DIR, config.SMOOTHING_SIGMA_CELLS, config.CACHE_DIR = old
+        import shutil as _sh
+        _sh.rmtree(tmp, ignore_errors=True)
+
+
+def t_void_radius_and_physical_smoothing():
+    """2026-10-07: the measured void radius R_v (where the spherically averaged smoothed delta around the minimum first
+    rises to 0) on an analytic field, an overdense minimum and the periodic wrap; distinct voids deepest first (and
+    across the box edge); the smoothing in Mpc -- set_smoothing and DTFE_SIGMA_MPC -- with its footprint, and the
+    anchor: 10 cells given in Mpc is exactly today's sigma, footprint and cache namespace."""
+    import os as _os, subprocess as _sp, sys as _sys
+    import config
+    from dtfelib import pipeline
+    n = 64
+    idx = np.indices((n, n, n)).astype(np.float64)
+
+    def bowl(c, r0):                                             # delta = ((r / r0)^2 - 1) / 2: 0 exactly at r = r0
+        r2 = sum((((idx[k] + 0.5) - (c[k] + 0.5) + n / 2) % n - n / 2) ** 2 for k in range(3))
+        return 0.5 * (r2 / r0 ** 2 - 1.0)
+    rv = pipeline.void_radius_cells(bowl((20, 30, 40), 6.0), np.array([[20, 30, 40]]), 1.0)
+    assert abs(rv[0] - 6.0) < 0.05, rv                            # linear interpolation over 0.2-cell steps of a parabola
+    rv = pipeline.void_radius_cells(bowl((1, 62, 0), 6.0), np.array([[1, 62, 0]]), 1.0)
+    assert abs(rv[0] - 6.0) < 0.05, rv                            # the same across the periodic edges
+    assert np.isnan(pipeline.void_radius_cells(bowl((20, 30, 40), 6.0) + 1.0, np.array([[20, 30, 40]]), 1.0)[0])
+    assert pipeline.void_radius_cells(bowl((20, 30, 40), 6.0), np.zeros((0, 3), int), 1.0).shape == (0,)
+    # distinct, deepest first: B lies inside A's R_v, D inside A's across the edge; C and E stand alone
+    coords = np.array([[2, 10, 10], [5, 10, 10], [40, 10, 10], [62, 10, 10], [40, 40, 40]])   # D: 4 cells from A via the edge
+    delta = np.array([-0.9, -0.5, -0.6, -0.4, -0.3])
+    r_v = np.array([5.0, 4.0, 3.0, 2.0, np.nan])
+    keep = pipeline.distinct_voids(coords, delta, r_v, n)
+    assert list(keep) == [True, False, True, False, False], keep  # E: no R_v, not distinct
+    assert list(pipeline.distinct_voids(coords[[1, 2]], delta[[1, 2]], r_v[[1, 2]], n)) == [True, True]   # per sample
+    # each void claims min(R_v, R_eff): A's R_v of 20 is capped at its R_eff of 5 (B at 8 cells survives); a void
+    # without R_v takes part with its R_eff
+    c2 = np.array([[10, 10, 10], [18, 10, 10], [10, 40, 10], [10, 43, 10]])
+    d2, rv2, re2 = np.array([-0.9, -0.5, -0.8, -0.3]), np.array([20.0, 3.0, np.nan, 2.0]), np.array([5.0, 4.0, 6.0, 3.0])
+    assert list(pipeline.distinct_voids(c2, d2, rv2, n)) == [True, False, False, True]            # R_v alone: A swallows B
+    assert list(pipeline.distinct_voids(c2, d2, rv2, n, re2)) == [True, True, True, False]        # capped; C claims R_eff
+    # the smoothing in Mpc
+    old = (config.SMOOTHING_SIGMA_CELLS, config.FOOTPRINT_SIZE, config.SMOOTHING_SIGMA_MPC)
+    try:
+        hash10 = pipeline._param_hash()
+        assert pipeline.set_smoothing(mpc=10.0 * config.CELL_SIZE) == 10.0 and config.FOOTPRINT_SIZE == 11
+        assert pipeline._param_hash() == hash10, (pipeline._param_hash(), hash10)            # the anchor: today's caches
+        s = pipeline.set_smoothing(mpc=2.1625)
+        assert abs(s - 2.1625 / config.CELL_SIZE) < 1e-8 and config.FOOTPRINT_SIZE == config.footprint_for(s) \
+            and config.FOOTPRINT_SIZE % 2 == 1 and abs(config.SMOOTHING_SIGMA_MPC - 2.1625) < 1e-8, (s, config.FOOTPRINT_SIZE)
+        fp = config.FOOTPRINT_SIZE
+        assert fp != 11 and pipeline.set_smoothing(cells=5.0) == 5.0 and config.FOOTPRINT_SIZE == 11   # cells: production fp
+        assert [config.footprint_for(x) for x in (10.0, 3.655, 21.43, 0.5)] == [11, 5, 23, 3]
+        try:
+            pipeline.set_smoothing(cells=5.0, mpc=1.0)
+            raise AssertionError("both units accepted")
+        except ValueError:
+            pass
+        pipeline.set_smoothing(mpc=2.1625)
+        assert pipeline.smoothing_tag() == f"s2.1625Mpc_f{config.FOOTPRINT_SIZE}", pipeline.smoothing_tag()   # 6 digits:
+        pipeline.set_smoothing(mpc=2.16)                                                      # 2.16 is its own tag
+        assert pipeline.smoothing_tag() == f"s2.16Mpc_f{config.FOOTPRINT_SIZE}", pipeline.smoothing_tag()
+        assert pipeline.set_smoothing(cells=10.0) == 10.0 and config.FOOTPRINT_SIZE == 11 and pipeline.smoothing_tag() == ""
+        pipeline.set_smoothing(mpc=10.0 * config.CELL_SIZE)
+        assert pipeline.smoothing_tag() == ""                     # the production smoothing: the default names
+    finally:
+        config.SMOOTHING_SIGMA_CELLS, config.FOOTPRINT_SIZE, config.SMOOTHING_SIGMA_MPC = old
+    # DTFE_SIGMA_MPC at import (the module-level copies and analyze.py follow), in a fresh interpreter per box
+    py = Path(__file__).resolve().parents[1] / "python"
+    probe = "import config; print(config.SMOOTHING_SIGMA_CELLS, config.FOOTPRINT_SIZE, round(config.SMOOTHING_SIGMA_MPC, 6))"
+    for sim, sig, want in (("TNG300-3-Dark", "2.1625", (2.1625 / (302.62769412459404 / 512), 5)),
+                           ("TNG50-4-Dark", str(10 * 51.668142899320934 / 512), (10.0, 11))):
+        env = dict(_os.environ, DTFE_SIM=sim, DTFE_SIGMA_MPC=sig)
+        out = _sp.run([_sys.executable, "-c", probe], cwd=py, env=env, capture_output=True, text=True).stdout.split()
+        assert len(out) == 3 and abs(float(out[0]) - want[0]) < 1e-6 and int(out[1]) == want[1], (sim, out)
+    # the thesis outputs are safe from it: analyze.py compute/plot/all refuse; no figure goes into the thesis tree
+    env = dict(_os.environ, DTFE_SIM="TNG100-3-Dark", DTFE_SIGMA_MPC="5.0")
+    r = _sp.run([_sys.executable, "analyze.py", "plot"], cwd=py, env=env, capture_output=True, text=True)
+    assert r.returncode != 0 and "refused" in (r.stderr + r.stdout), (r.returncode, r.stderr[-300:])
+    import tempfile as _tf
+    from matplotlib.figure import Figure
+    from dtfelib import figures as F
+    tmp = Path(_tf.mkdtemp(prefix="dtfe_tag_"))
+    oldf = (config.LOCAL_FIGURES_ROOT, config.THESIS_FIGURES_DIR, config.SMOOTHING_SIGMA_CELLS, config.FOOTPRINT_SIZE)
+    try:
+        config.LOCAL_FIGURES_ROOT, config.THESIS_FIGURES_DIR = str(tmp / "figs"), tmp / "mirror"
+        pipeline.set_smoothing(mpc=2.1625)
+        F.save_plot_to_multiple_paths(Figure(figsize=(1, 1)), tmp / "figs" / "x" / "a.png", dpi=20)
+        assert (tmp / "figs" / "x" / "a.png").is_file() and not (tmp / "mirror").exists()
+    finally:
+        config.LOCAL_FIGURES_ROOT, config.THESIS_FIGURES_DIR, config.SMOOTHING_SIGMA_CELLS, config.FOOTPRINT_SIZE = oldf
+        import shutil as _sh
+        _sh.rmtree(tmp, ignore_errors=True)
+
+
 def t_thesis_mirror_outside_repo():
     """config.THESIS_FIGURES_DIR lies OUTSIDE the repo. From 2026-07-10 to 2026-10-06 its fallback was
     DTFE/Figures (config.py had moved into python/), which on macOS's case-insensitive disk is the repo's own
@@ -2839,6 +3107,8 @@ def main():
     print("=" * 60)
     print("synthetic:")
     check("the thesis figure mirror lies outside the repo (case-insensitively: DTFE/Figures IS DTFE/figures on macOS)", t_thesis_mirror_outside_repo)
+    check("2026-10-07: the measured void radius R_v (analytic, periodic, overdense), distinct voids deepest first, the smoothing in Mpc (set_smoothing, DTFE_SIGMA_MPC, footprint) and its 10-cell anchor (synthetic)", t_void_radius_and_physical_smoothing)
+    check("2026-10-07: the mirror keeps the sim folder under a root without 'figures' in its path; the cuts are 10 sigma / L/2 / 1 cell at CALL time; a cache older than its grid is rebuilt; profile bins in sigma (synthetic)", t_science_fixes_2026_10_07)
     check("cross-epoch limits store: a subset run keeps the series' maxima (synthetic)", t_limits_store)
     check("map ranges: symmetric about 0, log range of an empty slice (synthetic)", t_map_limits)
     check("webstreams: stream bins + caustic class by web class, chunked == whole (synthetic)", t_webstreams)
