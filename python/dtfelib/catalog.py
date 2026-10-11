@@ -16,7 +16,9 @@ eigenvalue order -- the effective radius (a b c)^(1/3), the fit's ellipticity 1 
 the major and minor axis directions) and the two sample flags (well_resolved: passes
 pipeline.ellipsoid_cuts_mpc() from config.ELLIPSOID_CUT_RULES; deep: central delta below config.DEEP_VOID_THRESHOLD). Fit columns are NaN for a
 void that is not well resolved, as plot_void_population treats them. R_eff is r_eff_mpc(), the one
-definition in the code base (plot_void_population.snapshot_stats uses it).
+definition in the code base (plot_void_population.snapshot_stats uses it). The measured radii (2026-10-11) come
+in three definitions (R_V_DEFINITIONS: r_v_mpc, r_v_delta08_mpc, r_v_ridge_mpc), the settings they were measured
+with in the provenance (r_v_*), as is the void gate (void_gate: DTFE_VOID_GATE).
 
 THE FRAME: the catalogue's positions and semi-axes are computed with config.CELL_SIZE, which comes
 from the DTFE_SIM simulation's box (config.py), not from the snapshot a script's --sim names. So the
@@ -60,6 +62,8 @@ COLUMNS = (
     ("c_mpc", "Mpc", "ellipsoid semi-axis, smallest"),
     ("r_eff_mpc", "Mpc", "effective radius (a b c)^(1/3)"),
     ("r_v_mpc", "Mpc", "MEASURED void radius: where the spherically averaged smoothed delta around the minimum first rises to 0 (NaN without a crossing within 15 sigma / half the box; ~0.57 R_eff)"),
+    ("r_v_delta08_mpc", "Mpc", "radius where the ENCLOSED smoothed density contrast Delta(<R) first reaches -0.8 going outward (r_v_delta08 in the header; NaN when the minimum is not below it or it is not reached within the search range)"),
+    ("r_v_ridge_mpc", "Mpc", "radius of the maximum of the spherically averaged smoothed delta (the compensation ridge) within the R_v search range (NaN when the maximum is the outermost shell)"),
     ("distinct", "0/1", "well resolved, with an R_v, and no deeper well-resolved void holds its centre inside the sphere of min(R_v, R_eff) that void claims (deepest first; a void without R_v claims its R_eff but is never flagged): the profile / abundance sample"),
     ("ellipticity_fit", "", "1 - c/a of the ellipsoid fit"),
     ("prolateness_fit", "", "(a^2 - b^2) / (a^2 - c^2) of the ellipsoid fit"),
@@ -136,6 +140,8 @@ def void_table(cat, n_grid: int | None = None) -> dict:
         "a_mpc": axes[:, 0] * nanfit, "b_mpc": axes[:, 1] * nanfit, "c_mpc": axes[:, 2] * nanfit,
         "r_eff_mpc": r_eff_mpc(cat).astype(np.float64),
         "r_v_mpc": r_v_mpc(cat).astype(np.float64),
+        "r_v_delta08_mpc": r_v_mpc(cat, "delta08"),
+        "r_v_ridge_mpc": r_v_mpc(cat, "ridge"),
         "distinct": distinct_mask(cat, resolved & np.isfinite(r_v_mpc(cat)), int(n_grid or config.FIELD_RESOLUTION)),
         "ellipticity_fit": np.asarray(cat["fit_ellipticity"], dtype=np.float64) * nanfit,
         "prolateness_fit": np.asarray(cat["fit_prolateness"], dtype=np.float64) * nanfit,
@@ -163,14 +169,36 @@ def assert_frame(cat, cell_mpc: float) -> None:
                          f"which re-derives its fits in this frame")
 
 
-def r_v_mpc(cat) -> np.ndarray:
-    """The measured void radius R_v in Mpc per catalogue row (pipeline.void_radius_cells: where the spherically
-    averaged smoothed density contrast around the minimum first rises to 0), in the catalogue's frame; NaN where it
-    has none -- and for a catalogue built before R_v existed (2026-10-07)."""
-    if "r_v_cells" not in cat:
+# The measured void radii (2026-10-11), all from ONE shell loop (pipeline.void_radii_cells) on the smoothed delta:
+#   'crossing' the first up-crossing of the mean (0) of the shell-averaged delta: THE R_v since 2026-10-07
+#   'delta08'  where the ENCLOSED contrast Delta(<R) first reaches pipeline.R_V_DELTA08 (-0.8, the nonlinear
+#              shell-crossing value of the spherical model; Sheth & van de Weygaert 2004) going outward
+#   'ridge'    the maximum of the shell-averaged delta (the compensation ridge) inside the R_v search range
+R_V_DEFINITIONS = ("crossing", "delta08", "ridge")
+R_V_KEYS = {"crossing": "r_v_cells", "delta08": "r_v_delta08_cells", "ridge": "r_v_ridge_cells"}
+
+
+def r_v_cells(cat, definition: str = "crossing") -> np.ndarray:
+    """R_v in CELLS per catalogue row under 'definition' (R_V_DEFINITIONS), float64; NaN where it is undefined and
+    for every row of a catalogue that lacks the key (built before that definition existed)."""
+    if definition not in R_V_KEYS:
+        raise ValueError(f"R_v definition must be one of {R_V_DEFINITIONS}, got {definition!r}")
+    key = R_V_KEYS[definition]
+    if key not in cat:
         return np.full(len(np.asarray(cat["coords"])), np.nan)
+    return np.asarray(cat[key], dtype=np.float64).reshape(-1)
+
+
+def r_v_mpc(cat, definition: str = "crossing") -> np.ndarray:
+    """The measured void radius R_v in Mpc per catalogue row (r_v_cells x the catalogue's own cell): by default the
+    'crossing' radius (where the spherically averaged smoothed density contrast around the minimum first rises to 0);
+    NaN where it has none -- and for a catalogue built before that definition existed (crossing: 2026-10-07, delta08
+    and ridge: 2026-10-11)."""
+    cells = r_v_cells(cat, definition)
+    if not len(cells):
+        return cells
     cell = pipeline.catalog_cell_mpc(cat)
-    return np.asarray(cat["r_v_cells"], dtype=np.float64) * (np.nan if cell is None else cell)
+    return cells * (np.nan if cell is None else cell)
 
 
 def distinct_mask(cat, sample, n_grid: int) -> np.ndarray:
@@ -197,10 +225,16 @@ def distinct_mask(cat, sample, n_grid: int) -> np.ndarray:
     return out & sample
 
 
-def provenance(products, n_voids: int, frame) -> dict:
-    """What the catalogue was built from and with: the HDF5 root attributes, the CSV's '#' lines."""
+def provenance(products, n_voids: int, frame, cat=None) -> dict:
+    """What the catalogue was built from and with: the HDF5 root attributes, the CSV's '#' lines. The R_v settings
+    (2026-10-11) are the catalogue's own record when 'cat' is given and has one, else today's (pipeline.r_v_settings,
+    which SnapshotProducts.voids() guarantees a served catalogue was measured with); the cuts are the ones its
+    well_resolved was taken with under the void gate (pipeline.gate_cuts_mpc: max axis inf under 'none')."""
     cell, box, n, source = frame
-    cuts = pipeline.ellipsoid_cuts_mpc()
+    cuts = pipeline.gate_cuts_mpc()
+    rv = pipeline.r_v_settings()
+    if cat is not None and "r_v_settings" in cat:
+        rv = np.asarray(cat["r_v_settings"], dtype=np.float64).reshape(-1)
     z = products.redshift
     return {
         "catalogue": "DTFE void catalogue: minima of the smoothed density contrast (dtfelib.pipeline.build_void_catalog)",
@@ -226,6 +260,13 @@ def provenance(products, n_voids: int, frame) -> dict:
         "cut_min_axis_cells": float(config.ELLIPSOID_CUT_RULES["min_axis_cells"]),
         "cut_max_axis_sigma": float(config.ELLIPSOID_CUT_RULES["max_axis_sigma"]),
         "cut_max_axis_box_frac": float(config.ELLIPSOID_CUT_RULES["max_axis_box_frac"]),
+        "void_gate": pipeline.void_gate(),             # DTFE_VOID_GATE: 'none' drops the max-axis clause
+        # how R_v was measured (pipeline.r_v_settings): shells every step sigma out to max sigma (or L/2), dirs each
+        "r_v_step_sigma": float(rv[0]),
+        "r_v_max_sigma": float(rv[1]),
+        "r_v_dirs": int(rv[2]),
+        "r_v_algorithm": int(rv[3]),
+        "r_v_delta08": float(rv[4]) if rv.size > 4 else float("nan"),
         "param_hash": pipeline._param_hash(),         # the cache directory the catalogue lives in
         "n_voids": int(n_voids),
         "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -327,7 +368,7 @@ def export_voids(products, out_dir, formats=("csv", "hdf5"), stem: str | None = 
     frame = frame_of(products)
     assert_frame(cat, frame[0])
     table = void_table(cat, frame[2])
-    prov = provenance(products, len(table["id"]), frame)
+    prov = provenance(products, len(table["id"]), frame, cat)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     if stem is None:

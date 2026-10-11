@@ -1,10 +1,8 @@
 # Standalone example: access the Delaunay tessellation via the DTFE() library call.
 #
-# STATUS: UNMAINTAINED. main_particle_density.cpp targets the 2011 upstream API
-# (vertexPositionMatrix free function, User_options::field, the old DTFE()/
-# writeOutputData signatures) and no longer compiles against the current sources.
-# The Makefile below is updated to the current build layout, so only the example
-# code itself needs porting to revive it.
+# STATUS: ported to the current API 2026-10-11 (DTFE()/writeOutputData() with the
+# unaveraged + averaged quantities, User_options::uField); CI builds it after
+# 'make library' (tests/ci_suite.sh variants), so it keeps compiling.
 #
 # Builds against the shared library produced by `make library` at the repo root
 # (run automatically as a prerequisite). The OPTIONS block below MUST match the
@@ -53,6 +51,13 @@ OPTIONS += -DOPEN_MP
 OPTIONS += -DTEST_PADDING
 OPTIONS += -DREDSHIFT_SPACE
 OPTIONS += -DTRIANGULATION
+OPTIONS += -DFIELD_OPTIONS
+OPTIONS += -DREGION_OPTIONS
+OPTIONS += -DPARTITION_OPTIONS
+OPTIONS += -DPADDING_OPTIONS
+OPTIONS += -DAVERAGING_OPTIONS
+OPTIONS += -DREDSHIFT_CONE_OPTIONS
+OPTIONS += -DADDITIONAL_OPTIONS
 OPTIONS += -DBOOST_TIMER_ENABLE_DEPRECATED
 OPTIONS += -DBOOST_ALLOW_DEPRECATED_HEADERS
 

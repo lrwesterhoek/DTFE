@@ -15,12 +15,18 @@
 #include <cmath>
 #include <cstring>
 #include <deque>
+#include <memory>
 #include <mutex>
+#include <new>
+#include <string>
+#include <vector>
 #include <unistd.h>
 
 #include "gpu_host.h"
 #include "ps_deposit_params.h"
 #include "ps_deposit_msl.h"   // generated: static const char PS_DEPOSIT_MSL[]
+#include <atomic>
+extern std::atomic<int> psGpuRetries;   // ps_interpolation.cc (run_progress.h)
 #include "../message.h"       // ANSI colour helpers only (retry warning below)
 
 namespace {
@@ -88,6 +94,151 @@ std::string gpuDeviceName()
     Ctx& c = ctx();
     return c.dev ? std::string(c.dev->name()->utf8String()) : std::string();
 }
+
+
+// ---- chunk-level checkpoints and the cause-aware retry policy (2026-10-11) ----
+// A failed command buffer used to redo the WHOLE partition deposit (up to ~2000 s per TNG50 partition) and
+// three failures in a row sent it to the CPU. Now every pass keeps a snapshot of the buffers its kernel writes
+// (the accumulator grids, the exact items' sumW, the per-tet masses the kernel negates when it defers a tet),
+// taken at the pass's start and every DTFE_GPU_CHECKPOINT_CHUNKS chunks; a failed buffer (which may have
+// deposited part or all of its atomics) restores the last snapshot and continues from its chunk.
+namespace {
+
+// What a failed command buffer says about its cause. Both watchdog flavours share Metal's Timeout code (2), so
+// the description is read first:
+//   Victim    "Innocent Victim": another process's buffer hung the GPU and ours was collateral -> retry at
+//             once at the same pace (slowing down would only cost time, our buffers were not the problem)
+//   Watchdog  "Impacting Interactivity" / a GPU timeout: our buffers starved the display -> shorter buffers,
+//             wider gaps (the pacing the chunking exists for)
+//   Resource  out of memory, page fault, invalid resource, internal: escalate as for the watchdog and let the
+//             system settle 2 s first
+//   Fatal     device removed / not permitted / access revoked: no retry can help -> straight to the CPU
+enum class GpuFault { Victim, Watchdog, Resource, Fatal };
+
+char const* gpuFaultName(GpuFault f)
+{
+    switch (f)
+    {
+        case GpuFault::Victim:   return "innocent victim";
+        case GpuFault::Watchdog: return "watchdog";
+        case GpuFault::Resource: return "resource";
+        default:                 return "fatal";
+    }
+}
+
+GpuFault classifyGpuFault(long code, std::string const& desc)
+{
+    auto has = [&](char const* s) { return desc.find(s) != std::string::npos; };
+    if (has("Innocent Victim") || has("InnocentVictim")) return GpuFault::Victim;
+    if (has("Impacting Interactivity") || has("ImpactingInteractivity") || has("Timeout")
+        || code == long(MTL::CommandBufferErrorTimeout)) return GpuFault::Watchdog;
+    if (code == long(MTL::CommandBufferErrorDeviceRemoved) || code == long(MTL::CommandBufferErrorNotPermitted)
+        || code == long(MTL::CommandBufferErrorAccessRevoked)) return GpuFault::Fatal;
+    return GpuFault::Resource;
+}
+
+// The dispatch pace, kept for the rest of the PROCESS once escalated (as dtfe_metal_host.cc's ChunkState does
+// per run): a machine whose display load killed one partition's buffers will kill the next one's at the same
+// pace. Guarded by ctxMutex (only touched inside psGpuDepositFields).
+struct GpuPace { double targetSec = 0.25; useconds_t gapUs = 8000; };
+GpuPace& gpuPace() { static GpuPace p; return p; }
+
+// The test hook DTFE_GPU_FAULT_AT=<k>[:<kind>]: the k-th command buffer of the PROCESS (1-based, counted over
+// every pass and partition; buffers that failed for real are not counted) runs to completion -- its atomics ARE deposited, the worst case of a buffer killed
+// late -- and is then reported as failed, so only a correct restore keeps the grids exact. Kinds: 'innocent'
+// (default), 'timeout', 'oom', and 'persist' (every buffer from the k-th on fails as an innocent victim: the
+// retry policy must then give the partition to the CPU). One-shot except 'persist'.
+struct GpuFaultHook { long at = 0; std::string kind = "innocent"; long count = 0; bool fired = false; };
+GpuFaultHook& gpuFaultHook()
+{
+    static GpuFaultHook h = [] {
+        GpuFaultHook r;
+        if (const char* env = getenv("DTFE_GPU_FAULT_AT"))
+        {
+            r.at = atol(env);
+            if (const char* colon = strchr(env, ':')) r.kind = colon + 1;
+        }
+        return r;
+    }();
+    return h;
+}
+
+// true (and the injected error's description in 'desc', its code in 'code') when this buffer is to fail
+bool gpuFaultInjected(std::string& desc, long& code)
+{
+    GpuFaultHook& h = gpuFaultHook();
+    if (h.at <= 0) return false;
+    ++h.count;
+    bool const persist = h.kind == "persist";
+    if (h.count < h.at || (h.fired && !persist)) return false;
+    h.fired = true;
+    code = 0;
+    if (h.kind == "timeout")  { desc = "injected fault (DTFE_GPU_FAULT_AT): Impacting Interactivity"; code = long(MTL::CommandBufferErrorTimeout); }
+    else if (h.kind == "oom") { desc = "injected fault (DTFE_GPU_FAULT_AT): out of memory"; code = long(MTL::CommandBufferErrorOutOfMemory); }
+    else desc = std::string("injected fault (DTFE_GPU_FAULT_AT") + (persist ? ", persistent" : "") + "): Innocent Victim";
+    return true;
+}
+
+// One snapshot of a set of buffers, host-side. A buffer known to be all zeros is recorded as such (no copy):
+// the first pass's grids at its start, so a short deposit never allocates the spare copy at all.
+struct GpuSnapshot
+{
+    struct Blob { std::unique_ptr<char[]> p; size_t n = 0; bool zero = false; };
+    std::vector<MTL::Buffer*> bufs;
+    std::vector<Blob> blobs;
+    size_t start = 0;      // the pass's first thread NOT yet covered by the snapshot
+    bool   valid = false;
+    int    taken = 0;      // periodic snapshots (not the pass-start ones)
+    double sec   = 0.;     // time spent copying
+    size_t bytes = 0;      // largest snapshot held
+
+    // copies every buffer (zeroMask[i]: buffer i is known zero, not copied); false when the host memory for the
+    // spare copy is not there (the caller then runs without checkpoints)
+    bool take(std::vector<MTL::Buffer*> const& bs, std::vector<bool> const& zeroMask, size_t at)
+    {
+        auto const t0 = std::chrono::steady_clock::now();
+        if (blobs.size() < bs.size()) blobs.resize(bs.size());
+        // allocate everything BEFORE copying anything: a failed allocation leaves the previous snapshot whole
+        for (size_t i = 0; i < bs.size(); ++i)
+        {
+            Blob& b = blobs[i];
+            size_t const n = bs[i]->length();
+            if ((i < zeroMask.size() && zeroMask[i]) || (b.p && b.n >= n)) continue;
+            b.p.reset(new (std::nothrow) char[n]);
+            b.n = b.p ? n : 0;
+            if (!b.p) return false;
+        }
+        bufs = bs;
+        size_t held = 0;
+        for (size_t i = 0; i < bs.size(); ++i)
+        {
+            Blob& b = blobs[i];
+            b.zero = i < zeroMask.size() && zeroMask[i];
+            if (b.zero) continue;
+            size_t const n = bs[i]->length();
+            std::memcpy(b.p.get(), bs[i]->contents(), n);
+            held += n;
+        }
+        start = at;
+        valid = true;
+        bytes = std::max(bytes, held);
+        sec += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        return true;
+    }
+    void restore()
+    {
+        auto const t0 = std::chrono::steady_clock::now();
+        for (size_t i = 0; i < bufs.size(); ++i)
+        {
+            size_t const n = bufs[i]->length();
+            if (blobs[i].zero) std::memset(bufs[i]->contents(), 0, n);
+            else std::memcpy(bufs[i]->contents(), blobs[i].p.get(), n);
+        }
+        sec += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    }
+};
+
+} // namespace
 
 
 bool psGpuDepositFields(std::vector<float>& verts,
@@ -245,15 +396,16 @@ bool psGpuDepositFields(std::vector<float>& verts,
     //  - keeping buffers back-to-back (pipelined) sustains 100% GPU queue pressure and gets killed
     //    EVEN WITH ~0.1 s buffers under active display use -- the watchdog reacts to starvation,
     //    not just per-buffer duration. The gaps are what let WindowServer breathe.
-    // Chunk size adapts toward targetSec (heavy-tailed per-tet cost on real data); a killed buffer
-    // may have PARTIALLY deposited its atomics, so a failed chunk is never retried alone: each
-    // retry re-zeros the grids, redoes the whole deposit with 4x shorter buffers and wider gaps,
-    // and persistent failure falls back to the CPU deposit in the caller.
+    // Chunk size adapts toward targetSec (heavy-tailed per-tet cost on real data). A killed buffer
+    // may have PARTIALLY deposited its atomics, so a failed chunk is never retried alone: the pass
+    // restores its last snapshot (the pass's start, or a periodic checkpoint) and continues from
+    // there (2026-10-11; before, every failure redid the whole partition deposit from zero). The
+    // retry depends on the cause (GpuFault above); the partition goes to the CPU deposit in the
+    // caller only when one chunk fails 3 times, on a fatal error, or when no snapshot can be held.
     // PS_METAL_CHUNK=<n> overrides the starting chunk size of the one-thread-per-tet kernel.
     size_t const MIN_CHUNK = fExact ? 50 : 2000;
     size_t const MAX_CHUNK = 500000;
-    double targetSec = 0.25;
-    useconds_t gapUs = 8000;          // ~3% overhead at 0.25 s buffers
+    GpuPace& pace = gpuPace();        // targetSec 0.25 s, gapUs 8 ms (~3% overhead) until escalated
     // --ps-exact-deposit costs ~1-2 orders of magnitude more per tet (analytic clipping of
     // every cell in the window vs a barycentric test per sample), so start far smaller: the
     // adaptive controller only retargets AFTER the first chunk, and one oversized opening
@@ -261,21 +413,51 @@ bool psGpuDepositFields(std::vector<float>& verts,
     size_t baseChunk = fExact ? 500 : 25000;
     if (const char* env = getenv("PS_METAL_CHUNK"))
     { long v = atol(env); if (v > 0) baseChunk = size_t(v); }
+    // an escalated pace (an earlier partition's failures) opens with a proportionally smaller chunk
+    if (pace.targetSec < 0.25)
+        baseChunk = std::max(size_t(double(baseChunk) * pace.targetSec / 0.25), MIN_CHUNK);
     std::string lastErr;
     // PS_METAL_TIMING=1: one line per kernel run (threads, buffers, GPU-busy and wall seconds)
     bool const timing = getenv("PS_METAL_TIMING") && atoi(getenv("PS_METAL_TIMING")) != 0;
 
+    // DTFE_GPU_CHECKPOINT_CHUNKS=<n>: a checkpoint every n command buffers (0 = only the pass-start
+    // snapshot). Unset: every ~10 s of GPU work (n = 10 s / the current buffer target, so an escalated
+    // pace of 0.02 s buffers does not checkpoint 12x as often). A checkpoint memcpy's the accumulator
+    // grids (~24 B per cell for density + velocity: ~0.4 GB at 256^3, ~0.1 s) into ONE spare host copy,
+    // allocated at the first checkpoint and held until the partition's deposit returns.
+    long ckChunks = -1;
+    if (const char* env = getenv("DTFE_GPU_CHECKPOINT_CHUNKS")) { ckChunks = atol(env); if (ckChunks < 0) ckChunks = 0; }
+    std::vector<MTL::Buffer*> const gridBufs = { bMass, bMassFx, bMom, bM2, bGrad, bStr, bMomW, bCaust, bSV, bDV, bDW, bScal, bSG };
+    GpuSnapshot snap;
+    int nFailed = 0, nResumedCk = 0;   // failed buffers of this deposit, and how many resumed from a periodic checkpoint
+    int const MAX_FAILS_SAME_CHUNK = 3, MAX_FAILS_TOTAL = 16;
+
     // One paced, chunked run of 'pso' over nThreads threads; bind(enc, start, n) binds the buffers
-    // for the chunk [start, start+n). False (lastErr set) when a command buffer failed.
+    // for the chunk [start, start+n). 'extras' are the non-grid buffers the kernel WRITES (sumW, the
+    // per-tet masses it negates); gridsZero: the grids are all zero at the pass's start (snapshotted
+    // as such, without a copy); gridsKeepZero: the pass never writes them (the exact items' phase 0),
+    // so its periodic checkpoints skip them too. False (lastErr set) when the pass gave up (the caller
+    // falls back).
     auto runChunked = [&](MTL::ComputePipelineState* pso, size_t nThreads, size_t firstChunk,
-                          size_t minChunk, auto&& bind) -> bool
+                          size_t minChunk, std::vector<MTL::Buffer*> const& extras, bool gridsZero,
+                          bool gridsKeepZero, auto&& bind) -> bool
     {
         NS::UInteger tg = pso->maxTotalThreadsPerThreadgroup();
         if (tg > 256) tg = 256;
         size_t chunk = std::max(firstChunk, minChunk);
-        size_t start = 0, nBuf = 0;
+        size_t start = 0, nBuf = 0, sinceCk = 0;
         double busy = 0.;
         auto const tRun = std::chrono::steady_clock::now();
+        std::vector<MTL::Buffer*> ckBufs = gridBufs;
+        ckBufs.insert(ckBufs.end(), extras.begin(), extras.end());
+        std::vector<bool> zeroMask(ckBufs.size(), false);
+        if (gridsZero) std::fill(zeroMask.begin(), zeroMask.begin() + gridBufs.size(), true);
+        bool ckOn = snap.take(ckBufs, zeroMask, 0);
+        bool ckPeriodic = false;           // the held snapshot is a periodic checkpoint (not the pass start)
+        // failures of the 'same chunk': a failure that comes before the redo got past the previous failed
+        // buffer's end (chunk boundaries move with the timing controller, so a start offset is no identity)
+        int  failsHere = 0;
+        size_t failEnd = 0;
         while (start < nThreads)
         {
             uint32_t const n = uint32_t(std::min(chunk, nThreads - start));
@@ -290,25 +472,73 @@ bool psGpuDepositFields(std::vector<float>& verts,
             cb->waitUntilCompleted();
             double const el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 
+            std::string desc;
+            long code = 0;
+            bool failed = false;
             if (cb->status() == MTL::CommandBufferStatusError)
             {
                 NS::Error* e = cb->error();
-                lastErr = std::string("Metal command buffer failed: ")
-                        + (e ? e->localizedDescription()->utf8String() : "unknown");
-                return false;
+                desc = e ? e->localizedDescription()->utf8String() : "unknown";
+                code = e ? long(e->code()) : 0;
+                failed = true;
+            }
+            else failed = gpuFaultInjected(desc, code);   // the test hook (the buffer DID deposit)
+
+            if (failed)
+            {
+                ++psGpuRetries;   // the run's progress sidecar counts every failed buffer (run_progress.h)
+                ++nFailed;
+                GpuFault const cause = classifyGpuFault(code, desc);
+                lastErr = std::string("Metal command buffer failed: ") + desc + " [" + gpuFaultName(cause) + "]";
+                failsHere = (failsHere > 0 && start < failEnd) ? failsHere + 1 : 1;
+                failEnd = std::max(failEnd, start + n);
+                if (cause == GpuFault::Fatal || !ckOn || failsHere >= MAX_FAILS_SAME_CHUNK || nFailed >= MAX_FAILS_TOTAL)
+                {
+                    if (!ckOn) lastErr += " (no checkpoint held)";
+                    else if (failsHere >= MAX_FAILS_SAME_CHUNK) lastErr += " (" + std::to_string(failsHere) + " failures of the same chunk)";
+                    else if (nFailed >= MAX_FAILS_TOTAL) lastErr += " (" + std::to_string(nFailed) + " failed buffers in this deposit)";
+                    return false;
+                }
+                if (cause != GpuFault::Victim)
+                {   // escalate (for the rest of the process): 4x shorter buffers, wider gaps, smaller chunk
+                    pace.targetSec = std::max(pace.targetSec / 4.0, 0.02);
+                    pace.gapUs     = std::min(pace.gapUs * 3, useconds_t(50000));
+                    chunk = std::max(chunk / 4, minChunk);
+                    baseChunk = std::max(baseChunk / 2, MIN_CHUNK);
+                }
+                snap.restore();
+                if (ckPeriodic) ++nResumedCk;
+                fprintf(stderr, "%sPS-DTFE Metal: %s -- resuming from the %s at thread %zu of %zu "
+                                "(redoing %zu; failure %d of this chunk, target %.0f ms buffers, %.0f ms gaps)%s\n",
+                        MESSAGE::cYellow(), lastErr.c_str(), ckPeriodic ? "checkpoint" : "pass start",
+                        snap.start, nThreads, start + n - snap.start, failsHere,
+                        pace.targetSec * 1e3, pace.gapUs / 1e3, MESSAGE::cReset());
+                start = snap.start;
+                sinceCk = 0;
+                // an innocent victim retries at once; our own buffers' failures let the system settle first
+                if (cause == GpuFault::Resource) sleep(2);
+                else if (cause == GpuFault::Watchdog) sleep(1);
+                continue;
             }
 
             start += n;
             ++nBuf;
+            ++sinceCk;
             busy += el;
             if (el > 1e-4)   // retarget the next chunk toward targetSec (bounded rescale)
             {
-                double scale = targetSec / el;
+                double scale = pace.targetSec / el;
                 if (scale < 0.5) scale = 0.5;
                 if (scale > 4.0) scale = 4.0;
                 chunk = std::min(std::max(size_t(double(chunk) * scale), minChunk), MAX_CHUNK);
             }
-            usleep(gapUs);   // deliberate idle gap: lets WindowServer take the GPU
+            long const every = ckChunks >= 0 ? ckChunks : std::max(1L, long(std::lround(10.0 / pace.targetSec)));
+            if (ckOn && every > 0 && long(sinceCk) >= every && start < nThreads)
+            {   // the queue is drained (waitUntilCompleted above): the buffers hold exactly [0, start)
+                if (snap.take(ckBufs, gridsKeepZero ? zeroMask : std::vector<bool>(), start)) { ++snap.taken; ckPeriodic = true; sinceCk = 0; }
+                // else: no host memory for the spare copy; the last snapshot stays valid
+            }
+            usleep(pace.gapUs);   // deliberate idle gap: lets WindowServer take the GPU
         }
         if (timing)
             fprintf(stderr, "PS-DTFE Metal: %-17s %10zu threads  %6zu buffers  %8.3f s busy  %8.3f s wall\n",
@@ -319,10 +549,13 @@ bool psGpuDepositFields(std::vector<float>& verts,
 
     // depositFields over the tets [0,nT) of the given records. The grids are bound whole; the
     // per-tet buffers at the chunk's offset (P.nTet = chunk size, rewritten per chunk: safe, the
-    // previous chunk completed).
-    auto runPerTet = [&](MTL::Buffer* vB, MTL::Buffer* uB, MTL::Buffer* mB, MTL::Buffer* dB, MTL::Buffer* sB, size_t nT) -> bool
+    // previous chunk completed). The kernel negates the masses of the tets it defers, so mB is
+    // part of the snapshot: a redo then runs exactly the same code path.
+    auto runPerTet = [&](MTL::Buffer* vB, MTL::Buffer* uB, MTL::Buffer* mB, MTL::Buffer* dB, MTL::Buffer* sB, size_t nT,
+                         bool gridsZero) -> bool
     {
-        return runChunked(c.pso, nT, baseChunk, MIN_CHUNK, [&](MTL::ComputeCommandEncoder* enc, size_t start, uint32_t n)
+        return runChunked(c.pso, nT, baseChunk, MIN_CHUNK, { mB }, gridsZero, false,
+                          [&](MTL::ComputeCommandEncoder* enc, size_t start, uint32_t n)
         {
             P.nTet = n;
             std::memcpy(bP->contents(), &P, sizeof(P));
@@ -428,8 +661,12 @@ bool psGpuDepositFields(std::vector<float>& verts,
     struct ExactItemParams { uint32_t nItems, phase, blockCells, pad; };   // == the MSL struct
     auto runItems = [&](uint32_t phase) -> bool
     {
-        // an item clips at most blockCells cells: far cheaper and more uniform than a whole tet
-        return runChunked(c.psoItems, nItems, 8192, 1024, [&](MTL::ComputeCommandEncoder* enc, size_t start, uint32_t n)
+        // an item clips at most blockCells cells: far cheaper and more uniform than a whole tet.
+        // Phase 0 writes only sumW (the grids are still zero), phase 1 only the grids (sumW is read)
+        std::vector<MTL::Buffer*> extras;
+        if (phase == 0) extras.push_back(bSumW);
+        return runChunked(c.psoItems, nItems, 8192, 1024, extras, true, phase == 0,
+                          [&](MTL::ComputeCommandEncoder* enc, size_t start, uint32_t n)
         {
             ExactItemParams const IP{ n, phase, blockCells, 0u };
             enc->setBuffer(bV,    0, 0);
@@ -499,7 +736,7 @@ bool psGpuDepositFields(std::vector<float>& verts,
         }
         bool ok = lV && lU && lM && lD && lS;
         if (!ok) lastErr = "Metal buffer allocation failed (exact-deposit leftovers)";
-        else ok = runPerTet(lV, lU, lM, lD, lS, compact ? nL : nTetTotal);
+        else ok = runPerTet(lV, lU, lM, lD, lS, compact ? nL : nTetTotal, false);
         if (ok)
         {
             float const* lm = static_cast<float const*>(lM->contents());
@@ -514,49 +751,23 @@ bool psGpuDepositFields(std::vector<float>& verts,
         return ok;
     };
 
-    int const maxAttempts = 3;
-    bool success = false;
-
-    for (int attempt = 0; attempt < maxAttempts && !success; ++attempt)
+    // one pass sequence; each pass heals its own failed buffers from its snapshots (runChunked), so a
+    // false here means the GPU gave up on this partition and the caller deposits it on the CPU
+    bool success;
+    if (useItems)
     {
-        std::memset(bMass->contents(), 0, massBytes);
-        std::memset(bMassFx->contents(), 0, massFxBytes);
-        std::memset(bMom->contents(),  0, momBytes);
-        std::memset(bM2->contents(),   0, m2Bytes);
-        std::memset(bGrad->contents(), 0, gradBytes);
-        std::memset(bStr->contents(),  0, nCell * 4);
-        std::memset(bMomW->contents(),  0, momwBytes);
-        std::memset(bCaust->contents(), 0, caustBytes);
-        std::memset(bSV->contents(),    0, svBytes);
-        std::memset(bDV->contents(),    0, dvBytes);
-        std::memset(bDW->contents(),    0, dwBytes);
-        std::memset(bScal->contents(),  0, scalBytes);
-        std::memset(bSG->contents(),    0, sgBytes);
-
-        if (useItems)
-        {
-            std::memset(bSumW->contents(), 0, nTetTotal * sizeof(float));
-            success = runItems(0) && runItems(1) && runLeftovers();
-        }
-        else
-            success = runPerTet(bV, bU, bM, bD, bSc, nTetTotal);
-
-        if (!success)
-        {
-            // escalate: 4x shorter buffers, wider gaps, smaller starting chunk; settle first
-            targetSec = std::max(targetSec / 4.0, 0.02);
-            gapUs     = std::min(gapUs * 3, useconds_t(50000));
-            baseChunk = std::max(baseChunk / 2, MIN_CHUNK);
-            if (attempt + 1 < maxAttempts)
-            {
-                fprintf(stderr, "%sPS-DTFE Metal: %s -- retrying the partition deposit from scratch "
-                                "(attempt %d/%d, target %.0f ms buffers, %.0f ms gaps)%s\n",
-                        MESSAGE::cYellow(), lastErr.c_str(), attempt + 2, maxAttempts,
-                        targetSec*1e3, gapUs/1e3, MESSAGE::cReset());
-                sleep(2);   // let the system settle before hammering the GPU again
-            }
-        }
+        std::memset(bSumW->contents(), 0, nTetTotal * sizeof(float));
+        success = runItems(0) && runItems(1) && runLeftovers();
     }
+    else
+        success = runPerTet(bV, bU, bM, bD, bSc, nTetTotal, true);
+    if (nFailed > 0)
+        fprintf(stderr, "%sPS-DTFE Metal: deposit %s after %d failed buffer(s) (%d resumed from a periodic checkpoint); "
+                        "%d checkpoint(s), %.0f MB held, %.3f s copying%s\n",
+                success ? MESSAGE::cYellow() : MESSAGE::cRed(), success ? "recovered on the GPU" : "gave up",
+                nFailed, nResumedCk, snap.taken, snap.bytes / 1.e6, snap.sec, MESSAGE::cReset());
+    else if (timing)
+        fprintf(stderr, "PS-DTFE Metal: checkpoints: %d, %.0f MB held, %.3f s copying\n", snap.taken, snap.bytes / 1.e6, snap.sec);
     for (MTL::Buffer* b : {bItems, bSumW}) if (b) b->release();
     if (!success)
     {

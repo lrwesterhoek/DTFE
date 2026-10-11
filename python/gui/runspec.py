@@ -121,6 +121,11 @@ class RunSpec:
     mem_budget_gb: float = 0.0       # DTFE_MEM_BUDGET_GB: the auto-tuner's memory budget; 0 = its own (free RAM)
     tess_cache: str = ""             # TESS_CACHE: reuse the tessellation across runs (a local folder); "" = none
     linear_deposit: bool = False     # PS_LINEAR_DEPOSIT: --ps-linear-deposit (density-weighted inside each tet)
+    ordered_merge: bool = False      # ORDERED_MERGE: --ordered-merge (partitions merged in index order: bit-identical
+                                     # repeats; a fast partition then waits for the slower lower-numbered ones)
+    start_over: bool = False         # PS_RESUME=0: a killed run's checkpoint is NOT resumed, the run starts from the
+                                     # beginning and replaces it (2026-10-11: the launcher had no way to, and a
+                                     # refused resume -- other settings, an incomplete checkpoint -- failed every time)
 
     # ------------------------------------------------------------------ data
     def sim_path(self) -> Path:
@@ -230,6 +235,8 @@ class RunSpec:
             "PS_CAUSTIC_CUSPS": "1" if self.caustic_cusps else "0",
             "PS_PARALLEL_TRI": "1" if self.parallel_triangulation else "0",
             "PS_LINEAR_DEPOSIT": "1" if self.linear_deposit else "0",
+            "ORDERED_MERGE": "1" if self.ordered_merge else "0",      # K1 (2026-10-11)
+            "PS_RESUME": "0" if self.start_over else "1",             # spelled out: a stray export cannot leak in
             "OUTPUT_PREFIX": self.output_prefix,
         })
         if self.slice_plane:
@@ -242,7 +249,7 @@ class RunSpec:
         return shell(*self.command())
 
     def memory_key(self) -> str:
-        return _memory_key(self, ("snapshots", "lambda_th", "tess_cache"))
+        return _memory_key(self, ("snapshots", "lambda_th", "tess_cache", "start_over"))
 
     def check_step(self) -> "Step":
         """The same run_ps_dtfe.sh call in report mode: the binary's own memory prediction per
@@ -328,9 +335,26 @@ def export_script(steps: list[Step], title: str, slurm: dict | None = None) -> s
         lines.append('export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"   # the binaries use OpenMP')
     lines += ["set -o pipefail", "failed=0"]
     for st in steps:
-        lines += [f"# {st.label}", st.line() + " || failed=$((failed + 1))"]
+        lines += [f"# {st.label}", _export_line(st)]
     lines += ['[ "$failed" -eq 0 ] || echo "$failed step(s) failed" >&2', 'exit "$failed"', ""]
     return "\n".join(lines)
+
+
+def _export_line(st: Step) -> str:
+    """One step of an exported script. A step with a run log keeps the run-log contract as the launcher's own
+    tee does (_close_tee, 2026-10-08): the output goes into '<log>.partial', which becomes '<log>' on exit 0 (a
+    stale '<log>.failed' goes) and '<log>.failed' otherwise, so a failed re-run never truncates the log of the
+    grids on disk. Before 2026-10-11 the export teed straight into '<log>'. pipefail (set by the header) makes
+    the pipe's status the program's, not tee's."""
+    if not st.tee:
+        return st.line() + " || failed=$((failed + 1))"
+    log, part = _q(st.tee), _q(st.tee + ".partial")
+    failed = _q(st.tee + ".failed")
+    return (f"if {shell(st.argv, st.env)} 2>&1 | tee {part}; then\n"
+            f"    mv -f {part} {log} && rm -f {failed}\n"
+            f"else\n"
+            f"    mv -f {part} {failed}; failed=$((failed + 1))\n"
+            f"fi")
 
 
 def _scratch_problems(scratch_dir: str) -> list[tuple[str, str]]:
@@ -537,6 +561,8 @@ class PipelineSpec:
     mem_budget_gb: float = 0.0      # DTFE_MEM_BUDGET_GB, see RunSpec
     tess_cache: str = ""            # TESS_CACHE (run_ps_pipeline.sh forwards it to run_ps_dtfe.sh)
     linear_deposit: bool = False    # PS_LINEAR_DEPOSIT, see RunSpec
+    ordered_merge: bool = False     # ORDERED_MERGE (run_ps_pipeline.sh's run_ps_dtfe.sh inherits it), see RunSpec
+    start_over: bool = False        # PS_RESUME=0 (inherited the same way), see RunSpec
     output_prefix: str = "ps_output"
     precision: str = "single"       # "double" = the PS-DTFE-double binary (DTFE_PRECISION), see RunSpec
     partition: int = 0
@@ -609,7 +635,8 @@ class PipelineSpec:
     # ------------------------------------------------------------------ memory check
     def memory_key(self) -> str:
         return _memory_key(self, ("sims", "nu", "force", "plan_only", "adaptive", "plan", "plan_key",
-                                  "figures_root", "center", "thickness", "lambda_th") + PIPELINE_RENDER_KEYS)
+                                  "figures_root", "center", "thickness", "lambda_th", "start_over")
+                           + PIPELINE_RENDER_KEYS)
 
     def check_step(self, sim: str, snaps: list[int], nu: int) -> Step:
         """run_ps_dtfe.sh in report mode with every setting run_ps_pipeline.sh would pass it (the run
@@ -735,7 +762,9 @@ class PipelineSpec:
                "PS_CAUSTICS": "1" if self.caustics else "0",
                "PS_CAUSTIC_CUSPS": "1" if self.caustic_cusps else "0",
                "PS_PARALLEL_TRI": "1" if self.parallel_triangulation else "0",
-               "PS_LINEAR_DEPOSIT": "1" if self.linear_deposit else "0"}
+               "PS_LINEAR_DEPOSIT": "1" if self.linear_deposit else "0",
+               "ORDERED_MERGE": "1" if self.ordered_merge else "0",
+               "PS_RESUME": "0" if self.start_over else "1"}
         if self.planes > 1:
             env["THICKNESS"] = _num(self.thickness)
         try:
@@ -939,6 +968,9 @@ _RADIUS = Opt("radius", "Void radius", "choice", "r_v", ("r_v", "r_eff"),
 _OVERLAPS = Opt("keep_overlaps", "Keep overlapping voids", "bool", False,
                 help="also the voids whose centre lies inside the region of a deeper void")
 
+CROSSBOX_SIMS = "TNG50-3-Dark TNG100-3-Dark TNG300-3-Dark"     # plot_void_crossbox.py's own defaults
+CROSSBOX_SMOOTH_MPC = 2.1625
+
 FIGURE_SETS: tuple[FigureSet, ...] = (
     FigureSet("fields", "Field slice maps", "plot/plot_PS_DTFE.py", "snapshot",
               "Slices through every field grid of a snapshot: density, streams, velocity, "
@@ -988,7 +1020,43 @@ FIGURE_SETS: tuple[FigureSet, ...] = (
     FigureSet("voidtrack", "Void tracking", "plot/plot_void_tracking.py", "sim",
               "Size, BBKS shape and orientation of the deepest voids followed back in time "
               "through the merger trees.", "void_tracking/<sim>",
-              opts=(_REF, Opt("n_voids", "Voids", "int", 5))),
+              opts=(_REF, Opt("n_voids", "Voids", "int", 5), _RADIUS, _SMOOTH_MPC)),
+    # the cross-box comparison (2026-10-11): several boxes at ONE smoothing in Mpc; it takes the boxes itself
+    # (--sims), not the selected simulation
+    FigureSet("crossbox", "Void statistics across boxes", "plot/plot_void_crossbox.py", "sim",
+              "Resolved fraction, distinct-void density, R_v and stacked profiles of several boxes side by side at "
+              "one smoothing length in Mpc. Builds each box's void catalogues first (a minute and about 10 GB "
+              "per 512 cubed snapshot) unless only redrawn.", "void_crossbox", common=False,
+              opts=(Opt("sims", "Boxes", "text", CROSSBOX_SIMS, help="space-separated simulation names"),
+                    Opt("smooth_mpc", "Common smoothing in Mpc", "float", CROSSBOX_SMOOTH_MPC,
+                        help="2.1625 = 10.0002 TNG100-3-Dark cells, the earlier results' value",
+                        limits=(0.0, 100.0, 4)),
+                    Opt("z", "Redshifts of the bottom row", "text", "0 0.5 1", help="space-separated, one figure each"),
+                    Opt("n_boot", "Bootstrap resamples (0 = the script's default)", "int", 0),
+                    Opt("replot", "Only redraw from the saved results", "bool", False))),
+    # the void science figures of the 2026-10-11 wave (contract C5): registered by name with their default
+    # arguments (--sim and the common grid options)
+    FigureSet("voidevol", "Void profile evolution", "plot/plot_void_profile_evolution.py", "sim",
+              "The stacked void density profiles across redshift, with the Hamaus, Sutter and Wandelt (2014) fit.",
+              "void_profile_evolution/<sim>"),
+    FigureSet("voidenv", "Void environment", "plot/plot_void_environment.py", "sim",
+              "Voids in clouds against voids in voids (Ceccarelli et al. 2013): the density contrast within two "
+              "void radii, and how the two kinds evolve.", "void_environment/<sim>"),
+    FigureSet("voidfate", "Void fate", "plot/plot_void_fate.py", "sim",
+              "What becomes of each void between snapshots, linked by its member particles: survives, merges, "
+              "splits or vanishes.", "void_fate/<sim>"),
+    # the convergence check (contract K4, 2026-10-11): registered by name, default arguments '--sim SIM' (like
+    # every void script it needs DTFE_SIM, which _plot_env sets) plus the common grid options when set
+    FigureSet("voidconv", "Void convergence", "plot/plot_void_convergence.py", "sim",
+              "Resolution and estimator convergence of the void statistics: abundance, R_v and stacked profiles "
+              "at different grid resolutions, and PS-DTFE against standard DTFE on the same voids.",
+              "void_convergence/<sim>"),
+    # the catalogue itself, for the Runs tab's 'Build void catalogue' (2026-10-11): the pipeline's cached
+    # catalogue of the selected snapshots' grids, as the Explore outlines and the void figures read it
+    FigureSet("voidcat", "Void catalogue build", "gui/void_cache.py", "snapshot",
+              "Builds the void catalogue of each selected snapshot's grids into the analysis cache (about a minute "
+              "and 10 GB at 512 cubed; refused when the memory is not free), so the void figures and the Explore "
+              "outlines need not. The estimator and grid prefix are this tab's.", "(no figures)", common=False),
     FigureSet("halotrack", "Halo tracking", "plot/plot_halo_tracking.py", "sim",
               "Mass, shape, orientation, mergers and field environment of subhalos along their "
               "main progenitor branch. Needs the merger trees (shapes also the group catalogues).",
@@ -1154,7 +1222,35 @@ class PlotSpec:
                 out.append(Step(f"{name} {len(snaps)} snapshots", a + self._void_args(key), env))
             elif key == "voidtrack":
                 out.append(Step(name, base + ["--sim", self.sim, "--snap", str(self.opt(key, "ref"))]
-                                + self._common() + ["--n-voids", str(self.opt(key, "n_voids"))], env))
+                                + self._common() + ["--n-voids", str(self.opt(key, "n_voids"))]
+                                + self._void_args(key), env))
+            elif key == "crossbox":
+                a = base + ["--sims", *str(self.opt(key, "sims")).replace(",", " ").split(),
+                            "--data-root", str(self.data_root)]
+                if self.method != "auto":
+                    a += ["--method", self.method]
+                if self.prefix:
+                    a += ["--prefix", self.prefix]
+                if float(self.opt(key, "smooth_mpc")) != CROSSBOX_SMOOTH_MPC:
+                    a += ["--smooth-mpc", f"{float(self.opt(key, 'smooth_mpc')):g}"]
+                if str(self.opt(key, "z")).split() != ["0", "0.5", "1"]:
+                    a += ["--z", *str(self.opt(key, "z")).replace(",", " ").split()]
+                if int(self.opt(key, "n_boot")) > 0:
+                    a += ["--n-boot", str(int(self.opt(key, "n_boot")))]
+                if self.opt(key, "replot"):
+                    a.append("--replot")
+                if Path(self.figures_root) != FIGURES_ROOT:
+                    a += ["--out", str(Path(self.figures_root) / "void_crossbox")]
+                out.append(Step(name, a, env))      # its per-box workers get their own DTFE_SIM
+            elif key in ("voidevol", "voidenv", "voidfate", "voidconv"):
+                out.append(Step(name, base + ["--sim", self.sim] + self._common(), env))
+            elif key == "voidcat":
+                method = self.method if self.method in ("ps", "dtfe") else "ps"
+                for n in snaps:
+                    a = base + ["build", "--sim", self.sim, "--snap", str(n), "--method", method]
+                    if self.prefix:
+                        a += ["--prefix", self.prefix]
+                    out.append(Step(f"void catalogue snap {n:03d}", a, env))
             elif key == "halotrack":
                 a = base + ["--sim", self.sim, "--snap", str(self.opt(key, "ref"))] + self._common()
                 ids = str(self.opt(key, "subhalos")).replace(",", " ").split()
@@ -1194,7 +1290,11 @@ class PlotSpec:
             out.append(("error", "no snapshots selected (needed by: "
                                  + ", ".join(FIGURE_SET[k].title for k in need_snaps) + ")"))
         sp = self.sim_path()
-        grid_sets = [k for k in ("fields", "web", "series") if k in self.sets
+        absent = [Path(FIGURE_SET[k].script).name for k in self.sets
+                  if not (REPO_ROOT / "python" / FIGURE_SET[k].script).is_file()]
+        if absent:
+            out.append(("error", "not in this checkout: " + ", ".join(absent)))
+        grid_sets = [k for k in ("fields", "web", "series", "voidcat") if k in self.sets
                      and not (k == "fields" and self.opt(k, "pointeval_only"))]
         if grid_sets:
             missing = [n for n in snaps if not has_grids(sp / f"snapdir_{n:03d}", self.method, self.prefix)]
@@ -1552,6 +1652,7 @@ class CustomSpec:
     mem_budget_gb: float = 0.0      # DTFE_MEM_BUDGET_GB in the binary's environment, see RunSpec
     tess_cache: str = ""            # --tessellation-cache <folder>; "" = none
     linear_deposit: bool = False    # --ps-linear-deposit (PS only; not with the volume-weighted velocities)
+    ordered_merge: bool = False     # --ordered-merge (PS only), see RunSpec
     sample_points: str = ""         # --sample-points <file>: the fields at these points too ('.pts_*'); "" = none
     pts_vel_grad: bool = True       # ... with the velocity gradient at each point (--pts-vel-grad)
     window: list[float] = field(default_factory=list)   # --ps-window x0 x1 y0 y1 [z0 z1] in Mpc: only these cells
@@ -1621,6 +1722,8 @@ class CustomSpec:
                 a += ["--ps-alpha-shape", f"{self.alpha_shape:g}"]
             if self.linear_deposit:
                 a.append("--ps-linear-deposit")
+            if self.ordered_merge:
+                a.append("--ordered-merge")
             if self.halo_release > 0:
                 a += ["--ps-halo-release", _num(self.halo_release)]
             if len(self.window) == 2 * self.dim:
@@ -2176,6 +2279,10 @@ def recommended_gpu(deposit: str, fields, n_particles, estimator: str = "ps", pr
 _JOBS_CACHE: tuple[float, dict] = (-1e9, {"runs": [], "servers": []})
 _SERVE = re.compile(r"(^|\s)--serve(\s|$)")     # the '--serve' token itself, not --serve-resident or a path
 _REPORT_RUN = re.compile(r"(^|\s)--auto-tune-report(\s|$)")   # a memory check: the tuner's prediction, no run
+# the Explore tab's exact zoom writes into tempfile.mkdtemp(prefix=ZOOM_DIR_PREFIX) / "zoom": its output root
+# names it, whatever else its command shares with a Custom-tab run (both may pass --ps-window; 2026-10-11)
+ZOOM_DIR_PREFIX = "dtfe-zoom-"
+_ZOOM_ROOT = re.compile(r"/" + re.escape(ZOOM_DIR_PREFIX) + r"[^/\s]*/zoom(\s|$)")
 
 
 def dtfe_processes(max_age: float = 2.0) -> dict:
@@ -2186,7 +2293,8 @@ def dtfe_processes(max_age: float = 2.0) -> dict:
       'servers'  [(pid, name, gb)]  query servers ('--serve': resident, idle between requests, but their
                                     tessellations are real memory a large run has to live beside)
     Not listed at all: report-mode runs ('--auto-tune-report', a memory check from any tab or terminal) and
-    this process's own direct children (the Explore tab's exact zoom). Counted as runs, the servers made every
+    this process's own exact zoom (a direct child writing into a ZOOM_DIR_PREFIX folder; its Custom-tab runs DO
+    count, 2026-10-11). Counted as runs, the servers made every
     tab warn while Explore's server was up and a queue with 'wait' ticked waited forever; the jobs the
     launcher runs through a script are grandchildren (bash -> binary) and do count."""
     global _JOBS_CACHE
@@ -2250,20 +2358,199 @@ def _classify(names: dict[int, str]) -> dict:
 def _kind(ppid: int, args: str, me: int) -> str:
     """What a DTFE binary with this parent and command line is: 'run' (occupies the machine), 'server'
     (a query server: resident memory, idle CPU), 'report' (a memory check: the tuner's prediction only),
-    'own' (a direct child of this launcher: its exact zoom). Decided 2026-10-05: report-mode runs are
-    never counted (the memory check from any tab or terminal is not a run), servers are listed apart with
-    their memory instead of being counted or hidden."""
+    'own' (a direct child of this launcher writing into an exact-zoom folder: its exact zoom). Decided
+    2026-10-05: report-mode runs are never counted (the memory check from any tab or terminal is not a run),
+    servers are listed apart with their memory instead of being counted or hidden. 2026-10-11: a Custom-tab run
+    is a direct child too (the binary itself, no script between) and was missing from the memory strip and the
+    Running-now panel: only the zoom's output folder makes a child 'own' now."""
     if _SERVE.search(args):              # a server is a server, the launcher's own included (its memory counts)
         return "server"
     if _REPORT_RUN.search(args):
         return "report"
-    if ppid == me:
+    if ppid == me and _ZOOM_ROOT.search(args):
         return "own"
     return "run"
 
 
 def _gb_text(gb) -> str:
     return "" if gb is None else f", {gb:.1f} GB"
+
+
+# ---------------------------------------------------------------------- keep-awake
+# the run scripts hold their own power assertion ('caffeinate -i -m -w $$'); run_ps_pipeline.sh runs
+# run_ps_dtfe.sh, so it is covered too
+SELF_CAFFEINATED = ("run_ps_dtfe.sh", "run_dtfe.sh", "run_ps_pipeline.sh")
+
+
+def keep_awake_argv(step_argv, pid: int) -> list[str] | None:
+    """The command that keeps the Mac awake while process 'pid' (a step the launcher started) lives, or None
+    (not macOS, no caffeinate, or a run script that holds its own assertion). 2026-10-11: a Custom-tab run
+    executes the binary directly, a long analysis or a multi-hour download from the Data tab has no script
+    that caffeinates, and an idle-sleeping Mac suspended them (wget loses its connection)."""
+    if sys.platform != "darwin" or not pid or any(Path(str(a)).name in SELF_CAFFEINATED for a in step_argv):
+        return None
+    exe = shutil.which("caffeinate")
+    return [exe, "-i", "-m", "-w", str(int(pid))] if exe else None
+
+
+# ---------------------------------------------------------------------- memory and runs started elsewhere
+_SWAP = re.compile(r"total = ([\d.]+)([MG])\s+used = ([\d.]+)([MG])")
+
+
+def memory_status() -> dict:
+    """{'free_gb', 'swap_used_gb', 'swap_total_gb'} of this machine now (a value None when the OS will not say;
+    2026-10-11, the launcher's status strip). Free = what the other programs leave: DTFE_FREE_GB when set (as for
+    the C++ programs and the void helper), else macOS vm_stat's free + inactive + speculative + purgeable pages
+    (void_outlines.available_bytes' rule), else Linux MemAvailable. Swap: macOS sysctl vm.swapusage, Linux
+    SwapTotal - SwapFree. Two short subprocess calls on a Mac: call it off the GUI thread."""
+    out = {"free_gb": None, "swap_used_gb": None, "swap_total_gb": None}
+    if os.environ.get("DTFE_FREE_GB"):
+        try:
+            out["free_gb"] = float(os.environ["DTFE_FREE_GB"])
+        except ValueError:
+            pass
+    if sys.platform == "darwin":
+        try:
+            vm = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5).stdout
+            page = int(re.search(r"page size of (\d+) bytes", vm).group(1))
+            pages = {m.group(1): int(m.group(2)) for m in re.finditer(r"^Pages ([\w ]+):\s+(\d+)\.", vm, re.M)}
+            if out["free_gb"] is None:
+                out["free_gb"] = page * sum(pages.get(k, 0) for k in ("free", "inactive", "speculative",
+                                                                        "purgeable")) / 1e9
+        except (OSError, subprocess.SubprocessError, AttributeError, ValueError):
+            pass
+        try:
+            sw = subprocess.run(["sysctl", "-n", "vm.swapusage"], capture_output=True, text=True, timeout=5).stdout
+            m = _SWAP.search(sw)
+            if m:
+                unit = {"M": 2**20 / 1e9, "G": 2**30 / 1e9}     # sysctl prints MiB / GiB as M / G
+                out["swap_total_gb"] = float(m.group(1)) * unit[m.group(2)]
+                out["swap_used_gb"] = float(m.group(3)) * unit[m.group(4)]
+        except (OSError, subprocess.SubprocessError):
+            pass
+        return out
+    try:
+        info = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, _, v = line.partition(":")
+                info[k] = float(v.split()[0]) * 1024 / 1e9
+        if out["free_gb"] is None and "MemAvailable" in info:
+            out["free_gb"] = info["MemAvailable"]
+        if "SwapTotal" in info:
+            out["swap_total_gb"] = info["SwapTotal"]
+            out["swap_used_gb"] = info["SwapTotal"] - info.get("SwapFree", 0.0)
+    except (OSError, ValueError, IndexError):
+        pass
+    return out
+
+
+def memory_text(mem: dict, procs: dict | None = None) -> str:
+    """The status strip: 'free 31.2 GB · swap 1.4 of 4.0 GB · PS-DTFE pid 812, 37.1 GB'."""
+    bits = []
+    if mem.get("free_gb") is not None:
+        bits.append(f"free {mem['free_gb']:.1f} GB")
+    if mem.get("swap_used_gb") is not None:
+        tot = mem.get("swap_total_gb")
+        bits.append(f"swap {mem['swap_used_gb']:.1f}" + (f" of {tot:.1f} GB" if tot else " GB"))
+    for key, what in (("runs", ""), ("servers", " server")):
+        for pid, name, gb in (procs or {}).get(key, []):
+            bits.append(f"{name}{what} pid {pid}{_gb_text(gb)}")
+    return " · ".join(bits) or "memory: unknown"
+
+
+# the binary's command line: '<exe> <input> <output root> [--options]'; the paths may hold spaces ('Samsung T7',
+# 'Mobile Documents'), so the input is matched up to its snapshot suffix and the output root up to the next option
+# (the launcher's own Custom runs name the binary by its absolute path, which holds spaces under iCloud)
+_ARGV = re.compile(r"^(?P<exe>(?:.*?/)?(?:PS-)?DTFE(?:-[\w-]+)?)\s+(?P<input>.+?\.(?:hdf5|h5|hdf|bin|dat|txt|\d+))"
+                   r"\s+(?P<output>.+?)(?=\s+--|\s*$)")
+_SNAPDIR = re.compile(r"(?:^|/)snapdir_(\d{3})(?:/|$)")
+_ETIME = re.compile(r"^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$")
+
+
+def parse_run_args(args: str) -> dict:
+    """What a DTFE / PS-DTFE command line says about its run: {'exe', 'input', 'output', 'sim', 'snap'}
+    ('' / None where it does not say). sim = the folder above 'snapdir_NNN' (the TNG layout)."""
+    m = _ARGV.match(args.strip())
+    d = {"exe": "", "input": "", "output": "", "sim": "", "snap": None}
+    if not m:
+        return d
+    d.update(exe=Path(m.group("exe")).name, input=m.group("input"), output=m.group("output").strip())
+    for path in (d["output"], d["input"]):
+        sm = _SNAPDIR.search(path)
+        if sm:
+            d["snap"] = int(sm.group(1))
+            d["sim"] = Path(path[: sm.start() + (1 if path[sm.start()] == "/" else 0)]).name
+            break
+    return d
+
+
+def _etime_seconds(text: str) -> float | None:
+    """ps's elapsed time '[[dd-]hh:]mm:ss' -> seconds."""
+    m = _ETIME.match(text.strip())
+    if not m:
+        return None
+    dd, hh, mm, ss = (int(g) if g else 0 for g in m.groups())
+    return float(((dd * 24 + hh) * 60 + mm) * 60 + ss)
+
+
+def running_now(progress_files=(), procs: dict | None = None) -> list[dict]:
+    """The runs going on this machine, wherever they were started (nohup, a terminal script, this launcher), for
+    the launcher's 'Running now' panel (2026-10-11): one dict per live DTFE / PS-DTFE run (dtfe_processes()
+    'runs') with its pid, program, resident GB, elapsed seconds (ps), what its command line says (parse_run_args:
+    simulation, snapshot, output root) and its progress sidecar '<output root>.runlog.progress' (C1; read with
+    results.read_progress), plus one 'died' entry per leftover sidecar in progress_files whose pid is gone.
+    Keys: pid, name, gb, elapsed_s, sim, snap, output, progress (dict or None), state ('running' | 'died')."""
+    import results as R
+    procs = procs if procs is not None else dtfe_processes(0.0)
+    pids = [pid for pid, _n, _g in procs.get("runs", [])]
+    info: dict[int, tuple[float | None, str]] = {}
+    if pids:
+        try:
+            text = subprocess.run(["ps", "-ww", "-o", "pid=,etime=,args=", "-p", ",".join(map(str, pids))],
+                                  capture_output=True, text=True, timeout=5).stdout
+        except (OSError, subprocess.SubprocessError):
+            text = ""
+        for line in text.splitlines():
+            parts = line.split(None, 2)
+            if len(parts) >= 2 and parts[0].isdigit():
+                info[int(parts[0])] = (_etime_seconds(parts[1]), parts[2] if len(parts) > 2 else "")
+    out, seen = [], set()
+    for pid, name, gb in procs.get("runs", []):
+        elapsed, args = info.get(pid, (None, ""))
+        d = parse_run_args(args)
+        prog = None
+        if d["output"]:
+            side = Path(d["output"] + R.PROGRESS_SUFFIX)
+            seen.add(str(side))
+            prog = R.read_progress(side)
+        out.append({"pid": pid, "name": name, "gb": gb, "elapsed_s": elapsed, "sim": d["sim"], "snap": d["snap"],
+                    "output": d["output"], "progress": prog, "state": "running"})
+    for f in progress_files:
+        if str(f) in seen:
+            continue
+        prog = R.read_progress(f)
+        if prog is None or prog.get("state") == "running":
+            continue            # a live run that is not a DTFE binary's child we know: its own process row shows it
+        output = str(f)[: -len(R.PROGRESS_SUFFIX)]
+        d = parse_run_args(f"DTFE x.hdf5 {output}")
+        out.append({"pid": prog.get("pid"), "name": "", "gb": None, "elapsed_s": prog.get("elapsed_s"),
+                    "sim": d["sim"], "snap": d["snap"], "output": output, "progress": prog, "state": "died"})
+    return out
+
+
+def progress_files(data_root, extra_dirs=()) -> list[Path]:
+    """Every progress sidecar '<prefix>.runlog.progress' (C1) under the data root's snapshot folders (per-family
+    and flat layout) and in the custom-snapshot output folders."""
+    found: list[Path] = []
+    root = Path(data_root)
+    if root.is_dir():
+        for pattern in ("*/snapdir_*/*.runlog.progress", "*/*/snapdir_*/*.runlog.progress"):
+            found += root.glob(pattern)
+    for d in extra_dirs:
+        if Path(d).is_dir():
+            found += Path(d).glob("*.runlog.progress")
+    return sorted(set(found))
 
 
 # ---------------------------------------------------------------------- progress parsing

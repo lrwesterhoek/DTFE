@@ -33,6 +33,8 @@
 #include "interlacing.h"
 #include "ps_point_eval.h"
 #include "ps_globals_record.h"
+#include "run_progress.h"     // '<output>.runlog.progress' (2026-10-11)
+#include "output_staging.h"   // '<file>.part.<pid>' + rename, rescue folder (2026-10-11)
 
 using namespace std;
 
@@ -87,6 +89,21 @@ int main( int argc, char *argv[] )
               << ")\n" << MESSAGE::Flush;
     }
 
+    // the progress sidecar, and the partial outputs a killed earlier run of this output name left behind
+    runProgressInit( userOptions );
+    if ( not userOptions.psServe and not userOptions.autoTuneReport and not userOptions.outputFilename.empty() )
+    {
+        outputStageCleanStale( userOptions.outputFilename );
+        std::string const outDir = outputStageDirOf( userOptions.outputFilename );
+        if ( not outputStageDirWritable( outDir ) )
+        {
+            MESSAGE::Warning warning( userOptions.verboseLevel );
+            warning << "The output folder '" << outDir << "' cannot be written now. The run goes on; at the end it waits "
+                    << "for the folder (DTFE_OUTPUT_WAIT seconds, default 300) and otherwise writes the results to a "
+                    << "rescue folder under $TMPDIR/dtfe-rescue.\n" << MESSAGE::EndWarning;
+        }
+    }
+
     // wall-clock (not CPU) timer for the run summary, so it reflects elapsed time across all threads
     auto const wallStart = std::chrono::steady_clock::now();
     MESSAGE::Message phase( userOptions.verboseLevel );
@@ -94,6 +111,7 @@ int main( int argc, char *argv[] )
 
 
     phase << MESSAGE::banner("READING INPUT") << MESSAGE::Flush;
+    runProgressPhase( "reading" );
     vector<Particle_data> particles;
     vector<Sample_point> samplingCoordinates; // sampling coords for non-regular-grid interpolation
     // --ps-window with a tessellation cache (the launcher's exact zoom): when the snapshot's particle-
@@ -135,6 +153,7 @@ int main( int argc, char *argv[] )
     Quantities aQuantities;     // fields volume-averaged over each sampling cell
 
     phase << MESSAGE::banner("DTFE COMPUTATION") << MESSAGE::Flush;
+    runProgressPhase( "computing" );
     if ( userOptions.interlace )
     {
         // Interlacing: interpolate twice (original + half-cell offset), average in Fourier space.
@@ -200,7 +219,16 @@ int main( int argc, char *argv[] )
 
 
     phase << MESSAGE::banner("WRITING OUTPUT") << MESSAGE::Flush;
+    runProgressPhase( "writing" );
+    // every file goes to '<file>.part.<pid>' (or the rescue folder) and the set is renamed into place only
+    // after the last one is written: a kill here leaves the previous set intact (output_staging.h)
+    outputStageBegin( userOptions.outputFilename );
     writeOutputData( uQuantities, aQuantities, userOptions );
+    int const exitStatus = outputStageCommit();   // 3: the outputs are in the rescue folder
+    if ( exitStatus == 0 )
+        runProgressFinish();
+    else
+        runProgressPhase( "rescued" );
 
 
     // report peak RSS (to tune --max-concurrent / --partition to fit RAM) and total wall time
@@ -225,4 +253,5 @@ int main( int argc, char *argv[] )
                   << MESSAGE::cGreen() << MESSAGE::formatDuration(wallSec) << MESSAGE::cReset() << "\n"
                   << MESSAGE::cCyan() << MESSAGE::hrule() << MESSAGE::cReset() << "\n" << std::flush;
     }
+    return exitStatus;
 }

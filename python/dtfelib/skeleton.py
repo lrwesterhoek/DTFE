@@ -30,6 +30,12 @@ R_eff (profiles.shell_means by nearest cell, the void's cell centre as its centr
 the void's centre to the nearest sheet cell, from the Euclidean distance transform of a periodic cut-out
 of 'cutout_cells' half-width around the centre (np.take with wrap); no sheet in the cut-out -> NaN with
 the cut-out's half-width as the lower bound.
+
+THE CONTROL (2026-10-11; the per-void numbers alone -- fold shell 0.285 against a box fold fraction of 0.249, the
+wall at 0.105 R_v -- could not be interpreted): random_sphere_null draws the same metrics in random spheres with the
+voids' own radii, null_zscores gives the voids' median against the null's mean +- std as a z-score, and
+filter_components keeps only the sheet components above a size (cells) or mass threshold before the shells and the
+distance transform see them.
 """
 
 from __future__ import annotations
@@ -155,16 +161,21 @@ def skeleton_summary(caustic_class, density=None, cell_mpc: float = 1.0, connect
     return out
 
 
-def void_shell_fractions(caustic_class, centers_frac, r_eff_cells, shells=(1.0, 1.1, 1.2, 1.3), m: int = 200) -> dict:
+def void_shell_fractions(caustic_class, centers_frac, r_eff_cells, shells=(1.0, 1.1, 1.2, 1.3), m: int = 200,
+                         masks=None) -> dict:
     """Per void: the fold and sheet fractions of its shells x R_eff (nearest cell, profiles.shell_means),
-    averaged over the shells: {'fold': (n,), 'sheet': (n,), 'shells': x, 'per_shell': {name: (n, len(x))}}."""
+    averaged over the shells: {'fold': (n,), 'sheet': (n,), 'shells': x, 'per_shell': {name: (n, len(x))}}.
+    'masks' {'fold': bool grid, 'sheet': bool grid} replaces the class masks of 'caustic_class' (which may then be
+    None): a sheet filtered by filter_components, or masks computed once for many calls (the random-sphere null)."""
     from .profiles import fibonacci_sphere, shell_means
-    masks = class_masks(caustic_class)
+    if masks is None:
+        cm = class_masks(caustic_class)
+        masks = {"fold": cm["indicator"]["fold"], "sheet": cm["cumulative"]["sheet"]}
     dirs = fibonacci_sphere(m)
     centers = np.asarray(centers_frac, dtype=np.float64).reshape(-1, 3)
     r_eff = np.asarray(r_eff_cells, dtype=np.float64).reshape(-1)
     out = {"shells": np.asarray(shells, dtype=np.float64), "per_shell": {}}
-    for name, mask in (("fold", masks["indicator"]["fold"]), ("sheet", masks["cumulative"]["sheet"])):
+    for name, mask in (("fold", masks["fold"]), ("sheet", masks["sheet"])):
         per = np.empty((len(r_eff), len(shells)))
         for j, x in enumerate(shells):
             per[:, j] = shell_means(mask.astype(np.float32), centers, x * r_eff, dirs, mode="ngp")
@@ -214,6 +225,89 @@ def nearest_wall_distance(sheet_mask, centers_cells, cutout_cells: int = 32, sta
             break
         todo, half = np.asarray(left, dtype=np.int64), min(2 * half, full)
     return dist, bounded
+
+
+def filter_components(mask, min_cells: int = 0, density=None, min_mass_fraction: float = 0.0,
+                      connectivity: int = 26) -> tuple[np.ndarray, dict]:
+    """The mask with only its periodic components of at least 'min_cells' cells AND at least 'min_mass_fraction' of
+    the box's mass (with a density grid; rho/rho_bar or physical, the constant cancels): (filtered mask, {'n': the
+    components, 'kept', 'cells_removed', 'min_cells', 'min_mass_fraction'}). The caustic skeleton's control
+    (2026-10-11): a wall distance to a 3-cell flake of k >= 1 cells inside a void says nothing about its walls."""
+    mask = np.asarray(mask, dtype=bool)
+    info = {"n": None, "kept": None, "cells_removed": 0, "min_cells": int(min_cells),
+            "min_mass_fraction": float(min_mass_fraction)}
+    if int(min_cells) <= 1 and not float(min_mass_fraction) > 0:
+        return mask, info
+    if float(min_mass_fraction) > 0 and density is None:
+        raise ValueError("a mass threshold needs the density grid")
+    c = components(mask, density if float(min_mass_fraction) > 0 else None, connectivity=connectivity, top=0)
+    ok = c["cells"] >= int(min_cells)
+    if float(min_mass_fraction) > 0 and c["n"]:
+        ok &= np.asarray(c["mass_fraction"]) >= float(min_mass_fraction)
+    keep = np.concatenate([[False], ok])                     # label 0 is outside the mask
+    out = keep[c["labels"]]
+    info.update(n=int(c["n"]), kept=int(ok.sum()), cells_removed=int(mask.sum() - out.sum()))
+    return out, info
+
+
+NULL_METRICS = ("fold", "sheet", "dist_r")                    # shell fold / sheet fraction, wall distance / R
+
+
+def _median(a):
+    """The median of the finite entries, NaN without one (no RuntimeWarning: none of numpy's empty-slice messages)."""
+    a = np.asarray(a, dtype=float)
+    a = a[np.isfinite(a)]
+    return float(np.median(a)) if a.size else float("nan")
+
+
+def sphere_metrics(masks, centers_cells, r_cells, n_grid: int, shells, cutout_cells: int) -> dict:
+    """The per-sphere wall metrics of plot_caustic_skeleton's --voids for spheres at integer cells 'centers_cells'
+    (n, 3), centred on the cells' centres, of radii 'r_cells' (n,): {'fold', 'sheet' (shell fractions), 'dist_r'
+    (nearest-sheet distance / r, NaN beyond the cut-out), 'bounded'}."""
+    c = np.asarray(centers_cells, dtype=np.int64).reshape(-1, 3)
+    r = np.asarray(r_cells, dtype=np.float64).reshape(-1)
+    sh = void_shell_fractions(None, (c + 0.5) / n_grid, r, shells=tuple(shells), masks=masks)
+    dist, bounded = nearest_wall_distance(masks["sheet"], c, cutout_cells=cutout_cells)
+    return {"fold": sh["fold"], "sheet": sh["sheet"], "dist_r": dist / r, "bounded": bounded}
+
+
+def random_sphere_null(masks, r_cells, n_grid: int, shells, cutout_cells: int, n_draws: int = 50,
+                       seed: int = 0) -> dict:
+    """The random-sphere null of the per-void wall metrics (2026-10-11): 'n_draws' realisations, each one sphere per
+    void at a uniformly random cell of the box carrying THAT void's radius (so the radius distribution is the voids'
+    exactly), the same metrics (sphere_metrics) and per realisation their median over the spheres: {metric:
+    (n_draws,) medians, 'bounded_fraction': (n_draws,)}. A void sample whose median sits several null standard
+    deviations away from these is related to the walls; one inside them is not distinguishable from a random place
+    of that size. Seeded: the same call gives the same null."""
+    rng = np.random.default_rng(int(seed))
+    r = np.asarray(r_cells, dtype=np.float64).reshape(-1)
+    out = {k: np.full(int(n_draws), np.nan) for k in NULL_METRICS}
+    out["bounded_fraction"] = np.full(int(n_draws), np.nan)
+    if not r.size:
+        return out
+    for i in range(int(n_draws)):
+        c = rng.integers(0, int(n_grid), size=(r.size, 3))
+        m = sphere_metrics(masks, c, r, n_grid, shells, cutout_cells)
+        for k in NULL_METRICS:
+            out[k][i] = _median(m[k])
+        out["bounded_fraction"][i] = float(np.mean(m["bounded"]))
+    return out
+
+
+def null_zscores(void_metrics: dict, null: dict) -> dict:
+    """Per metric: the voids' median, the null's mean and standard deviation over its realisations' medians, and
+    z = (void - null mean) / null std ({'void', 'null_mean', 'null_std', 'z', 'draws'}; NaN where undefined: no
+    finite value, or a null without spread)."""
+    out = {}
+    for k in NULL_METRICS:
+        v = _median(void_metrics[k])
+        nv = np.asarray(null[k], dtype=float)
+        nv = nv[np.isfinite(nv)]
+        mean = float(nv.mean()) if nv.size else float("nan")
+        std = float(nv.std(ddof=1)) if nv.size > 1 else float("nan")
+        z = (v - mean) / std if np.isfinite(v) and np.isfinite(mean) and np.isfinite(std) and std > 0 else float("nan")
+        out[k] = {"void": v, "null_mean": mean, "null_std": std, "z": z, "draws": int(nv.size)}
+    return out
 
 
 def json_safe(obj):

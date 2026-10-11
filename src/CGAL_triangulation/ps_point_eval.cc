@@ -65,6 +65,7 @@
 #include "../define.h"
 
 #include "../ps_point_eval.h"
+#include "../output_staging.h"   // the .pts_* files are staged with the grids (crash-safe outputs)
 
 #if NO_DIM==3 || NO_DIM==2
 
@@ -1431,8 +1432,15 @@ void psPointEvalWriteOutputs(User_options const &userOptions)
                                    char const *what)
     {
         std::string const name = userOptions.outputFilename + ext;
-        std::ofstream f( name.c_str(), std::ios::binary | std::ios::trunc );
+        // staged as '<file>.part.<pid>' (or rescued) with the grids, renamed by main.cpp (output_staging.h)
+        std::string path = outputStagePath( name );
+        std::ofstream f( path.c_str(), std::ios::binary | std::ios::trunc );
         if ( not f )
+        {
+            path = outputStageRetry( name );
+            if ( not path.empty() ) f.open( path.c_str(), std::ios::binary | std::ios::trunc );
+        }
+        if ( not f.is_open() )
             throwError( "Cannot open the point-evaluation output file '", name, "'." );
         f.write( reinterpret_cast<char const *>(data), bytes );
         if ( not f )

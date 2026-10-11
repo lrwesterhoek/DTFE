@@ -11,6 +11,12 @@ each box, pipeline.set_smoothing). The definitions are the per-box scripts':
   * R_v           : the measured radius (catalog.r_v_mpc: where the smoothed delta around the minimum rises to 0)
   * distinct      : the resolved voids with an R_v, deepest first, none inside a deeper one's region
                     (catalog.distinct_mask) -- plot_void_population.snapshot_stats, the abundance sample
+  * shapes        : the BBKS ellipticity e and prolateness p of the minima (the BBKS-valid sample of
+                    plot_void_population.bbks_valid, the thesis's e and p), medians with bootstrap 68% intervals,
+                    against the minima of a Gaussian random field with the same smoothed linear spectrum
+                    (dtfelib.theory, BBKS 1986 eqs 7.6, A14, A15): at each void's own height nu = -delta_min /
+                    sigma_0(z) (gamma and sigma_0 of the linear EH98 spectrum smoothed with this sigma), and over all
+                    minima (the same for any spectrum) -- added 2026-10-11
   * profiles      : profiles.void_profiles of the distinct resolved voids in r / R_v, stacked over ONE common R_v
                     range in Mpc (--rv-range, in smoothing lengths: 2.5-5 sigma by default); the wrap rule
                     (3 R_v <= L/2) leaves a small box only its smaller voids, said in the legend
@@ -20,8 +26,11 @@ crossbox_<sim>_<method>_s<sigma>Mpc.npz; this process draws them together. Catal
 pipeline cache under the sigma's own namespace, so a rerun is fast; --replot only redraws from the .npz files.
 
 Outputs (figures/void_crossbox/, never mirrored into the thesis tree -- a common sigma is not the production one):
-  crossbox_<method>_s<sigma>Mpc_z<z>.png   top: resolved fraction, distinct voids per (100 Mpc)^3 and median R_v
-                                           against z; bottom, at z: dn/dlnR_v and the stacked density and v_r
+  crossbox_<method>_s<sigma>Mpc_z<z>.png   top: resolved fraction, distinct voids per (100 Mpc)^3 (beside all minima
+                                           and the minima with an R_v: the gate, not formation, sets the rise and
+                                           fall) and median R_v against z; middle, at z: dn/dlnR_v and the stacked
+                                           density and v_r; bottom: e and p against z with the Gaussian-field
+                                           expectation, and the e distribution at z against it
   crossbox_<method>_s<sigma>Mpc.txt        the numbers per box and snapshot
   crossbox_<sim>_<method>_s<sigma>Mpc.npz  one per box (the worker's output)
 
@@ -45,6 +54,7 @@ import matplotlib.pyplot as plt
 
 import config
 from dtfelib.cli import DATA_ROOT
+from dtfelib import figures as style
 
 DEFAULT_SIMS = ("TNG50-3-Dark", "TNG100-3-Dark", "TNG300-3-Dark")
 DEFAULT_SIGMA_MPC = 2.1625            # 10.0002 cells of TNG100-3-Dark (110.7 Mpc / 512; production 10 cells = 2.16245
@@ -54,12 +64,39 @@ DEFAULT_RV_RANGE = (2.5, 5.0)         # the common R_v range of the stacks, in s
 Z_TOLERANCE = 0.05                    # a box's snapshot counts as 'at z' within this
 FIGURE_ROOT = Path(config.LOCAL_FIGURES_ROOT) / "void_crossbox"
 PER_VOLUME = 1.0e6                    # densities per (100 Mpc)^3
+SHAPE_CI = (16, 84)                   # the bootstrap interval of the e, p medians (68%)
+
+
+def median_ci(x, n_boot=200, seed=0):
+    """(median, lo, hi) of x with the bootstrap SHAPE_CI interval of the median; NaNs for an empty x."""
+    x = np.asarray(x, dtype=np.float64)
+    x = x[np.isfinite(x)]
+    if not x.size:
+        return np.full(3, np.nan)
+    rng = np.random.default_rng(seed)
+    meds = np.median(x[rng.integers(0, x.size, size=(max(int(n_boot), 1), x.size))], axis=1)
+    lo, hi = np.percentile(meds, SHAPE_CI)
+    return np.array([np.median(x), lo, hi])
+
+
+def grf_shapes(delta_min, z, sigma_mpc):
+    """The Gaussian-random-field expectation of the e, p percentiles (16/50/84) of minima of the depths 'delta_min'
+    at z (theory.minima_shape_percentiles at nu = -delta_min / sigma_0(z), gamma of the linear spectrum smoothed
+    with sigma_mpc): (e_pct, p_pct), NaN without a redshift."""
+    from dtfelib import theory
+    if not np.isfinite(z):
+        return np.full(3, np.nan), np.full(3, np.nan)
+    s0 = theory.spectral_moments(sigma_mpc, float(z))[0]
+    q = theory.minima_shape_percentiles(-np.asarray(delta_min, float) / s0, theory.bbks_gamma(sigma_mpc)[0])
+    return q["e"], q["p"]
 
 
 def sigma_tag(sigma_mpc: float) -> str:
     """'s2.1625Mpc': the sigma in file names, six significant digits as pipeline.smoothing_tag (whose footprint part
-    differs per box: it is in each box's .npz instead)."""
-    return f"s{float(sigma_mpc):.6g}Mpc"
+    differs per box: it is in each box's .npz instead). A non-default void gate (DTFE_VOID_GATE, inherited by the per-box
+    workers) adds '_gatenone', as pipeline.smoothing_tag does, so it never overwrites the gated products (2026-10-11)."""
+    gate = str(getattr(config, "VOID_GATE", "ellipsoid") or "ellipsoid").strip().lower()
+    return f"s{float(sigma_mpc):.6g}Mpc" + ("" if gate == "ellipsoid" else f"_gate{gate}")
 
 
 def worker_path(out_dir: Path, sim: str, method: str, sigma_mpc: float) -> Path:
@@ -102,8 +139,11 @@ def measure(sim, method="ps", prefix=None, data_root=None, zs=DEFAULT_Z, rv_rang
         finally:
             prod.release()
         st = pop.snapshot_stats(cat, n)
-        rows.append({"snap": s, "z": float(ztab.get(s, np.nan)), "box": float(box), "cell": float(cell),
-                     "n": int(n), "method": used, **st})
+        zs_ = float(ztab.get(s, np.nan))
+        grf_e, grf_p = grf_shapes(st["_delta_valid"], zs_, sigma)
+        rows.append({"snap": s, "z": zs_, "box": float(box), "cell": float(cell),
+                     "n": int(n), "method": used, **st, "e_med": median_ci(st["_e"], n_boot, s),
+                     "p_med": median_ci(st["_p"], n_boot, s + 1), "grf_e_pct": grf_e, "grf_p_pct": grf_p})
     if not rows:
         raise SystemExit(f"{sim}: no {method} void catalogue at any snapshot" + (f" ({len(refused)} refused)" if refused else ""))
 
@@ -116,8 +156,18 @@ def measure(sim, method="ps", prefix=None, data_root=None, zs=DEFAULT_Z, rv_rang
            "r_v_pct": np.array([r["r_v_pct"] for r in rows]),
            "r_v_concat": np.concatenate([r["_r_v"] for r in rows]).astype(np.float64),
            "r_v_count": np.array([r["_r_v"].size for r in rows])}
-    for k in ("n_total", "n_resolved", "n_deep", "n_counted", "n_no_rv", "n_overlapping"):
+    for k in ("n_total", "n_resolved", "n_deep", "n_counted", "n_no_rv", "n_overlapping", "n_rv_all", "n_bbks"):
         out[k] = np.array([r[k] for r in rows])
+    # the shapes (2026-10-11): medians with their bootstrap interval, the percentiles, the Gaussian-field null at the
+    # sample's own heights and over all minima, and the raw e, p (ragged, as r_v) for the distributions
+    from dtfelib import theory
+    grf_all = theory.minima_shape_percentiles(None)
+    out.update({k: np.array([r[k] for r in rows]) for k in ("e_med", "p_med", "e_pct", "p_pct", "grf_e_pct", "grf_p_pct")})
+    out.update(grf_all_e_pct=grf_all["e"], grf_all_p_pct=grf_all["p"], grf_gamma=float(theory.bbks_gamma(sigma)[0]),
+               e_concat=np.concatenate([r["_e"] for r in rows]).astype(np.float64),
+               p_concat=np.concatenate([r["_p"] for r in rows]).astype(np.float64),
+               delta_valid_concat=np.concatenate([r["_delta_valid"] for r in rows]).astype(np.float64),
+               e_count=np.array([r["_e"].size for r in rows]))
 
     # ---- the stacks at the target redshifts: one common R_v range in Mpc
     lo, hi = (float(k) * sigma for k in rv_range_sigma)
@@ -218,11 +268,13 @@ def short(sim: str) -> str:
     return str(sim).split("-")[0]
 
 
-def r_v_at(res, snap) -> np.ndarray:
-    """The R_v of the distinct resolved voids at one snapshot (the worker's ragged concatenation)."""
-    ends = np.cumsum(res["r_v_count"])
+def r_v_at(res, snap, key="r_v") -> np.ndarray:
+    """The R_v of the distinct resolved voids at one snapshot (the worker's ragged concatenation); key 'e', 'p' or
+    'delta_valid': the BBKS-valid minima's e, p or depth (counted by 'e_count')."""
+    count = res["r_v_count"] if key == "r_v" else res["e_count"]
+    ends = np.cumsum(count)
     i = int(np.nonzero(res["snaps"] == snap)[0][0])
-    return res["r_v_concat"][ends[i] - res["r_v_count"][i]:ends[i]]
+    return res[f"{key}_concat"][ends[i] - count[i]:ends[i]]
 
 
 def summary_lines(results) -> list:
@@ -232,12 +284,23 @@ def summary_lines(results) -> list:
                      f"sigma {float(r['sigma_mpc']):.6g} Mpc = {float(r['sigma_cells']):.4g} cells, footprint "
                      f"{int(r['footprint'])} ({str(r['cache_namespace'])})")
         vol = float(r["box_mpc"]) ** 3
-        lines.append("   snap      z   minima  resolved  frac   distinct  per(100Mpc)^3  R_v 16/50/84 [Mpc]")
+        shapes = "e_med" in r                    # 2026-10-11: the BBKS e, p medians and the Gaussian-field null
+        lines.append("   snap      z   minima  resolved  frac   distinct  per(100Mpc)^3  R_v 16/50/84 [Mpc]"
+                     + ("   e (68% CI)            p (68% CI)            GRF e    GRF p" if shapes else ""))
         for j, s in enumerate(r["snaps"]):
             nt, nr, nc = int(r["n_total"][j]), int(r["n_resolved"][j]), int(r["n_counted"][j])
             pc = r["r_v_pct"][j]
-            lines.append(f"   {int(s):4d} {float(r['redshift'][j]):6.2f} {nt:8d} {nr:9d} {nr / max(nt, 1):5.3f} {nc:9d} "
-                         f"{nc / vol * PER_VOLUME:14.1f}  {pc[0]:5.2f} {pc[1]:5.2f} {pc[2]:5.2f}")
+            row = (f"   {int(s):4d} {float(r['redshift'][j]):6.2f} {nt:8d} {nr:9d} {nr / max(nt, 1):5.3f} {nc:9d} "
+                   f"{nc / vol * PER_VOLUME:14.1f}  {pc[0]:5.2f} {pc[1]:5.2f} {pc[2]:5.2f}")
+            if shapes:
+                e, p_ = r["e_med"][j], r["p_med"][j]
+                row += (f"   {e[0]:.4f} ({e[1]:.4f}-{e[2]:.4f})  {p_[0]:+.4f} ({p_[1]:+.4f}-{p_[2]:+.4f})"
+                        f"  {r['grf_e_pct'][j][1]:.4f}  {r['grf_p_pct'][j][1]:+.4f}")
+            lines.append(row)
+        if shapes:
+            lines.append(f"   Gaussian field, all minima: median e {float(r['grf_all_e_pct'][1]):.4f}, p "
+                         f"{float(r['grf_all_p_pct'][1]):+.4f}; gamma of the smoothed linear spectrum "
+                         f"{float(r['grf_gamma']):.4f}")
     return lines
 
 
@@ -245,7 +308,8 @@ def draw(results, z_target, args, out_dir) -> Path:
     from dtfelib import catalog
     sigma = float(args.smooth_mpc)
     colors = dict(zip([r["sim"] for r in results], plt.cm.tab10(np.arange(len(results)))))
-    fig, axes = plt.subplots(2, 3, figsize=(16, 9.5))
+    shapes = all("e_med" in r for r in results)   # a worker .npz from before 2026-10-11 has no shapes
+    fig, axes = plt.subplots(3 if shapes else 2, 3, figsize=(16, 14 if shapes else 9.5))
     # ---- top: against redshift
     for r in results:
         c, lab = colors[r["sim"]], short(r["sim"])
@@ -256,17 +320,27 @@ def draw(results, z_target, args, out_dir) -> Path:
         axes[0, 0].plot(z[ok], (nr / np.maximum(nt, 1))[ok], "o-", ms=4, color=c, label=lab)
         axes[0, 1].errorbar(z[ok], (nc / vol * PER_VOLUME)[ok], yerr=(np.sqrt(nc) / vol * PER_VOLUME)[ok], fmt="o-",
                             ms=4, capsize=2, color=c, label=f"{lab} ({float(r['box_mpc']):.0f} Mpc box)")
+        # the caveat (survey GAP, 2026-10-11): the minima, and those with an R_v, are nearly flat in z, so the rise
+        # and fall of the distinct count is the ellipsoid gate (the 10 sigma max axis) turning on, not formation
+        axes[0, 1].plot(z[ok], (nt / vol * PER_VOLUME)[ok], ":", lw=1.0, color=c)
+        if "n_rv_all" in r:
+            axes[0, 1].plot(z[ok], (np.asarray(r["n_rv_all"], float) / vol * PER_VOLUME)[ok], "-.", lw=0.8, color=c)
         pc = np.asarray(r["r_v_pct"], float)
         axes[0, 2].plot(z[ok], pc[ok, 1], "o-", ms=4, color=c, label=lab)
         for q in (0, 2):                           # the 16/84% as thin lines: three overlapping bands hid the medians
             axes[0, 2].plot(z[ok], pc[ok, q], "--", lw=0.8, color=c, alpha=0.7)
     axes[0, 0].set_ylabel("resolved fraction of the minima")
     axes[0, 1].set_ylabel(r"distinct voids per $(100\,$Mpc$)^3$")
+    axes[0, 1].set_yscale("log")
+    lo_, hi_ = axes[0, 1].get_ylim()
+    axes[0, 1].set_ylim(lo_, hi_ * 3.0)            # room above the minima's lines for the caveat
+    axes[0, 1].text(0.02, 0.97, "dotted: all minima; dash-dot: minima with an R_v (no gate).\nThe distinct count "
+                    "follows the ellipsoid gate, not void formation.", transform=axes[0, 1].transAxes, fontsize=7,
+                    color="0.3", va="top")
     axes[0, 2].set_ylabel(r"$R_v$ of the distinct voids [Mpc] (median; dashed 16, 84%)")
     for ax in axes[0]:
         ax.set_xlabel("redshift z"); ax.grid(alpha=0.3); ax.legend(fontsize=8)
         ax.invert_xaxis()                          # high z on the left, as in the population figures
-    axes[0, 1].set_yscale("log")
     # ---- bottom: at z_target
     edges = np.geomspace(0.3 * sigma, 30.0 * sigma, 16)
     mid = np.sqrt(edges[1:] * edges[:-1])
@@ -302,24 +376,72 @@ def draw(results, z_target, args, out_dir) -> Path:
     if abundance:
         axes[1, 0].set_xscale("log"); axes[1, 0].set_yscale("log")
     axes[1, 0].set_xlabel(r"$R_v$ [Mpc]"); axes[1, 0].set_ylabel(r"$dn/d\ln R_v$ per $(100\,$Mpc$)^3$")
-    axes[1, 0].set_title(f"distinct resolved voids, z = {z_target:g}", fontsize=10)
+    style.set_title(axes[1, 0], f"distinct resolved voids, z = {z_target:g}")
     axes[1, 1].set_ylabel(r"$\rho / \bar\rho$"); axes[1, 2].set_ylabel(r"$v_r$ [km/s]  (positive = outflow)")
     for ax, base in ((axes[1, 1], 1.0), (axes[1, 2], 0.0)):
         ax.axhline(base, color="gray", lw=0.7, ls=":")
         ax.axvline(1.0, color="gray", lw=0.7, ls=":")
         ax.set_xlabel(r"$r / R_v$")
-        ax.set_title(f"stacked, R_v {lo_mpc:.3g}-{hi_mpc:.3g} Mpc ({lo_sig:g}-{hi_sig:g} sigma), "
-                     f"z = {z_target:g}", fontsize=10)
+        style.set_title(ax, f"stacked, R_v {lo_mpc:.3g}-{hi_mpc:.3g} Mpc ({lo_sig:g}-{hi_sig:g} sigma), "
+                            f"z = {z_target:g}")
     for ax in axes[1]:
         ax.grid(alpha=0.3, which="both"); ax.legend(fontsize=8)
+    if shapes:
+        draw_shapes(results, z_target, axes[2], colors)
     methods = "/".join(sorted({str(r["method"]) for r in results}))
-    fig.suptitle(f"Voids across boxes at one smoothing length: sigma = {sigma:.6g} Mpc ({methods}; the footprint "
-                 f"follows sigma in each box)")
+    style.set_suptitle(fig, f"Voids across boxes at one smoothing length: sigma = {sigma:.6g} Mpc ({methods}; the "
+                            f"footprint follows sigma in each box)")
     fig.tight_layout()
     path = out_dir / f"crossbox_{args.method}_{sigma_tag(sigma)}_z{z_target:.2f}.png"
-    fig.savefig(path, dpi=200, bbox_inches="tight")
+    # the house style (2026-10-11), never mirrored: a common sigma is not the thesis's production smoothing
+    style.save_plot_to_multiple_paths(fig, path, dpi=config.DPI, mirror=False)
     plt.close(fig)
     return path
+
+
+def draw_shapes(results, z_target, row, colors):
+    """The bottom row: median e and p against z per box (bootstrap 68% interval), the Gaussian-field expectation
+    of the median at each box's own minima heights (dashed) and over all minima (grey); the e distribution at
+    z_target per box against its Gaussian-field pdf."""
+    from dtfelib import theory
+    grf_all = (np.asarray(results[0]["grf_all_e_pct"], float), np.asarray(results[0]["grf_all_p_pct"], float))
+    for ax, key, lab, g in ((row[0], "e", "BBKS ellipticity e (median)", grf_all[0]),
+                            (row[1], "p", "BBKS prolateness p (median)", grf_all[1])):
+        # the median only: the field's 16-84% of single minima (e 0.13-0.25) would dwarf the medians' intervals
+        ax.axhline(g[1], color="0.5", lw=0.9, label="Gaussian field, all minima (median)")
+        for r in results:
+            c, lab_ = colors[r["sim"]], short(r["sim"])
+            z = np.asarray(r["redshift"], float)
+            ok = np.isfinite(z)
+            m = np.asarray(r[f"{key}_med"], float)
+            ax.errorbar(z[ok], m[ok, 0], yerr=[(m[:, 0] - m[:, 1])[ok], (m[:, 2] - m[:, 0])[ok]], fmt="o-", ms=4,
+                        capsize=2, color=c, label=f"{lab_} (n at z=0: {int(r['n_bbks'][np.argmin(np.where(ok, z, np.inf))])})")
+            ax.plot(z[ok], np.asarray(r[f"grf_{key}_pct"], float)[ok, 1], "--", lw=1.0, color=c)
+        ax.set_xlabel("redshift z"); ax.set_ylabel(lab)
+        ax.invert_xaxis()
+        ax.grid(alpha=0.3)
+    row[0].text(0.02, 0.03, "dashed: Gaussian field at the same minima heights", transform=row[0].transAxes,
+                fontsize=7, color="0.3")
+    row[0].legend(fontsize=7)
+    gamma = float(results[0]["grf_gamma"])
+    for r in results:
+        c, lab_ = colors[r["sim"]], short(r["sim"])
+        z = np.asarray(r["redshift"], float)
+        if not np.isfinite(z).any() or np.nanmin(np.abs(z - z_target)) > Z_TOLERANCE:
+            continue
+        snap = int(r["snaps"][np.nanargmin(np.abs(z - z_target))])
+        e = r_v_at(r, snap, "e")
+        if e.size:
+            row[2].hist(e, bins=30, range=(0, 0.6), density=True, histtype="step", lw=1.5, color=c,
+                        label=f"{lab_} (n={e.size})")
+            zs = float(z[np.nanargmin(np.abs(z - z_target))])
+            s0 = theory.spectral_moments(float(r["sigma_mpc"]), zs)[0]
+            pdf = theory.minima_shape_pdf(-r_v_at(r, snap, "delta_valid") / s0, gamma)
+            row[2].plot(pdf["e"], pdf["pdf_e"], "--", lw=1.0, color=c)
+    row[2].set_xlabel("BBKS ellipticity e"); row[2].set_ylabel("pdf")
+    style.set_title(row[2], f"z = {z_target:g}; dashed: Gaussian field at the same heights")
+    row[2].grid(alpha=0.3)
+    row[2].legend(fontsize=7)
 
 
 def main(argv=None):
@@ -344,6 +466,7 @@ def main(argv=None):
     p.add_argument("--out", type=Path, default=None, help=f"output folder (default {FIGURE_ROOT})")
     p.add_argument("--replot", action="store_true", help="only redraw from the boxes' saved .npz files")
     args = p.parse_args(argv)
+    style.apply()
     if not args.smooth_mpc > 0:
         raise SystemExit("--smooth-mpc must be positive")
     if not 0 <= args.rv_range[0] < args.rv_range[1]:

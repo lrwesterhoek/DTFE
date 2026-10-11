@@ -13,7 +13,8 @@
 #   M3  heavy accumulation (a 128^3 pancake on a 2^3 grid, nSub 1: 1.47e7 tetrahedra, ~1.8e6 deposits per
 #       cell): the GPU box mean equals the CPU's to 3e-6 (measured 8.7e-7 against the single-precision CPU,
 #       1.5e-8 against the double one; the float grid gave 7.8e-6 on the same case, so the old grid fails here)
-# GPU builds only, Metal only (the CUDA/HIP port still accumulates the mass in float): skipped (exit 0) otherwise,
+# GPU builds only: Metal, and the CUDA/HIP port since it has the fixed-point grid too (2026-10-11; CUDAEMU=1 runs it
+# on the CPU emulation): skipped (exit 0) otherwise,
 # like tests/gpu_scalar_check.sh, and a local GPU suite (not in tests/ci_suite.sh). M3 takes ~40 s.
 # Usage: tests/gpu_mass_check.sh [--no-build]   (--no-build is accepted and ignored)
 set -uo pipefail
@@ -27,7 +28,9 @@ command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/
 [ -x "${PS_BIN}" ] || { echo "FAIL: ${PS_BIN} is not built"; exit 1; }
 OBJ=o_ps; precision_double && OBJ=o_ps_d
 if [ ! -d "$OBJ" ] || [ -f "$OBJ/.gpu_mode_off" ]; then echo "SKIP: $OBJ carries no GPU stamp (build with METAL=1)"; exit 0; fi
-if [ ! -f "$OBJ/.gpu_mode_metal" ]; then echo "SKIP: $OBJ is not a Metal build (the CUDA/HIP port still sums the mass in float)"; exit 0; fi
+gpu_stamp=""                                              # any one GPU backend stamp will do
+for m in metal cudaemu cuda hip; do [ -f "$OBJ/.gpu_mode_$m" ] && gpu_stamp="$m"; done
+if [ -z "$gpu_stamp" ]; then echo "SKIP: $OBJ is neither a Metal nor a CUDA/HIP (or CUDAEMU) build"; exit 0; fi
 TMP="${DTFE_TEST_TMP:-${TMPDIR:-/tmp}/dtfe-tests}/gpu_mass_check"
 mkdir -p "$TMP"
 SNAP="$TMP/waves.hdf5"; PAN="$TMP/pancake128.hdf5"

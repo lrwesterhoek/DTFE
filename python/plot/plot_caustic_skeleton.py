@@ -17,8 +17,19 @@ another one no longer overwrites them: '_<prefix>' (not ps_output), '_c6' / '_c1
 --voids '_reff' (--radius r_eff), '_shells<a>-<b>-...' (not the radius's default shells), '_overlaps'
 (--keep-overlaps), '_cut<N>' (--cutout) and the smoothing tag. A run without --voids removes the set's _voids.npz.
 
+The control (2026-10-11): with --voids the same metrics are measured in --null-draws (default 50) realisations of
+random spheres, one per void at a random cell with that void's radius, and the voids' median fold / sheet shell
+fraction and wall distance are reported against the null's mean +- std with a z-score (JSON 'null', the text, and the
+grey / orange bands of the void panel); --min-component N / --min-component-mass F keep only the sheet components of
+at least N cells / that fraction of the box's mass for the void metrics and the null ('sheet_filter' in the JSON).
+--sheet-min-density RHO keeps only the sheet cells denser than RHO x the mean (applied first: the k >= 1 sheet
+percolates through the voids themselves). Their non-default values tag the set: '_null<K>', '_seed<S>', '_min<N>',
+'_minm<F>', '_dens<RHO>'. --all-caustic runs every snapshot
+that has a caustic_class grid under the prefix.
+
     python3 plot/plot_caustic_skeleton.py --sim TNG100-3-Dark --snap 99 --voids
     python3 plot/plot_caustic_skeleton.py --sim TNG50-4-Dark --snaps 99 50 --connectivity 6
+    python3 plot/plot_caustic_skeleton.py --sim TNG100-3-Dark --prefix ps_caustic --all-caustic --voids --min-component 1000
 """
 
 import _bootstrap  # noqa: F401  (puts python/ on sys.path)
@@ -62,7 +73,35 @@ def summary_text(summ, title=""):
     for name, c in summ["components"].items():
         lines.append(f"{name}: {c['n']} component(s); the largest holds {100 * (c['largest_fraction'] or 0):.1f}% of the class; "
                      f"top sizes (cells): {c['top_cells'][:5]}")
+    if summ.get("sheet_min_density"):
+        lines.append(f"sheet for the void metrics: cells denser than {summ['sheet_min_density']:g} x the mean only")
+    filt = summ.get("sheet_filter")
+    if filt:
+        lines.append(f"sheet for the void metrics: components of >= {filt['min_cells']} cells and >= "
+                     f"{filt['min_mass_fraction']:g} of the mass only: {filt['kept']} of {filt['n']} kept, "
+                     f"{filt['cells_removed']} cells removed")
+    null = summ.get("null")
+    if null:
+        lines.append("")
+        lines.append(f"random-sphere null: {null['draws']} draws (seed {null['seed']}), one sphere per void at a random "
+                     f"cell with that void's radius; box fold {pct(null['box_fold_volume'])}, sheet {pct(null['box_sheet_volume'])}")
+        lines.append(f"{'metric':12s} {'voids':>8s} {'null mean':>10s} {'null std':>9s} {'z':>7s}")
+
+        def num(v, f):
+            return format(v, f) if _finite(v) else "--"
+        for name, m in null["metrics"].items():
+            lines.append(f"{NULL_LABELS.get(name, name):12s} {num(m['void'], '8.4f'):>8s} {num(m['null_mean'], '10.4f'):>10s} "
+                         f"{num(m['null_std'], '9.4f'):>9s} {num(m['z'], '+7.2f'):>7s}")
     return "\n".join(lines) + "\n"
+
+
+NULL_LABELS = {"fold": "fold shell", "sheet": "sheet shell", "dist_r": "wall dist/R"}
+NULL_DRAWS = 50                 # the random-sphere null's default realisations (a non-default count tags the set)
+
+
+def _finite(v):
+    """A number that is not None, NaN or infinite (the null's entries before and after json_safe)."""
+    return v is not None and bool(np.isfinite(v))
 
 
 def _median_or_none(a):
@@ -72,21 +111,24 @@ def _median_or_none(a):
     return float(np.median(a)) if a.size else None
 
 
-def void_block(cc, cat, cell_c, n_grid, cutout, shells=(1.0, 1.1, 1.2, 1.3), radius="r_eff", distinct=False):
+def void_block(cc, cat, cell_c, n_grid, cutout, shells=(1.0, 1.1, 1.2, 1.3), radius="r_eff", distinct=False,
+               masks=None):
     """--voids: per well-resolved void of the catalogue with that radius ('r_eff', or 'r_v' the measured one; only
     the distinct ones with distinct=True), the fold / sheet fractions of its shells (x the radius) and the distance
     to the nearest sheet (cells, and in units of the radius; NaN + bounded beyond the cut-out, which is at most half
     the grid). The keys keep their names ('dist_reff', 'r_eff_cells') whatever the radius: 'radius' says which.
     Returns (the arrays for the _voids.npz, the summary's 'voids' entry -- medians None when undefined:
-    no well-resolved void, or every one beyond the cut-out)."""
+    no well-resolved void, or every one beyond the cut-out). 'masks' {'fold', 'sheet'}: the grids the metrics are
+    taken on (default: cc's classes; --min-component passes a filtered sheet)."""
     r_all = catalog.r_v_mpc(cat) if radius == "r_v" else catalog.r_eff_mpc(cat)
     res = np.asarray(cat["well_resolved"]).astype(bool) & np.isfinite(r_all)
     if distinct:
         res = catalog.distinct_mask(cat, res, n_grid)
     coords = np.asarray(cat["coords"])[res]
     r_eff = r_all[res] / cell_c
-    sh = sk.void_shell_fractions(cc, (coords + 0.5) / n_grid, r_eff, shells=tuple(shells))
-    dist, bounded = sk.nearest_wall_distance(sk.class_masks(cc)["cumulative"]["sheet"], coords,
+    sh = sk.void_shell_fractions(cc, (coords + 0.5) / n_grid, r_eff, shells=tuple(shells), masks=masks)
+    sheet = masks["sheet"] if masks is not None else sk.class_masks(cc)["cumulative"]["sheet"]
+    dist, bounded = sk.nearest_wall_distance(sheet, coords,
                                              cutout_cells=min(int(cutout), int(n_grid) // 2))
     voids = {"fold": sh["fold"], "sheet": sh["sheet"], "dist_cells": dist, "dist_reff": dist / r_eff, "bounded": bounded,
              "index": np.nonzero(res)[0], "r_eff_cells": r_eff, "radius": radius, "shells": np.asarray(shells, float)}
@@ -128,6 +170,16 @@ def plot_skeleton(cc, summ, fold, voids, title, path):
         sh_ = voids.get("shells", np.array([1.0, 1.3]))
         ax.set_xlabel(f"fold fraction of the {sh_[0]:g}-{sh_[-1]:g} {rl} shells")
         ax.set_ylabel(f"distance to the nearest sheet [{rl}]")
+        null = summ.get("null")
+        if null:                                    # the random spheres' median, mean +- std over the draws
+            mf, md = null["metrics"]["fold"], null["metrics"]["dist_r"]
+            if _finite(mf["null_mean"]) and _finite(mf["null_std"]):
+                ax.axvspan(mf["null_mean"] - mf["null_std"], mf["null_mean"] + mf["null_std"], color="0.5", alpha=0.25,
+                           label="random spheres: median fold, mean $\\pm$ std")
+            if _finite(md["null_mean"]) and _finite(md["null_std"]):
+                ax.axhspan(md["null_mean"] - md["null_std"], md["null_mean"] + md["null_std"], color="tab:orange",
+                           alpha=0.2, label="random spheres: median distance")
+            ax.legend(fontsize=7)
         ax.grid(alpha=0.3)
         # 'distinct' from what was applied (summ['voids']), not from the radius: --keep-overlaps under r_v was
         # titled 'distinct' and the distinct r_eff sample was not (2026-10-08)
@@ -138,6 +190,18 @@ def plot_skeleton(cc, summ, fold, voids, title, path):
     fig.tight_layout()
     style.save_plot_to_multiple_paths(fig, path, mirror=MIRROR)
     plt.close(fig)
+
+
+def caustic_snapshots(sim, data_root, method, prefix):
+    """The snapshots of 'sim' whose snapdir holds a caustic_class grid under 'prefix' (--all-caustic)."""
+    out = []
+    for d in sorted(sim_dir(sim, data_root).glob("snapdir_*")):
+        try:
+            if FieldSet(d, method=method, prefix=prefix).has("caustic_class"):
+                out.append(int(d.name.split("_")[1]))
+        except (FileNotFoundError, ValueError, OSError):
+            continue
+    return out
 
 
 def skeleton_tag(args, prefix, default_shells):
@@ -153,6 +217,11 @@ def skeleton_tag(args, prefix, default_shells):
             tag += "_shells" + "-".join(f"{x:g}" for x in shells)
         tag += "_overlaps" if args.keep_overlaps else ""
         tag += "" if args.cutout is None else f"_cut{args.cutout}"
+        tag += "" if args.null_draws == NULL_DRAWS else f"_null{args.null_draws}"     # the control (2026-10-11)
+        tag += "" if not args.null_seed else f"_seed{args.null_seed}"
+        tag += "" if args.min_component <= 1 else f"_min{args.min_component}"
+        tag += "" if not args.min_component_mass > 0 else f"_minm{args.min_component_mass:g}"
+        tag += "" if not args.sheet_min_density > 0 else f"_dens{args.sheet_min_density:g}"
         tag += f"_{pipeline.smoothing_tag()}" if pipeline.smoothing_tag() else ""   # a non-default sigma: its own files
     return tag
 
@@ -175,6 +244,22 @@ def main():
     parser.add_argument("--keep-overlaps", action="store_true",
                         help="--voids: every resolved void, not only the distinct ones (none whose centre lies inside "
                              "a deeper void's min(R_v, R_eff))")
+    parser.add_argument("--null-draws", type=int, default=NULL_DRAWS,
+                        help=f"--voids: realisations of the random-sphere null (one sphere per void, at a random cell, "
+                             f"with that void's radius); the voids' medians against it as z-scores (default {NULL_DRAWS}; "
+                             "0: no null)")
+    parser.add_argument("--null-seed", type=int, default=0, help="the null's random seed (default 0)")
+    parser.add_argument("--min-component", type=int, default=0, metavar="CELLS",
+                        help="--voids: take the shells and the wall distance on sheet components of at least this many "
+                             "cells only (default 0: every sheet cell)")
+    parser.add_argument("--min-component-mass", type=float, default=0.0, metavar="FRACTION",
+                        help="--voids: and of at least this fraction of the box's mass (default 0)")
+    parser.add_argument("--sheet-min-density", type=float, default=0.0, metavar="RHO",
+                        help="--voids: count only the sheet cells denser than RHO times the mean (default 0: every one); "
+                             "the k >= 1 sheet percolates through the voids, its dense part is the walls")
+    parser.add_argument("--all-caustic", action="store_true",
+                        help="every snapshot of the simulation that has a caustic_class grid under this prefix "
+                             "(instead of --snap / --snaps)")
     pipeline.add_smoothing_mpc_arg(parser)
     parser.add_argument("--out", default=None, help=f"output folder (default {OUTPUT_DIR}/<sim>)")
     args = parser.parse_args()
@@ -187,6 +272,12 @@ def main():
     MIRROR = args.out is None
     method = "ps" if args.method == "auto" else args.method
     snaps = args.snaps if args.snaps else [args.snap]
+    if args.all_caustic:
+        snaps = caustic_snapshots(args.sim, args.data_root, method, args.prefix)
+        print(f"caustic_class grids ({args.prefix or 'ps_output'}) at snapshot(s) {snaps or 'none'}")
+        if len(snaps) < 2:
+            print("  one snapshot shows where the walls are, not when they form at R_v: a --ps-caustics rerun of more "
+                  "snapshots (050 and 033, z = 1 and 2; 25-40 min each for TNG100-3-Dark at 512^3) would add that epoch")
     failed, written = [], []
     for snap in snaps:
         snapdir = sim_dir(args.sim, args.data_root) / f"snapdir_{snap:03d}"
@@ -212,8 +303,26 @@ def main():
                 cat = p.voids()
                 cutout = args.cutout if args.cutout is not None else int(round(10 * pipeline.smoothing_length_mpc() / cell_c))
                 shells = [float(x) for x in args.shells.split(",") if x.strip()]
+                cm = sk.class_masks(cc)
+                masks = {"fold": cm["indicator"]["fold"], "sheet": cm["cumulative"]["sheet"]}
+                if args.sheet_min_density > 0:          # before the components: a dense wall, not a flake, is kept
+                    masks["sheet"] = masks["sheet"] & (np.asarray(den) > args.sheet_min_density)
+                    summ["sheet_min_density"] = float(args.sheet_min_density)
+                if args.min_component > 1 or args.min_component_mass > 0:
+                    masks["sheet"], summ["sheet_filter"] = sk.filter_components(
+                        masks["sheet"], args.min_component, den, args.min_component_mass, args.connectivity)
                 voids, summ["voids"] = void_block(cc, cat, cell_c, n_grid, cutout, shells=shells, radius=args.radius,
-                                                  distinct=not args.keep_overlaps)
+                                                  distinct=not args.keep_overlaps, masks=masks)
+                if args.null_draws > 0 and len(voids["index"]):
+                    cut = min(int(cutout), int(n_grid) // 2)
+                    nul = sk.random_sphere_null(masks, voids["r_eff_cells"], n_grid, shells, cut,
+                                                n_draws=args.null_draws, seed=args.null_seed)
+                    summ["null"] = {"draws": int(args.null_draws), "seed": int(args.null_seed),
+                                    "metrics": sk.null_zscores({"fold": voids["fold"], "sheet": voids["sheet"],
+                                                                "dist_r": voids["dist_reff"]}, nul),
+                                    "box_fold_volume": float(masks["fold"].mean()),
+                                    "box_sheet_volume": float(masks["sheet"].mean()),
+                                    "bounded_fraction_mean": float(np.mean(nul["bounded_fraction"]))}
                 summ["voids"].update(radius=args.radius, shells=shells, distinct=not args.keep_overlaps,
                                      sigma_mpc=pipeline.smoothing_length_mpc(), footprint_cells=int(config.FOOTPRINT_SIZE))
             except (FileNotFoundError, ValueError, OSError) as e:   # asked for and not delivered: a failed snapshot, exit 1

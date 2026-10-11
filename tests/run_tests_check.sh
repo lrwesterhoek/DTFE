@@ -11,8 +11,13 @@
 #   R2  run_tests.py, a ./DTFE whose --full_help lacks --exact-average: both tests SKIP and the run exits 0;
 #       under DTFE_TEST_REQUIRED=1 both FAIL ('DTFE_TEST_REQUIRED=1, but ...') and it exits 1
 #   R3  run_tests.py, a fresh DTFE_TEST_REFERENCE_DIR: the regression is a SKIP (', 1 skipped' in the Results
-#       line) and the run exits 0 EVEN under DTFE_TEST_REQUIRED=1 (ci_suite.sh's double stage relies on it: no
-#       build can supply a reference); the next run compares against the reference written
+#       line) and the run exits 0 EVEN under DTFE_TEST_REQUIRED=1 (no build can supply a reference; ci_suite.sh
+#       relied on it until 2026-10-11, it now compares with the stored one: R5); the next run compares against the
+#       reference written
+#   R5  run_tests.py against the STORED reference (tests/reference/regression_periodic.txt, which CI compares with
+#       since 2026-10-11): it PASSES as stored, and with every value moved by 5e-5 relative (rounding-level, under
+#       the 3e-4 tolerance); ONE value moved by 1e-3 relative (the size of moving one of the 1000 particles by
+#       0.05% of the box) makes it FAIL and the run exit 1
 #   R4  run_tests.py, DTFE_TEST_PRECISION=double with no ./DTFE-double: 'SKIP:' and exit 0, or 'FAIL
 #       (required):' and exit 1 under DTFE_TEST_REQUIRED=1
 #   D1  ps_double_check.sh in a tree with only ./DTFE and ./PS-DTFE: 'SKIP:' and exit 0, or 'FAIL (required):'
@@ -78,7 +83,7 @@ check "$(has "$TMP/r2_0.log" '^Results: [0-9]+/[0-9]+ passed, 3 skipped$')" "...
 rc=$(rt "$TMP/r2_1.log" "$(fresh)" STUB_HELP=noflag DTFE_TEST_REQUIRED=1)
 check "$([ "$rc" = "1" ] && [ "$(count "$TMP/r2_1.log" '^  FAIL  exact_average_(lattice|convergence) -- DTFE_TEST_REQUIRED=1, but DTFE has no --exact-average$')" = "2" ] \
          && echo 0 || echo 1)" "DTFE_TEST_REQUIRED=1: both FAIL instead, exit 1 ($rc)"
-echo ">> R3: no regression reference (a fresh folder, as in CI and Docker)"
+echo ">> R3: no regression reference (a fresh DTFE_TEST_REFERENCE_DIR)"
 ref="$(fresh)"
 rc=$(rt "$TMP/r3.log" "$ref" DTFE_TEST_REQUIRED=1)
 check "$([ "$rc" = "0" ] && [ "$(has "$TMP/r3.log" "^  SKIP  regression -- no reference in ")" = "0" ] \
@@ -86,9 +91,31 @@ check "$([ "$rc" = "0" ] && [ "$(has "$TMP/r3.log" "^  SKIP  regression -- no re
       "the regression is a SKIP and the run exits 0 even under DTFE_TEST_REQUIRED=1 ($rc)"
 check "$(has "$TMP/r3.log" '^Results: ([0-9]+)/[0-9]+ passed, 1 skipped$')" "... the Results line says '1 skipped'"
 rc=$(rt "$TMP/r3b.log" "$ref" DTFE_TEST_REQUIRED=1)
-check "$([ "$rc" = "0" ] && [ -s "$ref/regression_density.txt" ] && [ "$(has "$TMP/r3b.log" '^  PASS  regression$')" = "0" ] \
+check "$([ "$rc" = "0" ] && [ -s "$ref/regression_periodic.txt" ] && [ "$(has "$TMP/r3b.log" '^  PASS  regression$')" = "0" ] \
          && [ "$(has "$TMP/r3b.log" 'skipped')" = "1" ] && echo 0 || echo 1)" \
       "... it wrote a reference, and the next run compares against it: PASS, nothing skipped ($rc)"
+echo ">> R5: the stored reference, as stored and perturbed"
+STORED="$ROOT/tests/reference/regression_periodic.txt"
+if [ -s "$STORED" ]; then
+    # r5 <log> <scale every value> <scale value 100 of the density column>: a copy of the stored reference, scaled
+    r5() {
+        local d; d="$(fresh)"
+        awk -v all="$2" -v one="$3" '/^#/ { print; next } { n++; a = $1 * all; if (n == 100) a *= one; printf "%.9e %.9e\n", a, $2 * all }' \
+            "$STORED" > "$d/regression_periodic.txt"
+        rt "$1" "$d"
+    }
+    rc=$(r5 "$TMP/r5a.log" 1 1)
+    check "$([ "$rc" = "0" ] && [ "$(has "$TMP/r5a.log" '^  PASS  regression$')" = "0" ] && echo 0 || echo 1)" \
+          "this build matches the stored reference: PASS ($rc)"
+    rc=$(r5 "$TMP/r5b.log" 1.00005 1)
+    check "$([ "$rc" = "0" ] && [ "$(has "$TMP/r5b.log" '^  PASS  regression$')" = "0" ] && echo 0 || echo 1)" \
+          "... every value moved by 5e-5 relative (rounding-level): still PASS ($rc)"
+    rc=$(r5 "$TMP/r5c.log" 1 1.001)
+    check "$([ "$rc" = "1" ] && [ "$(has "$TMP/r5c.log" '^  FAIL  regression -- .*density: 1/1728 values differ')" = "0" ] && echo 0 || echo 1)" \
+          "... ONE value moved by 1e-3 relative: FAIL, exit 1 ($rc)"
+else
+    check 1 "the stored reference $STORED exists"
+fi
 echo ">> R4: DTFE_TEST_PRECISION=double without ./DTFE-double"
 rc=$(rt "$TMP/r4_0.log" "$(fresh)" DTFE_TEST_PRECISION=double)
 check "$([ "$rc" = "0" ] && [ "$(has "$TMP/r4_0.log" '^SKIP: .*DTFE-double is not built')" = "0" ] && echo 0 || echo 1)" "SKIP: and exit 0 ($rc)"

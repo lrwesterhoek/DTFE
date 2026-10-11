@@ -444,11 +444,80 @@ def main():
         figures_root_rule()
         void_outline_geometry()
         run_log_contract()
+        launcher_2026_10_11()
     finally:
         shutil.rmtree(tmp.parent)
     print("-" * 60)
     print(f"RESULT: {len(PASS)} passed, {len(FAIL)} failed")
     return 1 if FAIL else 0
+
+
+def gpu_branches(tmp: Path, snap: Path):
+    """The GPU advice and recommendation for a GPU build AND a CPU-only one, whatever this host has: rs._objdir
+    (where gpu_built, gpu_backend and tbb_built read the Makefile's stamps) points at a fake object directory with
+    or without '.gpu_mode_off'."""
+    real = rs._objdir
+    fake = Path(tempfile.mkdtemp(prefix="gui_objdir_"))
+    try:
+        rs._objdir = lambda estimator, precision="single", dim=3: fake / (estimator + precision + str(dim))
+        for built in (True, False):
+            for d in (rs._objdir(e, p) for e in ("ps", "dtfe") for p in ("single", "double")):
+                d.mkdir(exist_ok=True)
+                (d / ".gpu_mode_off").unlink(missing_ok=True)
+                (d / ".gpu_mode_metal").unlink(missing_ok=True)
+                (d / (".gpu_mode_metal" if built else ".gpu_mode_off")).touch()
+            print(f"  (faked build: {'GPU (Metal)' if built else 'CPU only'})")
+            check(f"the faked stamp is what the build checks read ({built})",
+                  rs.gpu_built("ps") is built and rs.gpu_built("dtfe") is built
+                  and rs.gpu_backend("ps") == ("Metal" if built else ""))
+            _gpu_advice_checks(tmp, snap)
+    finally:
+        rs._objdir = real
+        shutil.rmtree(fake, ignore_errors=True)
+
+
+def _gpu_advice_checks(tmp: Path, snap: Path):
+    ps_gpu, dt_gpu = rs.gpu_built("ps"), rs.gpu_built("dtfe")
+    adv = rs.gpu_advice
+    check("gpu advice: a small PS run with the GPU ticked is told the CPU is faster; a big one without it, the GPU",
+          len(adv(True, "sampled", ["density_a"], 260_000, "ps")) == 1
+          and len(adv(False, "sampled", ["density_a"], 2_100_000, "ps")) == (1 if ps_gpu else 0)
+          and adv(False, "sampled", ["density_a"], 260_000, "ps") == []
+          and adv(True, "sampled", ["density_a"], 7_100_000, "ps") == [])
+    check("gpu advice: the exact deposit without the GPU warns whatever the particle count (none known too)",
+          len(adv(False, "exact", ["density_a"], None, "ps")) == (1 if ps_gpu else 0)
+          and adv(True, "exact", ["density_a"], None, "ps") == []
+          and adv(True, "sampled", ["density_a"], None, "ps") == [])
+    check("gpu advice: standard DTFE with the GPU unticked on a fine grid is told the GPU is 1.5-2.3x faster; not at 256³",
+          adv(True, "sampled", rs.DTFE_FIELDS, 7_100_000, "dtfe", grid=512) == []
+          and adv(False, "sampled", rs.DTFE_FIELDS, 7_100_000, "dtfe", grid=256) == []
+          and len(adv(False, "sampled", rs.DTFE_FIELDS, 7_100_000, "dtfe", grid=1024)) == (1 if dt_gpu else 0))
+    rec = rs.recommended_gpu
+    check("recommended GPU: exact always (when built), sampled from ~1M particles, standard DTFE when built",
+          rec("exact", ["density_a"], 1000) == ps_gpu and rec("sampled", ["density_a"], 32 ** 3) is False
+          and rec("sampled", ["density_a"], 19_000_000) == ps_gpu and rec("sampled", ["density_a"], None) == ps_gpu
+          and rec("sampled", ["density_a"], 1e9, "dtfe") == dt_gpu)
+    ex = rs.RunSpec(sim="TNG50-4", snapshots=[99], deposit="exact", gpu=False, data_root=str(tmp))
+    msgs = [m for level, m in ex.problems() if level == "warning" and "exact" in m]
+    check("a Grids exact run without the GPU gets ONE warning (the duplicate is gone)", len(msgs) == (1 if ps_gpu else 0), str(msgs))
+    dtg = rs.RunSpec(sim="TNG50-4", snapshots=[99], estimator="dtfe", gpu=True, grid=512, data_root=str(tmp))
+    cm = rs.CustomSpec(input_file=str(snap), estimator="dtfe", gpu=True, grid=512)
+    check("a standard-DTFE 512³ run with the GPU gets no GPU warning (Grids and custom)",
+          not any("GPU" in m and level == "warning" and "METAL" not in m for level, m in dtg.problems() + cm.problems()),
+          str(dtg.problems()))
+    dtg.gpu = cm.gpu = False
+    check("... and with the GPU unticked both are told it is faster (when built)",
+          (any("faster" in m for _, m in dtg.problems()) and any("faster" in m for _, m in cm.problems())) == dt_gpu,
+          str(cm.problems()))
+    dex = rs.RunSpec(sim="TNG50-4", snapshots=[99], estimator="dtfe", deposit="exact", gpu=False, grid=256,
+                     data_root=str(tmp))
+    cex = rs.CustomSpec(input_file=str(snap), estimator="dtfe", deposit="exact", gpu=False, grid=256)
+    check("standard DTFE exact: the custom command passes --exact-average (not the PS flag), and without the GPU "
+          "both specs say the GPU is ~6.6x faster (when built)",
+          "--exact-average" in cex.command() and "--ps-exact-deposit" not in cex.command()
+          and "--exact-average" not in rs.CustomSpec(input_file=str(snap), estimator="dtfe").command()
+          and (any("6.6x" in m for _, m in dex.problems()) and any("6.6x" in m for _, m in cex.problems())) == dt_gpu,
+          str(cex.problems()))
 
 
 def tick_helpers():
@@ -615,7 +684,7 @@ def new_features(tmp: Path, sim: Path):
                                    volume_weighted=True, caustics=True, caustic_cusps=True, scalar_dataset="Masses",
                                    partition=2, max_concurrent=2, scratch_dir=str(work), lagrangian="separate",
                                    lagrangian_file=str(snap), box=[0, 1, 0, 1, 0, 1], parallel_triangulation=True,
-                                   alpha_shape=2.5, periodic=False),
+                                   alpha_shape=2.5, periodic=False, ordered_merge=True),
                      rs.CustomSpec(input_file=str(snap), estimator="dtfe", gpu=True)):
             emitted |= {a for a in spec.command() if a.startswith("--")}
         known = set(ps_help) | set(dt_help)
@@ -631,48 +700,9 @@ def new_features(tmp: Path, sim: Path):
     else:
         check("flags-exist check skipped: a binary is not built", True)
 
-    # ---- GPU advice: where the deposit pays (measured 2026-10-01), one warning per condition
-    ps_gpu, dt_gpu = rs.gpu_built("ps"), rs.gpu_built("dtfe")
-    adv = rs.gpu_advice
-    check("gpu advice: a small PS run with the GPU ticked is told the CPU is faster; a big one without it, the GPU",
-          len(adv(True, "sampled", ["density_a"], 260_000, "ps")) == 1
-          and len(adv(False, "sampled", ["density_a"], 2_100_000, "ps")) == (1 if ps_gpu else 0)
-          and adv(False, "sampled", ["density_a"], 260_000, "ps") == []
-          and adv(True, "sampled", ["density_a"], 7_100_000, "ps") == [])
-    check("gpu advice: the exact deposit without the GPU warns whatever the particle count (none known too)",
-          len(adv(False, "exact", ["density_a"], None, "ps")) == (1 if ps_gpu else 0)
-          and adv(True, "exact", ["density_a"], None, "ps") == []
-          and adv(True, "sampled", ["density_a"], None, "ps") == [])
-    check("gpu advice: standard DTFE with the GPU unticked on a fine grid is told the GPU is 1.5-2.3x faster; not at 256³",
-          adv(True, "sampled", rs.DTFE_FIELDS, 7_100_000, "dtfe", grid=512) == []
-          and adv(False, "sampled", rs.DTFE_FIELDS, 7_100_000, "dtfe", grid=256) == []
-          and len(adv(False, "sampled", rs.DTFE_FIELDS, 7_100_000, "dtfe", grid=1024)) == (1 if dt_gpu else 0))
-    rec = rs.recommended_gpu
-    check("recommended GPU: exact always (when built), sampled from ~1M particles, standard DTFE when built",
-          rec("exact", ["density_a"], 1000) == ps_gpu and rec("sampled", ["density_a"], 32 ** 3) is False
-          and rec("sampled", ["density_a"], 19_000_000) == ps_gpu and rec("sampled", ["density_a"], None) == ps_gpu
-          and rec("sampled", ["density_a"], 1e9, "dtfe") == dt_gpu)
-    ex = rs.RunSpec(sim="TNG50-4", snapshots=[99], deposit="exact", gpu=False, data_root=str(tmp))
-    msgs = [m for level, m in ex.problems() if level == "warning" and "exact" in m]
-    check("a Grids exact run without the GPU gets ONE warning (the duplicate is gone)", len(msgs) == (1 if ps_gpu else 0), str(msgs))
-    dtg = rs.RunSpec(sim="TNG50-4", snapshots=[99], estimator="dtfe", gpu=True, grid=512, data_root=str(tmp))
-    cm = rs.CustomSpec(input_file=str(snap), estimator="dtfe", gpu=True, grid=512)
-    check("a standard-DTFE 512³ run with the GPU gets no GPU warning (Grids and custom)",
-          not any("GPU" in m and level == "warning" and "METAL" not in m for level, m in dtg.problems() + cm.problems()),
-          str(dtg.problems()))
-    dtg.gpu = cm.gpu = False
-    check("... and with the GPU unticked both are told it is faster (when built)",
-          (any("faster" in m for _, m in dtg.problems()) and any("faster" in m for _, m in cm.problems())) == dt_gpu,
-          str(cm.problems()))
-    dex = rs.RunSpec(sim="TNG50-4", snapshots=[99], estimator="dtfe", deposit="exact", gpu=False, grid=256,
-                     data_root=str(tmp))
-    cex = rs.CustomSpec(input_file=str(snap), estimator="dtfe", deposit="exact", gpu=False, grid=256)
-    check("standard DTFE exact: the custom command passes --exact-average (not the PS flag), and without the GPU "
-          "both specs say the GPU is ~6.6x faster (when built)",
-          "--exact-average" in cex.command() and "--ps-exact-deposit" not in cex.command()
-          and "--exact-average" not in rs.CustomSpec(input_file=str(snap), estimator="dtfe").command()
-          and (any("6.6x" in m for _, m in dex.problems()) and any("6.6x" in m for _, m in cex.problems())) == dt_gpu,
-          str(cex.problems()))
+    # ---- GPU advice: where the deposit pays (measured 2026-10-01), one warning per condition; asserted for BOTH
+    # builds by faking the Makefile's GPU stamp (2026-10-11: on CPU-only CI the GPU branches were never asserted)
+    gpu_branches(tmp, snap)
     # ---- precision: the double pair is a setting, picked per job; the knob and binary names
     both_double = rs.binary_built("ps", "double") and rs.binary_built("dtfe", "double")
     rp = rs.RunSpec(sim="TNG50-4", snapshots=[99], precision="double", data_root=str(tmp))
@@ -711,8 +741,13 @@ def new_features(tmp: Path, sim: Path):
     print("export:")
     txt = rs.export_script(steps, "a test job")
     check("bash export: shebang, cd to the repo, every step, failure count as exit status",
-          txt.startswith("#!/usr/bin/env bash") and 'cd "$REPO"' in txt and steps[-1].line() in txt
+          txt.startswith("#!/usr/bin/env bash") and 'cd "$REPO"' in txt
+          and all(rs.shell(st.argv, st.env) in txt for st in steps)
           and 'exit "$failed"' in txt and "#SBATCH" not in txt)
+    tee = steps[-1].tee
+    check("bash export: a step with a run log tees into '<log>.partial', never straight into '<log>' (the run-log "
+          "contract, 2026-10-11)", bool(tee) and f"| tee {rs._q(tee + '.partial')}" in txt
+          and f"| tee {rs._q(tee)}\n" not in txt and f"| tee {rs._q(tee)} " not in txt, txt[-600:])
     sl = rs.export_script(steps, "a test job", {"job_name": "j1", "time": "02:00:00", "cpus": 8, "mem": "32G",
                                                 "partition": "regular", "mail": ""})
     check("SLURM export: the #SBATCH header, OMP threads from SLURM, no empty options",
@@ -725,6 +760,22 @@ def new_features(tmp: Path, sim: Path):
     r = subprocess.run(["bash", str(ex)], capture_output=True, text=True)
     check("an exported script runs, goes on after a failed step and exits with the failure count",
           r.returncode == 1 and "hello" in r.stdout, f"{r.returncode} {r.stdout} {r.stderr}")
+    # the run-log contract in an exported script, run for real: a good step's log lands on '<log>' (and a stale
+    # '<log>.failed' goes), a failing step's on '<log>.failed' with the old '<log>' untouched; no '.partial' left
+    lg = work / "export logs"                      # a space: the quoting is exercised too
+    lg.mkdir()
+    (lg / "ok.runlog.failed").write_text("an older failed attempt\n")
+    (lg / "bad.runlog").write_text("the log of the grids on disk\n")
+    ex.write_text(rs.export_script([rs.Step("ok", ["echo", "hello"], {}, tee=str(lg / "ok.runlog")),
+                                    rs.Step("bad", ["sh", "-c", "echo oops; exit 3"], {}, tee=str(lg / "bad.runlog"))],
+                                   "t"))
+    r = subprocess.run(["bash", str(ex)], capture_output=True, text=True)
+    check("exported run logs: exit 0 -> '<log>' (stale .failed removed), a failure -> '<log>.failed' (the old log "
+          "kept), no '.partial' left, the failure counted",
+          r.returncode == 1 and (lg / "ok.runlog").read_text() == "hello\n" and not (lg / "ok.runlog.failed").exists()
+          and (lg / "bad.runlog.failed").read_text() == "oops\n"
+          and (lg / "bad.runlog").read_text() == "the log of the grids on disk\n"
+          and not list(lg.glob("*.partial")), f"{r.returncode} {sorted(p.name for p in lg.iterdir())} {r.stderr}")
 
     print("run logs (results.py):")
     snapdir = sim / "snapdir_099"
@@ -1798,18 +1849,22 @@ def launcher_fixes():
     print("running jobs:")
     me = os.getpid()
     # pgrep names five DTFE binaries; ps shows what they are: the launcher's query server (--serve, a direct
-    # child), its exact zoom (a direct child, --ps-window), a run from another terminal (bash -> binary: a
-    # grandchild), a run whose OUTPUT PATH contains '--serve' (the token rule), a memory check from a terminal
-    # (--auto-tune-report, never counted) and someone else's query server (listed apart, with its memory)
-    pgrep_out = "100 PS-DTFE\n200 PS-DTFE\n300 DTFE-double\n400 PS-DTFE\n500 PS-DTFE\n600 PS-DTFE\n"
+    # child), its exact zoom (a direct child writing into a 'dtfe-zoom-' folder), a run from another terminal
+    # (bash -> binary: a grandchild), a run whose OUTPUT PATH contains '--serve' (the token rule), a memory check
+    # from a terminal (--auto-tune-report, never counted), someone else's query server (listed apart, with its
+    # memory) and a Custom-tab run (2026-10-11: a direct child too, with a --ps-window of its own, but a run)
+    pgrep_out = "100 PS-DTFE\n200 PS-DTFE\n300 DTFE-double\n400 PS-DTFE\n500 PS-DTFE\n600 PS-DTFE\n700 PS-DTFE\n"
     ps_out = (f"  100 {me} 24000000 /Users/x/Mobile Documents/DTFE/PS-DTFE /Volumes/T7/snap.hdf5 /tmp/s/serve --serve "
               f"--input 105 --verbose 0 --serve-resident 4 --serve-progress\n"
-              f"  200 {me} 1500000 /Users/x/Mobile Documents/DTFE/PS-DTFE /Volumes/T7/snap.hdf5 /tmp/z/zoom --ps-window "
+              f"  200 {me} 1500000 /Users/x/Mobile Documents/DTFE/PS-DTFE /Volumes/T7/snap.hdf5 "
+              f"/var/folders/ab/T/{rs.ZOOM_DIR_PREFIX}k3_x9q/zoom --ps-window "
               f"1 2 3 4 5 6 --field density_a\n"
               f"  300 4242 18200000 /Users/x/Mobile Documents/DTFE/DTFE-double /Volumes/T7/snap.hdf5 out --grid 256 256 256\n"
               f"  400 4343 900000 ./PS-DTFE snap.hdf5 /tmp/--serve-test/out --periodic\n"
               f"  500 4444 300000 ./PS-DTFE snap.hdf5 /tmp/r/out --grid 512 --auto-tune-report\n"
-              f"  600 4545 9300000 ./PS-DTFE other.hdf5 /tmp/s2/serve --serve --input 105\n")
+              f"  600 4545 9300000 ./PS-DTFE other.hdf5 /tmp/s2/serve --serve --input 105\n"
+              f"  700 {me} 5100000 /Users/x/Mobile Documents/DTFE/PS-DTFE /Users/x/cloud.hdf5 /Users/x/out/zoom "
+              f"--grid 64 --ps-window 0 1 0 1 0 1\n")
     calls = []
 
     def fake_run(argv, **kw):
@@ -1817,7 +1872,7 @@ def launcher_fixes():
         if argv[0] == "pgrep":
             return subprocess.CompletedProcess(argv, 0, stdout=pgrep_out, stderr="")
         if argv[0] == "ps":
-            assert argv[-1] == "100,200,300,400,500,600" and "-ww" in argv and "rss=" in argv[3], argv
+            assert argv[-1] == "100,200,300,400,500,600,700" and "-ww" in argv and "rss=" in argv[3], argv
             return subprocess.CompletedProcess(argv, 0, stdout=ps_out, stderr="")
         raise AssertionError(argv)
 
@@ -1827,9 +1882,10 @@ def launcher_fixes():
         rs._JOBS_CACHE = (-1e9, {"runs": [], "servers": []})
         rs.dtfe_processes(max_age=0)             # one classification; the two views below read the cache
         jobs = rs.running_jobs()
-        check("runs: a run from another terminal and one whose path merely contains '--serve'; not the launcher's own "
-              "server or exact zoom, not a memory check (--auto-tune-report), not another server",
-              jobs == [(300, "DTFE-double"), (400, "PS-DTFE")], str(jobs))
+        check("runs: a run from another terminal, one whose path merely contains '--serve' and the launcher's own "
+              "Custom-tab run (a direct child, even with --ps-window and an output named 'zoom'); not the launcher's "
+              "own server or exact zoom, not a memory check (--auto-tune-report), not another server",
+              jobs == [(300, "DTFE-double"), (400, "PS-DTFE"), (700, "PS-DTFE")], str(jobs))
         servers = rs.running_servers()
         check("servers: every query server, with its resident memory in GB (ps rss)",
               [(p, n, round(g, 1)) for p, n, g in servers] == [(100, "PS-DTFE", 24.0), (600, "PS-DTFE", 9.3)], str(servers))
@@ -1844,7 +1900,7 @@ def launcher_fixes():
                                                else (_ for _ in ()).throw(OSError("no ps")))
         check("without ps every named binary counts as a run (no memory known), as before",
               rs.running_jobs(max_age=0) == [(100, "PS-DTFE"), (200, "PS-DTFE"), (300, "DTFE-double"), (400, "PS-DTFE"),
-                                             (500, "PS-DTFE"), (600, "PS-DTFE")]
+                                             (500, "PS-DTFE"), (600, "PS-DTFE"), (700, "PS-DTFE")]
               and rs.running_servers(max_age=0) == [] and "(pid 100)" in rs._busy_problems()[0][1])
         rs._JOBS_CACHE = (-1e9, {"runs": [], "servers": []})
         rs.subprocess.run = lambda argv, **kw: subprocess.CompletedProcess(argv, 1, stdout="", stderr="")
@@ -1852,9 +1908,12 @@ def launcher_fixes():
               rs.running_jobs(max_age=0) == [] and rs.running_servers(max_age=0) == [] and not rs._busy_problems())
     finally:
         rs.subprocess.run, rs._JOBS_CACHE = orig_run, orig_cache
-    check("the kinds: server by the --serve token, report by --auto-tune-report, own by the parent, else a run",
+    zoom = f"x /tmp/{rs.ZOOM_DIR_PREFIX}ab12/zoom --grid 8"
+    check("the kinds: server by the --serve token, report by --auto-tune-report, own = a child writing into an "
+          "exact-zoom folder, else a run (a Custom-tab child included; 2026-10-11)",
           rs._kind(1, "x --serve y", 99) == "server" and rs._kind(1, "x --auto-tune-report", 99) == "report"
-          and rs._kind(99, "x --grid 8", 99) == "own" and rs._kind(1, "x --grid 8", 99) == "run"
+          and rs._kind(99, zoom, 99) == "own" and rs._kind(99, "x --grid 8", 99) == "run"
+          and rs._kind(1, zoom, 99) == "run" and rs._kind(1, "x --grid 8", 99) == "run"
           and rs._kind(99, "x --serve", 99) == "server")
     check("the token rule: '--serve' alone, not --serve-resident/-progress or a path",
           bool(rs._SERVE.search("a --serve b")) and bool(rs._SERVE.search("x --serve"))
@@ -2058,6 +2117,130 @@ def run_log_contract():
         if child is not None:
             child.kill()
             child.wait()
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def launcher_2026_10_11():
+    """The launcher's part of the 2026-10-11 afternoon wave: the ordered merge (K1) from every tab into its run
+    and back through 'Load settings', and a killed run's checkpoint directory (K2) in the Runs browser."""
+    import results as R
+    print("launcher 2026-10-11 (ordered merge, checkpoints):")
+    base = Path(tempfile.mkdtemp(prefix="gui_wave2_"))
+    try:
+        snap = base / "cloud.hdf5"
+        on = rs.RunSpec(sim="TNG50-4", snapshots=[99], ordered_merge=True).command()[1]
+        off = rs.RunSpec(sim="TNG50-4", snapshots=[99]).command()[1]
+        pon = rs.PipelineSpec(sims=["TNG50-4"], ordered_merge=True)
+        check("ordered merge: Grids and Pipeline jobs set ORDERED_MERGE for run_ps_dtfe.sh (spelled out when off, so a "
+              "stray export cannot leak in), the Pipeline's memory check too; the Custom tab passes the flag (PS only)",
+              on.get("ORDERED_MERGE") == "1" and off.get("ORDERED_MERGE") == "0"
+              and pon.command()[1].get("ORDERED_MERGE") == "1"
+              and pon.check_step("TNG50-4", [99], 1024).env.get("ORDERED_MERGE") == "1"
+              and rs.PipelineSpec(sims=["TNG50-4"]).command()[1].get("ORDERED_MERGE") == "0"
+              and "--ordered-merge" in rs.CustomSpec(input_file=str(snap), ordered_merge=True).command()
+              and "--ordered-merge" not in rs.CustomSpec(input_file=str(snap)).command()
+              and "--ordered-merge" not in rs.CustomSpec(input_file=str(snap), estimator="dtfe",
+                                                         ordered_merge=True).command(), str(on))
+        d = base / "runs"
+        d.mkdir()
+        _write_log(d / "om.runlog", "RUNNING: /x/PS-DTFE in.hdf5 om --grid 64 --partition 2 2 2 --ordered-merge\n"
+                   "   total wall time   : 12s\n")
+        _write_log(d / "plain.runlog", "RUNNING: /x/PS-DTFE in.hdf5 plain --grid 64 --partition 2 2 2\n"
+                   "   total wall time   : 12s\n")
+        om, plain = R.parse_runlog(d / "om.runlog"), R.parse_runlog(d / "plain.runlog")
+        check("ordered merge: settings() carries it (and turns it OFF for a run without it), the Options column says it, "
+              "and the settings load into a RunSpec",
+              om.settings().get("ordered_merge") is True and plain.settings().get("ordered_merge") is False
+              and "ordered merge" in om.options_text() and "ordered merge" not in plain.options_text()
+              and all(hasattr(rs.RunSpec(), k) for k in om.settings()), f"{om.settings()} {om.options_text()!r}")
+        import presets as P
+        check("ordered merge: the tick's label has no '--', and names the option it stands for",
+              "--" not in P.label("ordered_merge") and P.OPTION_TEXT["ordered_merge"][1] == "--ordered-merge")
+
+        # K2: a killed partitioned run leaves '<prefix>.runlog.checkpoint/' (a directory); it is a run file, never an
+        # output or a log, and with no live process the run is 'resumable' -- when run_ps_dtfe.sh ran it (a Grids or
+        # Pipeline job: under the data root's snapdir_*, 2026-10-11), and its attempt did not fail on a refused resume
+        t0 = time.time() - 600.0
+        sd = base / "root" / "TNGK-1-Dark" / "snapdir_099"           # where run_ps_dtfe.sh writes
+        sd.mkdir(parents=True)
+        for sfx in ("a_den", "a_vel"):
+            (sd / f"ck.{sfx}").write_bytes(b"\0" * 32)
+        _write_log(sd / "ck.runlog.partial", "RUNNING: /x/PS-DTFE in.hdf5 ck --grid 64 --partition 2 2 2\n"
+                   "PS-DTFE: checkpoints of the merged grids go to 'ck.runlog.checkpoint' (at most ~5% of the run; "
+                   "removed when the outputs are written; '--resume' continues a killed run from it).\n"
+                   "partition 3/8 done\n", t0)
+        ckd = sd / "ck.runlog.checkpoint"
+        ckd.mkdir()
+        (ckd / "manifest.json").write_text("{}")
+        (sd / "ck.runlog.checkpoint.tmp").write_text("")      # a checkpoint being written: a run file too
+        _write_log(sd / "ck2.runlog", "RUNNING: /x/PS-DTFE in.hdf5 ck2 --grid 64\n   total wall time   : 1s\n", t0 - 60)
+        _write_log(sd / "ck2.runlog.failed", "RUNNING: /x/PS-DTFE in.hdf5 ck2 --grid 64 --partition 2 2 2\n"
+                   "~~~ ERROR ~~~\n", t0)
+        (sd / "ck2.runlog.checkpoint").mkdir()
+        # the resume refused (the settings changed since the kill): the same job fails the same way every time
+        _write_log(sd / "rf.runlog", "RUNNING: /x/PS-DTFE in.hdf5 rf --grid 64\n   total wall time   : 1s\n", t0 - 60)
+        _write_log(sd / "rf.runlog.failed", "RUNNING: /x/PS-DTFE in.hdf5 rf --grid 128 --partition 2 2 2 --resume\n"
+                   "~~~ ERROR ~~~ '--resume' refused: the checkpoint 'rf.runlog.checkpoint' was written by a run with "
+                   "other settings.\n", t0)
+        (sd / "rf.runlog.checkpoint").mkdir()
+        _write_log(sd / "rf0.runlog.failed", "RUNNING: /x/PS-DTFE in.hdf5 rf0 --grid 64 --partition 2 2 2 --resume\n"
+                   "~~~ ERROR ~~~ '--resume': nothing to resume -- no manifest. Run without '--resume' to start the "
+                   "run.\n", t0)
+        (sd / "rf0.runlog.checkpoint").mkdir()
+        # a Custom run (its own output folder): it never resumes, a checkpoint or not
+        _write_log(d / "cu.runlog.failed", "RUNNING: /x/PS-DTFE in.hdf5 cu --grid 64 --partition 2 2 2\n"
+                   "~~~ ERROR ~~~\n", t0)
+        (d / "cu.runlog.checkpoint").mkdir()
+        _write_log(d / "gone.runlog.partial", "RUNNING: /x/PS-DTFE in.hdf5 gone --grid 64\n", t0)
+        check("a checkpoint directory and its files are run files (never an output, never a log)",
+              R.is_run_file("ck.runlog.checkpoint") and R.is_run_file("ck.runlog.checkpoint.tmp")
+              and not R.is_run_file("ck.runlog") and not R.is_run_file("ck.a_den"))
+        got = {r.prefix: r for r in R.scan_runs(base / "root", [d])}
+        ck, ck2, gone = got.get("ck"), got.get("ck2"), got.get("gone")
+        rf, rf0, cu = got.get("rf"), got.get("rf0"), got.get("cu")
+        if shutil.which("ps"):
+            check("a killed run with its checkpoint is 'resumable' (a failed attempt after a finished log too); one "
+                  "killed without a checkpoint stays 'killed'; the checkpoint is not among the outputs",
+                  ck is not None and ck.attempt == "resumable" and not ck.ok
+                  and [p.name for p in ck.outputs] == ["ck.a_den", "ck.a_vel"]
+                  and ck2 is not None and ck2.ok and ck2.attempt == "resumable"
+                  and gone is not None and gone.attempt == "killed",
+                  str({k: (v.attempt, [p.name for p in v.outputs]) for k, v in got.items()}))
+            n1, n2 = R.attempt_note(ck), R.attempt_note(ck2)
+            check("... and its note says the same job resumes it, and names the start-over tick",
+                  n1 is not None and "resum" in n1[1] and n2 is not None and "resum" in n2[1]
+                  and all("Start over" in m and "PS_RESUME=0" in m for _, m in (n1, n2))
+                  and not [m for _, m in (n1, n2) if "--" in m], f"{n1} {n2}")
+        else:
+            check("without ps a '.runlog.partial' stays 'partial' (its process cannot be ruled out), checkpoint or not",
+                  ck is not None and ck.attempt == "partial")
+        # 2026-10-11: a refused resume is never 'resumable' (rerunning fails again), nor is a Custom run's checkpoint
+        nr, nr0 = (R.attempt_note(r) if r is not None else None for r in (rf, rf0))
+        check("a resume the binary refused (other settings; nothing to resume) stays 'failed', its note and cause name "
+              "'Start over' (PS_RESUME=0, no '--'); a Custom run's checkpoint is never 'resumable'",
+              rf is not None and rf.attempt == "failed" and getattr(rf, "attempt_resume_refused", False) and rf.ok
+              and rf0 is not None and rf0.attempt == "failed" and getattr(rf0, "attempt_resume_refused", False)
+              and "Resume refused" in rf.attempt_cause
+              and all(n is not None and n[0] == "warning" and "Start over" in n[1] and "PS_RESUME=0" in n[1]
+                      and "--" not in n[1] for n in (nr, nr0))
+              and cu is not None and cu.attempt == "failed" and not getattr(cu, "attempt_resume_refused", False),
+              str({k: (v.attempt, getattr(v, "attempt_resume_refused", None), v.attempt_cause) for k, v in got.items()}) + f" {nr} {nr0}")
+        dg = R.diagnose("~~~ ERROR ~~~ '--resume' refused: the checkpoint 'x' was written by a run with other settings.")
+        check("... diagnose() offers the start-over tick for it; the binary's info lines about '--resume' are no refusal",
+              [d_.action for d_ in dg] == ["start_over"] and "--" not in dg[0].advice
+              and hasattr(R, "RESUME_REFUSED") and not R.RESUME_REFUSED.search("this run starts over and replaces it ('--resume' continues it).")
+              and not R.RESUME_REFUSED.search("removed when the outputs are written; '--resume' continues a killed "
+                                              "run from it)"), str(dg))
+        # the start-over tick: PS_RESUME=0 for run_ps_dtfe.sh, spelled out as 1 otherwise (a stray export cannot leak in)
+        check("start over: Grids and Pipeline jobs set PS_RESUME=0 when ticked, 1 otherwise; the memory check ignores it",
+              rs.RunSpec(sim="TNG50-4", snapshots=[99], start_over=True).command()[1].get("PS_RESUME") == "0"
+              and off.get("PS_RESUME") == "1"
+              and rs.PipelineSpec(sims=["TNG50-4"], start_over=True).command()[1].get("PS_RESUME") == "0"
+              and rs.PipelineSpec(sims=["TNG50-4"]).command()[1].get("PS_RESUME") == "1"
+              and rs.RunSpec(start_over=True).memory_key() == rs.RunSpec().memory_key()
+              and rs.PipelineSpec(start_over=True).memory_key() == rs.PipelineSpec().memory_key()
+              and "start_over" not in om.settings(), str(off))
+    finally:
         shutil.rmtree(base, ignore_errors=True)
 
 

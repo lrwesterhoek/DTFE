@@ -28,6 +28,15 @@ per void with every tracked quantity. Those names are PS-DTFE's default grids (p
 estimator or --prefix adds '_<method>' / '_<prefix>', another --snap '_snap<N>', --radius r_eff '_reff' to the
 figures (2026-10-08: a --method dtfe or --snap run replaced the default files), and the void<K> files of this set
 beyond the voids written now are removed (a smaller --n-voids, or a void skipped, left an earlier run's beside them).
+--link particles adds '_particles', --exclusive (partitioned members, 2026-10-11) '_exclusive' after it.
+
+--link particles follows the void at each earlier snapshot that gave its successor the most member particles. With
+the default (overlapping) members a large R_v sphere at z >= 1 holds the matter of its neighbours too (member pairs
+are 1.5-2x the particles in TNG100 at z = 1.5-5), which favours the largest progenitor spheres; --exclusive
+partitions the matter (lagrangian.void_members) and reads the census's '_excl' links (plot_void_fate.py --exclusive
+builds them). TNG100-3-Dark, the 30 deepest z = 0 voids (2026-10-11): median progenitor R_v at z = 1 / 1.5 / 2 is
+23.6 / 23.2 / 27.6 Mpc by default and 15.3 / 17.2 / 22.6 Mpc exclusive, the median share 0.95 against 0.73-0.82;
+the median BBKS e per snapshot agrees within 0.015.
 """
 
 import _bootstrap  # noqa: F401  (puts python/ on sys.path)
@@ -46,6 +55,7 @@ from dtfelib.trees import TreeSet
 from dtfelib import environment as env
 from dtfelib import voids as V
 from dtfelib import groupcat as gc
+from dtfelib import lagrangian as L
 
 FIGURE_ROOT = Path(config.LOCAL_FIGURES_ROOT) / "void_tracking"
 
@@ -77,7 +87,10 @@ def catalog_at(snap, args):
     return cat, n, grids
 
 
-def main():
+TRACK_KEYS = ("r_v", "r_eff", "e", "p", "ell", "prol", "delta_min", "axis_cos", "a", "b", "c", "match_dist_mpc")
+
+
+def parse_args(argv=None):
     def extra(p):
         p.add_argument("--n-voids", type=int, default=5,
                        help="number of (deepest, well-resolved) voids to track (default 5)")
@@ -94,60 +107,61 @@ def main():
         p.add_argument("--radius", choices=("r_v", "r_eff"), default="r_v",
                        help="the size drawn and summarized: r_v, the measured void radius (default), or r_eff, "
                             "the ellipsoid fit's (abc)^(1/3) (the matching always uses R_eff)")
-    parser = make_parser("Track void size / BBKS shape (e,p) / orientation along merger-tree tracers, "
-                         "using the pipeline's own void catalogs at every snapshot.")
+        p.add_argument("--link", choices=("trees", "particles"), default="trees",
+                       help="how a void is followed in time: trees (default), along the merger-tree tracers; or "
+                            "particles, by its member particles (dtfelib.lagrangian: the void at the earlier "
+                            "snapshot that gave it most of them, the distinct well-resolved voids only; reads the "
+                            "combined snapshots once, then the links are cached)")
+        p.add_argument("--exclusive", action="store_true",
+                       help="with --link particles: each particle belongs to one void only, the one whose centre is "
+                            "nearest in units of its R_v (plot_void_fate's partitioned links, files '_exclusive'); at "
+                            "z >= 1 the R_v spheres overlap, and a large progenitor sphere otherwise claims the matter "
+                            "of its neighbours")
+    parser = make_parser("Track void size / BBKS shape (e,p) / orientation along merger-tree tracers (or by their "
+                         "member particles), using the pipeline's own void catalogs at every snapshot.")
     extra(parser)
     pipeline.add_smoothing_mpc_arg(parser)
-    args = parser.parse_args()
-    # keep the pipeline's cache/param hash in charge of consistency: an explicit --smooth / --smooth-mpc changes
-    # SMOOTHING_SIGMA_CELLS (and, in Mpc, the footprint) exactly the way a pipeline run with that value would
-    pipeline.apply_smoothing_args(args, "void-tracking")
+    args = parser.parse_args(argv)
+    if args.exclusive and args.link != "particles":
+        parser.error("--exclusive goes with --link particles (the merger-tree tracers have no member particles)")
+    return args
 
-    # ---- 1. reference-snapshot void catalog (the pipeline's own) ------------------------
-    try:
-        cat0, n0, grids0 = catalog_at(args.snap, args)
-    except ValueError as e:                    # the frame guard (or a bad grid): its own message, not 'no grids'
-        raise SystemExit(f"snapshot {args.snap} of {args.sim}: REFUSED: {e}")
-    if cat0 is None:
-        raise SystemExit(f"no {args.method} field grids at snapshot {args.snap} of {args.sim}")
-    good = np.nonzero(cat0["well_resolved"] & cat0["deep"])[0]
-    if not good.size:
-        raise SystemExit("no deep, well-resolved voids in the pipeline catalog")
-    order = good[np.argsort(cat0["delta_values"][good])]
-    picked = order[:args.n_voids]
-    print(f"{args.sim} snap {args.snap} ({args.method}): pipeline catalog has {len(cat0['coords'])} voids, "
-          f"{good.size} deep+well-resolved; tracking the {picked.size} deepest")
 
-    # ---- 2. tracer pool from the merger trees ------------------------------------------
-    use_data_root(args.data_root)      # --data-root for the trees, group catalogues and ladder too (2026-10-05)
-    ts = TreeSet(args.sim)
-    box_ckpc_h = env.box_ckpc_h(args.sim, args.snap)   # SubLink positions are ckpc/h
-    pool = ts.positions_at(args.snap, min_mass=args.min_mass)
-    pool_frac = V.wrap_frac(pool["pos_ckpc_h"] / box_ckpc_h)
-    print(f"tracer pool: {pool_frac.shape[0]} tree subhalos at snap {args.snap}")
+def new_track(snaps, ztab):
+    """The empty per-snapshot record of one tracked void (snapshots descending)."""
+    t = {q: np.full(len(snaps), np.nan) for q in TRACK_KEYS}
+    t["snap"] = np.array(snaps)
+    t["redshift"] = np.array([ztab.get(s, np.nan) for s in snaps])
+    t["n_tracers"] = np.zeros(len(snaps))
+    t["tree_identity"] = np.zeros(len(snaps), dtype=bool)
+    t["well_resolved"] = np.zeros(len(snaps), dtype=bool)
+    return t
 
-    ztab = gc.redshift_table(args.sim)
-    ladder = sorted({int(d.name.split("_")[1]) for d in env.sim_dir(args.sim).glob("snapdir_*")})
 
-    # per-snapshot pipeline catalogs (cached on disk by the pipeline itself)
-    catalogs = {}
-    for s in ladder:
-        if s > args.snap:
-            continue
-        try:
-            cat, n, _grids = catalog_at(s, args)
-        except ValueError as e:                # said, as plot_void_population does, not dropped silently
-            print(f"  snap {s:3d}: REFUSED: {e}")
-            continue
-        if cat is not None:
-            catalogs[s] = (cat, n)
-    print(f"pipeline void catalogs available at {len(catalogs)} snapshots: {sorted(catalogs)}")
+def read_void(t, i, cat, n, j, ref_axis):
+    """Fill snapshot i of track t from catalogue row j (the void's size, shape, depth and orientation)."""
+    t["well_resolved"][i] = bool(cat["well_resolved"][j])
+    t["e"][i], t["p"][i] = cat["bbks_params"][j]
+    t["delta_min"][i] = cat["delta_values"][j]
+    t["r_v"][i] = C.r_v_mpc(cat)[j]                      # the measured radius, cut or no cut
+    # sizes/orientation from the SAME fit formula as the catalog, but without the
+    # resolution gate (config.ELLIPSOID_CUT_RULES): shallow high-z proto-voids exceed its max axis
+    # and would otherwise vanish from the track; well_resolved records the gate.
+    fit = pipeline.ellipsoid_fit_one(cat["eigenvalues"][j], cat["eigenvectors"][j], config.BOX_SIZE / n)
+    if fit is not None:
+        a, b, c = fit["semi_axes"]
+        t["a"][i], t["b"][i], t["c"][i] = a, b, c
+        t["r_eff"][i] = float((a * b * c) ** (1.0 / 3.0))
+        t["ell"][i] = fit["ell"]
+        t["prol"][i] = fit["prol"]
+        t["axis_cos"][i] = unit_cos(fit["orientation"][:, 0], ref_axis)
 
-    outdir = FIGURE_ROOT / args.sim / pipeline.smoothing_tag()     # a non-default sigma: its own folder
-    outdir.mkdir(parents=True, exist_ok=True)
-    args.tag = _set_tag(args, grids0)
-    summary = []
 
+def track_voids_trees(cat0, n0, picked, catalogs, ts, pool_frac, pool_ids, box_ckpc_h, ztab, args):
+    """Follow the reference voids 'picked' (rows of cat0, snapshot args.snap) along merger-tree tracers and read
+    them from 'catalogs' ({snap: (cat, n)}) at every snapshot: [(k, track, r_eff0, extra npz fields)]. 'ts' is
+    anything with TreeSet.main_branch; split out of main (2026-10-11) so the tracker runs on synthetic trees."""
+    out = []
     for k, i0 in enumerate(picked):
         center0 = (cat0["coords"][i0] + 0.5) / n0
         semi0 = cat0["semi_axes"][i0]
@@ -163,7 +177,7 @@ def main():
             print("   too few tracers; skipping (raise --sel-factor or lower --min-mass)")
             continue
 
-        branches = V.tracer_branches(ts, args.snap, pool["subfind_id"][idx], box_ckpc_h)
+        branches = V.tracer_branches(ts, args.snap, pool_ids[idx], box_ckpc_h)
         centers = V.track_center(branches, args.snap, center0, args.min_tracers)
         earliest = min(centers)
         n_tr = {s: sum(1 for b in branches.values() if s in b) for s in centers}
@@ -172,14 +186,9 @@ def main():
 
         # ---- 3. read the void from the PIPELINE CATALOG at every field snapshot --------
         snaps = sorted(set(catalogs) | set(centers), reverse=True)
-        t = {q: np.full(len(snaps), np.nan) for q in
-             ("r_v", "r_eff", "e", "p", "ell", "prol", "delta_min", "axis_cos",
-              "a", "b", "c", "match_dist_mpc")}
-        t["snap"] = np.array(snaps)
-        t["redshift"] = np.array([ztab.get(s, np.nan) for s in snaps])
+        t = new_track(snaps, ztab)
         t["n_tracers"] = np.array([n_tr.get(s, 0) for s in snaps], dtype=float)
         t["tree_identity"] = np.array([s >= earliest for s in snaps])
-        t["well_resolved"] = np.zeros(len(snaps), dtype=bool)
         match_frac = args.match_factor * r_eff0 / config.BOX_SIZE
         missed = []
         for i, s in enumerate(snaps):
@@ -191,23 +200,8 @@ def main():
             if j is None:
                 missed.append((s, dist))
                 continue
-            t["well_resolved"][i] = bool(cat["well_resolved"][j])
-            t["e"][i], t["p"][i] = cat["bbks_params"][j]
-            t["delta_min"][i] = cat["delta_values"][j]
             t["match_dist_mpc"][i] = dist * config.BOX_SIZE
-            t["r_v"][i] = C.r_v_mpc(cat)[j]                      # the measured radius, cut or no cut
-            # sizes/orientation from the SAME fit formula as the catalog, but without the
-            # resolution gate (config.ELLIPSOID_CUT_RULES): shallow high-z proto-voids exceed its max axis
-            # and would otherwise vanish from the track; well_resolved records the gate.
-            fit = pipeline.ellipsoid_fit_one(cat["eigenvalues"][j], cat["eigenvectors"][j],
-                                             config.BOX_SIZE / n)
-            if fit is not None:
-                a, b, c = fit["semi_axes"]
-                t["a"][i], t["b"][i], t["c"][i] = a, b, c
-                t["r_eff"][i] = float((a * b * c) ** (1.0 / 3.0))
-                t["ell"][i] = fit["ell"]
-                t["prol"][i] = fit["prol"]
-                t["axis_cos"][i] = unit_cos(fit["orientation"][:, 0], ref_axis)
+            read_void(t, i, cat, n, j, ref_axis)
 
         got = np.isfinite(t["e"])
         zs = t["redshift"][got]
@@ -215,12 +209,140 @@ def main():
               f"(z = {np.nanmax(zs):.2f} .. {np.nanmin(zs):.2f})"
               + (f"; no match within {args.match_factor}*R_eff at snaps {[s for s,_ in missed]}"
                  if missed else ""))
+        out.append((k, t, r_eff0, {"center0_frac": center0, "catalog_index0": i0}))
+    return out
 
+
+def track_voids_particles(vsnaps, n_voids, ztab, links=None):
+    """Follow the deepest 'n_voids' distinct resolved voids of the LAST of 'vsnaps' (lagrangian.VoidSnapshot,
+    ascending in time) back by their matter: at each earlier snapshot the void is the one that gave its successor
+    the most member particles (lagrangian.main_progenitor). 'links' = [Link a -> b per consecutive pair] (default:
+    lagrangian.cached_link). The track's 'link_frac' is that progenitor's share of the successor's members (the
+    identity quality, as n_tracers is for the trees); before a void without progenitor nothing is read.
+    The walk stays on FOLLOWED voids (2026-10-11): a link's progenitors are a's followed voids only, and its
+    descendants b's whole pool with the followed ones first (lagrangian.void_pool), so a followed void's sample index
+    IS its pool index there and main_progenitor hands back a sample index of the earlier snapshot.
+    Returns [(k, track, r_eff0, extra npz fields)] as track_voids_trees."""
+    ref = vsnaps[-1]
+    order = np.argsort(np.asarray(ref.cat["delta_values"], float)[ref.rows])[:n_voids]
+    if links is None:
+        links = []
+        tag = L.link_tag(vsnaps[-1].method, vsnaps[-1].prefix)    # the census's link files (plot_void_fate)
+        for a, b in zip(vsnaps[:-1], vsnaps[1:]):
+            links.append(L.cached_link(a, b, tag))
+            a.drop_members()                                 # one snapshot's pool held at a time, as the census
+            b.drop_members(keep_prog=True)
+        vsnaps[-1].drop_members()
+    for lk, b in zip(links, vsnaps[1:]):
+        # the followed voids lead the pool: the tracker's sample indices address the link's descendants directly
+        assert lk.n_followed() >= b.rows.size, f"link to snap {b.snap}: its descendants are not b's pool"
+    back = [L.main_progenitor(lk) for lk in links]          # back[i]: vsnaps[i+1] -> vsnaps[i]
+    snaps = [v.snap for v in reversed(vsnaps)]
+    out = []
+    for k, q0 in enumerate(order):
+        i0 = int(ref.rows[q0])
+        ref_axis = ref.cat["orientations"][i0][:, 0]
+        semi0 = ref.cat["semi_axes"][i0]
+        r_eff0 = float(np.prod(semi0) ** (1.0 / 3.0))
+        t = new_track(snaps, ztab)
+        t["link_frac"] = np.full(len(snaps), np.nan)
+        t["catalog_row"] = np.full(len(snaps), -1)
+        q = int(q0)
+        for i, v in enumerate(reversed(vsnaps)):            # i = 0 is the reference snapshot
+            if q < 0:
+                break
+            if i > 0:
+                prog, frac = back[len(vsnaps) - 1 - i]
+                q, share = int(prog[q]), float(frac[q])
+                if q < 0:
+                    break
+                t["link_frac"][i] = share
+            j = int(v.rows[q])
+            t["catalog_row"][i] = j
+            t["tree_identity"][i] = True                     # identity by matter: never frozen
+            read_void(t, i, v.cat, v.n, j, ref_axis)
+        reached = t["snap"][t["catalog_row"] >= 0]
+        print(f"void {k}: row {i0}, delta_min {ref.cat['delta_values'][i0]:.2f}, R_v {t['r_v'][0]:.2f} Mpc: "
+              f"followed by its particles back to snap {reached.min()}")
+        out.append((k, t, r_eff0, {"center0_frac": (ref.cat["coords"][i0] + 0.5) / ref.n, "catalog_index0": i0}))
+    return out
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    # keep the pipeline's cache/param hash in charge of consistency: an explicit --smooth / --smooth-mpc changes
+    # SMOOTHING_SIGMA_CELLS (and, in Mpc, the footprint) exactly the way a pipeline run with that value would
+    pipeline.apply_smoothing_args(args, "void-tracking")
+
+    # ---- 1. reference-snapshot void catalog (the pipeline's own) ------------------------
+    try:
+        cat0, n0, grids0 = catalog_at(args.snap, args)
+    except ValueError as e:                    # the frame guard (or a bad grid): its own message, not 'no grids'
+        raise SystemExit(f"snapshot {args.snap} of {args.sim}: REFUSED: {e}")
+    if cat0 is None:
+        raise SystemExit(f"no {args.method} field grids at snapshot {args.snap} of {args.sim}")
+    use_data_root(args.data_root)      # --data-root for the trees, group catalogues and ladder too (2026-10-05)
+    ztab = gc.redshift_table(args.sim)
+    ladder = sorted({int(d.name.split("_")[1]) for d in env.sim_dir(args.sim).glob("snapdir_*")})
+    outdir = FIGURE_ROOT / args.sim / pipeline.smoothing_tag()     # a non-default sigma: its own folder
+    outdir.mkdir(parents=True, exist_ok=True)
+    args.tag = _set_tag(args, grids0)
+
+    if args.link == "particles":
+        vsnaps = []
+        for s in ladder:
+            if s > args.snap:
+                continue
+            try:
+                vsnaps.append(L.VoidSnapshot(args.sim, s, args.method, args.prefix, args.data_root,
+                                             exclusive=args.exclusive))
+            except FileNotFoundError as e:
+                print(f"  snap {s:3d}: left out ({e})")
+            except ValueError as e:
+                print(f"  snap {s:3d}: REFUSED: {e}")
+        if not vsnaps or vsnaps[-1].snap != args.snap:
+            raise SystemExit(f"no combined snapshot or void catalogue at snapshot {args.snap} of {args.sim}")
+        print(f"{args.sim} snap {args.snap}: {vsnaps[-1].rows.size} distinct resolved voids; following the "
+              f"{min(args.n_voids, vsnaps[-1].rows.size)} deepest by their particles over snaps "
+              f"{[v.snap for v in vsnaps]}")
+        summary = track_voids_particles(vsnaps, args.n_voids, ztab)
+    else:
+        good = np.nonzero(cat0["well_resolved"] & cat0["deep"])[0]
+        if not good.size:
+            raise SystemExit("no deep, well-resolved voids in the pipeline catalog")
+        order = good[np.argsort(cat0["delta_values"][good])]
+        picked = order[:args.n_voids]
+        print(f"{args.sim} snap {args.snap} ({args.method}): pipeline catalog has {len(cat0['coords'])} voids, "
+              f"{good.size} deep+well-resolved; tracking the {picked.size} deepest")
+
+        # ---- 2. tracer pool from the merger trees ------------------------------------------
+        ts = TreeSet(args.sim)
+        box_ckpc_h = env.box_ckpc_h(args.sim, args.snap)   # SubLink positions are ckpc/h
+        pool = ts.positions_at(args.snap, min_mass=args.min_mass)
+        pool_frac = V.wrap_frac(pool["pos_ckpc_h"] / box_ckpc_h)
+        print(f"tracer pool: {pool_frac.shape[0]} tree subhalos at snap {args.snap}")
+
+        # per-snapshot pipeline catalogs (cached on disk by the pipeline itself)
+        catalogs = {}
+        for s in ladder:
+            if s > args.snap:
+                continue
+            try:
+                cat, n, _grids = catalog_at(s, args)
+            except ValueError as e:                # said, as plot_void_population does, not dropped silently
+                print(f"  snap {s:3d}: REFUSED: {e}")
+                continue
+            if cat is not None:
+                catalogs[s] = (cat, n)
+        print(f"pipeline void catalogs available at {len(catalogs)} snapshots: {sorted(catalogs)}")
+        summary = track_voids_trees(cat0, n0, picked, catalogs, ts, pool_frac, pool["subfind_id"], box_ckpc_h,
+                                    ztab, args)
+
+    for k, t, r_eff0, extra in summary:
         plot_void(t, k, args, outdir, r_eff0)
-        np.savez_compressed(outdir / f"void{k}_track{args.tag}.npz", **t, center0_frac=center0,
-                            catalog_index0=i0, method=grids0[0], prefix=grids0[1], ref_snap=args.snap)
-        summary.append((k, t))
-
+        np.savez_compressed(outdir / f"void{k}_track{args.tag}.npz", **t, **extra,
+                            method=grids0[0], prefix=grids0[1], ref_snap=args.snap, link=args.link)
+    summary = [(k, t) for k, t, _r, _e in summary]
     if summary:
         plot_summary(summary, args, outdir)
     _remove_stale(outdir, args, {k for k, _t in summary})
@@ -229,11 +351,14 @@ def main():
 
 def _set_tag(args, grids):
     """The name tag of this run's set (2026-10-08): '' for PS-DTFE's default grids from snapshot 99 (every file on the
-    T7); else '_<method>' or '_<prefix>', and '_snap<N>'. The radius has its own suffix on the figures."""
+    T7); else '_<method>' or '_<prefix>', and '_snap<N>'; '_particles' for --link particles (2026-10-11), and
+    '_exclusive' after it for partitioned members (2026-10-11 afternoon). The radius has its own suffix on the figures."""
     method, prefix = grids
     default_prefix = {"ps": "ps_output.", "dtfe": "output."}         # io's: an estimator's own grids
     g = method if prefix == default_prefix.get(method) else prefix.rstrip(".")
-    return ("" if g == "ps" else f"_{g}") + ("" if args.snap == DEFAULT_SNAP else f"_snap{args.snap}")
+    return (("" if g == "ps" else f"_{g}") + ("" if args.snap == DEFAULT_SNAP else f"_snap{args.snap}")
+            + ("_particles" if getattr(args, "link", "trees") == "particles" else "")
+            + ("_exclusive" if getattr(args, "exclusive", False) else ""))
 
 
 def _remove_stale(outdir, args, written):
@@ -275,11 +400,28 @@ def _radius_suffix(args):
     return "" if args.radius == "r_v" else "_reff"
 
 
+def _x_axis(t):
+    """The time axis: 1+z on a log scale (2026-10-11: 6 of the 9 ladder snapshots sit at z < 3, squeezed into the
+    right 15% of a linear z axis); the snapshot number when no redshift is known."""
+    if np.isfinite(t["redshift"]).any():
+        return 1.0 + np.asarray(t["redshift"], dtype=float), "1 + z"
+    return t["snap"].astype(float), "snapshot"
+
+
+def _finish_x(ax, xlabel):
+    if xlabel == "1 + z":
+        from matplotlib.ticker import FixedLocator, NullLocator, FuncFormatter
+        ax.set_xscale("log")
+        lo, hi = sorted(ax.get_xlim())
+        ticks = [t for t in (1, 1.5, 2, 3, 4, 6, 11, 21) if lo <= t <= hi]   # the ladder's 1+z, readable
+        ax.xaxis.set_major_locator(FixedLocator(ticks))
+        ax.xaxis.set_minor_locator(NullLocator())
+        ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _p: f"{v:g}"))
+        ax.invert_xaxis()
+
+
 def plot_void(t, k, args, outdir, r_eff0):
-    x = t["redshift"]
-    xlabel = "redshift z"
-    if not np.isfinite(x).any():
-        x, xlabel = t["snap"].astype(float), "snapshot"
+    x, xlabel = _x_axis(t)
 
     fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(8, 12), sharex=True)
 
@@ -314,38 +456,76 @@ def plot_void(t, k, args, outdir, r_eff0):
     _open_markers(ax3, x, t["axis_cos"], t["tree_identity"], color="tab:green")
     _sub_res_markers(ax3, x, t["axis_cos"], t["well_resolved"], color="tab:green")
     ax3b = ax3.twinx()
-    plot_finite(ax3b, x, t["n_tracers"], "-", color="0.6", lw=0.9, label="surviving tracers")
-    ax3.set_ylim(0, 1.05); ax3.set_ylabel("orientation drift"); ax3b.set_ylabel("tracers")
+    if "link_frac" in t:                 # --link particles: the main progenitor's share of the successor's members
+        plot_finite(ax3b, x, t["link_frac"], "-", color="0.6", lw=0.9, label="main-progenitor share of members")
+        ax3b.set_ylabel("particle share"); ax3b.set_ylim(0, 1.05)
+    else:
+        plot_finite(ax3b, x, t["n_tracers"], "-", color="0.6", lw=0.9, label="surviving tracers")
+        ax3b.set_ylabel("tracers")
+    ax3.set_ylim(0, 1.05); ax3.set_ylabel("orientation drift")
     ax3.set_xlabel(xlabel)
     h1, l1 = ax3.get_legend_handles_labels(); h2, l2 = ax3b.get_legend_handles_labels()
     ax3.legend(h1 + h2, l1 + l2, fontsize=9, loc="lower left")
 
     for ax in (ax1, ax2, ax3):
         ax.grid(alpha=0.3)
-    if xlabel.startswith("redshift"):
-        ax3.invert_xaxis()
+    _finish_x(ax3, xlabel)
     fig.tight_layout()
     fig.savefig(outdir / f"void{k}_evolution{args.tag}{_radius_suffix(args)}.png", dpi=200, bbox_inches="tight")
     plt.close(fig)
 
 
+BAND_MIN_VOIDS = 6     # from this many tracked voids on, the summary draws their median and 16-84% band
+
+
+def summary_bands(summary, key):
+    """(snaps descending, 1+z, 16/50/84 percentiles (3, n)) of one tracked quantity over the voids, per snapshot
+    (NaN where fewer than half the voids, or fewer than 3, have it: a median of the few survivors is no median)."""
+    snaps = sorted({int(s) for _k, t in summary for s in t["snap"]}, reverse=True)
+    z = np.full(len(snaps), np.nan)
+    vals = np.full((len(summary), len(snaps)), np.nan)
+    for r, (_k, t) in enumerate(summary):
+        for i, s in enumerate(t["snap"]):
+            c = snaps.index(int(s))
+            vals[r, c] = t[key][i]
+            z[c] = t["redshift"][i]
+    pct = np.full((3, len(snaps)), np.nan)
+    for c in range(len(snaps)):
+        v = vals[:, c][np.isfinite(vals[:, c])]
+        if v.size >= max(3, len(summary) // 2):
+            pct[:, c] = np.percentile(v, (16, 50, 84))
+    return np.array(snaps), 1.0 + z, pct
+
+
 def plot_summary(summary, args, outdir):
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 9), sharex=True)
+    many = len(summary) >= BAND_MIN_VOIDS
+    xlabel = "1 + z"
     for k, t in summary:
-        x = t["redshift"] if np.isfinite(t["redshift"]).any() else t["snap"].astype(float)
-        c = f"C{k % 10}"                 # one colour per void in both panels (the cycle gave e and p different ones)
-        plot_finite(ax1, x, t[args.radius], "o-", ms=3, alpha=0.8, color=c, label=f"void {k}")
-        plot_finite(ax2, x, t["e"], "o-", ms=3, alpha=0.8, color=c, label=f"void {k}")
-        plot_finite(ax2, x, t["p"], "s--", ms=3, alpha=0.5, color=c)
+        x, xlabel = _x_axis(t)
+        c = "0.75" if many else f"C{k % 10}"   # one colour per void in both panels (the cycle gave e and p different ones)
+        kw = dict(lw=0.6, ms=0, alpha=0.6) if many else dict(ms=3, alpha=0.8, label=f"void {k}")
+        plot_finite(ax1, x, t[args.radius], "o-", color=c, **kw)
+        plot_finite(ax2, x, t["e"], "o-", color=c, **kw)
+        if not many:
+            plot_finite(ax2, x, t["p"], "s--", ms=3, alpha=0.5, color=c)
+    if many and xlabel == "1 + z":         # tens of voids: their median and 16-84% band per snapshot (2026-10-11)
+        for ax, key, col, lab in ((ax1, args.radius, "tab:purple", "radius"), (ax2, "e", "tab:blue", "e"),
+                                  (ax2, "p", "tab:orange", "p")):
+            _s, x, pct = summary_bands(summary, key)
+            ok = np.isfinite(pct[1])
+            ax.plot(x[ok], pct[1][ok], "o-", color=col, ms=4, label=f"median {lab} ({len(summary)} voids)")
+            ax.fill_between(x[ok], pct[0][ok], pct[2][ok], color=col, alpha=0.2, label="16-84%")
     ax1.set_ylabel(r"$R_v$ (measured) [Mpc]" if args.radius == "r_v" else r"$R_{\rm eff}$ [Mpc]"); ax1.legend(fontsize=8)
-    ax1.set_title(f"{args.sim} — tracked void evolution ({args.method}, pipeline catalogs); "
-                  "solid=e, dashed=p below")
+    link = "particle links" if getattr(args, "link", "trees") == "particles" else "merger-tree tracers"
+    ax1.set_title(f"{args.sim} — tracked void evolution ({args.method}, pipeline catalogs, {link}); "
+                  + ("grey: single voids" if many else "solid=e, dashed=p below"))
     ax2.axhline(0, color="gray", lw=0.7, ls=":")
-    ax2.set_ylabel("BBKS e (solid), p (dashed)")
-    ax2.set_xlabel("redshift z"); ax2.legend(fontsize=8)
+    ax2.set_ylabel("BBKS e, p" if many else "BBKS e (solid), p (dashed)")
+    ax2.set_xlabel(xlabel); ax2.legend(fontsize=8)
     for ax in (ax1, ax2):
         ax.grid(alpha=0.3)
-    ax2.invert_xaxis()
+    _finish_x(ax2, xlabel)
     fig.tight_layout()
     fig.savefig(outdir / f"voids_summary{args.tag}{_radius_suffix(args)}.png", dpi=200, bbox_inches="tight")
     plt.close(fig)

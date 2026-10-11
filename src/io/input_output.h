@@ -26,6 +26,7 @@
 binary/text files for input/output. */
 
 #include <algorithm>
+#include "../output_staging.h"   // crash-safe outputs: openOutput*File stages every file
 
 
 // Owning pointer + allocated flag for one Read_data array; frees its buffer on destruction.
@@ -255,8 +256,14 @@ void openInputBinaryFile(std::fstream & inputFile,
 void openOutputBinaryFile(std::fstream & outputFile,
                           std::string & fileName)
 {
-    char const *temp = fileName.c_str();
-    outputFile.open( temp, std::ios::out | std::ios::binary );
+    // the write phase stages every output as '<file>.part.<pid>' (or in the rescue folder): output_staging.h
+    std::string path = outputStagePath( fileName );
+    outputFile.open( path.c_str(), std::ios::out | std::ios::binary );
+    if ( not outputFile.is_open() )
+    {
+        path = outputStageRetry( fileName );
+        if ( not path.empty() ) outputFile.open( path.c_str(), std::ios::out | std::ios::binary );
+    }
     
     if ( not outputFile.is_open() )
     {
@@ -281,8 +288,14 @@ void openInputTextFile(std::fstream & inputFile,
 void openOutputTextFile(std::fstream & outputFile,
                         std::string & fileName)
 {
-    char const *temp = fileName.c_str();
-    outputFile.open( temp, std::ios::out );
+    // the write phase stages every output as '<file>.part.<pid>' (or in the rescue folder): output_staging.h
+    std::string path = outputStagePath( fileName );
+    outputFile.open( path.c_str(), std::ios::out );
+    if ( not outputFile.is_open() )
+    {
+        path = outputStageRetry( fileName );
+        if ( not path.empty() ) outputFile.open( path.c_str(), std::ios::out );
+    }
     
     if ( not outputFile.is_open() )
     {

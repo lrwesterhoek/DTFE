@@ -15,7 +15,11 @@
 #   ./run_ps_pipeline.sh --help                     # this header, nothing run (--version: the revision)
 #
 # RESUMABLE: a snapshot is skipped when its <prefix>.pts_den exists and is newer than both
-# its combined_*.hdf5 and the plane file (and, with PTS_VEL_GRAD=1, its .pts_velGrad exists).
+# its combined_*.hdf5 and the plane file (and, with PTS_VEL_GRAD=1, its .pts_velGrad exists),
+# AND the settings in its <prefix>.runlog match this run's (grid, sub-samples, padding, lambda_th,
+# precision, the deposit options, and every requested field among its fields; not the GPU/CPU
+# choice, the split or the build).
+# A snapshot without a run log is judged by the file times alone (said per snapshot).
 # Interrupted batches continue where they stopped. FORCE=1 recomputes everything.
 #
 # Env knobs (all optional):
@@ -109,6 +113,39 @@ echo "Slice: axis ${AXIS}, ${NU} px, centre ${CENTER:-box/2}, planes ${PLANES}$(
 
 run() { echo "+ $*"; [ "${DRY_RUN}" = "1" ] || "$@"; }
 
+# run_settings <command line>: the options of a run_ps_dtfe.sh command that change its grids, one per line,
+# sorted -- from the RUNNING: line a run log starts with, or from a DRY_RUN=1 'would run' line (its %q
+# quoting only touches the paths, which are not compared). The binary's name carries the precision.
+run_settings() {
+    printf '%s\n' "$1" | awk '
+        BEGIN { split("--grid --padding --avg-subsamples --field --lambda_th", v); for (i in v) val[v[i]] = 1
+                split("--periodic --ps-vertex-mass --ps-volume-weighted --ps-exact-deposit --ps-linear-deposit " \
+                      "--ps-caustics --ps-caustic-cusps --pts-vel-grad", b); for (i in b) flag[b[i]] = 1 }
+        { i = 1; if ($1 == "RUNNING:") i = 2
+          bin = $i; sub(/.*\//, "", bin); print "binary " bin
+          cur = ""; line = ""
+          for (i = i + 1; i <= NF; i++) {
+              if ($i ~ /^--/) {
+                  if (line != "") print line
+                  line = ""; cur = ""
+                  if ($i in val) { cur = $i; line = $i } else if ($i in flag) print $i
+              } else if (cur != "") line = line " " $i
+          }
+          if (line != "") print line }' | sort
+}
+
+# same_settings <have> <want> (run_settings outputs): equal, except that the grids on disk may carry MORE
+# fields than asked for (the thesis set adds tweb_a/vweb_a to the pipeline's default list: a rerun with the
+# default must not recompute grids it already has)
+same_settings() {
+    [ "$(printf '%s\n' "$1" | grep -v '^--field ')" = "$(printf '%s\n' "$2" | grep -v '^--field ')" ] || return 1
+    local have=" $(printf '%s\n' "$1" | sed -n 's/^--field //p') " f
+    for f in $(printf '%s\n' "$2" | sed -n 's/^--field //p'); do
+        case "${have}" in *" ${f} "*) ;; *) return 1 ;; esac
+    done
+    return 0
+}
+
 # fresh <target> <prereq...>: target exists and is strictly newer than every prerequisite
 # (a missing prerequisite counts as stale -- we cannot verify against what is not there).
 fresh() {
@@ -172,7 +209,22 @@ for sim in ${SIMS}; do
     fi
 
     # ---- grids + point evaluation, one triangulation per snapshot ------------------------
-    # resume: only snapshots whose slice is missing or older than its inputs are computed
+    # PS_METAL follows PS_GPU too: -m only switches the GPU ON, an exported PS_METAL=1 would otherwise leak in
+    env_args=(SAMPLE_POINTS="${plane}.bin" PS_VOLUME_WEIGHTED="${PS_VOLUME_WEIGHTED}" PTS_VEL_GRAD="${PTS_VEL_GRAD}"
+              PS_METAL="${PS_GPU}")
+    [ -n "${FIELDS:-}" ] && env_args+=(FIELDS="${FIELDS}")
+    # The settings this batch would run each snapshot with, asked from run_ps_dtfe.sh itself (DRY_RUN=1: reads,
+    # runs and writes nothing), so the comparison below cannot drift from what it runs (2026-10-11: the check
+    # compared file times only, so a changed grid or field list printed 'up to date' for every snapshot).
+    planned=""
+    if [ "${FORCE}" != "1" ] && [ "${plane_new}" != "1" ]; then
+        planned="$(env "${env_args[@]}" DRY_RUN=1 "${SCRIPT_DIR}/run_ps_dtfe.sh" -s "${sim}" -g "${GRID_SIZE}" \
+                       ${gpu_args[@]+"${gpu_args[@]}"} "${snaps[@]}" 2>/dev/null \
+                   | awk '/^Processing snapshot / { s = $3; sub(/\.+$/, "", s) }
+                          /DRY RUN -- would run:/ { want = 1; next }
+                          want { sub(/^ +/, ""); print s "\t" $0; want = 0 }')"
+    fi
+    # resume: only snapshots whose slice is missing, older than its inputs, or made with other settings are computed
     compute=()
     for n in "${snaps[@]}"; do
         sd="${simdir}/snapdir_$(printf "%03d" "$n")"
@@ -183,16 +235,29 @@ for sim in ${SIMS}; do
         if [ "${PTS_VEL_GRAD}" = "1" ] && [ ! -f "${sd}/${PREFIX}.pts_velGrad" ]; then vg_ok=0; fi
         if [ "${FORCE}" != "1" ] && [ "${plane_new}" != "1" ] && [ "${vg_ok}" = "1" ] \
             && fresh "${sd}/${PREFIX}.pts_den" "${cf}" "${plane}.bin"; then
-            echo "-- snap ${n}: ${PREFIX}.pts_den up to date, skipping compute"
+            rl="${sd}/${PREFIX}.runlog"
+            want="$(printf '%s\n' "${planned}" | awk -F '\t' -v s="$(printf "%03d" "$n")" '$1 == s { print $2; exit }')"
+            if [ ! -f "${rl}" ]; then
+                echo "-- snap ${n}: ${PREFIX}.pts_den up to date by file times (no ${PREFIX}.runlog to compare the settings with), skipping compute"
+            elif [ -z "${want}" ]; then
+                echo "-- snap ${n}: ${PREFIX}.pts_den up to date by file times (this run's settings could not be worked out: run_ps_dtfe.sh's dry run failed), skipping compute"
+            else
+                have_s="$(run_settings "$(grep -a -m1 '^RUNNING:' "${rl}")")"
+                want_s="$(run_settings "${want}")"
+                if same_settings "${have_s}" "${want_s}"; then
+                    echo "-- snap ${n}: ${PREFIX}.pts_den up to date (same settings), skipping compute"
+                else
+                    echo "-- snap ${n}: settings differ from its ${PREFIX}.runlog, recomputing"
+                    comm -23 <(printf '%s\n' "${have_s}") <(printf '%s\n' "${want_s}") | sed 's/^/     was: /'
+                    comm -13 <(printf '%s\n' "${have_s}") <(printf '%s\n' "${want_s}") | sed 's/^/     now: /'
+                    compute+=("$n")
+                fi
+            fi
         else
             compute+=("$n")
         fi
     done
     if [ ${#compute[@]} -gt 0 ]; then
-        # PS_METAL follows PS_GPU too: -m only switches the GPU ON, an exported PS_METAL=1 would otherwise leak in
-        env_args=(SAMPLE_POINTS="${plane}.bin" PS_VOLUME_WEIGHTED="${PS_VOLUME_WEIGHTED}" PTS_VEL_GRAD="${PTS_VEL_GRAD}"
-                  PS_METAL="${PS_GPU}")
-        [ -n "${FIELDS:-}" ] && env_args+=(FIELDS="${FIELDS}")
         run env "${env_args[@]}" \
             "${SCRIPT_DIR}/run_ps_dtfe.sh" -s "${sim}" -g "${GRID_SIZE}" ${gpu_args[@]+"${gpu_args[@]}"} "${compute[@]}" \
             || { echo "!! ${sim}: run_ps_dtfe.sh reported failure (continuing with the next simulation)"; overall_rc=1; }

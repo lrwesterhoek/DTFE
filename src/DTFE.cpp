@@ -28,6 +28,9 @@
 #include <condition_variable>
 #include <mutex>
 #include <chrono>   // partition-loop progress + ETA
+#include <thread>      // the partition look-ahead (2026-10-11)
+#include <exception>
+#include <memory>
 #ifdef OPEN_MP
     #include <omp.h>
 #endif
@@ -51,6 +54,10 @@
 #include "scratch_alloc.h"
 #include "ps_point_eval.h"
 #include "ps_globals_record.h"
+#include "run_progress.h"   // the '<output>.runlog.progress' sidecar (2026-10-11)
+#ifdef PHASE_SPACE
+#include "partition_checkpoint.h"   // checkpoint + '--resume' of a partitioned PS run (2026-10-11)
+#endif
 #include "io/io.h"         // readInputData: the late read of a --ps-window run that started without its particles
 
 
@@ -75,6 +82,13 @@ void DTFE_parallel(vector<Particle_data> *allParticles,
                    User_options & userOptions,
                    Quantities *uQuantities,
                    Quantities *aQuantities);
+#ifdef PHASE_SPACE
+// the partition look-ahead's two halves (triangulation.cpp): the tessellation + vertex densities of a
+// partition built ahead (an opaque handle: this file does not see CGAL), and its grid passes later
+std::shared_ptr<void> psPrebuildTessellation(vector<Particle_data> *p, User_options &userOptions);
+void psInterpolatePrebuilt(std::shared_ptr<void> &tessellation, vector<Sample_point> &samples,
+                           User_options &userOptions, Quantities *uQuantities, Quantities *aQuantities);
+#endif
 
 // Derives velocity divergence, shear and vorticity from the stored velocity gradient.
 void computeDivergenceShearVorticity(Field &fields,
@@ -265,6 +279,70 @@ struct PSPartitionPlan
         }
     }
 };
+
+/* Each partition's predicted COST, for the partition loop's ETA (2026-10-11). Partitions hold about the same
+   number of particles (a Lagrangian split of a lattice), so the particle count says nothing; what makes one
+   partition 30x dearer than another is the collapsed structure in it -- folded tetrahedra inside a halo span
+   the halo in Eulerian space, so the deposit visits ~(halo size)^3 cells for each of them. The proxy: each
+   particle weighs the number of particles in its cell of a coarse Eulerian count grid with ~1.6 Mpc cells
+   (the size of the largest haloes; 8..256 cells per axis), i.e. the sum of the local density over the
+   partition's particles -- a pair count that grows with the mass in dense regions. Checked against the TNG50-3-
+   Dark z=0 run (125 partitions, 69 s to 2091 s each): log-correlation 0.86 with the measured partition times;
+   the ETA it gives was within 1.27x / 1.18x / 0.82x of the truth at 24% / 48% / 75% (the partition count's:
+   1.76x / 1.99x / 1.76x), median |log2 error| over the run 0.25 against 0.85. Finer cells (0.8 Mpc: 0.71)
+   and a squared weight per particle (unstable: up to 16x off) did worse. ONE run's evidence: say so when a
+   long run disagrees. One O(N) pass (~0.5 s for 94M particles). Uniform weights when the particles are not
+   in memory. */
+static std::vector<double> psPartitionCosts(std::vector<Particle_data> const &particles, PSPartitionPlan &plan,
+                                            User_options const &options)
+{
+    std::vector<double> cost( size_t(plan.total), 1. );
+    if ( particles.empty() or plan.total <= 1 ) return cost;
+    Real lo[NO_DIM], len[NO_DIM];
+    for (int d=0; d<NO_DIM; ++d)
+    {
+        lo[d]  = options.boxCoordinates.coords[2*d];
+        len[d] = options.boxCoordinates.coords[2*d+1] - options.boxCoordinates.coords[2*d];
+        if ( not ( len[d] > Real(0.) ) ) return cost;
+    }
+    size_t nc[NO_DIM];
+    size_t cells = 1;
+    for (int d=0; d<NO_DIM; ++d)
+    {
+        nc[d] = size_t( std::max( 8., std::min( 256., std::round( double(len[d]) / 1.6 ) ) ) );   // ~1.6 Mpc cells
+        cells *= nc[d];
+    }
+    auto cellOf = [&](Particle_data const &p) -> size_t
+    {
+        size_t c = 0;
+        for (int d=0; d<NO_DIM; ++d)
+        {
+            Real x = std::fmod( p.pos[d] - lo[d], len[d] );   // the unwrapped Eulerian position, wrapped
+            if ( x < Real(0.) ) x += len[d];
+            size_t i = size_t( x / len[d] * Real(nc[d]) );
+            if ( i >= nc[d] ) i = nc[d] - 1;
+            c = c * nc[d] + i;
+        }
+        return c;
+    };
+    std::vector<uint32_t> count( cells, 0 );
+    for (auto const &p : particles) ++count[ cellOf( p ) ];
+    std::fill( cost.begin(), cost.end(), 0. );
+    for (auto const &p : particles)
+    {
+        int pi = 0;
+        for (int d=0; d<NO_DIM; ++d)
+        {
+            Real const f = ( p.lagPos[d] - plan.lagBox[2*d] ) / plan.lagLen[d];
+            int i = int( std::floor( f * Real(plan.grid[d]) ) );
+            i = std::max( 0, std::min( int(plan.grid[d]) - 1, i ) );
+            pi = pi * int(plan.grid[d]) + i;
+        }
+        cost[size_t(pi)] += double( count[ cellOf( p ) ] );
+    }
+    for (double &c : cost) c = std::max( c, 1. );   // an empty partition still takes a moment
+    return cost;
+}
 #endif
 
 
@@ -335,6 +413,30 @@ DTFE_State DTFE_setup(vector<Particle_data> *allParticles,
     if ( userOptions.psWindowOn )
         userOptions.computePsWindow();
 
+#ifdef PHASE_SPACE
+    // '--resume' without '--partition' (2026-10-11): the split is the checkpoint's. The auto-tuner would pick it
+    // from the free memory of THIS moment, which need not be the killed run's choice, and a different split
+    // cannot continue the merged partitions; with the split given it still tunes '--max-concurrent'.
+    if ( userOptions.psResume and not userOptions.partitionGiven and userOptions.partNo < 0 )
+    {
+        PartitionCheckpoint::Manifest m;
+        std::string why;
+        std::string const dir = PartitionCheckpoint::directoryFor( userOptions );
+        if ( not PartitionCheckpoint::readManifest( dir, m, why ) )
+            throwError( "'--resume': nothing to resume -- ", why, ". Run without '--resume' to start the run." );
+        if ( m.partition.size() != size_t(NO_DIM) )
+            throwError( "'--resume': the checkpoint in '", dir, "' names no partition split of ", NO_DIM, " numbers." );
+        userOptions.partition = m.partition;
+        size_t n = 1;
+        for ( size_t p : m.partition ) n *= p;
+        userOptions.partitionOn = n > 1;
+        userOptions.partitionGiven = true;
+        MESSAGE::Message message( userOptions.verboseLevel );
+        message << MESSAGE::cBold() << "PS-DTFE:" << MESSAGE::cReset() << " --resume: the partition split ["
+                << MESSAGE::printElements( m.partition, "," ) << "] is the checkpoint's.\n" << MESSAGE::Flush;
+    }
+#endif
+
     // auto-select --partition / --max-concurrent from the data and machine when not user-given
     {
         bool gpuActive = false;
@@ -347,7 +449,15 @@ DTFE_State DTFE_setup(vector<Particle_data> *allParticles,
                                                             not samples.empty(), gpuActive, particlePointer );
 #ifdef PHASE_SPACE
         if ( report.valid )
-            userOptions.psPartitionBytes = report.perPartition;   // the partition memory gate (auto_tune.h)
+        {
+            // the partition memory gate (auto_tune.h). It compares ONE partition's need with the free memory, so
+            // the GPU deposit's host snapshot -- one at a time, allocated during a deposit, not yet in the free
+            // memory a partition sees when it starts -- is in each check once (2026-10-11)
+            userOptions.psPartitionBytes = report.perPartition + report.gpuSnapshot;
+            // what the budget leaves for the look-ahead beside one partition (2026-10-11: it used to check the
+            // free memory only, so a budget set low on purpose was passed by one tessellation)
+            userOptions.psLookAheadRoom = report.budget - report.fixed - report.gpuSnapshot - report.perPartition;
+        }
 #endif
         if ( userOptions.autoTuneReport )   // the memory check: the decision and prediction, nothing else
         {
@@ -356,6 +466,13 @@ DTFE_State DTFE_setup(vector<Particle_data> *allParticles,
             std::exit( 0 );
         }
     }
+
+#ifdef PHASE_SPACE
+    // only the partition loop checkpoints, so only a partitioned run has anything to resume
+    if ( userOptions.psResume and not ( userOptions.partitionOn and userOptions.partNo < 0 ) )
+        throwError( "'--resume' continues a partitioned run ('--partition' with more than one partition); this run has "
+                    "one triangulation. Run it without '--resume'." );
+#endif
 
     // velocity derivatives are computed from the gradient afterwards, so request the gradient now
     // and defer the derived quantities to the post-processing step
@@ -919,14 +1036,97 @@ void DTFE(vector<Particle_data> *allParticles,
                 state.options.psParticlesDeferred = false;
             }
         }
+
+        // The checkpoint of the merged grids, and '--resume' (partition_checkpoint.h, 2026-10-11). On resume the
+        // checkpoint's grids are loaded into the (pre-sized) accumulators and its merged partitions are skipped
+        // like a --ps-window skip: no particles, no tessellation, but still a turn in the ordered merge.
+        PartitionCheckpoint::Checkpointer &checkpoint = PartitionCheckpoint::state();
+        {
+            char const *env = std::getenv( "DTFE_PS_CHECKPOINT" );
+            bool const off = env and env[0] == '0';
+            bool const pointEval = psPointEvalActive();   // its per-point accumulators are not in the grids
+            std::string const dir = PartitionCheckpoint::directoryFor( state.options );
+            std::string const key = PartitionCheckpoint::settingsKey( state.options );
+            PartitionCheckpoint::removeStaleTemps( dir );
+            checkpoint.dir = dir;
+            checkpoint.key = key;
+            checkpoint.partition = state.options.partition;
+            checkpoint.merged.assign( size_t(totalPartitions), 0 );
+            if ( char const *hook = std::getenv( "DTFE_TEST_EXIT_AFTER_PARTITIONS" ) )
+                checkpoint.exitAfter = std::atoi( hook );
+            struct stat st;
+            bool const exists = ::stat( ( dir + "/checkpoint" ).c_str(), &st ) == 0;
+            if ( state.options.psResume )
+            {
+                if ( pointEval )
+                    throwError( "'--resume' cannot continue a '--sample-points' run: its point accumulators are not "
+                                "checkpointed. Run it again without '--resume'." );
+                PartitionCheckpoint::Manifest m;
+                std::string why;
+                if ( not PartitionCheckpoint::readManifest( dir, m, why ) )
+                    throwError( "'--resume': nothing to resume -- ", why, ". Run without '--resume' to start the run." );
+                if ( m.key != key )
+                    throwError( "'--resume' refused: the checkpoint '", dir, "' was written by a run with other settings. "
+                                "The lines that differ:", PartitionCheckpoint::keyDifference( m.key, key ),
+                                "\n\tRun with the killed run's settings, or without '--resume' to start over (the "
+                                "checkpoint is then replaced; run_ps_dtfe.sh: PS_RESUME=0). A 'binary=' line differs "
+                                "after a rebuild: the old binary's partitions cannot be combined with the new one's." );
+                if ( m.merged.size() != size_t(totalPartitions) )
+                    throwError( "'--resume': the checkpoint '", dir, "' lists " + std::to_string( m.merged.size() )
+                                + " partitions, this run has " + std::to_string( totalPartitions ) + "." );
+                if ( not PartitionCheckpoint::load( dir, m, *uQuantities, *aQuantities, why ) )
+                    throwError( "'--resume': ", why, ". Run without '--resume' to start over." );
+                checkpoint.merged = m.merged;
+                checkpoint.resumed = true;
+                int nDone = 0;
+                for (int pi=0; pi<totalPartitions; ++pi)
+                    if ( checkpoint.merged[size_t(pi)] )
+                    {
+                        ++nDone;
+                        if ( not skipPartition[size_t(pi)] ) { skipPartition[size_t(pi)] = 1; ++nSkipped; }
+                    }
+                message << MESSAGE::cBold() << "PS-DTFE:" << MESSAGE::cReset() << " --resume: " << MESSAGE::cMagenta()
+                        << nDone << " of " << totalPartitions << MESSAGE::cReset() << " partitions are already in the "
+                        << "checkpoint '" << dir << "'; computing the other " << ( totalPartitions - nDone )
+                        << " (merged in partition order: --resume implies --ordered-merge).\n" << MESSAGE::Flush;
+            }
+            // '--interlace' (psNoCheckpoint, user_options.cc): its two passes would share this folder and key
+            checkpoint.on = not off and not pointEval and not state.options.psNoCheckpoint;
+            if ( exists and not state.options.psResume )
+                message << MESSAGE::cBold() << "PS-DTFE:" << MESSAGE::cReset() << " an earlier run's checkpoint is in '"
+                        << dir << "'; this run starts over" << ( checkpoint.on ? " and replaces it" : " (it writes none)" )
+                        << " ('--resume' continues it).\n" << MESSAGE::Flush;
+            if ( checkpoint.on )
+                message << MESSAGE::cBold() << "PS-DTFE:" << MESSAGE::cReset() << " checkpoints of the merged grids go to '"
+                        << dir << "' (at most ~5% of the run; removed when the outputs are written; '--resume' "
+                        << "continues a killed run from it).\n" << MESSAGE::Flush;
+            else if ( pointEval )
+                message << MESSAGE::cDim() << "  no checkpoints: a '--sample-points' run cannot be resumed\n"
+                        << MESSAGE::cReset() << MESSAGE::Flush;
+            else if ( state.options.psNoCheckpoint )
+                message << MESSAGE::cDim() << "  no checkpoints: an '--interlace' run cannot be resumed (its two passes "
+                        << "would share one checkpoint)\n" << MESSAGE::cReset() << MESSAGE::Flush;
+            if ( checkpoint.on or checkpoint.resumed )
+                PartitionCheckpoint::armRemovalOnSuccess( dir );
+            checkpoint.lastWrite = std::chrono::steady_clock::now();
+        }
         int const toProcess = std::max( 1, totalPartitions - nSkipped );
 
-        // progress + ETA; updated only under mergeMutex below so it is race-free
+        // progress + ETA; updated only under mergeMutex below so it is race-free. The ETA weights each partition
+        // by a predicted cost instead of counting partitions (2026-10-11): the deposit time per partition is
+        // heavy-tailed (TNG50 z=0: 40 s to 2049 s, median 73 s) and the costly cluster partitions sit together in
+        // index order, so elapsed x remaining/done was off by 2x (9 h 4 m printed at 24%, 5 h 11 m actual).
         auto const psLoopStart = std::chrono::steady_clock::now();
         int psDone = 0;
+        std::vector<double> const partCost = psPartitionCosts( state.particles, plan, state.options );
+        double costTotal = 0., costDone = 0.;
+        for (int pi=0; pi<totalPartitions; ++pi)
+            if ( not skipPartition[size_t(pi)] ) costTotal += partCost[size_t(pi)];
+        runProgressPhase( "partitions", 0, toProcess );
         // The auto-tuner's SPEED split of a small set (psOrderedMerge) adds the partitions' grids
         // in INDEX order, so the float sums are the same run after run; its partitions are small
-        // and uniform, so waiting for the predecessor costs nothing. A memory-driven split keeps
+        // and uniform, so waiting for the predecessor costs nothing. '--ordered-merge' asks for the
+        // same on any split (2026-10-11). A memory-driven split keeps
         // merging in completion order: its partitions differ 30x in cost, and threads idling behind
         // a slow one cost the TNG region's GPU grid 35%. The price: the merge's own adds follow the
         // completion order, so such a run differs from the next in the last bits (in the double build
@@ -941,94 +1141,268 @@ void DTFE(vector<Particle_data> *allParticles,
 
         ConcurrentTriangulationPlan triangulationPlan( psConcurrency, totalPartitions );
         psGpuFallbacksTaken( true );   // counted from here; reported once after the loop
-        // a partition starts only when the machine has the memory for it (or nothing else is in flight)
-        PartitionMemoryGate memoryGate( psConcurrency > 1 ? state.options.psPartitionBytes : 0. );
-#ifdef OPEN_MP
-        #pragma omp parallel for schedule(dynamic, 1) num_threads(psConcurrency)
-#endif
-        for (int pi=0; pi<totalPartitions; ++pi)
+        // a partition starts only when the machine has the memory for it (or nothing else is in flight);
+        // under the ordered merge it waits only behind lower-numbered partitions (auto_tune.h)
+        PartitionMemoryGate memoryGate( psConcurrency > 1 ? state.options.psPartitionBytes : 0., orderedMerge );
+
+        // One partition's work, in two stages: PREPARE (select its particles; with 'build', also its
+        // tessellation and vertex densities) and DEPOSIT (the grid passes, then the merge). The look-ahead
+        // below runs the prepare stage of partition k+1 on another thread while partition k deposits.
+        struct PSPrepared
         {
-            ConcurrentTriangulationGuard concurrentTriangulation;
+            bool skipped = false, cacheOnly = false, emptyPartition = true;
+            User_options opt;
+            vector<Particle_data> part;
+            std::shared_ptr<void> pre;   // the look-ahead's tessellation (psPrebuildTessellation); none: built in the deposit
+            double seconds = 0.;         // the look-ahead's build time
+        };
+        auto prepare = [&](int const pi, bool const build, PSPrepared &P)
+        {
+            auto const t0 = std::chrono::steady_clock::now();
             // unpadded Lagrangian region for this partition (ownership) and the padded selection box
             Box lagRegion, lagPadded;
             plan.regions( pi, lagRegion, lagPadded );
 
             // select particles by Lagrangian position; when periodic, this partition's images
             // are generated on the fly so the global array stays originals-only
-            bool const skipped = skipPartition[size_t(pi)] != 0;   // --ps-window: never reaches the window
+            P.skipped = skipPartition[size_t(pi)] != 0;   // --ps-window: never reaches the window
             // a partition whose cached tessellation matches its descriptor is loaded, not built: its
             // particles are never needed, so their selection (a scan of every particle, ~3 s for TNG100-3's
             // 94M, plus a copy of the padded share) is skipped -- the load must then succeed (psCacheOnly)
-            User_options tempOpt = partitionOptions( lagRegion );
-            bool const cacheOnly = not skipped and not state.options.tessellationCacheDir.empty()
-                                   and psTessellationCached( tempOpt );
+            P.opt = partitionOptions( lagRegion );
+            P.cacheOnly = not P.skipped and not state.options.tessellationCacheDir.empty()
+                          and psTessellationCached( P.opt );
+            if ( not P.skipped and not P.cacheOnly and state.options.psParticlesDeferred )
+                throwError( "internal: a partition needs its particles, but they were not read (the globals record path)." );
+            if ( not P.skipped and not P.cacheOnly )
+                findParticlesInBoxLagrangianPeriodic( state.particles, &P.part, lagPadded,
+                                                      plan.eulerLen, plan.periodicCopies, 0 );
+            // an empty (or skipped) partition builds nothing but still takes its turn in the ordered merge
+            P.emptyPartition = P.skipped or ( not P.cacheOnly and P.part.empty() );
+            P.opt.psCacheOnly = P.cacheOnly;
+            if ( build and not P.emptyPartition )
+            {
+                P.opt.verboseLevel = 0;   // the look-ahead thread is silent; the progress line reports it
+                P.pre = psPrebuildTessellation( &P.part, P.opt );
+            }
+            P.seconds = std::chrono::duration<double>( std::chrono::steady_clock::now() - t0 ).count();
+        };
+        auto deposit = [&](int const pi, PSPrepared &P, int const verbose)
+        {
+            Quantities temp_uQuantities, temp_aQuantities;
+            if ( not P.emptyPartition )
+            {
+                // per-partition options use the full Eulerian grid; only the master thread logs
+                P.opt.verboseLevel = verbose;
+                if ( P.pre )
+                    psInterpolatePrebuilt( P.pre, samples, P.opt, &temp_uQuantities, &temp_aQuantities );
+                else   // PS-DTFE: DTFE_parallel calls serial interpolation directly (no nested OpenMP region)
+                    DTFE_parallel( &P.part, samples, P.opt, &temp_uQuantities, &temp_aQuantities );
+            }
+
+            // accumulate into the shared grids (in partition order under the speed split)
+            std::unique_lock<std::mutex> lock( mergeMutex );
+            if ( orderedMerge )
+                mergeCv.wait( lock, [&]{ return nextMerge == pi; } );
+            if ( not P.emptyPartition )
+            {   // with --ps-window every partition's sub-grid IS the window: the merge is window-local
+                size_t const *wo = state.options.psWindowOn ? state.options.psWindowLo   : nullptr;
+                size_t const *wd = state.options.psWindowOn ? state.options.psWindowDims : nullptr;
+                uQuantities->addFromSubgrid( temp_uQuantities, &(state.options.gridSize[0]), wo, wd );
+                aQuantities->addFromSubgrid( temp_aQuantities, &(state.options.gridSize[0]), wo, wd );
+            }
+            // the checkpoint (partition_checkpoint.h), while the grids hold still under the merge lock: after
+            // this merge unless the last write took more than 5% of the time since it
+            checkpoint.merged[size_t(pi)] = 1;
+            if ( not P.skipped ) ++checkpoint.mergesHere;
+            bool const hookNow = checkpoint.exitAfter > 0 and not P.skipped and checkpoint.mergesHere == checkpoint.exitAfter;
+            if ( checkpoint.on )
+            {
+                auto const now = std::chrono::steady_clock::now();
+                double const since = std::chrono::duration<double>( now - checkpoint.lastWrite ).count();
+                if ( hookNow or not checkpoint.wroteOnce or since >= 20. * checkpoint.lastWriteSec )
+                {
+                    std::string why;
+                    bool const ok = PartitionCheckpoint::write( *uQuantities, *aQuantities, why );
+                    auto const end = std::chrono::steady_clock::now();
+                    checkpoint.lastWriteSec = std::chrono::duration<double>( end - now ).count();
+                    checkpoint.lastWrite = end;
+                    if ( ok ) { checkpoint.wroteOnce = true; ++checkpoint.written; checkpoint.writeSecTotal += checkpoint.lastWriteSec; }
+                    else if ( not checkpoint.warned )
+                    {
+                        checkpoint.warned = true;
+                        MESSAGE::Warning warning( userOptions.verboseLevel );
+                        warning << "the partition checkpoint could not be written (" << why << "); the run goes on, "
+                                << "the previous checkpoint (if any) stays, and later merges try again. Said once.\n"
+                                << MESSAGE::EndWarning;
+                    }
+                }
+            }
+            if ( hookNow )
+            {   // the test hook: die here as a SIGKILL would, the checkpoint just written
+                std::fflush( nullptr );
+                ::raise( SIGKILL );
+            }
+            if ( orderedMerge )
+            {
+                nextMerge = pi + 1;
+                mergeCv.notify_all();
+            }
+
+            // progress over the partitions actually processed (the skipped ones cost nothing)
+            if ( not P.skipped )
+            {
+            ++psDone;
+            costDone += partCost[size_t(pi)];
+            double const elapsed = std::chrono::duration<double>( std::chrono::steady_clock::now() - psLoopStart ).count();
+            double const frac    = double(psDone) / double(toProcess);
+            // the time per unit of predicted cost so far, times the predicted cost still to come
+            double const eta     = ( costDone > 0. ) ? elapsed * std::max( 0., costTotal - costDone ) / costDone : 0.;
+            MESSAGE::Message prog( userOptions.verboseLevel );
+            prog << MESSAGE::cGreen() << "  [partitions " << psDone << "/" << toProcess
+                 << " | " << int(100.*frac + 0.5) << "%]" << MESSAGE::cReset()
+                 << MESSAGE::cDim() << "  elapsed " << MESSAGE::formatDuration(elapsed)
+                 << ( psDone<toProcess ? ", ETA ~" + MESSAGE::formatDuration(eta) : ", done" )
+                 << MESSAGE::cReset() << "\n" << MESSAGE::Flush;
+            runProgressPhase( "partitions", psDone, toProcess, psDone < toProcess ? eta : 0. );
+            }
+        };
+
+        // The LOOK-AHEAD (2026-10-11). At --max-concurrent 1 with the GPU deposit the cores idled while the
+        // GPU worked: the TNG50 z=0 run used 0.56 of 10 cores, the deposit was 82% of its 8 h, and each next
+        // partition's selection + triangulation + vertex densities (~35 s) waited behind it. Now partition k+1
+        // is prepared on a CPU thread while k deposits, at most one ahead. Every tessellation is built exactly
+        // as without the look-ahead (same particles, same sequential insert) and the merge stays in index
+        // order, so the outputs are byte-identical (tests/ps_runtime_check.sh). It holds one more partition's
+        // particles + tessellation; before each look-ahead the free memory is checked against that (the
+        // auto-tuner's prediction counts it too) and the partition is prepared in turn when it does not fit.
+        // '--ps-no-overlap' switches it off; DTFE_PS_OVERLAP=1 forces it on a CPU deposit too (the test suite's
+        // byte-identity check on a build without a GPU), DTFE_PS_OVERLAP=0 switches it off.
+        bool gpuDeposit = false;
+#if defined(PS_GPU) && NO_DIM==3
+        gpuDeposit = state.options.psUseMetal and not state.options.psLinearDeposit;
+#endif
+        char const *overlapEnv = std::getenv( "DTFE_PS_OVERLAP" );
+        bool const overlapForced = overlapEnv and overlapEnv[0] == '1';
+        bool const overlapBanned = overlapEnv and overlapEnv[0] == '0';
+        bool overlap = psConcurrency == 1 and toProcess > 1 and not state.options.psNoOverlap
+                       and not state.options.psLookAheadOffBudget   // the auto-tuner's: it does not fit the budget
+                       and not overlapBanned and ( gpuDeposit or overlapForced );
+        // what the look-ahead holds: one partition's padded particle copy + its tessellation (auto_tune.h's
+        // model: Particle_data + 666 B per vertex, padding included)
+        double aheadBytes = 0.;
+        if ( overlap )
+        {
+            double padVol = 1., ownVol = 1.;
+            {
+                Box r, rp;
+                plan.regions( 0, r, rp );
+                for (int d=0; d<NO_DIM; ++d) { ownVol *= double(r[2*d+1]-r[2*d]); padVol *= double(rp[2*d+1]-rp[2*d]); }
+            }
+            double const nAll = state.options.psParticlesDeferred ? double(userOptions.psPresetN) : double(state.particles.size());
+            aheadBytes = nAll / double(totalPartitions) * ( padVol / std::max( ownVol, 1e-300 ) )
+                         * ( double(sizeof(Particle_data)) + 666. );
+            // the memory budget too, not only the free memory (2026-10-11): what it leaves beside the grids,
+            // particles and one partition must hold the look-ahead, or the run has none (the same for every
+            // partition, so decided once)
+            if ( aheadBytes > state.options.psLookAheadRoom )
+            {
+                overlap = false;
+                message << MESSAGE::cBold() << "PS-DTFE:" << MESSAGE::cReset() << " look-ahead off: the ~"
+                        << std::round( aheadBytes/1.e7 )/100. << " GB it holds is more than the ~"
+                        << std::round( std::max( 0., state.options.psLookAheadRoom )/1.e7 )/100. << " GB the memory "
+                        << "budget leaves beside one partition; partitions are prepared in turn.\n" << MESSAGE::Flush;
+            }
+        }
+        if ( overlap )
+        {
+            message << MESSAGE::cBold() << "PS-DTFE:" << MESSAGE::cReset() << " look-ahead on: partition k+1 is "
+                    << "tessellated on a CPU thread while partition k deposits"
+                    << ( gpuDeposit ? " on the GPU" : " (DTFE_PS_OVERLAP=1)" ) << " (~" << std::round( aheadBytes/1.e7 )/100.
+                    << " GB more in memory; '--ps-no-overlap' switches it off).\n" << MESSAGE::Flush;
+
+            PSPrepared cur;
+            prepare( 0, false, cur );
+            bool saidNoRoom = false;
+            for (int pi=0; pi<totalPartitions; ++pi)
+            {
+                ConcurrentTriangulationGuard concurrentTriangulation;
+                PSPrepared next;
+                std::thread ahead;
+                std::exception_ptr aheadError;
+                bool aheadRan = false;
+                if ( pi + 1 < totalPartitions )
+                {
+                    double const freeNow = autoTuneSystemFree();
+                    bool const room = freeNow < 0. or freeNow - 4.e9 >= aheadBytes;
+                    if ( room and not skipPartition[size_t(pi+1)] )
+                    {
+                        aheadRan = true;
+                        ahead = std::thread( [&, pi]()
+                        {
+                            try { prepare( pi + 1, true, next ); }
+                            catch ( ... ) { aheadError = std::current_exception(); }
+                        } );
+                    }
+                    else if ( not room and not saidNoRoom )
+                    {
+                        saidNoRoom = true;
+                        MESSAGE::Message m( userOptions.verboseLevel );
+                        m << MESSAGE::cDim() << "  look-ahead paused: " << freeNow/1.e9 << " GB free, minus 4 GB headroom, "
+                          << "is below the ~" << aheadBytes/1.e9 << " GB it holds; partitions are prepared in turn "
+                          << "until memory frees up\n" << MESSAGE::cReset() << MESSAGE::Flush;
+                    }
+                }
+                try
+                {
+                    deposit( pi, cur, userOptions.verboseLevel );
+                }
+                catch ( ... )
+                {
+                    if ( ahead.joinable() ) ahead.join();
+                    throw;
+                }
+                if ( ahead.joinable() ) ahead.join();
+                if ( aheadError ) std::rethrow_exception( aheadError );
+                if ( aheadRan and userOptions.verboseLevel > 0 and not next.emptyPartition )
+                {
+                    MESSAGE::Message m( userOptions.verboseLevel );
+                    m << MESSAGE::cDim() << "  look-ahead: partition " << pi + 1 << " prepared in "
+                      << MESSAGE::formatDuration( next.seconds ) << " during this deposit\n" << MESSAGE::cReset() << MESSAGE::Flush;
+                }
+                if ( pi + 1 < totalPartitions )
+                {
+                    if ( not aheadRan ) prepare( pi + 1, false, next );
+                    cur = std::move( next );
+                }
+            }
+        }
+        else
+        {
+#ifdef OPEN_MP
+        #pragma omp parallel for schedule(dynamic, 1) num_threads(psConcurrency)
+#endif
+        for (int pi=0; pi<totalPartitions; ++pi)
+        {
+            ConcurrentTriangulationGuard concurrentTriangulation;
             // the memory gate, BEFORE the particle copy (part of a partition's memory): a partition that builds or
-            // loads waits while the free memory cannot hold one more and another is in flight; a skipped one passes
-            // (never with the ordered merge's speed split: tiny uniform partitions). Released at the iteration's end.
-            struct GateRelease { PartitionMemoryGate *g; ~GateRelease() { if ( g ) g->leave(); } };
-            bool const gated = not skipped and not orderedMerge;
+            // loads waits while the free memory cannot hold one more and another (under '--ordered-merge': a
+            // lower-numbered one) is in flight; a skipped one passes, and so does the auto-tuner's speed split
+            // (tiny uniform partitions). Released at the iteration's end.
+            struct GateRelease { PartitionMemoryGate *g; int pi; ~GateRelease() { if ( g ) g->leave( pi ); } };
+            bool const gated = not skipPartition[size_t(pi)] and ( not orderedMerge or state.options.psOrderedMergeFlag );
             if ( gated )
                 memoryGate.enter( pi, userOptions.verboseLevel );
-            GateRelease const gateRelease{ gated ? &memoryGate : nullptr };
-            vector<Particle_data> tempPart;
-            if ( not skipped and not cacheOnly and state.options.psParticlesDeferred )
-                throwError( "internal: a partition needs its particles, but they were not read (the globals record path)." );
-            if ( not skipped and not cacheOnly )
-                findParticlesInBoxLagrangianPeriodic( state.particles, &tempPart, lagPadded,
-                                                      plan.eulerLen, plan.periodicCopies, 0 );
-
-            // an empty (or skipped) partition builds nothing but still takes its turn in the ordered merge
-            bool const emptyPartition = skipped or ( not cacheOnly and tempPart.empty() );
-            Quantities temp_uQuantities, temp_aQuantities;
-            if ( not emptyPartition )
-            {
-            // per-partition options use the full Eulerian grid; only the master thread logs
-            tempOpt.psCacheOnly = cacheOnly;
+            GateRelease const gateRelease{ gated ? &memoryGate : nullptr, pi };
+            PSPrepared P;
+            prepare( pi, false, P );
             int tnum = 0;
 #ifdef OPEN_MP
             tnum = omp_get_thread_num();
 #endif
-            tempOpt.verboseLevel = (tnum == 0) ? userOptions.verboseLevel : 0;
-
-            // PS-DTFE: DTFE_parallel calls serial interpolation directly (no nested OpenMP region)
-            DTFE_parallel( &tempPart, samples, tempOpt, &temp_uQuantities, &temp_aQuantities );
-            }
-
-            // accumulate into the shared grids (in partition order under the speed split)
-            {
-                std::unique_lock<std::mutex> lock( mergeMutex );
-                if ( orderedMerge )
-                    mergeCv.wait( lock, [&]{ return nextMerge == pi; } );
-                if ( not emptyPartition )
-                {   // with --ps-window every partition's sub-grid IS the window: the merge is window-local
-                    size_t const *wo = state.options.psWindowOn ? state.options.psWindowLo   : nullptr;
-                    size_t const *wd = state.options.psWindowOn ? state.options.psWindowDims : nullptr;
-                    uQuantities->addFromSubgrid( temp_uQuantities, &(state.options.gridSize[0]), wo, wd );
-                    aQuantities->addFromSubgrid( temp_aQuantities, &(state.options.gridSize[0]), wo, wd );
-                }
-                if ( orderedMerge )
-                {
-                    nextMerge = pi + 1;
-                    mergeCv.notify_all();
-                }
-
-                // progress over the partitions actually processed (the skipped ones cost nothing)
-                if ( not skipped )
-                {
-                ++psDone;
-                double const elapsed = std::chrono::duration<double>( std::chrono::steady_clock::now() - psLoopStart ).count();
-                double const frac    = double(psDone) / double(toProcess);
-                double const eta     = ( psDone>0 ) ? elapsed * ( double(toProcess - psDone) / double(psDone) ) : 0.;
-                MESSAGE::Message prog( userOptions.verboseLevel );
-                prog << MESSAGE::cGreen() << "  [partitions " << psDone << "/" << toProcess
-                     << " | " << int(100.*frac + 0.5) << "%]" << MESSAGE::cReset()
-                     << MESSAGE::cDim() << "  elapsed " << MESSAGE::formatDuration(elapsed)
-                     << ( psDone<toProcess ? ", ETA ~" + MESSAGE::formatDuration(eta) : ", done" )
-                     << MESSAGE::cReset() << "\n" << MESSAGE::Flush;
-                }
-            }
+            deposit( pi, P, (tnum == 0) ? userOptions.verboseLevel : 0 );
         }
-
+        }
         // A GPU deposit that fell back to the CPU warns from the master thread only (the others run at
         // verbose 0), so with partitions in flight on several threads most fallbacks were silent: say how
         // many there were (2026-10-08)
@@ -1038,6 +1412,14 @@ void DTFE(vector<Particle_data> *allParticles,
             warning << nFallback << " partition deposit pass(es) asked for the GPU and ran on the CPU instead. Only "
                     << "the master thread's partitions print the reason (above, when one of them fell back); the "
                     << "grids are complete, the run only took longer.\n" << MESSAGE::EndWarning;
+        }
+
+        if ( checkpoint.written > 0 )
+        {
+            double const loopSec = std::chrono::duration<double>( std::chrono::steady_clock::now() - psLoopStart ).count();
+            message << MESSAGE::cDim() << "  checkpoints: " << checkpoint.written << " written in "
+                    << MESSAGE::formatDuration( checkpoint.writeSecTotal ) << " (" << std::round( 1000. * checkpoint.writeSecTotal
+                    / std::max( loopSec, 1e-9 ) ) / 10. << "% of the partition loop)\n" << MESSAGE::cReset() << MESSAGE::Flush;
         }
 
         // every partition copied its own particles (tempPart); the global array is not needed by
@@ -1196,7 +1578,9 @@ void DTFE(vector<Particle_data> *allParticles,
             // progress + ETA over the serial partition loop
             double const elapsed = std::chrono::duration<double>( std::chrono::steady_clock::now() - partLoopStart ).count();
             int    const done    = i + 1;
+            // (the split balances the particle counts, so counting partitions is the cost weighting here)
             double const eta     = elapsed * ( double(totalPartitions - done) / double(done) );
+            runProgressPhase( "partitions", done, totalPartitions, eta );
             message << MESSAGE::cGreen() << "  [partitions " << done << "/" << totalPartitions
                     << " | " << int(100.*done/double(totalPartitions) + 0.5) << "%]" << MESSAGE::cReset()
                     << MESSAGE::cDim() << "  elapsed " << MESSAGE::formatDuration(elapsed)
@@ -1235,6 +1619,7 @@ void DTFE(vector<Particle_data> *allParticles,
 #endif
 
     // post-processing: derive velocity divergence/shear/vorticity and cosmic-web labels from the gradient
+    runProgressPhase( "post-processing" );
     postProcessWebFields( userOptions, uQuantities, aQuantities );
 }
 

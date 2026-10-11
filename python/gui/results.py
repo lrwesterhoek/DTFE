@@ -10,6 +10,10 @@ its time estimates and its failure advice. Pure Python (no Qt): tests/py_gui_run
                                 attempt after it (attempt_note)
   time_estimate(records, ...)   the median wall time of comparable earlier runs
   diagnose(log, exit_codes)     plain-language causes and fixes for a failed job
+  void_status(records, root)    whether each run's void catalogue is cached, stale or absent (void_cache.py)
+  read_progress / is_run_file   the run-directory files of a run going (contract C1, 2026-10-11): the binary's
+                                '<prefix>.runlog.progress', the scripts' '.runlog.lock' and '<grid>.part.<pid>'
+                                are never outputs nor logs; a '.partial' with a live sidecar shows its progress
   notify_command(title, text)   the OS command that shows a desktop notification
 
 A run log is the binary's own output, tee'd next to its outputs by run_ps_dtfe.sh, run_dtfe.sh
@@ -49,6 +53,125 @@ _FIELDS = re.compile(r"--field ((?:(?!--)\S+\s*)+)")
 _GPU_RETRY = re.compile(r"retrying the (?:partition )?deposit from scratch")
 # the run-log contract's three names: the log of record, the last failed attempt, a run going or killed
 LOG_SUFFIXES = (".runlog", ".runlog.failed", ".runlog.partial")
+# the run-directory files of a run going (contract C1, 2026-10-11): the binary's JSON progress sidecar, the run
+# scripts' lock DIRECTORY (holding the driver's 'pid'), and a grid written as '<file>.part.<pid>' until renamed
+# at the end. None of them is an output or a run log.
+PROGRESS_SUFFIX = ".runlog.progress"
+LOCK_SUFFIX = ".runlog.lock"
+# the checkpoint DIRECTORY of a killed partitioned PS-DTFE run (contract K2, 2026-10-11): its merged accumulators
+# and the manifest of finished partitions; the next run of the same job resumes from it ('--resume', which
+# run_ps_dtfe.sh passes by itself when it is there) and removes it on success
+CHECKPOINT_SUFFIX = ".runlog.checkpoint"
+# the binary's errors when '--resume' cannot continue the checkpoint (DTFE.cpp, 2026-10-11): other settings, nothing
+# to resume (no manifest), not partitioned, a '--sample-points' run. Only the error phrasings: its info lines
+# ("'--resume' continues it", "... continues a killed run from it") are in the logs of runs that CAN be resumed.
+RESUME_REFUSED = re.compile(r"'--resume'(?::|\s+refused|\s+cannot|\s+continues a partitioned run)")
+_PART = re.compile(r"\.part\.\d+$")
+
+
+def is_run_file(name: str) -> bool:
+    """A file of a run going (C1): its progress sidecar (and the sidecar's '.tmp'), its lock, a grid half written
+    as '<file>.part.<pid>', a killed run's checkpoint directory and what is in it (K2). Never an output, never a
+    run log."""
+    return (PROGRESS_SUFFIX in name or LOCK_SUFFIX in name or CHECKPOINT_SUFFIX in name or _PART.search(name) is not None
+            or name.endswith(".part.tmp"))
+
+
+def pid_alive(pid) -> bool | None:
+    """Whether process 'pid' exists (None: cannot say). EPERM means it exists under another user."""
+    import os
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return None
+    return True
+
+
+_DTFE_NAME = re.compile(r"^(PS-)?DTFE(-.*)?$")    # every binary set (runspec.dtfe_processes' pgrep pattern)
+
+
+def dtfe_pid_alive(pid) -> bool | None:
+    """Whether process 'pid' is alive AND a DTFE / PS-DTFE binary (None: cannot say). A bare pid test is not
+    enough for a leftover sidecar (2026-10-11): a run killed outright with its driver (a reboot, a group SIGKILL)
+    leaves its sidecar, and once the launcher's own polling has wrapped the pids (~a day) its pid belongs to some
+    other process, which read as the run still going. 'ps -o comm=' is argv[0] on macOS (a path, maybe with
+    spaces) and the executable's 15-character name on Linux: its basename is matched. Without ps the bare pid
+    test stands, as before."""
+    alive = pid_alive(pid)
+    if not alive:
+        return alive
+    try:
+        pr = subprocess.run(["ps", "-p", str(int(pid)), "-o", "comm="], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return alive
+    comm = pr.stdout.strip()
+    if pr.returncode != 0 or not comm:
+        return False                                # gone between the two tests
+    return _DTFE_NAME.match(comm.rstrip("/").rsplit("/", 1)[-1]) is not None
+
+
+def read_progress(path) -> dict | None:
+    """The binary's progress sidecar '<prefix>.runlog.progress' (C1) as a dict, with 'state' added: 'running'
+    (its pid is a live DTFE binary, dtfe_pid_alive), 'died' (the pid is gone or now another program's: a run
+    killed outright leaves the sidecar behind; a run that finishes removes it) or 'unknown'. None without a
+    readable sidecar (the binary writes it atomically, so a half-written one is never seen; a missing key reads
+    as absent)."""
+    try:
+        d = json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(d, dict):
+        return None
+    alive = dtfe_pid_alive(d.get("pid"))
+    d["state"] = "running" if alive else "died" if alive is False else "unknown"
+    return d
+
+
+def progress_text(d: dict | None) -> str:
+    """'phase 3/27 (11%), ETA 2h 05m, 37.2 GB' -- one line for a progress sidecar; 'died' for a dead pid."""
+    if not d:
+        return ""
+    bits = []
+    phase = str(d.get("phase") or "").strip()
+    done, total = d.get("done"), d.get("total")
+    try:
+        frac = f"{int(done)}/{int(total)}" + (f" ({100.0 * float(done) / float(total):.0f}%)" if float(total) > 0 else "")
+    except (TypeError, ValueError):
+        frac = ""
+    head = " ".join(b for b in (phase, frac) if b)
+    if head:
+        bits.append(head)
+    if d.get("state") == "died":
+        bits.append("died (its process is gone)")
+        return ", ".join(bits)
+    for key, label in (("eta_s", "ETA"), ("elapsed_s", "elapsed")):
+        try:
+            v = float(d.get(key))
+        except (TypeError, ValueError):
+            continue
+        if v >= 0 and math.isfinite(v):
+            bits.append(f"{label} {format_duration(v)}")
+            break
+    try:
+        bits.append(f"{float(d.get('rss_gb')):.1f} GB")
+    except (TypeError, ValueError):
+        pass
+    try:
+        if int(d.get("gpu_retries") or 0):
+            bits.append(f"{int(d['gpu_retries'])} GPU retries")
+    except (TypeError, ValueError):
+        pass
+    return ", ".join(bits)
 
 
 def log_prefix(name: str) -> str:
@@ -96,13 +219,17 @@ class RunRecord:
     redshift: float | None = None
     # a later run under this name that left no log of record (scan_runs, the run-log contract; 2026-10-08):
     # 'failed' ('<prefix>.runlog.failed'), 'running' or 'killed' ('<prefix>.runlog.partial' with or without a
-    # live process naming it; 'partial' when ps cannot say), '' when none is newer than this log. Without a
-    # '<prefix>.runlog' the record IS that attempt (path == attempt_log, never ok).
+    # live process naming it; 'partial' when ps cannot say), 'resumable' (failed or killed, with its checkpoint
+    # directory '<prefix>.runlog.checkpoint' left: the same job continues from it, K2), '' when none is newer
+    # than this log. Without a '<prefix>.runlog' the record IS that attempt (path == attempt_log, never ok).
     attempt: str = ""
     attempt_log: Path | None = None
     attempt_time: _dt.datetime | None = None
     attempt_cause: str = ""         # diagnose()'s titles for the attempt's log ("Out of memory", ...)
+    attempt_resume_refused: bool = False   # the attempt failed because the binary refused to resume its checkpoint
+                                           # (RESUME_REFUSED): never 'resumable', the same job fails again (2026-10-11)
     attempt_rewrote: int = 0        # outputs modified after this log was: the attempt rewrote them
+    progress: dict | None = None    # the binary's progress sidecar of a run going (C1, read_progress; 2026-10-11)
 
     # -- the settings the RUNNING line shows
     def has(self, flag: str) -> bool:
@@ -165,6 +292,11 @@ class RunRecord:
         """The binary's build time if the log names it, else when the run finished."""
         return self.build_time or self.finished
 
+    def checkpoint_dir(self) -> Path:
+        """Where a killed partitioned run of this output keeps its checkpoint (K2; under '--scratch-dir' it lives
+        there instead, which a scan of the output folder cannot see)."""
+        return Path(str(self.path.parent / self.prefix) + CHECKPOINT_SUFFIX)
+
     def log_files(self) -> list[Path]:
         """Every log of this output set on disk (the run-log contract's three names, 2026-10-08): what Move to
         Trash must take with the outputs, or the attempt's log alone shows up as a failed run afterwards."""
@@ -196,6 +328,8 @@ class RunRecord:
                 bits.append("volume-weighted")
             if self.has("--ps-caustics"):
                 bits.append("caustics")
+            if self.has("--ordered-merge"):
+                bits.append("ordered merge")
         if self.gpu:
             bits.append("GPU")
         if self.precision == "double":
@@ -221,6 +355,7 @@ class RunRecord:
                      volume_weighted=self.has("--ps-volume-weighted"),
                      caustics=self.has("--ps-caustics"), caustic_cusps=self.has("--ps-caustic-cusps"),
                      parallel_triangulation=self.has("--parallel-triangulation"),
+                     ordered_merge=self.has("--ordered-merge"),       # K1: off too, as linear_deposit (2026-10-11)
                      output_prefix=self.prefix or "ps_output")
             m = re.search(r"(?:^|\s)--ps-alpha-shape\s+([0-9.]+)", self.command)
             if m:
@@ -280,14 +415,15 @@ def run_inputs(rec: RunRecord) -> set[Path]:
     return found
 
 
-def parse_runlog(path: Path, sim: str = "", snap: int | None = None) -> RunRecord:
-    path = Path(path)
-    rec = RunRecord(path=path, sim=sim, snap=snap, prefix=log_prefix(path.name))
-    try:
-        text = path.read_text(errors="replace")
-        rec.finished = _dt.datetime.fromtimestamp(path.stat().st_mtime)
-    except OSError:
-        return rec
+# the text-derived fields of every run log read, by path, with the (size, mtime_ns) they were read at
+# (2026-10-11): the launcher rescans every 30 s on its GUI thread, and a TNG50 z=0 log is large and on the
+# external disk; an unchanged log is not read again
+_LOG_FIELDS = ("binary", "build_rev", "build_time", "command", "gpu_retried", "wall_seconds", "peak_rss_gb",
+               "footprint_gb", "ok")
+_LOG_CACHE: dict[str, tuple[int, int, dict]] = {}
+
+
+def _parse_text(rec: RunRecord, text: str):
     m = _BUILD.search(text)
     if m:
         rec.binary, rec.build_rev = m.group(1), m.group(2)
@@ -314,11 +450,29 @@ def parse_runlog(path: Path, sim: str = "", snap: int | None = None) -> RunRecor
     feet = _FOOTPRINT.findall(text)
     rec.footprint_gb = int(feet[-1]) / 2**30 if feet else None     # GiB: the unit of the RSS line and of the run scripts
     # a '.failed' or '.partial' log is an attempt that did not exit 0, whatever it printed (2026-10-08)
-    rec.ok = bool(m or rec.wall_seconds is not None) and "~~~ ERROR ~~~" not in text and path.name.endswith(".runlog")
+    rec.ok = bool(m or rec.wall_seconds is not None) and "~~~ ERROR ~~~" not in text and rec.path.name.endswith(".runlog")
+
+
+def parse_runlog(path: Path, sim: str = "", snap: int | None = None) -> RunRecord:
+    path = Path(path)
+    rec = RunRecord(path=path, sim=sim, snap=snap, prefix=log_prefix(path.name))
+    try:
+        st = path.stat()
+        rec.finished = _dt.datetime.fromtimestamp(st.st_mtime)
+        hit = _LOG_CACHE.get(str(path))
+        if hit is not None and hit[:2] == (st.st_size, st.st_mtime_ns):
+            for k, v in hit[2].items():
+                setattr(rec, k, v)
+        else:
+            _parse_text(rec, path.read_text(errors="replace"))
+            _LOG_CACHE[str(path)] = (st.st_size, st.st_mtime_ns, {k: getattr(rec, k) for k in _LOG_FIELDS})
+    except OSError:
+        return rec
     inputs = run_inputs(rec)
     log = rec.prefix + ".runlog"    # by name: '.runlog.failed', '.runlog.partial' (and a script's '.runlog.tmp') too
     rec.outputs = sorted(p for p in path.parent.glob(_glob.escape(rec.prefix) + ".*")       # escaped: '[' in a name
                          if p.is_file() and p.suffix not in (".runlog", ".json") and not p.name.startswith(log)
+                         and not is_run_file(p.name)         # C1: the sidecar, the lock, '<grid>.part.<pid>'
                          and p.suffix.lower() not in INPUT_SUFFIXES and p.resolve() not in inputs)
     return rec
 
@@ -397,9 +551,13 @@ def _read_run(logs: dict[str, Path], sim: str = "", snap: int | None = None) -> 
         t, sfx, p = max(attempts)
         rec.attempt = "failed" if sfx == ".runlog.failed" else "partial"
         rec.attempt_log, rec.attempt_time = p, _dt.datetime.fromtimestamp(t)
-        rec.attempt_cause = ", ".join(d.title for d in diagnose(_tail(p)))
+        tail = _tail(p)
+        rec.attempt_cause = ", ".join(d.title for d in diagnose(tail))
+        rec.attempt_resume_refused = RESUME_REFUSED.search(tail) is not None
         if t0 is not None:          # a run's outputs are all written before its log ends: newer ones are the attempt's
             rec.attempt_rewrote = sum(1 for q in rec.outputs if (_mtime(q) or 0.0) > t0 + 5.0)   # 5 s: FAT's 2 s mtimes
+        if sfx == ".runlog.partial":
+            rec.progress = read_progress(Path(str(p)[: -len(".partial")] + ".progress"))
     return rec
 
 
@@ -438,9 +596,57 @@ def scan_runs(root, extra_dirs=()) -> list[RunRecord]:
     partial = [r for r in out if r.attempt == "partial"]
     live = _live_roots([str(r.path.parent / r.prefix) for r in partial]) if partial else set()
     for r in partial:
-        if live is not None:
+        state = (r.progress or {}).get("state")
+        if state in ("running", "died"):            # the sidecar's pid decides, whatever path the run was given
+            r.attempt = "running" if state == "running" else "killed"
+        elif live is not None:
             r.attempt = "running" if str(r.path.parent / r.prefix) in live else "killed"
+    # K2: no process continues it, but the next run can -- when it is a Grids or Pipeline job (run_ps_dtfe.sh passes
+    # '--resume' by itself; it writes under the data root's snapdir_*, so the record has a sim; a Custom run never
+    # resumes and starts over), and not when the attempt failed BECAUSE the resume was refused (other settings, no
+    # manifest): the same job then fails the same way every time (2026-10-11), and only 'Start over' runs it
+    for r in out:
+        if (r.attempt in ("failed", "killed") and r.checkpoint_dir().is_dir() and r.sim and r.estimator == "ps"
+                and not r.attempt_resume_refused):
+            r.attempt = "resumable"
     return sorted(out, key=lambda r: r.finished or _dt.datetime.min, reverse=True)
+
+
+# ---------------------------------------------------------------------- void catalogues
+VOID_CACHE_TOOL = Path(__file__).resolve().parent / "void_cache.py"
+VOID_STATES = ("cached", "stale", "absent", "error")
+
+
+def void_candidate(rec: RunRecord) -> bool:
+    """A run whose grids the void pipeline reads: a finished TNG 3D full-box run with a density grid."""
+    return (bool(rec.sim) and rec.snap is not None and rec.ok and rec.dim == 3 and rec.estimator in ("ps", "dtfe")
+            and any(p.name.endswith((".a_den", ".den")) for p in rec.outputs))
+
+
+def void_status(records, data_root, python: str | None = None, timeout: float = 120.0) -> dict[str, tuple[str, str]]:
+    """{str(record.path): (state, why)} of the void catalogue of every void_candidate run (void_cache.py status:
+    'cached', 'stale' = built from an older grid or its R_v not today's, 'absent', 'error'), one subprocess per simulation
+    (config reads the box for DTFE_SIM). Reads only; seconds for a whole data root, so call it off the GUI thread."""
+    import os
+    by_sim: dict[str, list[RunRecord]] = {}
+    for r in records:
+        if void_candidate(r):
+            by_sim.setdefault(r.sim, []).append(r)
+    out: dict[str, tuple[str, str]] = {}
+    for sim, recs in by_sim.items():
+        items = [{"sim": sim, "snap": r.snap, "method": r.estimator, "prefix": r.prefix} for r in recs]
+        env = dict(os.environ, DTFE_SIM=sim, DTFE_DATA_ROOT=str(data_root), MPLBACKEND="Agg")
+        try:
+            pr = subprocess.run([python or sys.executable, str(VOID_CACHE_TOOL), "status"], input=json.dumps(items),
+                                capture_output=True, text=True, timeout=timeout, env=env)
+            got = json.loads(pr.stdout.strip().splitlines()[-1]) if pr.returncode == 0 and pr.stdout.strip() else None
+        except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+            got = None
+        for k, r in enumerate(recs):
+            d = got[k] if isinstance(got, list) and k < len(got) and isinstance(got[k], dict) else \
+                {"state": "error", "why": "the status helper failed"}
+            out[str(r.path)] = (str(d.get("state", "error")), str(d.get("why", "")))
+    return out
 
 
 # ---------------------------------------------------------------------- known output-changing fixes
@@ -504,6 +710,10 @@ KNOWN_FIXES: tuple[Fix, ...] = (
 )
 
 
+# the launcher's start-over control, as the notes name it (no '--': launcher text; 2026-10-11)
+START_OVER_HINT = "'Start over' on the Grids or Pipeline tab (PS_RESUME=0)"
+
+
 def attempt_note(rec: RunRecord) -> tuple[str, str] | None:
     """(level, message) about the attempt after this run's log (RunRecord.attempt), or None: a 'warning' when
     it rewrote outputs (or the record is a killed or failed attempt itself), else 'info'."""
@@ -512,18 +722,32 @@ def attempt_note(rec: RunRecord) -> tuple[str, str] | None:
     name = rec.attempt_log.name
     cause = f"; likely cause: {rec.attempt_cause}" if rec.attempt_cause else ""
     when = f"{rec.attempt_time:%Y-%m-%d %H:%M}" if rec.attempt_time else "later"
+    prog = progress_text(rec.progress) if rec.attempt == "running" else ""
+    if prog:
+        prog = f" ({prog})"
+    if rec.attempt == "failed" and rec.attempt_resume_refused:     # 2026-10-11: rerunning as is fails again
+        return ("warning", f"the last attempt ({name}, {when}) failed because its checkpoint could not be resumed (written "
+                           f"with other settings, or incomplete): {START_OVER_HINT} runs the job from the beginning"
+                + ("" if rec.path == rec.attempt_log else
+                   f"; it rewrote {rec.attempt_rewrote} of the outputs" if rec.attempt_rewrote else
+                   "; the outputs are still this log's"))
     if rec.path == rec.attempt_log:                     # no run under this name ever finished
         return {"failed": ("warning", f"the last attempt under this name failed ({name}{cause}); none has finished"),
-                "running": ("info", f"still running (its log so far: {name})"),
+                "running": ("info", f"still running{prog} (its log so far: {name})"),
                 "killed": ("warning", f"killed outright: its log {name} stops mid-run, so the outputs may be "
                                       f"incomplete{cause}"),
+                "resumable": ("warning", f"resumable: stopped before the end ({name}{cause}) with its checkpoint "
+                                         f"kept; running the same job again continues from the finished partitions "
+                                         f"({START_OVER_HINT} runs it from the beginning instead)"),
                 }.get(rec.attempt, ("warning", f"killed outright, or still running: its log {name} has no end yet"))
     n = rec.attempt_rewrote
     if rec.attempt == "running":
-        return ("info", f"a new run under this name is going ({name}): "
+        return ("info", f"a new run under this name is going{prog} ({name}): "
                 + (f"it has rewritten {n} of the outputs so far" if n else "the outputs are this run's until it ends"))
     what = {"failed": f"failed on {when} ({name}{cause})",
-            "killed": f"was killed outright on {when} ({name} stops mid-run{cause})"}.get(
+            "killed": f"was killed outright on {when} ({name} stops mid-run{cause})",
+            "resumable": f"stopped on {when} ({name}{cause}) with its checkpoint kept: running the same job "
+                         f"again resumes it ({START_OVER_HINT} starts over)"}.get(
         rec.attempt, f"was killed outright or is still going ({name}, last written {when})")
     return (("warning", f"a later run under this name {what}; it rewrote {n} of the outputs, which no longer "
                         "match this log: regenerate") if n else
@@ -616,6 +840,12 @@ def diagnose(log: str, exit_codes=()) -> list[Diagnosis]:
                              "macOS refused access to a file. Apps started from Finder need Full Disk "
                              "Access for iCloud Drive and external disks (System Settings -> Privacy & "
                              "Security -> Full Disk Access).", ""))
+    if RESUME_REFUSED.search(tail):                 # 2026-10-11: the same job would fail the same way
+        out.append(Diagnosis("Resume refused",
+                             "A killed run's checkpoint is there, but it cannot be continued (written with other "
+                             "settings, or incomplete). Tick 'Start over' on the Grids or Pipeline tab "
+                             "(PS_RESUME=0) to run the job from the beginning; it replaces the checkpoint.",
+                             "start_over"))
     if re.search(r"OVER BUDGET|over the memory budget|exceed the memory budget", tail) and not out:
         out.append(Diagnosis("Over the memory budget",
                              "The auto-tuner warned that this run does not fit in memory.", "check_memory"))

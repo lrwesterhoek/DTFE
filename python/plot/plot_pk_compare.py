@@ -20,6 +20,9 @@ SAME realisation's early spectrum grown linearly (--ref-snap, default snapshot 0
 amplitudes cancel, so what is left is growth (1 where linear) -- the dip disappears there. The default
 binning stays 40 log bins (single |n| shells at low k); --nbins 0 gives k_f-wide linear bins.
 
+Files: pk_<dtfe+ps | method | prefix>_z<z>.npz/.png; a non-default --nbins adds '_nb<N>' and a non-default --ref-snap
+'_ref<S>' ('_noref' for -1) before the redshift (2026-10-11), so a rerun with other bins never replaces the default.
+
     python3 plot/plot_pk_compare.py --sim TNG100-3-Dark --snaps 99 50
     python3 plot/plot_pk_compare.py --sim TNG50-4-Dark --snap 99 --method dtfe --nbins 30
 """
@@ -165,15 +168,29 @@ def plot_pk(ps, z, box, title, path, labels=None, note=None, ref=None):
     plt.close(fig)
 
 
+DEFAULT_NBINS, DEFAULT_REF_SNAP = 40, 0
+
+
+def option_tag(args) -> str:
+    """'' at the default binning and reference, else '_nb<N>' (--nbins; '_nb0' = k_f-wide linear bins) and '_ref<S>'
+    / '_noref' (--ref-snap) -- 2026-10-11, as the 2026-10-08 round's tags: a rerun with another binning or reference
+    overwrote the default figure and npz (other k bins, another third panel) under the same name."""
+    t = "" if int(args.nbins) == DEFAULT_NBINS else f"_nb{int(args.nbins)}"
+    if int(args.ref_snap) != DEFAULT_REF_SNAP:
+        t += "_noref" if int(args.ref_snap) < 0 else f"_ref{int(args.ref_snap)}"
+    return t
+
+
 def main():
     global MIRROR
     parser = make_parser("Density power spectrum: DTFE and PS-DTFE grids against linear theory.")
     parser.add_argument("--snaps", type=int, nargs="*", default=None, help="snapshots (default: --snap)")
-    parser.add_argument("--nbins", type=int, default=40,
-                        help="logarithmic k bins from k_f to k_Ny (default 40; 0 = k_f-wide linear bins)")
-    parser.add_argument("--ref-snap", type=int, default=0,
-                        help="the early snapshot whose growth-scaled P(k) is the same-realisation reference panel "
-                             "(default 0; -1 = no panel)")
+    parser.add_argument("--nbins", type=int, default=DEFAULT_NBINS,
+                        help=f"logarithmic k bins from k_f to k_Ny (default {DEFAULT_NBINS}; 0 = k_f-wide linear bins); "
+                             "another value tags the files '_nb<N>'")
+    parser.add_argument("--ref-snap", type=int, default=DEFAULT_REF_SNAP,
+                        help=f"the early snapshot whose growth-scaled P(k) is the same-realisation reference panel "
+                             f"(default {DEFAULT_REF_SNAP}; -1 = no panel); another value tags the files '_ref<S>' / '_noref'")
     parser.add_argument("--out", default=None, help=f"output folder (default {OUTPUT_DIR}/<sim>)")
     args = parser.parse_args()
     style.apply()
@@ -206,7 +223,7 @@ def main():
             print(f"    only {LABEL[next(iter(ps))]} grids here: that estimator against linear theory alone")
             note = f"no {LABEL[other]} grid for this snapshot"
         tag = args.prefix or "+".join(ps)               # the file names what it holds: a --method or --prefix rerun
-        base = out_dir / f"pk_{tag}_z{z:.2f}"           # used to overwrite the default file (suffixes APPENDED)
+        base = out_dir / f"pk_{tag}{option_tag(args)}_z{z:.2f}"     # used to overwrite the default file (suffixes APPENDED)
         base.parent.mkdir(parents=True, exist_ok=True)
         arrays = {"redshift": z, "box_mpc": box, "k_linear": np.geomspace(1e-3, 10.0, 400),
                   "prefix": args.prefix or "", "methods": np.array(list(ps))}

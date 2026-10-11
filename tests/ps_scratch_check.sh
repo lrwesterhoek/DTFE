@@ -14,6 +14,8 @@
 #     empty after every run -- even though GBs flowed through it.
 #  D) GUARDS: an iCloud path and a nonexistent directory are both rejected up front.
 #
+# Portable (2026-10-11): runs on Linux too (tests/ci_suite.sh core); B is GPU-only and SKIPs on a CPU build.
+#
 # Usage: tests/ps_scratch_check.sh [--no-build]
 
 set -euo pipefail
@@ -28,7 +30,9 @@ N="${N:-64}"; BOX="${BOX:-100.0}"
 BIN="./PS-DTFE"
 TMP="${DTFE_TEST_TMP:-${TMPDIR:-/tmp}/dtfe-tests}"; mkdir -p "${TMP}"
 SNAP="${TMP}/scr_input_pancake.hdf5"
-SC="$(mktemp -d /private/tmp/dtfe-scratch-check.XXXXXX)"
+# a LOCAL temp folder on either system (was /private/tmp: macOS only; 2026-10-11 Linux port). TMPDIR on a Mac is
+# /var/folders/..., local and never under iCloud, which the binary would refuse (section D)
+SC="$(mktemp -d "${TMPDIR:-/tmp}/dtfe-scratch-check.XXXXXX")"
 trap 'rm -rf "${SC}"' EXIT
 
 echo "============================================================"
@@ -41,8 +45,10 @@ if [ "${1:-}" != "--no-build" ]; then
     make PS-DTFE ${BUILD_MODE:+"$BUILD_MODE"} >/dev/null
 fi
 [ -x "${BIN}" ] || { echo "FAIL: ${BIN} not built"; exit 1; }
+# GPU deposit compiled in: the build mode names a backend (o_ps/.gpu_mode_off alone also called the CUDA
+# emulator and a never-stamped tree "GPU")
 GPU_BUILT=0
-[ -f o_ps/.gpu_mode_off ] || GPU_BUILT=1
+grep -Eq "METAL=1|CUDA=1|HIP=1|CUDAEMU=1" o_ps/.build_mode 2>/dev/null && GPU_BUILT=1
 
 echo ">> generating test snapshot ..."
 "${PY}" "${SCRIPT_DIR}/generate_ps_test_data.py" --out "${SNAP}" --n "${N}" --box "${BOX}" \
@@ -110,7 +116,7 @@ PYEOF
     then check "B GPU scratch run matches plain GPU run (float tolerance)" 1
     else check "B GPU scratch run matches plain GPU run (float tolerance)" 0; fi
 else
-    echo ">> B skipped (CPU-only build)"
+    echo "   SKIP  B (this build has no GPU backend)"
 fi
 
 # ---------- (C) nothing left behind ----------

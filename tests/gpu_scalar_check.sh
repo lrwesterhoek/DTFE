@@ -42,7 +42,9 @@ with h5py.File(sys.argv[1], "a") as f:
 PYEOF
 G=32
 FIELDS=(--field density_a velocity_a gradient_a scalar_a scalarGradient_a --scalar-dataset Phi)
-COMMON=(--grid $G --periodic --input 105 --MpcUnit 1 --verbose 1 "${FIELDS[@]}")
+# one domain for both runs: on <= 8 cores the time-aware tuner splits the CPU reference, and a split sampled deposit
+# differs from one domain by ~4e-3, which failed this suite on Linux (2026-10-11, the CUDAEMU port's first Linux run)
+COMMON=(--grid $G --periodic --input 105 --MpcUnit 1 --verbose 1 --partition 1 1 1 "${FIELDS[@]}")
 run() { local out="$1"; shift; "$@" > "$out.log" 2>&1 || { echo "FAIL: $* (see $out.log)"; exit 1; }
         grep -q "using the CPU interpolation\|using the CPU deposit\|deposit unavailable" "$out.log" && { echo "FAIL: $out fell back to the CPU"; exit 1; }; return 0; }
 echo ">> DTFE: CPU, GPU item kernel, GPU per-tet kernel"

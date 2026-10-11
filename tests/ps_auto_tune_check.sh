@@ -36,6 +36,7 @@
 #     written; a hand-set --partition/--max-concurrent is reported as given (the prediction uses
 #     the concurrency the run will use); DTFE_AUTO_PTS_N sizes a plane that does not exist yet.
 #  J) the machine's free memory over a plan: an explicit budget capped by it, the partition memory gate.
+#  M) the GPU deposit's host snapshot (ps_metal_host.cc GpuSnapshot) is in the prediction, ONCE (the deposits serialise).
 #  K) partitions in flight never outnumber the threads (2026-10-08): a hand-set split with the
 #     concurrency left to the tuner, and '--max-concurrent 0' ("all threads"), each started every
 #     partition at once (64 threads for '--partition 4 4 4').
@@ -43,6 +44,9 @@
 # The 2^32 GPU sub-grid guard (ps_interpolation.cc) is NOT exercised here: it needs a real
 # >4.29e9-cell partition sub-grid, i.e. >32 GB of buffers. It mirrors the validated guard in
 # averaged_interpolation_1.cc line-for-line.
+#
+# Portable (2026-10-11): runs on Linux too (tests/ci_suite.sh core) -- the peak RSS from getrusage, no macOS-only
+# command; the GPU-only parts (H3, I2/I3, L, M) SKIP on a CPU build.
 #
 # Usage: tests/ps_auto_tune_check.sh [--no-build]
 
@@ -126,15 +130,28 @@ agrep "B prints a predicted peak" "predicted peak ~[0-9.]+ GB" "${LOG_B}"
 # ---------- (C) conservative contract: predicted >= measured on a REAL partitioned run ----------
 echo ">> C: predicted >= measured (256^3, volume-weighted dispersion, real run)"
 LOG_C="${TMP}/at_c.log"
-DTFE_AUTO_MINN=1000 /usr/bin/time -l "${BIN}" "${SNAP}" "${TMP}/at_c" --grid 256 \
+# The peak RSS comes from getrusage(RUSAGE_CHILDREN) in a python parent, not '/usr/bin/time -l' (macOS
+# only; GNU time spells it -v and is not even installed on a bare Ubuntu): ru_maxrss is in BYTES on macOS
+# and in KILOBYTES on Linux (2026-10-11, the Linux port of this suite).
+peak_rss_run() {  # $1 = log; the rest = the command. Appends 'PEAK_RSS_BYTES <n>' to the log; exits as the command
+    "${PY}" - "$@" <<'PYEOF'
+import resource, subprocess, sys
+with open(sys.argv[1], "w") as log:
+    rc = subprocess.call(sys.argv[2:], stdout=log, stderr=subprocess.STDOUT)
+    kb_or_b = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+    log.write(f"\nPEAK_RSS_BYTES {kb_or_b if sys.platform == 'darwin' else kb_or_b * 1024}\n")
+sys.exit(rc)
+PYEOF
+}
+peak_rss_run "${LOG_C}" env DTFE_AUTO_MINN=1000 "${BIN}" "${SNAP}" "${TMP}/at_c" --grid 256 \
     --field density_a velocity_a dispersion_a --input 105 --MpcUnit 1 --verbose 2 --periodic \
-    --avg-subsamples 1 --ps-volume-weighted > "${LOG_C}" 2>&1
+    --avg-subsamples 1 --ps-volume-weighted
 if "${PY}" - "${LOG_C}" <<'PYEOF'
 import re, sys
 log = open(sys.argv[1]).read()
 mp = re.search(r"predicted peak ~([0-9.]+) GB", log)
-mm = re.search(r"(\d+)\s+maximum resident", log)
-assert mp and mm, "missing predicted-peak or time -l output"
+mm = re.search(r"PEAK_RSS_BYTES (\d+)", log)
+assert mp and mm, "missing predicted-peak or peak-RSS output"
 pred, meas = float(mp.group(1)), int(mm.group(1)) / 1e9
 print(f"   .... predicted {pred:.2f} GB vs measured {meas:.2f} GB")
 sys.exit(0 if pred >= meas else 1)
@@ -238,7 +255,7 @@ check "G the estimate stays physical: 0 < ${sg:-none} < 20 streams/point" \
 
 # ---------- (H) the time-aware split of a small set ----------
 echo ">> H: time-aware split for small sets (speed, not memory)"
-GPU_H=0; grep -q "METAL=1\|CUDA=1\|HIP=1" o_ps/.build_mode 2>/dev/null && GPU_H=1
+GPU_H=0; grep -Eq "METAL=1|CUDA=1|HIP=1" o_ps/.build_mode 2>/dev/null && GPU_H=1   # (-E: GNU and BSD grep alike)
 COMMON_H=(--input 105 --MpcUnit 1 --verbose 2 --auto-tune-report)
 # H1: a slice of the 64^3 box (4.2M points, 16^3 grid) is triangulation-bound -> 2^3 partitions
 env DTFE_RAM_GB=64 DTFE_AUTO_PTS_N=4194304 "${BIN}" "${SNAP}" "${TMP}/at_h1" --grid 16 --field density --periodic \
@@ -256,6 +273,8 @@ if [ "${GPU_H}" = 1 ]; then
     env DTFE_RAM_GB=64 "${BIN}" "${SNAP}" "${TMP}/at_h3" --grid 256 --field density_a velocity_a --periodic --ps-gpu \
         "${COMMON_H[@]}" > "${TMP}/at_h3.log" 2>&1
     agrep "H3 a GPU grid keeps one domain" "^AUTO-TUNE-REPORT partition=1 " "${TMP}/at_h3.log"
+else
+    echo "   SKIP  H3 (this build has no GPU backend)"
 fi
 # H4: the non-periodic clump (48^3) makes no periodic copies, so its single domain is cheap
 # enough to keep (charged the periodic 1.7x it would be split)
@@ -374,6 +393,59 @@ for k in K1 K2; do
 done
 K_ARGS=()
 rm -f "${TMP}"/at_k.*
+
+# ---------- (L) the look-ahead and the budget agree (2026-10-11) ----------
+# At --max-concurrent 1 with the GPU deposit the run prepares the next partition during the deposit. Its bytes were
+# added to the prediction AFTER the split was chosen without them, so a plan that fitted reported over_budget=1 and
+# the launcher's memory check halved a plane that fits. A budget between 'one partition' and 'one partition + the
+# look-ahead' must now switch the look-ahead off and report a prediction within the budget.
+echo ">> L: the look-ahead is counted against the budget"
+run_l() {  # $1 = budget in GB, $2 = log
+    env DTFE_RAM_GB=64 DTFE_FREE_GB=1000 DTFE_AUTO_MINN=1000 DTFE_MEM_BUDGET_GB="$1" "${BIN}" "${SNAP}" "${TMP}/at_l" \
+        --grid 64 --field density_a --input 105 --MpcUnit 1 --verbose 2 --periodic --ps-gpu \
+        --partition 2 2 2 --max-concurrent 1 --auto-tune-report > "$2" 2>&1 || true
+}
+run_l 50 "${TMP}/at_l1.log"
+if grep -q "GPU (--ps-gpu)" "${TMP}/at_l1.log"; then
+    p1=$(sed -n 's/^AUTO-TUNE-REPORT .*predicted_gb=\([0-9.]*\) .*/\1/p' "${TMP}/at_l1.log" | head -1)
+    # just under 'one partition + the look-ahead' (~0.1 GB at 2^3 of 64^3 particles), above one partition
+    bl=$(awk -v p="${p1:-0}" 'BEGIN{printf "%.4f", p - 0.03}')
+    run_l "${bl}" "${TMP}/at_l2.log"
+    pl=$(sed -n 's/^AUTO-TUNE-REPORT .*predicted_gb=\([0-9.]*\) .*/\1/p' "${TMP}/at_l2.log" | head -1)
+    ol=$(sed -n 's/^AUTO-TUNE-REPORT .*over_budget=\([01]\).*/\1/p' "${TMP}/at_l2.log" | head -1)
+    check "L a budget ${bl} GB under one partition + look-ahead (${p1:-none} GB): look-ahead off, predicted ${pl:-none} GB, over_budget ${ol:-none}" \
+          "$([ "${ol}" = "0" ] && grep -q "look-ahead off for this run" "${TMP}/at_l2.log" \
+             && ! grep -q "look-ahead off" "${TMP}/at_l1.log" \
+             && awk -v p="${pl:-99}" -v b="${bl}" 'BEGIN{exit !(p <= b)}' && echo 1 || echo 0)"
+else
+    echo "   SKIP  L (this build has no GPU backend)"
+fi
+rm -f "${TMP}"/at_l*
+
+# ---------- (M) the GPU deposit's host snapshot is in the prediction, once (2026-10-11) ----------
+# The Metal deposit keeps a host copy of its accumulator buffers (ps_metal_host.cc GpuSnapshot: the grids, the
+# 8 B fixed-point mass, the per-tet masses) to resume a failed command buffer. The model did not count it: ~4.7 GB
+# per partition at 1024^3 split 2^3. The deposits run one at a time, so the copy is counted ONCE whatever the
+# concurrency: predicted(c) = fixed + c x per-partition + snapshot, i.e. snapshot = p(2) - fixed - 2 (p(3) - p(2)).
+echo ">> M: the GPU deposit's snapshot is counted once"
+run_m() {  # $1 = --max-concurrent, $2 = log
+    env DTFE_RAM_GB=64 DTFE_FREE_GB=1000 "${BIN}" "${SNAP}" "${TMP}/at_m" --grid 256 \
+        --field density_a velocity_a --ps-volume-weighted --input 105 --MpcUnit 1 --verbose 2 --periodic --ps-gpu \
+        --partition 2 2 2 --max-concurrent "$1" --auto-tune-report > "$2" 2>&1 || true
+}
+run_m 2 "${TMP}/at_m2.log"
+if grep -q "GPU (--ps-gpu)" "${TMP}/at_m2.log"; then
+    run_m 3 "${TMP}/at_m3.log"
+    gb() { sed -n "s/^AUTO-TUNE-REPORT .*$1=\([0-9.]*\) .*/\1/p" "$2" | head -1; }
+    p2=$(gb predicted_gb "${TMP}/at_m2.log"); p3=$(gb predicted_gb "${TMP}/at_m3.log"); f2=$(gb fixed_gb "${TMP}/at_m2.log")
+    # expected: (24 B of selected grids + 4 B of the 64-bit mass) x the (256/2 + 40)^3 sub-grid cells = 0.133 GB
+    sm=$(awk -v a="${p2:-0}" -v b="${p3:-0}" -v f="${f2:-0}" 'BEGIN{printf "%.3f", a - f - 2*(b - a)}')
+    check "M the GPU snapshot is counted once: ${sm} GB beyond 2 partitions (expected ~0.13 GB; predicted ${p2:-none} / ${p3:-none} GB at 2 / 3 in flight)" \
+          "$(awk -v s="${sm}" 'BEGIN{exit !(s >= 0.10 && s <= 0.17)}' && echo 1 || echo 0)"
+else
+    echo "   SKIP  M (this build has no GPU backend)"
+fi
+rm -f "${TMP}"/at_m*
 
 echo "------------------------------------------------------------"
 if [ "${FAILS}" -gt 0 ]; then

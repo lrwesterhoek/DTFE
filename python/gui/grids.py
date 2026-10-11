@@ -675,6 +675,79 @@ def void_circles(centres, radii, box: float, axis: int, position: float, rest, l
     return out
 
 
+def void_circles_mpc(centres, radii, box: float, axis: int, position: float, rest, lo, hi,
+                     periodic: bool = True) -> list[tuple[float, float, float, int]]:
+    """void_circles in the DATA frame of a matplotlib imshow(extent=[lo0, hi0, lo1, hi1], origin='lower'):
+    [(u, v, radius, k)] in Mpc, for a saved figure's matplotlib Circle patches (2026-10-11). One pixel per Mpc
+    and y measured down from hi1 make void_circles' image pixels the data offsets."""
+    (u0, v0), (u1, v1) = (float(lo[0]), float(lo[1])), (float(hi[0]), float(hi[1]))
+    return [(u0 + x, v1 - y, rx, k) for x, y, rx, _ry, k in
+            void_circles(centres, radii, box, axis, position, rest, lo, hi, u1 - u0, v1 - v0, periodic)]
+
+
+def draw_void_circles_mpl(ax, circles_mpc, dashed=(), color="white"):
+    """The outlines on a matplotlib axes as the screen draws them: white over a dark edge, clipped to the axes;
+    'dashed' = a second list (R_eff) drawn dashed. Returns the number of patches drawn."""
+    from matplotlib.patches import Circle
+    n = 0
+    for circles, style in ((circles_mpc, "-"), (dashed, (0, (4, 3)))):
+        for u, v, r, _k in circles:
+            for lw, c in ((1.6, (0, 0, 0, 0.65)), (0.7, color)):
+                ax.add_patch(Circle((u, v), r, fill=False, lw=lw, ec=c, ls=style, clip_on=True))
+            n += 1
+    return n
+
+
+def void_at(circles, x: float, y: float):
+    """The catalogue row k of the outline under image position (x, y) (pixels), or None: of the circles that
+    contain it the smallest one (a small void drawn inside a big one's outline stays reachable)."""
+    best = None
+    for cx, cy, rx, ry, k in circles or ():
+        if rx <= 0 or ry <= 0:
+            continue
+        if ((x - cx) / rx) ** 2 + ((y - cy) / ry) ** 2 <= 1.0 and (best is None or rx < best[0]):
+            best = (rx, int(k))
+    return None if best is None else best[1]
+
+
+def void_info(res: dict, k: int, short: bool = False) -> str:
+    """What the inspector says about catalogue row k of a void_outlines.py result: R_v (every definition the
+    catalogue has), R_eff, the central delta, the resolved / distinct flags and the centre. 'short' = one line
+    for the hover readout."""
+    def mpc(v):
+        return "none" if v is None or v != v else f"{float(v):.2f} Mpc"
+    r_v = res["r_v_mpc"][k]
+    others = {d: v[k] for d, v in (res.get("r_v_defs") or {}).items() if d != "crossing"}
+    delta = res["delta"][k]
+    d_text = "none" if delta is None else f"{float(delta):.3f}"
+    flags = ", ".join([("resolved" if res["resolved"][k] else "not resolved"),
+                       ("distinct" if res["distinct"][k] else "not distinct")])
+    if short:
+        return f"void {k}: R_v {mpc(r_v)}, R_eff {mpc(res['r_eff_mpc'][k])}, δ {d_text}, {flags}"
+    c = res["centres_mpc"][k]
+    labels = {"delta08": "enclosed Δ reaches −0.8", "ridge": "compensation ridge"}
+    radii = [f"R_v {mpc(r_v)} (back to the mean)"] + [f"{mpc(v)} ({labels.get(d, d)})" for d, v in others.items()]
+    lines = [f"<b>void {k}</b> · {flags} · centre ({', '.join(f'{float(v):.2f}' for v in c)}) Mpc",
+             " · ".join(radii),
+             f"R_eff {mpc(res['r_eff_mpc'][k])} (ellipsoid (a b c)^⅓) · central δ {d_text}"]
+    return "<br>".join(lines)
+
+
+def available_gb() -> float | None:
+    """What the other programs leave free now (GB; None when unreadable): tools/void_outlines.available_bytes,
+    the reading the catalogue build gate itself uses (DTFE_FREE_GB, psutil, vm_stat, MemAvailable)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("_void_outlines_mem",
+                                                  REPO_ROOT / "python" / "tools" / "void_outlines.py")
+    try:
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        b = mod.available_bytes()
+    except (OSError, ImportError, AttributeError, ValueError):
+        return None
+    return None if b is None else b / 1e9
+
+
 # ---------------------------------------------------------------------- discovery
 def _tng_box(snapdir: Path) -> tuple[tuple, float | None] | tuple[None, None]:
     """((lo, hi), redshift) of a TNG-layout snapshot from its combined file (h-free ckpc -> Mpc)."""

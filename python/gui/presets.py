@@ -106,6 +106,8 @@ OPTION_TEXT = {
     "exact":           ("Exact: analytic tetrahedron-cell clipping (noise-free; best on the GPU)", "--ps-exact-deposit"),
     "parallel_triangulation": ("Parallel triangulation (faster; repeats differ at float rounding)",
                                "--parallel-triangulation"),
+    "ordered_merge":   ("Merge the partitions in index order (bit-identical repeats; can be slower)",
+                        "--ordered-merge"),
     "alpha_shape":     ("Alpha shape: drop Lagrangian tetrahedra wider than this many mean particle spacings "
                         "(0 keeps the whole convex hull)", "--ps-alpha-shape"),
     "sampled":         ("Sampled: nSub³ points per cell (fast, the default)", "--avg-subsamples"),

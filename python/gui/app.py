@@ -468,7 +468,10 @@ class MainWindow(QMainWindow):
         left.setMinimumWidth(690)           # three columns of field boxes ('velocity dispersion' ...) need it:
                                             # at 590 the third column read 've', 'vo', 'V-' (seen 2026-10-05)
 
-        self.runs = RV.RunsBrowser(lambda: self.root_edit.text().strip(), self._custom_output_dirs)
+        self.runs = RV.RunsBrowser(lambda: self.root_edit.text().strip(), self._custom_output_dirs, rs.PYTHON)
+        self.runs.build_voids.connect(self.queue_void_build)
+        self.running_now = RV.RunningNow()
+        self.running_now.message.connect(self.status_message)
         self.runs.load_settings.connect(self._load_run_settings)
         self.runs.explore.connect(self._explore_output)
         self.runs.message.connect(self.status_message)
@@ -513,6 +516,21 @@ class MainWindow(QMainWindow):
         self._poll = QTimer(self, interval=4000)
         self._poll.timeout.connect(lambda: self.proc is None and self.refresh())
         self._poll.start()
+        # the memory strip and the 'Running now' panel (2026-10-11): vm_stat, sysctl, pgrep, ps and a glob of the
+        # data root's progress files, in a worker thread every 5 s (never two at once), the answer relayed back
+        self.mem_strip = QLabel("")
+        self.mem_strip.setStyleSheet("color: gray")
+        self.mem_strip.setToolTip("Free memory (what the other programs leave), swap in use, and the DTFE / PS-DTFE "
+                                  "programs running on this machine with their resident memory")
+        self.statusBar().addPermanentWidget(self.mem_strip)
+        self._machine_relay = RV._Relay()
+        self._machine_relay.done.connect(self._machine_known)
+        self._machine_busy = False
+        self.machine: dict = {}             # the last poll: {'mem', 'procs', 'running'}
+        self._machine_timer = QTimer(self, interval=5000)
+        self._machine_timer.timeout.connect(self._poll_machine)
+        self._machine_timer.start()
+        self._poll_machine()
 
     # ================================================================ shared data panel
     def _build_data(self) -> QWidget:
@@ -867,7 +885,8 @@ class MainWindow(QMainWindow):
         col.addWidget(self.slice_group)
 
         g, (self.part_spin, self.conc_spin, self.scratch_edit, self.prefix_edit,
-            self.pt_check, self.prec_combo, self.budget_spin, self.tess_edit) = self._resources_group()
+            self.pt_check, self.prec_combo, self.budget_spin, self.tess_edit, self.om_check,
+            self.so_check) = self._resources_group()
         col.addWidget(g)
         col.addStretch(1)
         w = QWidget()
@@ -945,6 +964,21 @@ class MainWindow(QMainWindow):
         ptri.setToolTip(P.tooltip("parallel_triangulation"))
         ptri.toggled.connect(self._changed)
         f.addRow("", ptri)
+        # K1 (2026-10-11): the partitions merged in index order, so two identical runs give bit-identical grids
+        ordered = QCheckBox(P.label("ordered_merge"))
+        ordered.setToolTip(P.tooltip("ordered_merge"))
+        ordered.toggled.connect(self._changed)
+        f.addRow("", ordered)
+        # 2026-10-11: a killed partitioned run's checkpoint is resumed by the next run of the same job; this starts
+        # it over instead (the only way out when the resume is refused: other settings, an incomplete checkpoint).
+        # The Custom tab hides it: a Custom run never resumes.
+        start_over = QCheckBox("Start over: do not resume a killed run's checkpoint")
+        start_over.setToolTip("A partitioned run that was killed keeps a checkpoint of its finished partitions, and the "
+                              "next run of the same job continues from it. Ticked, the run starts from the beginning "
+                              "and replaces the checkpoint (PS_RESUME=0): needed when the settings changed since, as "
+                              "the program then refuses to resume.")
+        start_over.toggled.connect(self._changed)
+        f.addRow("", start_over)
         prec = QComboBox()
         prec.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)   # its long double-precision text
         prec.setMinimumContentsLength(24)       # made the tab wider than the pane: the '…' buttons were cut off
@@ -975,7 +1009,7 @@ class MainWindow(QMainWindow):
                         "10.9 s -> 4.6 s). A LOCAL folder (iCloud is refused); about 0.15 KB per vertex of disk.")
         tess.editingFinished.connect(self._changed)
         f.addRow("Tessellation cache", _dir_row(tess, lambda: self._browse_dir(tess, "Tessellation cache folder")))
-        return g, (part, conc, scratch, prefix, ptri, prec, budget, tess)
+        return g, (part, conc, scratch, prefix, ptri, prec, budget, tess, ordered, start_over)
 
     # ================================================================ Custom snapshot tab
     def _build_own_tab(self) -> QWidget:
@@ -1157,9 +1191,12 @@ class MainWindow(QMainWindow):
         f.addRow("Name", self.o_name)
         col.addWidget(g)
         g, (self.o_part, self.o_conc, self.o_scratch, _prefix, self.o_pt, self.o_prec,
-            self.o_budget, self.o_tess) = self._resources_group()
-        _prefix.hide()
-        g.layout().labelForField(_prefix).hide()
+            self.o_budget, self.o_tess, self.o_om, _start_over) = self._resources_group()
+        for wid in (_prefix, _start_over):
+            wid.hide()
+            lab = g.layout().labelForField(wid)     # an addRow("", ...) row may have none
+            if lab is not None:
+                lab.hide()
         col.addWidget(g)
         col.addStretch(1)
         w = QWidget()
@@ -1331,7 +1368,7 @@ class MainWindow(QMainWindow):
         col.addWidget(g)
 
         g, (self.p_part, self.p_conc, self.p_scratch, self.p_prefix, self.p_pt, self.p_prec,
-            self.p_budget, self.p_tess) = self._resources_group()
+            self.p_budget, self.p_tess, self.p_om, self.p_so) = self._resources_group()
         col.addWidget(g)
 
         g = QGroupBox("Run")
@@ -1624,6 +1661,10 @@ class MainWindow(QMainWindow):
         self.figures.mode.currentIndexChanged.connect(lambda _i: self._sync_figures_actions())
         self.results.addTab(self.figures, "Figures")
         self.results.addTab(self.runs, "Runs")
+        self.results.addTab(self.running_now, "Running now")
+        self.results.setTabToolTip(self.results.indexOf(self.running_now),
+                                   "Every DTFE / PS-DTFE run on this machine, wherever it was started (a terminal, "
+                                   "nohup, this launcher): progress, ETA, memory")
         self.results.setTabToolTip(self.results.indexOf(self.runs),
                                    "Every run on disk: settings, time, memory, size, and outputs made before a fix")
         self.results.currentChanged.connect(self._results_tab_changed)
@@ -1732,7 +1773,8 @@ class MainWindow(QMainWindow):
         opts = self._restore_json("queue_options", {})
         self.q_stop_on_fail = QCheckBox("Stop the queue when a job fails (later jobs usually need its output)")
         self.q_stop_on_fail.setChecked(opts.get("stop_on_fail", True))
-        self.q_wait = QCheckBox("Before a grids or pipeline job, wait while another DTFE / PS-DTFE run is going")
+        self.q_wait = QCheckBox("Before a grids, pipeline or custom-snapshot job, wait while another DTFE / PS-DTFE "
+                                "run is going")
         self.q_wait.setChecked(opts.get("wait", True))
         self.q_notify = QCheckBox("Notify me when a job or the queue finishes (a desktop notification)")
         self.q_notify.setChecked(opts.get("notify", True))
@@ -1785,6 +1827,8 @@ class MainWindow(QMainWindow):
         self.fields_box.lambda_spin.setValue(s.lambda_th)
         self.prefix_edit.setText(s.output_prefix)
         self.pt_check.setChecked(s.parallel_triangulation)
+        self.om_check.setChecked(s.ordered_merge)
+        self.so_check.setChecked(s.start_over)
         self.prec_combo.setCurrentIndex(max(self.prec_combo.findData(s.precision), 0))
         # Pipeline
         self.p_nu.setCurrentText(str(p.nu))
@@ -1808,6 +1852,8 @@ class MainWindow(QMainWindow):
         self.p_cu.setChecked(p.caustic_cusps)
         self.p_ld.setChecked(p.linear_deposit)
         self.p_pt.setChecked(p.parallel_triangulation)
+        self.p_om.setChecked(p.ordered_merge)
+        self.p_so.setChecked(p.start_over)
         self.p_part.setValue(p.partition)
         self.p_conc.setValue(p.max_concurrent)
         self.p_scratch.setText(p.scratch_dir)
@@ -1866,6 +1912,7 @@ class MainWindow(QMainWindow):
         self.o_tess.setText(c.tess_cache)
         self.o_fields_box.lambda_spin.setValue(c.lambda_th)
         self.o_pt.setChecked(c.parallel_triangulation)
+        self.o_om.setChecked(c.ordered_merge)
         self.o_prec.setCurrentIndex(max(self.o_prec.findData(c.precision), 0))
         self._own_last_file = c.input_file
         # Plots
@@ -1920,6 +1967,8 @@ class MainWindow(QMainWindow):
         s.lambda_th = self.fields_box.lambda_spin.value()
         s.output_prefix = self.prefix_edit.text().strip()
         s.parallel_triangulation = self.pt_check.isChecked()
+        s.ordered_merge = self.om_check.isChecked()
+        s.start_over = self.so_check.isChecked()
         s.precision = self.prec_combo.currentData() or "single"
         # Pipeline
         p.sims = _checked(self.p_sims)
@@ -1943,6 +1992,8 @@ class MainWindow(QMainWindow):
         p.caustic_cusps = self.p_cu.isChecked() and self.p_ca.isChecked()
         p.linear_deposit = self.p_ld.isChecked()
         p.parallel_triangulation = self.p_pt.isChecked()
+        p.ordered_merge = self.p_om.isChecked()
+        p.start_over = self.p_so.isChecked()
         p.partition = self.p_part.value()
         p.max_concurrent = self.p_conc.value()
         p.scratch_dir = self.p_scratch.text().strip()
@@ -2006,6 +2057,7 @@ class MainWindow(QMainWindow):
         c.tess_cache = self.o_tess.text().strip()
         c.lambda_th = self.o_fields_box.lambda_spin.value()
         c.parallel_triangulation = self.o_pt.isChecked()
+        c.ordered_merge = self.o_om.isChecked()
         c.precision = self.o_prec.currentData() or "single"
         # Plots
         pl.sets = _checked(self.fig_list)
@@ -2225,6 +2277,8 @@ class MainWindow(QMainWindow):
         tbb_note = "" if rs.tbb_built(s.precision) else " (this build has no TBB: ignored)"
         self.pt_check.setText(P.label("parallel_triangulation") + tbb_note)
         self.pt_check.setEnabled(ps)
+        self.om_check.setEnabled(ps)                # a PS-DTFE option (standard DTFE has no partition merge order)
+        self.so_check.setEnabled(ps)                # only run_ps_dtfe.sh checkpoints and resumes (2026-10-11)
         for combo in (self.prec_combo, self.o_prec, self.p_prec):     # the double pair's state, in words
             i = combo.findData("double")
             built = rs.binary_built("ps", "double") and rs.binary_built("dtfe", "double")
@@ -2253,6 +2307,7 @@ class MainWindow(QMainWindow):
         self.o_pt.setText(P.label("parallel_triangulation") + (" (3D only)" if flat else "" if rs.tbb_built(c.precision)
                                                                else " (this build has no TBB: ignored)"))
         self.o_pt.setEnabled(cps and not flat)
+        self.o_om.setEnabled(cps)                   # 2D runs are partitioned too
         self.o_snap_form.setRowVisible(self.o_alpha, cps and not c.periodic)
         self.o_gpu.setEnabled(not flat)
         self.o_gpu.setText(P.label("gpu" if cps else "gpu_dtfe") + (" (the 2D programs run on the CPU)" if flat else
@@ -2395,6 +2450,8 @@ class MainWindow(QMainWindow):
         self._tee_path = ""                 # ... nor its log be renamed at this job's first step end: it stays .partial
         G.drop_cubes()                      # Explore's cubes are this process's memory: the auto-tuner budgets from what is free
         G.cap_cubes(True)                   # ... and they stay small while the job runs (lifted in _finish_job)
+        if tab in (GRIDS, OWN, PIPELINE):    # a void-catalogue search costs ~80 B per cell: a heavy job gets the memory
+            self.explore.stop_void_search()  # (the next tick or output change asks again; 2026-10-11)
         self.banner.hide()
         if isinstance(spec, rs.CustomSpec):
             spec = rs.CustomSpec.from_dict(spec.to_dict())    # a COPY: the Custom tab keeps editing the live one while
@@ -2537,8 +2594,21 @@ class MainWindow(QMainWindow):
         self.proc.readyReadStandardOutput.connect(self._on_output)
         self.proc.finished.connect(self._on_finished)
         self.proc.errorOccurred.connect(self._on_error)
+        proc = self.proc
+        self.proc.started.connect(lambda: self._keep_awake(st.argv, int(proc.processId())))
         self.proc.start(st.argv[0], st.argv[1:])
         self.refresh()
+
+    def _keep_awake(self, argv, pid: int):
+        """caffeinate for a step no run script keeps awake (rs.keep_awake_argv: Custom runs, analysis, downloads;
+        2026-10-11). It follows the step's pid (-w), so it ends with the step, a Stop or a crash included."""
+        cmd = rs.keep_awake_argv(argv, pid)
+        if cmd is None:
+            return
+        try:
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError:
+            pass
 
     def _on_output(self):
         if self.proc is None:
@@ -2799,6 +2869,51 @@ class MainWindow(QMainWindow):
     # ================================================================ helpers for the new panels
     def status_message(self, text: str):
         self.status.setText(text)
+
+    def _poll_machine(self):
+        """Start one background reading of the machine (memory, swap, DTFE processes, their progress files)."""
+        if self._machine_busy:
+            return
+        self._machine_busy = True
+        root, extra, relay = self.root_edit.text().strip(), self._custom_output_dirs(), self._machine_relay
+
+        def work():
+            res = {}
+            try:
+                res["mem"] = rs.memory_status()
+                res["procs"] = rs.dtfe_processes(0.0)
+                res["running"] = rs.running_now(rs.progress_files(root, extra), res["procs"])
+            except Exception as e:          # a reading that fails shows as unknown, never kills the poll
+                res["error"] = str(e)
+            relay.done.emit(res)
+        import threading
+        threading.Thread(target=work, daemon=True).start()
+
+    def _machine_known(self, res: dict):
+        self._machine_busy = False
+        self.machine = res
+        try:
+            self.mem_strip.setText(rs.memory_text(res.get("mem") or {}, res.get("procs")))
+            self.running_now.show_entries(res.get("running") or [])
+        except RuntimeError:                # the window went while the reading was under way
+            pass
+
+    def queue_void_build(self, rec: R.RunRecord):
+        """The Runs tab's 'Build void catalogue': a Plots job of the 'voidcat' set for this run's snapshot, grids
+        and prefix, added to the queue (2026-10-11)."""
+        if not R.void_candidate(rec):
+            return
+        spec = rs.PlotSpec(data_root=self.root_edit.text().strip(), sim=rec.sim, snapshots=[int(rec.snap)],
+                           sets=["voidcat"], method=rec.estimator,
+                           prefix="" if rec.prefix in ("ps_output", "output") else rec.prefix,
+                           figures_root=self.plots.figures_root)
+        qjob = rs.QueuedJob.of("plots", spec)
+        self.queue.append(qjob)
+        self._save_queue()
+        self._refresh_queue()
+        self.q_list.setCurrentRow(len(self.queue) - 1)
+        self.results.setCurrentIndex(self.results.indexOf(self.queue_tab))
+        self.status.setText(f"Queued: {qjob.title}" + ("" if self._queue_running else " (Start queue runs it)"))
 
     def _runs(self) -> list[R.RunRecord]:
         """The run logs on disk, for the time estimates (rescanned at most every 30 s)."""
@@ -3145,7 +3260,7 @@ class MainWindow(QMainWindow):
     # ---------------------------------------------------------------- failure banner
     _ACTION_TEXT = {"check_memory": "Check memory", "scratch": "Set a scratch folder…",
                     "choose_root": "Choose the data folder…", "open_data": "Open the Data tab",
-                    "build": "Build the programs…"}
+                    "build": "Build the programs…", "start_over": "Tick Start over"}
 
     def _show_banner(self, diagnoses: list[R.Diagnosis]):
         while self.banner_buttons.count():
@@ -3184,6 +3299,10 @@ class MainWindow(QMainWindow):
             self.tabs.setCurrentIndex(DATA)
         elif action == "build":
             self.run_setup(page=1)
+        elif action == "start_over":                # a refused resume (2026-10-11): the tab's start-over tick
+            t = tab if tab in (GRIDS, PIPELINE) else GRIDS
+            self.tabs.setCurrentIndex(t)
+            (self.so_check if t == GRIDS else self.p_so).setChecked(True)
         self.banner.hide()
 
     # ---------------------------------------------------------------- export
@@ -3378,6 +3497,11 @@ class MainWindow(QMainWindow):
                 over.append(n)
         if code != 0 or not any(n in reports for n in snaps):
             mc["failed"] = mc.get("failed", 0) + 1  # a crashed pass, or one that reported nothing, is not "fits"
+            # its output into the log, which the status line points to (2026-10-11: it went only into the buffer,
+            # so 'see the log' showed nothing of a missing snapshot or a crash); the last 200 lines are enough
+            tail = "\n".join(rs.strip_ansi(mc["buf"]).splitlines()[-200:])
+            self.log.appendPlainText(f"== memory check of {sim}" + (f" at {nu}²" if nu else "")
+                                     + f" failed (exit {code}):\n" + (tail or "(no output)"))
         mc["done"] += 1
         # pipeline: what does not fit is tried again at half the plane size
         if nu and over and nu // 2 >= rs.ADAPTIVE_MIN_NU:
@@ -3556,7 +3680,11 @@ class MainWindow(QMainWindow):
             busy = rs.running_jobs(max_age=0)
             if busy:
                 pid, name = busy[0]
-                self.status.setText(f"Queue: waiting for {name} (pid {pid}) to finish before '{qjob.title}'")
+                # its ETA from the progress sidecar the last machine poll read (2026-10-11), when it has one
+                prog = next((e.get("progress") for e in self.machine.get("running") or [] if e.get("pid") == pid), None)
+                eta = (prog or {}).get("eta_s")
+                eta = f", ETA {R.format_duration(float(eta))}" if isinstance(eta, (int, float)) and eta >= 0 else ""
+                self.status.setText(f"Queue: waiting for {name} (pid {pid}{eta}) to finish before '{qjob.title}'")
                 QTimer.singleShot(self._wait_poll_ms, self._next_queued)
                 return
         steps = spec.steps()

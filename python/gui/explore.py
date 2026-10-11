@@ -43,7 +43,18 @@ VOID_CACHE_DIR = None        # the helper's catalogue cache: None = the pipeline
 VOID_TIP = ("Outline the voids on the map: a circle where each distinct, well-resolved void's sphere of radius R_v "
             "(where the smoothed density around its centre rises back to the mean) cuts this slice. The analysis "
             "pipeline's own catalogue at its production smoothing, found once per snapshot (about a minute) and cached; "
-            "a catalogue that is not cached and would not fit in the free memory is not built, and it says so.")
+            "a catalogue that is not cached and would not fit in the free memory is not built, and it says so. "
+            "Point at an outline for its R_v, R_eff and central δ; click it for the whole entry. Saved images and the "
+            "figure grid carry the outlines, and a saved PNG gets a CSV table of the voids beside it.")
+# a heavy action beside a running DTFE job starts without a question only when it fits in the free memory less
+# this (void_outlines.HEADROOM_BYTES, the catalogue build's own margin)
+HEAVY_HEADROOM_GB = 4.0
+VOID_REFF_TIP = ("Also draw each void's R_eff = (a b c)^⅓ of its fitted ellipsoid, dashed, around the same centre: "
+                 "R_eff is about 1.6 R_v, the open question of which radius describes the void")
+VOID_SIGMA_TIP = ("The smoothing the voids are found at. 'production' = the analysis scripts' own (10 cells: a "
+                  "different physical scale in every box) and their cached catalogue; a value in Mpc smooths every "
+                  "box at that scale (the cross-box comparison), with its own cached catalogue, built once per "
+                  "snapshot and smoothing")
 
 CMAPS = ["viridis", "magma", "inferno", "cividis", "plasma", "RdBu_r", "coolwarm", "gray", "tab10"]
 AXES = ["x", "y", "z"]
@@ -155,8 +166,10 @@ class SliceWorker(QObject):
         try:
             items = grid_items(req)
             rgb, labels, bar = grid_tiles(req, items)
+            circles, dashed, clips = grid_tile_circles(req, items)
             self.grid_done.emit({"request": req, "rgb": rgb, "labels": labels, "bar": bar,
-                                 "shown": sum(1 for it in items if it is not None)})
+                                 "shown": sum(1 for it in items if it is not None),
+                                 "circles": circles, "dashed": dashed, "clips": clips})
         except Exception as e:
             self.grid_failed.emit(f"{type(e).__name__}: {e}")
 
@@ -502,7 +515,7 @@ def grid_items(req: dict) -> list:
         ext = [o.lo[rest[0]], o.lo[rest[0]] + o.length[rest[0]], o.lo[rest[1]], o.lo[rest[1]] + o.length[rest[1]]]
         items.append({"output": o, "field": name, "component": comp, "plane": plane, "img": img, "lo": lo, "hi": hi,
                       "log": log, "cmap": cmap, "symmetric": symmetric, "ext": ext, "rest": rest, "idx": idx,
-                      "finite": finite})
+                      "finite": finite, "voids": p.get("voids")})
     if req["shared"] or req["merged"]:
         groups: dict = {}
         for it in items:
@@ -564,6 +577,57 @@ def panel_label(it: dict, diff: dict) -> str:
     if len(diff["quantities"]) > 1:
         parts.append(label + ctext)
     return "\n".join(parts) or (when or who)
+
+
+def _void_tool():
+    """tools/void_outlines.py as a module (its write_csv), loaded once by path: python/tools is not a package."""
+    global _VOID_MOD
+    if _VOID_MOD is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("void_outlines", VOID_TOOL)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _VOID_MOD = mod
+    return _VOID_MOD
+
+
+_VOID_MOD = None
+
+
+def panel_void_circles(it: dict, axis: int, n0: float, n1: float, radius: str = "r_v") -> list:
+    """A grid panel's void outlines (it['voids']: the panel's own catalogue, its shown rows) in the panel's pixels
+    (n0 x n1 over its extent; void_circles' convention), [] without a catalogue or in 2D (2026-10-11)."""
+    v = it.get("voids")
+    o = it["output"]
+    if not v or v.get(radius) is None or o.dim != 3:
+        return []
+    pos = float(o.lo[axis] + (it["idx"] + 0.5) * o.length[axis] / o.n)
+    e = it["ext"]
+    circles = G.void_circles(v["centres"], v[radius], v["box"], axis, pos, it["rest"], (e[0], e[2]), (e[1], e[3]),
+                             n0, n1)
+    return [(x, y, rx, ry, int(v["rows"][k])) for x, y, rx, ry, k in circles]
+
+
+def grid_tile_circles(req: dict, items: list, max_tile: int = 1024) -> tuple[list, list, list]:
+    """The outlines over grid_tiles' picture: (circles, dashed, clips) in its image pixels, each panel's offset by
+    its tile and clipped to it (clips: one (x0, y0, w, h) per circle, the R_v ones first, then the R_eff ones)."""
+    rows, cols = req["rows"], req["cols"]
+    sizes = [it["img"].shape[0] for it in items if it is not None]
+    if not sizes:
+        return [], [], []
+    T = min(max(sizes), max_tile)                   # grid_tiles' tile size and gaps
+    gap = 0 if req["merged"] else 6
+    solid, dashed, clip_s, clip_d = [], [], [], []
+    for k, it in enumerate(items):
+        if it is None:
+            continue
+        r, c = divmod(k, cols)
+        y0, x0 = r * (T + gap), c * (T + gap)
+        for radius, out, clips in (("r_v", solid, clip_s), ("r_eff", dashed, clip_d)):
+            for x, y, rx, ry, row in panel_void_circles(it, req["axis"], T, T, radius):
+                out.append((x0 + x, y0 + y, rx, ry, row))
+                clips.append((x0, y0, T, T))
+    return solid, dashed, clip_s + clip_d
 
 
 def grid_tiles(req: dict, items: list, max_tile: int = 1024) -> tuple[np.ndarray, list, tuple | None]:
@@ -648,6 +712,11 @@ def grid_figure(req: dict, items: list, dpi: float = 200.0):
         hi = it["hi"] if it["hi"] > it["lo"] else it["lo"] + 1.0
         im = ax.imshow(data, origin="lower", extent=it["ext"], cmap=it["cmap"], vmin=it["lo"], vmax=hi,
                        aspect="equal", interpolation="nearest")
+        if it.get("voids"):                 # the panel's own voids, as on screen (2026-10-11)
+            e = it["ext"]
+            to_mpc = lambda cs: [(e[0] + x, e[3] - y, rx, k) for x, y, rx, _ry, k in cs]   # noqa: E731
+            G.draw_void_circles_mpl(ax, to_mpc(panel_void_circles(it, axis, e[1] - e[0], e[3] - e[2])),
+                                    to_mpc(panel_void_circles(it, axis, e[1] - e[0], e[3] - e[2], "r_eff")))
         label, ctext, who, when = panel_names(it)
         unit = "Mpc" if o.box is not None else "cells"
         ax.set_xlabel(f"{AXES[it['rest'][0]]} [{unit}]", fontsize=8 * fs)
@@ -730,6 +799,9 @@ class ImageCanvas(QLabel):
         self.marker: tuple[int, int] | None = None
         self.arrows: dict | None = None     # grids.OutputSet.arrow_field(), drawn over the map
         self.circles: list | None = None    # grids.void_circles(): [(x, y, rx, ry, k)] in image pixels, the void outlines
+        self.dashed: list | None = None     # the same for the R_eff outlines, drawn dashed (2026-10-11)
+        # the figure grid: per circle (circles, then dashed) the tile (x0, y0, w, h) in image pixels it is clipped to
+        self.circle_clips: list | None = None
         self.labels: list | None = None     # [(x, y, text)] in image pixels: the figure grid's panel labels
         # {"x": (lo, hi, name), "y": (lo, hi, name), "unit": "Mpc"|"cells"}: the axes drawn around the image
         # (x increasing to the right, y UPWARD) and the scale bar; None for the figure grid's tiles
@@ -793,7 +865,7 @@ class ImageCanvas(QLabel):
         p.drawImage(t, self._img)
         if self.arrows is not None:
             self._draw_arrows(p, t)
-        if self.circles:
+        if self.circles or self.dashed:
             self._draw_circles(p, t)
         if self.labels:
             self._draw_labels(p, t)
@@ -915,15 +987,23 @@ class ImageCanvas(QLabel):
         p.drawLines(lines)
 
     def _draw_circles(self, p: QPainter, t: QRectF):
-        """The void outlines: white over a dark outline (as the arrows), clipped to the map."""
+        """The void outlines: white over a dark outline (as the arrows), clipped to the map -- or, for the figure
+        grid, each to its own tile (circle_clips); the R_eff ones (dashed) dashed."""
         s = t.width() / self._img.width()
         p.save()
-        p.setClipRect(t)
         p.setRenderHint(QPainter.Antialiasing, True)
         p.setBrush(Qt.NoBrush)
-        for pen in (QPen(QColor(0, 0, 0, 170), 2.6), QPen(QColor("white"), 1.2)):
-            p.setPen(pen)
-            for x, y, rx, ry, _k in self.circles:
+        solid, dashed = list(self.circles or []), list(self.dashed or [])
+        clips = self.circle_clips if self.circle_clips and len(self.circle_clips) == len(solid) + len(dashed) else None
+        for j, (x, y, rx, ry, _k) in enumerate(solid + dashed):
+            if clips is not None:
+                cx, cy, cw, ch = clips[j]
+                p.setClipRect(QRectF(t.left() + cx * s, t.top() + cy * s, cw * s, ch * s))
+            else:
+                p.setClipRect(t)
+            style = Qt.DashLine if j >= len(solid) else Qt.SolidLine
+            for pen in (QPen(QColor(0, 0, 0, 170), 2.6, style), QPen(QColor("white"), 1.2, style)):
+                p.setPen(pen)
                 p.drawEllipse(QPointF(t.left() + x * s, t.top() + y * s), rx * s, ry * s)
         p.restore()
 
@@ -1176,6 +1256,37 @@ class ExploreControls(QWidget):
         self.voids.toggled.connect(self._voids_toggled)
         crow.addWidget(self.voids)
         f.addRow("Component", crow)
+        # the void inspector and its options (2026-10-11): R_eff outlines too (dashed), the smoothing the voids are
+        # found at, the void last clicked and a jump to the slice through its centre
+        vrow = QHBoxLayout()
+        self.void_reff = QCheckBox("R_eff too (dashed)")
+        self.void_reff.setToolTip(VOID_REFF_TIP)
+        self.void_reff.toggled.connect(self._void_reff_toggled)
+        vrow.addWidget(self.void_reff)
+        vrow.addWidget(QLabel("σ"))
+        self.void_sigma = QDoubleSpinBox()
+        self.void_sigma.setRange(0.0, 50.0)
+        self.void_sigma.setDecimals(3)
+        self.void_sigma.setSingleStep(0.1)
+        self.void_sigma.setSuffix(" Mpc")
+        self.void_sigma.setSpecialValueText("production")
+        self.void_sigma.setToolTip(VOID_SIGMA_TIP)
+        self.void_sigma.setKeyboardTracking(False)          # one search per value typed, not per keystroke
+        self.void_sigma.valueChanged.connect(self._void_sigma_changed)
+        vrow.addWidget(self.void_sigma)
+        self.void_goto = QPushButton("Go to its centre")
+        self.void_goto.setToolTip("Show the slice through the centre of the void last clicked")
+        self.void_goto.setEnabled(False)
+        self.void_goto.clicked.connect(self._void_goto)
+        vrow.addWidget(self.void_goto)
+        vrow.addStretch(1)
+        f.addRow("Voids", vrow)
+        self.void_info = QLabel("")
+        self.void_info.setWordWrap(True)
+        self.void_info.setTextFormat(Qt.RichText)
+        self.void_info.setStyleSheet("color: gray")
+        f.addRow("", self.void_info)
+        self._void_picked = None                # (cache key, catalogue row) of the void last clicked
         ax = QHBoxLayout()
         self.axis = QComboBox()
         self.axis.addItems([f"{a} (normal)" for a in AXES])
@@ -1453,6 +1564,11 @@ class ExploreControls(QWidget):
         self._void_cache: dict = {}             # output key -> the void_outlines.py JSON, or {"error": why}
         self._void_proc: QProcess | None = None  # the one catalogue being found
         self._void_key = None                   # ... and the output it is for
+        self._void_out = None                   # ... and that output itself (re-queued when the map's search stops it)
+        self._void_queue: list = []             # outputs whose catalogue the figure grid waits for, one at a time
+        # asked before a memory-heavy action while a DTFE run is going: None = a dialog; tests set a
+        # callable(title, text) -> bool (2026-10-11)
+        self.confirm_heavy = None
         self._to_exact.connect(self._exact_worker.run)
         self._exact_worker.done.connect(self._zoomed)
         self._exact_worker.failed.connect(self._exact_failed)
@@ -1549,7 +1665,7 @@ class ExploreControls(QWidget):
                 c.blockSignals(False)
             self._out_form.setRowVisible(self.prefix_combo, False)
             self.current = self._plane = self._arrows = None
-            self.view.canvas.arrows = self.view.canvas.circles = None
+            self.view.canvas.arrows = self.view.canvas.circles = self.view.canvas.dashed = None
             self.info.setText("No grids yet: run the demo (Setup), a Grids job or a Custom snapshot job first.")
             self.view.canvas.set_rgb(None)
             self.view.canvas.setText("No outputs with grids found.")
@@ -1949,7 +2065,9 @@ class ExploreControls(QWidget):
                 "field": self.field.currentData(), "component": self.component.currentText(),
                 "axis": self.axis.currentIndex(), "index": self.index.value(),
                 "fixed": self.fixed.isChecked(), "vmin": self.vmin_edit.text(), "vmax": self.vmax_edit.text(),
-                "snapshots": dict(self._snapshots), "resident": self.resident.value()}
+                "snapshots": dict(self._snapshots), "resident": self.resident.value(),
+                "voids": self.voids.isChecked(), "void_reff": self.void_reff.isChecked(),
+                "void_sigma": self.void_sigma.value()}
 
     def restore_state(self, d: dict) -> bool:
         """Back to a remembered state when its output is still listed (selected first by refresh_outputs)."""
@@ -1972,6 +2090,16 @@ class ExploreControls(QWidget):
         self.vmin_edit.setText(str(d.get("vmin", "")))
         self.vmax_edit.setText(str(d.get("vmax", "")))
         self.fixed.setChecked(bool(d.get("fixed")))
+        # the void outlines and their options (2026-10-11: off after every restart before); the smoothing and the
+        # R_eff tick first, so ticking 'voids' asks for the catalogue once, at the remembered smoothing
+        for w, v in ((self.void_sigma, float(d.get("void_sigma", 0.0) or 0.0)),
+                     (self.void_reff, bool(d.get("void_reff"))), (self.voids, bool(d.get("voids")))):
+            w.blockSignals(w is not self.voids)
+            if isinstance(w, QDoubleSpinBox):
+                w.setValue(v)
+            else:
+                w.setChecked(v)
+            w.blockSignals(False)
         return True
 
     # ---------------------------------------------------------------- void outlines
@@ -1989,54 +2117,131 @@ class ExploreControls(QWidget):
             return "needs the density grid and the snapshot's box"
         return ""
 
-    @staticmethod
-    def _void_cache_key(o):
-        """The catalogue's key: the files' root, their grid and the density file's stamp (a rerun rewrites it)."""
+    def _void_cache_key(self, o, sigma: float | None = None):
+        """The catalogue's key: the files' root, their grid, the density file's stamp (a rerun rewrites it) and the
+        smoothing asked for (0 = production; 2026-10-11: each sigma is another catalogue)."""
         try:
             stamp = o.files["density"].path.stat().st_mtime_ns
         except (KeyError, OSError):
             stamp = None
-        return str(o.root), o.n, stamp
+        return str(o.root), o.n, stamp, round(self.void_sigma.value() if sigma is None else float(sigma), 6)
+
+    def _void_reff_toggled(self, *_):
+        self._voids_redraw()
+        if self._grid_shown and self.voids.isChecked():
+            self.show_grid(True)
+
+    def _void_sigma_changed(self, *_):
+        """Another smoothing: its own catalogue (cached by key, so going back costs nothing)."""
+        self._void_picked = None
+        self.void_info.setText("")
+        self.void_goto.setEnabled(False)
+        if self.voids.isChecked() and self.current is not None and not self.voids_applicable(self.current):
+            self._voids_request(self.current)
+        self._voids_redraw()
+        if self._grid_shown and self.voids.isChecked():
+            self.show_grid(True)
+
+    # ---------------------------------------------------------------- memory guard (2026-10-11)
+    def heavy_ok(self, title: str, what: str, need_gb: float | None = None) -> bool:
+        """Before a memory-heavy action (a query server, an exact zoom, a void catalogue build): True at once when
+        no DTFE run is going (rs.dtfe_processes: never blocks then), or when one is but what this needs fits in what
+        is free less HEAVY_HEADROOM_GB (said in the status line); else ask, naming the runs with their resident
+        memory, what this needs and what is free now. The TNG50 z = 0 run died of memory pressure, and the
+        auto-tuner budgets only from the memory free at its own start (2026-10-11)."""
+        runs = rs.dtfe_processes()["runs"]
+        if not runs:
+            return True
+        free = G.available_gb()
+        who = "; ".join(f"{name} pid {pid}{rs._gb_text(gb)}" for pid, name, gb in runs)
+        if need_gb is not None and free is not None and need_gb <= free - HEAVY_HEADROOM_GB:
+            self.status.emit(f"a DTFE run is going ({who}); this needs about {need_gb:.1f} GB of the {free:.0f} GB "
+                             f"free: started")
+            return True
+        need = f"about {need_gb:.0f} GB" if need_gb is not None else "an unknown amount of memory"
+        text = (f"A DTFE run is going ({who}).\n\n{what} needs {need}; "
+                + (f"{free:.0f} GB is free now." if free is not None else "the free memory could not be read.")
+                + "\n\nStarting it beside the run can push the machine into swap or get the run killed. "
+                  "Start it anyway?")
+        if self.confirm_heavy is not None:
+            return bool(self.confirm_heavy(title, text))
+        return QMessageBox.question(self, title, text) == QMessageBox.Yes
+
+    def memory_status(self) -> str:
+        """One line for a status bar: free memory and the DTFE runs and servers alive (their resident GB)."""
+        free = G.available_gb()
+        d = rs.dtfe_processes()
+        parts = [f"{free:.0f} GB free" if free is not None else "free memory unknown"]
+        parts += [f"{name} pid {pid}{rs._gb_text(gb)}" for pid, name, gb in d["runs"]]
+        parts += [f"server pid {pid}{rs._gb_text(gb)}" for pid, _name, gb in d["servers"]]
+        return " · ".join(parts)
 
     def _voids_sync(self):
         """The checkbox follows the output: enabled where the outlines apply, else greyed out saying why."""
         why = self.voids_applicable(self.current)
         self.voids.setEnabled(not why)
         self.voids.setToolTip(VOID_TIP if not why else f"Void outlines: {why}.")
+        if self._void_picked is not None and (why or self._void_picked[0] != self._void_cache_key(self.current)):
+            self._void_picked = None                # another output: the inspector's void is not on it
+            self.void_info.setText("")
+            self.void_goto.setEnabled(False)
         if not why and self.voids.isChecked():
             self._voids_request(self.current)
 
     def _voids_toggled(self, on: bool):
-        if on and self.current is not None:
-            key = self._void_cache_key(self.current)
-            if "error" in self._void_cache.get(key, {}):
-                del self._void_cache[key]           # ticked again: try again
-            if not self.voids_applicable(self.current):
+        if on:
+            for key in [k for k, v in self._void_cache.items() if "error" in v]:
+                del self._void_cache[key]           # ticked again: try again (the grid's panels too)
+            if self.current is not None and not self.voids_applicable(self.current):
                 self._voids_request(self.current)
+        else:
+            self._void_queue.clear()
+            self._void_picked = None
+            self.void_info.setText("")
+            self.void_goto.setEnabled(False)
         self._voids_redraw()
+        if self._grid_shown:
+            self.show_grid(True)                    # the panels' outlines follow the tick
 
-    def _voids_request(self, o):
+    def _voids_request(self, o, queued: bool = False):
         """Find the voids of this output in a helper process (the pipeline's catalogue: cached, else about a
-        minute), unless they are known or already being found."""
+        minute), unless they are known or already being found. 'queued' (the figure grid's panels): wait for the
+        search running instead of stopping it."""
         key = self._void_cache_key(o)
         if key in self._void_cache or (self._void_proc is not None and self._void_key == key):
             return
+        if self._void_proc is not None:
+            if queued:
+                if all(self._void_cache_key(q) != key for q in self._void_queue):
+                    self._void_queue.append(o)
+                return
+            if self._void_out is not None:          # a grid panel's search stopped for the map's: it comes back
+                self._void_queue.insert(0, self._void_out)
         self._voids_stop()                          # another output's search: this one is wanted now
+        n = int(o.n or 0)
+        if not self.heavy_ok("Find the voids", f"Finding the voids of {o.title} builds its catalogue when it is "
+                             f"not cached yet; that", 80.0 * n ** 3 / 1e9 if n else None):
+            self._void_cache[key] = {"error": "not started while a DTFE run is going (tick again to retry)"}
+            self.status.emit("void outlines not started: a DTFE run is going")
+            self._voids_next()
+            return
         root = o.dir.parent.parent                  # <data root>/<sim>/snapdir_NNN, or the family folder: both work
         proc = QProcess(self)
         env = QProcessEnvironment.systemEnvironment()
         env.insert("DTFE_SIM", o.sim)
         env.insert("DTFE_DATA_ROOT", str(root))
-        env.remove("DTFE_SIGMA_MPC")                # the production smoothing: the thesis's catalogue
+        env.remove("DTFE_SIGMA_MPC")                # the smoothing is the --sigma-mpc below, never the shell's
         env.remove("CLICOLOR_FORCE")
         proc.setProcessEnvironment(env)
         proc.finished.connect(lambda code, _status, k=key, pr=proc: self._voids_done(k, pr, code))
         proc.errorOccurred.connect(lambda err, k=key, pr=proc: self._voids_start_failed(k, pr, err))
-        self._void_proc, self._void_key = proc, key
+        self._void_proc, self._void_key, self._void_out = proc, key, o
         method = "ps" if G.estimator_label(o) == "PS-DTFE" else "dtfe"
         args = [str(VOID_TOOL), "--sim", o.sim, "--snap", str(int(o.snap)), "--method", method, "--data-root", str(root)]
         if o.prefix != ("ps_output" if method == "ps" else "output"):
             args += ["--prefix", o.prefix]          # the production set: no prefix, so the analysis scripts' cache is shared
+        if key[-1] > 0:
+            args += ["--sigma-mpc", repr(key[-1])]  # a common physical sigma: its own cache namespace
         proc.start(rs.PYTHON, args + (["--cache-dir", str(VOID_CACHE_DIR)] if VOID_CACHE_DIR else []))
         self.status.emit(f"finding the voids of {o.title} (the first time per snapshot: about a minute)")
 
@@ -2044,7 +2249,7 @@ class ExploreControls(QWidget):
         if proc is not self._void_proc:             # stopped: a newer search, or the window closing
             proc.deleteLater()
             return
-        self._void_proc = self._void_key = None
+        self._void_proc = self._void_key = self._void_out = None
         out = bytes(proc.readAllStandardOutput()).decode(errors="replace").strip().splitlines()
         err = bytes(proc.readAllStandardError()).decode(errors="replace").strip().splitlines()
         proc.deleteLater()
@@ -2055,6 +2260,7 @@ class ExploreControls(QWidget):
             res["_centres"] = np.asarray(res["centres_mpc"], dtype=np.float64).reshape(-1, 3)
             res["_r_v"] = np.array([np.nan if v is None else v for v in res["r_v_mpc"]], dtype=np.float64)
             res["_shown"] = np.asarray(res["distinct"], dtype=bool)
+            res["_r_eff"] = np.array([np.nan if v is None else v for v in res["r_eff_mpc"]], dtype=np.float64)
             self._void_cache[key] = res
             self.status.emit(f"voids: {int(res['_shown'].sum())} distinct, well-resolved voids (outlines: R_v; "
                              f"sigma {res['sigma_mpc']:.3g} Mpc)")
@@ -2062,19 +2268,36 @@ class ExploreControls(QWidget):
             self._void_cache[key] = {"error": str(e)}
             self.status.emit(f"no void outlines: {e}")
         self._voids_redraw()
+        if self._grid_shown and self.voids.isChecked():
+            self.show_grid(True)                    # a panel's catalogue arrived: its outlines
+        self._voids_next()
+
+    def _voids_next(self):
+        """The next catalogue the figure grid waits for (one helper at a time)."""
+        while self._void_proc is None and self._void_queue and self.voids.isChecked() and not self._shut:
+            o = self._void_queue.pop(0)
+            if self._void_cache_key(o) not in self._void_cache:
+                self._voids_request(o)
 
     def _voids_start_failed(self, key, proc, err):
         """The helper never started (no 'finished' follows): said, and the next tick tries again."""
         if err != QProcess.FailedToStart or proc is not self._void_proc:
             return
-        self._void_proc = self._void_key = None
+        self._void_proc = self._void_key = self._void_out = None
         self._void_cache[key] = {"error": f"could not start {rs.PYTHON}: {proc.errorString()}"}
         proc.deleteLater()
         self.status.emit(f"no void outlines: could not start {rs.PYTHON}")
         self._voids_redraw()
+        self._voids_next()
+
+    def stop_void_search(self):
+        """Stop a catalogue search and forget the grid's queue: for the window when a heavy job starts (a
+        catalogue build costs about 80 B per cell); the next tick or output change asks again."""
+        self._void_queue.clear()
+        self._voids_stop()
 
     def _voids_stop(self):
-        proc, self._void_proc, self._void_key = self._void_proc, None, None
+        proc, self._void_proc, self._void_key, self._void_out = self._void_proc, None, None, None
         if proc is not None:
             proc.kill()
             proc.waitForFinished(2000)
@@ -2089,18 +2312,26 @@ class ExploreControls(QWidget):
         o, axis = req["output"], req["axis"]
         return float(o.lo[axis] + (req["index"] + 0.5) * o.length[axis] / o.n)
 
-    def _void_circles(self):
-        """The outlines over what the map shows now (None: off, not applicable, or not found yet)."""
+    def _void_result(self):
+        """The catalogue of the output on the map (the void_outlines.py result), or None."""
         o = self.current
         if not self.voids.isChecked() or self._grid_shown or o is None or self.voids_applicable(o):
             return None
         res = self._void_cache.get(self._void_cache_key(o))
+        if not res or "error" in res or self._req is None or self._req.get("output") is not o:
+            return None
+        return res
+
+    def _void_circles(self, radius: str = "_r_v"):
+        """The outlines over what the map shows now (None: off, not applicable, or not found yet); radius
+        '_r_eff' = the dashed R_eff outlines (None unless ticked)."""
+        res = self._void_result()
         g = self._geometry()
-        if not res or "error" in res or g is None or self._req.get("output") is not o:
+        if res is None or g is None or (radius == "_r_eff" and not self.void_reff.isChecked()):
             return None
         axis, _index, rest, lo, hi, n0, n1 = g
         sel = np.nonzero(res["_shown"])[0]
-        circles = G.void_circles(res["_centres"][sel], res["_r_v"][sel], float(res["box_mpc"]), axis,
+        circles = G.void_circles(res["_centres"][sel], res[radius][sel], float(res["box_mpc"]), axis,
                                  self._slice_position(), rest, lo, hi, n0, n1)
         return [(x, y, rx, ry, int(sel[k])) for x, y, rx, ry, k in circles]
 
@@ -2109,7 +2340,31 @@ class ExploreControls(QWidget):
         if c._img is None or self._grid_shown:
             return
         c.circles = self._void_circles()
+        c.dashed = self._void_circles("_r_eff")
         c._redraw()
+
+    def voids_shown(self) -> list[int]:
+        """The catalogue rows outlined on the map now (R_v or R_eff), in row order: the saved CSV's voids."""
+        rows = {k for circles in (self.view.canvas.circles, self.view.canvas.dashed) for *_xy, k in circles or ()}
+        return sorted(rows)
+
+    def _void_pick(self, r: int, c: int):
+        """The catalogue row under image pixel (r, c), or None: the R_v outlines first, then the dashed R_eff."""
+        cv = self.view.canvas
+        k = G.void_at(cv.circles, c + 0.5, r + 0.5)
+        k = k if k is not None else G.void_at(cv.dashed, c + 0.5, r + 0.5)
+        # the hit test first: the result's key stats the density file, not wanted on every mouse move
+        return k if k is not None and self._void_result() is not None else None
+
+    def _void_goto(self):
+        """The slice through the centre of the void last clicked (along the map's own axis)."""
+        res, picked, o = self._void_result(), self._void_picked, self.current
+        if res is None or picked is None or picked[0] != self._void_cache_key(o) or self.is_zoomed():
+            return
+        axis = self.axis.currentIndex()
+        x = float(res["_centres"][picked[1]][axis])
+        i = int(np.floor((x - float(o.lo[axis])) / (float(o.length[axis]) / o.n))) % int(o.n)
+        self.index.setValue(i)
 
     def _canvas_axes(self) -> dict | None:
         """The axes of what the map shows (the slice, or the zoomed region): Mpc, or cells without a box."""
@@ -2231,6 +2486,7 @@ class ExploreControls(QWidget):
         self.view.canvas.labels = None
         self.view.canvas.arrows = self._arrows
         self.view.canvas.circles = self._void_circles()
+        self.view.canvas.dashed = self._void_circles("_r_eff")
         self.view.canvas.axes = self._canvas_axes()      # BEFORE the image: its first drawing has the margins
         self.view.canvas.set_rgb(res["rgb"])
         label = G.FIELD_LABELS.get(req["field"], req["field"])
@@ -2264,7 +2520,7 @@ class ExploreControls(QWidget):
         if self.is_zoomed():                    # a slice asked for before the zoom landed: the zoom stays (2026-10-08)
             return
         self._plane = self._arrows = None
-        self.view.canvas.arrows = self.view.canvas.circles = None
+        self.view.canvas.arrows = self.view.canvas.circles = self.view.canvas.dashed = None
         self.view.canvas.set_rgb(None)
         self.view.canvas.setText(f"Could not read this slice: {msg}")
         self.changed.emit()
@@ -2342,7 +2598,9 @@ class ExploreControls(QWidget):
         if self._planes is not None and not self.is_zoomed():
             a, b = self._planes
             both = f"   (A = {float(a[row, col]):.5g}, B = {float(b[row, col]):.5g})"
-        self.view.readout.setText(f"{xyz} {unit}      {where}      value = {value:.5g}{both}")
+        k = self._void_pick(r, c)
+        void = f"      {G.void_info(self._void_result(), k, short=True)}" if k is not None else ""
+        self.view.readout.setText(f"{xyz} {unit}      {where}      value = {value:.5g}{both}{void}")
 
     def _save_image(self):
         if self._grid_shown:
@@ -2350,10 +2608,17 @@ class ExploreControls(QWidget):
             return
         if self._plane is None:
             return
-        f, _ = QFileDialog.getSaveFileName(self, "Save the map", str(Path.home() / "explore.png"),
-                                           "PNG image (*.png);;NumPy array of the values (*.npy);;"
-                                           "CSV table: x, y, value (*.csv)")
+        void_filter = "CSV table of the voids outlined (*.csv)"
+        f, chosen = QFileDialog.getSaveFileName(self, "Save the map", str(Path.home() / "explore.png"),
+                                                "PNG image (*.png);;NumPy array of the values (*.npy);;"
+                                                "CSV table: x, y, value (*.csv);;" + void_filter)
         if not f:
+            return
+        if chosen == void_filter:
+            try:
+                self.status.emit(f"saved {self.save_voids_csv(f)}")
+            except OSError as e:
+                self.status.emit(f"could not save {f}: {e}")
             return
         if Path(f).suffix.lower() in (".npy", ".csv"):
             try:
@@ -2361,38 +2626,68 @@ class ExploreControls(QWidget):
             except OSError as e:
                 self.status.emit(f"could not save {f}: {e}")
             return
-        req = self._req
         try:
-            import matplotlib
-            matplotlib.use("Agg", force=False)
-            import matplotlib.pyplot as plt
-            o = req["output"]
-            data = self._plane.T
-            if req["log"]:
-                data = np.log10(np.where(data > 0, data, np.nan))
-            _, _, rest, glo, ghi, _, _ = self._geometry()    # a hi-res slice's axes are its file's, not the menu's
-            ext = [glo[0], ghi[0], glo[1], ghi[1]]
-            fig, ax = plt.subplots(figsize=(7, 6))
-            lo, hi = self.view.colorbar.vrange
-            im = ax.imshow(data, origin="lower", extent=ext, cmap=req["cmap"], vmin=lo, vmax=hi)
-            unit = "Mpc" if o.box is not None else "cells"
-            ax.set_xlabel(f"{AXES[rest[0]]} [{unit}]")
-            ax.set_ylabel(f"{AXES[rest[1]]} [{unit}]")
-            ax.set_title(self.view.title.text().replace("<b>", "").replace("</b>", ""), fontsize=8)
-            fig.colorbar(im, ax=ax, label=self.view.colorbar.label)
-            arrows = getattr(self, "_arrows", None)
-            if arrows is not None and arrows["vmax"] > 0:
-                h = o.length / o.n                              # cell size per axis
-                X, Y = np.meshgrid(o.lo[rest[0]] + arrows["c0"] * h[rest[0]],
-                                   o.lo[rest[1]] + arrows["c1"] * h[rest[1]], indexing="ij")
-                ax.quiver(X, Y, arrows["u"], arrows["v"], color="white", edgecolor="black", linewidth=0.3,
-                          angles="xy", scale_units="xy", pivot="middle",
-                          scale=arrows["vmax"] / (0.9 * arrows["spacing"] * h[rest[0]]), width=0.003)
-            fig.savefig(f, dpi=200, bbox_inches="tight")
-            plt.close(fig)
+            self.status.emit("saved " + ", ".join(self.save_png(f)))
         except Exception:
             self.view.canvas.grab().save(f)
-        self.status.emit(f"saved {f}")
+            self.status.emit(f"saved {f}")
+
+    def save_png(self, f) -> list[str]:
+        """The map as a matplotlib PNG at 200 dpi (axes, colour bar, arrows, the void outlines as on screen) and,
+        with outlines drawn, '<name>_voids.csv' beside it: the table of those voids (2026-10-11). The paths."""
+        req = self._req
+        written = [str(f)]
+        import matplotlib
+        matplotlib.use("Agg", force=False)
+        import matplotlib.pyplot as plt
+        o = req["output"]
+        data = self._plane.T
+        if req["log"]:
+            data = np.log10(np.where(data > 0, data, np.nan))
+        _, _, rest, glo, ghi, _, _ = self._geometry()    # a hi-res slice's axes are its file's, not the menu's
+        ext = [glo[0], ghi[0], glo[1], ghi[1]]
+        fig, ax = plt.subplots(figsize=(7, 6))
+        lo, hi = self.view.colorbar.vrange
+        im = ax.imshow(data, origin="lower", extent=ext, cmap=req["cmap"], vmin=lo, vmax=hi)
+        unit = "Mpc" if o.box is not None else "cells"
+        ax.set_xlabel(f"{AXES[rest[0]]} [{unit}]")
+        ax.set_ylabel(f"{AXES[rest[1]]} [{unit}]")
+        ax.set_title(self.view.title.text().replace("<b>", "").replace("</b>", ""), fontsize=8)
+        fig.colorbar(im, ax=ax, label=self.view.colorbar.label)
+        arrows = getattr(self, "_arrows", None)
+        if arrows is not None and arrows["vmax"] > 0:
+            h = o.length / o.n                              # cell size per axis
+            X, Y = np.meshgrid(o.lo[rest[0]] + arrows["c0"] * h[rest[0]],
+                               o.lo[rest[1]] + arrows["c1"] * h[rest[1]], indexing="ij")
+            ax.quiver(X, Y, arrows["u"], arrows["v"], color="white", edgecolor="black", linewidth=0.3,
+                      angles="xy", scale_units="xy", pivot="middle",
+                      scale=arrows["vmax"] / (0.9 * arrows["spacing"] * h[rest[0]]), width=0.003)
+        res = self._void_result()
+        if res is not None and self.view.canvas.circles is not None:
+            axis = self._geometry()[0]
+            pos = self._slice_position()
+            sel = np.nonzero(res["_shown"])[0]
+            circ = [(u, v, r, int(sel[k])) for u, v, r, k in G.void_circles_mpc(
+                res["_centres"][sel], res["_r_v"][sel], float(res["box_mpc"]), axis, pos, rest, glo, ghi)]
+            dash = [] if not self.void_reff.isChecked() else [(u, v, r, int(sel[k])) for u, v, r, k in G.void_circles_mpc(
+                res["_centres"][sel], res["_r_eff"][sel], float(res["box_mpc"]), axis, pos, rest, glo, ghi)]
+            G.draw_void_circles_mpl(ax, circ, dash)
+            ax.set_xlim(ext[0], ext[1])
+            ax.set_ylim(ext[2], ext[3])
+        fig.savefig(f, dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        if self.voids_shown():
+            written.append(self.save_voids_csv(Path(f).with_name(Path(f).stem + "_voids.csv")))
+        return written
+
+    def save_voids_csv(self, path) -> str:
+        """The voids outlined on the map now as a CSV table (tools/void_outlines.write_csv: centre, every R_v the
+        catalogue has, R_eff, central delta, resolved and distinct)."""
+        res = self._void_result()
+        rows = self.voids_shown()
+        if res is None or not rows:
+            raise OSError("no void outlines on the map (tick 'voids')")
+        return _void_tool().write_csv(res, path, rows)
 
     def save_values(self, path) -> str:
         """The map's VALUES (not its colours): '.npy' = the 2D array as drawn, rows along the vertical axis from
@@ -2808,7 +3103,8 @@ class ExploreControls(QWidget):
         cur = self.current
         rows, cols = self.grid_dims()
         return {"panels": [None if p is None else {"output": p[0], "field": p[1], "component": p[2],
-                                                    "cmap": self._grid_cmap(p[1]), "log": self._grid_log(p[1])}
+                                                    "cmap": self._grid_cmap(p[1]), "log": self._grid_log(p[1]),
+                                                    "voids": self._panel_voids(p[0])}
                            for p in panels],
                 "rows": rows, "cols": cols, "axis": self.axis.currentIndex(),
                 "rel": 0.5 if cur.n <= 1 or cur.dim == 2 else self.index.value() / (cur.n - 1),
@@ -2816,6 +3112,22 @@ class ExploreControls(QWidget):
                 "shared": self.grid_shared.isChecked(),
                 "merged": self.grid_merge.isChecked() and self._grid_merge_applicable(),
                 "position": self.position.text() if cur.dim == 3 else ""}
+
+    def _panel_voids(self, o) -> dict | None:
+        """A grid panel's outlines: its output's own catalogue (shown rows: centres, R_v, R_eff when ticked) when
+        'voids' is ticked and it applies; a catalogue not found yet is asked for (queued, one at a time; the grid
+        is recomposed when it arrives). None otherwise (2026-10-11)."""
+        if not self.voids.isChecked() or self.voids_applicable(o):
+            return None
+        res = self._void_cache.get(self._void_cache_key(o))
+        if res is None:
+            self._voids_request(o, queued=True)
+            return None
+        if "error" in res:
+            return None
+        sel = np.nonzero(res["_shown"])[0]
+        return {"rows": sel, "centres": res["_centres"][sel], "r_v": res["_r_v"][sel], "box": float(res["box_mpc"]),
+                "r_eff": res["_r_eff"][sel] if self.void_reff.isChecked() else None}
 
     def show_grid(self, on: bool):
         """The toggle: the panels as tiles in place of the map (the worker colours them, like the single
@@ -2872,8 +3184,11 @@ class ExploreControls(QWidget):
         req = res["request"]
         self.view.canvas.setStyleSheet("")
         self.view.canvas.marker = None
-        self.view.canvas.arrows = self.view.canvas.circles = None
+        self.view.canvas.arrows = self.view.canvas.circles = self.view.canvas.dashed = None
         self.view.canvas.labels = res["labels"]
+        self.view.canvas.circles = res.get("circles") or None       # each panel's own voids (2026-10-11)
+        self.view.canvas.dashed = res.get("dashed") or None
+        self.view.canvas.circle_clips = res.get("clips") or None
         self.view.canvas.axes = None                # tiles of several frames: the saved figure has the axes
         self.view.canvas.set_rgb(np.ascontiguousarray(res["rgb"]))
         bar = res["bar"]
@@ -2908,6 +3223,7 @@ class ExploreControls(QWidget):
     def _leave_grid(self):
         self._grid_shown = False
         self._grid_pending = None
+        self.view.canvas.circle_clips = None
         self.grid_toggle.blockSignals(True)
         self.grid_toggle.setChecked(False)
         self.grid_toggle.blockSignals(False)
@@ -3028,6 +3344,11 @@ class ExploreControls(QWidget):
             return
         cache = Path(kw["tessellation_cache"])
         cost = G.server_cost(kw["snapshot"], kw.get("phase_space", True))
+        need = None if not cost else (cost["budget_gb"] if cost["split"] else cost["single_gb"])
+        if not self.heavy_ok("Start the query server", f"A query server on {Path(kw['snapshot']).name} "
+                             f"({cost['particles']:,} particles)" if cost else "A query server", need):
+            self.server_state.setText("not started: a DTFE run is going")
+            return
         if confirm and cost and cost["split"]:
             import shutil as _sh
             try:
@@ -3120,6 +3441,11 @@ class ExploreControls(QWidget):
             return
         self.view.canvas.marker = (r, c)
         self.view.canvas._redraw()
+        k = self._void_pick(r, c)
+        if k is not None:                    # the inspector: the whole entry of the void clicked (2026-10-11)
+            self._void_picked = (self._void_cache_key(self.current), k)
+            self.void_info.setText(G.void_info(self._void_result(), k))
+            self.void_goto.setEnabled(not self.is_zoomed())
         x, value, (row, col) = pt
         o = self._req["output"]
         if not self._server_running or not self._same(self._server_output, o):
@@ -3251,7 +3577,7 @@ class ExploreControls(QWidget):
         grid[axis] = 1
         if flat:
             grid = [res, res]
-        out_dir = Path(tempfile.mkdtemp(prefix="dtfe-zoom-"))
+        out_dir = Path(tempfile.mkdtemp(prefix=rs.ZOOM_DIR_PREFIX))     # runspec._kind tells it from a Custom run by this
         root = out_dir / "zoom"
         cmd = [str(binary), str(kw["snapshot"]), str(root), "--input", str(int(kw.get("input_type", 105)))]
         if mpc is not None:
@@ -3437,6 +3763,14 @@ class ExploreControls(QWidget):
             self._zoomed(dict(hit[0], depth=depth, memo=True, seconds=0.0), hit[1])
             return
         est = self.exact_zoom_estimate(plan)
+        cost = G.server_cost(plan["snapshot"], True) if plan.get("snapshot") else None
+        if not self.heavy_ok("Exact zoom", "An exact zoom runs PS-DTFE over the whole snapshot again; it",
+                             None if not cost else min(cost["single_gb"], cost["budget_gb"])):
+            import shutil
+            shutil.rmtree(Path(plan["root"]).parent, ignore_errors=True)
+            self.zoom_state.setText("exact zoom not started: a DTFE run is going")
+            self.changed.emit()
+            return
         if est is not None and est["seconds"] > EXACT_CONFIRM_SECONDS and not self._confirm_exact(est):
             import shutil
             shutil.rmtree(Path(plan["root"]).parent, ignore_errors=True)
@@ -3603,6 +3937,7 @@ class ExploreControls(QWidget):
         self.view.canvas.marker = None
         self.view.canvas.arrows = None
         self.view.canvas.circles = self._void_circles()
+        self.view.canvas.dashed = self._void_circles("_r_eff")
         self.view.canvas.axes = self._canvas_axes()
         self.view.canvas.set_rgb(np.ascontiguousarray(rgb))
         self._compare_sync()

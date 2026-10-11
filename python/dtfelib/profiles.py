@@ -6,6 +6,9 @@ ellipsoid's R_eff (radius='r_eff'; with distinct=False and the old bins the prof
 curvature length, ~1.75x R_v
 (median R_v/R_eff 0.53-0.65 in TNG100 and TNG300 at z = 0, 1, 5), and in the R_eff stacks the density reached
 the mean, v_r turned to infall and the single-stream fraction bottomed out all at 0.5-0.7 R_eff -- at R_v.
+In the R_v stacks the raw density crossing the mean at 1.0 R_v is the definition of R_v (the first up-crossing of
+the SMOOTHED profile), a check of the smoothing against the raw density, not a finding (2026-10-11); the infall
+radius, the compensation ridge and the single-stream fraction are independent of it.
 
     from dtfelib import pipeline, profiles
     p = pipeline.products("099", 0.0)
@@ -42,6 +45,21 @@ within r, Delta(<r) = 3 / x^3 * integral_0^x (rho/rho_bar - 1) x'^2 dx' (trapezo
 profile taken flat inside the first shell), gives v_r(r) = -(1/3) f(z) H(z) a r Delta(<r) in km/s with r
 comoving (fields.get_cosmology_params: f = Omega_m(z)^0.55, H in km/s/Mpc). What the measured v_r panel
 would be if the voids expanded linearly: the comparison is the point of the figure.
+
+THE INTERIOR SINGLE-STREAM FRACTION (2026-10-11, interior_single_fraction): per void, the fraction of the
+cells whose centres lie within x R of the void's cell centre (periodic) that are single-stream, for x in
+INTERIOR_X = (0.5, 1.0): a VOLUME fraction counted cell by cell, not the x^2-weighted integral of the shells
+(whose first shell sits at 0.1 R). void_profiles returns it as 'single_interior' (n_voids, len(INTERIOR_X)).
+
+THE UNIVERSAL PROFILE (2026-10-11, hsw_delta / fit_hsw / fit_stack): Hamaus, Sutter & Wandelt (2014, PRL 112,
+251302) delta(r) = delta_c (1 - (r/r_s)^alpha) / (1 + (r/R_v)^beta), with r in units of the stack's own R
+(x = r/R, so R_v = 1 and r_s is r_s/R_v), fitted by scipy's curve_fit to a stack's mean rho/rho_bar - 1 with
+the stack's scatter as the error of each shell (std / sqrt(n) over its voids, absolute_sigma). The shells of one
+stack are correlated (the same voids), so chi2/dof is a guide, not a probability.
+
+THE R_V DEFINITION (contract C3, 2026-10-11): radius='r_v' takes catalog.r_v_mpc(cat, definition) with
+definition in catalog.R_V_DEFINITIONS ('crossing' = today's R_v, 'delta08', 'ridge'); a catalogue without that
+key (all NaN) falls back to 'crossing' and says so.
 """
 
 from __future__ import annotations
@@ -58,6 +76,11 @@ DEFAULT_EDGES_SIGMA = {"r_v": (0.0, 2.5, 3.5, 5.0),     # the scripts' default b
                        "r_eff": (0.0, 5.0, 6.0, 7.0)}   # cap); R_v of distinct resolved voids: 16/50/84% ~ 2 / 3.3 / 7.5 sigma
 RADII = ("r_v", "r_eff")
 DEFAULT_M = 400                                                          # points per shell
+INTERIOR_X = (0.5, 1.0)                                                  # interior_single_fraction's spheres, in R
+# curve_fit's start and bounds for (delta_c, r_s/R_v, alpha, beta): HSW 2014's fits sit near (-0.8, 0.9, 2, 8)
+HSW_P0 = (-0.8, 0.9, 2.0, 8.0)
+HSW_BOUNDS = ((-1.0, 0.05, 0.1, 0.5), (0.0, 5.0, 20.0, 40.0))
+HSW_PARAMS = ("delta_c", "r_s", "alpha", "beta")
 
 
 def default_edges_mpc(sigma_mpc: float, box_mpc: float, radius: str = "r_v") -> tuple:
@@ -137,13 +160,64 @@ def profile_grids(grids: dict, centers_frac, r_eff_cells, bins=DEFAULT_BINS, m: 
     return out
 
 
+def interior_single_fraction(single, coords, radii_cells, x=INTERIOR_X) -> np.ndarray:
+    """(n_voids, len(x)): per void, the fraction of the cells whose CENTRES lie within x * R of the void's cell
+    centre (periodic; 'coords' (n, 3) integer cells, 'radii_cells' (n,) R in cells) that are True in 'single'
+    (N,N,N) bool -- the interior single-stream VOLUME fraction (2026-10-11). The void's centre is its cell's centre,
+    so the offsets to the other cells' centres are whole cells and the centre cell itself is always counted.
+    NaN for a void without a finite positive radius."""
+    single = np.asarray(single)
+    n_grid = single.shape[0]
+    xs = np.asarray(x, dtype=np.float64).reshape(-1)
+    coords = np.asarray(coords, dtype=np.int64).reshape(-1, 3)
+    radii = np.asarray(radii_cells, dtype=np.float64).reshape(-1)
+    out = np.full((len(radii), len(xs)), np.nan)
+    for i, (c, r) in enumerate(zip(coords, radii)):
+        if not (np.isfinite(r) and r > 0):
+            continue
+        h = int(np.floor(xs.max() * r))
+        h = min(h, (n_grid - 1) // 2)                       # never the same cell twice through the wrap
+        d = np.arange(-h, h + 1)
+        sub = single[np.ix_((c[0] + d) % n_grid, (c[1] + d) % n_grid, (c[2] + d) % n_grid)]
+        d2 = d[:, None, None] ** 2 + d[None, :, None] ** 2 + d[None, None, :] ** 2
+        for j, xv in enumerate(xs):
+            sel = d2 <= (xv * r) ** 2 * (1.0 + 1e-12)       # a cell exactly on the sphere counts as inside
+            out[i, j] = float(sub[sel].mean())
+    return out
+
+
+def r_v_by_definition(cat, definition: str = "crossing", say=print) -> tuple[np.ndarray, str]:
+    """(R_v in Mpc per catalogue row, the definition used): catalog.r_v_mpc(cat, definition) (contract C3,
+    2026-10-11). A catalogue without that definition's key (r_v_<definition>_cells: built before the definitions),
+    or a catalog module without it, falls back to 'crossing', today's R_v, said through 'say'. A key that is there
+    but NaN everywhere is an answer, not a gap: delta08 is undefined at z >= 3 in TNG100 (the enclosed contrast
+    never reaches -0.8), and a fallback there would mix two definitions on one axis."""
+    if definition == "crossing":
+        return catalog.r_v_mpc(cat), "crossing"
+    known = getattr(catalog, "R_V_DEFINITIONS", ("crossing",))
+    r = None
+    key = getattr(catalog, "R_V_KEYS", {}).get(definition, f"r_v_{definition}_cells")
+    if definition in known and key in cat:
+        try:
+            r = np.asarray(catalog.r_v_mpc(cat, definition=definition), dtype=np.float64)
+        except TypeError:                                   # a catalog.r_v_mpc from before the definitions
+            r = None
+    if r is None:
+        say(f"  R_v definition {definition!r} not in this catalogue (rebuild it with the R_v definitions); "
+            f"using 'crossing'")
+        return catalog.r_v_mpc(cat), "crossing"
+    return r, definition
+
+
 def void_profiles(products, bins=DEFAULT_BINS, m: int = DEFAULT_M, sample: str = "resolved", radius: str = "r_v",
-                  distinct: bool = True) -> dict:
+                  distinct: bool = True, definition: str = "crossing", interior=INTERIOR_X) -> dict:
     """profile_grids() on one snapshot's grids and catalogue (pipeline.SnapshotProducts): the voids of the
     'sample' ('resolved': well_resolved; 'deep': well_resolved and deep) with a finite 'radius' ('r_v', the
-    measured catalog.r_v_mpc, or 'r_eff', catalog.r_eff_mpc), only the distinct ones of them unless distinct=False,
-    the frame checked by catalog.frame_of. Adds 'r_mpc' (the radius the shells are in), 'r_v_mpc', 'r_eff_mpc',
-    'radius', 'distinct', 'delta_c', 'sample', 'cell_mpc', 'n_grid'."""
+    measured catalog.r_v_mpc under 'definition' (contract C3), or 'r_eff', catalog.r_eff_mpc), only the distinct
+    ones of them unless distinct=False, the frame checked by catalog.frame_of. Adds 'r_mpc' (the radius the shells
+    are in), 'r_v_mpc', 'r_eff_mpc', 'radius', 'distinct', 'delta_c', 'sample', 'cell_mpc', 'n_grid', 'definition',
+    and on phase-space grids 'single_interior' (interior_single_fraction at 'interior' x R) and 'single_box' (the
+    whole box's single-stream fraction, the reference for it)."""
     cat = products.voids()
     cell, box, n_grid, _source = catalog.frame_of(products)
     catalog.assert_frame(cat, cell)
@@ -154,7 +228,8 @@ def void_profiles(products, bins=DEFAULT_BINS, m: int = DEFAULT_M, sample: str =
         resolved &= np.asarray(cat["deep"]).astype(bool)
     elif sample != "resolved":
         raise ValueError(f"sample must be 'resolved' or 'deep', got {sample!r}")
-    r_v_all, r_eff_all = catalog.r_v_mpc(cat), catalog.r_eff_mpc(cat)
+    r_v_all, definition = r_v_by_definition(cat, definition) if radius == "r_v" else (catalog.r_v_mpc(cat), "crossing")
+    r_eff_all = catalog.r_eff_mpc(cat)
     r_all = r_v_all if radius == "r_v" else r_eff_all
     n_sample = int(resolved.sum())
     resolved &= np.isfinite(r_all)
@@ -182,7 +257,12 @@ def void_profiles(products, bins=DEFAULT_BINS, m: int = DEFAULT_M, sample: str =
     out["radius"], out["distinct"] = radius, bool(distinct)
     out["n_no_radius"], out["n_overlapping"] = n_no_radius, n_overlapping
     out["delta_c"] = np.asarray(cat["delta_values"], dtype=np.float64)[rows[local]]
-    out.update(sample=sample, cell_mpc=float(cell), box_mpc=float(box), n_grid=int(n_grid), method=str(fs.method))
+    out.update(sample=sample, cell_mpc=float(cell), box_mpc=float(box), n_grid=int(n_grid), method=str(fs.method),
+               definition=definition, interior_x=np.asarray(interior, dtype=np.float64))
+    out["single_interior"], out["single_box"] = None, None
+    if grids["single"] is not None:
+        out["single_interior"] = interior_single_fraction(grids["single"], coords[local], r_mpc[local] / cell, interior)
+        out["single_box"] = float(grids["single"].mean())
     return out
 
 
@@ -238,3 +318,85 @@ def linear_v_r(bins, density_mean, r_eff_mpc: float, z: float) -> np.ndarray:
     cum = 3.0 * (inner + np.interp(x, xf, integral)) / x ** 3
     c = dtfe.get_cosmology_params(z)
     return -(1.0 / 3.0) * c["f_growth"] * c["H_z"] * c["a"] * (x * r_eff_mpc) * cum
+
+
+def hsw_delta(x, delta_c, r_s, alpha, beta):
+    """The universal void profile of Hamaus, Sutter & Wandelt (2014): delta(r) = delta_c (1 - (r/r_s)^alpha) /
+    (1 + (r/R_v)^beta), in x = r / R_v (so R_v = 1 and r_s is r_s / R_v)."""
+    x = np.asarray(x, dtype=np.float64)
+    return delta_c * (1.0 - (x / r_s) ** alpha) / (1.0 + x ** beta)
+
+
+def stack_scatter(prof: dict, edges_mpc, key: str = "density", min_count: int = 5) -> tuple[np.ndarray, np.ndarray]:
+    """(mean, error) per radius bin of stack(): the mean over the bin's voids and its error std / sqrt(n) per shell
+    (the stack's scatter, ddof=1), both (nbin, nb); NaN in a bin below 'min_count' voids. fit_stack's weights."""
+    edges = np.asarray(edges_mpc, dtype=np.float64)
+    r = np.asarray(prof["r_mpc"] if "r_mpc" in prof else prof["r_eff_mpc"], dtype=np.float64)
+    v_all = np.asarray(prof[key], dtype=np.float64)
+    nb = v_all.shape[1] if v_all.ndim == 2 else len(prof["bins"])
+    mean = np.full((len(edges) - 1, nb), np.nan)
+    err = np.full((len(edges) - 1, nb), np.nan)
+    for i in range(len(edges) - 1):
+        sel = (r >= edges[i]) & (r < edges[i + 1])
+        if sel.sum() < max(int(min_count), 2):
+            continue
+        v = v_all[sel]
+        n = np.sum(np.isfinite(v), axis=0)
+        mean[i] = np.nanmean(v, axis=0)
+        err[i] = np.nanstd(v, axis=0, ddof=1) / np.sqrt(np.maximum(n, 1))
+    return mean, err
+
+
+def fit_hsw(bins, density_mean, density_err, x_range=(0.0, np.inf)) -> dict:
+    """curve_fit of hsw_delta to a stacked rho/rho_bar (density_mean, its error density_err per shell, at x =
+    'bins' in r / R_v; shells outside 'x_range' left out): {'params': {delta_c, r_s, alpha, beta}, 'errors': the
+    same (sqrt of the covariance's diagonal, absolute_sigma), 'chi2_dof', 'n_shells', 'ok', 'at_bound' (the
+    parameters on a bound of HSW_BOUNDS), 'constrained' (ok, none at a bound, every error below its value: the
+    largest R_v bins put delta_c on -1 with alpha ~ 0.2, where the first shell at 0.1 R_v leaves the centre free)}. The errors are floored
+    at 1e-3 of the profile's range so a noiseless shell does not get infinite weight. A fit that fails (too few
+    shells, no convergence) is ok=False with NaN parameters, never an exception."""
+    from scipy.optimize import curve_fit
+    x = np.asarray(bins, dtype=np.float64)
+    y = np.asarray(density_mean, dtype=np.float64) - 1.0
+    e = np.asarray(density_err, dtype=np.float64)
+    use = np.isfinite(y) & np.isfinite(e) & (x >= x_range[0]) & (x <= x_range[1])
+    nan = {k: float("nan") for k in HSW_PARAMS}
+    out = {"params": dict(nan), "errors": dict(nan), "chi2_dof": float("nan"), "n_shells": int(use.sum()), "ok": False,
+           "at_bound": [], "constrained": False}
+    if use.sum() <= len(HSW_PARAMS):
+        return out
+    x, y, e = x[use], y[use], e[use]
+    e = np.maximum(e, 1e-3 * max(float(np.ptp(y)), 1e-6))
+    p0 = list(HSW_P0)
+    p0[0] = float(np.clip(y[0], HSW_BOUNDS[0][0] + 1e-3, HSW_BOUNDS[1][0] - 1e-3))   # the centre's own depth
+    try:
+        popt, pcov = curve_fit(hsw_delta, x, y, p0=p0, sigma=e, absolute_sigma=True, bounds=HSW_BOUNDS, maxfev=20000)
+    except (RuntimeError, ValueError):
+        return out
+    perr = np.sqrt(np.clip(np.diag(pcov), 0.0, np.inf)) if np.all(np.isfinite(pcov)) else np.full(4, np.nan)
+    chi2 = float(np.sum(((hsw_delta(x, *popt) - y) / e) ** 2))
+    out.update(params=dict(zip(HSW_PARAMS, map(float, popt))), errors=dict(zip(HSW_PARAMS, map(float, perr))),
+               chi2_dof=chi2 / max(len(x) - len(HSW_PARAMS), 1), ok=True)
+    lo, hi = np.asarray(HSW_BOUNDS[0]), np.asarray(HSW_BOUNDS[1])
+    tol = 1e-4 * (hi - lo)
+    out["at_bound"] = [k for k, v, a, b, t in zip(HSW_PARAMS, popt, lo, hi, tol) if v - a <= t or b - v <= t]
+    out["constrained"] = bool(not out["at_bound"] and np.all(np.isfinite(perr)) and np.all(perr < np.abs(popt)))
+    return out
+
+
+def fit_stack(prof: dict, edges_mpc, min_count: int = 5, x_range=(0.0, np.inf)) -> list:
+    """fit_hsw per radius bin of the profiles 'prof' (stack_scatter's mean and error): one dict per bin with
+    'edges' (lo, hi Mpc), 'count' and 'mean_r_mpc' added (a bin below 'min_count' voids: ok=False)."""
+    edges = np.asarray(edges_mpc, dtype=np.float64)
+    r = np.asarray(prof["r_mpc"] if "r_mpc" in prof else prof["r_eff_mpc"], dtype=np.float64)
+    mean, err = stack_scatter(prof, edges, "density", min_count)
+    fits = []
+    for i in range(len(edges) - 1):
+        sel = (r >= edges[i]) & (r < edges[i + 1])
+        f = fit_hsw(prof["bins"], mean[i], err[i], x_range) if np.isfinite(mean[i]).any() else \
+            {"params": {k: float("nan") for k in HSW_PARAMS}, "errors": {k: float("nan") for k in HSW_PARAMS},
+             "chi2_dof": float("nan"), "n_shells": 0, "ok": False, "at_bound": [], "constrained": False}
+        f.update(edges=[float(edges[i]), float(edges[i + 1])], count=int(sel.sum()),
+                 mean_r_mpc=float(np.mean(r[sel])) if sel.any() else float("nan"))
+        fits.append(f)
+    return fits

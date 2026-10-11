@@ -130,7 +130,7 @@ def region_faces(binary):
     helptext = h.stdout + h.stderr
     try:
         mode = open(os.path.join(ROOT, "o_ps", ".build_mode")).read()
-        gpu = any(m in mode for m in ("METAL=1", "CUDA=1", "HIP=1"))
+        gpu = any(m in mode for m in ("METAL=1", "CUDA=1", "HIP=1", "CUDAEMU=1"))   # the emulated port too (2026-10-11)
     except OSError:
         gpu = False
     variants = [("sampled", []), ("linear", ["--ps-linear-deposit"])]

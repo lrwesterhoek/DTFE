@@ -143,6 +143,105 @@ def find_critical_points(delta_s, hessian, grad_mag):
 R_V_STEP_SIGMA = 0.2      # radial step of the R_v search, in smoothing lengths (the crossing is interpolated)
 R_V_MAX_SIGMA = 15.0      # how far out it looks (capped at half the box)
 R_V_DIRS = 128            # Fibonacci directions per shell
+R_V_DELTA08 = -0.8        # the enclosed contrast of the 'delta08' radius: shell crossing of the spherical model
+                          # (nonlinear -0.8 <-> linear -2.71; Sheth & van de Weygaert 2004)
+# The R_v ALGORITHM, bumped by hand when the measurement changes (a cache records it, r_v_settings, and is re-measured
+# when it is not today's): 1 = 2026-10-07, the first up-crossing alone, the loop stopping at it; 2 = 2026-10-11, the
+# full shell matrix out to the search range, giving the crossing (bit-identical to 1), delta08 and ridge.
+R_V_ALGORITHM = 2
+
+
+def r_v_settings():
+    """What a catalogue's radii were measured with, as it records them ('r_v_settings'): [step in sigma, reach in
+    sigma, directions, algorithm, delta08 threshold]. Read at call time, so a changed module constant counts."""
+    return np.array([R_V_STEP_SIGMA, R_V_MAX_SIGMA, R_V_DIRS, R_V_ALGORITHM, R_V_DELTA08], dtype=np.float64)
+
+
+def catalog_r_v_ok(cat):
+    """Whether a catalogue's radii were measured with today's settings (r_v_settings) and it holds all three
+    (catalog.R_V_DEFINITIONS). A cache from before 2026-10-11 has no record: not ok, re-measured once (the survey's
+    GAP: a changed R_V_MAX_SIGMA or algorithm used to leave every cache with the old radii and NaNs)."""
+    if 'r_v_settings' not in cat or any(k not in cat for k in ('r_v_cells', 'r_v_delta08_cells', 'r_v_ridge_cells')):
+        return False
+    have = np.asarray(cat['r_v_settings'], dtype=np.float64).reshape(-1)
+    want = r_v_settings()
+    return have.shape == want.shape and np.array_equal(have, want)
+
+
+def _enclosed_contrast(radii, shells):
+    """Delta(<r) at every radius of 'radii' (r_0 = 0 first) from the shell means 'shells' (rows = voids, column 0 =
+    the value at r = 0): delta taken piecewise LINEAR in r between the shells and r^2 dr integrated exactly over each
+    piece, so a constant profile gives Delta = that constant (a trapezoid on r^2 delta gives 1.5x it at the first
+    shell). Column 0 is the central value itself."""
+    a, b = radii[:-1], radii[1:]
+    va, vb = shells[:, :-1], shells[:, 1:]
+    d3 = (b ** 3 - a ** 3) / 3.0
+    slope = (vb - va) / (b - a)
+    piece = va * d3 + slope * ((b ** 4 - a ** 4) / 4.0 - a * d3)          # integral of delta(r) r^2 over [a, b]
+    out = np.empty_like(shells)
+    out[:, 0] = shells[:, 0]
+    out[:, 1:] = 3.0 * np.cumsum(piece, axis=1) / radii[1:] ** 3
+    return out
+
+
+def void_radii_cells(delta_s, coords, sigma_cells):
+    """The three measured radii per minimum, in cells, from ONE matrix of shell means of the SMOOTHED delta
+    (trilinear, R_V_DIRS directions about the minimum's cell centre, every R_V_STEP_SIGMA sigma out to R_V_MAX_SIGMA
+    sigma or half the box; column 0 the minimum itself at r = 0) (2026-10-11, catalog.R_V_DEFINITIONS):
+      'r_v_cells'          the first up-crossing of 0 (the mean), linearly interpolated from the last negative shell
+                           -- void_radius_cells, bit for bit;
+      'r_v_delta08_cells'  where the enclosed contrast Delta(<R) (_enclosed_contrast) first reaches R_V_DELTA08 going
+                           outward, interpolated likewise; NaN when the minimum itself is not below it (no sphere
+                           about it is that empty: on a field smoothed at sigma this is the common case for shallow
+                           minima) or it is not reached within reach;
+      'r_v_ridge_cells'    the radius of the MAXIMUM of the shell mean over the search range (the compensation ridge),
+                           refined by a parabola through it and its neighbours; NaN when the maximum is the outermost
+                           shell (the profile still rising: the range truncated it, no ridge was seen).
+    All three NaN for a minimum that is not underdense (delta_s >= 0). The survey's question behind the two new ones:
+    is the z < 3 shrinkage of the crossing R_v a property of the voids or the first-crossing rule latching onto an
+    inner wall? A void whose crossing R_v falls while delta08 and the ridge hold is the latter."""
+    from .profiles import fibonacci_sphere, shell_means          # here: profiles imports catalog, which imports this module
+    coords = np.asarray(coords, dtype=np.int64).reshape(-1, 3)
+    out = {k: np.full(len(coords), np.nan) for k in ('r_v_cells', 'r_v_delta08_cells', 'r_v_ridge_cells')}
+    if not len(coords):
+        return out
+    n = delta_s.shape[0]
+    step = R_V_STEP_SIGMA * max(float(sigma_cells), 1.0)
+    radii = np.arange(1, int(min(R_V_MAX_SIGMA * max(float(sigma_cells), 1.0), 0.5 * n) / step) + 1) * step
+    v0 = np.asarray(delta_s[coords[:, 0], coords[:, 1], coords[:, 2]], dtype=np.float64)
+    todo = np.nonzero(v0 < 0)[0]                                # an overdense 'minimum' has no underdense region
+    if not todo.size or not radii.size:
+        return out
+    dirs = fibonacci_sphere(R_V_DIRS)
+    k = radii.size
+    centers = np.repeat((coords[todo] + 0.5) / n, k, axis=0)   # (void, shell) pairs, void-major
+    shells = np.empty((todo.size, k + 1))
+    shells[:, 0] = v0[todo]
+    shells[:, 1:] = shell_means(delta_s, centers, np.tile(radii, todo.size), dirs).reshape(todo.size, k)
+    r_all = np.concatenate([[0.0], radii])
+
+    def first_up(prof, level):
+        # the first column >= level after column 0 (which is below it), interpolated from the column before
+        hit = prof[:, 1:] >= level
+        rows = np.nonzero(hit.any(axis=1) & (prof[:, 0] < level))[0]
+        j = np.argmax(hit[rows], axis=1) + 1
+        pr, pv, v = r_all[j - 1], prof[rows, j - 1], prof[rows, j]
+        res = np.full(len(prof), np.nan)
+        res[rows] = pr + (r_all[j] - pr) * (level - pv) / (v - pv)
+        return res
+
+    out['r_v_cells'][todo] = first_up(shells, 0.0)
+    out['r_v_delta08_cells'][todo] = first_up(_enclosed_contrast(r_all, shells), R_V_DELTA08)
+    j = np.argmax(shells[:, 1:], axis=1) + 1                    # the ridge: a shell, never the minimum itself
+    inner = j < k                                               # the outermost shell is no ridge (truncated)
+    jj, rows = j[inner], np.nonzero(inner)[0]
+    f0, f1, f2 = shells[rows, jj - 1], shells[rows, jj], shells[rows, jj + 1]
+    curv = f0 - 2.0 * f1 + f2
+    off = np.where(curv < 0, 0.5 * (f0 - f2) / np.where(curv < 0, curv, -1.0), 0.0)
+    ridge = np.full(todo.size, np.nan)
+    ridge[rows] = r_all[jj] + np.clip(off, -0.5, 0.5) * step
+    out['r_v_ridge_cells'][todo] = ridge
+    return out
 
 
 def void_radius_cells(delta_s, coords, sigma_cells):
@@ -153,31 +252,9 @@ def void_radius_cells(delta_s, coords, sigma_cells):
     (TNG100 z = 0, 2026-10-07). Shell means of delta_s (trilinear, R_V_DIRS directions, centred on the minimum's
     cell centre) every R_V_STEP_SIGMA sigma out to R_V_MAX_SIGMA sigma or half the box; the crossing linearly
     interpolated from the last negative shell (from r = 0: the minimum itself). Defined at every redshift (delta_s
-    < 0 at a void's minimum); NaN for a minimum that is not underdense or never reaches 0 within reach."""
-    from .profiles import fibonacci_sphere, shell_means          # here: profiles imports catalog, which imports this module
-    coords = np.asarray(coords, dtype=np.int64).reshape(-1, 3)
-    out = np.full(len(coords), np.nan)
-    if not len(coords):
-        return out
-    n = delta_s.shape[0]
-    step = R_V_STEP_SIGMA * max(float(sigma_cells), 1.0)
-    radii = np.arange(1, int(min(R_V_MAX_SIGMA * max(float(sigma_cells), 1.0), 0.5 * n) / step) + 1) * step
-    centers = (coords + 0.5) / n
-    dirs = fibonacci_sphere(R_V_DIRS)
-    prev_v = np.asarray(delta_s[coords[:, 0], coords[:, 1], coords[:, 2]], dtype=np.float64)
-    prev_r = np.zeros(len(coords))
-    todo = np.nonzero(prev_v < 0)[0]                            # an overdense 'minimum' has no underdense region
-    for r in radii:
-        if not todo.size:
-            break
-        v = shell_means(delta_s, centers[todo], np.full(todo.size, r), dirs)
-        hit = v >= 0
-        i = todo[hit]
-        out[i] = prev_r[i] + (r - prev_r[i]) * (-prev_v[i]) / (v[hit] - prev_v[i])
-        stay = todo[~hit]
-        prev_v[stay], prev_r[stay] = v[~hit], r
-        todo = stay
-    return out
+    < 0 at a void's minimum); NaN for a minimum that is not underdense or never reaches 0 within reach. The
+    'crossing' of void_radii_cells (2026-10-11: one shell matrix gives all three definitions)."""
+    return void_radii_cells(delta_s, coords, sigma_cells)['r_v_cells']
 
 
 def distinct_voids(coords, delta_values, r_v_cells, n_grid, r_eff_cells=None):
@@ -237,8 +314,10 @@ def build_void_catalog(delta_s, hessian):
         'deep': dvals < config.DEEP_VOID_THRESHOLD,
     }
     cat.update(_ellipsoid_fits(coords, evals, evecs))
-    # the MEASURED radius (2026-10-07): in cells, frame-free like coords, so a refit keeps it
-    cat['r_v_cells'] = void_radius_cells(delta_s, coords, config.SMOOTHING_SIGMA_CELLS)
+    # the MEASURED radii (2026-10-07; delta08 and ridge 2026-10-11): in cells, frame-free like coords, so a refit
+    # keeps them; with the settings they were measured with (catalog_r_v_ok)
+    cat.update(void_radii_cells(delta_s, coords, config.SMOOTHING_SIGMA_CELLS))
+    cat['r_v_settings'] = r_v_settings()
     cat['cell_mpc'] = np.float64(config.CELL_SIZE)      # the FRAME the positions and semi-axes are in (2026-10-05)
     cat['cuts_mpc'] = _cuts_array()                     # the cuts (in Mpc) the well_resolved flag was taken with
     cat['deep_threshold'] = np.float64(config.DEEP_VOID_THRESHOLD)   # the threshold 'deep' was taken at
@@ -286,11 +365,17 @@ def apply_smoothing_args(args, tag="pipeline"):
 def smoothing_tag() -> str:
     """'' at the production smoothing (config.PRODUCTION_SMOOTHING: 10 cells, footprint 11), else a tag for file
     and folder names -- 's2.1625Mpc_f5' -- so a --smooth / --smooth-mpc run never overwrites the default products.
-    Six significant digits: '.3g' made 2.16 and 2.1625 Mpc one tag over two different caches (review 2026-10-07)."""
+    Six significant digits: '.3g' made 2.16 and 2.1625 Mpc one tag over two different caches (review 2026-10-07).
+    A non-default void gate (DTFE_VOID_GATE, void_gate) adds 'gatenone' (2026-10-11): 'gatenone' alone at the
+    production smoothing, 's2.1625Mpc_f5_gatenone' with both -- so every caller that keys names (and the thesis
+    mirror's refusal) on this tag keeps the ungated products apart with no change of its own."""
+    parts = []
     sig0, fp0 = config.PRODUCTION_SMOOTHING
-    if (float(config.SMOOTHING_SIGMA_CELLS), int(config.FOOTPRINT_SIZE)) == (float(sig0), int(fp0)):
-        return ""
-    return f"s{smoothing_length_mpc():.6g}Mpc_f{int(config.FOOTPRINT_SIZE)}"
+    if (float(config.SMOOTHING_SIGMA_CELLS), int(config.FOOTPRINT_SIZE)) != (float(sig0), int(fp0)):
+        parts.append(f"s{smoothing_length_mpc():.6g}Mpc_f{int(config.FOOTPRINT_SIZE)}")
+    if void_gate() != 'ellipsoid':
+        parts.append(f"gate{void_gate()}")
+    return "_".join(parts)
 
 
 def smoothing_length_mpc():
@@ -309,6 +394,46 @@ def ellipsoid_cuts_mpc():
             'max_axis_mpc': min(float(r['max_axis_sigma']) * smoothing_length_mpc(),
                                 float(r['max_axis_box_frac']) * float(config.BOX_SIZE)),
             'max_axis_ratio': float(r['max_axis_ratio'])}
+
+
+VOID_GATES = ('ellipsoid', 'none')
+
+
+def void_gate():
+    """The void sample gate for this process (config.VOID_GATE, DTFE_VOID_GATE; 2026-10-11): 'ellipsoid' (default:
+    well_resolved is today's ellipsoid cut) or 'none' (the max-axis clause dropped, gate_view). Read at call time."""
+    g = str(getattr(config, 'VOID_GATE', 'ellipsoid') or 'ellipsoid').strip().lower()
+    if g not in VOID_GATES:
+        raise ValueError(f"DTFE_VOID_GATE must be one of {VOID_GATES}, got {g!r}")
+    return g
+
+
+def gate_cuts_mpc():
+    """The cuts the returned catalogue's well_resolved is taken with under void_gate(): ellipsoid_cuts_mpc(), with
+    max_axis_mpc = inf under 'none'."""
+    cuts = ellipsoid_cuts_mpc()
+    if void_gate() == 'none':
+        cuts['max_axis_mpc'] = float('inf')
+    return cuts
+
+
+def gate_view(cat):
+    """The catalogue as the samples see it under void_gate(). 'ellipsoid': 'cat' itself. 'none' (the survey's GAP:
+    the R_v abundance and profiles inherited the 10-sigma max-axis cut, which drops a void because its CURVATURE
+    length is large, not because its R_v is unresolved -- about 77-79% of the z = 0 minima): a copy whose ellipsoid
+    fits, well_resolved and 'cuts_mpc' are re-derived without the max-axis clause (min axis and axis ratio kept), so
+    every sample built on well_resolved -- the R_v ones, and the R_eff / shape ones too -- is ungated, with no change
+    in its script. NEVER saved: the cache keeps the production flags, so processes with either gate share it; the
+    outputs are kept apart by smoothing_tag()'s 'gatenone'. Marked 'void_gate' = 'none'."""
+    if void_gate() == 'ellipsoid':
+        return cat
+    out = dict(cat)
+    cuts = gate_cuts_mpc()
+    out.update(_ellipsoid_fits(np.asarray(cat['coords']), np.asarray(cat['eigenvalues']), np.asarray(cat['eigenvectors']),
+                               cuts=cuts))
+    out['cuts_mpc'] = np.array([cuts['min_axis_mpc'], cuts['max_axis_mpc'], cuts['max_axis_ratio']], dtype=np.float64)
+    out['void_gate'] = np.str_('none')
+    return out
 
 
 def _cuts_array():
@@ -427,12 +552,12 @@ def ellipsoid_fit_one(evals, evecs, cell):
     }
 
 
-def _ellipsoid_fits(coords, evals, evecs):
+def _ellipsoid_fits(coords, evals, evecs, cuts=None):
     # Batched twin of ellipsoid_fit_one (same formulas, thresholds and argsort tie order --
-    # keep them in lockstep) + the ellipsoid_cuts_mpc() resolution gate, vectorized over voids.
+    # keep them in lockstep) + the ellipsoid_cuts_mpc() resolution gate (or 'cuts': gate_view's), vectorized over voids.
     # Bit-equivalence with the per-void path is covered by tests/py_dtfelib_test.py.
     cell = config.CELL_SIZE
-    cuts = ellipsoid_cuts_mpc()
+    cuts = ellipsoid_cuts_mpc() if cuts is None else cuts
     n = len(coords)
     valid = np.zeros(n, dtype=bool)
     semi_axes = np.zeros((n, 3), dtype=np.float32)
@@ -652,21 +777,30 @@ class SnapshotProducts:
         TNG100-3-Dark catalogues of July were built under TNG50's frame (positions up to 51.6 Mpc in a
         110.7 Mpc box) and read as hundreds of 'resolved' voids where the right frame leaves a handful --
         or when the cuts (ellipsoid_cuts_mpc) changed since (they are not in the cache's parameter hash, so a
-        retuned cut used to need the caches deleted). Says so. (2026-10-05)"""
+        retuned cut used to need the caches deleted). Says so. (2026-10-05) A cache whose radii were measured with
+        other settings (catalog_r_v_ok) gets them re-measured from the smoothed field (2026-10-11). The cache always
+        holds the PRODUCTION gate; DTFE_VOID_GATE=none is applied to the returned dict only (gate_view)."""
         snapshot_frame(self)                    # the header's frame must be config's: refuse before any cache is touched
         p = self._cpath('voids')
         if self._cached('voids') is not None:
             with np.load(p) as z:
                 cat = {k: z[k] for k in z.files}
-            if 'r_v_cells' not in cat and self._grid_path() is not None:
-                # R_v needs the smoothed field, which a refit does not have: rebuild (once per cache, ~18 s at 512^3)
-                print(f"    [pipeline] cached void catalogue {p.name} has no measured radius R_v (2026-10-07): rebuilding it")
-                cat = build_void_catalog(self.delta_smoothed, self.hessian)
-                self._save(p, cat)
-                return cat
+            remeasured = False
+            if not catalog_r_v_ok(cat) and self._grid_path() is not None:
+                # the radii need the smoothed field, which a refit does not have; the minima are this grid's (the
+                # stamp passed), so only the radii are re-measured: no Hessian (2026-10-11), saved once with the rest
+                why = ("has no record of its R_v settings" if 'r_v_settings' not in cat
+                       else f"was measured with R_v settings {np.asarray(cat['r_v_settings']).tolist()}, "
+                            f"not today's {r_v_settings().tolist()}")
+                print(f"    [pipeline] cached void catalogue {p.name} {why}: re-measuring R_v (crossing, delta08, ridge)")
+                cat.update(void_radii_cells(self.delta_smoothed, cat['coords'], config.SMOOTHING_SIGMA_CELLS))
+                cat['r_v_settings'] = r_v_settings()
+                remeasured = True
             frame_ok, cuts_ok = catalog_frame_ok(cat), catalog_cuts_ok(cat)
             if frame_ok and cuts_ok:
-                return cat
+                if remeasured:
+                    self._save(p, cat)
+                return gate_view(cat)
             why = []
             if not frame_ok:
                 why.append(f"built with cell {catalog_cell_mpc(cat):.5g} Mpc, not this frame's {config.CELL_SIZE:.5g} "
@@ -677,10 +811,10 @@ class SnapshotProducts:
             print(f"    [pipeline] cached void catalogue {p.name}: {'; '.join(why)}: re-deriving its fits")
             cat = refit_catalog(cat)
             self._save(p, cat)
-            return cat
+            return gate_view(cat)
         cat = build_void_catalog(self.delta_smoothed, self.hessian)
         self._save(p, cat)
-        return cat
+        return gate_view(cat)
 
     def critical_points(self):
         p = self._cpath('critical')

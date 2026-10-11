@@ -8,6 +8,15 @@
 # kernels) compiled with nvcc in NVIDIA's toolkit image: no GPU on the runner, so this only keeps the
 # port compiling (the two .cu files are self-contained, so no CGAL is needed for this).
 # hip-compile -- the same port compiled with ROCm's hipcc (AMD), compile only as well.
+# old-python -- every .py parses under Python 3.10, the oldest pyproject supports (2026-10-11: ci_suite's
+# check skipped on the runner, which has no 3.10, so a PEP 701 f-string could pass CI).
+# cudaemu -- the CUDA/HIP port RUN (not only compiled) through its CPU emulation (CUDAEMU=1, gpu_cuda_emu.h): the
+# GPU parity suites via tests/cudaemu_check.sh at warp 32 (CUDA) and 64 (HIP wavefront). Validates the
+# transliteration and the host logic, not real hardware (2026-10-11).
+# compile-variants -- what users build beyond the pairs: no TBB and no libdeflate (neither installed),
+# 'make library' and the demo/examples program linked against it (tests/ci_suite.sh variants).
+# The C++ jobs share their compiler output through ccache (Debian's /usr/lib/ccache masquerade: the
+# Makefile's 'which g++' finds it first on PATH, so nothing in the Makefile changes).
 
 name: ci
 
@@ -23,6 +32,8 @@ jobs:
   build-and-test:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    env:
+      CCACHE_MAXSIZE: 500M
     steps:
       - uses: actions/checkout@v4
 
@@ -32,7 +43,16 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential libgsl-dev libboost-all-dev libcgal-dev libtbb-dev \
             libmpfr-dev libhdf5-dev libgmp-dev libfftw3-dev libdeflate-dev \
-            python3 python3-numpy python3-h5py python3-scipy python3-matplotlib
+            python3 python3-numpy python3-h5py python3-scipy python3-matplotlib ccache
+          echo "/usr/lib/ccache" >> "$GITHUB_PATH"
+          echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"   # what the cache step saves (~ is not expanded in env:)
+
+      - name: Compiler cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-build-and-test-${{ hashFiles('Makefile', 'src/**') }}
+          restore-keys: ccache-build-and-test-
 
       # single + DOUBLE=1 + DIM=2: each is a separate compile of every translation unit, so only a
       # build catches a float-only or 3D-only construct creeping in (the 2D build was broken for a
@@ -40,7 +60,9 @@ jobs:
       - name: Build the single, double and 2D binaries (CPU-only)
         run: tests/ci_suite.sh build
 
-      # every CPU suite against ./DTFE and ./PS-DTFE (tests/ci_suite.sh lists them, with why)
+      # every CPU suite against ./DTFE and ./PS-DTFE (tests/ci_suite.sh lists them, with why); since
+      # 2026-10-11 with the standard-DTFE regression against its STORED reference (it compared nothing
+      # here before) and the auto-tune and --scratch-dir suites (ported off macOS-only commands)
       - name: Test battery (single precision)
         run: tests/ci_suite.sh core
 
@@ -65,6 +87,98 @@ jobs:
 
       - name: 2D phase space against analytic 2D flows
         run: tests/ci_suite.sh 2d
+
+      - name: Compiler cache statistics
+        if: always()
+        run: ccache -s
+
+  old-python:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      # update-environment false: the 3.10 stays OFF the PATH (it has no numpy); the stage is handed its path
+      - id: py310
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          update-environment: false
+      - name: Every .py parses under Python 3.10
+        run: OLD_PYTHON="${{ steps.py310.outputs.python-path }}" tests/ci_suite.sh oldpy
+
+  compile-variants:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CCACHE_MAXSIZE: 500M
+    steps:
+      - uses: actions/checkout@v4
+      # deliberately WITHOUT libtbb-dev and libdeflate-dev: the build must not need them
+      - name: Install dependencies (no TBB, no libdeflate)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential libgsl-dev libboost-all-dev libcgal-dev \
+            libmpfr-dev libhdf5-dev libgmp-dev libfftw3-dev ccache
+          echo "/usr/lib/ccache" >> "$GITHUB_PATH"
+          echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"   # what the cache step saves (~ is not expanded in env:)
+      - name: Compiler cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-compile-variants-${{ hashFiles('Makefile', 'src/**', 'demo/examples/**') }}
+          restore-keys: ccache-compile-variants-
+      - name: TBB=0 LIBDEFLATE=0 build, make library, the demo/examples program
+        run: tests/ci_suite.sh variants
+      - name: Compiler cache statistics
+        if: always()
+        run: ccache -s
+
+  cudaemu:
+    runs-on: ubuntu-24.04
+    # non-blocking until its first green run on the runners' x86-64 (the emulation's context switch has run there
+    # only under Rosetta); the Linux-only std::bad_alloc that made it red is fixed (src/subpartition.h, 2026-10-11)
+    continue-on-error: true
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        warp: [32, 64]
+    env:
+      CCACHE_MAXSIZE: 500M
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential libgsl-dev libboost-all-dev libcgal-dev libtbb-dev \
+            libmpfr-dev libhdf5-dev libgmp-dev libfftw3-dev libdeflate-dev \
+            python3 python3-numpy python3-h5py python3-scipy python3-matplotlib ccache
+          echo "/usr/lib/ccache" >> "$GITHUB_PATH"
+          echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
+      - name: Compiler cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-cudaemu-${{ hashFiles('Makefile', 'src/**') }}
+          restore-keys: ccache-cudaemu-
+      # the CUDA/HIP sources compiled as plain C++ against the CPU emulation of the device (no GPU needed)
+      - name: Build DTFE and PS-DTFE with CUDAEMU=1
+        run: make DTFE PS-DTFE CUDAEMU=1 -j"$(nproc)"
+      - name: GPU parity suites through the emulated CUDA/HIP backend (warp ${{ matrix.warp }})
+        env:
+          DTFE_TEST_TMP: ${{ runner.temp }}/dtfe-tests   # the suites' grids, outside the checkout
+        run: CUDAEMU_WARPS=${{ matrix.warp }} tests/cudaemu_check.sh
+      - name: Keep the suites' output on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cudaemu-logs-w${{ matrix.warp }}
+          path: ${{ runner.temp }}/dtfe-tests/cudaemu_check/
+      - name: Compiler cache statistics
+        if: always()
+        run: ccache -s
 
   cuda-compile:
     runs-on: ubuntu-24.04

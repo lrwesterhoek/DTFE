@@ -305,6 +305,13 @@ endif
 ifeq ($(GPU_MODE),cudaemu)
 GPUXX = $(CC)
 GPUXX_FLAGS = -x c++ -std=c++20 -O2 -fPIC -DGPU_EMU -Wno-unused-function -Wno-deprecated-declarations $(MACOS_ISYSROOT)
+# x86-64 (2026-10-11): the emulation's lanes switch stacks by hand (gpu_cuda_emu.h gpuemu_switch), which a
+# CET shadow stack would kill at the first 'ret' into another lane. Ubuntu's GCC marks every object
+# shadow-stack compatible by default (-fcf-protection); leaving this one unmarked keeps the linked binary
+# unmarked, so the loader never turns the shadow stack on. arm64 has no such flag.
+ifeq ($(shell uname -m),x86_64)
+GPUXX_FLAGS += -fcf-protection=none
+endif
 OPTIONS    += -DDTFE_GPU -DGPU_BACKEND_NAME=\"CUDA-emulated\"
 OPTIONS_PS += -DPS_GPU -DGPU_BACKEND_NAME=\"CUDA-emulated\"
 DTFE_GPU_OBJS = $(OBJ_DIR)/dtfe_gpu_cuda$(OBJ_EXT)

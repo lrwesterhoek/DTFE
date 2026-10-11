@@ -85,8 +85,11 @@ enum Collective { C_ANY, C_MINU, C_SUMF };
 // stack pointer into *fromSp, switches to the stack toSp and restores the registers saved there --
 // a register-only coroutine switch (the libc routines cost a signal-mask syscall per switch, which
 // made a 32^3 test take ten minutes). A fresh stack is prepared so that the first switch "returns"
-// into the lane trampoline (prepareStack). The arm64 switch is verified (Apple Silicon); the x86-64
-// one is written to the System V convention but has not been run yet.
+// into the lane trampoline (prepareStack). The arm64 switch is verified (Apple Silicon, and Linux arm64 with
+// GCC 13); the x86-64 one, written to the System V convention, ran for the first time on 2026-10-11 (Rosetta:
+// the PS deposit bit-identical in mass to arm64, and a collectives + __syncthreads kernel exact at warp 32 and
+// 64). It must not run under a CET shadow stack (a 'ret' into another lane's stack): the Makefile builds the
+// emulated objects with -fcf-protection=none on x86-64 so the binary is never marked for one.
 extern "C" void gpuemu_switch(void** fromSp, void* toSp);
 #if defined(__APPLE__)
 #define GPUEMU_SYM "_gpuemu_switch"

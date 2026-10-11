@@ -333,7 +333,8 @@ class SetupDialog(QDialog):
         if err != QProcess.FailedToStart or self._build is None:
             return
         self.build_log.appendPlainText(f"cannot start {self._build.program()}: {self._build.errorString()} "
-                                       "(install the Xcode command-line tools: xcode-select --install)")
+                                       "(install the Xcode command-line tools: in a terminal, run xcode-select with its install "
+                                       "option and click Install in the dialog; the README's build section has the line)")
         self._build_queue = []
         self._build = None
         self.build_btn.setEnabled(True)

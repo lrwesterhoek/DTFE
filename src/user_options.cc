@@ -25,6 +25,7 @@
 
 #include <fstream>
 #include <cstdio>
+#include <cmath>       // HUGE_VAL
 #include <sys/stat.h>
 #include "user_options.h"
 
@@ -135,9 +136,16 @@ User_options::User_options()
     psSuppressGridStats = false;
     psDeferNormalization = false;
     psLagAlphaRadius = 0.;   // set from --ps-alpha-shape once the Lagrangian cloud is known (DTFE.cpp)
-    psOrderedMerge = false;  // set by the auto-tuner's speed split (auto_tune.h)
+    psOrderedMerge = false;  // --ordered-merge, or set by the auto-tuner's speed split (auto_tune.h)
+    psOrderedMergeFlag = false;   // --ordered-merge (folded into psOrderedMerge after parsing)
+    psResume = false;        // --resume
+    psNoCheckpoint = false;  // set under --interlace (below)
+    psNoOverlap = false;     // --ps-no-overlap
+    psLookAheadOffBudget = false;   // set by the auto-tuner when the look-ahead does not fit the budget
+    psLookAheadRoom = HUGE_VAL;     // set from the auto-tuner's report (DTFE.cpp): no budget known = no budget limit
     psPartitionBytes = 0.;   // set from the auto-tuner's report (DTFE.cpp): the partition memory gate
     psUseSubgrid = false;
+    psTessellationPrebuilt = false;   // set only by psInterpolatePrebuilt (the partition look-ahead)
     psMayClearDT = false;   // set only by the DTFE_interpolation overload that owns its DT
 #endif
     userDefinedSampling = false;
@@ -214,6 +222,11 @@ void User_options::addOptions(po::options_description &allOptions,
              " In standard DTFE this limits the concurrent spatial sub-triangulations inside the parallel interpolation; combine with --partition for serial, low-memory processing of very large data."
 #endif
              )
+#ifdef PHASE_SPACE
+            ("ordered-merge", po::bool_switch(&(this->psOrderedMergeFlag)), "PS-DTFE, partitioned runs: add the partitions' grids into the result in partition INDEX order, whatever order they finish in, so two identical runs give bit-identical grids (the merge's float adds then always happen in the same order; with '--ps-gpu' the deposit's own atomic sums must be order-free too, which the mass grid is and the float velocity moments are not). A finished partition waits, holding its sub-grid, until every lower-numbered one has merged: when the partitions differ much in cost and '--max-concurrent' is above 1 this costs time (35% on a TNG region's GPU run) and some memory. The memory gate still applies; under this flag a partition waits for memory only while a LOWER-numbered one is in flight, so the wait cannot deadlock. At '--max-concurrent 1' the order is the index order anyway, and the auto-tuner's speed split of a small set always merges in order.")
+            ("resume", po::bool_switch(&(this->psResume)), "PS-DTFE, partitioned runs: continue a run that was killed, from its checkpoint. A partitioned run saves its merged grids and the list of merged partitions in '<output>.runlog.checkpoint' (with '--scratch-dir': in the scratch directory, named from the whole output path) after a partition merges, unless the last save took more than 5% of the time since it; the folder is removed once the outputs are in place. '--resume' loads it, skips the partitions it lists and computes the rest; it refuses, naming the differing settings, when the command line (apart from --resume, --ordered-merge, --ps-no-overlap, --verbose, --max-concurrent, --scratch-dir and --tessellation-cache), the build or the binary itself (a rebuilt binary does not resume), the input files or the partition split differ. Without '--partition' the checkpoint's split is used. It implies '--ordered-merge': when the killed run merged in index order too, the grids are byte-identical to an uninterrupted '--ordered-merge' run. DTFE_PS_CHECKPOINT=0 writes no checkpoints; runs with '--sample-points' or '--interlace' are not checkpointed.")
+            ("ps-no-overlap", po::bool_switch(&(this->psNoOverlap)), "PS-DTFE, partitioned GPU runs at '--max-concurrent 1': switch off the look-ahead that builds the NEXT partition's tessellation (particle selection, Delaunay triangulation, vertex densities) on a CPU thread while the current one deposits on the GPU. The look-ahead changes no output byte (each tessellation is built exactly as without it and the merge stays in index order); it holds one more partition's tessellation in memory, which the memory gate and the auto-tuner count, and it is skipped for a partition when the free memory cannot hold it.")
+#endif
             ("auto-tune-report", po::bool_switch(&(this->autoTuneReport)), "PS-DTFE: read the input, run the memory auto-tuner exactly as a real run would (the same flags, including a given --partition/--max-concurrent), print ONE line -- AUTO-TUNE-REPORT partition=.. mc=.. predicted_gb=.. budget_gb=.. over_budget=0|1 ... -- and exit without computing anything. For checking whether a configuration fits before running it (the GUI does). DTFE_AUTO_PTS_N and DTFE_AUTO_PTS_VELGRAD=1 size a --sample-points plane that does not exist yet.")
             ;
     
@@ -420,6 +433,11 @@ void User_options::shortHelp( char *progName )
             ("partition", po::value< Real >(&temp), "specify in how many parts to split the box along each direction.")
             ("partNo", po::value< Real >(&temp), "choose to compute the interpolation only for this partition number.")
             ("max-concurrent", po::value< Real >(&temp), "cap how many Delaunay triangulations build at once to bound peak memory (0 = all threads).")
+#ifdef PHASE_SPACE
+            ("ordered-merge", "PS-DTFE: merge the partitions in index order (bit-identical grids run to run).")
+            ("resume", "PS-DTFE: continue a killed partitioned run from its '<output>.runlog.checkpoint' (implies --ordered-merge).")
+            ("ps-no-overlap", "PS-DTFE: no look-ahead tessellation of the next partition during a GPU deposit.")
+#endif
             ;
     po::options_description paddingOptions("Padding options");
     paddingOptions.add_options()
@@ -634,6 +652,14 @@ void User_options::printOptions()
     }
     if ( this->maxConcurrent>0 )
         message << "\t max concurrent triangs : " << this->maxConcurrent << "   (capping concurrent Delaunay triangulations to bound peak memory)\n";
+#ifdef PHASE_SPACE
+    if ( this->psOrderedMerge )
+        message << "\t partition merge order  : partition index (--ordered-merge; bit-reproducible sums)\n";
+    if ( this->psNoOverlap )
+        message << "\t look-ahead tessellation: off (--ps-no-overlap)\n";
+    else if ( this->psLookAheadOffBudget )
+        message << "\t look-ahead tessellation: off (one partition plus the look-ahead does not fit the memory budget)\n";
+#endif
     if ( this->partitionGiven and not this->partitionOn )
         message << "\t splitting the data in  : 1   (--partition 1: a single triangulation, no auto-selected split)\n";
     if ( not this->partitionOn and not this->partitionGiven and not this->maxConcurrentOn and this->partNo<0 and not this->redshiftConeOn )
@@ -1134,6 +1160,15 @@ void User_options::readOptions(int argc, char *argv[], bool getFileNames, bool s
 #endif
 
     // read the partition options
+#ifdef PHASE_SPACE
+    // '--resume' implies the ordered merge (2026-10-11): the resumed partitions then add in index order, and a run
+    // killed under the ordered merge resumes to byte-identical grids. The FLAG too, not only the order: it keeps
+    // the memory gate on (DTFE.cpp), which a resumed memory-driven split needs.
+    if ( this->psResume )
+        this->psOrderedMergeFlag = true;
+    if ( this->psOrderedMergeFlag )
+        this->psOrderedMerge = true;   // '--ordered-merge' (the auto-tuner's speed split sets it too)
+#endif
     if ( vm.count("max-concurrent") and not vm["max-concurrent"].defaulted() )
         this->maxConcurrentOn = true;   // user gave it (possibly 0 = uncapped); auto-tuner must not touch it
     if ( vm.count("partition") )
@@ -1290,6 +1325,19 @@ void User_options::readOptions(int argc, char *argv[], bool getFileNames, bool s
     }
     if ( vm.count("interlace") )
         this->interlace = true;
+#ifdef PHASE_SPACE
+    // '--interlace' runs the partition loop twice, the second time on a half-cell-shifted grid (main.cpp). Both
+    // passes would checkpoint into ONE folder under ONE settings key (the shift is not on the command line), so a
+    // resume loaded one pass's grids as the other's (2026-10-11): an interlaced run is not checkpointed, and
+    // '--resume' refuses it.
+    if ( this->interlace )
+    {
+        if ( this->psResume )
+            throwError( "'--resume' cannot be combined with '--interlace': an interlaced run (two passes, the second on "
+                        "a half-cell-shifted grid) writes no checkpoint. Run it without '--resume'." );
+        this->psNoCheckpoint = true;
+    }
+#endif
     if ( vm.count("MpcUnit") )
         lowerBoundCheck( MpcValue, Real(0.), "value of option '--MpcUnit'" );
     if ( vm.count("extensive") )
@@ -1330,6 +1378,7 @@ void User_options::readOptions(int argc, char *argv[], bool getFileNames, bool s
     // set values to userOptions->programOptions
     for (int i=0; i<argc; ++i)
         this->programOptions += string( argv[i] ) + " ";
+    this->commandTokens.assign( argv + std::min( argc, 1 ), argv + argc );   // the checkpoint's settings key
     
     
     // disable options that were turned off at compile time

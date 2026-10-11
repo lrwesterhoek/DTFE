@@ -14,10 +14,9 @@ PROJECT_DIR = os.path.dirname(SCRIPT_DIR)
 # outputs are float64; the text outputs most tests read are precision-free
 PRECISION = os.environ.get("DTFE_TEST_PRECISION", "single")
 DTFE_BIN = os.path.join(PROJECT_DIR, "DTFE-double" if PRECISION == "double" else "DTFE")
-# DTFE_TEST_REFERENCE_DIR: where the regression reference lives (tests/ci_suite.sh points it at a
-# scratch folder: the stored reference was made with macOS's CGAL, and another CGAL breaks Delaunay
-# ties in co-spherical configurations differently, so a Linux run creates its own there -- and the
-# regression is then a SKIP, never a pass: it compared nothing)
+# DTFE_TEST_REFERENCE_DIR: where the regression reference lives (default tests/reference, which CI uses too since
+# 2026-10-11: see test_regression). A folder without one gets a reference written from the run, and the
+# regression is then a SKIP, never a pass: it compared nothing (tests/run_tests_check.sh R3)
 REFERENCE_DIR = os.environ.get("DTFE_TEST_REFERENCE_DIR") or os.path.join(SCRIPT_DIR, "reference")
 # DTFE_TEST_REQUIRED=1 (ci_suite.sh's double stage, after building the pair): a missing binary or
 # feature is a FAILURE, as with tests/precision.sh's skip_or_fail -- a green stage that ran no
@@ -545,60 +544,94 @@ def test_exact_average_convergence(tmpdir):
         report(name, False, str(e))
 
 
+# The standard-DTFE regression (2026-10-11: a stored reference CI compares with, on every platform). Until today
+# it sampled a NON-periodic cloud, whose padding-test dummy points sit on a regular lattice against the convex hull:
+# co-spherical ties that CGAL breaks differently per platform (rel err ~1.6 Mac vs Linux), so CI wrote a fresh
+# reference and compared nothing. Now: a PERIODIC box of 1000 seeded random points (no exact ties: the Delaunay
+# tessellation is unique, so every correct CGAL builds the same one), the point-sampled density and the
+# --exact-average cell average (no Monte Carlo: the sampled density_a depends on insertion order -- 25% per cell
+# when the input is shuffled), written as binary floats (the text output keeps 6 digits).
+REGRESSION_REF = "regression_periodic.txt"
+REGRESSION_ARGS = ["-i", "111", "-o", "101", "-g", "12", "-f", "density", "density_a", "--MpcUnit", "1",
+                   "--periodic", "--exact-average"]
+# Per value |new - ref| <= RTOL * |ref| (every density here is >= 0.35, so no absolute floor is needed). Measured on
+# the Mac, against this reference (max rel over the 2 x 1728 values, two seeds):
+#   the double build (no float rounding at all)       2.7e-5      one thread (another reduction order)   2.5e-5
+#   coordinates perturbed by 1e-7 relative            7.2e-6      the input order shuffled               6.0e-7
+#   --seed / --noTest                                 0 (bit-identical)
+# against REAL changes of the input or the estimator:
+#   one of the 1000 particles moved 0.05% of the box  1.2e-3      one particle's weight +1%              3.2e-3
+#   one particle moved 0.5% of the box                5.3e-2
+# 3e-4 sits 11x above everything rounding, threads or another compiler can do (the double build bounds a
+# different float evaluation order) and 4x below the smallest real change tried.
+REGRESSION_RTOL = 3e-4
+
+
+def _write_regression_ref(path, den, den_a):
+    with open(path, "w") as f:
+        f.write("# tests/run_tests.py test_regression reference: 1000 seeded points (seed 12345), periodic 10^3 box, "
+                "a 12^3 grid; columns = density (point sample), density_a (--exact-average)\n")
+        for a, b in zip(den, den_a):
+            f.write(f"{a:.9e} {b:.9e}\n")
+
+
+def _read_regression_ref(path):
+    den, den_a = [], []
+    with open(path) as f:
+        for line in f:
+            if line.strip() and not line.startswith("#"):
+                a, b = line.split()
+                den.append(float(a))
+                den_a.append(float(b))
+    return den, den_a
+
+
 def test_regression(tmpdir, update_ref=False):
     name = "regression"
     box_size = 10.0
-    particles = make_seeded_random_particles(150, box_size, weight=1.0, seed=12345)
+    particles = make_seeded_random_particles(1000, box_size, weight=1.0, seed=12345)
 
     infile = os.path.join(tmpdir, f"{name}.txt")
     outfile = os.path.join(tmpdir, name)
     write_text_input(infile, particles, (0, box_size, 0, box_size, 0, box_size))
 
-    ok, _ = run_dtfe(infile, outfile, grid_size=8, input_type=111)
+    ok, out = _run_raw(REGRESSION_ARGS, infile, outfile)
     if not ok:
         report(name, False, "DTFE execution failed")
+        log(out)
         return
-
-    density = read_density_output(outfile + ".den")
-    ref_file = os.path.join(REFERENCE_DIR, "regression_density.txt")
+    den, den_a = list(_read_float32(outfile + ".den")), list(_read_float32(outfile + ".a_den"))
+    ref_file = os.path.join(REFERENCE_DIR, REGRESSION_REF)
 
     if update_ref or not os.path.exists(ref_file):
         os.makedirs(REFERENCE_DIR, exist_ok=True)
-        with open(ref_file, "w") as f:
-            for d in density:
-                f.write(f"{d:.8e}\n")
+        _write_regression_ref(ref_file, den, den_a)
         if update_ref:
             print(f"  UPDATED  {name} (reference file written)")
         else:
-            # a reference made from the run under test compares nothing: a SKIP, not a silent drop from
-            # the count -- in CI and Docker every run lands here (ci_suite.sh's fresh folder), so they have
-            # no fixed-number check of the standard estimator (2026-10-08). Never a failure under
-            # DTFE_TEST_REQUIRED=1: no build can supply the reference.
+            # a reference made from the run under test compares nothing: a SKIP, not a silent drop from the
+            # count. Never a failure under DTFE_TEST_REQUIRED=1: no build can supply the reference. (CI and
+            # Docker compare with the stored one since 2026-10-11; this is a fresh DTFE_TEST_REFERENCE_DIR.)
             skip(name, f"no reference in {REFERENCE_DIR}: one was written from this run, nothing compared",
                  required=False)
         return
 
-    ref_density = read_density_output(ref_file)
-    if len(density) != len(ref_density):
-        report(name, False,
-               f"Size mismatch: {len(density)} vs ref {len(ref_density)}")
-        return
-
-    max_rel_err = 0
-    max_abs_err = 0
-    for d, r in zip(density, ref_density):
-        abs_err = abs(d - r)
-        max_abs_err = max(max_abs_err, abs_err)
-        if abs(r) > 1e-10:
-            max_rel_err = max(max_rel_err, abs_err / abs(r))
-
-    log(f"Max absolute error vs reference: {max_abs_err:.2e}")
-    log(f"Max relative error vs reference: {max_rel_err:.2e}")
-
-    if max_rel_err > 1e-4 and max_abs_err > 1e-6:
-        report(name, False,
-               f"Output differs from reference: "
-               f"max rel err={max_rel_err:.2e}, max abs err={max_abs_err:.2e}")
+    ref_den, ref_den_a = _read_regression_ref(ref_file)
+    msgs = []
+    for what, new, ref in (("density", den, ref_den), ("density_a (exact)", den_a, ref_den_a)):
+        if len(new) != len(ref):
+            msgs.append(f"{what}: {len(new)} values vs {len(ref)} in the reference")
+            continue
+        rel = [abs(a - b) / abs(b) if b != 0 else abs(a) for a, b in zip(new, ref)]
+        worst = max(rel)
+        bad = sum(1 for r in rel if r > REGRESSION_RTOL)
+        log(f"{what}: max rel err vs reference {worst:.2e} ({bad} of {len(rel)} above {REGRESSION_RTOL:g})")
+        if bad:
+            k = rel.index(worst)
+            msgs.append(f"{what}: {bad}/{len(rel)} values differ by more than {REGRESSION_RTOL:g} relative "
+                        f"(worst: cell {k}, {new[k]:.6e} vs {ref[k]:.6e}, rel {worst:.2e})")
+    if msgs:
+        report(name, False, f"output differs from {ref_file}: " + "; ".join(msgs))
     else:
         report(name, True)
 
@@ -720,6 +753,43 @@ def test_gadget_mass_block_skip(tmpdir):
         report(name, False, str(e))
 
 
+def test_thin_region_threads(tmpdir):
+    """A multi-threaded run on a THIN --regionMpc (the launcher's exact-zoom shape, here 1 x 1 x
+    2e-5 Mpc) must run and match the one-thread run. Each thread's particle search
+    reserved p.size() * padded-box/region volume = a multi-PB vector: std::bad_alloc on Linux
+    already at 2 kpc thickness (macOS overcommits that, so it needs this thinner slab), while
+    OMP_NUM_THREADS=1 never takes that path (2026-10-11)."""
+    name = "thin_region_threads"
+    box = 100.0
+    infile = os.path.join(tmpdir, f"{name}.txt")
+    write_text_input(infile, make_seeded_random_particles(4000, box), (0, box, 0, box, 0, box))
+    try:
+        for threads in (1, 2, 4):
+            outfile = os.path.join(tmpdir, f"{name}_t{threads}")
+            cmd = [DTFE_BIN, infile, outfile, "-i", "111", "-o", "101", "-g", "16", "16", "1",
+                   "-f", "density", "--MpcUnit", "1", "--periodic",
+                   "--regionMpc", "40", "41", "40", "41", "50", "50.00002"]
+            env = dict(os.environ, OMP_NUM_THREADS=str(threads))
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=env)
+            if result.returncode != 0:
+                tail = (result.stdout + result.stderr).strip().splitlines()[-1:]
+                raise AssertionError(f"DTFE failed with {threads} threads (exit {result.returncode}): {tail}")
+        den = _read_float32(os.path.join(tmpdir, f"{name}_t1.den"))
+        if len(den) != 16 * 16 or not all(math.isfinite(v) and v > 0 for v in den):
+            raise AssertionError(f"one-thread density: {len(den)} values, not all finite and > 0")
+        # byte-identical on arm64 clang and GCC; compared to 1e-5 so another CPU's rounding of a
+        # per-thread triangulation cannot turn this crash check red
+        for threads in (2, 4):
+            den_t = _read_float32(os.path.join(tmpdir, f"{name}_t{threads}.den"))
+            if len(den_t) != len(den):
+                raise AssertionError(f"{threads}-thread .den has {len(den_t)} values, not {len(den)}")
+            for v, ref in zip(den_t, den):
+                assert_close(v, ref, 1e-5, f"{threads}-thread vs one-thread density")
+        report(name, True)
+    except AssertionError as e:
+        report(name, False, str(e))
+
+
 def main():
     global VERBOSE, PASSED, FAILED
 
@@ -757,6 +827,7 @@ def main():
         test_raw_binary_reader(tmpdir)
         test_text_reader_zero_velocity(tmpdir)
         test_gadget_mass_block_skip(tmpdir)
+        test_thin_region_threads(tmpdir)
         test_exact_average_lattice(tmpdir)
         test_exact_average_convergence(tmpdir)
         test_regression(tmpdir, update_ref=args.update_ref)

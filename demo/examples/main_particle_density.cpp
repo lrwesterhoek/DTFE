@@ -24,14 +24,21 @@
 /** This file contain an example of how one can access the Delaunay tessellation of the point set using the DTFE function.
 
 NOTE: For this code to work you must compile with the Makefile option: TRIANGULATION
+
+Ported to the current library API (2026-10-11): DTFE() and writeOutputData() take the unaveraged AND the
+cell-averaged quantities, the field selectors are User_options::uField / aField, and the input/output
+functions come from libDTFE (io/io.h) instead of an #include of input_output.cc.
 */
 
 #include <vector>
+#include <fstream>
 
 #include "../../src/DTFE.h"
-#include "../../src/input_output.cc"
+#include "../../src/io/io.h"
+#include "../../src/io/input_output.h"
 
 using namespace std;
+#include "../../src/CGAL_triangulation/triangulation_miscellaneous.h"   // vertexPositionMatrix (expects std names in scope)
 
 
 
@@ -44,9 +51,13 @@ Real computeDensity(Cell_handle &cell,
     Real A[NO_DIM][NO_DIM];
     vertexPositionMatrix( cell, A );
     
-    // compute the inverse of A
+    // compute the inverse of A (matrixInverse works in double whatever the build's precision)
+    double Ad[NO_DIM][NO_DIM];
+    for (int i=0; i<NO_DIM; ++i)
+        for (int j=0; j<NO_DIM; ++j)
+            Ad[i][j] = A[i][j];
     Real AInverse[NO_DIM][NO_DIM];
-    matrixInverse( A, AInverse );
+    matrixInverse( Ad, AInverse );
     
     // compute the density gradient
     Real dens[NO_DIM];  //matrix to store the density differences
@@ -68,7 +79,7 @@ Real computeDensity(Cell_handle &cell,
 int main( int argc, char *argv[] )
 {
     User_options userOptions;		// stores the program options supplied by the user plus additional program wide constants
-    userOptions.field.triangulation = true;
+    userOptions.uField.triangulation = true;
     userOptions.readOptions( argc, argv );  // read the user supplied options
 //     userOptions.field.density = false;
     
@@ -96,8 +107,8 @@ int main( int argc, char *argv[] )
     
     // compute the DTFE
     DT delaunayTriangulation;   // the Delaunay Triangulation of the point set
-    Quantities quantities;	// structure that keeps vectors for all allowed field computations - only for grid quantities, not for the Delaunay triangulation itself
-    DTFE( &particles, samplingCoordinates, userOptions, &quantities, delaunayTriangulation );  // this function deletes the information in 'particles'
+    Quantities uQuantities, aQuantities;	// the grid quantities: unaveraged (at the sampling points) and cell-averaged ('_a')
+    DTFE( &particles, samplingCoordinates, userOptions, &uQuantities, &aQuantities, delaunayTriangulation );  // this function deletes the information in 'particles'
     
     
     // find the density at the positions stored in vector "positions"
@@ -125,7 +136,7 @@ int main( int argc, char *argv[] )
     
     
     // output the desired quantities to file/files
-    writeOutputData( quantities, userOptions );
+    writeOutputData( uQuantities, aQuantities, userOptions );
     //now writting the particle positions to a file
     std::fstream outputFile;
     string filename = userOptions.outputFilename+".particleDensity";

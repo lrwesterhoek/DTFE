@@ -115,7 +115,8 @@ nSub 3) the density-only deposit is unchanged (5.95 s) and the full field set ~2
 The moment grids stay float; their normalizer is this mass (or momw / dispw), so in cells with ~1e7
 deposits a mass-weighted sigma^2 no longer has the mass grid's matching float loss to cancel its own.
 `PS_METAL_FLOAT_MASS=1` (and the harness's `VALIDATE_FLOAT_MASS=1`) brings back the float mass grid
-for comparison. The CUDA/HIP port still accumulates the mass in float.
+for comparison. The CUDA/HIP port has the same fixed-point grid since 2026-10-11 (PS_GPU_FLOAT_MASS=1, or the Metal
+spelling, for its float grid); tests/cudaemu_check.sh runs the parity suites on it through the CPU emulation.
 
 Random stress set (60% normal + 25% flat/caustic + 15% tiny tets): CPU-vs-GPU mean-rel agreement
 mass 4e-6, momentum 3e-6, second moment 7e-7, gradient 9e-9; stream counts differ in 0.003% of
@@ -184,10 +185,15 @@ not dropped, so no mass is lost there either.
   even with ~0.1 s buffers under active display use, while serialized submission with small
   host-side gaps survives. The host therefore submits SERIALIZED chunks that adapt toward ~0.25 s
   each (start 25k tets, `PS_METAL_CHUNK=<n>` overrides) with an ~8 ms sleep between buffers. A
-  killed buffer may have partially deposited, so a failed chunk is never retried alone: each retry
-  re-zeros the grids and redoes the whole partition with 4× shorter buffers and wider gaps (logged
-  to stderr), then the CPU deposit takes over. Running with the display idle/locked avoids the
-  watchdog entirely.
+  killed buffer may have partially deposited, so a failed chunk is never retried alone: each pass
+  keeps a host-side snapshot of the buffers it writes (at its start and every ~10 s of GPU work,
+  `DTFE_GPU_CHECKPOINT_CHUNKS=<n>` = every n buffers, 0 = pass start only), and a failure restores
+  the last snapshot and continues from there (2026-10-11; before, every retry redid the whole
+  partition). The retry depends on the error: "Innocent Victim" retries at once at the same pace, a
+  watchdog/timeout or resource error escalates to 4× shorter buffers and wider gaps for the rest of
+  the process (logged to stderr); three failures of the same chunk, or a lost device, hand the
+  partition to the CPU deposit. `DTFE_GPU_FAULT_AT=<k>[:innocent|timeout|oom|persist]` is the test
+  hook (tests/gpu_retry_check.sh). Running with the display idle/locked avoids the watchdog entirely.
 - **No mixed builds**: the PS build GPU mode (metal/off) is stamped in `o_ps/`; changing
   it wipes all PS objects, so an incremental rebuild can never mix `-DPS_GPU` and plain objects
   (which would produce a binary that half-believes it has GPU support). `o_ps/.build_mode` records

@@ -3,15 +3,24 @@
 For every snapshot: the shells of every DISTINCT well-resolved void of the pipeline's catalogue (dtfelib.profiles:
 the RAW rho/rho_bar, v_r positive = outflow, the single-stream fraction on phase-space grids), stacked in
 bins of R with 16-84% bootstrap bands, as a two- or three-panel figure plus an npz of the stacked curves. R is the
-measured void radius R_v (where the smoothed density contrast around the minimum rises to 0) by default, the
+measured void radius R_v (where the smoothed density contrast around the minimum rises to 0) by default -- so the
+stacked density reaching the mean near 1.0 R_v is R_v's own definition (2026-10-11), a check of the smoothing against
+the raw density, not a finding; the infall radius, the ridge and the single-stream fraction are -- the
 ellipsoid's R_eff with --radius r_eff (with --keep-overlaps --edges 0,2,4,8,16: the figures before 2026-10-07);
 --keep-overlaps stacks every resolved void,
 neighbouring minima of one void included; --smooth-mpc smooths at the same physical scale in every box. The dashed lines on the v_r panel are linear theory from the stacked density itself
-(profiles.linear_v_r): what the voids would do if they expanded linearly.
+(profiles.linear_v_r): what the voids would do if they expanded linearly. With --radius r_v (the default) every
+radius bin's stacked density is also fitted with the universal profile of Hamaus, Sutter & Wandelt (2014),
+profiles.fit_stack (2026-10-11): the fitted curves dotted on the density panel (constrained fits only), the parameters
+in the npz as hsw_params / hsw_errors (nbin, 4: delta_c, r_s / R_v, alpha, beta), hsw_ok, hsw_constrained, hsw_chi2_dof.
+plot_void_profile_evolution.py draws them against redshift.
+
+Files: void_profiles_<method|prefix>_<sample>[_reff][_overlaps][_edges<e0>-<e1>-...][_<smoothing tag>]_z<z>.npz/.png;
+'_edges...' (2026-10-11) only for --edges other than the default bins, so a rerun with other bins never replaces them.
 
     python3 plot/plot_void_profiles.py --sim TNG100-3-Dark --snaps 99 50
     python3 plot/plot_void_profiles.py --sim TNG100-3-Dark --snaps 99 --out ~/profiles   (no thesis-tree copy)
-    python3 plot/plot_void_profiles.py --sim TNG300-3-Dark --snaps 99 --smooth-mpc 2.16 --radius r_eff
+    python3 plot/plot_void_profiles.py --sim TNG300-3-Dark --snaps 99 --smooth-mpc 2.1625 --radius r_eff
     python3 plot/plot_void_profiles.py --sim TNG50-4-Dark --snap 99 --method dtfe --sample deep --edges 0,3,6,12
 """
 
@@ -31,8 +40,9 @@ OUTPUT_DIR = Path(config.LOCAL_FIGURES_ROOT) / "void_profiles"
 MIRROR = True                              # --out: the user's folder, nothing goes into the thesis tree
 
 
-def plot_stack(st, prof, title, path, z, linear=True):
-    """One panel per stacked field, a curve (with its band) per radius bin; the dashed linear-theory v_r."""
+def plot_stack(st, prof, title, path, z, linear=True, fits=None):
+    """One panel per stacked field, a curve (with its band) per radius bin; the dashed linear-theory v_r; the dotted
+    HSW fit of each bin on the density panel when 'fits' (profiles.fit_stack) holds a constrained one."""
     panels = [("density", r"$\rho / \bar\rho$"), ("v_r", r"$v_r$ [km/s]  (positive = outflow)")]
     if "single" in st:
         panels.append(("single", "single-stream fraction of the shell"))
@@ -49,6 +59,10 @@ def plot_stack(st, prof, title, path, z, linear=True):
             label = f"{st['edges'][i]:.3g}-{st['edges'][i + 1]:.3g} Mpc (n = {st['count'][i]})"
             ax.plot(st["bins"], st[k]["mean"][i], color=colors[i], label=label)
             ax.fill_between(st["bins"], st[k]["lo"][i], st[k]["hi"][i], color=colors[i], alpha=0.2, lw=0)
+            if k == "density" and fits and fits[i]["constrained"]:
+                xf = np.linspace(min(st["bins"]), max(st["bins"]), 200)
+                ax.plot(xf, 1.0 + profiles.hsw_delta(xf, *(fits[i]["params"][q] for q in profiles.HSW_PARAMS)), ":",
+                        color=colors[i], lw=1.2)
             if k == "v_r" and linear:
                 sel = (r_eff >= st["edges"][i]) & (r_eff < st["edges"][i + 1])
                 v_lin = profiles.linear_v_r(st["bins"], st["density"]["mean"][i], float(np.mean(r_eff[sel])), z)
@@ -62,6 +76,8 @@ def plot_stack(st, prof, title, path, z, linear=True):
             ax.text(0.03, 0.03, "dashed: linear theory from the stacked density", transform=ax.transAxes, fontsize=7, color="0.3")
         if k == "single":
             ax.set_ylim(0, 1.02)
+        if k == "density" and fits and any(f["constrained"] for f in fits):
+            ax.text(0.97, 0.03, "dotted: HSW 2014 fit", transform=ax.transAxes, fontsize=7, color="0.3", ha="right")
     if any(st["count"][i] >= st["min_count"] for i in range(nbin)):
         axes[0][0].legend(fontsize=7, title=f"${rlab}$ bin")
     else:
@@ -70,6 +86,15 @@ def plot_stack(st, prof, title, path, z, linear=True):
     fig.tight_layout()
     style.save_plot_to_multiple_paths(fig, path, mirror=MIRROR)
     plt.close(fig)
+
+
+def edges_tag(edges, default_edges) -> str:
+    """'' for the default radius bins (profiles.default_edges_mpc, as given or spelled out to 4 digits), else
+    '_edges<e0>-<e1>-...' in Mpc (4 significant digits, '.' kept) -- 2026-10-11, as the 2026-10-08 round's tags: a
+    rerun with other --edges overwrote the default stack under the same name."""
+    if [f"{float(e):.4g}" for e in edges] == [f"{float(e):.4g}" for e in default_edges]:
+        return ""                               # the defaults as computed (L/6 = 10.6667) or as the help spells them
+    return "_edges" + "-".join(f"{float(e):.4g}" for e in edges)
 
 
 def main():
@@ -85,7 +110,8 @@ def main():
                              "deeper void's min(R_v, R_eff))")
     parser.add_argument("--edges", default=None,
                         help="radius bin edges in Mpc, comma-separated (default in smoothing lengths: R_v 0, 2.5, 3.5, 5; "
-                             "R_eff 0, 5, 6, 7; and the wrap cap L/6 -- profiles.default_edges_mpc)")
+                             "R_eff 0, 5, 6, 7; and the wrap cap L/6 -- profiles.default_edges_mpc); other edges tag "
+                             "the files '_edges<e0>-<e1>-...'")
     parser.add_argument("--points", type=int, default=profiles.DEFAULT_M, help="points per shell")
     parser.add_argument("--n-boot", type=int, default=200, help="bootstrap resamples for the bands")
     parser.add_argument("--no-linear", action="store_true", help="no linear-theory v_r overlay")
@@ -96,13 +122,18 @@ def main():
     MIRROR = args.out is None
     style.apply()
     pipeline.apply_smoothing_args(args, "void-profiles")  # the catalogue's cache namespace follows, as in the other scripts
+    default_edges = list(profiles.default_edges_mpc(pipeline.smoothing_length_mpc(), config.BOX_SIZE, args.radius))
     if args.edges is None:                               # in smoothing lengths: the same bins mean the same in every box
-        edges = list(profiles.default_edges_mpc(pipeline.smoothing_length_mpc(), config.BOX_SIZE, args.radius))
+        edges = default_edges
         args.edges = ",".join(f"{e:.4g}" for e in edges)
     else:
-        edges = [float(e) for e in args.edges.split(",") if e.strip()]
+        try:
+            edges = [float(e) for e in args.edges.split(",") if e.strip()]
+        except ValueError:
+            raise SystemExit(f"--edges must be numbers, comma-separated, got {args.edges!r}")
     if len(edges) < 2 or any(b <= a for a, b in zip(edges, edges[1:])):
         raise SystemExit(f"--edges must be at least two increasing numbers, got {args.edges!r}")
+    etag = edges_tag(edges, default_edges)
     snaps = args.snaps if args.snaps else [args.snap]
     failed, written = [], []
     for snap in snaps:
@@ -119,6 +150,8 @@ def main():
         finally:
             p.release()
         st = profiles.stack(prof, edges_mpc=edges, n_boot=args.n_boot)
+        # the universal profile (HSW 2014) per bin, in r / R_v: its R_v term is the void radius, not R_eff
+        fits = profiles.fit_stack(prof, edges, min_count=st["min_count"]) if args.radius == "r_v" else None
         counts = ", ".join(f"{edges[i]:.3g}-{edges[i + 1]:.3g} Mpc: {st['count'][i]}" for i in range(len(edges) - 1))
         what = f"{'' if args.keep_overlaps else 'distinct '}{args.sample}"
         print(f"  snapshot {snap:03d} (z={z:.2f}, {prof['method']}): {len(prof['index'])} {what} voids profiled in "
@@ -127,7 +160,7 @@ def main():
         tag = args.prefix or prof["method"]            # named by what it holds, as the pk files are
         out_dir = Path(args.out).expanduser() if args.out else OUTPUT_DIR / args.sim
         kind = args.sample + ("" if args.radius == "r_v" else "_reff") + ("_overlaps" if args.keep_overlaps else "") \
-            + (f"_{pipeline.smoothing_tag()}" if pipeline.smoothing_tag() else "")    # a non-default sigma: its own file
+            + etag + (f"_{pipeline.smoothing_tag()}" if pipeline.smoothing_tag() else "")    # a non-default sigma: its own file
         base = out_dir / f"void_profiles_{tag}_{kind}_z{z:.2f}"    # suffixes APPENDED
         base.parent.mkdir(parents=True, exist_ok=True)
         arrays = {"bins": st["bins"], "edges": st["edges"], "count": st["count"], "r_eff_mpc": prof["r_eff_mpc"],
@@ -140,13 +173,18 @@ def main():
                   "prefix": args.prefix or "", "sigma_cells": config.SMOOTHING_SIGMA_CELLS, "cell_mpc": prof["cell_mpc"],
                   "box_mpc": prof["box_mpc"], "n_grid": prof["n_grid"], "n_boot": st["n_boot"], "min_count": st["min_count"],
                   "cuts_mpc": [pipeline.ellipsoid_cuts_mpc()[k] for k in ("min_axis_mpc", "max_axis_mpc", "max_axis_ratio")]}
+        if fits is not None:
+            arrays.update(hsw_params=np.array([[f["params"][q] for q in profiles.HSW_PARAMS] for f in fits]),
+                          hsw_errors=np.array([[f["errors"][q] for q in profiles.HSW_PARAMS] for f in fits]),
+                          hsw_ok=np.array([f["ok"] for f in fits]), hsw_constrained=np.array([f["constrained"] for f in fits]),
+                          hsw_chi2_dof=np.array([f["chi2_dof"] for f in fits]), hsw_param_names=np.array(profiles.HSW_PARAMS))
         for k in ("density", "v_r", "single"):
             if k in st:
                 for part in ("mean", "lo", "hi"):
                     arrays[f"{k}_{part}"] = st[k][part]
         np.savez_compressed(f"{base}.npz", **arrays)
         title = f"{args.sim}  z = {z:.2f}  {prof['method']}  ({what} voids, {len(prof['index'])}, r/{args.radius})"
-        plot_stack(st, prof, title, Path(f"{base}.png"), z, linear=not args.no_linear)
+        plot_stack(st, prof, title, Path(f"{base}.png"), z, linear=not args.no_linear, fits=fits)
         written.append(base)
     where = Path(args.out).expanduser() if args.out else OUTPUT_DIR / args.sim
     print(f"\n{len(written)} snapshot(s) under {where}" + (f"; failed: {failed}" if failed else ""))

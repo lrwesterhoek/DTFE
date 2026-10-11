@@ -931,6 +931,8 @@ def _t_void_catalog_export_body(d, cat, n_voids, n, _Prod, catalog, pipeline, co
            "a_mpc": axes[:, 0] * nanfit, "b_mpc": axes[:, 1] * nanfit, "c_mpc": axes[:, 2] * nanfit,
            "r_eff_mpc": f64(np.where(res, np.prod(cat["semi_axes"], axis=1) ** (1.0 / 3.0), np.nan)),
            "r_v_mpc": f64(cat["r_v_cells"]) * config.CELL_SIZE,
+           "r_v_delta08_mpc": f64(cat["r_v_delta08_cells"]) * config.CELL_SIZE,
+           "r_v_ridge_mpc": f64(cat["r_v_ridge_cells"]) * config.CELL_SIZE,
            "distinct": catalog.distinct_mask(cat, res & np.isfinite(f64(cat["r_v_cells"])), config.FIELD_RESOLUTION),
            "ellipticity_fit": f64(cat["fit_ellipticity"]) * nanfit, "prolateness_fit": f64(cat["fit_prolateness"]) * nanfit,
            "major_x": orient[:, 0, 0] * nanfit, "major_y": orient[:, 1, 0] * nanfit, "major_z": orient[:, 2, 0] * nanfit,
@@ -962,7 +964,8 @@ def _t_void_catalog_export_body(d, cat, n_voids, n, _Prod, catalog, pipeline, co
     ax = np.stack([to["a_mpc"], to["b_mpc"], to["c_mpc"]], 1)[res]
     assert np.allclose(ax ** 2 * lam, 4.0, rtol=1e-5), ("void_table in the dict's own cell", ax[:2] ** 2 * lam[:2])
     per_void = ("coords", "eigenvalues", "eigenvectors", "axis_ratios", "bbks_params", "delta_values", "deep", "well_resolved",
-                "semi_axes", "orientations", "fit_ellipticity", "fit_prolateness", "positions_mpc", "r_v_cells")
+                "semi_axes", "orientations", "fit_ellipticity", "fit_prolateness", "positions_mpc", "r_v_cells",
+                "r_v_delta08_cells", "r_v_ridge_cells")
     empty = {k: (np.asarray(v)[:0] if k in per_void else v) for k, v in cat.items() if k != "cell_mpc"}
     assert all(len(v) == 0 for v in catalog.void_table(empty).values())
     # the major axis IS the eigenvector of the smallest |lambda| (the longest semi-axis), the minor that of the largest
@@ -982,6 +985,8 @@ def _t_void_catalog_export_body(d, cat, n_voids, n, _Prod, catalog, pipeline, co
                 "cut_max_axis_ratio": cuts["max_axis_ratio"], "cut_min_axis_cells": config.ELLIPSOID_CUT_RULES["min_axis_cells"],
                 "cut_max_axis_sigma": config.ELLIPSOID_CUT_RULES["max_axis_sigma"],
                 "cut_max_axis_box_frac": config.ELLIPSOID_CUT_RULES["max_axis_box_frac"],
+                "void_gate": "ellipsoid", "r_v_step_sigma": pipeline.R_V_STEP_SIGMA, "r_v_max_sigma": pipeline.R_V_MAX_SIGMA,
+                "r_v_dirs": pipeline.R_V_DIRS, "r_v_algorithm": pipeline.R_V_ALGORITHM, "r_v_delta08": pipeline.R_V_DELTA08,
                 "param_hash": pipeline._param_hash(), "n_voids": n_voids,
                 "created": None}
     assert set(pc) == set(expected), sorted(set(pc) ^ set(expected))
@@ -1255,7 +1260,8 @@ def t_export_driver():
     cat = pipeline.build_void_catalog(delta_s, pipeline.hessian_from_field(delta_s))
     assert len(cat["coords"]) >= 2, len(cat["coords"])
     per_void = ("coords", "eigenvalues", "eigenvectors", "axis_ratios", "bbks_params", "delta_values", "deep", "well_resolved",
-                "semi_axes", "orientations", "fit_ellipticity", "fit_prolateness", "positions_mpc", "r_v_cells")
+                "semi_axes", "orientations", "fit_ellipticity", "fit_prolateness", "positions_mpc", "r_v_cells",
+                "r_v_delta08_cells", "r_v_ridge_cells")
     none = {k: (np.asarray(v)[:0] if k in per_void else v) for k, v in cat.items()}     # a snapshot without a void
     k0, k1, k2, k3 = list(config.SNAPSHOT_TO_REDSHIFT)[:4]
     good = config.CELL_SIZE * n
@@ -1648,7 +1654,8 @@ def t_void_scripts():
             return {k: z[k] for k in z.files}
 
     def cached(snap, method="ps"):
-        hits = list((root / "cache").rglob(f"SYN_{method}_{snap:03d}_voids.npz"))
+        # the figures' catalogue (--smooth 1.5); the size function keeps its own in another namespace (2026-10-11)
+        hits = [h for h in (root / "cache").rglob(f"SYN_{method}_{snap:03d}_voids.npz") if "_s1.5_" in h.parent.name]
         assert len(hits) == 1, hits
         return hits[0]
 
@@ -1661,17 +1668,18 @@ def t_void_scripts():
         out = pvp.OUTPUT_DIR / "SYN"
         code, text = run(pvp, ["--snaps", "99", "50", "--edges", "0,10,20", "--n-boot", "37"])
         names = sorted(q.name for q in out.iterdir()) if out.is_dir() else []
-        assert code == 0 and names == [f"void_profiles_ps_resolved_z{z}.{e}" for z in ("0.00", "0.50") for e in ("npz", "png")], (code, names, text[-600:])
+        # a non-default --edges tags the names (2026-10-11): '_edges0-10-20', the default stack's names stay free
+        assert code == 0 and names == [f"void_profiles_ps_resolved_edges0-10-20_z{z}.{e}" for z in ("0.00", "0.50") for e in ("npz", "png")], (code, names, text[-600:])
         assert sorted(q.name for q in (root / "mirror" / "void_profiles" / "SYN").iterdir()) == [q for q in names if q.endswith(".png")]
         assert not (Path(saved["LOCAL_FIGURES_ROOT"]) / "void_profiles" / "SYN").exists()
-        f = npz(out / "void_profiles_ps_resolved_z0.00.npz")
+        f = npz(out / "void_profiles_ps_resolved_edges0-10-20_z0.00.npz")
         need = {"bins", "edges", "count", "r_eff_mpc", "index", "delta_c", "redshift", "sample", "method", "dropped", "points",
                 "prefix", "sigma_cells", "cell_mpc", "box_mpc", "n_grid", "n_boot", "min_count", "cuts_mpc"}
         need |= {f"{k}_{q}" for k in ("density", "v_r", "single") for q in ("mean", "lo", "hi")}
         assert need <= set(f), sorted(need - set(f))
         assert str(f["prefix"]) == "" and float(f["sigma_cells"]) == 1.5 and float(f["cell_mpc"]) == 1.0 and float(f["box_mpc"]) == 64.0, f
         assert int(f["n_grid"]) == 64 and int(f["n_boot"]) == 37 and int(f["min_count"]) == 5 and str(f["method"]) == "ps" and str(f["sample"]) == "resolved", f
-        assert float(f["redshift"]) == 0.0 and float(npz(out / "void_profiles_ps_resolved_z0.50.npz")["redshift"]) == 0.5
+        assert float(f["redshift"]) == 0.0 and float(npz(out / "void_profiles_ps_resolved_edges0-10-20_z0.50.npz")["redshift"]) == 0.5
         cat99 = npz(cached(99))
         assert np.array_equal(f["r_eff_mpc"], catalog.r_eff_mpc(cat99)[f["index"]]) and np.allclose(f["delta_c"], cat99["delta_values"][f["index"]])
         # the default (2026-10-07): the DISTINCT resolved voids with a measured R_v, the shells in r / R_v
@@ -1683,20 +1691,27 @@ def t_void_scripts():
         assert np.isfinite(f["density_mean"][0]).all() and np.isnan(f["density_mean"][1]).all()
         # --radius r_eff --keep-overlaps: the stack before 2026-10-07 (every resolved void, in r / R_eff), its own file
         code, text = run(pvp, ["--snaps", "99", "--edges", "0,10,20", "--radius", "r_eff", "--keep-overlaps"])
-        g = npz(out / "void_profiles_ps_resolved_reff_overlaps_z0.00.npz")
+        g = npz(out / "void_profiles_ps_resolved_reff_overlaps_edges0-10-20_z0.00.npz")
         assert code == 0 and list(g["count"]) == [6, 0] and str(g["radius"]) == "r_eff" and np.array_equal(g["r_mpc"], g["r_eff_mpc"]), (code, text[-300:])
         # --prefix: the file is named by the set it holds, the primary set's file untouched
-        before = (out / "void_profiles_ps_resolved_z0.00.npz").read_bytes()
+        before = (out / "void_profiles_ps_resolved_edges0-10-20_z0.00.npz").read_bytes()
         code, text = run(pvp, ["--snaps", "99", "--prefix", "ps_mw"])
         assert code == 0 and (out / "void_profiles_ps_mw_resolved_z0.00.npz").is_file() and (out / "void_profiles_ps_mw_resolved_z0.00.png").is_file(), (code, sorted(q.name for q in out.iterdir()), text[-400:])
         assert str(npz(out / "void_profiles_ps_mw_resolved_z0.00.npz")["prefix"]) == "ps_mw"
-        assert (out / "void_profiles_ps_resolved_z0.00.npz").read_bytes() == before
+        assert (out / "void_profiles_ps_resolved_edges0-10-20_z0.00.npz").read_bytes() == before
         # --out: the user's folder and nothing into the thesis tree; without --edges the bins are in smoothing lengths
         from dtfelib import profiles as _prof
         own, mirrored = root / "own_out", sorted((root / "mirror").rglob("*.png"))
         code, text = run(pvp, ["--snaps", "99", "--out", str(own)])
         assert code == 0 and (own / "void_profiles_ps_resolved_z0.00.png").is_file() and sorted((root / "mirror").rglob("*.png")) == mirrored, (code, text[-400:])
         assert np.allclose(npz(own / "void_profiles_ps_resolved_z0.00.npz")["edges"], _prof.default_edges_mpc(1.5 * 1.0, 64.0))
+        # the default bins spelled out by hand are the default (no tag, the same file); other bins never touch it
+        dflt = ",".join(f"{e:.4g}" for e in _prof.default_edges_mpc(1.5 * 1.0, 64.0))
+        code, text = run(pvp, ["--snaps", "99", "--out", str(own), "--edges", dflt, "--n-boot", "200"])
+        assert code == 0 and sorted(q.name for q in own.iterdir()) == ["void_profiles_ps_resolved_z0.00.npz", "void_profiles_ps_resolved_z0.00.png"], (code, sorted(q.name for q in own.iterdir()))
+        code, text = run(pvp, ["--snaps", "99", "--out", str(own), "--edges", "0,7.5,20"])
+        assert code == 0 and (own / "void_profiles_ps_resolved_edges0-7.5-20_z0.00.npz").is_file(), sorted(q.name for q in own.iterdir())
+        assert pvp.edges_tag([0.0, 7.5, 20.0], [0.0, 3.75, 5.25]) == "_edges0-7.5-20" and pvp.edges_tag([0, 3.75, 10.67], [0.0, 3.750001, 32.0 / 3.0]) == ""
         # an unreadable snapshot file FIRST: counted failed, the next snapshot still profiled, exit 1; a missing one too
         d98 = garbage(98)
         shutil.rmtree(out)
@@ -1711,7 +1726,7 @@ def t_void_scripts():
         calls = []
 
         def counting(self):
-            calls.append((int(self.snapshot), self.fs.method))
+            calls.append((int(self.snapshot), self.fs.method, float(config.SMOOTHING_SIGMA_CELLS)))
             return old_voids(self)
         pipeline.SnapshotProducts.voids = counting
         try:
@@ -1721,7 +1736,10 @@ def t_void_scripts():
         popdir = pop.FIGURE_ROOT / "SYN"
         files = {q.name for q in popdir.iterdir()} if popdir.is_dir() else set()
         assert code == 0 and {"population_evolution.png", "population_distributions.png", "population_abundance.png", "population_stats.npz"} <= files, (code, files, text[-600:])
-        assert sorted(calls) == [(50, "ps"), (99, "dtfe"), (99, "ps")], calls
+        # at the figures' smoothing: each snapshot once, the other estimator at the panel only; the size function's own
+        # catalogue (plot_void_population --size-smooth, 2026-10-11) is a second smoothing, of the panel snapshot only
+        assert sorted(c[:2] for c in calls if c[2] == 1.5) == [(50, "ps"), (99, "dtfe"), (99, "ps")], calls
+        assert all(c[:2] == (99, "ps") for c in calls if c[2] != 1.5), calls
         st = npz(popdir / "population_stats.npz")
         parts = ("n_cum", "n_cum_err", "dn_dlnr", "dn_dlnr_err")
         assert {"snaps", "redshift", "box_mpc", "abundance_radii_mpc", "abundance_edges_mpc"} <= set(st), sorted(st)
@@ -2100,6 +2118,18 @@ def t_pk_script():
         assert code == 1 and "failed: [98]" in text, (code, text[-200:])
         code, text, names = run(["--snaps", "99", "--ref-snap", "50"])
         assert code == 0 and "reference snapshot 050" in text, text[-300:]
+        # non-default --nbins / --ref-snap are tagged (2026-10-11), the default names untouched: a rerun with other bins
+        # or another reference wrote over the default figure and npz
+        assert "pk_ps_ref50_z0.00.npz" in names and "pk_ps_z0.00.npz" in names, names
+        before = (root / "out" / "pk_ps_z0.00.npz").read_bytes()
+        code, text, names = run(["--snaps", "99", "--nbins", "0", "--ref-snap", "-1"])
+        assert code == 0 and "pk_ps_nb0_noref_z0.00.npz" in names and "pk_ps_nb0_noref_z0.00.png" in names, names
+        code, text, names = run(["--snaps", "99", "--nbins", "12"])
+        assert code == 0 and "pk_ps_nb12_z0.00.npz" in names and (root / "out" / "pk_ps_z0.00.npz").read_bytes() == before, names
+        code, text, names = run(["--snaps", "99", "--nbins", "40", "--ref-snap", "0"])           # the defaults spelled out
+        assert code == 0 and not [q for q in names if q.startswith("pk_ps_") and "_z0.00" in q and q not in (
+            "pk_ps_z0.00.npz", "pk_ps_z0.00.png", "pk_ps_ref50_z0.00.npz", "pk_ps_ref50_z0.00.png", "pk_ps_nb0_noref_z0.00.npz",
+            "pk_ps_nb0_noref_z0.00.png", "pk_ps_nb12_z0.00.npz", "pk_ps_nb12_z0.00.png")], names
         lo, hi = ppk.chi2_interval(np.array([1.0]), np.array([6]))      # M = 6: the truth 0.65-2.19x the measurement
         assert 0.6 < lo[0] < 0.7 and 2.1 < hi[0] < 2.3, (lo, hi)
         # mixed grid sizes: each estimator's own k_Ny and k_Ny/2 lines; the same size: one grey pair
@@ -3780,6 +3810,97 @@ def t_pointeval_name_tags():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def t_void_scripts_convergence():
+    """2026-10-11 (contract K4): analyze.py voids runs plot_void_convergence.py after the fate census, by name, with
+    the '--sim <SIM>' every void script gets (run_scripts' extra); not in the core PLOT_SCRIPTS."""
+    import analyze
+    assert analyze.VOID_SCRIPTS[-2:] == ["plot_void_fate.py", "plot_void_convergence.py"], analyze.VOID_SCRIPTS
+    assert "plot_void_convergence.py" not in analyze.PLOT_SCRIPTS
+    seen = []
+    old = analyze.run_step
+    root = Path(tempfile.mkdtemp(prefix="dtfe_voidreg_"))
+    try:
+        (root / "plot").mkdir()
+        (root / "plot" / "plot_void_convergence.py").write_text("pass\n")
+        analyze.run_step = lambda cmd, label, env=None: seen.append((label, cmd[2:])) or (0, 0.0)
+        skipped = analyze.run_scripts(analyze.VOID_SCRIPTS, root, {}, extra=("--sim", "SYN"))
+        assert seen == [("plot_void_convergence.py", ["--sim", "SYN"])] and "plot_void_fate.py" in skipped, (seen, skipped)
+    finally:
+        analyze.run_step = old
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def t_cache_prune():
+    """analyze.py cache --prune (2026-10-11, contract K5) on a synthetic cache root: a '_v1' namespace and a smoothing
+    no current setting produces (2.16 Mpc on TNG50-3-Dark: s21.4043_f23) are listed with their sizes, the production
+    namespace, a --smooth in cells (s5_f11) and the 2.1625 Mpc one (s21.4291_f23) are kept; inside a kept namespace an
+    old fate link (no link_version = 1) and a dead process's temp file are listed, a current link is not; the dry run
+    deletes nothing, --yes deletes exactly the list, --keep-mpc 2.16 keeps that namespace; a folder that is not a
+    namespace is left alone. The command line refuses --yes without 'cache --prune'."""
+    import io as _io, subprocess, sys as _sys
+    from contextlib import redirect_stdout
+    import config
+    import analyze
+    from dtfelib import lagrangian
+    root = Path(tempfile.mkdtemp(prefix="dtfe_cacheprune_"))
+    keys = ("SMOOTHING_SIGMA_CELLS", "FOOTPRINT_SIZE", "FIELD_RESOLUTION", "VOID_EIGENVALUE_CRITERION",
+            "GRADIENT_THRESHOLD", "SMOOTHING_SIGMA_MPC")
+    old = {k: getattr(config, k) for k in keys}
+    old_env = os.environ.pop("DTFE_SIGMA_MPC", None)
+    try:
+        config.SMOOTHING_SIGMA_CELLS, config.FOOTPRINT_SIZE, config.FIELD_RESOLUTION = 10.0, 11, 512
+        config.VOID_EIGENVALUE_CRITERION, config.GRADIENT_THRESHOLD = "trace", 0.1
+
+        def ns(name, *files):
+            d = root / name
+            d.mkdir()
+            for f in files:
+                np.savez(d / f, x=np.zeros(64))
+            return d
+        prod = ns("r512_s10_f11_trace_g0.1_v2", "TNG50-3-Dark_ps_099_voids.npz", "TNG50-3-Dark_ps_fate_067_099.npz")
+        np.savez(prod / "TNG50-3-Dark_ps_fate_050_067.npz", link_version=lagrangian.LINK_VERSION)
+        dead = subprocess.Popen([_sys.executable, "-c", "pass"])
+        dead.wait()                                   # a pid that is gone
+        (prod / f"TNG50-3-Dark_ps_050_voids.npz.{dead.pid}.tmp.npz").write_bytes(b"cut")
+        (prod / f"TNG50-3-Dark_ps_040_voids.npz.{os.getpid()}.tmp.npz").write_bytes(b"live")    # a live writer's: kept
+        old_v1 = ns("r512_s10_f11_trace_g0.1_v1", "099_voids.npz", "050_voids.npz")
+        s216 = ns("r512_s21.4043_f23_trace_g0.1_v2", "TNG50-3-Dark_ps_099_voids.npz")
+        keep = [prod, ns("r512_s21.4291_f23_trace_g0.1_v2", "TNG50-3-Dark_ps_099_voids.npz"),
+                ns("r512_s5_f11_trace_g0.1_v2", "TNG100-3-Dark_ps_099_voids.npz"), ns("notes")]
+        inv = analyze.cache_inventory(root)
+        listed = sorted(str(e["path"].relative_to(root)) for e in inv if e["prune"])
+        want = sorted(["r512_s10_f11_trace_g0.1_v1", "r512_s21.4043_f23_trace_g0.1_v2",
+                       "r512_s10_f11_trace_g0.1_v2/TNG50-3-Dark_ps_fate_067_099.npz",
+                       f"r512_s10_f11_trace_g0.1_v2/TNG50-3-Dark_ps_050_voids.npz.{dead.pid}.tmp.npz"])
+        assert listed == want, listed
+        why = {e["path"].name: e["reason"] for e in inv}
+        assert "2.1625" in why["r512_s21.4291_f23_trace_g0.1_v2"] and why["r512_s10_f11_trace_g0.1_v2"] == "production smoothing"
+        assert "cells" in why["r512_s5_f11_trace_g0.1_v2"] and "v1" in why["r512_s10_f11_trace_g0.1_v1"], why
+        before = sorted(str(q.relative_to(root)) for q in root.rglob("*"))
+        buf = _io.StringIO()
+        with redirect_stdout(buf):
+            total = analyze.cache_command(prune=True, root=root)
+        text = buf.getvalue()
+        assert sorted(str(q.relative_to(root)) for q in root.rglob("*")) == before, "the dry run deleted something"
+        assert "DRY RUN" in text and "would delete" in text and total == sum(e["bytes"] for e in inv if e["prune"]) > 0, text
+        assert "r512_s21.4291" not in text and "notes" not in text, text
+        # --keep-mpc 2.16: the 2.16 Mpc namespace counts as current
+        assert not any(e["prune"] and e["path"] == s216 for e in analyze.cache_inventory(root, keep_mpc=(2.16,)))
+        with redirect_stdout(_io.StringIO()):
+            analyze.cache_command(prune=True, yes=True, root=root)
+        assert not old_v1.exists() and not s216.exists() and all(d.is_dir() for d in keep)
+        assert sorted(q.name for q in prod.iterdir()) == sorted(["TNG50-3-Dark_ps_099_voids.npz", "TNG50-3-Dark_ps_fate_050_067.npz",
+                                                                 f"TNG50-3-Dark_ps_040_voids.npz.{os.getpid()}.tmp.npz"])
+        r = subprocess.run([_sys.executable, str(Path(analyze.__file__)), "cache", "--yes"], capture_output=True, text=True)
+        assert r.returncode == 2 and "--yes goes with" in r.stderr, (r.returncode, r.stderr[-300:])
+    finally:
+        for k, v in old.items():
+            setattr(config, k, v)
+        if old_env is not None:
+            os.environ["DTFE_SIGMA_MPC"] = old_env
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main():
     print("=" * 60)
     print(" dtfelib merger-tree / void-tracking tests")
@@ -3798,12 +3919,14 @@ def main():
     check("void cache frame: a header not config's refused before the cache is touched; frame-only, cuts-only and July caches re-derived without the field; 'deep' follows its threshold (synthetic)", t_void_cache_frame)
     check("analyze.py export: each exit clause alone, the summary, --format, a void-less catalogue, the default folder (synthetic)", t_export_driver)
     check("void profiles: exact step + outflow, periodic wrap, bulk cancels, the catalogue rows, the hidden bit, the cell-centre convention, the 16/84 band, min_count, linear v_r at z = 0 and 1 (synthetic)", t_void_profiles)
-    check("plot_void_profiles.py + plot_void_population.py end to end: npz keys + the --prefix tag, an unreadable snapshot counted failed and the next still done, abundance from each estimator's own catalogue, the one R_eff, 'deep' at the live threshold, --other-estimator at the panel only, the population's _overlaps / _dtfe names, a 1.3x header REFUSED before its cache (synthetic)", t_void_scripts)
+    check("plot_void_profiles.py + plot_void_population.py end to end: npz keys + the --prefix tag, an unreadable snapshot counted failed and the next still done, abundance from each estimator's own catalogue, the one R_eff, 'deep' at the live threshold, --other-estimator at the panel only, the population's _overlaps / _dtfe names, the profiles' _edges tag (2026-10-11), a 1.3x header REFUSED before its cache (synthetic)", t_void_scripts)
     check("plot_void_population.py: an unreadable snapshot file is left out and the rest analysed (synthetic)", t_void_population_unreadable)
     check("plot_void_tracking.py: catalog_at lets a frame refusal through, main() exits REFUSED, the set's name tag, only this set's stale void<K> files removed (synthetic)", t_void_tracking_script)
     check("plot_void_crossbox.py worker + --replot figure, tools/void_outlines.py, pipeline.adopt_snapshot_grid (synthetic)", t_void_crossbox_outlines)
     check("power spectrum: a known spectrum recovered for an even and an odd N, Parseval, mode count; linear P(k): sigma_8, D(z), f, k_eq, T(k) pinned (synthetic)", t_power_spectrum)
-    check("plot_pk_compare.py end to end: names by estimator/prefix, no mirror under --out, a lone estimator's note, the Nyquist pairs (synthetic)", t_pk_script)
+    check("plot_pk_compare.py end to end: names by estimator/prefix, the _nb<N> / _ref<S> / _noref tags of non-default options (2026-10-11), no mirror under --out, a lone estimator's note, the Nyquist pairs (synthetic)", t_pk_script)
+    check("2026-10-11: analyze.py voids registers plot_void_convergence.py (K4) after the fate census, run with --sim (synthetic)", t_void_scripts_convergence)
+    check("2026-10-11: analyze.py cache --prune lists the '_v1' and unreachable-smoothing namespaces, old fate links and dead temp files (dry run by default), --yes deletes exactly those, --keep-mpc (synthetic)", t_cache_prune)
     check("caustic skeleton: classes, periodic merge across a face/edge/corner, 6/18/26-connectivity, components, cusp vs swallowtail bits and 'not computed', the parity-only refusal, json_safe, per-void shells + the wall distance (synthetic)", t_caustic_skeleton)
     check("plot_caustic_skeleton.py end to end: files per redshift, strict JSON, '--' cusp rows, --connectivity, no mirror under --out, no grid / parity-only / failed --voids exit 1, void_block with no or censored voids, the option name tags, the stale _voids.npz removed, the 'distinct' title (synthetic)", t_caustic_skeleton_script)
     check("plot_web_streams.py end to end: files per redshift, a truncated web, an unreadable snapshot file mid-series, the exit rule, the _snaps / _<prefix> / _raw name tags (synthetic)", t_webstreams_script)

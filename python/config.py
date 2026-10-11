@@ -125,6 +125,12 @@ ELLIPSOID_CUT_RULES = {
     'max_axis_box_frac': 0.5,
     'max_axis_ratio': 10.0,
 }
+# The void sample gate (2026-10-11), DTFE_VOID_GATE: 'ellipsoid' (default) = well_resolved is the gate above;
+# 'none' = its max-axis clause dropped, so the R_v samples are defined on R_v and depth, not on the curvature length
+# (dtfelib.pipeline.gate_view; applied to the catalogue a process reads, never to the cache; outputs tagged 'gatenone').
+VOID_GATE = (os.environ.get('DTFE_VOID_GATE') or 'ellipsoid').strip().lower()
+if VOID_GATE not in ('ellipsoid', 'none'):
+    raise ValueError(f"DTFE_VOID_GATE must be 'ellipsoid' or 'none', got {os.environ.get('DTFE_VOID_GATE')!r}")
 
 CORRELATION_MAX_SEP = None
 CORRELATION_N_BINS = 50
@@ -219,7 +225,10 @@ def figures_path(analysis_key):
 # Note: TNG50-3-Dark's on-disk DTFE outputs predate the 2026-06-17 unit overhaul and are
 # stale for absolute units (mean-relative quantities remain usable).
 
-CACHE_DIR = _REPO_ROOT / 'cache'
+# DTFE_CACHE_DIR (2026-10-11) moves the derived-product caches (python/cache: the void catalogues, slices, limits)
+# elsewhere, e.g. off iCloud Drive, which syncs every catalogue; unset, the default and every existing cache stay.
+CACHE_DIR = Path(os.path.expanduser(os.environ['DTFE_CACHE_DIR'])) if os.environ.get('DTFE_CACHE_DIR') \
+    else _REPO_ROOT / 'cache'
 
 
 PERCENTILE_CLIP = (0.5, 99.5)

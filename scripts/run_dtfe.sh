@@ -15,6 +15,10 @@
 #          when at least one snapshot is planned).
 #   Run logs, beside the outputs: output.runlog belongs to the grids on disk, output.runlog.failed to the
 #   last failed or stopped attempt, output.runlog.partial to a run still going (or killed outright).
+#   While a snapshot runs, <prefix>.runlog.lock (a folder holding the driver's pid) refuses a second driver on
+#   it; a lock left by a killed driver is removed with a note. Before anything runs: the data disk must be
+#   there (exit 2 otherwise) and the output folder writable with room for the grids (DTFE_SPACE_CHECK=0 skips
+#   the space half).
 #
 set -uo pipefail
 
@@ -98,6 +102,7 @@ for _k in "${!SNAPSHOTS[@]}"; do
 done
 
 [ -z "${DATA_DIR}" ] && DATA_DIR="$(sim_dir "${SIMULATION}")"
+data_root_problem "${DATA_DIR}" || exit 2     # preflight (2026-10-11): the data disk unmounted, said up front
 
 cd "$REPO_ROOT" || exit 1
 
@@ -139,6 +144,7 @@ fi
 # a failed run with the new settings). A '.runlog.partial' left behind is a run killed outright (SIGKILL),
 # or one still going.
 live_log=""; live_rc=""            # the .partial being written, and its binary's exit status once known
+live_lock=""                       # this driver's 'output.runlog.lock' (config.sh run_lock_take), while held
 finish_runlog() {                  # <the .partial> <the binary's exit status>
     local part="$1" final="${1%.partial}"
     [ -f "${part}" ] || return 0
@@ -162,9 +168,11 @@ on_stop() {                        # <signal name>
         finish_runlog "${live_log}" "${live_rc:-1}"
         [ "${live_rc:-1}" = "0" ] || echo "  Stopped: snapshot ${n_str} did not finish; its log is ${live_log%.partial}.failed"
     fi
+    run_lock_release "${live_lock}"
     kill -s "$1" $$
 }
 trap 'on_stop INT' INT; trap 'on_stop TERM' TERM; trap 'on_stop HUP' HUP
+trap 'run_lock_release "${live_lock}"' EXIT   # any other way out (an error, set -u) frees the lock too
 
 echo "Starting DTFE processing..."
 echo "Data directory: ${DATA_DIR}"
@@ -241,6 +249,17 @@ for i in "${SNAPSHOTS[@]}"; do
         echo ""
         continue
     fi
+    # room for the grids, then the snapshot's single-instance lock (2026-10-11, config.sh; as run_ps_dtfe.sh)
+    bpv=4; [ "${DTFE_PRECISION}" = "double" ] && bpv=8
+    if ! output_space_problem "${input_dir}" "$(expected_output_bytes "${GRID_SIZE%% *}" "${bpv}" ${FIELDS})"; then
+        echo "  Error processing snapshot ${n_str}: no room for its grids (nothing was run)"
+        n_failed=$((n_failed + 1)); echo ""; continue
+    fi
+    if ! run_lock_take "${run_log}.lock"; then
+        echo "  Error processing snapshot ${n_str}: refused, another run holds it (nothing was run)"
+        n_failed=$((n_failed + 1)); echo ""; continue
+    fi
+    live_lock="${run_log}.lock"
     # the binary's output goes to 'output.runlog.partial' until it exits (the run-log contract above)
     live_log="${run_log}.partial"; live_rc=""
     ${TIME_WRAP[@]+"${TIME_WRAP[@]}"} "${cmd[@]}" 2>&1 | tee "${live_log}"
@@ -251,6 +270,7 @@ for i in "${SNAPSHOTS[@]}"; do
     # peak memory below is read from whichever it became
     finish_runlog "${live_log}" "${rc}"
     live_log=""
+    run_lock_release "${live_lock}"; live_lock=""
     [ "${rc}" -eq 0 ] || run_log="${run_log}.failed"
     # peak memory in whichever dialect TIME_WRAP produced (absent without one); macOS also reports the
     # peak FOOTPRINT, what the run really needed including compressed or swapped pages
@@ -274,6 +294,9 @@ for i in "${SNAPSHOTS[@]}"; do
         n_ok=$((n_ok + 1))
     else
         echo "  Error processing snapshot ${n_str} (its log: ${run_log})"
+        # exit 3: the run finished but its output folder could not be written, so the binary put the grids in its
+        # rescue folder; the log's OUTPUT RESCUE line names it and the mv that puts them in place (2026-10-11)
+        [ "${rc}" -eq 3 ] && echo "  The grids were computed and saved to the rescue folder: see the OUTPUT RESCUE line in ${run_log}"
         n_failed=$((n_failed + 1))
     fi
     echo ""

@@ -24,6 +24,7 @@
 /* Top-level DTFE driver: builds the Delaunay triangulation, estimates per-vertex
    densities, and dispatches field interpolation (standard, Voronoi, or PS-DTFE). */
 
+#include <memory>   // the look-ahead tessellation handle
 #include "triangulation_common.h"
 #include <atomic>
 #include <thread>
@@ -168,6 +169,9 @@ void DTFE_interpolation(vector<Particle_data> *p,
 
 
     Timer t;
+#ifdef PHASE_SPACE
+    if ( not userOptions.psTessellationPrebuilt )   // the partition look-ahead built it already (below)
+#endif
     buildTessellation( p, userOptions, dt );
 #ifdef PHASE_SPACE
     // a partition of a batch run with '--tessellation-cache': leave its occupancy map beside the
@@ -368,6 +372,32 @@ void DTFE_interpolation(vector<Particle_data> *p,
 }
 
 
+
+
+#ifdef PHASE_SPACE
+// The partition look-ahead (DTFE.cpp, 2026-10-11): partition k+1's tessellation and vertex densities are built
+// here on a CPU thread while partition k deposits, and handed back as an opaque handle (DTFE.cpp does not see
+// CGAL). buildTessellation is the very call DTFE_interpolation makes, so the tessellation is the same.
+std::shared_ptr<void> psPrebuildTessellation(vector<Particle_data> *p, User_options &userOptions)
+{
+    std::shared_ptr<DT> dt = std::make_shared<DT>();
+    buildTessellation( p, userOptions, *dt );
+    return dt;
+}
+
+// ... and its grid passes, exactly as the owning DTFE_interpolation overload runs them; frees the tessellation
+void psInterpolatePrebuilt(std::shared_ptr<void> &tessellation, vector<Sample_point> &samples,
+                           User_options &userOptions, Quantities *uQuantities, Quantities *aQuantities)
+{
+    DT &dt = *static_cast<DT*>( tessellation.get() );
+    vector<Particle_data> none;
+    userOptions.psMayClearDT = true;            // owned here, like the convenience overload's
+    userOptions.psTessellationPrebuilt = true;
+    DTFE_interpolation( &none, samples, userOptions, uQuantities, aQuantities, dt );
+    userOptions.psTessellationPrebuilt = false;
+    tessellation.reset();
+}
+#endif
 
 
 // How many tessellations a partition loop builds at once (its concurrency) and how many it has

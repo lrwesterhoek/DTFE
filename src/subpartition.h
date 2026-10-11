@@ -140,8 +140,16 @@ void findParticlesInBox(std::vector<Particle_data> &p,
     
     MESSAGE::Message message( userOptions.verboseLevel );
     message << "Finding the particles that reside in the padded box " << box.print() << " ... " << MESSAGE::Flush;
-    size_t const reserveSize = size_t( p.size() * box.volume()/fullBox.volume() * 1.3 ); // reserve 120% of the average number of particles in the given volume
-    output->reserve( reserveSize );
+    // reserve ~130% of the average number of particles in the given volume -- a hint only, so CAPPED at
+    // p.size(): DTFE_parallel's threads call this after updateFullBox(region), so 'fullBox' is the user
+    // region there, not the data box, and a thin --regionMpc (1 x 1 x 0.002 Mpc, the exact-zoom shape)
+    // made the padded/region volume ratio ~5e6 = a multi-TB reserve. macOS overcommits it (untouched
+    // pages), Linux refuses it with std::bad_alloc (2026-10-11). '!(est < cap)' also catches a NaN/inf
+    // from a zero-volume region, and the double is clamped BEFORE the size_t conversion (UB if too big).
+    double estimate = double( p.size() ) * double( box.volume() ) / double( fullBox.volume() ) * 1.3;
+    if ( not (estimate < double(p.size())) ) estimate = double( p.size() );
+    if ( not (estimate > 0.) ) estimate = 0.;
+    output->reserve( size_t(estimate) );
     
     if ( not userOptions.periodic )
     {

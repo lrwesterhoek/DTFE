@@ -12,6 +12,16 @@
 #          (exit 0 when at least one snapshot is planned).
 #   Run logs, beside the outputs: <prefix>.runlog belongs to the grids on disk, <prefix>.runlog.failed
 #   to the last failed or stopped attempt, <prefix>.runlog.partial to a run still going (or killed outright).
+#   Knobs (environment; each is explained where the script sets it): PARTITION MAX_CONCURRENT AVG_SUBSAMPLES THREADS
+#   SCRATCH_DIR SAMPLE_POINTS PTS_VEL_GRAD PS_METAL PS_EXACT PS_VERTEX_MASS PS_VOLUME_WEIGHTED PS_LINEAR_DEPOSIT
+#   PS_CAUSTICS PS_CAUSTIC_CUSPS PS_PARALLEL_TRI TESS_CACHE OUTPUT_PREFIX FIELDS LAMBDA_TH LAGRANGIAN_INPUT
+#   DTFE_PRECISION AUTO_TUNE_REPORT (1 = only the auto-tuner's memory report per snapshot, nothing computed)
+#   ORDERED_MERGE PS_RESUME. A partitioned run killed part-way resumes: when the snapshot's checkpoint
+#   (<prefix>.runlog.checkpoint, or in SCRATCH_DIR) exists, the next run passes --resume (PS_RESUME=0 starts over).
+#   While a snapshot runs, <prefix>.runlog.lock (a folder holding the driver's pid) refuses a second driver on
+#   it; a lock left by a killed driver is removed with a note. Before anything runs: the data disk must be
+#   there (exit 2 otherwise) and the output folder writable with room for the grids (DTFE_SPACE_CHECK=0 skips
+#   the space half).
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"   # the binaries and Makefile live one level up
@@ -48,6 +58,15 @@ PTS_VEL_GRAD="${PTS_VEL_GRAD:-0}"   # 1 = with SAMPLE_POINTS, also write '.pts_v
                            # divergence / shear / vorticity maps from it, so this is what makes
                            # the velocity-derivative fields available to the hi-res figures.
 PS_METAL="${PS_METAL:-0}"  # 1 = run the deposit on the Apple GPU (--ps-gpu; needs 'make PS-DTFE METAL=1')
+ORDERED_MERGE="${ORDERED_MERGE:-0}"  # 1 = --ordered-merge: the partitions' grids are added in partition index order,
+                           # so two identical runs write bit-identical grids (and a killed run resumes to exactly
+                           # the grids of an uninterrupted one). Costs time when partitions differ much in cost and
+                           # MAX_CONCURRENT is above 1 (35% on a TNG region's GPU run). (2026-10-11)
+PS_RESUME="${PS_RESUME:-1}"  # 1 (default) = resume a killed partitioned run: when the snapshot's checkpoint file
+                           # exists (<prefix>.runlog.checkpoint/checkpoint beside the outputs, or under SCRATCH_DIR; config.sh
+                           # ps_checkpoint_dir), --resume is passed and only the partitions it lacks are computed.
+                           # The binary refuses, naming the differing settings, when the settings changed; then
+                           # PS_RESUME=0 starts over (the new run replaces the checkpoint). (2026-10-11)
 AUTO_TUNE_REPORT="${AUTO_TUNE_REPORT:-0}"  # 1 = only ASK the binary's auto-tuner what this run would need
                            # (--auto-tune-report): per snapshot one line
                            #   AUTO-TUNE-REPORT snap=NNN partition=.. mc=.. predicted_gb=.. budget_gb=.. over_budget=0|1 ...
@@ -143,6 +162,9 @@ for _k in "${!SNAPSHOTS[@]}"; do
 done
 
 [ -z "${DATA_DIR}" ] && DATA_DIR="$(sim_dir "${SIMULATION}")"
+# preflight (2026-10-11): with the data disk unmounted every snapshot used to print 'Input file not found'
+# under a path that was never there, and only the last line said 'check DATA_ROOT'
+data_root_problem "${DATA_DIR}" || exit 2
 
 # Lagrangian positions, matched to present-day Coordinates by ParticleID. Must be in the
 # SAME units as the snapshots (combined_*.hdf5 are h-removed ckpc, so the IC was rescaled
@@ -246,6 +268,7 @@ fi
 # and their own settings, build stamp, wall time and peak memory were gone. A '.runlog.partial' left
 # behind is a run killed outright (SIGKILL), or one still going.
 live_log=""; live_rc=""            # the .partial being written, and its binary's exit status once known
+live_lock=""                       # this driver's '<prefix>.runlog.lock' (config.sh run_lock_take), while held
 finish_runlog() {                  # <the .partial> <the binary's exit status>
     local part="$1" final="${1%.partial}"
     [ -f "${part}" ] || return 0
@@ -273,9 +296,11 @@ on_stop() {                        # <signal name>
         finish_runlog "${live_log}" "${live_rc:-1}"
         [ "${live_rc:-1}" = "0" ] || echo "  Stopped: snapshot ${n_str} did not finish; its log is ${live_log%.partial}.failed"
     fi
+    run_lock_release "${live_lock}"
     kill -s "$1" $$
 }
 trap 'on_stop INT' INT; trap 'on_stop TERM' TERM; trap 'on_stop HUP' HUP
+trap 'run_lock_release "${live_lock}"' EXIT   # any other way out (an error, set -u) frees the lock too
 
 echo "Starting PS-DTFE processing..."
 echo "Data directory: ${DATA_DIR}"
@@ -383,6 +408,20 @@ for i in "${SNAPSHOTS[@]}"; do
     [ -n "${PARTITION}" ] && part_args+=(--partition ${PARTITION})
     [ -n "${MAX_CONCURRENT}" ] && part_args+=(--max-concurrent "${MAX_CONCURRENT}")
     [ -n "${SCRATCH_DIR}" ] && part_args+=(--scratch-dir "${SCRATCH_DIR}")
+    [ "${ORDERED_MERGE}" = "1" ] && part_args+=(--ordered-merge)
+    # a killed partitioned run left its checkpoint (the binary removes it once the outputs are in place): resume it.
+    # The FILE, not the folder (2026-10-11): a folder with no 'checkpoint' in it (a kill during the first write) holds
+    # nothing to resume, the binary refuses '--resume' there, and every rerun of the snapshot failed the same way
+    resume_args=()
+    ckpt_dir="$(ps_checkpoint_dir "${output_root}" "${SCRATCH_DIR}")"
+    if [ "${AUTO_TUNE_REPORT}" != "1" ] && [ -f "${ckpt_dir}/checkpoint" ]; then
+        if [ "${PS_RESUME}" = "0" ]; then
+            echo "  Note: a killed run's checkpoint is in ${ckpt_dir}; PS_RESUME=0, so this run starts over and replaces it."
+        else
+            echo "  Resuming: a killed run's checkpoint is in ${ckpt_dir}; passing --resume, only the missing partitions are computed (PS_RESUME=0 starts over)."
+            resume_args=(--resume)
+        fi
+    fi
 
     cmd=("${PS_BIN}" "${input_file}" "${output_root}"
         --grid ${GRID_SIZE}
@@ -403,6 +442,7 @@ for i in "${SNAPSHOTS[@]}"; do
         ${caustic_args[@]+"${caustic_args[@]}"}
         ${tess_args[@]+"${tess_args[@]}"}
         ${report_args[@]+"${report_args[@]}"}
+        ${resume_args[@]+"${resume_args[@]}"}
         "${lag_args[@]}")
     if [ "${DRY_RUN}" = "1" ]; then                 # DRY_RUN=1: the expanded command and the paths, nothing run
         echo "  DRY RUN -- would run:"
@@ -412,6 +452,20 @@ for i in "${SNAPSHOTS[@]}"; do
         n_planned=$((n_planned + 1))
         echo ""
         continue
+    fi
+    # Real runs only (2026-10-11): room for the grids, then the snapshot's single-instance lock (config.sh).
+    # A report writes nothing, so it takes neither: the launcher's memory check runs one beside a live run.
+    if [ "${AUTO_TUNE_REPORT}" != "1" ]; then
+        bpv=4; [ "${DTFE_PRECISION}" = "double" ] && bpv=8
+        if ! output_space_problem "${input_dir}" "$(expected_output_bytes "${GRID_SIZE%% *}" "${bpv}" ${FIELDS})"; then
+            echo "  Error processing snapshot ${n_str}: no room for its grids (nothing was run)"
+            n_failed=$((n_failed+1)); echo ""; continue
+        fi
+        if ! run_lock_take "${run_log}.lock"; then
+            echo "  Error processing snapshot ${n_str}: refused, another run holds it (nothing was run)"
+            n_failed=$((n_failed+1)); echo ""; continue
+        fi
+        live_lock="${run_log}.lock"
     fi
     # the binary's output goes to '<run_log>.partial' until it exits (the run-log contract above);
     # a report's temp file takes it directly
@@ -441,6 +495,7 @@ for i in "${SNAPSHOTS[@]}"; do
     # (the contract above); the peak memory below is read from whichever it became
     finish_runlog "${live_log}" "${rc}"
     live_log=""
+    run_lock_release "${live_lock}"; live_lock=""
     [ "${rc}" -eq 0 ] || run_log="${run_log}.failed"
 
     # Peak RSS, in whichever dialect TIME_WRAP produced (absent when neither exists -- then the
@@ -477,6 +532,9 @@ for i in "${SNAPSHOTS[@]}"; do
         n_ok=$((n_ok+1))
     else
         echo "  Error processing snapshot ${n_str} (its log: ${run_log})"
+        # exit 3: the run finished but its output folder could not be written, so the binary put the grids in its
+        # rescue folder; the log's OUTPUT RESCUE line names it and the mv that puts them in place (2026-10-11)
+        [ "${rc}" -eq 3 ] && echo "  The grids were computed and saved to the rescue folder: see the OUTPUT RESCUE line in ${run_log}"
         n_failed=$((n_failed+1))
     fi
     echo ""

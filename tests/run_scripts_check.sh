@@ -34,6 +34,13 @@
 #     <prefix>.runlog.partial while it goes, <prefix>.runlog after exit 0, <prefix>.runlog.failed after a
 #     failure or a stop; a failed, stopped or killed re-run never touches the .runlog of the grids on disk.
 #  N) the Makefile stamps BUILD_MODE, ARCH_FLAGS and EXTRA_FLAGS in the object dirs (a dry run, builds nothing).
+#  O) the drivers' single-instance lock (<prefix>.runlog.lock: a second driver refused, stale locks removed, a stop
+#     releases it) and their preflight (data disk mounted, output folder writable with room for the grids).
+#  P) run_ps_pipeline.sh's freshness test compares the run settings with the snapshot's run log, not only file times.
+#  Q) scripts/thesis_runs.sh (the thesis run recipe): DRY_RUN=1 prints the exact settings of each stage, runs nothing.
+#  R) run_ps_dtfe.sh ORDERED_MERGE=1 passes --ordered-merge; a killed run's checkpoint (<prefix>.runlog.checkpoint, or
+#     config.sh ps_checkpoint_dir's name under SCRATCH_DIR) makes the next run pass --resume and say so; PS_RESUME=0,
+#     an auto-tune report and a checkpoint folder with no 'checkpoint' file in it do not.
 #
 # Usage: tests/run_scripts_check.sh [--no-build]
 
@@ -266,7 +273,9 @@ if [ -f "${FAMROOT}/FAM/FAM-1-Dark/hires_plane_z8.json" ]; then
     # every snapshot up to date is a success, not 'nothing to compute' (2026-10-08)
     touch -t 203001010000 "${FAMROOT}/FAM/FAM-1-Dark/snapdir_099/ps_output.pts_den" \
                           "${FAMROOT}/FAM/FAM-1-Dark/snapdir_099/ps_output.pts_velGrad"
-    rc6=0; DRY_RUN=1 NU=8 DTFE_DATA_ROOT="${FAMROOT}" scripts/run_ps_pipeline.sh >"${TMP}/g_pipeline6.log" 2>&1 || rc6=$?
+    # the settings of the (A)-style run that made these grids: since 2026-10-11 the pipeline compares them too (P)
+    rc6=0; DRY_RUN=1 NU=8 GRID_SIZE=24 FIELDS=density_a AVG_SUBSAMPLES=1 PS_VOLUME_WEIGHTED=0 PTS_VEL_GRAD=0 \
+        DTFE_DATA_ROOT="${FAMROOT}" scripts/run_ps_pipeline.sh >"${TMP}/g_pipeline6.log" 2>&1 || rc6=$?
     check "$([ "${rc6}" = "0" ] && echo 0 || echo 1)" "every snapshot up to date still exits 0 (${rc6})"
     check "$(has "${TMP}/g_pipeline6.log" 'FAM-1-Dark: all snapshots up to date')" "... with nothing to recompute"
     rm -f "${FAMROOT}/FAM/FAM-1-Dark/snapdir_099/ps_output.pts_den" "${FAMROOT}/FAM/FAM-1-Dark/snapdir_099/ps_output.pts_velGrad"
@@ -744,6 +753,207 @@ check "$(cmp -s "${MDATA}/SIM/snapdir_099/ps_output.runlog" "${TMP}/m_before_rep
          && [ ! -e "${MDATA}/SIM/snapdir_099/ps_output.runlog.partial" ] \
          && [ ! -e "${MDATA}/SIM/snapdir_099/ps_output.runlog.failed" ] && echo 0 || echo 1)" \
       "... and leaves the snapshot's run logs alone"
+
+echo ""
+echo "(O) the single-instance lock and the preflight of run_dtfe.sh / run_ps_dtfe.sh (2026-10-11)."
+# Contract C1: '<prefix>.runlog.lock' is a directory holding the driver's pid while it runs that snapshot. A
+# second driver on the same snapshot is refused (two TNG runs together got both SIGKILLed for memory,
+# 2026-10-03); a lock whose driver is gone is stale and removed with a message; a stop releases it.
+for pair in "run_dtfe.sh output" "run_ps_dtfe.sh ps_output"; do
+    scr="${pair% *}"; pfx="${pair#* }"
+    L="${MDATA}/SIM/snapdir_099/${pfx}.runlog"; K="${L}.lock"
+    rm -rf "${K}"
+    mhang "${scr}" "${TMP}/o_${pfx}_hold.log" sixth
+    check "$([ -d "${K}" ] && [ "$(cat "${K}/pid" 2>/dev/null)" = "${mpid}" ] && echo 0 || echo 1)" \
+          "${scr}: while it runs, ${pfx}.runlog.lock holds the driver's pid (${mpid})"
+    cp "${L}" "${TMP}/o_${pfx}_before.runlog"
+    rc=$(mdrive "${scr}" "${TMP}/o_${pfx}_second.log" FAKE_MODE=ok FAKE_TAG=intruder)
+    check "$([ "${rc}" = "1" ] && echo 0 || echo 1)" "... a second driver on the same snapshot is refused: exit 1 (${rc})"
+    check "$(has "${TMP}/o_${pfx}_second.log" "another driver \(pid ${mpid}\) is running this snapshot")" "... naming the pid that holds it"
+    check "$(lacks "${TMP}/o_${pfx}_second.log" '^RUNNING:')" "... and its binary never started"
+    check "$([ -f "${L}.partial" ] && ! grep -aq 'intruder' "${L}.partial" && cmp -s "${L}" "${TMP}/o_${pfx}_before.runlog" \
+             && [ "$(cat "${K}/pid" 2>/dev/null)" = "${mpid}" ] && echo 0 || echo 1)" \
+          "... the running attempt's .partial, the grids' .runlog and the lock are untouched"
+    kill -TERM "${mpid}" 2>/dev/null || true
+    sleep 0.3
+    kill -TERM "$(cat "${MPID}" 2>/dev/null)" 2>/dev/null || true
+    rc=0; wait "${mpid}" 2>/dev/null || rc=$?
+    check "$([ "${rc}" = "143" ] && [ ! -e "${K}" ] && echo 0 || echo 1)" "... a stop still exits 143 and releases the lock (${rc})"
+    # 2026-10-11: the driver alone SIGKILLed: its binary and tee keep running on the snapshot, so its lock is not
+    # stale (removing it started a second binary beside the orphan, the 2026-10-03 double launch)
+    mhang "${scr}" "${TMP}/o_${pfx}_orphan.log" orphan
+    kill -KILL "${mpid}" 2>/dev/null || true
+    wait "${mpid}" 2>/dev/null || true
+    rc=$(mdrive "${scr}" "${TMP}/o_${pfx}_beside.log" FAKE_MODE=ok FAKE_TAG=beside)
+    check "$([ "${rc}" = "1" ] && [ -d "${K}" ] && grep -aq 'is gone, but a process still' "${TMP}/o_${pfx}_beside.log" \
+             && ! grep -aq '^RUNNING:' "${TMP}/o_${pfx}_beside.log" && echo 0 || echo 1)" \
+          "... a driver SIGKILLed while its run goes on: the next one is refused, names the process, keeps the lock (${rc})"
+    kill -TERM "$(cat "${MPID}" 2>/dev/null)" 2>/dev/null || true
+    unlocked_root_wait() {  # until no process names '<prefix>.runlog.partial' (tee ends once the binary has)
+        local a
+        for _ in $(seq 50); do a="$(ps -A -ww -o args= 2>/dev/null)"; case "${a}" in *"${L}.partial"*) sleep 0.1 ;; *) return 0 ;; esac; done
+    }
+    unlocked_root_wait; rm -rf "${K}"
+    # killed outright: the lock stays behind with a dead pid; the next run removes it and goes ahead
+    mhang "${scr}" "${TMP}/o_${pfx}_kill.log" seventh
+    kill -KILL "${mpid}" 2>/dev/null || true
+    kill -TERM "$(cat "${MPID}" 2>/dev/null)" 2>/dev/null || true
+    wait "${mpid}" 2>/dev/null || true
+    unlocked_root_wait
+    check "$([ -d "${K}" ] && echo 0 || echo 1)" "... a SIGKILLed driver leaves its lock"
+    rc=$(mdrive "${scr}" "${TMP}/o_${pfx}_after.log" FAKE_MODE=ok FAKE_TAG=eighth)
+    check "$([ "${rc}" = "0" ] && [ ! -e "${K}" ] && grep -aq 'fake attempt eighth' "${L}" && echo 0 || echo 1)" \
+          "... the next run removes the stale lock, succeeds and leaves no lock (${rc})"
+    check "$(has "${TMP}/o_${pfx}_after.log" 'removing a stale lock \(pid [0-9]+ is no longer running\)')" "... and says so"
+    # a reused pid: alive, but not a driver -- stale as well
+    sleep 30 & other=$!
+    mkdir -p "${K}"; echo "${other}" > "${K}/pid"
+    rc=$(mdrive "${scr}" "${TMP}/o_${pfx}_reused.log" FAKE_MODE=ok)
+    kill "${other}" 2>/dev/null || true; wait "${other}" 2>/dev/null || true
+    check "$([ "${rc}" = "0" ] && [ ! -e "${K}" ] && echo 0 || echo 1)" "... a lock whose pid now belongs to another program is stale too (${rc})"
+    # preflight: the grids must fit on the output volume (a 20000^3 grid needs ~1e14 bytes); DTFE_SPACE_CHECK=0 skips
+    rc=0; env DTFE_DATA_ROOT="${MDATA}" FAKE_MODE=ok "${MREPO}/scripts/${scr}" -s SIM -g 20000 99 >"${TMP}/o_${pfx}_space.log" 2>&1 || rc=$?
+    check "$([ "${rc}" = "1" ] && echo 0 || echo 1)" "... grids larger than the free space: refused, exit 1 (${rc})"
+    check "$(has "${TMP}/o_${pfx}_space.log" "GB free; this run's grids need about")" "... saying how much is free and needed"
+    check "$(lacks "${TMP}/o_${pfx}_space.log" '^RUNNING:')" "... before the binary started"
+    rc=0; env DTFE_DATA_ROOT="${MDATA}" FAKE_MODE=ok DTFE_SPACE_CHECK=0 "${MREPO}/scripts/${scr}" -s SIM -g 20000 99 >"${TMP}/o_${pfx}_nospace.log" 2>&1 || rc=$?
+    check "$([ "${rc}" = "0" ] && echo 0 || echo 1)" "... DTFE_SPACE_CHECK=0 skips the space check (${rc})"
+    # the data disk unplugged: one clear message up front, exit 2 (it used to skip every snapshot under a wrong path)
+    rc=0; env DTFE_DATA_ROOT="${TMP}/no such disk/Illustris TNG" "${MREPO}/scripts/${scr}" -s SIM 99 >"${TMP}/o_${pfx}_root.log" 2>&1 || rc=$?
+    check "$([ "${rc}" = "2" ] && echo 0 || echo 1)" "... a data root that does not exist: exit 2 (${rc})"
+    check "$(has "${TMP}/o_${pfx}_root.log" 'does not exist: is the data disk mounted')" "... asking whether the disk is mounted"
+    check "$(lacks "${TMP}/o_${pfx}_root.log" 'Processing snapshot')" "... before any snapshot"
+    # an output folder that is not writable (root writes anywhere: skipped under root, as in the Docker image)
+    if [ "$(id -u)" != "0" ]; then
+        chmod a-w "${MDATA}/SIM/snapdir_099"
+        rc=$(mdrive "${scr}" "${TMP}/o_${pfx}_ro.log" FAKE_MODE=ok)
+        chmod u+w "${MDATA}/SIM/snapdir_099"
+        check "$([ "${rc}" = "1" ] && echo 0 || echo 1)" "... an output folder that is not writable: refused, exit 1 (${rc})"
+        check "$(has "${TMP}/o_${pfx}_ro.log" 'is not writable')" "... saying so"
+    fi
+done
+# a report and a dry run take no lock: the launcher's memory check runs a report beside a live run
+mhang run_ps_dtfe.sh "${TMP}/o_hold_report.log" ninth
+rc=$(mdrive run_ps_dtfe.sh "${TMP}/o_report.log" FAKE_MODE=report AUTO_TUNE_REPORT=1)
+rc2=$(mdrive run_ps_dtfe.sh "${TMP}/o_dry.log" DRY_RUN=1)
+check "$([ "${rc}" = "0" ] && [ "${rc2}" = "0" ] && [ "$(cat "${MDATA}/SIM/snapdir_099/ps_output.runlog.lock/pid" 2>/dev/null)" = "${mpid}" ] && echo 0 || echo 1)" \
+      "an auto-tune report and a dry run go ahead beside a live run, and leave its lock alone (${rc}, ${rc2})"
+kill -TERM "${mpid}" 2>/dev/null || true; sleep 0.3
+kill -TERM "$(cat "${MPID}" 2>/dev/null)" 2>/dev/null || true
+wait "${mpid}" 2>/dev/null || true
+
+echo ""
+echo "(R) run_ps_dtfe.sh: ORDERED_MERGE=1, and --resume when a killed run left its checkpoint (2026-10-11)."
+# Contracts K1/K2: the binary checkpoints a partitioned run in '<output>.runlog.checkpoint' (under --scratch-dir:
+# '<scratch>/<basename>.<hash of the output path>.runlog.checkpoint') and removes it on success, so a folder there
+# means a killed run. Against the stand-in binaries of (M), which print their arguments.
+RSD="${MDATA}/SIM/snapdir_099"; RCK="${RSD}/ps_output.runlog.checkpoint"
+rm -rf "${RCK}" "${RSD}/ps_output.runlog.lock"
+rc=$(mdrive run_ps_dtfe.sh "${TMP}/r_plain.log" FAKE_MODE=ok)
+check "$([ "${rc}" = "0" ] && grep -aq '^RUNNING: ' "${TMP}/r_plain.log" && echo 0 || echo 1)" "a plain run goes (${rc})"
+check "$(lacks "${TMP}/r_plain.log" '^RUNNING: .*--(ordered-merge|resume)')" "... with neither --ordered-merge nor --resume"
+rc=$(mdrive run_ps_dtfe.sh "${TMP}/r_ordered.log" FAKE_MODE=ok ORDERED_MERGE=1)
+check "$(has "${TMP}/r_ordered.log" '^RUNNING: .*--ordered-merge')" "ORDERED_MERGE=1 passes --ordered-merge (${rc})"
+mkdir -p "${RCK}"; : > "${RCK}/checkpoint"
+rc=$(mdrive run_ps_dtfe.sh "${TMP}/r_resume.log" FAKE_MODE=ok)
+check "$([ "${rc}" = "0" ] && grep -aqE -e '^RUNNING: .*--resume' "${TMP}/r_resume.log" && echo 0 || echo 1)" "a checkpoint folder beside the outputs: --resume is passed (${rc})"
+check "$(has "${TMP}/r_resume.log" "Resuming: a killed run's checkpoint is in .*ps_output\.runlog\.checkpoint")" "... and the driver says so, naming the folder"
+rc=$(mdrive run_ps_dtfe.sh "${TMP}/r_noresume.log" FAKE_MODE=ok PS_RESUME=0)
+check "$(lacks "${TMP}/r_noresume.log" '^RUNNING: .*--resume')" "PS_RESUME=0: no --resume (${rc})"
+check "$(has "${TMP}/r_noresume.log" 'PS_RESUME=0, so this run starts over')" "... and the driver says the run starts over"
+rc=$(mdrive run_ps_dtfe.sh "${TMP}/r_report.log" FAKE_MODE=report AUTO_TUNE_REPORT=1)
+check "$(lacks "${TMP}/r_report.log" '(--resume|Resuming)')" "an auto-tune report never resumes (${rc})"
+# a folder with no 'checkpoint' file (a run killed during its first write, or one that never had room) holds
+# nothing to resume: the binary refuses '--resume' there, and the folder made every rerun fail (2026-10-11)
+rm -f "${RCK}/checkpoint"; : > "${RCK}/checkpoint.tmp.99999"
+rc=$(mdrive run_ps_dtfe.sh "${TMP}/r_emptyck.log" FAKE_MODE=ok)
+check "$(lacks "${TMP}/r_emptyck.log" '(^RUNNING: .*--resume|Resuming)')" "a checkpoint folder without a 'checkpoint' file: no --resume (${rc})"
+rm -rf "${RCK}"
+RSCR="${TMP}/r scratch"; mkdir -p "${RSCR}"
+SCK="$(source scripts/config.sh && ps_checkpoint_dir "${RSD}/ps_output" "${RSCR}")"
+check "$([[ "$(basename "${SCK}")" =~ ^ps_output\.[0-9a-f]{16}\.runlog\.checkpoint$ ]] && echo 0 || echo 1)" \
+      "config.sh ps_checkpoint_dir under a scratch dir: <basename>.<16 hex>.runlog.checkpoint ($(basename "${SCK}"))"
+rc=$(mdrive run_ps_dtfe.sh "${TMP}/r_scr0.log" FAKE_MODE=ok SCRATCH_DIR="${RSCR}")
+check "$(lacks "${TMP}/r_scr0.log" '^RUNNING: .*--resume')" "SCRATCH_DIR set, no checkpoint there: no --resume (${rc})"
+mkdir -p "${SCK}"; : > "${SCK}/checkpoint"
+rc=$(mdrive run_ps_dtfe.sh "${TMP}/r_scr1.log" FAKE_MODE=ok SCRATCH_DIR="${RSCR}")
+check "$(has "${TMP}/r_scr1.log" '^RUNNING: .*--resume')" "... the checkpoint in the scratch folder: --resume is passed (${rc})"
+rm -rf "${SCK}"
+
+echo ""
+echo "(P) run_ps_pipeline.sh's 'up to date' compares the run settings, not only the file times (2026-10-11)."
+# A changed grid or field list printed 'up to date, skipping compute' for every snapshot. The pipeline now asks
+# run_ps_dtfe.sh (DRY_RUN=1) for the command it would run and compares its options with the RUNNING: line of the
+# snapshot's <prefix>.runlog. Against the stand-in binaries of (M), on a real snapshot so the plane can be made.
+PDATA="${TMP}/pipe_data"; rm -rf "${PDATA}"; mkdir -p "${PDATA}/SIM/snapdir_099"
+cp "${TMP}/HASIC/snapdir_099/combined_099.hdf5" "${PDATA}/SIM/snapdir_099/"
+: > "${PDATA}/SIM/combined_ics.hdf5"
+cp scripts/run_ps_pipeline.sh "${MREPO}/scripts/"
+ln -sfn "${ROOT_DIR}/python" "${MREPO}/python"
+pdrive() {   # <log> [VAR=value ...]: the copied pipeline on SIM; echoes its exit status
+    local log="$1"; shift
+    local rc=0
+    env DTFE_DATA_ROOT="${PDATA}" SIMS=SIM NU=8 GRID_SIZE=16 FIELDS="density_a velocity_a" PS_GPU=0 FAKE_MODE=ok \
+        "$@" "${MREPO}/scripts/run_ps_pipeline.sh" >"${log}" 2>&1 || rc=$?
+    echo "${rc}"
+}
+SD="${PDATA}/SIM/snapdir_099"
+rc=$(pdrive "${TMP}/p_first.log")
+touch -t 203001010000 "${SD}/ps_output.pts_den" "${SD}/ps_output.pts_velGrad"   # what a real run leaves (newer than its inputs)
+check "$([ "${rc}" = "0" ] && grep -aq '^RUNNING: ./PS-DTFE[^ ]* .*--grid 16 ' "${SD}/ps_output.runlog" && echo 0 || echo 1)" \
+      "a first pipeline run computes the snapshot, its run log carries the command (${rc})"
+rc=$(pdrive "${TMP}/p_same.log")
+check "$([ "${rc}" = "0" ] && echo 0 || echo 1)" "... a rerun with the same settings exits 0 (${rc})"
+check "$(has "${TMP}/p_same.log" 'snap 99: ps_output.pts_den up to date \(same settings\), skipping compute')" "... and skips the snapshot: same settings"
+check "$(lacks "${TMP}/p_same.log" 'run_ps_dtfe.sh -s SIM')" "... running nothing"
+rc=$(pdrive "${TMP}/p_grid.log" GRID_SIZE=24 DRY_RUN=1)
+check "$(has "${TMP}/p_grid.log" 'snap 99: settings differ from its ps_output.runlog, recomputing')" "a different grid: the snapshot is recomputed (${rc})"
+check "$(grep -aq 'was: --grid 16$' "${TMP}/p_grid.log" && grep -aq 'now: --grid 24$' "${TMP}/p_grid.log" && echo 0 || echo 1)" "... the difference is shown"
+check "$(has "${TMP}/p_grid.log" 'run_ps_dtfe.sh -s SIM -g 24 99')" "... and run_ps_dtfe.sh is called for it"
+rc=$(pdrive "${TMP}/p_vw.log" PS_VOLUME_WEIGHTED=0 DRY_RUN=1)
+check "$(has "${TMP}/p_vw.log" 'was: --ps-volume-weighted')" "a deposit option switched off (PS_VOLUME_WEIGHTED=0) counts too"
+rc=$(pdrive "${TMP}/p_sub.log" FIELDS=density_a DRY_RUN=1)
+check "$(has "${TMP}/p_sub.log" 'up to date \(same settings\)')" "fewer fields than the grids on disk carry: still up to date"
+rc=$(pdrive "${TMP}/p_more.log" FIELDS="density_a velocity_a tweb_a" DRY_RUN=1)
+check "$(has "${TMP}/p_more.log" 'settings differ')" "... a field the grids lack: recomputed"
+rc=$(pdrive "${TMP}/p_gpu.log" PS_GPU=1 DRY_RUN=1)
+check "$(has "${TMP}/p_gpu.log" 'up to date \(same settings\)')" "the GPU/CPU choice alone does not make grids stale"
+mv "${SD}/ps_output.runlog" "${SD}/ps_output.runlog.keep"
+rc=$(pdrive "${TMP}/p_nolog.log" GRID_SIZE=24 DRY_RUN=1)
+check "$(has "${TMP}/p_nolog.log" 'up to date by file times \(no ps_output.runlog to compare the settings with\)')" \
+      "no run log: judged by the file times, and said so"
+mv "${SD}/ps_output.runlog.keep" "${SD}/ps_output.runlog"
+
+echo ""
+echo "(Q) scripts/thesis_runs.sh: the thesis run recipe, repo-relative, DRY_RUN prints it and runs nothing (2026-10-11)."
+TROOT="${TMP}/thesis root/Illustris TNG"; rm -rf "${TMP}/thesis root"
+for s in TNG50/TNG50-3-Dark TNG100/TNG100-3-Dark TNG300/TNG300-3-Dark; do
+    mkdir -p "${TROOT}/${s}/snapdir_099"; : > "${TROOT}/${s}/snapdir_099/combined_099.hdf5"; : > "${TROOT}/${s}/combined_ics.hdf5"
+done
+cp scripts/thesis_runs.sh "${MREPO}/scripts/"
+rc=0; env DTFE_DATA_ROOT="${TROOT}" DRY_RUN=1 SCRATCH_DIR="${TMP}/thesis scratch" "${MREPO}/scripts/thesis_runs.sh" tng50z0 caustics \
+    >"${TMP}/q_dry.log" 2>&1 || rc=$?
+check "$([ "${rc}" = "0" ] && [ ! -e "${TMP}/thesis scratch" ] && echo 0 || echo 1)" "DRY_RUN=1 tng50z0 caustics exits 0 and creates nothing (${rc})"
+check "$(lacks "${TMP}/q_dry.log" '^RUNNING:')" "... no binary ran"
+check "$(has "${TMP}/q_dry.log" 'PS-DTFE .*TNG50-3-Dark/snapdir_099/ps_output +--grid +512 .*--scratch-dir .*--field +density_a +velocity_a +gradient_a +divergence_a +shear_a +vorticity_a +dispersion_a +tweb_a +vweb_a .*--ps-gpu .*--ps-volume-weighted .*--sample-points .*TNG50-3-Dark/hires_plane_z2048\.bin +--pts-vel-grad')" \
+      "... TNG50 099: 512^3, scratch, the nine thesis fields, GPU, volume-weighted, the 2048^2 plane with velocity gradients"
+check "$(has "${TMP}/q_dry.log" 'PS-DTFE .*TNG100-3-Dark/snapdir_099/ps_caustic +--grid +512 .*--field +density_a +tweb_a +--lambda_th.*--ps-caustics')" \
+      "... TNG100 099 caustics: its own ps_caustic prefix, density + T-web, --ps-caustics"
+check "$(grep -aq 'budget 40 GB' "${TMP}/q_dry.log" && grep -aq 'budget 44 GB' "${TMP}/q_dry.log" && echo 0 || echo 1)" "... the budgets are named"
+check "$(has "${TMP}/q_dry.log" '^\+ .*plot_void_population\.py --sim TNG50-3-Dark --method ps --smooth-mpc 2\.1625$')" "... the figures are printed, not run"
+check "$(has "${TMP}/q_dry.log" '^\+ .*plot_caustic_skeleton\.py --sim TNG100-3-Dark --prefix ps_caustic --snaps 99 --voids$')" "... the caustic skeleton too"
+rc=0; env DTFE_DATA_ROOT="${TROOT}" DRY_RUN=1 "${MREPO}/scripts/thesis_runs.sh" production >"${TMP}/q_prod.log" 2>&1 || rc=$?
+check "$([ "${rc}" = "0" ] && echo 0 || echo 1)" "DRY_RUN=1 production exits 0 (${rc})"
+check "$(has "${TMP}/q_prod.log" 'FIELDS=density_a velocity_a gradient_a divergence_a shear_a vorticity_a dispersion_a tweb_a vweb_a .*run_ps_dtfe.sh -s TNG100-3-Dark -g 512 -m 99')" \
+      "... the pipeline runs TNG100 at 512^3 with the nine fields on the GPU"
+check "$(has "${TMP}/q_prod.log" 'make_image_plane.py .*--nu 2048 .*TNG50-3-Dark/hires_plane_z2048')" "... TNG50's plane is 2048^2"
+check "$(has "${TMP}/q_prod.log" 'make_image_plane.py .*--nu 4096 .*TNG300-3-Dark/hires_plane_z4096')" "... TNG300's 4096^2"
+check "$(has "${TMP}/q_prod.log" 'force: 1')" "... FORCE=1: everything recomputed"
+rc=0; "${MREPO}/scripts/thesis_runs.sh" >"${TMP}/q_none.log" 2>&1 || rc=$?
+rc2=0; "${MREPO}/scripts/thesis_runs.sh" everything >"${TMP}/q_bad.log" 2>&1 || rc2=$?
+check "$([ "${rc}" = "2" ] && [ "${rc2}" = "2" ] && echo 0 || echo 1)" "no stage, or an unknown one: exit 2, nothing run (${rc}, ${rc2})"
+rc=0; env DTFE_DATA_ROOT="${TMP}/no such disk" DRY_RUN=1 "${MREPO}/scripts/thesis_runs.sh" all >"${TMP}/q_root.log" 2>&1 || rc=$?
+check "$([ "${rc}" = "2" ] && echo 0 || echo 1)" "the data disk missing: exit 2 up front (${rc})"
 
 echo ""
 echo "(N) the Makefile stamps BUILD_MODE, ARCH_FLAGS and EXTRA_FLAGS in the object dirs (2026-10-08)."

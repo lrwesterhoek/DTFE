@@ -11,11 +11,14 @@
    the deferrals), this host keeps a host mirror of the masses and copies explicitly.
 
    The CPU deposit remains the double-precision reference; this backend carries the same
-   parity contract as the Metal one (float rounding, atomic summation order). It has been
+   parity contract as the Metal one (float rounding, atomic summation order). The MASS grid is,
+   like Metal's since 2026-10-08, an exact 64-bit fixed-point sum (depositMass, 2026-10-11): it no
+   longer loses small shares in busy cells and is bit-identical run to run. It has been
    compiled and its CPU fallback exercised on Linux, but NOT yet validated on NVIDIA/AMD
    hardware -- see metal/README.md ("CUDA / HIP"). */
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -25,6 +28,7 @@
 #include <mutex>
 #include <string>
 #include <vector>
+extern std::atomic<int> psGpuRetries;   // ps_interpolation.cc (run_progress.h)
 #include <unistd.h>
 
 #include "gpu_host.h"
@@ -96,7 +100,36 @@ struct FieldGrids {
     float*    dispw;   // nCell     its normalizer (fVolW+fDisp; else dummy)
     float*    scal;    // nCell     scalar moment sum(wm s) (fScal; else dummy)
     float*    sgrad;   // nCell*3   scalar-gradient moment (fSGrad; else dummy)
+    unsigned* massFx;  // nCell*2   the mass as a 64-bit fixed-point sum [flat*2] low, [flat*2+1] high (massFixed; else dummy)
+    float     massScale; // its unit: 1/massScale mass
+    bool      massFixed;
 };
+
+// A mass share into the mass grid (2026-10-11, metal/ps_deposit.metal depositMass; DepositParams.massFixed
+// there says why): the exact 64-bit fixed-point sum (massFixed), else a float atomic. The float atomics
+// dropped every share below half an ulp of a busy cell's running sum, always downward, and their result
+// depended on the order the atomics landed in. Two's-complement words with the carry done by hand, as in
+// Metal (a native 64-bit atomicAdd would give the same bits; the two words keep the kernels line by line
+// and the host decode, psMassFixedValue, shared): the low word's carry is read off the value its atomic
+// returns (the add wrapped iff the result is below it), and the high words add modulo 2^32, so once every
+// thread is done the two words hold the exact integer total whatever the interleaving. The host keeps the
+// partition's whole mass below 2^62 units, so no share and no cell total overflows. massScale is 2^k, so
+// the product is exact and rintf (round to nearest even, as Metal's rint) gives Metal's integer.
+__device__ __forceinline__ void depositMass(const FieldGrids& G, unsigned flat, float w)
+{
+    if (!G.massFixed) {
+        atomicAdd(&G.mass[flat], w);
+        return;
+    }
+    ull const q = ull((long long)(rintf(w * G.massScale)));
+    if (q == 0ull) return;                          // below half a unit: nothing to add
+    unsigned const lo = unsigned(q), hi = unsigned(q >> 32);
+    ull const at = ull(flat) * 2ull;                // 64-bit: a sub-grid may hold up to 2^32 cells
+    unsigned const old = atomicAdd(&G.massFx[at], lo);
+    unsigned const up = hi + ((old + lo < old) ? 1u : 0u);
+    if (up != 0u)
+        atomicAdd(&G.massFx[at + 1ull], up);
+}
 
 __device__ __forceinline__ void depositSample(const FieldGrids& G, unsigned flat,
                                               const float rel[3], float w, float wm, unsigned obits,
@@ -108,7 +141,7 @@ __device__ __forceinline__ void depositSample(const FieldGrids& G, unsigned flat
 {
     // Moment-grid offsets are 64-bit BECAUSE flat*9 WOULD overflow a 32-bit uint above ~782^3.
     ull base = ull(flat);
-    atomicAdd(&G.mass[flat], w);
+    depositMass(G, flat, w);
     if (fVel || fDisp) {
         float vv[3];
         for (int j=0; j<3; ++j) {
@@ -257,7 +290,7 @@ __device__ void exact_cell_deposit(const FieldGrids& G, unsigned flat, const flo
 {
     float const wmEx = fVolW ? mo[0] : massShare;
     ull const base = ull(flat);
-    atomicAdd(&G.mass[flat], massShare);
+    depositMass(G, flat, massShare);
     float const invV = 1.0f / mo[0];
     float const loc[3] = { mo[1]*invV, mo[2]*invV, mo[3]*invV };            // about the clip origin
     float const cen[3] = { cc.x + loc[0], cc.y + loc[1], cc.z + loc[2] };   // vertex-0 frame
@@ -471,7 +504,7 @@ depositFields(const float* __restrict__ verts, const float* __restrict__ vels, f
               float* massGrid, float* momGrid, float* m2Grid, float* gradGrid, unsigned* strGrid,
               const DepositParams P, const float* __restrict__ dens,
               float* momwGrid, unsigned* caustGrid, float* svGrid, float* dvGrid, float* dwGrid,
-              const float* __restrict__ scal, float* scalGrid, float* sgGrid)
+              const float* __restrict__ scal, float* scalGrid, float* sgGrid, unsigned* massFxGrid)
 {
     unsigned const tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= P.nTet) return;
@@ -526,6 +559,7 @@ depositFields(const float* __restrict__ verts, const float* __restrict__ vels, f
     G.mass = massGrid; G.mom = momGrid; G.m2 = m2Grid; G.grad = gradGrid; G.streams = strGrid;
     G.momw = momwGrid; G.caustic = caustGrid; G.sv = svGrid; G.dispvel = dvGrid; G.dispw = dwGrid;
     G.scal = scalGrid; G.sgrad = sgGrid;
+    G.massFx = massFxGrid; G.massScale = P.massScale; G.massFixed = P.massFixed != 0;
 
     bool const fVolW = P.fVolW != 0, fCaustic = P.fCaustic != 0, fExact = P.fExact != 0;
     float const mw = fVolW ? fabsf(d)/6.0f : m;
@@ -806,7 +840,7 @@ depositExactItems(const float* __restrict__ verts, const float* __restrict__ vel
                   const DepositParams P, const float* __restrict__ dens,
                   float* momwGrid, unsigned* caustGrid, float* svGrid, float* dvGrid, float* dwGrid,
                   const uint2* __restrict__ items, float* sumW, const ExactItemParams IP,
-                  const float* __restrict__ scal, float* scalGrid, float* sgGrid)
+                  const float* __restrict__ scal, float* scalGrid, float* sgGrid, unsigned* massFxGrid)
 {
     unsigned const iid = blockIdx.x * blockDim.x + threadIdx.x;
     if (iid >= IP.nItems) return;
@@ -844,6 +878,7 @@ depositExactItems(const float* __restrict__ verts, const float* __restrict__ vel
     G.mass = massGrid; G.mom = momGrid; G.m2 = m2Grid; G.grad = gradGrid; G.streams = strGrid;
     G.momw = momwGrid; G.caustic = caustGrid; G.sv = svGrid; G.dispvel = dvGrid; G.dispw = dwGrid;
     G.scal = scalGrid; G.sgrad = sgGrid;
+    G.massFx = massFxGrid; G.massScale = P.massScale; G.massFixed = P.massFixed != 0;
     float acc = 0.0f;
     for (; w < wEnd; ++w) {
         int const raw[3] = { iMin[0] + a0, iMin[1] + a1, iMin[2] + a2 };
@@ -1004,6 +1039,21 @@ bool psGpuDepositFields(std::vector<float>& verts,
     P.fScal    = (fScal  && !scal.empty()) ? 1 : 0;
     P.fSGrad   = (fSGrad && !scal.empty()) ? 1 : 0;
     P.windowMode = windowMode ? 1 : 0;
+    // the mass grid as an exact 64-bit fixed-point sum (2026-10-11, as ps_metal_host.cc since 2026-10-08;
+    // depositMass says why). PS_GPU_FLOAT_MASS=1 (or the Metal spelling PS_METAL_FLOAT_MASS=1) keeps the
+    // float atomics of before, for comparison.
+    {
+        double totalMass = 0.;
+        for (float const mt : masses) totalMass += double(mt);
+        float scale = 1.f;
+        auto envOn = [](const char* n) { const char* e = getenv(n); return e && atoi(e) != 0; };
+        bool const floatMass = envOn("PS_GPU_FLOAT_MASS") || envOn("PS_METAL_FLOAT_MASS");
+        P.massFixed = (!floatMass && psMassFixedScale(totalMass, scale)) ? 1 : 0;
+        P.massScale = scale;
+    }
+    bool const massFixed = P.massFixed != 0;
+    size_t const massBytes   = massFixed ? 4 : nCell * 4;   // the float grid, else a dummy
+    size_t const massFxBytes = massFixed ? nCell * 8 : 4;   // the fixed-point grid, else a dummy
     size_t const nTetTotal = masses.size();
 
     // PS_GPU_TIMING=1 (or PS_METAL_TIMING=1): one line per kernel run
@@ -1082,8 +1132,9 @@ bool psGpuDepositFields(std::vector<float>& verts,
     std::vector<float>().swap(dens);
     float* dSc = dD ? devUpload(scal.data(), scal.size() * sizeof(float), "upload scalars", err) : nullptr;
     std::vector<float>().swap(scal);
-    float* dMass = dSc ? devAlloc(nCell * 4, "mass grid", err) : nullptr;
-    float* dMom  = dMass ? devAlloc(momBytes, "moment grid", err) : nullptr;
+    float* dMass = dSc ? devAlloc(massBytes, "mass grid", err) : nullptr;
+    float* dMassFx = dMass ? devAlloc(massFxBytes, "fixed-point mass grid", err) : nullptr;
+    float* dMom  = dMassFx ? devAlloc(momBytes, "moment grid", err) : nullptr;
     float* dM2   = dMom ? devAlloc(m2Bytes, "second-moment grid", err) : nullptr;
     float* dGrad = dM2 ? devAlloc(gradBytes, "gradient grid", err) : nullptr;
     float* dStr  = dGrad ? devAlloc(nCell * 4, "stream grid", err) : nullptr;
@@ -1112,7 +1163,7 @@ bool psGpuDepositFields(std::vector<float>& verts,
     }
     auto freeAll = [&]()
     {
-        for (float* p : { dV, dU, dM, dD, dSc, dMass, dMom, dM2, dGrad, dStr, dMomW, dCaust, dSV, dDV, dDW, dScal, dSG, dItems, dSumW })
+        for (float* p : { dV, dU, dM, dD, dSc, dMass, dMassFx, dMom, dM2, dGrad, dStr, dMomW, dCaust, dSV, dDV, dDW, dScal, dSG, dItems, dSumW })
             if (p) gpuFree(p);
     };
     if (!dSG)
@@ -1186,7 +1237,7 @@ bool psGpuDepositFields(std::vector<float>& verts,
                 dMass, dMom, dM2, dGrad, reinterpret_cast<unsigned*>(dStr), Pc,
                 haveDens ? dB + start * 4 : dB,
                 dMomW, reinterpret_cast<unsigned*>(dCaust), dSV, dDV, dDW,
-                haveScal ? sB + start * 4 : sB, dScal, dSG);
+                haveScal ? sB + start * 4 : sB, dScal, dSG, reinterpret_cast<unsigned*>(dMassFx));
         });
     };
 
@@ -1198,7 +1249,8 @@ bool psGpuDepositFields(std::vector<float>& verts,
             GPU_LAUNCH(depositExactItems, blocksFor(n, tpb), tpb, 0,
                 dV, dU, dM, dMass, dMom, dM2, dGrad, reinterpret_cast<unsigned*>(dStr), P, dD,
                 dMomW, reinterpret_cast<unsigned*>(dCaust), dSV, dDV, dDW,
-                reinterpret_cast<const uint2*>(dItems) + start, dSumW, IP, dSc, dScal, dSG);
+                reinterpret_cast<const uint2*>(dItems) + start, dSumW, IP, dSc, dScal, dSG,
+                reinterpret_cast<unsigned*>(dMassFx));
         });
     };
 
@@ -1268,7 +1320,8 @@ bool psGpuDepositFields(std::vector<float>& verts,
     bool success = false;
     for (int attempt = 0; attempt < maxAttempts && !success; ++attempt)
     {
-        bool zeroed = gpuCheck(gpuMemset(dMass, 0, nCell * 4), "zero grids", lastErr)
+        bool zeroed = gpuCheck(gpuMemset(dMass, 0, massBytes), "zero grids", lastErr)
+                   && gpuCheck(gpuMemset(dMassFx, 0, massFxBytes), "zero grids", lastErr)
                    && gpuCheck(gpuMemset(dMom,  0, momBytes), "zero grids", lastErr)
                    && gpuCheck(gpuMemset(dM2,   0, m2Bytes), "zero grids", lastErr)
                    && gpuCheck(gpuMemset(dGrad, 0, gradBytes), "zero grids", lastErr)
@@ -1290,6 +1343,7 @@ bool psGpuDepositFields(std::vector<float>& verts,
 
         if (!success)
         {
+            ++psGpuRetries;   // the run's progress sidecar counts every failed attempt (run_progress.h)
             targetSec = std::max(targetSec / 4.0, 0.02);
             gapUs     = std::min(std::max(gapUs * 3, useconds_t(8000)), useconds_t(50000));
             baseChunk = std::max(baseChunk / 2, MIN_CHUNK);
@@ -1316,8 +1370,23 @@ bool psGpuDepositFields(std::vector<float>& verts,
     for (size_t t = 0; ok && t < nTetTotal; ++t)
         if (hostMass[t] < 0.f) deferred.push_back(uint32_t(t));
 
-    ok = ok && gpuCheck(gpuMemcpy(out.mass.data(),    dMass, nCell * 4,  gpuMemcpyDeviceToHost), "copy mass back", err)
-            && (!fVel  || gpuCheck(gpuMemcpy(out.mom.data(),  dMom,  nCell * 12, gpuMemcpyDeviceToHost), "copy mom back", err))
+    if (ok && massFixed)
+    {   // decode the fixed-point words in blocks (the whole grid's 8 B per cell would be one more
+        // host copy of a GB at 512^3)
+        size_t const blk = size_t(1) << 20;
+        std::vector<uint32_t> fx(2 * std::min(blk, nCell));
+        for (size_t c0 = 0; ok && c0 < nCell; c0 += blk)
+        {
+            size_t const n = std::min(blk, nCell - c0);
+            ok = gpuCheck(gpuMemcpy(fx.data(), reinterpret_cast<const uint32_t*>(dMassFx) + 2 * c0, n * 8,
+                                    gpuMemcpyDeviceToHost), "copy fixed-point mass back", err);
+            for (size_t i = 0; ok && i < n; ++i)
+                out.mass[c0 + i] = float(psMassFixedValue(fx[2*i], fx[2*i + 1], P.massScale));
+        }
+    }
+    else if (ok)
+        ok = gpuCheck(gpuMemcpy(out.mass.data(), dMass, nCell * 4, gpuMemcpyDeviceToHost), "copy mass back", err);
+    ok = ok && (!fVel  || gpuCheck(gpuMemcpy(out.mom.data(),  dMom,  nCell * 12, gpuMemcpyDeviceToHost), "copy mom back", err))
             && (!fDisp || gpuCheck(gpuMemcpy(out.m2.data(),   dM2,   nCell * 24, gpuMemcpyDeviceToHost), "copy m2 back", err))
             && (!fGrad || gpuCheck(gpuMemcpy(out.grad.data(), dGrad, nCell * 36, gpuMemcpyDeviceToHost), "copy grad back", err))
             && gpuCheck(gpuMemcpy(out.streams.data(), dStr,  nCell * 4,  gpuMemcpyDeviceToHost), "copy streams back", err)

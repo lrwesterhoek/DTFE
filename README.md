@@ -164,6 +164,15 @@ is rebuilt with them. A failed compile leaves the previous binaries in place and
    ```
    `tests/ci_suite.sh` is the one list of suites that both the GitHub workflow (`.github/workflows/ci.yml`) and the Docker image run: `build` builds the single, double and 2D pairs, `double` repeats the suites against the double pair, `2d` runs the 2D suite and `gui` the launcher's tests. The GPU suites (`tests/dtfe_metal_check.sh`, `tests/gpu_scalar_check.sh`, `tests/gpu_mass_check.sh`) need a GPU build and are run by hand.
 
+   **Standard-DTFE regression.** `tests/run_tests.py` compares a periodic 1000-particle run (point density and the
+   `--exact-average` cell average on a 12^3 grid) with `tests/reference/regression_periodic.txt` to 3e-4 relative,
+   on macOS and in Linux CI alike: the set has no Delaunay ties, so every CGAL builds the same tessellation, and the
+   tolerance sits 11x above the measured rounding spread (double build, thread count, Linux vs Mac) and below the
+   smallest real change tried. After an intended change of the estimator, regenerate it with
+   `python3 tests/run_tests.py --update-ref` and commit the file. `tests/ps_auto_tune_check.sh` and
+   `tests/ps_scratch_check.sh` now run on Linux too (part of `tests/ci_suite.sh core`); their GPU parts skip on a
+   CPU build.
+
 ### Configuration Options
 
 The software behavior can be configured by editing the `OPTIONS` section in the Makefile:
@@ -220,8 +229,8 @@ precision, so a double build hands the GPU float copies of its tetrahedra and ad
 into its double grids, while reading, triangulation, densities, point evaluation and the CPU
 deposits stay double. The one exception is the Metal mass grid (the density), which is an exact 64-bit
 fixed-point sum in both builds, so a partition's mass comes out the same run after run whatever order the GPU's
-threads add in (`PS_METAL_FLOAT_MASS=1` brings back the old float grid for comparison; the CUDA/HIP port still
-sums it in float). A split run that merges several partitions at once (`--max-concurrent` above 1) still differs
+threads add in (`PS_METAL_FLOAT_MASS=1` brings back the old float grid for comparison); the CUDA/HIP port has the same
+fixed-point grid since 2026-10-11 (`PS_GPU_FLOAT_MASS=1` for its float grid), validated through its CPU emulation. A split run that merges several partitions at once (`--max-concurrent` above 1) still differs
 from run to run in the last bits, because the merge adds the partitions in the order they finish. `tests/ps_double_check.sh` compares the two pairs on the same snapshot: the
 grids agree the way two single-precision paths do (a few borderline samples change cell), stream
 counts and caustic flags are identical, and the double pair's GPU deposit matches its own CPU run
@@ -345,6 +354,76 @@ A box too large for one tessellation is served as a composite of partition tesse
 
 Large runs are split into smaller computational chunks (`--partition`) that are processed a few at a time (`--max-concurrent`; 0 means as many as there are threads, never more), so that the peak memory stays within the machine. When these options are not supplied the code **chooses them automatically** from the particle count, grid size, requested fields and the machine's memory and core count, printing the chosen decomposition and the predicted peak memory before it starts; any explicit option always takes precedence, and `--partition 1` asks for a single, unsplit computation. The memory it plans for is at most 60% of the machine's RAM, and never more than what the programs already running leave free (less a few GB of headroom), so the computer stays usable during a run; `DTFE_MEM_FRACTION` changes the share and `DTFE_MEM_BUDGET_GB` sets the budget outright, though never above what the other programs leave free at the start (less 4 GB). While a phase-space grid run has several partitions in flight, a partition does not start when the memory then free would not hold it: it waits until one in flight has finished (and says so), or starts alone when none is, so programs that take memory during the run slow it down instead of getting it killed by the system, as the TNG50-3-Dark run at z = 0 (6×6×6 partitions, three at a time) was after 82 minutes on 7 October 2026. This gate works from the auto-tuner's estimate of what one partition adds, so it acts only when the auto-tuner chose the split or the concurrency and more than one partition runs at a time. It does nothing when the partitions run one at a time (`--max-concurrent 1`, given or auto-tuned, as for the 5×5×5 rerun of that snapshot), when both `--partition` and `--max-concurrent` are given by hand, for a point evaluation (`--sample-points`), or for the small partitions the auto-tuner picks for speed when a run fits in memory easily; such a run has only the budget it was planned with. Very fine grids work beyond the 32-bit cell counts: a 1300³ grid (2.2 billion cells) on the CPU and a 1700³ grid (4.9 billion) on the GPU, both with the grids on `--scratch-dir`, reproduce the 2×2×2 block means of a run at half the resolution with twice the sub-samples (the same sample points) to float rounding. The GPU kernels number a partition's sub-grid cells with 32 bits, so with the GPU on the code now splits until every sub-grid holds fewer than 2³² cells (a 1700³ grid: 2×2×2) instead of falling back to the CPU, and a small particle set on such a grid splits for memory instead of staying in one domain over budget. The T-web's FFT is planned with FFTW's 64-bit interface, so it is no longer refused above 2³¹ cells; at that size its double-precision work arrays need on the order of 100 GB, and since they are ordinary allocations `--scratch-dir` backs them with disk like the grids: a 1300³ T-web (2.2 billion cells) ran on a 64 GB machine in 19 minutes, its classification checked in every cell. The memory of a phase-space point evaluation (`--sample-points`) grows with the number of streams crossing each point, which rises steeply towards low redshift; the code estimates it from the particles before it starts (the Eulerian over the Lagrangian volume of the tessellation, measured on a few hundred small patches) and plans with a generous margin on top, since a single plane can cross more collapsed structure than the box average. Each stream is stored with only the quantities that were asked for (42 bytes per stream at the least, 114 with `--pts-vel-grad`, instead of 176), which leaves every output unchanged. `--auto-tune-report` reads the input, prints the decision and the predicted peak memory as one line, and stops, so a configuration can be checked before it is run. When even a single chunk of the full-resolution grids would not fit in memory, the grids can be backed by memory-mapped files on a local disk with `--scratch-dir`, trading disk space for RAM while leaving the results unchanged.
 
+### Long runs: ordered merge, look-ahead, crash-safe outputs, progress
+
+**Reproducible partition merge (`--ordered-merge`).** A partitioned PS-DTFE run normally adds each partition's
+grids into the result as soon as it finishes, so with several partitions in flight the float sums happen in a
+different order every run and two identical runs differ in the last bits. `--ordered-merge` adds them in
+partition index order instead, so the grids are bit-identical run to run (on the GPU only the exactly summed mass
+grids are; the float velocity moments vary at rounding anyway). A finished partition waits for the
+lower-numbered ones, which can cost time when partitions differ much in cost; the memory gate keeps working.
+
+**Look-ahead tessellation (GPU runs at `--max-concurrent 1`).** While one partition deposits on the GPU, the next
+partition's particles are selected and its Delaunay tessellation and vertex densities are built on a CPU thread,
+one partition ahead. The outputs are byte-identical to a run without it; on a synthetic 2.1M-particle GPU run it
+cut the wall time by ~20%. It holds one more partition's tessellation in memory, which the auto-tuner counts and
+which is checked against the free memory before each look-ahead. Switch it off with `--ps-no-overlap`.
+
+**Crash-safe outputs.** Every output file is first written as `<file>.part.<pid>` and the whole set is renamed
+into place only after the last one, so an output folder never holds a mix of an old and a new run. If the
+output folder is missing when the results are written (an unmounted disk), the program waits for it
+(`DTFE_OUTPUT_WAIT` seconds, default 300) and otherwise writes everything to
+`$TMPDIR/dtfe-rescue/<folder>_<name>`, prints the `mv` command to put it back, and exits with status 3.
+Leftover `.part.<pid>` files of a killed earlier run are removed at the next start.
+
+**Progress sidecar.** While a run goes, the binary keeps `<output>.runlog.progress` up to date: a small JSON file
+with the phase, partitions done/total, elapsed time, ETA, current memory, GPU retries and the update time. It is
+removed when the run finishes. The ETA weighs each partition by a predicted cost (how much of its mass sits in
+dense regions) instead of counting partitions; on the TNG50 z=0 run that brings the ETA from about 2x too long to
+within about 20%. `DTFE_NO_PROGRESS=1` switches the file off.
+
+**Resuming a killed run.** A partitioned PS-DTFE run saves its merged grids, and the list of partitions
+already in them, in `<output>.runlog.checkpoint` (with `--scratch-dir`: in the scratch folder) after a
+partition merges. It skips a save while the previous one took more than 5% of the time since it, and
+removes the folder once the outputs are written. If the run is killed (a restart, an unplugged disk,
+out of memory), run it again with `--resume`: the binary loads the checkpoint and computes only the
+missing partitions. It refuses, naming the differing settings, if the build or the binary itself (a
+rebuild: its revision and link time), the input files, the partition split or the command line changed. `--verbose`, `--max-concurrent`, `--scratch-dir`,
+`--tessellation-cache`, `--ps-no-overlap` and `--ordered-merge` may change. `--resume` implies
+`--ordered-merge`: when the killed run also merged in index order, the grids are byte-identical to an
+uninterrupted run at the same `--max-concurrent`. `scripts/run_ps_dtfe.sh` resumes on its own when it
+finds the checkpoint (`PS_RESUME=0` starts over). `DTFE_PS_CHECKPOINT=0` writes no checkpoints, and
+`--sample-points` and `--interlace` runs are not checkpointed. A save needs twice the grids' size plus 2 GB free; with
+less, it is skipped with a warning.
+
+**ORDERED_MERGE=1** (run_ps_dtfe.sh) passes `--ordered-merge`: the partitions' grids are added in
+partition order, so two identical runs write bit-identical grids. It costs time when partitions differ
+much in cost and MAX_CONCURRENT is above 1.
+
+**Failed GPU buffers resume from a checkpoint.** The Metal deposit runs each partition as a sequence of short,
+paced command buffers. When macOS kills one (the display watchdog, another app's GPU hang, a memory error), the
+deposit no longer starts the partition over: it keeps a snapshot of its grids at the start of each pass and,
+by default, every ~10 s of GPU work (`DTFE_GPU_CHECKPOINT_CHUNKS=<n>` sets a checkpoint every n buffers; 0 keeps
+only the pass-start snapshot), restores the last one and continues from there, so a failure costs at most ~10 s
+of work instead of up to ~30 min on a TNG50 partition. The retry depends on the cause: an "innocent victim"
+error (another process hung the GPU) retries at once at the same pace; a watchdog or memory error shortens the
+buffers and widens the gaps for the rest of the run. Only three failures of the same chunk (or a lost device)
+send the partition to the CPU deposit. The snapshot costs one extra copy of the partition's grids in memory
+while its deposit runs (~0.2 % of the time measured at 256^3). Each failed buffer counts into the progress
+sidecar's `gpu_retries`. For testing, `DTFE_GPU_FAULT_AT=<k>[:innocent|timeout|oom|persist]` makes the k-th
+buffer fail after it ran; tests/gpu_retry_check.sh checks that the resumed run's mass grid is byte-identical to
+an undisturbed one.
+
+**CUDA/HIP: exact mass grid, and the port checked in CI without a GPU.** The CUDA/HIP phase-space deposit now
+sums the mass grid exactly, like the Metal one since 2026-10-08: every mass share is added as a 64-bit
+fixed-point integer (two 32-bit atomic words per cell), so no small share is lost in a busy halo cell and the
+density grid is bit-identical from run to run (`PS_GPU_FLOAT_MASS=1` brings back the float sum for
+comparison). Without an NVIDIA or AMD card the port can still be run: `make DTFE PS-DTFE CUDAEMU=1` compiles it
+against a CPU emulation of the device, and `tests/cudaemu_check.sh` runs every GPU parity suite through it at
+warp width 32 (CUDA) and 64 (AMD's wavefront) -- also as a CI job on Linux. That validates the port's code and
+host logic, not the numerics of real hardware; a run on a GPU machine
+(`GPU_BUILD=CUDA=1 tests/dtfe_metal_check.sh` and the PS suites) remains the final word.
+
 ## Reusing the tessellation
 
 Constructing the Delaunay tessellation and the densities at its vertices is the dominant fixed cost of a run — measured at 81% of the total for a snapshot of 884736 particles — and it is repeated in full every time, even when the same snapshot is analysed again with a different grid or a different set of sampling points. `--tessellation-cache <local dir>` writes the finished tessellation to disk once and reuses it in later runs, which skips both stages (the same example run takes 10.9 s without the cache and 4.6 s with it). For phase-space runs the interpolation grid, the fields and the sampling points may all change and the cached tessellation is still valid, since it is built in Lagrangian space and does not depend on them — which is what makes repeated point evaluation on one snapshot cheap. Anything that would change the tessellation itself or the densities stored in it — a modified input file, a different box, region, padding, periodicity or density normalisation, or a different build of the code — is detected and the tessellation is simply rebuilt, so a stale cache can never produce a wrong result. (Periodicity was missing from that list until 30 September 2026: a standard-DTFE run could load the tessellation a run with the other setting had cached. A periodic phase-space run in one piece, without `--partition`, rebuilds a tessellation cached before 2 October 2026 once: its ownership box, part of the identity, moved that day to fix a mass loss on lattice initial conditions.) The input files are identified by their resolved path, so a relative name, a name through a symbolic link, or other letter case of the same file finds the same cached tessellation; before 2 October 2026 each such name was a separate key and a rebuild (a cache written through such a name then is rebuilt once). The cached file is compressed and costs about 0.15 KB per tessellation vertex. Since 2 October 2026 it is compressed in independent 16 MB chunks, written and decompressed on several cores, which made writing a partition 3.6 times and loading it 1.7 times faster; files in the older single-stream format still load, and `python/tools/upgrade_tess_cache.py <cache folder>` converts them, checking each file's content before replacing it (an older binary cannot read converted files). After that, most of a load was CGAL's own reader taking every vertex and cell index through a separate stream call; the cache now reads and writes the same bytes in blocks and builds the triangulation through the same calls in the same order, so the result is CGAL's exactly (the tests compare a hash of the loaded structure and the written files byte for byte). For 3.65 million vertices a load went from 3.2 s to 0.9 s and a save from 3.8 s to 2.2 s; with eight loads at once, decompression on the shared cores is now the limit (2.5 s each instead of 5.6 s). The 512² exact zoom on TNG100-3-Dark, three partitions at a time, went from 27 to 15 s. When libdeflate is installed (`brew install libdeflate`, `apt-get install libdeflate-dev`; the Makefile finds it, `LIBDEFLATE=0` builds without it) the chunks are compressed and decompressed with it instead of zlib: on this Mac compression is 2.4 times faster and 3% smaller, which made a save 12% faster, while a load gains little (1.13 times). On Linux (Ubuntu 24.04) it is much the same: a 2.1-million-vertex tessellation saved in 2.0 s instead of 2.3 s and loaded in 1.15 s instead of 1.28 s. The chunks are already decompressed on all cores, so the codec is only a small part of either. Both codecs write plain gzip, so every build reads every cache, and a run that loads one names the codec it used.
@@ -388,7 +467,8 @@ that was killed outright). The launcher's Runs tab shows such an attempt beside 
   resolution cut (`config.ELLIPSOID_CUT_RULES`: largest semi-axis within 10 smoothing lengths and half the box) and
   the shapes.
 - **R_v**, the *measured* radius, where the spherically averaged smoothed density around the minimum first rises back
-  to the mean: about 0.57 R_eff. In units of R_v the stacked density reaches the mean at 1.0 R_v and the
+  to the mean: about 0.57 R_eff. R_v is defined by that crossing of the smoothed profile, so in units of R_v the stacked (raw) density reaching the
+  mean near 1.0 R_v checks the smoothing against the raw field rather than being a result; what is measured is that the
   outflow turns to infall just beyond it.
 
 The profile, abundance and skeleton scripts use R_v and the *distinct* voids by default: deepest first, a void whose
@@ -415,10 +495,165 @@ Other non-default options add a tag to the output names instead of overwriting t
 `plot_void_tracking` (`_dtfe` or `_<prefix>`, `_snap<N>`) and the point-evaluation maps (`_slab`, `_smooth<s>`,
 `_fixed`). So `--snap 99 --prefix ps_caustic` writes `caustic_skeleton_z0.00_ps_caustic.*`.
 
+### Void analyses added 2026-10-11
+
+**Three void radii.** Every void catalogue now measures R_v three ways in one pass over spherical shells of the smoothed
+density contrast around each minimum (`catalog.R_V_DEFINITIONS`): `crossing` (the default R_v: where the shell mean first
+rises to the cosmic mean), `delta08` (where the enclosed contrast Delta(<R) first reaches -0.8, the shell-crossing value
+of the spherical model) and `ridge` (the radius of the compensation ridge, the maximum of the shell mean within 15 sigma).
+Read them with `catalog.r_v_mpc(cat, 'delta08')`; the export has `r_v_delta08_mpc` and `r_v_ridge_mpc` columns. A void
+whose crossing radius shrinks while its delta08 and ridge radii hold is latching onto an inner wall.
+
+**R_v settings are part of the cache.** Each catalogue records how its radii were measured (step, reach, directions,
+algorithm version; `pipeline.r_v_settings()`), and the CSV/HDF5 provenance repeats it. A cache made with other settings,
+or before they were recorded, has its radii re-measured on first load (about 15 s per 512^3 snapshot) and says so once.
+
+**DTFE_CACHE_DIR.** Set `DTFE_CACHE_DIR=/path` to keep the derived-product caches (void catalogues, slices, limits)
+outside python/cache, e.g. off iCloud Drive. Unset, nothing changes.
+
+**DTFE_VOID_GATE.** `DTFE_VOID_GATE=none` drops the ellipsoid fit's max-axis cut (10 sigma) from the void sample, so
+the R_v abundance and profiles are defined on R_v and depth alone. It changes only what a run reads, never the shared
+cache, and every output made under it carries the tag `gatenone` (no thesis mirror). Default `ellipsoid` = today's sample.
+
+**Void profiles across cosmic time** (`python/plot/plot_void_profile_evolution.py --sim TNG100-3-Dark`, with
+`DTFE_SIM` set): one figure of the stacked density rho/rho_bar against r/R_v of the distinct resolved voids at every
+snapshot on disk (colour = redshift), their radial velocity in units of the Hubble flow at R_v against the linear-theory
+prediction -(1/3) f(z) x Delta(<x), the interior single-stream volume fraction (r < 0.5 R_v and r < R_v, beside the whole
+box) and v_r/v_lin at 0.5 and 1 R_v against 1+z. Every R_v bin and redshift is also fitted with the universal profile of
+Hamaus, Sutter & Wandelt (2014), delta(r) = delta_c (1 - (r/r_s)^alpha) / (1 + (r/R_v)^beta), with the stack's scatter as
+errors: profile_fits.png/.json/.txt (fits with a parameter on its bound are flagged and not drawn). Per-snapshot profiles
+are cached under per_snapshot/, so `--replot` redraws with other bins in seconds. `--rv-definition ridge|delta08` uses
+the other R_v definitions. plot_void_profiles.py now draws the same fit on each snapshot's density panel and saves the
+parameters (hsw_params, hsw_errors) in its npz.
+
+**Void size function.** `plot_void_population.py` also writes `population_size_function.png`: the measured
+dn/dlnR_v and n(>R_v) of the distinct well-resolved voids at the panel snapshots against the Sheth & van de Weygaert
+(2004) size function in the volume-conserving form of Jennings, Li & Hu (2013) (delta_v = -2.71, i.e. -0.8 nonlinear;
+delta_c = 1.686; EH98 sigma(R) at TNG's Planck 2015 sigma_8 and the exact LambdaCDM growth), and their ratio. R_v is
+the radius where the enclosed contrast reaches -0.8 (`--size-rv delta08`, the model's radius; `crossing` or `ridge`
+give tagged files). The theory lives in `dtfelib/theory.py`. The -0.8 radius of a minimum of the smoothed field
+follows the smoothing length (see 'Size function smoothing' below), so this comparison is not yet a test of the
+theory.
+
+**Void shapes against a Gaussian field.** `plot_void_crossbox.py` now carries the thesis's BBKS ellipticity e and
+prolateness p of the minima for each box at the common sigma (medians with bootstrap 68% intervals), with the BBKS
+(1986) expectation for minima of a Gaussian random field with the same smoothed linear spectrum, at the voids' own
+heights and over all minima, and the e distribution at each z against it. At sigma = 2.16 Mpc TNG100 and TNG300 start
+on the Gaussian expectation at z = 20 (e 0.18-0.19, p 0.015) and end at e 0.23-0.24, p 0.055-0.066 at z = 0.
+
+**Void scripts from analyze.py.** `python3 analyze.py voids` runs the void-population scripts (population, profiles,
+profile evolution, environment, fate) for `DTFE_SIM`'s simulation; `--only` picks some; a script not written yet is
+skipped with a note.
+
+**Void environment (void-in-void / void-in-cloud).** `python3 python/plot/plot_void_environment.py --sim TNG100-3-Dark`
+classifies every distinct well-resolved void at every snapshot by the raw density contrast enclosed within 2 R_v
+(dtfelib.classify; Ceccarelli et al. 2013). A void with Delta(<2 R_v) > 0 is void-in-cloud (S-type) and is expected to
+shrink; any other void is void-in-void (R-type). The script draws the void-in-cloud fraction against redshift, the R_v,
+depth and shape distributions of the two types per snapshot, and, where plot_void_tracking.py has followed voids,
+their tracks coloured by type. Results go under figures/void_environment/<sim>/. `--factor` changes the 2 R_v and
+`--r-v-definition` picks the R_v. At z = 0, 67% of TNG100-3-Dark's voids are void-in-cloud (60% at z = 1), and they are
+smaller than the void-in-void ones.
+
+**Caustic skeleton: random-sphere control.** With `--voids`, plot_caustic_skeleton.py also measures the same wall
+metrics in 50 sets of random spheres that carry the voids' own radii (`--null-draws`, `--null-seed`). It reports each
+void median against the null's mean +- std as a z-score, in the JSON `null` block, the text table and bands on the
+void panel. `--sheet-min-density RHO` keeps only the sheet cells denser than RHO x the mean, and
+`--min-component N` / `--min-component-mass F` keep only the sheet components of at least N cells, or that fraction
+of the mass, for the void metrics. `--all-caustic` runs every snapshot that has a caustic_class grid.
+On TNG100-3-Dark at z = 0 (`--prefix ps_caustic`), the fold fraction of the voids' R_v shells is 0.283 against
+0.243 +- 0.011 in the random spheres (z = +3.8).
+
+**Void fate census** (`python3 python/plot/plot_void_fate.py --sim TNG50-3-Dark`). Links the distinct well-resolved
+voids of every snapshot to those of the next by their matter: the particles within R_v of a void's centre are found
+again by ParticleID in the next combined snapshot (`dtfelib/lagrangian.py`, read in chunks). A void SURVIVES when
+at least half of them end in one descendant, MERGES when two or more voids pass half to the same one, SPLITS when two
+or more descendants get a quarter each, and VANISHES when no void at the next snapshot receives that much
+(thresholds: `lagrangian.SURVIVE_FRAC`, `SPLIT_FRAC`). The descendants are every minimum with a usable radius
+(min(R_v, R_eff)), not only the followed sample: a void whose matter ends in a minimum the sample does not follow is
+UNRESOLVED, not vanished. How many really vanish depends on how members are counted: with overlapping spheres
+(the default) 2-3% per late interval on TNG100-3-Dark, with `--exclusive` members 15% (z = 1 -> 0.5) and 29%
+(z = 0.5 -> 0); see below. Writes `figures/void_fate/<SIM>/fate_census.png` (class counts per interval, the fraction of each
+snapshot's voids still alive at z = 0, fate against R_v and depth), `fate_table.csv` (one row per void and interval)
+and `fate_census.npz`. `--ref-snap` (default 33, z = 2) also links that snapshot straight to z = 0. The shared-particle
+tables are cached in python/cache, so a re-run (or new thresholds) takes seconds; the first run reads every combined
+snapshot once (TNG100-3-Dark: ~33 min, 31 GB with the whole descendant pool; TNG50-3-Dark, with 1.6e8 particles,
+may need ~50 GB: lower `DTFE_FATE_CHUNK` or watch the memory). Like every void script it needs DTFE_SIM=<SIM> (the catalogue frame guard): `DTFE_SIM=TNG50-3-Dark python3
+python/plot/plot_void_fate.py --sim TNG50-3-Dark`.
+
+**Void tracking by particles** (`plot_void_tracking.py --link particles --n-voids 30`). Instead of merger-tree
+tracers, follows each z = 0 void back through the void that gave it most of its member particles at each earlier
+snapshot (the same cached links as the census; distinct resolved voids only). Files get `_particles` in their names;
+the per-void figure shows that share as the identity quality. `plot_void_fate.py --exclusive` gives each particle
+to one void only (the nearest centre in units of R_v), so overlapping high-z voids cannot both count the same matter;
+its files are tagged `_exclusive`. From six voids on, the summary draws the median and
+16-84% band of R_v, e and p per snapshot. All tracking figures now use a logarithmic 1 + z axis.
+
+**Fate census: overlapping or partitioned members.** `plot_void_fate.py --exclusive` gives each particle to one void
+only. In TNG100-3-Dark it turns most high-redshift mergers into survivals (z = 10 -> 5: 88 merges become 16), and at
+late times it turns most 'unresolved' voids into vanished or split ones (z = 0.5 -> 0: 3 vanish and 50 unresolved
+become 34 and 13 of 119), because without the overlap no single unfollowed minimum receives half of a dying void's
+matter. The fraction of z = 2 voids with a descendant at z = 0 hardly changes (15% vs 17%). The partitioned census
+needs about 10 GB instead of 31 GB. `plot_void_tracking.py --link particles --exclusive` follows voids back through
+the partitioned links; with overlapping members the walk prefers the largest progenitor spheres (median progenitor
+R_v at z = 1: 24 Mpc against 15 Mpc partitioned), while the shape evolution (median BBKS e) is the same either way.
+
+**Void convergence.** `plot_void_convergence.py --sim <SIM>` (needs `DTFE_SIM`) tests whether the void statistics
+are properties of the voids or of the measurement, at one physical smoothing length. (a) Grid: the density grid is
+block-averaged to 256^3 and 128^3 (`--factors 2 4`; exactly the cell average a coarser run gives from the same
+particles), voids are found at the same sigma in Mpc and matched one by one with the native catalogue
+(`--match-sigma`, in smoothing lengths): R_v ratio, centre offset, voids unmatched both ways, abundance and the stacked
+density. (b) Particle mass: TNG50-3 / TNG100-3 / TNG300-3 side by side from plot_void_crossbox.py's per-box products
+(`--crossbox-dir`, `--crossbox-smooth-mpc`). (c) Estimator: DTFE against PS-DTFE void by void, with a per-void table,
+for any snapshot that has both grids. A row that cannot be drawn says why. TNG100-3-Dark: the matched voids keep R_v to
+0.3% (median; 16-84% within 2-4%) at 256^3 and 128^3, at z = 0 and 1, and the stacked interior is unchanged; only the
+height of the compensation ridge falls with the grid. Coarse catalogues are cached as `..._voids_block<f>.npz` under
+their own frame's cache namespace.
+
+**Size function smoothing.** `plot_void_population.py` draws the size function from its own, less-smoothed catalogue
+(`--size-smooth CELLS`, default 5; 0 = the catalogue of the other figures), written as
+`population_size_function_ss<cells>.png` (a non-default value also tags `population_stats` `_ss<cells>`), because at the production 10 cells the delta08 radius lies below sigma. The figure and the log give the
+smoothing and the fraction of the distinct voids whose delta08 radius exists. Measured on TNG100: that radius follows
+the smoothing at every sigma tried (10, 5, 3, 2 cells: 0.7-1.06 sigma), and measured/Vdn stays at 1e-3-1e-2, so
+the -0.8 radius of a minimum of the smoothed field is a smoothing scale, not a void size.
+
+**Cleaning the cache.** `python3 python/analyze.py cache` lists the namespaces of `python/cache` (one folder per
+grid size, smoothing, footprint, criterion and cache format) with their sizes and whether today's code can still
+reach them. A namespace of an older format (`_v1`) or of a smoothing that no current setting produces (for example
+`r512_s21.4043_f23`, TNG50-3-Dark smoothed at 2.16 Mpc, next to the current 2.1625 Mpc's `r512_s21.4291_f23`) is
+unreachable, and so are, inside a kept namespace, fate links of an older link version and the temporary files of an
+interrupted save. `cache --prune` only lists what would be deleted and its total size; `cache --prune --yes` deletes
+it. `--keep-mpc` and `--keep-cells` count further smoothings as current. On 11 October the dry run listed 872 MB,
+almost all of it the June `_v1` caches.
+
+**Power-spectrum and profile file names.** `plot_pk_compare.py` adds `_nb<N>` to its file names for a `--nbins`
+other than 40 and `_ref<S>` (or `_noref` for `--ref-snap -1`) for another reference snapshot; `plot_void_profiles.py`
+adds `_edges<e0>-<e1>-...` for `--edges` other than the default bins. The default names are unchanged, so a run with
+other bins no longer overwrites the default figure and npz.
+
 `plot_pk_compare.py` draws:
 - the chi^2 cosmic-variance band;
 - a panel divided by the same box's early spectrum grown linearly (`--ref-snap`, default snapshot 0), where a single
   realisation's low-k scatter cancels.
+
+**Thesis runs.** `scripts/thesis_runs.sh production|tng50z0|caustics|all` is the recipe that produced the thesis
+grids, image planes and run logs: every snapshot of TNG100-3-Dark, TNG50-3-Dark and TNG300-3-Dark at 512^3 with
+the T-web and V-web, image planes of 4096^2 (TNG50: 2048^2) pixels, a 52 GB memory budget and the grids'
+accumulators in `SCRATCH_DIR` (default `~/DTFE-scratch`), then the TNG50 z = 0 redo at 40 GB and the TNG100 z = 0
+caustic run under its own prefix `ps_caustic`, each followed by its figures. `DRY_RUN=1` prints every command and
+runs nothing. Run one stage at a time with nothing else heavy beside it. The budget is an upper cap: the
+auto-tuner also caps it by the memory free when a run starts, so the partition plan depends on what else is open
+(each run log records it).
+
+**One run per snapshot; preflight.** While `run_ps_dtfe.sh` or `run_dtfe.sh` runs a snapshot it holds
+`<prefix>.runlog.lock` (a folder with the driver's pid): a second driver on the same snapshot is refused, and a
+lock left by a killed driver is removed with a note. Before running, the drivers stop with exit 2 when the data
+disk is not mounted, and skip a snapshot (exit 1) whose output folder is not writable or lacks room for its
+grids (`DTFE_SPACE_CHECK=0` skips the space estimate).
+
+**Resuming the pipeline.** `run_ps_pipeline.sh` skips a snapshot only when its outputs are newer than its
+inputs AND its `.runlog` shows the same settings (grid, sub-samples, deposit options, precision; the grids may
+carry more fields than asked for). A changed setting is printed as `was:`/`now:` lines and recomputed. Grids
+without a run log are judged by their file times. `FORCE=1` still recomputes everything.
 
 | knob (environment) | meaning | default |
 |---|---|---|
@@ -434,6 +669,9 @@ Other non-default options add a tag to the output names instead of overwriting t
 | `FIELDS`, `OUTPUT_PREFIX`, `LAMBDA_TH` | the fields, the files' prefix, the web threshold | the production set, `ps_output`, 0.3 |
 | `DTFE_PRECISION` | `double` runs the double-precision pair | `single` |
 | `DRY_RUN` | 1 = print the commands, run nothing | 0 |
+| `DTFE_SPACE_CHECK` | 0 = skip the drivers' free-space check | 1 |
+| `ORDERED_MERGE` | 1 = merge the partitions in index order (bit-reproducible) | 0 |
+| `PS_RESUME` | 0 = start a killed run over instead of resuming it | 1 |
 
 ## Graphical launcher
 
@@ -469,6 +707,59 @@ The **Explore** tab shows any run's grids as maps, whatever its size (a slice is
 
 The **Runs** tab beside the log lists every run found on disk, from its run log: the settings, when it finished, how long it took, its peak memory and the size of its outputs. It marks outputs made before a fix that changed them (for instance grids from GPU runs split into partitions before 29 September 2026, or stream counts made before the fix of 28 September), judged by the build of the program that made them, which every run now records in its log (`Build:`, also printed by `--version`). A run's settings can be loaded back into the Grids tab to repeat it, and its outputs opened in Explore or moved to the Trash. The time a run will take is estimated from comparable earlier runs; the options can be set from **presets** (a quick look, the standard production settings, figure quality, the exact deposit) or saved as new ones, and their descriptions, shown on hovering, are the program's own help text. When a job fails, the window says what probably went wrong (not enough memory, the data disk missing, an old build, a refused iCloud path) with a button that fixes it where it can; a notification says when a long job or the queue has finished. The commands behind a job can also be saved as a bash script, or as a SLURM batch job to run the same thing on a cluster.
 
+
+**Voids on the Explore map.** Tick *voids* to outline the distinct, well-resolved voids of the snapshot shown (the
+analysis pipeline's catalogue, cached). Point at an outline to read its R_v, R_eff and central density contrast;
+click it for the whole entry (every R_v definition the catalogue has, R_eff, central δ, the resolved and distinct
+flags, the centre) and *Go to its centre* for the slice through it. *R_eff too* adds the effective radius as dashed
+circles. The σ box chooses the smoothing the voids are found at: *production* (the analysis scripts' 10 cells) or a
+common physical σ in Mpc for every box, each its own cached catalogue. *Save image* writes the outlines into the PNG
+and a CSV of the voids shown beside it (`<name>_voids.csv`: centre, R_v, R_eff, δ, flags); the figure grid, the
+redshift series included, outlines each panel with its own snapshot's voids. `python/tools/void_outlines.py ...
+--sigma-mpc S --csv voids.csv` gives the same table for a whole snapshot. While a DTFE run is going, Explore asks
+before a query server, an exact zoom or a catalogue build, saying the run's memory and what is free.
+
+**Memory strip and Running now.** The launcher's status bar shows the free memory, swap in use and every DTFE /
+PS-DTFE program running on the Mac with its resident memory, refreshed every five seconds. The 'Running now' tab
+lists every run going, also those started from a terminal or with nohup: simulation, snapshot, phase, partitions
+done, ETA and memory from the binary's progress file beside its outputs, and a Stop button. A run whose process is
+gone but left its progress file reads 'died'. A queue waiting for another run shows that run's ETA.
+
+**Void catalogues in the Runs tab.** The Runs tab's Voids column says whether each run's void catalogue is cached,
+stale (the grids were rewritten after it was built) or absent. 'Build void catalogue' queues a job that builds it
+into the analysis cache (about a minute and 10 GB at 512 cubed; refused when the memory is not free); the same job
+is the Plots tab's 'Void catalogue build' set.
+
+**Void figures in the Plots tab.** Besides the existing void sets, the Plots tab runs the cross-box comparison
+(plot_void_crossbox.py), the void profile evolution, environment and fate figures, and void tracking with the radius
+and smoothing in Mpc.
+
+**Keep-awake.** Custom-snapshot runs, analysis and plot steps and downloads started from the launcher now hold a
+power assertion (caffeinate) for as long as they run, as the run scripts already did.
+
+**Ordered merge.** The Grids, Pipeline and Custom tabs have a tick "Merge the partitions in index order"
+under Resources. A partitioned PS-DTFE run then adds the partitions' grids in partition order whatever order they
+finish in, so two identical runs give bit-identical grids (Grids and Pipeline jobs set ORDERED_MERGE=1 for
+run_ps_dtfe.sh, the Custom tab passes the program's ordered-merge option). It can cost time when the partitions
+differ much in cost. The Runs tab shows "ordered merge" in the Options column, and Load settings restores it.
+
+**Resumable runs.** A partitioned PS-DTFE run that was killed leaves a checkpoint folder
+'<prefix>.runlog.checkpoint' beside its outputs. The Runs tab shows such a run as "resumable"; running the same
+job again continues from the partitions that had finished (run_ps_dtfe.sh resumes by itself when the folder is
+there). The checkpoint is never listed as an output.
+
+**Custom runs in the memory strip.** A run started from the Custom tab now shows in the memory strip, the Running
+now panel and the "already running" warnings, like a run started from a terminal; only the Explore tab's own
+exact zoom is left out. While it runs, the other tabs therefore say a run is going (it is: it occupies the
+machine).
+
+**Exported scripts keep the run log safe.** An exported job script (bash or SLURM) writes each run's log as
+'<prefix>.runlog.partial' and puts it in place when the step ends: '<prefix>.runlog' on success,
+'<prefix>.runlog.failed' on failure, so a failed re-run never overwrites the log of the grids already on disk
+(the same rule the launcher and the run scripts follow).
+
+**Void convergence figure.** The Plots tab lists "Void convergence" (plot_void_convergence.py): the resolution
+and estimator convergence of the void statistics for the selected simulation.
 
 ## Contributors
 * **Marius Cautun (Kapteyn Astronomical Institute, Durham University, Leiden University)** - *code and documentation.*

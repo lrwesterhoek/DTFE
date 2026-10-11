@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # The Linux CI suite, ONE list shared by .github/workflows/ci.yml and the Dockerfile so the two cannot
-# drift. CPU-only: the GPU suites (dtfe_metal_check, gpu_scalar_check, gpu_mass_check) need a GPU build and
-# stay local, as do ps_auto_tune_check and ps_scratch_check (macOS-isms: /usr/bin/time -l, /private/tmp).
+# drift. CPU-only: the GPU suites (dtfe_metal_check, gpu_scalar_check, gpu_mass_check, gpu_retry_check) need a GPU
+# build and stay local (the CUDA/HIP port runs them through its CPU emulation in the ci.yml job cudaemu:
+# tests/cudaemu_check.sh). ps_auto_tune_check and ps_scratch_check run here since 2026-10-11 (ported: the peak RSS from
+# getrusage instead of '/usr/bin/time -l', a temp folder instead of /private/tmp; their GPU parts SKIP).
 #
 #   tests/ci_suite.sh build     the single pair, the double pair (DOUBLE=1) and the 2D pair (DIM=2)
 #   tests/ci_suite.sh core      every CPU suite against ./DTFE and ./PS-DTFE
@@ -10,6 +12,11 @@
 #   tests/ci_suite.sh 2d        tests/ps_2d_check.sh (the 2D pair against analytic 2D flows)
 #   tests/ci_suite.sh gui       the launcher's job specifications; the end-to-end window test too when
 #                               DTFE_GUI_PYTHON names a Python with PySide6 (QT_QPA_PLATFORM=offscreen)
+#   tests/ci_suite.sh oldpy     every .py parses under the oldest supported Python: OLD_PYTHON (CI: setup-python
+#                               3.10), else python3.10 / python3.11 on PATH; none found is a FAILURE here
+#   tests/ci_suite.sh variants  what users build beyond the pairs: PS-DTFE + DTFE with TBB=0 LIBDEFLATE=0 (the
+#                               build without the optional libraries), 'make library' (libDTFE) and the
+#                               demo/examples program linked against it; CI runs it as its own job
 #   tests/ci_suite.sh all       build core double 2d
 # Several stages may be given at once; the first failing suite stops the run (set -e).
 set -euo pipefail
@@ -33,9 +40,11 @@ stage_build() {
 }
 
 # the suites that run the programs (also the double pass); the python ones take --no-build
+# The standard-DTFE regression compares with the STORED reference (tests/reference/regression_periodic.txt, a
+# periodic set without Delaunay ties, to 3e-4 relative: run_tests.py says why) -- until 2026-10-11 it wrote a fresh
+# one here and compared nothing. The double pass compares the same reference (the double build sits 2.7e-5 from it).
 run_program_suites() {
-    local ref; ref="$(mktemp -d)"
-    step "standard DTFE regression";            DTFE_TEST_REFERENCE_DIR="$ref" "$PY" tests/run_tests.py
+    step "standard DTFE regression (stored reference)"; env -u DTFE_TEST_REFERENCE_DIR "$PY" tests/run_tests.py
     step "PS-DTFE smoke test";                  tests/ps_smoke_test.sh --no-build
     step "PS-DTFE regression (analytic pancake)"; "$PY" tests/ps_regression_test.py --no-build
     step "3D crossed waves";                    "$PY" tests/ps_3d_test.py --no-build
@@ -59,7 +68,8 @@ run_program_suites() {
     step "T-web (tidal tensor)";                tests/tweb_check.sh --no-build
     step "interlacing (unit, 2D + 3D)";         tests/interlacing_check.sh
     step "composite server split";              tests/serve_split_check.sh --no-build
-    rm -rf "$ref"
+    step "ordered merge, look-ahead, crash-safe outputs, progress"; tests/ps_runtime_check.sh --no-build
+    step "resume of a killed partitioned run";  tests/ps_resume_check.sh --no-build
 }
 
 # The oldest supported Python (pyproject: >= 3.10) must PARSE every file: a PEP 701 f-string (3.12) is a
@@ -67,7 +77,7 @@ run_program_suites() {
 # review 2026-10-05). Needs a REAL 3.10/3.11 -- ast.parse(feature_version=) under 3.12+ does not catch it.
 old_python_parse() {
     local p
-    for p in python3.10 python3.11; do
+    for p in ${OLD_PYTHON:-} python3.10 python3.11; do
         if command -v "$p" >/dev/null 2>&1 && "$p" -c 'import sys; sys.exit(sys.version_info >= (3, 12))' 2>/dev/null; then
             "$p" - python tests <<'EOF'
 import sys, pathlib
@@ -89,23 +99,58 @@ EOF
         fi
     done
     echo "  no python3.10 / python3.11 on PATH: the oldest-Python parse check skipped"
+    [ "${1:-}" != "required" ]          # the oldpy stage: a skip is a failure (2026-10-11)
 }
 
 stage_core() {
     unset DTFE_TEST_PRECISION
     step "every .py parses under the oldest supported Python"; old_python_parse
     run_program_suites
+    # against the single pair (the double stage does not repeat them): the memory model's predictions against a measured peak,
+    # and the out-of-core accumulators bit-identical to in-RAM runs (2026-10-11, ported to Linux)
+    step "auto-tune (memory model, budget, splits)"; tests/ps_auto_tune_check.sh --no-build
+    step "--scratch-dir (out-of-core accumulators)"; tests/ps_scratch_check.sh --no-build
     # AFTER the program suites: ps_caustic_class_check.sh leaves the crossed-waves run (pcc_out.*) under the
     # temp root, which the caustic-skeleton test's real-grid half reads (else it is a SKIP, not a pass)
     step "dtfelib python suite (synthetic tier; the data-backed tier skips without the T7)"; "$PY" tests/py_dtfelib_test.py
     # the suites' own contract (2026-10-08): skips that DTFE_TEST_REQUIRED=1 turns into failures, which the double
     # stage relies on, and run_tests.py's regression SKIP in a fresh reference folder, which it does not
     step "skip / fail contract of run_tests.py and ps_double_check.sh"; tests/run_tests_check.sh --no-build
+    # the 2026-10-11 void analyses, one suite each (synthetic; the T7 parts skip)
+    step "void catalogue: R_v definitions, cache identity, gate"; MPLBACKEND=Agg "$PY" tests/py_void_core_test.py
+    step "void profiles across z + HSW fits";   MPLBACKEND=Agg "$PY" tests/py_profiles_test.py
+    step "size function theory, cross-box shapes"; MPLBACKEND=Agg "$PY" tests/py_population_test.py
+    step "void environment + caustic control";  MPLBACKEND=Agg "$PY" tests/py_environment_test.py
+    step "void fate: particle links + census";  MPLBACKEND=Agg "$PY" tests/py_fate_test.py
+    step "void convergence: grid, mass, estimator"; MPLBACKEND=Agg "$PY" tests/py_convergence_test.py
+    # 2026-10-11: what the README tells a user to type exists in the code, and the drivers' knobs are documented
+    step "docs drift (README / COMMANDS.md against the code)"; "$PY" tests/docs_drift_check.py
+    # the python analysis stack end to end on a synthetic two-snapshot set (pins its own temp folders; its mirror
+    # check needs the thesis mirror ON, so a DTFE_NO_MIRROR from the caller's shell is dropped)
+    step "python selftest (synthetic pipeline + the core plot scripts)"; env -u DTFE_NO_MIRROR MPLBACKEND=Agg "$PY" python/selftest.py
+}
+
+stage_oldpy() {
+    step "every .py parses under the oldest supported Python (required)"; old_python_parse required
+}
+
+# Compile-only checks of the configurations the main job does not build (2026-10-11). Run in a fresh checkout:
+# the TBB toggle wipes o_ps/ by its stamp, but nothing else here should reuse the pairs' objects.
+stage_variants() {
+    step "build: PS-DTFE + DTFE without TBB and libdeflate (TBB=0 LIBDEFLATE=0)"
+    make DTFE PS-DTFE TBB=0 LIBDEFLATE=0 ARCH_FLAGS="$ARCH" -j"$JOBS"
+    ./DTFE --version; ./PS-DTFE --version
+    step "build: the shared library (make library)"
+    make library ARCH_FLAGS="$ARCH" -j"$JOBS"
+    ls -la libDTFE.* || { echo "no libDTFE built"; exit 1; }
+    step "build: demo/examples against libDTFE (the library's documented use)"
+    make -C demo/examples ARCH_FLAGS="$ARCH"     # a command-line variable reaches its "make library" too (same stamp)
+    ls -la demo/examples/DTFE_particle_density
 }
 
 # after stage_build the pairs EXIST: a suite that would skip for a missing binary or feature is a failure here
-# (DTFE_TEST_REQUIRED=1 turns every skip_or_fail into exit 1; survey rank 20, 2026-10-05 -- except run_tests.py's
-# regression, which SKIPs in a fresh reference folder by design: it has no Linux reference to compare with)
+# (DTFE_TEST_REQUIRED=1 turns every skip_or_fail into exit 1; survey rank 20, 2026-10-05; run_tests.py's regression
+# compares with the stored reference here too since 2026-10-11)
 stage_double() {
     step "the double pair against the single pair"; DTFE_TEST_REQUIRED=1 tests/ps_double_check.sh --no-build
     export DTFE_TEST_PRECISION=double DTFE_TEST_REQUIRED=1
@@ -123,14 +168,18 @@ stage_gui() {
         step "launcher end-to-end (offscreen)"
         QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-offscreen}" DTFE_GUI_TEST_REQUIRED=1 "$DTFE_GUI_PYTHON" tests/py_gui_app_test.py
     fi
+    # the 2026-10-11 launcher additions: their Qt tier runs with PySide6, their pure tier everywhere
+    local gp="${DTFE_GUI_PYTHON:-$PY}"
+    step "Explore: void inspector, outlines, smoothing, memory guard"; QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-offscreen}" "$gp" tests/py_gui_explore_test.py
+    step "launcher: memory strip, Running now, void catalogues, run files"; QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-offscreen}" "$gp" tests/py_gui_app2_test.py
 }
 
-[ "$#" -gt 0 ] || { sed -n '2,14p' "$0"; exit 2; }
+[ "$#" -gt 0 ] || { sed -n '2,18p' "$0"; exit 2; }
 for s in "$@"; do
     case "$s" in
-        build|core|double|2d|gui) "stage_$s" ;;
+        build|core|double|2d|gui|oldpy|variants) "stage_$s" ;;
         all) stage_build; stage_core; stage_double; stage_2d ;;
-        *) echo "unknown stage '$s' (build core double 2d gui all)"; exit 2 ;;
+        *) echo "unknown stage '$s' (build core double 2d gui oldpy variants all)"; exit 2 ;;
     esac
 done
 echo; echo "==== ci_suite: $* PASSED"

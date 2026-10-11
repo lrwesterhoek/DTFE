@@ -44,6 +44,7 @@
 #include <chrono>
 #include <dirent.h>    // autoTuneServe: the cached partition splits of a snapshot
 #include <map>
+#include <set>
 #include <sstream>
 #include "cache_key_lines.h"
 
@@ -367,6 +368,8 @@ struct AutoTuneReport
     int    partition = 1, maxConcurrent = 1;
     double predicted = 0., fixed = 0., budget = 0., pts = 0.;   // bytes
     double perPartition = 0.;   // bytes ONE partition in flight adds (the run's memory gate waits for this much)
+    double lookAhead = 0.;      // bytes the partition look-ahead adds to 'predicted' (0: none runs)
+    double gpuSnapshot = 0.;    // bytes of the GPU deposit's host snapshot, held by ONE partition at a time (in 'predicted')
     double streamsEstimate = -1., streamsBudgeted = 0.;
     std::string line() const
     {
@@ -749,6 +752,15 @@ inline AutoTuneReport autoTunePartitioning(User_options &u,
     bool const psCaust = ps.caustics;
     bool const psExact = ps.exactDeposit;
 
+    // Every buffer in PSGpuGrids, per cell and copy (the GPU deposit's host and device grids). mass 4 + streams 4
+    // = the 8; the fVolW/fCaustic/fExact terms were missing and fVolW is the PRODUCTION default -- 20 B/cell/copy =
+    // 40 after the x2 in partitionBytes(), i.e. 6.7 GB per partition at 1024^3/n=2.
+    double const gridB  = 8. + (psVel ? 12. : 0.) + (psDisp ? 24. : 0.) + (psGrad ? 36. : 0.)
+                        + (psVolW ? 4. : 0.)                              // momw
+                        + (psCaust ? 4. : 0.)                             // caustic
+                        + (psExact ? 4. : 0.)                             // streamvol
+                        + ((psVolW and psDisp) ? 16. : 0.);               // dispvel 12 + dispw 4
+
     // per-partition bytes for an n^3 Lagrangian split
     auto partitionBytes = [&](int n) -> double
     {
@@ -778,14 +790,7 @@ inline AutoTuneReport autoTunePartitioning(User_options &u,
             // + vels 48 when velocity-derived grids are requested; the cost-sort permutes IN PLACE,
             // so no gather copy) + the PSGpuGrids host and device copies of the selected grids
             double const perTet = (72. + (psVel or psDisp or psGrad ? 48. : 0.)) * 1.3;   // + allocator slack
-            // Every buffer in PSGpuGrids, mirrored host+device (the x2 below). mass 4 + streams 4
-            // = the 8; the fVolW/fCaustic/fExact terms were missing and fVolW is the PRODUCTION
-            // default -- 20 B/cell/copy = 40 after the x2, i.e. 6.7 GB per partition at 1024^3/n=2.
-            double const gridB  = 8. + (psVel ? 12. : 0.) + (psDisp ? 24. : 0.) + (psGrad ? 36. : 0.)
-                                + (psVolW ? 4. : 0.)                              // momw
-                                + (psCaust ? 4. : 0.)                             // caustic
-                                + (psExact ? 4. : 0.)                             // streamvol
-                                + ((psVolW and psDisp) ? 16. : 0.);               // dispvel 12 + dispw 4
+            // gridB (above): every buffer in PSGpuGrids, mirrored host+device (the x2 below)
             // + 4 B/cell: the device's mass grid is a 64-bit fixed-point sum (ps_metal_host.cc, 2026-10-08)
             m += perTet*6.77*nOwn + 2.*gridB*subCells + 4.*subCells;
             // --ps-exact-deposit runs depositExactItems (ps_metal_host.cc): a per-tet weight total
@@ -816,6 +821,35 @@ inline AutoTuneReport autoTunePartitioning(User_options &u,
         return m;
     };
 
+    // The GPU deposit's host snapshot (ps_metal_host.cc GpuSnapshot, 2026-10-11): to resume a failed command buffer
+    // the deposit keeps a host copy of every buffer its kernel writes -- the device grids (gridB, with the 8 B
+    // fixed-point mass for the 4 B float one: +4 B/cell), the per-tet masses (4 B/tet) and the exact items' weight
+    // totals (4 B/tet) -- taken at each pass's start and every ~10 s of GPU work. Left out it was ~4.7 GB per
+    // partition at 1024^3 split 2^3 (volume-weighted velocity), past the gate's 4 GB headroom. Not in
+    // partitionBytes(): the deposits run one at a time (ctxMutex), so whatever the concurrency there is ONE such
+    // copy, added once to every plan below. (The CUDA port keeps none yet: there it is slack; the model errs high.)
+    auto snapshotBytes = [&](int n) -> double
+    {
+        if ( not metalActive ) return 0.;
+        double subCells = 1.;   // the same crop + slop as partitionBytes()
+        for (int d=0; d<NO_DIM; ++d)
+            subCells *= std::min( double(outGrid[d]), double(u.gridSize[d])/double(n) + 40. );
+        double const nTet = 6.77 * N / double(n)/double(n)/double(n);
+        return (gridB + 4.)*subCells + (psExact ? 8. : 4.)*nTet;
+    };
+
+    // The partition look-ahead (DTFE.cpp, 2026-10-11): at one partition in flight with the GPU deposit, the NEXT
+    // partition's particle copy + tessellation are built during the deposit -- one more partition's
+    // triangulation stage on top of the peak (the run skips a look-ahead the free memory cannot hold)
+    auto lookAheadBytes = [&](int n, int c) -> double
+    {
+        if ( not metalActive or u.psNoOverlap or u.psLookAheadOffBudget or c != 1 or n <= 1 ) return 0.;
+        double fPad = 1.;
+        for (int d=0; d<NO_DIM; ++d)
+            fPad *= 1. + 2.*std::max( 0.3, padFrac[d]*double(n) );
+        return N / double(n)/double(n)/double(n) * fPad * (partBytes + kDT);
+    };
+
     // what a given split and concurrency cost; the concurrency the run WILL use (0 = all cores)
     auto finishReport = [&](int n, int c) -> AutoTuneReport
     {
@@ -826,7 +860,26 @@ inline AutoTuneReport autoTunePartitioning(User_options &u,
         // the old product put a 0.26M-particle run at 52 GB and the GUI's memory check believed it)
         int const inFlight = std::min( report.maxConcurrent, report.partition*report.partition*report.partition );
         report.perPartition = partitionBytes( report.partition );
-        report.predicted = fixed + double(inFlight) * report.perPartition;
+        report.gpuSnapshot = snapshotBytes( report.partition );   // once: the GPU deposits run one at a time
+        double const base = fixed + report.gpuSnapshot + double(inFlight) * report.perPartition;
+        report.lookAhead = lookAheadBytes( report.partition, inFlight );
+        // 2026-10-11: the split above is chosen without the look-ahead, which used to be added here anyway --
+        // a plan that fitted then reported over_budget=1 (the launcher's memory check halved a plane that
+        // fits) and the run went past a budget set on purpose. Every return passes here, so this is where the
+        // plan, its prediction and the run are made to agree: a look-ahead that does not fit beside one
+        // partition is switched off for this run (DTFE.cpp reads psLookAheadOffBudget), and the prediction
+        // is then the grids + particles + one partition. Over budget anyway, the look-ahead only adds to it.
+        if ( report.lookAhead > 0. and base + report.lookAhead > budget )
+        {
+            message << MESSAGE::cBold() << "AUTO-TUNE:" << MESSAGE::cReset() << " look-ahead off for this run: one "
+                    << "partition (~" << report.perPartition/1.e9 << " GB) plus the next one's tessellation (~"
+                    << report.lookAhead/1.e9 << " GB) does not fit the " << (budget - fixed)/1.e9 << " GB the "
+                    << "memory budget leaves beside the grids and particles; partitions are prepared in turn.\n"
+                    << MESSAGE::Flush;
+            u.psLookAheadOffBudget = true;
+            report.lookAhead = 0.;
+        }
+        report.predicted = base + report.lookAhead;
         return report;
     };
     int const userC = u.maxConcurrent > 0 ? u.maxConcurrent : cores;
@@ -914,7 +967,8 @@ inline AutoTuneReport autoTunePartitioning(User_options &u,
     // on a very fine grid (1700^3 from 0.26M particles) one domain's sub-grid accumulators and the
     // deposit threads' private copies are tens of GB, and only a split shrinks them. Such a run takes
     // the memory-driven split below instead (it predicted 83 GB unsplit, over budget, before 2026-10-02).
-    bool const smallFits = not autoPart or fixed + partitionBytes( std::max( 1, nGpuMin ) ) <= budget;
+    bool const smallFits = not autoPart or fixed + snapshotBytes( std::max( 1, nGpuMin ) )
+                                           + partitionBytes( std::max( 1, nGpuMin ) ) <= budget;
     if ( N < minN and smallFits )     // small particle set AND the grid fits: one domain, or a split for SPEED
     {
         if ( not autoPart )
@@ -961,14 +1015,14 @@ inline AutoTuneReport autoTunePartitioning(User_options &u,
         {
             bestN = nGpuMin;
             bestC = std::max( 1, std::min( { nGpuMin*nGpuMin*nGpuMin, cores,
-                                               int( std::floor( (budget - fixed) / partitionBytes(nGpuMin) ) ) } ) );
+                                               int( std::floor( (budget - fixed - snapshotBytes(nGpuMin)) / partitionBytes(nGpuMin) ) ) } ) );
             if ( not autoConc ) bestC = std::min( bestC, userC > 0 ? userC : cores );
             bestT = predictedWall( nGpuMin, bestC );
         }
         for (int n = std::max( 2, nGpuMin ); n <= std::max( 3, nGpuMin ); ++n)
         {
             int c = std::min( n*n*n, cores );
-            int const cMem = int( std::floor( (budget - fixed) / partitionBytes(n) ) );
+            int const cMem = int( std::floor( (budget - fixed - snapshotBytes(n)) / partitionBytes(n) ) );
             if ( cMem < 1 ) continue;
             c = std::min( c, cMem );
             if ( not autoConc ) c = std::min( c, userC > 0 ? userC : cores );
@@ -986,13 +1040,13 @@ inline AutoTuneReport autoTunePartitioning(User_options &u,
                           "%s grid on the GPU: --partition %d %d %d --max-concurrent %d keeps each partition's "
                           "sub-grid under the 2^32 cells the GPU kernels number (~%.3g cells; predicted peak ~%.3g GB)",
                           MESSAGE::printElements( u.gridSize, "x" ).c_str(), bestN, bestN, bestN, u.maxConcurrent,
-                          gpuSubCells(bestN), (fixed + double(bestC)*partitionBytes(bestN))/1.e9 );
+                          gpuSubCells(bestN), (fixed + snapshotBytes(bestN) + double(bestC)*partitionBytes(bestN))/1.e9 );
             else
                 snprintf( buf, sizeof(buf),
                           "%.3g particles: triangulation-bound, so --partition %d %d %d --max-concurrent %d "
                           "(predicted %.2g s against %.2g s for one triangulation; predicted peak ~%.3g GB)",
                           N, bestN, bestN, bestN, u.maxConcurrent, bestT, single,
-                          (fixed + double(bestC)*partitionBytes(bestN))/1.e9 );
+                          (fixed + snapshotBytes(bestN) + double(bestC)*partitionBytes(bestN))/1.e9 );
             message << "\n" << MESSAGE::cBold() << "AUTO-TUNE:" << MESSAGE::cReset() << " " << buf
                     << ". Pass --partition 1 1 1 for one triangulation.\n" << MESSAGE::Flush;
             return finishReport( bestN, autoConc ? bestC : userC );
@@ -1016,7 +1070,7 @@ inline AutoTuneReport autoTunePartitioning(User_options &u,
                   "--max-concurrent %d (smallest partition, ~%.3g GB; predicted peak ~%.3g GB%s)",
                   N, MESSAGE::printElements( u.gridSize, "x" ).c_str(), ramBytes/1.e9, budget/1.e9,
                   bestN, bestN, bestN, u.maxConcurrent, partitionBytes(bestN)/1.e9,
-                  (fixed + partitionBytes(bestN))/1.e9, metalActive ? ", GPU deposit" : "" );
+                  (fixed + snapshotBytes(bestN) + partitionBytes(bestN))/1.e9, metalActive ? ", GPU deposit" : "" );
         message << "\n" << MESSAGE::cBold() << "AUTO-TUNE:" << MESSAGE::cReset() << " " << buf
                 << ". Pass --partition/--max-concurrent to override.\n           memory budget: "
                 << budgetWhy << "\n" << MESSAGE::Flush;
@@ -1037,7 +1091,7 @@ inline AutoTuneReport autoTunePartitioning(User_options &u,
     for (int n=nLo; n<=nHi; ++n)
     {
         double const m = partitionBytes(n);
-        int cMem = int( std::floor( (budget - fixed) / m ) );
+        int cMem = int( std::floor( (budget - fixed - snapshotBytes(n)) / m ) );
         int c = std::min( { targetC, n*n*n, cMem } );
         if ( c > bestC or bestN<0 )
         {
@@ -1071,7 +1125,9 @@ inline AutoTuneReport autoTunePartitioning(User_options &u,
 
     // the concurrency the run WILL use: the tuner's, or the user's own (0 = all cores)
     int const effC = autoConc ? bestC : userC;
-    double const predicted = fixed + double(effC)*partitionBytes(bestN);
+    // the report first: it decides whether the look-ahead fits the budget, and the message states its prediction
+    AutoTuneReport const decided = finishReport( bestN, effC );
+    double const predicted = decided.predicted;
     char scratchNote[256] = "";
     if ( scratchOn )
         snprintf( scratchNote, sizeof(scratchNote), "; grid accumulators (%.3g GB) on scratch disk",
@@ -1089,7 +1145,7 @@ inline AutoTuneReport autoTunePartitioning(User_options &u,
     message << "\n" << MESSAGE::cBold() << "AUTO-TUNE:" << MESSAGE::cReset() << " " << buf
             << ". Pass --partition/--max-concurrent to override.\n           memory budget: "
             << budgetWhy << "\n" << MESSAGE::Flush;
-    return finishReport( bestN, effC );
+    return decided;
 
 #else
     // ---- standard DTFE: partitions are processed SERIALLY (memory knob); inside one partition
@@ -1168,15 +1224,27 @@ inline AutoTuneReport autoTunePartitioning(User_options &u,
    adds (AutoTuneReport::perPartition) AND another partition is in flight (whose finishing frees memory). With
    none in flight it always starts, saying so: the gate can delay, never deadlock. A skipped partition and the
    speed split's ordered merge never pass it; a cache-only one does (its loaded tessellation holds the same
-   memory). need = 0 (no auto-tune estimate: a user-given --partition) disables it. */
+   memory). need = 0 (no auto-tune estimate: a user-given --partition) disables it.
+   ORDERED (--ordered-merge, 2026-10-11): a finished partition waits for every lower-numbered one to merge while
+   it still holds its memory, so a partition waiting here for a HIGHER-numbered one to free memory could wait
+   forever; in that mode a partition waits only while a lower-numbered one is in flight (those never wait for it). */
 struct PartitionMemoryGate
 {
     double need = 0., headroom = 4.e9;
+    bool ordered = false;
     std::mutex m;
     std::condition_variable cv;
     int inFlight = 0, held = 0;
+    std::multiset<int> flying;   // the in-flight partition indices (the ordered mode's blockers)
     bool saidAlone = false;
-    explicit PartitionMemoryGate(double needBytes) : need(needBytes) {}
+    explicit PartitionMemoryGate(double needBytes, bool orderedMerge = false) : need(needBytes), ordered(orderedMerge) {}
+
+    // the in-flight partitions whose finishing this one may wait for
+    int blockers(int partition) const
+    {
+        if ( not ordered ) return inFlight;
+        return int( std::distance( flying.begin(), flying.lower_bound( partition ) ) );
+    }
 
     void enter(int partition, int verbose)
     {
@@ -1185,7 +1253,7 @@ struct PartitionMemoryGate
         {
             bool waited = false;
             double free = autoTuneSystemFree();
-            while ( free >= 0. and free - headroom < need and inFlight > 0 )
+            while ( free >= 0. and free - headroom < need and blockers( partition ) > 0 )
             {
                 if ( not waited )
                 {
@@ -1199,7 +1267,7 @@ struct PartitionMemoryGate
                 cv.wait_for( lock, std::chrono::seconds(2) );
                 free = autoTuneSystemFree();
             }
-            if ( free >= 0. and free - headroom < need and inFlight == 0 and not saidAlone )
+            if ( free >= 0. and free - headroom < need and blockers( partition ) == 0 and not saidAlone )
             {
                 saidAlone = true;
                 if ( verbose > 0 )
@@ -1209,10 +1277,16 @@ struct PartitionMemoryGate
             }
         }
         ++inFlight;
+        flying.insert( partition );
     }
-    void leave()
+    void leave(int partition)
     {
-        { std::lock_guard<std::mutex> lock( m ); --inFlight; }
+        {
+            std::lock_guard<std::mutex> lock( m );
+            --inFlight;
+            auto const it = flying.find( partition );
+            if ( it != flying.end() ) flying.erase( it );
+        }
         cv.notify_all();
     }
 };

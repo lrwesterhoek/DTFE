@@ -19,6 +19,12 @@ the map's frame), R_v and R_eff in Mpc (null where there is none), 'resolved' (t
 deeper resolved void, one without R_v claiming its R_eff; the sample of the profiles and the abundance), the
 central delta, and the frame and smoothing they were found at. Exit 1 with the reason on stderr when there is no
 catalogue (no grids, no snapshot header).
+
+--sigma-mpc S finds the voids at a smoothing of S Mpc instead of the production one (the same physical scale in
+every box: the cross-box comparison), cached under that smoothing's own namespace; 'r_v_defs' carries every R_v
+definition the catalogue has (catalog.R_V_DEFINITIONS once it exists: 'crossing', 'delta08', 'ridge'). --csv PATH
+also writes the table of the voids (write_csv: centre, the R_v's, R_eff, delta, the flags), as the launcher's
+Explore map does for the voids it shows (2026-10-11).
 """
 
 import argparse
@@ -65,30 +71,104 @@ def available_bytes():
     return None
 
 
-def needs_build(prod) -> bool:
-    """voids() would BUILD the catalogue (none cached for this grid, or one without R_v), not read it."""
+_R_V_KEYS = ("r_v_settings", "r_v_cells", "r_v_delta08_cells", "r_v_ridge_cells")   # what catalog_r_v_ok reads
+
+
+def r_v_stale(path) -> str | None:
+    """Why voids() would re-measure the radii of the cached catalogue at 'path' (the pipeline's own test,
+    pipeline.catalog_r_v_ok: today's R_v settings and all three radii), None when it reads them as they are. Only
+    the four keys are loaded (an npz loads per key), so the Runs tab's status stays cheap (2026-10-11: testing for
+    'r_v_cells' alone called a cache with older R_v settings, or none recorded, 'cached')."""
     import numpy as np
+    from dtfelib import pipeline
+    with np.load(path) as z:
+        cat = {k: z[k] for k in _R_V_KEYS if k in z.files}
+    if pipeline.catalog_r_v_ok(cat):
+        return None
+    if "r_v_cells" not in cat:
+        return "built before the measured radius R_v"
+    if "r_v_settings" not in cat:
+        return "R_v measured before its settings were recorded (re-measured on next read)"
+    return "R_v measured with older settings (re-measured on next read)"
+
+
+def needs_build(prod) -> bool:
+    """voids() would BUILD the catalogue (none cached for this grid) or re-measure its radii from the smoothed field
+    (r_v_stale), not just read it: either reads the density grid and smooths it, so the memory gate applies."""
     p = prod._cached("voids")
-    if p is None:
-        return True
-    with np.load(p) as z:
-        return "r_v_cells" not in z.files
+    return p is None or r_v_stale(p) is not None
 
 
 def _finite_or_none(x):
     return [float(v) if v == v else None for v in x]      # NaN -> null: JSON has no NaN
 
 
-def outlines(sim, snap, prefix=None, data_root=None, method="auto") -> dict:
+def r_v_definitions(cat) -> dict:
+    """{definition: R_v in Mpc} for every R_v definition the catalogue HAS ('crossing' always, the first up-crossing of
+    the mean; 'delta08' and 'ridge' only once catalog.R_V_DEFINITIONS exists and the cache holds them, contract C3):
+    a definition that is NaN everywhere (the key absent from an older cache) is left out, not shown as 'none'."""
+    import numpy as np
+    from dtfelib import catalog
+    defs = getattr(catalog, "R_V_DEFINITIONS", ("crossing",))
+    out = {}
+    for d in defs:
+        try:
+            r = catalog.r_v_mpc(cat) if d == "crossing" else catalog.r_v_mpc(cat, definition=d)
+        except (TypeError, KeyError, ValueError):
+            continue
+        r = np.asarray(r, dtype=np.float64)
+        if d == "crossing" or np.isfinite(r).any():
+            out[d] = r
+    return out
+
+
+CSV_HEAD = ("void", "x_mpc", "y_mpc", "z_mpc")
+
+
+def write_csv(res: dict, path, rows=None) -> str:
+    """The voids of an outlines() result as a CSV table (one row per void; 'rows' = the catalogue rows to write, all
+    by default): the centre (cell centre, Mpc), R_v (the 'crossing' definition) and every other R_v definition the
+    result has, R_eff, the central delta, resolved and distinct (0/1). Empty fields where a value is undefined. A
+    '#' line first says the snapshot, the frame and the smoothing, so a quoted number can be traced back."""
+    import csv
+    path = Path(path)
+    n = len(res["centres_mpc"])
+    rows = range(n) if rows is None else [int(k) for k in rows]
+    defs = {d: v for d, v in (res.get("r_v_defs") or {}).items() if d != "crossing"}
+    head = list(CSV_HEAD) + ["r_v_mpc"] + [f"r_v_{d}_mpc" for d in defs] + ["r_eff_mpc", "delta", "resolved", "distinct"]
+
+    def num(v):
+        return "" if v is None or v != v else f"{float(v):.6g}"
+    with open(path, "w", newline="") as f:
+        f.write(f"# {res.get('sim', '')} snapshot {res.get('snap', '')} {res.get('method', '')}"
+                f"{(' prefix ' + res['prefix']) if res.get('prefix') else ''}: box {num(res.get('box_mpc'))} Mpc, "
+                f"{res.get('n_grid', '')}^3 cells, sigma {num(res.get('sigma_mpc'))} Mpc; centres = cell centres; "
+                f"R_v = first up-crossing of the mean, R_eff = (a b c)^(1/3) of the resolved ellipsoid\n")
+        w = csv.writer(f)
+        w.writerow(head)
+        for k in rows:
+            c = res["centres_mpc"][k]
+            w.writerow([k] + [num(v) for v in c] + [num(res["r_v_mpc"][k])] + [num(v[k]) for v in defs.values()]
+                       + [num(res["r_eff_mpc"][k]), num(res["delta"][k]), int(bool(res["resolved"][k])),
+                          int(bool(res["distinct"][k]))])
+    return str(path)
+
+
+def outlines(sim, snap, prefix=None, data_root=None, method="auto", sigma_mpc=None) -> dict:
+    """The voids of one snapshot's grids (the module docstring); sigma_mpc > 0 = that smoothing in Mpc (set BEFORE
+    the frame is adopted, which keeps it in Mpc), None or 0 = the production one."""
     import numpy as np
     from dtfelib import pipeline, catalog
+    if sigma_mpc:
+        pipeline.set_smoothing(mpc=float(sigma_mpc))
     prod = pipeline.products(int(snap), sim=sim, method=method, prefix=prefix, data_root=data_root)
     try:
         cell, box, n = pipeline.adopt_snapshot_grid(prod)
         if needs_build(prod):
             need, free = BUILD_BYTES_PER_CELL * float(n) ** 3, available_bytes()
             if free is not None and need > free - HEADROOM_BYTES:
-                raise MemoryError(f"its catalogue is not cached, and building it ({n}^3) needs about {need / 1e9:.0f} GB "
+                raise MemoryError(f"its catalogue is not cached (or its R_v is re-measured), and building it ({n}^3) "
+                                  f"needs about {need / 1e9:.0f} GB "
                                   f"with {free / 1e9:.0f} GB free: build it with the analysis scripts when the machine is "
                                   f"free (analyze.py compute), then tick again")
         cat = prod.voids()
@@ -97,6 +177,7 @@ def outlines(sim, snap, prefix=None, data_root=None, method="auto") -> dict:
         prod.release()
     resolved = np.asarray(cat["well_resolved"]).astype(bool)
     r_v, r_eff = catalog.r_v_mpc(cat), catalog.r_eff_mpc(cat)
+    defs = r_v_definitions(cat)
     distinct = catalog.distinct_mask(cat, resolved & np.isfinite(r_v), n)
     centres = (np.asarray(cat["coords"], dtype=np.float64) + 0.5) * cell
     return {"sim": sim, "snap": int(snap), "prefix": prefix or "", "method": method, "box_mpc": box, "cell_mpc": cell,
@@ -104,7 +185,9 @@ def outlines(sim, snap, prefix=None, data_root=None, method="auto") -> dict:
             "namespace": pipeline._param_hash(), "centres_mpc": centres.round(6).tolist(),
             "r_v_mpc": _finite_or_none(r_v), "r_eff_mpc": _finite_or_none(r_eff),
             "resolved": resolved.tolist(), "distinct": distinct.tolist(),
-            "delta": _finite_or_none(np.asarray(cat["delta_values"], dtype=np.float64))}
+            "delta": _finite_or_none(np.asarray(cat["delta_values"], dtype=np.float64)),
+            "sigma_asked_mpc": float(sigma_mpc) if sigma_mpc else 0.0,
+            "r_v_defs": {d: _finite_or_none(v) for d, v in defs.items()}}
 
 
 def main(argv=None):
@@ -115,6 +198,9 @@ def main(argv=None):
     p.add_argument("--prefix", default=None, help="the grid set's output prefix (default the method's)")
     p.add_argument("--data-root", type=Path, default=None, help="the data root (default DTFE_DATA_ROOT's)")
     p.add_argument("--cache-dir", type=Path, default=None, help="the catalogue cache (default config.CACHE_DIR)")
+    p.add_argument("--sigma-mpc", type=float, default=0.0,
+                   help="the smoothing in Mpc (default 0: the production smoothing, the thesis's catalogue)")
+    p.add_argument("--csv", type=Path, default=None, help="also write the table of all voids (write_csv) here")
     a = p.parse_args(argv)
     if os.environ.get("DTFE_SIM") != a.sim:
         raise SystemExit(f"run with DTFE_SIM={a.sim}: config reads the box for the simulation it names")
@@ -124,10 +210,12 @@ def main(argv=None):
     import zipfile
     try:
         with contextlib.redirect_stdout(sys.stderr):          # the pipeline's progress lines: not on the JSON line
-            res = outlines(a.sim, a.snap, a.prefix, a.data_root, a.method)
+            res = outlines(a.sim, a.snap, a.prefix, a.data_root, a.method, a.sigma_mpc)
     # a damaged cache member (pipeline._cached reads only the stamp) is a reason, not a traceback (2026-10-08)
     except (OSError, ValueError, KeyError, MemoryError, EOFError, zipfile.BadZipFile) as e:
         raise SystemExit(f"no void catalogue for {a.sim} snapshot {a.snap}: {e}")
+    if a.csv is not None:
+        write_csv(res, a.csv)
     sys.stdout.write(json.dumps(res) + "\n")
 
 

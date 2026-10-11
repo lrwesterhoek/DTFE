@@ -256,12 +256,19 @@ struct User_options
 #ifdef PHASE_SPACE
     Box    lagrangianRegion; // unpadded Lagrangian partition region (PS-DTFE cell ownership check)
     double psLagAlphaRadius; // the --ps-alpha-shape cut in Lagrangian length (c x mean spacing, set for non-periodic runs; 0 = no cut)
+    bool   psTessellationPrebuilt;   // set by psInterpolatePrebuilt (triangulation.cpp): the partition look-ahead built the tessellation already, so DTFE_interpolation skips buildTessellation (2026-10-11)
     bool   psMayClearDT;     // set by the DTFE_interpolation overload that OWNS its triangulation: the last interpolateGrid_phaseSpace call may clear the DT right after its deposit (frees ~650 B/vertex before the merge phase). Never set when the caller keeps the triangulation (TRIANGULATION library API).
     bool   psSuppressGridStats; // PS-DTFE partition path: silence per-partition coverage/stream stats (each covers ~1/Npart of the grid); aggregate reported once after the loop
     bool   psCacheOnly = false;  // PS-DTFE partition path: the partition's particles were NOT selected because its cached tessellation's header matched -- a load that then fails is an error, never an empty build (internal, no option)
     bool   psUseSubgrid;        // PS-DTFE partition path: allocate only each partition's Eulerian bounding box, mapped back via addFromSubgrid -> lower peak memory
-    double psPartitionBytes;    // PS-DTFE partition path: what ONE partition in flight adds (the auto-tuner's estimate); the memory gate before each partition waits for this much free memory (0 = no estimate: no gate)
-    bool   psOrderedMerge;      // PS-DTFE partition path: merge the partitions' grids in index order (bit-reproducible sums). Set by the auto-tuner's SPEED split of a small set, whose uniform partitions wait for each other at no cost; a memory-driven split of a large set merges in completion order (waiting behind a slow partition cost the TNG region's GPU grid 35%; the merge's adds then follow the completion order, so the grids differ run to run in the last bits, even the exact Metal mass grid: 2026-10-08)
+    double psPartitionBytes;    // PS-DTFE partition path: what ONE partition in flight adds (the auto-tuner's estimate, + the GPU deposit's host snapshot once); the memory gate before each partition waits for this much free memory (0 = no estimate: no gate)
+    bool   psOrderedMerge;      // PS-DTFE partition path: merge the partitions' grids in index order (bit-reproducible sums). '--ordered-merge' (2026-10-11), or set by the auto-tuner's SPEED split of a small set, whose uniform partitions wait for each other at no cost; a memory-driven split of a large set merges in completion order by default (waiting behind a slow partition cost the TNG region's GPU grid 35%; the merge's adds then follow the completion order, so the grids differ run to run in the last bits, even the exact Metal mass grid: 2026-10-08)
+    bool   psOrderedMergeFlag;  // the user gave --ordered-merge (psOrderedMerge is then set too); unlike the speed split, such a run keeps the memory gate (DTFE.cpp)
+    bool   psResume;            // --resume (2026-10-11): continue a killed partitioned run from its checkpoint ('<output>.runlog.checkpoint', partition_checkpoint.h); turns psOrderedMerge + psOrderedMergeFlag on
+    bool   psNoCheckpoint;      // no partition checkpoints (2026-10-11): set under '--interlace', whose two passes (the second on a half-cell-shifted grid) would share one checkpoint and key; a copy of the options keeps it when main.cpp clears 'interlace' for the second pass
+    bool   psNoOverlap;         // --ps-no-overlap: no look-ahead tessellation of partition k+1 while partition k deposits on the GPU (DTFE.cpp, 2026-10-11)
+    bool   psLookAheadOffBudget; // set by the auto-tuner (2026-10-11): one partition plus the look-ahead's tessellation does not fit the memory budget, so this run has no look-ahead (its predicted peak counts none)
+    double psLookAheadRoom;     // what the memory budget leaves beside the grids, particles and ONE partition (the auto-tuner's budget - fixed - perPartition): the look-ahead runs only when it holds no more (DTFE.cpp; HUGE_VAL = no budget known, 2026-10-11)
     bool   psDeferNormalization; // PS-DTFE partition path: keep fields as density-weighted moments (no per-partition normalize) so they sum linearly and normalize once afterwards; correct for multi-stream cells spanning partitions
 #endif
     Box    paddedBox;      // dimensions of the padded box
@@ -274,6 +281,7 @@ struct User_options
     int    threadId;       // thread id for parallel processes
     Real   totalTime;      // total CPU time used by the program
     std::string programOptions; // all program options supplied by the user
+    std::vector<std::string> commandTokens; // argv[1..] one token each: the settings key of a partition checkpoint (partition_checkpoint.h, 2026-10-11)
     
     
     

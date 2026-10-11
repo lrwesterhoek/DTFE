@@ -58,6 +58,10 @@ int psGpuFallbacksTaken(bool reset)
     return reset ? psGpuFallbacks.exchange( 0 ) : psGpuFallbacks.load();
 }
 
+// Failed GPU deposit attempts of this run (run_progress.h: the progress sidecar's gpu_retries), counted by
+// the GPU hosts (ps_metal_host.cc, ps_gpu_cuda.cu). 2026-10-11
+std::atomic<int> psGpuRetries{ 0 };
+
 // The finite cells (3D) / faces (2D) around a vertex, appended to 'out'.
 template <class Tr, class V>
 static inline void psFiniteIncidentCells(Tr const &dt, V const &vh, std::vector<Cell_handle> &out)
@@ -2994,7 +2998,8 @@ void interpolateGrid_phaseSpace(DT &dt,
     // Mass conservation makes the box mean 1 for any nSub, up to the accumulators (2026-10-08: this
     // said "exactly 1"; TNG50-3-Dark z=0 on the GPU gave 0.99941). The Metal deposit's mass grid is an
     // exact fixed-point sum and the double build's sums are good to ~1e-15, but a FLOAT accumulator -- the
-    // CPU deposit of the single-precision build, the CUDA/HIP port, PS_METAL_FLOAT_MASS=1 -- drops every
+    // CPU deposit of the single-precision build, PS_METAL_FLOAT_MASS=1 / PS_GPU_FLOAT_MASS=1 (the CUDA/HIP port has
+    // the fixed-point grid too since 2026-10-11) -- drops every
     // share below half an ulp of a busy cell's running sum, always downward (~0.1% at 1e6 deposits into one
     // cell, ~2% at 1e7). Tetrahedra the cell filters drop take their mass along in every build.
     // Stream count is averaged over the nSub^NO_DIM sub-samples below.

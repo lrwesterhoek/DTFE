@@ -5,6 +5,8 @@
     python3 analyze.py plot [--only ...]     # phase 2: all figures from the cache
     python3 analyze.py all                   # compute (own subprocess) followed by plot
     python3 analyze.py export [snap ...]     # the void catalogues as CSV + HDF5 (figures/void_catalog/<sim>/)
+    python3 analyze.py voids [--only ...]    # the void-population scripts (VOID_SCRIPTS) for config's simulation
+    python3 analyze.py cache [--prune [--yes]]   # the cache namespaces, sizes, and which no current setting reaches
 
 Phase 1 does the expensive 512^3 work once per snapshot into python/cache/<param-hash>/;
 phase 2 reads the cache. Changing sigma/footprint/criterion in config.py changes the hash
@@ -15,6 +17,16 @@ compute and export take config's ladder where the snapdir exists.
 The core figures' names carry neither the simulation nor the estimator, so the thesis
 Figures/ tree takes them only from config.THESIS_SIMULATION's standard-DTFE grids
 (config.THESIS_METHOD); --no-mirror copies nothing there.
+
+'voids' runs VOID_SCRIPTS with --sim config.SIMULATION (DTFE_SIM): each writes per-simulation folders and tags a
+non-default smoothing itself, so DTFE_SIGMA_MPC is allowed there. A script named there (or in --only) that is not in
+python/plot yet is skipped with a note, not failed (2026-10-11: the profile-evolution, environment and fate figures
+were written alongside).
+
+'cache' (2026-10-11) lists python/cache's namespaces with their sizes and whether today's code can still reach
+them (cache_inventory: an older '_v<N>' format, or a smoothing no current setting produces); '--prune' is a DRY RUN
+listing what would be deleted and its size, and only '--prune --yes' deletes. '--keep-mpc' / '--keep-cells' count
+more smoothings as current.
 """
 
 import argparse
@@ -43,6 +55,20 @@ PLOT_SCRIPTS = [
     'plot_smoothing_comparison.py',
     'plot_phi_delta.py',
     'plot_tidal_correlation.py'
+]
+
+# The void-population scripts, run by 'voids' (2026-10-11), in this order: the catalogue statistics first (the
+# population script also draws the size function), then the profiles, their evolution, the environment (S/R
+# types), the fate census and the convergence check of the void statistics across resolution and estimator
+# (plot_void_convergence.py, contract K4, 2026-10-11 afternoon; default arguments '--sim <SIM>' like the others).
+# Registered by name; a missing one is skipped with a note (run_scripts).
+VOID_SCRIPTS = [
+    'plot_void_population.py',
+    'plot_void_profiles.py',
+    'plot_void_profile_evolution.py',
+    'plot_void_environment.py',
+    'plot_void_fate.py',
+    'plot_void_convergence.py',
 ]
 
 # the grids the core scripts read, after the estimator's prefix (ESTIMATOR_PREFIX)
@@ -247,6 +273,190 @@ def export(snaps, out_dir=None, formats=("csv", "hdf5")):
         sys.exit(1)
 
 
+# ---------------------------------------------------------------- cache (list / prune the namespaces)
+
+# The physical smoothings (Mpc) today's code asks for by default: the cross-box comparison's sigma
+# (plot_void_crossbox.DEFAULT_SIGMA_MPC, runspec.CROSSBOX_SMOOTH_MPC, scripts/thesis_runs.sh). A namespace made with
+# another Mpc value (2.16 on 2026-10-11 morning: r512_s21.4043_f23 next to 2.1625's r512_s21.4291_f23) is reached only
+# by typing that value again; 'cache --keep-mpc' and DTFE_SIGMA_MPC add values.
+CACHE_SMOOTHING_MPC = (2.1625,)
+NAMESPACE_RE = r"^r(?P<res>\d+)_s(?P<sig>[^_]+)_f(?P<fp>\d+)_(?P<crit>.+)_g(?P<g>[^_]+)_v(?P<ver>\d+)$"
+
+
+def _dir_size(path):
+    """(bytes, files) under 'path' (files only, links not followed)."""
+    total, n = 0, 0
+    for p in Path(path).rglob('*'):
+        if p.is_file() and not p.is_symlink():
+            total += p.stat().st_size
+            n += 1
+    return total, n
+
+
+def _human(nbytes):
+    for unit in ('B', 'KB', 'MB', 'GB'):
+        if nbytes < 1024 or unit == 'GB':
+            return f"{nbytes:.0f} {unit}" if unit == 'B' else f"{nbytes:.1f} {unit}"
+        nbytes /= 1024.0
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, ValueError, OverflowError):
+        return True                                 # another user's process, or not a pid: not ours to call dead
+    return True
+
+
+def cache_inventory(root=None, keep_mpc=(), keep_cells=()):
+    """Every entry of the pipeline cache (config.CACHE_DIR) with a verdict (2026-10-11, contract K5): a list of
+    {'path', 'kind' ('namespace' / 'file'), 'bytes', 'files', 'newest', 'prune' (bool), 'reason'}.
+
+    A NAMESPACE (r<N>_s<sigma>_f<footprint>_<criterion>_g<threshold>_v<version>, pipeline._param_hash) is UNREACHABLE,
+    and pruned, when
+      * its version is not today's ('_v1': the format before the June unit overhaul; nothing reads it), or
+      * no smoothing today's code asks for produces its sigma/footprint: the production one (config.PRODUCTION_SMOOTHING),
+        a --smooth in cells with the production footprint for config.SMOOTHING_COMPARISON_SIGMAS (+ keep_cells), or a
+        smoothing in Mpc -- CACHE_SMOOTHING_MPC, DTFE_SIGMA_MPC and keep_mpc -- for a simulation whose files it holds
+        (round(mpc / cell, 9) cells, config.footprint_for), the way config / pipeline.set_smoothing spell it.
+    Another resolution, criterion or gradient threshold is a config change away: kept. Inside a kept namespace a FILE
+    is pruned when it is an interrupted save's temp file ('<name>.npz.<pid>.tmp.npz', pipeline._save_npz) whose
+    process is gone, or a fate link (lagrangian) of an older LINK_VERSION, which cached_link never serves."""
+    import re
+    root = Path(config.CACHE_DIR if root is None else root)
+    out = []
+    if not root.is_dir():
+        return out
+    from dtfelib import pipeline
+    m_now = re.match(NAMESPACE_RE, pipeline._param_hash())
+    sig0, fp0 = config.PRODUCTION_SMOOTHING
+    cells_ok = {f"{float(c):g}" for c in (sig0, *config.SMOOTHING_COMPARISON_SIGMAS, *keep_cells)}
+    mpcs = list(CACHE_SMOOTHING_MPC) + [float(m) for m in keep_mpc]
+    if os.environ.get('DTFE_SIGMA_MPC'):
+        mpcs.append(float(os.environ['DTFE_SIGMA_MPC']))
+    try:
+        from dtfelib.lagrangian import LINK_VERSION
+    except ImportError:                             # h5py / scipy missing: the link check is left out, not guessed
+        LINK_VERSION = None
+    for d in sorted(p for p in root.iterdir() if p.is_dir()):
+        m = re.match(NAMESPACE_RE, d.name)
+        nbytes, nfiles = _dir_size(d)
+        files = [p for p in d.iterdir() if p.is_file()]
+        newest = max((p.stat().st_mtime for p in files), default=d.stat().st_mtime)
+        entry = {'path': d, 'kind': 'namespace', 'bytes': nbytes, 'files': nfiles, 'newest': newest}
+        if m is None:
+            out.append(dict(entry, prune=False, reason="not a cache namespace name: left alone"))
+            continue
+        sims = sorted({p.name.split('_')[0] for p in files if p.suffix == '.npz' and not p.name[:1].isdigit()})
+        if m['ver'] != m_now['ver']:
+            out.append(dict(entry, prune=True, reason=f"cache format v{m['ver']}, today's is v{m_now['ver']}: nothing "
+                                                       "reads it"))
+            continue
+        if (m['res'], m['crit'], m['g']) != (m_now['res'], m_now['crit'], m_now['g']):
+            out.append(dict(entry, prune=False, reason="another resolution / criterion / gradient threshold (config): "
+                                                        "kept"))
+            continue
+        fp = int(m['fp'])
+        why = None
+        if m['sig'] in cells_ok and fp == int(fp0):
+            why = "production smoothing" if m['sig'] == f"{float(sig0):g}" else f"--smooth {m['sig']} (cells)"
+        else:
+            for sim in sims:
+                box = config.SIMULATION_BOX_MPC.get(sim)
+                if box is None:
+                    continue
+                for mpc in mpcs:
+                    cells = round(mpc / (box / config.FIELD_RESOLUTION), 9)
+                    if f"{cells:g}" == m['sig'] and config.footprint_for(cells) == fp:
+                        why = f"--smooth-mpc {mpc:g} on {sim}"
+        if why is None:
+            held = ', '.join(sims) if sims else 'no simulation files'
+            out.append(dict(entry, prune=True, reason=f"sigma {m['sig']} cells / footprint {fp}: no current smoothing "
+                                                       f"(cells {sorted(cells_ok, key=float)}, Mpc {mpcs}) gives it for "
+                                                       f"{held}"))
+            continue
+        out.append(dict(entry, prune=False, reason=why))
+        for p in sorted(files):
+            st = p.stat()
+            fe = {'path': p, 'kind': 'file', 'bytes': st.st_size, 'files': 1, 'newest': st.st_mtime}
+            t = re.match(r"^.+\.npz\.(\d+)\.tmp\.npz$", p.name)
+            if t and not _pid_alive(t.group(1)):
+                out.append(dict(fe, prune=True, reason=f"an interrupted save's temp file (pid {t.group(1)} is gone)"))
+            elif LINK_VERSION is not None and re.match(r"^.+_fate(_excl)?_\d{3}_\d{3}\.npz$", p.name):
+                try:
+                    import numpy as np
+                    with np.load(p) as z:
+                        v = int(z['link_version']) if 'link_version' in z.files else 1
+                except Exception as e:              # a cut file: cached_link relinks it too
+                    out.append(dict(fe, prune=True, reason=f"an unreadable fate link ({type(e).__name__})"))
+                    continue
+                if v != LINK_VERSION:
+                    out.append(dict(fe, prune=True, reason=f"fate link version {v}, today's is {LINK_VERSION}: never "
+                                                           "served (relinked on the next census)"))
+    return out
+
+
+def cache_command(prune=False, yes=False, keep_mpc=(), keep_cells=(), root=None):
+    """'analyze.py cache': every namespace with its size and verdict; --prune lists only what would go (a DRY RUN);
+    --prune --yes deletes it. Returns the bytes listed for (or freed by) the prune."""
+    import shutil
+    root = Path(config.CACHE_DIR if root is None else root)
+    inv = cache_inventory(root, keep_mpc, keep_cells)
+    print(f"Pipeline cache {root}" + ("" if root.is_dir() else " (absent)"))
+    gone = [e for e in inv if e['prune']]
+    # the files of one namespace with one reason are one line (27 old fate links are not 27 lines)
+    shown, groups = [], {}
+    for e in (gone if prune else inv):
+        if e['kind'] == 'namespace':
+            shown.append(e)
+        elif e['prune']:
+            key = (e['path'].parent, e['reason'])
+            if key not in groups:
+                groups[key] = dict(e, bytes=0, files=0, newest=0.0, names=[])
+                shown.append(groups[key])
+            g = groups[key]
+            g['bytes'] += e['bytes']
+            g['files'] += 1
+            g['newest'] = max(g['newest'], e['newest'])
+            g['names'].append(e['path'].name)
+    for e in shown:
+        if e['kind'] == 'namespace':
+            name = e['path'].name
+        else:
+            ex = e['names'][0] + (f" (+{len(e['names']) - 1} more)" if len(e['names']) > 1 else "")
+            name = f"  {e['path'].parent.name}/{ex}"
+        mark = ("DELETE " if yes else "would delete ") if (prune and e['prune']) else ("prune  " if e['prune'] else "keep   ")
+        print(f"  {mark}{name:44s} {_human(e['bytes']):>9s} {e['files']:5d} file(s), newest "
+              f"{time.strftime('%Y-%m-%d', time.localtime(e['newest']))}: {e['reason']}")
+    total = sum(e['bytes'] for e in gone)
+    if not gone:
+        print("  nothing to prune")
+        return 0
+    if not prune:
+        print(f"\n{len(gone)} unreachable entr{'y' if len(gone) == 1 else 'ies'}, {_human(total)}: "
+              "'analyze.py cache --prune' lists them, '--prune --yes' deletes them.")
+        return total
+    if not yes:
+        print(f"\nDRY RUN: {len(gone)} entr{'y' if len(gone) == 1 else 'ies'}, {_human(total)} would be deleted; "
+              "add --yes to delete them.")
+        return total
+    freed = 0
+    for e in gone:
+        p = e['path']
+        if root.resolve() not in p.resolve().parents:   # never outside the cache, whatever a link points at
+            print(f"  !! {p} is not inside {root}: left alone")
+            continue
+        try:
+            shutil.rmtree(p) if e['kind'] == 'namespace' else p.unlink()
+            freed += e['bytes']
+        except OSError as err:
+            print(f"  !! {p}: {err}")
+    print(f"\nDeleted {_human(freed)} of {_human(total)}.")
+    return freed
+
+
 # ---------------------------------------------------------------- plot (phase 2)
 
 def run_step(cmd, label, env=None):
@@ -258,21 +468,52 @@ def run_step(cmd, label, env=None):
     return proc.returncode, dt
 
 
+def run_scripts(scripts, script_dir, results, env=None, extra=()):
+    """Run each plot script (python/plot/<name> + extra) into 'results' {label: (exit, seconds)}; a script not on
+    disk is noted and left out of results (a registered figure whose script is not written yet: not a failure).
+    Returns the skipped names."""
+    skipped = []
+    for script in scripts:
+        path = script_dir / 'plot' / script
+        if not path.is_file():
+            print(f"\n{script}: not in python/plot (yet): skipped")
+            skipped.append(script)
+            continue
+        results[script] = run_step([sys.executable, str(path), *extra], script, env=env)
+    return skipped
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('mode', nargs='?', default='all',
-                        choices=['check', 'compute', 'plot', 'all', 'export'])
+                        choices=['check', 'compute', 'plot', 'all', 'export', 'voids', 'cache'])
     parser.add_argument('snaps', nargs='*',
                         help="snapshots for 'compute' and 'export' (default: config's ladder where the snapdir exists)")
     parser.add_argument('--only', nargs='*', default=None,
-                        help='run only the named plot scripts')
+                        help="run only the named plot scripts (in 'voids' mode: these instead of VOID_SCRIPTS)")
     parser.add_argument('--out', default=None, help="'export': the output folder (default figures/void_catalog/<sim>)")
     parser.add_argument('--format', default='both', choices=['csv', 'hdf5', 'both'], help="'export': which files")
     parser.add_argument('--no-mirror', action='store_true',
                         help="copy nothing into the thesis Figures/ tree (it takes only "
                              f"{config.THESIS_SIMULATION} {ESTIMATOR_NAME[config.THESIS_METHOD]} figures anyway)")
+    parser.add_argument('--prune', action='store_true',
+                        help="'cache': list only what is unreachable, as a DRY RUN (nothing is deleted without --yes)")
+    parser.add_argument('--yes', action='store_true', help="'cache --prune': really delete what it lists")
+    parser.add_argument('--keep-mpc', type=float, nargs='*', default=[], metavar='MPC',
+                        help=f"'cache': more smoothings in Mpc to count as current (besides {list(CACHE_SMOOTHING_MPC)} "
+                             "and DTFE_SIGMA_MPC)")
+    parser.add_argument('--keep-cells', type=float, nargs='*', default=[], metavar='CELLS',
+                        help="'cache': more smoothings in cells (footprint 11) to count as current")
     args = parser.parse_args()
+    if args.yes and not (args.mode == 'cache' and args.prune):
+        parser.error("--yes goes with 'cache --prune' only")
+    if args.mode != 'cache' and (args.prune or args.keep_mpc or args.keep_cells):
+        parser.error("--prune / --keep-mpc / --keep-cells go with 'cache' only")
+    if args.mode == 'cache':
+        # before the banner and the gate/smoothing refusals: it reads no grid and writes no figure
+        cache_command(args.prune, args.yes, args.keep_mpc, args.keep_cells)
+        return
     # --no-mirror reaches the plot subprocesses through their environment (dtfelib.figures reads DTFE_NO_MIRROR)
     child_env = dict(os.environ, DTFE_NO_MIRROR='1') if args.no_mirror else None
 
@@ -306,10 +547,31 @@ def main():
     if args.mode == 'export':
         export(args.snaps, args.out, ('csv', 'hdf5') if args.format == 'both' else (args.format,))
         return
+    results, skipped = {}, []
+    if args.mode == 'voids':
+        # before the smoothing refusal: these scripts tag a non-default smoothing's files and folders themselves
+        skipped = run_scripts(args.only if args.only else VOID_SCRIPTS, script_dir, results, env=child_env,
+                              extra=('--sim', str(config.SIMULATION)))
+        summarize(results, skipped, "Void figures are in per-simulation folders under "
+                                    f"{config.LOCAL_FIGURES_ROOT} (void_population/, void_profiles/, ...).")
+        return
     from dtfelib import pipeline as _pl
-    if _pl.smoothing_tag():
+    try:
+        gate = _pl.void_gate()
+    except ValueError as e:
+        sys.exit(f"refused: {e}")
+    if gate != 'ellipsoid' and args.mode in ('plot', 'all'):
+        # checked apart from the smoothing (2026-10-11): smoothing_tag() carries 'gatenone' too, and the smoothing
+        # refusal below blamed DTFE_SIGMA_MPC at the production smoothing. 'compute' stays allowed: its caches (the
+        # void catalogue keeps the production gate, gate_view is never saved; slices, limits) do not depend on it
+        sys.exit(f"refused: DTFE_VOID_GATE={os.environ.get('DTFE_VOID_GATE', '')!r} (void gate '{gate}', not the "
+                 f"production 'ellipsoid'): '{args.mode}' writes the thesis figures under their production names. "
+                 f"Unset DTFE_VOID_GATE; it is for the void scripts (they tag their outputs 'gate{gate}').")
+    sig0, fp0 = config.PRODUCTION_SMOOTHING
+    if (float(config.SMOOTHING_SIGMA_CELLS), int(config.FOOTPRINT_SIZE)) != (float(sig0), int(fp0)):
         # the thesis scripts save under the PRODUCTION names (and into the thesis Figures/ tree): a left-over
-        # DTFE_SIGMA_MPC would overwrite them with another smoothing's figures and void_shape_table.txt
+        # DTFE_SIGMA_MPC would overwrite them with another smoothing's figures and void_shape_table.txt (the same
+        # test as smoothing_tag()'s smoothing part)
         sys.exit(f"refused: the smoothing is {config.SMOOTHING_SIGMA_CELLS:g} cells / footprint {config.FOOTPRINT_SIZE} "
                  f"(DTFE_SIGMA_MPC={os.environ.get('DTFE_SIGMA_MPC', '')!r}), not the production "
                  f"{config.PRODUCTION_SMOOTHING}: '{args.mode}' writes the thesis figures under their production names. "
@@ -317,8 +579,6 @@ def main():
     if args.mode == 'compute':
         compute(args.snaps)
         return
-
-    results = {}
 
     if args.mode == 'all':
         # compute in its own subprocess so its working set is released before plotting
@@ -330,11 +590,17 @@ def main():
             sys.exit(1)
 
     if args.mode in ('plot', 'all'):
-        scripts = args.only if args.only else PLOT_SCRIPTS
-        for script in scripts:
-            results[script] = run_step(
-                [sys.executable, str(script_dir / 'plot' / script)], script, env=child_env)
+        skipped = run_scripts(args.only if args.only else PLOT_SCRIPTS, script_dir, results, env=child_env)
 
+    summarize(results, skipped,
+              (f"Nothing was copied into the thesis Figures/ tree ({mirror_off}); " if mirror_off else
+               "Figures made from the thesis grids are mirrored into the thesis Figures/ tree; ")
+              + f"key numbers in {config.LOCAL_FIGURES_ROOT}/void_analysis/void_shape_table.txt "
+              "and shear_analysis/shear_stats.txt.")
+
+
+def summarize(results, skipped, done_note):
+    """The summary table; exit 1 when a step failed. A skipped (missing) script is listed, not failed."""
     print(f"\n{'=' * 70}\nSummary\n{'=' * 70}")
     failed = []
     for label, (code, dt) in results.items():
@@ -342,13 +608,12 @@ def main():
         if code != 0:
             failed.append(label)
         print(f"  {status} {label:38s} {dt / 60:6.1f} min")
+    for label in skipped:
+        print(f"  SKIP   {label:38s} (not in python/plot)")
     if failed:
         print(f"\n{len(failed)} step(s) failed: {', '.join(failed)}")
         sys.exit(1)
-    print("\nAll done. " + (f"Nothing was copied into the thesis Figures/ tree ({mirror_off}); " if mirror_off else
-                            "Figures made from the thesis grids are mirrored into the thesis Figures/ tree; ")
-          + f"key numbers in {config.LOCAL_FIGURES_ROOT}/void_analysis/void_shape_table.txt "
-          "and shear_analysis/shear_stats.txt.")
+    print("\nAll done. " + done_note)
 
 
 if __name__ == '__main__':
