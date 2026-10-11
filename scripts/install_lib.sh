@@ -6,7 +6,8 @@
 #   build_failed_hint LOG [N]    the last N lines of the build log plus the usual causes
 # Survey rank 24, 2026-10-05.
 
-INSTALL_BINARIES=(DTFE PS-DTFE DTFE-double PS-DTFE-double DTFE-2d PS-DTFE-2d)
+# the 2D double pair too (2026-10-08): install.sh rebuilds it, so a failed build must be able to restore it
+INSTALL_BINARIES=(DTFE PS-DTFE DTFE-double PS-DTFE-double DTFE-2d PS-DTFE-2d DTFE-2d-double PS-DTFE-2d-double)
 
 backup_binaries() {
     local dir="$1" b n=0

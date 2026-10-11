@@ -808,16 +808,25 @@ class PipelineSpec:
                 for nu, snaps in self.adaptive_groups(sim).items():
                     argv, env = self.command()
                     env.update({"SIMS": sim, "NU": str(nu), "SNAPS": " ".join(str(n) for n in snaps)})
-                    steps.append(Step(f"run_ps_pipeline.sh {sim} {nu}^2 ({len(snaps)} snapshots)", argv, env))
+                    compute = Step(f"run_ps_pipeline.sh {sim} {nu}^2 ({len(snaps)} snapshots)", argv, env)
+                    steps.append(compute)
                     if self.render and not self.plan_only:
-                        steps.append(self._render_step(sim, nu, snaps))
+                        steps.append(self._render_after(self._render_step(sim, nu, snaps), compute))
             return steps
         argv, env = self.command()
-        steps = [Step("run_ps_pipeline.sh " + " ".join(self.sims), argv, env)]
+        compute = Step("run_ps_pipeline.sh " + " ".join(self.sims), argv, env)
+        steps = [compute]
         if self.render and not self.plan_only:
             for sim in self.sims:
-                steps.append(self._render_step(sim, self.nu, None))
+                steps.append(self._render_after(self._render_step(sim, self.nu, None), compute))
         return steps
+
+    @staticmethod
+    def _render_after(render: Step, compute: Step) -> Step:
+        """A render step runs only when its compute step exited 0 (2026-10-08): run_ps_pipeline.sh now exits 1 when it
+        computed nothing (no simulation or snapshot found), and the render after it showed a green job regardless."""
+        render.after = compute.label
+        return render
 
     def to_dict(self) -> dict:
         return asdict(self)

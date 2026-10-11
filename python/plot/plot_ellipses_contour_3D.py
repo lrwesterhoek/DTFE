@@ -316,6 +316,7 @@ def process_single_snapshot(snapshot, redshift, args):
         p = pipeline.products(snapshot, sim=args.sim, method=args.method, prefix=args.prefix,
                               data_root=args.data_root)
         grid_n = p.fs.grid_n
+        style.note_source(p.fs)                     # the thesis mirror takes the thesis box's standard DTFE only
         box_size = p.fs.meta.box_mpc
         redshift = p.redshift
         cat = p.voids()

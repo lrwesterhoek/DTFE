@@ -13,6 +13,8 @@
 #   -h / --help prints this header and runs nothing; --version the repository revision.
 #   DRY_RUN=1 ./run_dtfe.sh ...   prints every snapshot's expanded command and paths, runs nothing (exit 0
 #          when at least one snapshot is planned).
+#   Run logs, beside the outputs: output.runlog belongs to the grids on disk, output.runlog.failed to the
+#   last failed or stopped attempt, output.runlog.partial to a run still going (or killed outright).
 #
 set -uo pipefail
 
@@ -129,6 +131,41 @@ if [ "${DRY_RUN}" != "1" ] && command -v caffeinate >/dev/null 2>&1; then
     caffeinate -i -m -w $$ &
 fi
 
+# The run-log contract (2026-10-08), as run_ps_dtfe.sh: while the binary runs its log is
+# 'output.runlog.partial'; exit 0 renames it onto 'output.runlog' (the log of the grids now on disk) and
+# removes a stale 'output.runlog.failed'; a failure or a stop renames it to 'output.runlog.failed' and
+# leaves 'output.runlog' alone. Teeing straight into 'output.runlog' let a re-run that failed early, or
+# was stopped or killed, replace the log of the grids still on disk (the Runs browser then showed them as
+# a failed run with the new settings). A '.runlog.partial' left behind is a run killed outright (SIGKILL),
+# or one still going.
+live_log=""; live_rc=""            # the .partial being written, and its binary's exit status once known
+finish_runlog() {                  # <the .partial> <the binary's exit status>
+    local part="$1" final="${1%.partial}"
+    [ -f "${part}" ] || return 0
+    # strip ANSI colour codes from the kept log (a temp file: BSD and GNU sed disagree on -i)
+    if sed -E $'s/\033\\[[0-9;]*m//g' "${part}" > "${part}.tmp" 2>/dev/null; then
+        mv "${part}.tmp" "${part}"
+    else
+        rm -f "${part}.tmp"
+    fi
+    if [ "$2" = "0" ]; then
+        mv -f "${part}" "${final}" && rm -f "${final}.failed"
+    else
+        mv -f "${part}" "${final}.failed"
+    fi
+}
+# a stop (the launcher's Stop: SIGTERM to the binary, then to this script; ^C: SIGINT) runs the trap once
+# the binary's pipeline has ended; the signal is then re-raised, so a caller sees a stop, not a failure
+on_stop() {                        # <signal name>
+    trap - "$1"
+    if [ -n "${live_log}" ] && [ -f "${live_log}" ]; then
+        finish_runlog "${live_log}" "${live_rc:-1}"
+        [ "${live_rc:-1}" = "0" ] || echo "  Stopped: snapshot ${n_str} did not finish; its log is ${live_log%.partial}.failed"
+    fi
+    kill -s "$1" $$
+}
+trap 'on_stop INT' INT; trap 'on_stop TERM' TERM; trap 'on_stop HUP' HUP
+
 echo "Starting DTFE processing..."
 echo "Data directory: ${DATA_DIR}"
 echo "Grid size: ${GRID_SIZE}"
@@ -204,15 +241,17 @@ for i in "${SNAPSHOTS[@]}"; do
         echo ""
         continue
     fi
-    ${TIME_WRAP[@]+"${TIME_WRAP[@]}"} "${cmd[@]}" 2>&1 | tee "${run_log}"
+    # the binary's output goes to 'output.runlog.partial' until it exits (the run-log contract above)
+    live_log="${run_log}.partial"; live_rc=""
+    ${TIME_WRAP[@]+"${TIME_WRAP[@]}"} "${cmd[@]}" 2>&1 | tee "${live_log}"
     rc=${PIPESTATUS[0]}                 # the binary's status, taken BEFORE anything else runs a pipe
+    live_rc="${rc}"
 
-    # strip ANSI colour codes from the saved log (a temp file: BSD and GNU sed disagree on -i)
-    if sed -E $'s/\033\\[[0-9;]*m//g' "${run_log}" > "${run_log}.tmp" 2>/dev/null; then
-        mv "${run_log}.tmp" "${run_log}"
-    else
-        rm -f "${run_log}.tmp"
-    fi
+    # de-ANSI'd, the log becomes 'output.runlog' on success and 'output.runlog.failed' otherwise; the
+    # peak memory below is read from whichever it became
+    finish_runlog "${live_log}" "${rc}"
+    live_log=""
+    [ "${rc}" -eq 0 ] || run_log="${run_log}.failed"
     # peak memory in whichever dialect TIME_WRAP produced (absent without one); macOS also reports the
     # peak FOOTPRINT, what the run really needed including compressed or swapped pages
     peak_bytes=$(awk 'tolower($0) ~ /maximum resident set size/ {
@@ -234,7 +273,7 @@ for i in "${SNAPSHOTS[@]}"; do
         echo "  Snapshot ${n_str} processed successfully"
         n_ok=$((n_ok + 1))
     else
-        echo "  Error processing snapshot ${n_str}"
+        echo "  Error processing snapshot ${n_str} (its log: ${run_log})"
         n_failed=$((n_failed + 1))
     fi
     echo ""
@@ -250,7 +289,7 @@ if [ "${DRY_RUN}" = "1" ]; then
 fi
 echo "DTFE processing complete: ${n_ok} processed, ${n_skipped} skipped, ${n_failed} failed."
 if [ "${n_failed}" -gt 0 ]; then
-    echo "ERROR: ${n_failed} snapshot(s) failed -- see the messages above and the .runlog files." >&2
+    echo "ERROR: ${n_failed} snapshot(s) failed; see the messages above and their .runlog.failed files." >&2
     exit 1
 fi
 if [ "${n_ok}" -eq 0 ]; then

@@ -15,6 +15,7 @@ run on worker threads, so a 1024^3 z-plane or a tessellation build never freezes
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -24,7 +25,8 @@ from collections import Counter
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QLineF, QObject, QPointF, QRectF, Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import (QLineF, QObject, QPointF, QProcess, QProcessEnvironment, QRectF, Qt, QThread, QTimer,
+                            Signal, Slot)
 from PySide6.QtGui import QColor, QFontMetrics, QImage, QLinearGradient, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox,
@@ -35,6 +37,13 @@ from PySide6.QtWidgets import (
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import grids as G  # noqa: E402
 import runspec as rs  # noqa: E402
+
+VOID_TOOL = rs.REPO_ROOT / "python" / "tools" / "void_outlines.py"     # the voids of one snapshot, as JSON
+VOID_CACHE_DIR = None        # the helper's catalogue cache: None = the pipeline's own (config.CACHE_DIR); tests pin a temp one
+VOID_TIP = ("Outline the voids on the map: a circle where each distinct, well-resolved void's sphere of radius R_v "
+            "(where the smoothed density around its centre rises back to the mean) cuts this slice. The analysis "
+            "pipeline's own catalogue at its production smoothing, found once per snapshot (about a minute) and cached; "
+            "a catalogue that is not cached and would not fit in the free memory is not built, and it says so.")
 
 CMAPS = ["viridis", "magma", "inferno", "cividis", "plasma", "RdBu_r", "coolwarm", "gray", "tab10"]
 AXES = ["x", "y", "z"]
@@ -720,6 +729,7 @@ class ImageCanvas(QLabel):
         self._drag: QRectF | None = None     # the rectangle being dragged out (view coordinates)
         self.marker: tuple[int, int] | None = None
         self.arrows: dict | None = None     # grids.OutputSet.arrow_field(), drawn over the map
+        self.circles: list | None = None    # grids.void_circles(): [(x, y, rx, ry, k)] in image pixels, the void outlines
         self.labels: list | None = None     # [(x, y, text)] in image pixels: the figure grid's panel labels
         # {"x": (lo, hi, name), "y": (lo, hi, name), "unit": "Mpc"|"cells"}: the axes drawn around the image
         # (x increasing to the right, y UPWARD) and the scale bar; None for the figure grid's tiles
@@ -783,6 +793,8 @@ class ImageCanvas(QLabel):
         p.drawImage(t, self._img)
         if self.arrows is not None:
             self._draw_arrows(p, t)
+        if self.circles:
+            self._draw_circles(p, t)
         if self.labels:
             self._draw_labels(p, t)
         if self.axes:
@@ -901,6 +913,19 @@ class ImageCanvas(QLabel):
         p.drawLines(lines)
         p.setPen(QPen(QColor("white"), 1.2, Qt.SolidLine, Qt.RoundCap))
         p.drawLines(lines)
+
+    def _draw_circles(self, p: QPainter, t: QRectF):
+        """The void outlines: white over a dark outline (as the arrows), clipped to the map."""
+        s = t.width() / self._img.width()
+        p.save()
+        p.setClipRect(t)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setBrush(Qt.NoBrush)
+        for pen in (QPen(QColor(0, 0, 0, 170), 2.6), QPen(QColor("white"), 1.2)):
+            p.setPen(pen)
+            for x, y, rx, ry, _k in self.circles:
+                p.drawEllipse(QPointF(t.left() + x * s, t.top() + y * s), rx * s, ry * s)
+        p.restore()
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
@@ -1146,6 +1171,10 @@ class ExploreControls(QWidget):
         self.vectors.setToolTip("Draw the in-plane components as arrows over the map")
         self.vectors.toggled.connect(self.render)
         crow.addWidget(self.vectors)
+        self.voids = QCheckBox("voids")
+        self.voids.setToolTip(VOID_TIP)
+        self.voids.toggled.connect(self._voids_toggled)
+        crow.addWidget(self.voids)
         f.addRow("Component", crow)
         ax = QHBoxLayout()
         self.axis = QComboBox()
@@ -1421,6 +1450,9 @@ class ExploreControls(QWidget):
         self._server = ServerWorker()
         self._exact_worker = ExactZoomWorker()
         self._exact_thread = None
+        self._void_cache: dict = {}             # output key -> the void_outlines.py JSON, or {"error": why}
+        self._void_proc: QProcess | None = None  # the one catalogue being found
+        self._void_key = None                   # ... and the output it is for
         self._to_exact.connect(self._exact_worker.run)
         self._exact_worker.done.connect(self._zoomed)
         self._exact_worker.failed.connect(self._exact_failed)
@@ -1517,7 +1549,7 @@ class ExploreControls(QWidget):
                 c.blockSignals(False)
             self._out_form.setRowVisible(self.prefix_combo, False)
             self.current = self._plane = self._arrows = None
-            self.view.canvas.arrows = None
+            self.view.canvas.arrows = self.view.canvas.circles = None
             self.info.setText("No grids yet: run the demo (Setup), a Grids job or a Custom snapshot job first.")
             self.view.canvas.set_rgb(None)
             self.view.canvas.setText("No outputs with grids found.")
@@ -1533,6 +1565,17 @@ class ExploreControls(QWidget):
         """Show the output whose files are '<root>.*' (the Runs browser's 'Explore')."""
         if not self._select_output(str(root)):
             self.refresh_outputs(select=str(root))
+
+    def refresh_if_vanished(self) -> bool:
+        """Look for outputs again when one listed here has lost its grids (the Runs browser's Move to Trash, the
+        Finder): neither the menus nor the figure grid may offer it, and its next slice read failed with
+        FileNotFoundError (2026-10-08). One stat per output; files opened by hand are the user's. True when it
+        looked again."""
+        for _, o in self.outputs:
+            if self._group(o) != GROUP_OPENED and o.files and not next(iter(o.files.values())).path.is_file():
+                self.refresh_outputs()
+                return True
+        return False
 
     def _rebuild_sims(self):
         """The first menu: the simulations with grids in natural order (TNG50, TNG100, TNG300), then
@@ -1716,6 +1759,7 @@ class ExploreControls(QWidget):
             w.setEnabled(not flat)
             w.blockSignals(False)
         self._pts_fill()                    # BEFORE the field's render: it reads the menu (this output's planes)
+        self._voids_sync()                  # BEFORE the render too: the outlines are drawn with the map
         self._field_changed()
         self._refresh_server_button()
 
@@ -1828,12 +1872,15 @@ class ExploreControls(QWidget):
         self._set_position(req)
         if self._zoom is not None:
             z = self._zoom
-            if self._same(z["output"], o) and z["axis"] == req["axis"] and z["index"] == req["index"]:
+            # the stamp LAST (it stats the files): a re-run under the same name gives a new OutputSet of the same
+            # root, and the old zoom must not stay beside the new grids' slices (2026-10-08)
+            if (self._same(z["output"], o) and z["axis"] == req["axis"] and z["index"] == req["index"]
+                    and ("stamp" not in z or z["stamp"] == self._file_stamp(o))):
                 if self._zoom_fields is not None:       # a colour/field change: no new evaluation
                     self._req = req
                     self._render_zoom()
                 return
-            self._clear_zoom()                          # another slice or output: back to its map
+            self._clear_zoom()                          # another slice or output, or rewritten grids: back to its map
             req = self.request()                        # ... with the comparison, which the zoom left out
         if self._busy:
             self._pending = req             # only the latest request is served
@@ -1926,6 +1973,143 @@ class ExploreControls(QWidget):
         self.vmax_edit.setText(str(d.get("vmax", "")))
         self.fixed.setChecked(bool(d.get("fixed")))
         return True
+
+    # ---------------------------------------------------------------- void outlines
+    @staticmethod
+    def voids_applicable(o) -> str:
+        """'' when the void outlines can be drawn over this output, else why not (the checkbox's tip): the
+        pipeline's catalogue needs a simulation snapshot's full-box 3D grids with a density."""
+        if o is None:
+            return "no output shown"
+        if not o.sim or o.snap is None:
+            return "only for a simulation snapshot's grids (the analysis pipeline finds the voids per snapshot)"
+        if o.dim != 3:
+            return "only for 3D grids"
+        if o.box is None or "density" not in o.files:
+            return "needs the density grid and the snapshot's box"
+        return ""
+
+    @staticmethod
+    def _void_cache_key(o):
+        """The catalogue's key: the files' root, their grid and the density file's stamp (a rerun rewrites it)."""
+        try:
+            stamp = o.files["density"].path.stat().st_mtime_ns
+        except (KeyError, OSError):
+            stamp = None
+        return str(o.root), o.n, stamp
+
+    def _voids_sync(self):
+        """The checkbox follows the output: enabled where the outlines apply, else greyed out saying why."""
+        why = self.voids_applicable(self.current)
+        self.voids.setEnabled(not why)
+        self.voids.setToolTip(VOID_TIP if not why else f"Void outlines: {why}.")
+        if not why and self.voids.isChecked():
+            self._voids_request(self.current)
+
+    def _voids_toggled(self, on: bool):
+        if on and self.current is not None:
+            key = self._void_cache_key(self.current)
+            if "error" in self._void_cache.get(key, {}):
+                del self._void_cache[key]           # ticked again: try again
+            if not self.voids_applicable(self.current):
+                self._voids_request(self.current)
+        self._voids_redraw()
+
+    def _voids_request(self, o):
+        """Find the voids of this output in a helper process (the pipeline's catalogue: cached, else about a
+        minute), unless they are known or already being found."""
+        key = self._void_cache_key(o)
+        if key in self._void_cache or (self._void_proc is not None and self._void_key == key):
+            return
+        self._voids_stop()                          # another output's search: this one is wanted now
+        root = o.dir.parent.parent                  # <data root>/<sim>/snapdir_NNN, or the family folder: both work
+        proc = QProcess(self)
+        env = QProcessEnvironment.systemEnvironment()
+        env.insert("DTFE_SIM", o.sim)
+        env.insert("DTFE_DATA_ROOT", str(root))
+        env.remove("DTFE_SIGMA_MPC")                # the production smoothing: the thesis's catalogue
+        env.remove("CLICOLOR_FORCE")
+        proc.setProcessEnvironment(env)
+        proc.finished.connect(lambda code, _status, k=key, pr=proc: self._voids_done(k, pr, code))
+        proc.errorOccurred.connect(lambda err, k=key, pr=proc: self._voids_start_failed(k, pr, err))
+        self._void_proc, self._void_key = proc, key
+        method = "ps" if G.estimator_label(o) == "PS-DTFE" else "dtfe"
+        args = [str(VOID_TOOL), "--sim", o.sim, "--snap", str(int(o.snap)), "--method", method, "--data-root", str(root)]
+        if o.prefix != ("ps_output" if method == "ps" else "output"):
+            args += ["--prefix", o.prefix]          # the production set: no prefix, so the analysis scripts' cache is shared
+        proc.start(rs.PYTHON, args + (["--cache-dir", str(VOID_CACHE_DIR)] if VOID_CACHE_DIR else []))
+        self.status.emit(f"finding the voids of {o.title} (the first time per snapshot: about a minute)")
+
+    def _voids_done(self, key, proc, code: int):
+        if proc is not self._void_proc:             # stopped: a newer search, or the window closing
+            proc.deleteLater()
+            return
+        self._void_proc = self._void_key = None
+        out = bytes(proc.readAllStandardOutput()).decode(errors="replace").strip().splitlines()
+        err = bytes(proc.readAllStandardError()).decode(errors="replace").strip().splitlines()
+        proc.deleteLater()
+        try:
+            if code != 0 or not out:
+                raise ValueError(err[-1] if err else f"the helper exited with {code}")
+            res = json.loads(out[-1])
+            res["_centres"] = np.asarray(res["centres_mpc"], dtype=np.float64).reshape(-1, 3)
+            res["_r_v"] = np.array([np.nan if v is None else v for v in res["r_v_mpc"]], dtype=np.float64)
+            res["_shown"] = np.asarray(res["distinct"], dtype=bool)
+            self._void_cache[key] = res
+            self.status.emit(f"voids: {int(res['_shown'].sum())} distinct, well-resolved voids (outlines: R_v; "
+                             f"sigma {res['sigma_mpc']:.3g} Mpc)")
+        except (ValueError, KeyError, TypeError) as e:
+            self._void_cache[key] = {"error": str(e)}
+            self.status.emit(f"no void outlines: {e}")
+        self._voids_redraw()
+
+    def _voids_start_failed(self, key, proc, err):
+        """The helper never started (no 'finished' follows): said, and the next tick tries again."""
+        if err != QProcess.FailedToStart or proc is not self._void_proc:
+            return
+        self._void_proc = self._void_key = None
+        self._void_cache[key] = {"error": f"could not start {rs.PYTHON}: {proc.errorString()}"}
+        proc.deleteLater()
+        self.status.emit(f"no void outlines: could not start {rs.PYTHON}")
+        self._voids_redraw()
+
+    def _voids_stop(self):
+        proc, self._void_proc, self._void_key = self._void_proc, None, None
+        if proc is not None:
+            proc.kill()
+            proc.waitForFinished(2000)
+
+    def _slice_position(self) -> float | None:
+        """Where the shown plane lies along its normal (Mpc, or cells without a box)."""
+        req = self._req
+        if req is None:
+            return None
+        if req.get("pts") and self._pts_side is not None:
+            return float(self._pts_side.get("center", 0.0))
+        o, axis = req["output"], req["axis"]
+        return float(o.lo[axis] + (req["index"] + 0.5) * o.length[axis] / o.n)
+
+    def _void_circles(self):
+        """The outlines over what the map shows now (None: off, not applicable, or not found yet)."""
+        o = self.current
+        if not self.voids.isChecked() or self._grid_shown or o is None or self.voids_applicable(o):
+            return None
+        res = self._void_cache.get(self._void_cache_key(o))
+        g = self._geometry()
+        if not res or "error" in res or g is None or self._req.get("output") is not o:
+            return None
+        axis, _index, rest, lo, hi, n0, n1 = g
+        sel = np.nonzero(res["_shown"])[0]
+        circles = G.void_circles(res["_centres"][sel], res["_r_v"][sel], float(res["box_mpc"]), axis,
+                                 self._slice_position(), rest, lo, hi, n0, n1)
+        return [(x, y, rx, ry, int(sel[k])) for x, y, rx, ry, k in circles]
+
+    def _voids_redraw(self):
+        c = self.view.canvas
+        if c._img is None or self._grid_shown:
+            return
+        c.circles = self._void_circles()
+        c._redraw()
 
     def _canvas_axes(self) -> dict | None:
         """The axes of what the map shows (the slice, or the zoomed region): Mpc, or cells without a box."""
@@ -2032,6 +2216,8 @@ class ExploreControls(QWidget):
         if self._pending is not None:
             req, self._pending = self._pending, None
             self.render_request(req)
+        if self.is_zoomed():                    # asked for before a zoom landed (a field changed meanwhile): the zoom
+            return                              # stays; drawn, the slice took the zoom's geometry (2026-10-08)
         req = res["request"]
         self._plane = res["plane"]
         self._req = req
@@ -2044,6 +2230,7 @@ class ExploreControls(QWidget):
         self.view.canvas.marker = None
         self.view.canvas.labels = None
         self.view.canvas.arrows = self._arrows
+        self.view.canvas.circles = self._void_circles()
         self.view.canvas.axes = self._canvas_axes()      # BEFORE the image: its first drawing has the margins
         self.view.canvas.set_rgb(res["rgb"])
         label = G.FIELD_LABELS.get(req["field"], req["field"])
@@ -2074,8 +2261,10 @@ class ExploreControls(QWidget):
             req, self._pending = self._pending, None
             self.render_request(req)
             return
+        if self.is_zoomed():                    # a slice asked for before the zoom landed: the zoom stays (2026-10-08)
+            return
         self._plane = self._arrows = None
-        self.view.canvas.arrows = None
+        self.view.canvas.arrows = self.view.canvas.circles = None
         self.view.canvas.set_rgb(None)
         self.view.canvas.setText(f"Could not read this slice: {msg}")
         self.changed.emit()
@@ -2683,7 +2872,7 @@ class ExploreControls(QWidget):
         req = res["request"]
         self.view.canvas.setStyleSheet("")
         self.view.canvas.marker = None
-        self.view.canvas.arrows = None
+        self.view.canvas.arrows = self.view.canvas.circles = None
         self.view.canvas.labels = res["labels"]
         self.view.canvas.axes = None                # tiles of several frames: the saved figure has the axes
         self.view.canvas.set_rgb(np.ascontiguousarray(res["rgb"]))
@@ -2977,7 +3166,7 @@ class ExploreControls(QWidget):
         if o.dim == 2:                                  # a 2D server: the plane's own two axes
             coords = coords[:2]
         req = {"output": o, "axis": axis, "index": index, "rest": rest, "a0": a0, "a1": a1, "res": res,
-               "coords": coords, "depth": depth}
+               "coords": coords, "depth": depth, "stamp": self._file_stamp(o)}
         hit = self._memo_get(self._memo_key(o, axis, index, a0, a1, res, False))
         if hit is not None:                             # the same region was evaluated a moment ago
             self._zoomed(dict(req, memo=True, seconds=0.0), hit[1])
@@ -3257,7 +3446,7 @@ class ExploreControls(QWidget):
         a0, a1 = plan["edges"]                          # the region as the run will grid it
         req = {"output": o, "axis": axis, "index": index, "rest": rest, "a0": a0, "a1": a1, "res": res,
                "depth": depth, "exact": True, "cmd": plan["cmd"], "root": plan["root"], "grid": plan["grid"],
-               "cache_dir": plan.get("cache_dir")}
+               "cache_dir": plan.get("cache_dir"), "stamp": self._file_stamp(o)}
 
         self._zoom_pending = True
         self._exact_running = True
@@ -3314,6 +3503,14 @@ class ExploreControls(QWidget):
             return
         if self._req.get("pts"):                 # a hi-res slice went on while the zoom ran: it is memoised, the
             return                               # map stays the slice (drawn in the zoom's frame it misplaced clicks)
+        if (not self._same(req["output"], self.current) or req["axis"] != self.axis.currentIndex()
+                or req["index"] != self.index.value()):
+            # the slice changed while the zoom was evaluated: drawn, it took the new slice's axes, scale bar and
+            # clicked positions (render() saw no zoom yet). It is memoised; the map stays the slice (2026-10-08)
+            self.zoom_state.setText("the zoom finished after the slice changed, so it is not shown: zoom again on "
+                                    "this slice")
+            self.changed.emit()
+            return
         if self._zoom is not None and self._zoom_fields is not None and req["depth"] > self._zoom["depth"]:
             self._zoom_history.append((self._zoom, self._zoom_fields))   # Back returns here
         self._zoom, self._zoom_fields = req, f
@@ -3405,6 +3602,7 @@ class ExploreControls(QWidget):
         self.view.canvas.setStyleSheet("")
         self.view.canvas.marker = None
         self.view.canvas.arrows = None
+        self.view.canvas.circles = self._void_circles()
         self.view.canvas.axes = self._canvas_axes()
         self.view.canvas.set_rgb(np.ascontiguousarray(rgb))
         self._compare_sync()
@@ -3441,6 +3639,13 @@ class ExploreControls(QWidget):
         """A zoom remembered for this output AS IT IS ON DISK: a re-run under the same name (other settings, a
         rebuilt binary) rewrites its grids and sidecar, and the memory must not answer for it any more."""
         r = lambda t: tuple(round(float(v), 9) for v in t)
+        return (str(o.root), int(axis), int(index), r(a0), r(a1), int(res), ExploreControls._file_stamp(o),
+                bool(exact))                                                         # exact LAST: start_server keeps k[-1]
+
+    @staticmethod
+    def _file_stamp(o) -> tuple:
+        """The output's files as they are on disk (name, mtime, size; the sidecar too): the memory's key, and
+        what a zoom on screen checks before it stays beside the slice controls (render())."""
         stamp = []
         for p in [ff.path for ff in o.files.values()] + [Path(str(o.root) + ".gui.json")]:
             try:
@@ -3448,8 +3653,7 @@ class ExploreControls(QWidget):
                 stamp.append((p.name, st.st_mtime_ns, st.st_size))
             except OSError:
                 pass
-        return (str(o.root), int(axis), int(index), r(a0), r(a1), int(res), tuple(sorted(stamp)), bool(exact))   # exact LAST:
-                                                                                     # start_server keeps k[-1]
+        return tuple(sorted(stamp))
 
     def _memo_get(self, key):
         hit = self._zoom_memo.get(key)
@@ -3599,6 +3803,7 @@ class ExploreControls(QWidget):
             except OSError:
                 pass
         self._zoom_tick.stop()
+        self._voids_stop()
         self._server.kill()                            # a build OR a running request: the thread must come back
         self._exact_worker.cancel()                    # a running exact zoom would hold the thread
         if self._slice_thread is None:

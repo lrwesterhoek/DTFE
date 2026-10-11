@@ -72,6 +72,32 @@ struct PSDepositParams
     int32_t  fSGrad;    // scalar gradient (3 components): its moment grid in buffer 20
     int32_t  windowMode; // --ps-window: the sub-box is a WINDOW of the full grid -- count every sample / clipped
                          // piece of a tet (the full run's normalization), deposit only those inside the sub-box
+    int32_t  massFixed;  // the mass grid as an exact 64-bit fixed-point sum (buffer 21) instead of float atomics (buffer 3)
+    float    massScale;  // its unit, 1/massScale mass: a power of two (psMassFixedScale)
 };
+
+// The unit of the mass grid's fixed-point sum (2026-10-08; the kernel's DepositParams.massFixed says why):
+// scale = 2^k with the mass handed to the deposit (a partition's tets) at 2^61..2^62 units -- the finest unit
+// at which no cell overflows the signed 64-bit sum, even holding all of it plus every share's rounding. The
+// unit must be fine: a first version put the mean TET mass at 2^32 units, and the 3 kpc cells of a
+// --ps-window zoom (pieces of ~1e-8 of a tet) came out 5e-4 off. Here a cell holding 2^-40 of the partition's
+// mass still has 2^21 units. False when the mass gives no usable power of two (the caller keeps the float grid).
+inline bool psMassFixedScale(double totalMass, float &scale)
+{
+    if ( !(totalMass > 0.) || !std::isfinite( totalMass ) ) return false;
+    int eTotal = 0;
+    std::frexp( totalMass, &eTotal );                   // total < 2^eTotal
+    int const k = 62 - eTotal;
+    if ( k < -120 || k > 120 ) return false;           // far outside any mass unit: float range
+    scale = std::ldexp( 1.f, k );
+    return true;
+}
+
+// The mass of one cell from its two fixed-point words (low, high; two's complement).
+inline double psMassFixedValue(uint32_t lo, uint32_t hi, float scale)
+{
+    int64_t const q = int64_t( ( uint64_t(hi) << 32 ) | uint64_t(lo) );
+    return double(q) / double(scale);
+}
 
 #endif

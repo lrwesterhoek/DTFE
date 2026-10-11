@@ -641,6 +641,40 @@ def colorbar_ticks(lo: float, hi: float, log: bool = False, n: int = 5) -> list[
     return [(v, tick_text(v, ticks)) for v in ticks]
 
 
+def void_circles(centres, radii, box: float, axis: int, position: float, rest, lo, hi, n0: int, n1: int,
+                 periodic: bool = True) -> list[tuple[float, float, float, float, int]]:
+    """Where spheres (the voids: centres (k, 3) and radii in Mpc) cut the shown slice, in IMAGE pixels of the
+    Explore map: [(x, y, rx, ry, k)], k the sphere's row. The slice is the plane at 'position' along 'axis'; a
+    sphere at (periodic) distance d < R from it leaves a circle of radius sqrt(R^2 - d^2), kept (with each periodic
+    image) when it reaches the shown region lo..hi of the 'rest' axes. The map's convention: image = plane.T[::-1],
+    so x runs along rest[0] (n0 pixels over lo[0]..hi[0]) and y DOWN along rest[1] (n1 pixels, hi[1] at the top);
+    rx, ry differ when the pixels are not square in Mpc."""
+    c = np.asarray(centres, dtype=np.float64).reshape(-1, 3)
+    r = np.asarray(radii, dtype=np.float64).reshape(-1)
+    L = float(box)
+    d = c[:, axis] - float(position)
+    if periodic and L > 0:
+        d -= L * np.round(d / L)
+    with np.errstate(invalid="ignore"):
+        cut = np.isfinite(r) & (np.abs(d) < r)
+    rho = np.sqrt(np.where(cut, r * r - d * d, 0.0))
+    (u0, v0), (u1, v1) = (float(lo[0]), float(lo[1])), (float(hi[0]), float(hi[1]))
+    sx, sy = n0 / (u1 - u0), n1 / (v1 - v0)
+    shifts = (-L, 0.0, L) if periodic and L > 0 else (0.0,)
+    out = []
+    for k in np.nonzero(cut)[0]:
+        for du in shifts:
+            u = c[k, rest[0]] + du
+            if u + rho[k] < u0 or u - rho[k] > u1:
+                continue
+            for dv in shifts:
+                v = c[k, rest[1]] + dv
+                if v + rho[k] < v0 or v - rho[k] > v1:
+                    continue
+                out.append(((u - u0) * sx, (v1 - v) * sy, rho[k] * sx, rho[k] * sy, int(k)))
+    return out
+
+
 # ---------------------------------------------------------------------- discovery
 def _tng_box(snapdir: Path) -> tuple[tuple, float | None] | tuple[None, None]:
     """((lo, hi), redshift) of a TNG-layout snapshot from its combined file (h-free ckpc -> Mpc)."""

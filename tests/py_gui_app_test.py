@@ -661,6 +661,40 @@ def main():
         wait_queue(w, 300)
         check("resumed once free, the job runs", w.queue[0].state == "done"
               and (sim / "snapdir_050" / "ps_q2.a_den").is_file(), w.queue[0].note)
+        # 2026-10-08: a queued job never starts beside a memory check (it polls until the check is over), and a
+        # Pipeline job that finds nothing to compute (a simulation folder without merged snapshots) fails:
+        # run_ps_pipeline.sh exits 1 and the render chained to it is skipped, not run on nothing
+        empty = data / "GUIEMPTY" / "GUIEMPTY-1-Dark"
+        empty.mkdir(parents=True)
+        ep = rs.PipelineSpec(data_root=str(data), sims=["GUIEMPTY-1-Dark"], nu=64, grid=32, gpu=False,
+                             figures_root=str(tmp / "figs"))
+        lab = [st.label for st in ep.steps()]
+        w.queue.append(rs.QueuedJob.of("pipeline", ep))
+        w._refresh_queue()
+        poll_ms = w._wait_poll_ms
+        w._wait_poll_ms, w._mcheck, w._queue_running = 100, {"proc": None}, True     # a check going on
+        try:
+            w._next_queued()
+            spin(500)                                     # five polls
+            held = (w.proc is None and w.queue[-1].state == "waiting"
+                    and w.status.text().startswith("Queue: waiting for the memory check to finish"))
+            status_held = w.status.text()
+        finally:
+            w._mcheck = None
+        check("a queued job waits while a memory check runs (no process started; it looks again)", held
+              and not [e for lvl, e in ep.problems() if lvl == "error"], status_held)
+        wait_queue(w, 60)                                 # the next poll starts it: nothing else calls _next_queued
+        log = w.log.toPlainText()
+        check("... the check over, it starts; finding no snapshot, the pipeline exits 1, the render is skipped and the "
+              "job counts as failed", w.queue[-1].state == "failed" and w._results == [(lab[0], 1), (lab[1], 1)]
+              and "!! nothing to compute" in log and w.queue[-1].note.startswith("0/2 steps OK")
+              and f"!! {lab[1]}: skipped, '{lab[0]}' failed (run the job again)" in log,
+              f"{w.queue[-1].state} {w._results} {log[-500:]}")
+        shutil.rmtree(data / "GUIEMPTY")
+        w._wait_poll_ms = poll_ms
+        del w.queue[-1]
+        w._refresh_queue()
+        w._save_queue()
 
         ini = QSettings(str(tmp / "gui.ini"), QSettings.IniFormat)
         w2 = A.MainWindow(remember=True, settings=ini)
@@ -677,6 +711,7 @@ def main():
         w3.close()
 
         new_user_features(qa, w, tmp, data, sim)
+        launcher_run_log(qa, w, tmp)
 
         print("stop:")
         w.tabs.setCurrentIndex(A.GRIDS)
@@ -1018,6 +1053,8 @@ def new_user_features(qa, w, tmp, data, sim):
     qa.processEvents()
     ok = wait_for(lambda: w.explore._plane is not None and not w.explore._busy, 30)
     x = w.explore
+    check("a custom snapshot has no void outlines, and says why", not w.explore.voids.isEnabled()
+          and "simulation snapshot" in w.explore.voids.toolTip(), w.explore.voids.toolTip())
     check("Explore opens the demo output and draws a slice",
           ok and w.tabs.currentIndex() == A.EXPLORE and x.current is not None and str(x.current.root) == str(root)
           and w.right.currentWidget() is w.explore_view and w.explore_view.canvas._img is not None)
@@ -1044,11 +1081,43 @@ def new_user_features(qa, w, tmp, data, sim):
     ok = wait_for(lambda: not x._busy and x.current is not None and x.current.snap == 50, 30)
     check("choosing a redshift shows that snapshot's output", ok and x.current.dir.name == "snapdir_050"
           and w.explore_view.canvas._img is not None, str(x.current and x.current.root))
+    # the void outlines (2026-10-08): over a simulation snapshot's 3D grids, the analysis pipeline's catalogue found
+    # by tools/void_outlines.py in its own process (its cache pinned to a temp folder)
+    E.VOID_CACHE_DIR = tmp / "void cache"
+    check("the void outlines apply to a simulation snapshot's 3D grids", x.voids.isEnabled()
+          and not x.voids_applicable(x.current) and "--" not in E.VOID_TIP, x.voids.toolTip())
+    x.voids.setChecked(True)
+    ok = wait_for(lambda: x._void_proc is None and bool(x._void_cache), 180)
+    res = next(iter(x._void_cache.values()), {})
+    check("... ticked: a helper process finds the snapshot's voids (the pipeline's catalogue, cached in the folder "
+          "given) while the window keeps running", ok and "error" not in res and res.get("n_grid") == 32
+          and res.get("snap") == 50 and any((tmp / "void cache").rglob("*_voids.npz")),
+          str(res.get("error", sorted(res)))[:300])
+    c = w.explore_view.canvas
+    # something must be found AND drawn: 'the canvas holds what _void_circles gives' alone passed with no void at
+    # all ([] == []). The fixture (24^3 pancake, seed 42, 32^3 grid) has 38 distinct voids, and 14 or more of
+    # them cut every slice along every axis (probe of 2026-10-08), so both slices tried must show circles
+    n_distinct = int(np.sum(res.get("distinct", [])))
+    check(f"... and outlines the distinct ones over the map ({n_distinct} distinct, "
+          f"{len(c.circles or [])} cutting this slice)", n_distinct > 0 and isinstance(c.circles, list)
+          and len(c.circles) > 0 and c.circles == x._void_circles(), f"{n_distinct} distinct, circles {c.circles!r}")
+    i0 = x.index.value()
+    x.index.setValue((i0 + 8) % 32)
+    wait_for(lambda: not x._busy and x._req["index"] == (i0 + 8) % 32, 30)
+    check("another slice: its own outlines, from the same catalogue (no second search)",
+          isinstance(c.circles, list) and len(c.circles) > 0 and c.circles == x._void_circles()
+          and x._void_proc is None and len(x._void_cache) == 1, f"circles {c.circles!r}")
+    x.voids.setChecked(False)
+    qa.processEvents()
+    check("unticked: no outlines", c.circles is None and x._void_circles() is None)
+    x.index.setValue(i0)
+    wait_for(lambda: not x._busy and x._req["index"] == i0, 30)
     w._explore_output(str(root))
     ok = wait_for(lambda: not x._busy and x.current is not None and str(x.current.root) == str(root), 30)
     check("Runs > Explore (select_root) sets all the menus back to the demo", ok
           and x.sim_combo.currentData() == E.GROUP_CUSTOM and x.snap_combo.currentData() == str(root)
           and x.prefix_combo.currentData() == str(root))
+    trash_and_vanish(qa, w, x, tmp, root)
     texts = sims + zs + [x._out_form.labelForField(x.snap_combo).text(), x.sim_combo.toolTip(), x.snap_combo.toolTip(),
                          x.prefix_combo.toolTip()]
     check("no '--' in the Output menus' texts", not [t for t in texts if "--" in t])
@@ -1215,7 +1284,7 @@ def new_user_features(qa, w, tmp, data, sim):
         dst_ = o.dir / ("cmp2" + f_.name[len(o.prefix):])
         if f_.name.endswith(".a_den"):
             (np.fromfile(f_, dtype=o.dtype) * 2).astype(o.dtype).tofile(dst_)
-        elif f_.suffix not in (".runlog",):
+        elif not f_.name.startswith(o.prefix + ".runlog"):    # by name: '.runlog.failed' / '.partial' are logs too
             shutil.copy(f_, dst_)
         else:
             continue
@@ -1483,15 +1552,16 @@ def new_user_features(qa, w, tmp, data, sim):
     np.full(32 ** 3, 2.0, dtype=np.float32).tofile(str(std) + ".a_den")
     np.full(32 ** 3, 2.0, dtype=np.float32).tofile(str(s99 / "output") + ".a_den")     # ... at both snapshots
     alt_files = []                                        # ps_alt: a phase-space run at both snapshots, never the preferred prefix
+    is_log = lambda f_: f_.name.startswith("ps_gui.runlog")    # noqa: E731  (by name: '.runlog.failed' / '.partial' too)
     for sd in (s50, s99):
         for f_ in sd.glob("ps_gui.*"):
-            if f_.suffix not in (".runlog", ".json"):
+            if f_.suffix != ".json" and not is_log(f_):
                 shutil.copy(f_, sd / f_.name.replace("ps_gui.", "ps_alt."))
                 alt_files.append(sd / f_.name.replace("ps_gui.", "ps_alt."))
     if not (s50 / "ps_output.a_den").exists():            # the production prefix at 050 for certain (type_order's 2nd key);
         for f_ in s50.glob("ps_gui.*"):                   # never over what the pipeline left there
             dst_ = s50 / f_.name.replace("ps_gui.", "ps_output.")
-            if f_.suffix not in (".runlog", ".json") and not dst_.exists():
+            if f_.suffix != ".json" and not is_log(f_) and not dst_.exists():
                 shutil.copy(f_, dst_)
                 alt_files.append(dst_)
     x.refresh_outputs()
@@ -1931,6 +2001,55 @@ def new_user_features(qa, w, tmp, data, sim):
     ok = wait_for(lambda: not x.is_zoomed() and not x._busy and x._plane is not None and x._plane.shape == (64, 64), 30)
     check("Zoom Out returns to the slice from disk", ok and not w.zoom_out_action.isEnabled() and x.zoom_state.text() == "")
     check("... and Back is off again (no zoom history on the slice)", not x.zoom_back_btn.isEnabled())
+    # 2026-10-08: a zoom that lands after the slice changed is not drawn in the new slice's frame (it is memoised);
+    # with a zoom on screen, a slice result asked for before it landed (or its failure) leaves it; the zoom keeps to
+    # the files it was made from (a re-run under the same name drops it). Zoom results stood in for (memo=True)
+    import types as _types
+    o_, ax0, i0 = x.current, x.axis.currentIndex(), x.index.value()
+    shp = [8, 8, 8]
+    shp[ax0] = 1                                          # the slice axis is squeezed out
+    fz = _types.SimpleNamespace(density=np.full(shp, 3.0), streams=None, caustic=None, velocity=None, dispersion=None,
+                                sigma=None, velocity_gradient=None, offsets=None)
+    zr = {"output": o_, "rest": [a for a in range(3) if a != ax0], "a0": (20.0, 30.0), "a1": (40.0, 50.0), "res": 8,
+          "depth": 1, "memo": True, "seconds": 0.0, "stamp": x._file_stamp(o_)}
+    axes0 = w.explore_view.canvas.axes
+    x._zoomed(dict(zr, axis=(ax0 + 1) % 3, index=i0), fz)
+    other_axis = (x._zoom is None, x.zoom_state.text())
+    x._zoomed(dict(zr, axis=ax0, index=(i0 + 1) % o_.n), fz)
+    other_index = (x._zoom is None, x.zoom_state.text())
+    check("a zoom that finished after the slice axis or index changed is not shown (the map keeps the slice and its "
+          "axes), and the state line says so", other_axis[0] and other_index[0] and x._plane.shape == (64, 64)
+          and all("finished after the slice changed" in t for t in (other_axis[1], other_index[1]))
+          and w.explore_view.canvas.axes == axes0, f"{other_axis} {other_index}")
+    x._zoomed(dict(zr, axis=ax0, index=i0), fz)
+    zplane = x._plane
+    check("... a zoom of the slice on screen is shown", x.is_zoomed() and x._zoom_fields is fz and zplane.shape == (8, 8))
+    x._rendered({"request": dict(x._req), "plane": np.zeros((64, 64)), "rgb": None, "vrange": (0.0, 1.0)})
+    x._render_failed("simulated")
+    zax = w.explore_view.canvas.axes
+    check("... while it is, a late slice result and a late slice failure leave the zoom (its plane and its axes)",
+          x.is_zoomed() and x._plane is zplane and w.explore_view.canvas._img is not None
+          and abs(zax["x"][0] - 20.0) < 1e-9 and abs(zax["x"][1] - 30.0) < 1e-9, str(zax))
+    c0 = x.cmap.currentIndex()
+    x.cmap.setCurrentIndex((c0 + 1) % x.cmap.count())
+    qa.processEvents()
+    kept = x.is_zoomed() and x._zoom_fields is fz
+    x.cmap.setCurrentIndex(c0)
+    qa.processEvents()
+    k_ = x._memo_key(o_, ax0, i0, zr["a0"], zr["a1"], 8, True)
+    check("... a colour change keeps it (the files unchanged: its stamp matches); the memory key holds the same "
+          "stamp at [6] and 'exact' last", kept and x.is_zoomed() and k_[-1] is True and k_[6] == x._file_stamp(o_)
+          == zr["stamp"], str(k_))
+    g_ = next(iter(o_.files.values())).path
+    st_ = g_.stat()
+    os.utime(g_, ns=(st_.st_atime_ns, st_.st_mtime_ns + 2_000_000_000))      # a re-run rewrote it (a coarse clock too)
+    try:
+        x.refresh_outputs()
+        ok = wait_for(lambda: not x._busy and x._plane is not None and x._plane.shape == (64, 64), 30)
+        check("... after a re-run rewrote the grids, a refresh drops the zoom and shows the new grids' slice",
+              ok and x._zoom is None and x.zoom_state.text() == "" and not x.zoom_out_btn.isEnabled(), x.zoom_state.text())
+    finally:
+        os.utime(g_, ns=(st_.st_atime_ns, st_.st_mtime_ns))
 
     # a COMPOSITE query server (a large snapshot's): its zoom requests report their progress over the
     # partitions they visit (--serve-progress), which the bar follows and the state line sums up
@@ -2431,6 +2550,126 @@ def new_user_features(qa, w, tmp, data, sim):
     wo.close()
 
 
+def trash_and_vanish(qa, w, x, tmp, root):
+    """2026-10-08: Explore drops an output whose grids left the disk (a trashed run stayed listed, and its next
+    slice read failed), and the Runs browser's Move to Trash takes every log of the set (a '.runlog.failed' or
+    '.partial' left behind showed up as a failed run without outputs). The Trash and its question are stood in
+    for: nothing leaves the temp folder."""
+    import types as _types
+    import runs_view as RV
+    print("trash and vanished outputs:")
+    tr = tmp / "trash me"
+    tr.mkdir()
+    for nm in ("gone", "lost"):
+        np.full(32 ** 3, 1.0, dtype=np.float32).tofile(str(tr / f"{nm}.a_den"))
+    t0 = time.time() - 600.0
+    os.utime(tr / "gone.a_den", (t0 - 10, t0 - 10))
+    for sfx, dt_ in ((".runlog", 0.0), (".runlog.partial", 30.0), (".runlog.failed", 60.0)):
+        (tr / f"gone{sfx}").write_text(f"RUNNING: /x/PS-DTFE in.hdf5 gone --grid 32\n"
+                                       + ("   total wall time   : 1s\n" if sfx == ".runlog" else ""))
+        os.utime(tr / f"gone{sfx}", (t0 + dt_, t0 + dt_))
+    w.custom_dirs.append(str(tr))
+    try:
+        x.refresh_outputs()
+        wait_for(lambda: not x._busy, 30)
+        listed = {str(tr / "gone"), str(tr / "lost")} <= set(x._by_root)
+        same = x.refresh_if_vanished()
+        Path(str(tr / "lost") + ".a_den").unlink()       # gone behind Explore's back (the Finder)
+        looked = x.refresh_if_vanished()
+        wait_for(lambda: not x._busy, 30)
+        check("Explore looks for outputs again only when a listed one lost its grids: nothing gone -> no; a grid file "
+              "deleted -> yes, and that output is no longer offered (the one shown stays)",
+              listed and same is False and looked is True and str(tr / "lost") not in x._by_root
+              and str(tr / "gone") in x._by_root and str(x.current.root) == str(root),
+              f"{listed} {same} {looked} {sorted(x._by_root)}")
+        w.runs.reload()
+        rows = [r for r in w.runs._rows if r.path.parent == tr]
+        rec = rows[0] if len(rows) == 1 else None
+        check("the Runs browser lists that set once: its log of record, its newer failed attempt, one output",
+              rec is not None and rec.prefix == "gone" and rec.ok and rec.attempt == "failed"
+              and [p.name for p in rec.outputs] == ["gone.a_den"], str(rows))
+        w.runs.table.selectRow(w.runs._rows.index(rec))
+        qa.processEvents()
+        moved = []
+
+        def to_trash(p):
+            moved.append(Path(p).name)
+            Path(p).unlink()
+            return True
+        keep = RV.QMessageBox, RV.QFile
+        RV.QMessageBox = _types.SimpleNamespace(question=lambda *a, **k: "yes", Yes="yes")
+        RV.QFile = _types.SimpleNamespace(moveToTrash=to_trash)
+        try:
+            w.runs._trash()
+        finally:
+            RV.QMessageBox, RV.QFile = keep
+        qa.processEvents()
+        wait_for(lambda: not x._busy, 30)
+        check("Move to Trash takes the outputs AND all three logs; the rescan lists nothing there, and Explore drops the "
+              "output by itself (the rescan's records reach refresh_if_vanished)",
+              sorted(moved) == ["gone.a_den", "gone.runlog", "gone.runlog.failed", "gone.runlog.partial"]
+              and not any(r.path.parent == tr for r in w.runs.records) and str(tr / "gone") not in x._by_root
+              and not list(tr.iterdir()) and str(x.current.root) == str(root), f"{moved} {sorted(x._by_root)}")
+    finally:
+        w.custom_dirs.remove(str(tr))
+        shutil.rmtree(tr, ignore_errors=True)
+        x.refresh_outputs()
+        wait_for(lambda: not x._busy and x.current is not None and str(x.current.root) == str(root), 30)
+
+
+def launcher_run_log(qa, w, tmp):
+    """The launcher's own run log keeps the run-log contract (2026-10-08): a step with a tee writes '<log>.partial';
+    exit 0 renames it onto '<log>' (a stale '<log>.failed' goes), any other end -- a failure, a program that cannot
+    start, Stop -- onto '<log>.failed', so the log of the grids still on disk is never truncated. And every step's
+    Python is unbuffered: its lines reach the log while it runs, not when it exits."""
+    print("the launcher's run log, unbuffered steps:")
+    d = tmp / "run log"
+    d.mkdir()
+    f = d / "job.runlog"
+    failed, part = Path(str(f) + ".failed"), Path(str(f) + ".partial")
+
+    def start(argv, tee=True):          # (the printed words are put together: the '$ command' line must not hold them)
+        w._begin([rs.Step("a step", argv, {}, tee=str(f) if tee else "")], A.PLOTS, rs.PlotSpec(sets=[]), None)
+
+    f.write_text("OLD")
+    start([sys.executable, "-c", "print('attempt ' + 'one'); raise SystemExit(3)"])
+    wait_idle(w, 60)
+    check("a step that exits 3: the old '.runlog' stays as it was, the attempt's output is its '.runlog.failed', no "
+          "'.partial' is left, and Open Run Log names the .failed",
+          f.read_text() == "OLD" and failed.is_file() and "attempt one" in failed.read_text() and not part.exists()
+          and w._last_log_path == str(failed), f"{f.read_text()!r} {w._last_log_path}")
+    start([sys.executable, "-c", "print('attempt ' + 'two')"])
+    wait_idle(w, 60)
+    check("a step that exits 0: its log replaces the '.runlog', the stale '.failed' goes, Open Run Log names the .runlog",
+          "attempt two" in f.read_text() and not failed.exists() and not part.exists() and w._last_log_path == str(f),
+          f"{f.read_text()!r} {w._last_log_path}")
+    start([str(d / "no such program")])
+    wait_idle(w, 30)
+    spin(200)
+    check("a step that cannot start: a '.failed', the '.runlog' untouched", failed.is_file()
+          and "attempt two" in f.read_text() and not part.exists() and "could not start" in w.log.toPlainText(),
+          w.log.toPlainText()[-300:])
+    failed.unlink()
+    start([sys.executable, "-c", "import time; print('sta' + 'rted', flush=True); time.sleep(60)"])
+    ok = wait_for(lambda: "started" in w.log.toPlainText(), 30)
+    going = part.is_file() and w._last_log_path == str(part) and not failed.exists()
+    w.stop_run()
+    wait_idle(w, 30)
+    check("Stop mid-run: the attempt's log (its '.partial' while it ran) becomes the '.failed', the old '.runlog' stays",
+          ok and going and w.status.text() == "Stopped" and failed.is_file() and "started" in failed.read_text()
+          and "attempt two" in f.read_text() and not part.exists(), f"{ok} {going} {w.status.text()}")
+    start([sys.executable, "-c", "import os; print(os.environ.get('PYTHONUNBUFFERED'))"], tee=False)
+    wait_idle(w, 30)
+    env_lines = w.log.toPlainText().splitlines()
+    start([sys.executable, "-c", "import time; print('fir' + 'st'); time.sleep(3); print('sec' + 'ond')"], tee=False)
+    early = wait_for(lambda: "first" in w.log.toPlainText(), 2.5) and w.proc is not None
+    wait_idle(w, 30)
+    check("every step runs with PYTHONUNBUFFERED=1: a Python step's line reaches the log while it runs (through the "
+          "pipe it was block-buffered until the step exited)", "1" in env_lines and early
+          and "second" in w.log.toPlainText(), f"{env_lines[-3:]} {early}")
+    w.banner.hide()
+
+
 def two_d_gui(qa, w, tmp):
     """The 2D programs through the launcher: a 2D file is recognised, runs on the -2d binary, and
     Explore shows it as one plane, queries it, zooms into it (point and exact)."""
@@ -2480,6 +2719,8 @@ def two_d_gui(qa, w, tmp):
           ok and o.dim == 2 and x._plane.shape == (64, 64) and "64² grid (2D)" in x.info.text()
           and not x.axis.isEnabled() and not x.index.isEnabled() and not x.slider.isEnabled()
           and "2D" in x.position.text(), x.info.text())
+    check("... and no void outlines (they need 3D grids)", not x.voids.isEnabled() and x._void_circles() is None,
+          x.voids.toolTip())
     x.field.setCurrentIndex(x.field.findData("tweb_eigenvalues"))
     wait_for(lambda: not x._busy and x._req["field"] == "tweb_eigenvalues", 30)
     ecomps = [x.component.itemText(i) for i in range(x.component.count())]

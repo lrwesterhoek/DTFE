@@ -12,12 +12,15 @@ definitions:
   * 'deep'      : well_resolved AND central delta < DEEP_VOID_THRESHOLD -- the tracking sample
 
 Outputs (figures/void_population/<sim>/):
-  population_evolution.png    counts, R_eff, e, p, central delta vs redshift
+  population_evolution.png    counts, R_eff and the distinct voids' R_v, e, p, central delta vs redshift
   population_distributions.png  R_eff / e / p / delta histograms at config.PANEL_SNAPSHOTS
-  population_abundance.png    n(> R_eff) and dn/dlnR per Mpc^3 (well-resolved voids, Poisson errors) at
+  population_abundance.png    n(> R_v) and dn/dlnR_v per Mpc^3 (distinct well-resolved voids, Poisson errors) at
                               config.PANEL_SNAPSHOTS -- with --other-estimator also the other estimator's
-                              catalogue, dashed -- and R_eff against the central delta at the latest one
+                              catalogue, dashed -- and R_v against the central delta at the latest one
   population_stats.npz        every per-snapshot statistic, the abundance curves included
+Those names are PS-DTFE's default grids (ps_output.); another estimator or --prefix adds '_<method>' / '_<prefix>',
+--keep-overlaps '_overlaps', to every name (2026-10-08: a --method dtfe run replaced the PS-DTFE files), and a
+non-default smoothing writes into its own folder.
 
 Examples:
   python3 plot/plot_void_population.py --sim TNG50-3-Dark --method dtfe
@@ -100,7 +103,8 @@ def main():
                         help="abundance figure: overlay the OTHER estimator's catalogue (dtfe beside ps or the "
                              "reverse) where its grids exist -- computed into the cache when not there yet")
     parser.add_argument("--keep-overlaps", action="store_true",
-                        help="abundance: count every resolved void with a radius, not only the distinct ones")
+                        help="abundance: count every resolved void with a radius, not only the distinct ones (none "
+                             "whose centre lies inside a deeper void's min(R_v, R_eff))")
     pipeline.add_smoothing_mpc_arg(parser)
     args = parser.parse_args()
     pipeline.apply_smoothing_args(args, "void-population")
@@ -109,14 +113,14 @@ def main():
     ztab = gc.redshift_table(args.sim)
     ladder = sorted({int(d.name.split("_")[1]) for d in env.sim_dir(args.sim).glob("snapdir_*")})
 
-    stats, method_used, box, other, refused = {}, {}, {}, {}, []
+    stats, method_used, prefix_used, box, other, refused = {}, {}, {}, {}, {}, []
     panel_want = [int(s) for s in (args.panel_snaps or config.PANEL_SNAPSHOTS)]
     for s in ladder:
         prod = pipeline.products(s, sim=args.sim, method=args.method, prefix=args.prefix, data_root=args.data_root)
         try:
             cell_, box[s], _n, _src = catalog.frame_of(prod)    # the header's frame must be config's (DTFE_SIM): else refused
             cat = prod.voids()
-            method_used[s] = prod.fs.method
+            method_used[s], prefix_used[s] = prod.fs.method, prod.fs.prefix
         except OSError as e:                           # no grids (FileNotFoundError: silent, as before) or an unreadable file
             if not isinstance(e, FileNotFoundError):
                 print(f"  snap {s:3d}: unreadable, left out: {e}")
@@ -155,6 +159,12 @@ def main():
 
     outdir = FIGURE_ROOT / args.sim / pipeline.smoothing_tag()     # a non-default sigma: its own folder
     outdir.mkdir(parents=True, exist_ok=True)
+    # the names say what they hold (2026-10-08): untagged for PS-DTFE's default grids, as every file on the T7 is;
+    # another estimator, a --prefix or --keep-overlaps used to overwrite those (as the pk / profile files are tagged)
+    default_prefix = {"ps": "ps_output.", "dtfe": "output."}         # io's: an estimator's own grids
+    grids = "+".join(sorted({m if prefix_used[s] == default_prefix.get(m) else prefix_used[s].rstrip(".")
+                             for s, m in method_used.items()}))
+    name_tag = ("" if grids == "ps" else f"_{grids}") + ("_overlaps" if args.keep_overlaps else "")
 
     # ---- evolution figure ---------------------------------------------------------------
     fig, axes = plt.subplots(4, 1, figsize=(8, 15), sharex=True)
@@ -175,6 +185,12 @@ def main():
         ax.plot(z, med, "o-", ms=4, color=c_, label=f"median {lab}")
         ax.fill_between(z, lo, hi, color=c_, alpha=0.2, label="16-84%")
         ax.set_ylabel(lab); ax.legend(fontsize=8)
+    # the measured radius beside R_eff (~1.75 R_v, a curvature length): the abundance sample's R_v (2026-10-08)
+    lo, med, hi = (np.array([stats[s]["r_v_pct"][i] for s in snaps]) for i in range(3))
+    rv_lab = r"$R_v$ [Mpc] (" + ("" if args.keep_overlaps else "distinct ") + "well-resolved)"
+    axes[1].plot(z, med, "s--", ms=4, color="tab:green", label=f"median {rv_lab}")
+    axes[1].fill_between(z, lo, hi, color="tab:green", alpha=0.15)
+    axes[1].set_ylabel("void radius [Mpc]"); axes[1].legend(fontsize=8)
     # overlay prolateness on the ellipticity panel
     lo, med, hi = (np.array([stats[s]["p_pct"][i] for s in snaps]) for i in range(3))
     axes[2].plot(z, med, "s--", ms=4, color="tab:orange", label="median p")
@@ -186,7 +202,7 @@ def main():
         ax.grid(alpha=0.3)
     axes[-1].invert_xaxis()
     fig.tight_layout()
-    fig.savefig(outdir / "population_evolution.png", dpi=200, bbox_inches="tight")
+    fig.savefig(outdir / f"population_evolution{name_tag}.png", dpi=200, bbox_inches="tight")
     plt.close(fig)
 
     # ---- distribution figure ------------------------------------------------------------
@@ -206,7 +222,7 @@ def main():
         ax.set_xlabel(lab); ax.set_ylabel("pdf"); ax.legend(fontsize=8); ax.grid(alpha=0.3)
     fig.suptitle(f"{args.sim} — void population distributions ({'/'.join(methods)})")
     fig.tight_layout()
-    fig.savefig(outdir / "population_distributions.png", dpi=200, bbox_inches="tight")
+    fig.savefig(outdir / f"population_distributions{name_tag}.png", dpi=200, bbox_inches="tight")
     plt.close(fig)
 
     # ---- abundance figure (survey item 10): n(> R_eff), dn/dlnR per Mpc^3, R_eff against the central delta
@@ -248,12 +264,13 @@ def main():
     fig.suptitle(f"{args.sim} — void abundance in R_v ({'/'.join(methods)}, {'' if args.keep_overlaps else 'distinct '}"
                  f"well-resolved voids, box {box[snaps[-1]]:.0f} Mpc)")
     fig.tight_layout()
-    fig.savefig(outdir / "population_abundance.png", dpi=200, bbox_inches="tight")
+    fig.savefig(outdir / f"population_abundance{name_tag}.png", dpi=200, bbox_inches="tight")
     plt.close(fig)
 
     np.savez_compressed(
-        outdir / "population_stats.npz",
+        outdir / f"population_stats{name_tag}.npz",
         snaps=np.array(snaps), redshift=z, box_mpc=np.array([box[s] for s in snaps]),
+        method=np.array([method_used[s] for s in snaps]), prefix=np.array([prefix_used[s] for s in snaps]),
         abundance_radii_mpc=radii, abundance_edges_mpc=edges,
         **{k: np.array([stats[s][k] for s in snaps])
            for k in ("n_total", "n_bbks", "n_resolved", "n_deep", "n_counted", "n_no_rv", "n_overlapping",
@@ -261,7 +278,8 @@ def main():
         abundance_radius="r_v", abundance_distinct=not args.keep_overlaps,
         **{f"abundance_{key}_{part}": np.asarray(vals[i])
            for key, vals in abund.items() for i, part in enumerate(("n_cum", "n_cum_err", "dn_dlnr", "dn_dlnr_err"))})
-    print(f"-> {outdir}/population_evolution.png, population_distributions.png, population_abundance.png, population_stats.npz")
+    print(f"-> {outdir}/population_evolution{name_tag}.png, population_distributions{name_tag}.png, "
+          f"population_abundance{name_tag}.png, population_stats{name_tag}.npz")
 
 
 if __name__ == "__main__":

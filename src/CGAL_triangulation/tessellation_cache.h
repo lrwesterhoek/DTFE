@@ -60,6 +60,10 @@
 
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <cerrno>
+#include <dirent.h>     // removeStaleParts: a dead writer's temp file
+#include <signal.h>     // ... kill(pid, 0): is that writer still running
+#include <unistd.h>     // getpid: each writer's own temp name
 
 #include "../canonical_path.h"
 #include "../cache_key_lines.h"   // the build lines and file stamps of the key (shared with auto_tune.h)
@@ -669,6 +673,30 @@ inline double freeBytes(std::string const &dir)
 }
 
 
+// The temp files '<path>.part.<pid>' of writers of THIS cache file that no longer run (a crash or a
+// SIGKILL mid-write): removed before a new write, so a killed run does not strand GBs beside the cache.
+// A running writer's file is left alone (2026-10-08, with the per-writer temp names in save()).
+inline void removeStaleParts(std::string const &path)
+{
+    std::string::size_type const slash = path.find_last_of( '/' );
+    std::string const dir  = slash == std::string::npos ? std::string( "." ) : path.substr( 0, slash );
+    std::string const stem = ( slash == std::string::npos ? path : path.substr( slash + 1 ) ) + ".part.";
+    DIR *d = ::opendir( dir.c_str() );
+    if ( d == nullptr ) return;
+    while ( struct dirent *e = ::readdir( d ) )
+    {
+        std::string const name = e->d_name;
+        if ( name.size() <= stem.size() or name.compare( 0, stem.size(), stem ) != 0 ) continue;
+        char *end = nullptr;
+        long const pid = std::strtol( name.c_str() + stem.size(), &end, 10 );
+        if ( pid <= 0 or end == nullptr or *end != '\0' or pid == long( ::getpid() ) ) continue;
+        if ( ::kill( pid_t( pid ), 0 ) == 0 or errno != ESRCH ) continue;   // alive, or not ours to judge
+        ::remove( ( dir + "/" + name ).c_str() );
+    }
+    ::closedir( d );
+}
+
+
 /* ---------------------------------------------------------------- the triangulation, read in blocks
    CGAL writes a 3D triangulation in binary mode (Triangulation_3.h operator<<, CGAL 6) as: the
    dimension (int), the number of finite vertices n (size_t), each finite vertex's point (three
@@ -1174,7 +1202,11 @@ inline void save(DT &dt, User_options const &userOptions)
     }
 
     std::string const path = cachePath( userOptions );
-    std::string const tmp  = path + ".part";     // write aside, rename: a crash leaves no half file
+    // write aside, rename: a crash leaves no half file. The temp name is this writer's own (2026-10-08): two
+    // processes saving one partition at once (a batch run beside the composite server, which shares the cache
+    // folder) both truncated one '<path>.part', and the first rename could publish a file with a zero-filled hole
+    std::string const tmp  = path + ".part." + std::to_string( long( ::getpid() ) );
+    removeStaleParts( path );
     {
         std::ofstream os( tmp.c_str(), std::ios::binary | std::ios::trunc );
         if ( !os )

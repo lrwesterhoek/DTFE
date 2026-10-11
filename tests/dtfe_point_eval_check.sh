@@ -52,10 +52,11 @@ fi
 [ -x "${BIN}" ] || { echo "FAIL: ${BIN} not built"; exit 1; }
 
 # capture FIRST -- piping the binary straight into grep -q would SIGPIPE it under pipefail
-FULL_HELP="$("${BIN}" --full_help 2>/dev/null || true)"
+# a help that fails is a broken binary, not a missing feature; a missing feature fails under DTFE_TEST_REQUIRED=1
+# (skip_or_fail, tests/precision.sh: 2026-10-08)
+FULL_HELP="$("${BIN}" --full_help 2>/dev/null)" || { echo "FAIL: ${BIN} --full_help exited non-zero"; exit 1; }
 if ! grep -q -- '--sample-points' <<<"${FULL_HELP}"; then
-    echo "SKIP: this DTFE has no --sample-points support."
-    exit 0
+    skip_or_fail "this DTFE has no --sample-points support."
 fi
 HAVE_PS=0
 [ -x "${PSBIN}" ] && HAVE_PS=1

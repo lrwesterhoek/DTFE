@@ -10,7 +10,8 @@ run with a python whose h5py works (`/opt/homebrew/bin/python3` on the developme
 
 ```bash
 ./scripts/install.sh              # one-command clean rebuild, best backend auto-detected
-                                  #   (Apple Silicon -> METAL=1; Linux with nvcc / hipcc -> CUDA=1 / HIP=1; else CPU-only)
+                                  #   (Apple Silicon -> METAL=1; Linux with nvcc / hipcc -> CUDA=1 / HIP=1; else CPU-only);
+                                  #   a double or 2D pair already built is rebuilt too ('make clean' deletes every set)
 ./scripts/install.sh --cpu        # force CPU-only binaries
 ./scripts/install.sh --no-deps    # skip dependency installation, just clean + rebuild
 ./scripts/install.sh --jobs 4     # limit parallel build jobs
@@ -38,12 +39,16 @@ make DTFE PS-DTFE DIM=2           # the 2D pair: ./DTFE-2d and ./PS-DTFE-2d (own
                                   #   Every field works in 2D, the T-web too (classes 0 void, 1 filament,
                                   #   2 node): ./PS-DTFE-2d snap2d.hdf5 out2d --grid 192 --periodic --field density tweb
                                   #   tests/ps_2d_check.sh checks the 2D pair against analytic 2D flows.
-make PS-DTFE TBB=1                # opt-in parallel CGAL triangulation (slower at small N!)
+make PS-DTFE TBB=1                # REQUIRE tbb's parallel CGAL triangulation (the default TBB=auto compiles it in
+                                  #   when tbb is installed, TBB=0 leaves it out); the opt-in is at run time,
+                                  #   --parallel-triangulation (or DTFE_TBB_THREADS=N): runs then differ at rounding
 make PS-DTFE DOUBLE=1             # double precision end to end (Real = double; float64 output
-                                  #   grids, full-precision HDF5 reads). CPU-only: refused with
-                                  #   METAL=1. Stamped like DIM: switching it rebuilds.
+                                  #   grids, full-precision HDF5 reads) as ./PS-DTFE-double, from its own
+                                  #   object dir o_ps_d: ./PS-DTFE stays. METAL=1 works (the GPU deposits
+                                  #   float copies of the tetrahedra into the double grids), as above.
 make library                      # shared libDTFE
-make clean                        # binaries + objects + auto-dependency .d files
+make clean                        # EVERY binary set (single, -double, -2d), libDTFE and the objects (the
+                                  #   3D dirs' .d files too); the build-mode stamps stay
 make deps-check                   # verify headers/libraries exist before a long compile
 make test-platform                # show detected platform / compiler / paths
 make DTFE $(cat o/.build_mode)    # rebuild WITHOUT downgrading the current GPU mode
@@ -543,6 +548,9 @@ python3 tests/generate_ps_test_data.py --out snap.hdf5 --n 32 --box 100 \
     --margin-frac 0.2           `# non-periodic clump in vacuum instead`
 ```
 
-CI (`.github/workflows/ci.yml`) runs the Linux CPU build plus `run_tests.py`,
-`ps_smoke_test.sh`, `ps_regression_test.py` and the four PS flag suites. The Metal GPU path
-and the two macOS-specific suites (`ps_auto_tune_check`, `ps_scratch_check`) are local-only.
+CI (`.github/workflows/ci.yml`) and the Docker image run `tests/ci_suite.sh`, the one list of
+suites: `build` (the single, double and 2D pairs, CPU-only), `core` (every CPU suite), `double`
+(the program suites again against the double pair), `2d`, and in CI `gui` (the launcher, end to
+end offscreen); CI also compiles the CUDA/HIP port with nvcc and hipcc. The standard-DTFE
+regression has no reference there and reports SKIP. The Metal GPU path, the GPU suites and the
+two macOS-specific suites (`ps_auto_tune_check`, `ps_scratch_check`) are local-only.

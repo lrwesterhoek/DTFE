@@ -87,6 +87,11 @@ int psOccupancyTouchesWindow(User_options const &partOpts, User_options const &m
 // descriptor)? The batch partition loop then skips the particle selection.
 bool psTessellationCached(User_options const &opts);
 
+// The deposit passes since the last reset that asked for the GPU (--ps-gpu) and ran on the CPU instead
+// (ps_interpolation.cc); reset = true also zeroes the count. Each pass warns itself, but the partition
+// loop runs its non-master threads at verbose 0, so DTFE() reports the count after the loop (2026-10-08).
+int psGpuFallbacksTaken(bool reset = false);
+
 // Auto-tune: the mean number of streams at a random point of the box -- sum|V_Euler| over
 // sum V_Lagrange of the Lagrangian tessellation -- estimated from up to 256 random Lagrangian
 // patches, before any triangulation of the run exists. Needs the particles' Lagrangian

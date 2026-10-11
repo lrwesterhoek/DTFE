@@ -136,6 +136,7 @@ User_options::User_options()
     psDeferNormalization = false;
     psLagAlphaRadius = 0.;   // set from --ps-alpha-shape once the Lagrangian cloud is known (DTFE.cpp)
     psOrderedMerge = false;  // set by the auto-tuner's speed split (auto_tune.h)
+    psPartitionBytes = 0.;   // set from the auto-tuner's report (DTFE.cpp): the partition memory gate
     psUseSubgrid = false;
     psMayClearDT = false;   // set only by the DTFE_interpolation overload that owns its DT
 #endif

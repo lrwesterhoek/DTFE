@@ -58,10 +58,11 @@ GPU_BUILT=0
 [ -f o_ps/.gpu_mode_off ] || GPU_BUILT=1
 
 # capture FIRST -- piping the binary straight into grep -q would SIGPIPE it under pipefail
-FULL_HELP="$("${BIN}" --full_help 2>/dev/null || true)"
+# a help that fails is a broken binary, not a missing feature; a missing feature fails under DTFE_TEST_REQUIRED=1
+# (skip_or_fail, tests/precision.sh: 2026-10-08)
+FULL_HELP="$("${BIN}" --full_help 2>/dev/null)" || { echo "FAIL: ${BIN} --full_help exited non-zero"; exit 1; }
 if ! grep -q -- '--ps-halo-release' <<<"${FULL_HELP}"; then
-    echo "SKIP: this PS-DTFE has no --ps-halo-release support."
-    exit 0
+    skip_or_fail "this PS-DTFE has no --ps-halo-release support."
 fi
 
 echo ">> generating test snapshots ..."

@@ -5,6 +5,7 @@ Import as `from dtfelib import figures as style` (the historical alias). Reads c
 only at call time, so a test harness can patch config before running a script.
 """
 
+import os
 from pathlib import Path
 
 import matplotlib as mpl
@@ -279,22 +280,71 @@ def mirror_relative_path(primary_path) -> str:
     return s.split('/figures/', 1)[1] if '/figures/' in s else p.name
 
 
+# The thesis mirror's guard (2026-10-08). The thesis scripts name their figures without the simulation or the
+# estimator (config.figures_path), so a run on another box, or on PS-DTFE grids (FieldSet's auto-detect picks them
+# whenever they are there, as on the T7), replaced the thesis's TNG50-3-Dark standard-DTFE figures under the same
+# names. Those folders now take a figure only when the run is on config.THESIS_SIMULATION and every grid set the
+# script noted (note_source) is config.THESIS_METHOD's default one. The per-simulation folders (void_profiles/<sim>/,
+# web_streams/<sim>/, ...) cannot collide and mirror as before. DTFE_NO_MIRROR (analyze.py --no-mirror) turns every
+# mirror off.
+_SOURCES = set()            # (simulation, method, prefix) of the grids this process's thesis figures are made from
+_SAID = set()               # each refusal is said once per process, not once per figure
+_ESTIMATOR = {'ps': 'PS-DTFE', 'dtfe': 'standard-DTFE'}
+
+
+def note_source(fs):
+    """A thesis script's data: the FieldSet (a pipeline product's .fs) its figures are made from. Its snapshot
+    folder's parent names the simulation; the method and the prefix say which grids were read."""
+    snapdir = getattr(fs, 'snapdir', None)
+    sim = Path(snapdir).parent.name if snapdir is not None else str(config.SIMULATION)
+    _SOURCES.add((sim, str(getattr(fs, 'method', '')), str(getattr(fs, 'prefix', ''))))
+
+
+def thesis_mirror_refusal():
+    """Why a figure named without its simulation and estimator may not go into the thesis tree now; None: it may.
+    Read at call time (config, the environment, the noted sources)."""
+    from .io import _PREFIX
+    if os.environ.get('DTFE_NO_MIRROR'):
+        return "the run asked for no thesis mirror"
+    want_sim, want_method = config.THESIS_SIMULATION, config.THESIS_METHOD
+    if config.SIMULATION != want_sim:
+        return f"the simulation is {config.SIMULATION} (DTFE_SIM), not the thesis's {want_sim}"
+    for sim, method, prefix in sorted(_SOURCES):
+        if sim != want_sim:
+            return f"made from {sim}'s grids, not the thesis simulation {want_sim}'s"
+        if method != want_method or prefix != _PREFIX.get(want_method):
+            return (f"made from {_ESTIMATOR.get(method, method)} grids ({prefix}*), not the thesis's "
+                    f"{_ESTIMATOR.get(want_method, want_method)} ones ({_PREFIX.get(want_method)}*)")
+    return None
+
+
 def save_plot_to_multiple_paths(fig, primary_path, dpi=300, mirror=True, **kwargs):
     """Save a figure to its primary path and mirror it into the thesis Figures/ tree
     (config.THESIS_FIGURES_DIR, read at call time), preserving its path below the figure root
     (mirror_relative_path). mirror=False saves the primary path only: a script run with --out (a path outside
     the figure root) would otherwise drop its files FLAT into the thesis tree's root, where simulations' names
-    collide (review 2026-10-05)."""
+    collide (review 2026-10-05). A figure in one of config.THESIS_NAMED_DIRS is mirrored only when
+    thesis_mirror_refusal() has no objection (2026-10-08), and the refusal is said."""
     primary_path = Path(primary_path)
     primary_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(primary_path, dpi=dpi, **kwargs)
-    if not mirror:
+    if not mirror or os.environ.get('DTFE_NO_MIRROR'):
         return
     from . import pipeline as _pl                         # here: pipeline imports this module's package at load
     if _pl.smoothing_tag():
         return                                            # the thesis tree holds production-smoothing figures only
 
-    additional_path = Path(str(config.THESIS_FIGURES_DIR)) / mirror_relative_path(primary_path)
+    rel = mirror_relative_path(primary_path)
+    if rel.split('/', 1)[0] in getattr(config, 'THESIS_NAMED_DIRS', ()):
+        why = thesis_mirror_refusal()
+        if why:
+            if why not in _SAID:
+                _SAID.add(why)
+                print(f"  not copied into the thesis Figures/ tree: {why}. These file names carry neither the "
+                      f"simulation nor the estimator; only {config.THESIS_SIMULATION} "
+                      f"{_ESTIMATOR.get(config.THESIS_METHOD, config.THESIS_METHOD)} figures go there.")
+            return
+    additional_path = Path(str(config.THESIS_FIGURES_DIR)) / rel
     additional_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(additional_path, dpi=dpi, **kwargs)
 

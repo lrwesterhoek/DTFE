@@ -259,6 +259,13 @@ struct Gpu {
         const bool fields = !vels.empty();
         DepositParams Pk=P;
         if (!fields) { Pk.fVel=0; Pk.fDisp=0; Pk.fGrad=0; }
+        {   // the mass grid as the exact fixed-point sum, set as ps_metal_host.cc sets it (2026-10-08);
+            // VALIDATE_FLOAT_MASS=1 tests the float grid of before instead
+            double tm=0.; for(float x:masses) if(x>0.f) tm+=x;
+            float sc=1.f;
+            Pk.massFixed = (!getenv("VALIDATE_FLOAT_MASS") && psMassFixedScale(tm,sc)) ? 1 : 0;
+            Pk.massScale = sc;
+        }
         std::vector<float> rec(size_t(P.nTet)*PS_TET_STRIDE);
         {
             double const lo[3]={P.boxLo[0],P.boxLo[1],P.boxLo[2]};
@@ -290,7 +297,8 @@ struct Gpu {
         MTL::Buffer* bU=fields? dev->newBuffer(vels.data(),vels.size()*sizeof(float),MTL::ResourceStorageModeShared) : zbuf(4);
         MTL::Buffer* bM=dev->newBuffer(mcopy.data(),mcopy.size()*sizeof(float),MTL::ResourceStorageModeShared);
         MTL::Buffer* bP=dev->newBuffer(&Pk,sizeof(Pk),MTL::ResourceStorageModeShared);
-        MTL::Buffer* bMass=zbuf(nCell*4);
+        MTL::Buffer* bMass=zbuf(Pk.massFixed ? 4 : nCell*4);          // float mass (buffer 3), else a dummy
+        MTL::Buffer* bMassFx=zbuf(Pk.massFixed ? nCell*8 : 4);        // fixed-point mass (buffer 21), else a dummy
         MTL::Buffer* bMom=zbuf(Pk.fVel ? nCell*12 : 4);
         MTL::Buffer* bM2 =zbuf(Pk.fDisp? nCell*24 : 4);
         MTL::Buffer* bG  =zbuf(Pk.fGrad? nCell*36 : 4);
@@ -329,6 +337,7 @@ struct Gpu {
             e->setBuffer(bD,0,9); e->setBuffer(bW,0,10); e->setBuffer(bC,0,11);
             e->setBuffer(bSV,0,12); e->setBuffer(bDV,0,13); e->setBuffer(bDW,0,14);
             e->setBuffer(bSc,0,18); e->setBuffer(bScal,0,19); e->setBuffer(bSG,0,20);
+            e->setBuffer(bMassFx,0,21);
             if(bI){
                 uint32_t const IP[4]={uint32_t(nThreads),phase,itemCells,0u};
                 e->setBuffer(bI,0,15); e->setBuffer(bSW,0,16); e->setBytes(IP,sizeof IP,17);
@@ -370,7 +379,12 @@ struct Gpu {
         } else
             dispatch(psoFld,bM,P.nTet,nullptr,nullptr,0);
 
-        o.mass.assign((float*)bMass->contents(),(float*)bMass->contents()+nCell);
+        if(Pk.massFixed){
+            const uint32_t* fx=(const uint32_t*)bMassFx->contents();
+            o.mass.resize(nCell);
+            for(size_t i=0;i<nCell;++i) o.mass[i]=float(psMassFixedValue(fx[2*i],fx[2*i+1],Pk.massScale));
+        } else
+            o.mass.assign((float*)bMass->contents(),(float*)bMass->contents()+nCell);
         if (fields){
             o.mom.assign((float*)bMom->contents(),(float*)bMom->contents()+nCell*3);
             o.m2.assign((float*)bM2->contents(),(float*)bM2->contents()+nCell*6);

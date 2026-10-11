@@ -220,6 +220,7 @@ def process_snapshot(snapshot, redshift, args):
             # default (standard DTFE) so a plain run reproduces previous behavior
             print("  both PS and DTFE fields present; using --method dtfe")
             fs = FieldSet(snapdir, method='dtfe', averaged=not args.raw)
+        style.note_source(fs)                       # the thesis mirror takes the thesis box's standard DTFE only
         print("Loading fields")
         density_field = fs.density(units='mean')   # rho/rho_bar for BOTH methods
         velDiv_field = fs.load('divergence')

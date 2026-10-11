@@ -22,7 +22,8 @@
 #      but in the few caustic cells where a copy's float rounding flips a flat triangle's drop);
 #      --ps-vertex-mass, --ps-volume-weighted, --ps-halo-release, --ps-linear-deposit conserve mass;
 #      a non-periodic clump conserves mass and covers its interior; the tessellation cache hits and
-#      reproduces the run bit for bit
+#      reproduces the run bit for bit; --ps-gpu on the 2D build (no GPU backend in DIM=2) runs every
+#      partition on the CPU, exits 0 and says how many passes fell back (2026-10-08)
 #   D  the standard 2D build runs on the same file: its mean density is the particle density
 #   PE point evaluation (--sample-points, 2D since 2026-10-02): at the cell centres the point stream
 #      counts equal the same run's nSub = 1 grid counts EXACTLY; single-stream point velocities are
@@ -77,6 +78,9 @@ RUN "$TMP/pan_hr"  ./PS-DTFE-2d "$TMP/pan.hdf5" "$TMP/pan_hr"  "${COMMON[@]}" --
 RUN "$TMP/pan_lin" ./PS-DTFE-2d "$TMP/pan.hdf5" "$TMP/pan_lin" "${COMMON[@]}" --field density_a --ps-linear-deposit
 RUN "$TMP/pan_c1"  ./PS-DTFE-2d "$TMP/pan.hdf5" "$TMP/pan_c1"  "${COMMON[@]}" --field density_a --tessellation-cache "$CACHE"
 RUN "$TMP/pan_c2"  ./PS-DTFE-2d "$TMP/pan.hdf5" "$TMP/pan_c2"  "${COMMON[@]}" --field density_a --tessellation-cache "$CACHE"
+# --ps-gpu where no GPU can run: the deposit falls back pass by pass, and only the master thread's partitions
+# said so -- the run now counts every pass and says it once
+RUN "$TMP/pan_gfb" ./PS-DTFE-2d "$TMP/pan.hdf5" "$TMP/pan_gfb" --grid 32 --periodic --MpcUnit 1 --verbose 2 --field density --partition 2 2 --max-concurrent 2 --ps-gpu
 echo ">> convergence series (single-stream density, nSub 3, grid 96)"
 for n in 16 24 32 48; do
     GEN --out "$TMP/conv_$n.hdf5" --n $n --box 100 --amplitude-factor 1.8 --jitter-frac 0.02 --seed 42
@@ -255,6 +259,9 @@ check("S non-periodic clump", abs(mass - 1) < 0.02 and (cl[lo:hi, lo:hi] > 0).al
 log2 = (tmp / "pan_c2.log").read_text()
 same = all((tmp / f"pan_c1.{e}").read_bytes() == (tmp / f"pan_c2.{e}").read_bytes() for e in ("a_den", "a_streams"))
 check("S tessellation cache", "Reused the cached tessellation" in log2 and same, "the second run hits and its grids are identical")
+gfb = (tmp / "pan_gfb.log").read_text(errors="replace")
+check("S --ps-gpu fallback counted", "4 partition deposit pass(es) asked for the GPU and ran on the CPU instead" in gfb,
+      "a --ps-gpu run with --partition 2 2 on the CPU-only 2D build says '4 partition deposit pass(es) ... ran on the CPU'")
 
 # PE: point evaluation
 pst = np.fromfile(tmp / "pts.pts_streams", np.int32)

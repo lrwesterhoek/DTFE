@@ -124,6 +124,7 @@ def analyze_snapshot(snapshot, redshift, output_root, sim, method, prefix=None, 
     try:
         p = pipeline.products(snapshot, redshift, sim=sim, method=method, prefix=prefix, data_root=data_root)
         cat = p.voids()
+        style.note_source(p.fs)                     # the thesis mirror takes the thesis box's standard DTFE only
         coords = np.asarray(cat['coords'], dtype=int)
         n = len(coords)
         if n < 10:

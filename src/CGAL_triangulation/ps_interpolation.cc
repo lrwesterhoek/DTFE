@@ -51,6 +51,13 @@
 #include "gpu_host.h"
 #include "ps_clip2d.h"      // the 2D exact deposit's clipper (DIM=2 builds)
 
+// The deposit passes that asked for the GPU and ran on the CPU (ps_point_eval.h psGpuFallbacksTaken).
+static std::atomic<int> psGpuFallbacks{ 0 };
+int psGpuFallbacksTaken(bool reset)
+{
+    return reset ? psGpuFallbacks.exchange( 0 ) : psGpuFallbacks.load();
+}
+
 // The finite cells (3D) / faces (2D) around a vertex, appended to 'out'.
 template <class Tr, class V>
 static inline void psFiniteIncidentCells(Tr const &dt, V const &vh, std::vector<Cell_handle> &out)
@@ -1114,6 +1121,7 @@ void interpolateGrid_phaseSpace(DT &dt,
         MESSAGE::Warning warning( userOptions.verboseLevel );
         warning << "--ps-gpu supports ONE scalar component (this build has NO_SCALARS=" << noScalarComp << "); using the CPU deposit for this pass.\n" << MESSAGE::EndWarning;
         tryMetal = false;
+        ++psGpuFallbacks;
     }
 #endif
     // The kernels index cells with a 32-bit 'uint flat' (metal/ps_deposit.metal).
@@ -1130,6 +1138,7 @@ void interpolateGrid_phaseSpace(DT &dt,
                 << noTotalCells << "); using the CPU deposit for this pass. A finer --partition splits them.\n"
                 << MESSAGE::EndWarning;
         tryMetal = false;
+        ++psGpuFallbacks;
     }
     if ( tryMetal and subTotal > size_t(UINT32_MAX) )
     {
@@ -1138,6 +1147,7 @@ void interpolateGrid_phaseSpace(DT &dt,
                 << subTotal << ", i.e. > " << size_t(UINT32_MAX) << "); using the CPU deposit for this pass. "
                 << "A finer --partition would bring the sub-grid back under the cap.\n" << MESSAGE::EndWarning;
         tryMetal = false;
+        ++psGpuFallbacks;
     }
     if ( tryMetal )
     {
@@ -1511,6 +1521,7 @@ void interpolateGrid_phaseSpace(DT &dt,
         {
             MESSAGE::Warning warning( userOptions.verboseLevel );
             warning << "PS-DTFE GPU deposit unavailable (" << metalErr << "); using the CPU deposit.\n" << MESSAGE::EndWarning;
+            ++psGpuFallbacks;
             nReleased = 0;   // releasedTets are discarded; the CPU loop below recounts them
         }
     }
@@ -1547,6 +1558,7 @@ void interpolateGrid_phaseSpace(DT &dt,
 #else
     if ( userOptions.psUseMetal )
     {
+        ++psGpuFallbacks;
         static bool warned = false;
         if ( !warned )
         {
@@ -2979,8 +2991,13 @@ void interpolateGrid_phaseSpace(DT &dt,
     // density accumulated MASS (sum of per-tetrahedron mass shares); convert to a density by dividing
     // by the grid-cell volume, then normalize by averageDensity so the written field is rho/rho_bar
     // (mean-normalized "density contrast + 1", the SAME convention as standard DTFE).
-    // Mass conservation makes the box mean exactly 1 for any nSub. Stream count is averaged over
-    // the nSub^NO_DIM sub-samples below.
+    // Mass conservation makes the box mean 1 for any nSub, up to the accumulators (2026-10-08: this
+    // said "exactly 1"; TNG50-3-Dark z=0 on the GPU gave 0.99941). The Metal deposit's mass grid is an
+    // exact fixed-point sum and the double build's sums are good to ~1e-15, but a FLOAT accumulator -- the
+    // CPU deposit of the single-precision build, the CUDA/HIP port, PS_METAL_FLOAT_MASS=1 -- drops every
+    // share below half an ulp of a busy cell's running sum, always downward (~0.1% at 1e6 deposits into one
+    // cell, ~2% at 1e7). Tetrahedra the cell filters drop take their mass along in every build.
+    // Stream count is averaged over the nSub^NO_DIM sub-samples below.
     if ( field.density )
     {
         Real const invRhoBar = userOptions.averageDensity > Real(0.)

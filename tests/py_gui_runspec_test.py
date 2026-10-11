@@ -401,6 +401,10 @@ def main():
               [(g[1], g[2]) for g in got if g[1]] == [("64", "4"), ("32", "99")]
               and [st.argv[st.argv.index("--plane") + 1].endswith(f"hires_plane_z{nu}.json")
                    for st, nu in zip(pm.steps()[1::2], (64, 32))] == [True, True], str(got))
+        # 2026-10-08: run_ps_pipeline.sh exits 1 when it computed nothing, and the render after it must not run then
+        check("... each render waits for its own pipeline call (after = that call's label; the calls wait for nothing)",
+              [st.after for st in pm.steps()[1::2]] == [st.label for st in pm.steps()[0::2]]
+              and all(st.after == "" for st in pm.steps()[0::2]), str([(st.label, st.after) for st in pm.steps()]))
         pm.grid = 256
         lv, msg = levels(pm)
         check("a plan checked for other settings is refused", "error" in lv and "changed since" in msg, msg)
@@ -438,6 +442,8 @@ def main():
         type_labels_2026_10_06()
         launcher_fixes()
         figures_root_rule()
+        void_outline_geometry()
+        run_log_contract()
     finally:
         shutil.rmtree(tmp.parent)
     print("-" * 60)
@@ -1888,6 +1894,171 @@ def figures_root_rule():
     check("settings and queued jobs saved with the old default (python/figures) load as today's root; a folder of "
           "the user's own stays", pipe.figures_root == plot.figures_root == str(rs.FIGURES_ROOT)
           and own.figures_root == "/somewhere/else", f"{pipe.figures_root} {plot.figures_root} {own.figures_root}")
+
+
+def void_outline_geometry():
+    """The Explore map's void outlines (grids.void_circles): where a sphere cuts the slice, in image pixels (x along
+    the first remaining axis, y DOWN the second), its periodic images across the box edges, a zoom window with
+    non-square pixels, the wrap along the slice normal, and what is left out."""
+    import numpy as np
+    import grids as G
+    print("void outlines:")
+    L = 100.0
+    c = np.array([[10.0, 20.0, 53.0],             # 3 Mpc off the slice: a circle of radius 4
+                  [98.0, 50.0, 50.0],             # in the slice, straddling x = L: two circles
+                  [30.0, 30.0, 97.0],             # 95 Mpc away along z, i.e. 5 across the wrap from z = 2
+                  [60.0, 60.0, 50.0]])            # no radius (NaN): left out
+    r = np.array([5.0, 6.0, 6.0, np.nan])
+    got = G.void_circles(c, r, L, 2, 50.0, [0, 1], (0.0, 0.0), (L, L), 200, 200)
+    want = [(20.0, 160.0, 8.0, 8.0, 0), (-4.0, 100.0, 12.0, 12.0, 1), (196.0, 100.0, 12.0, 12.0, 1)]
+    check("a sphere 3 Mpc off the slice leaves a circle of sqrt(R^2 - d^2), at (x, L - y) in image pixels; one "
+          "straddling the box edge is drawn on both sides; a void without R_v is not",
+          np.allclose(sorted(got), sorted(want)), str(got))
+    near = G.void_circles(c, r, L, 2, 2.0, [0, 1], (0.0, 0.0), (L, L), 200, 200)
+    check("the distance to the slice wraps too (z = 97 is 5 Mpc from z = 2)",
+          [k for *_, k in near] == [2] and np.isclose(near[0][2], 2 * np.sqrt(11.0)), str(near))
+    check("... unless the box is not periodic",
+          G.void_circles(c, r, L, 2, 2.0, [0, 1], (0.0, 0.0), (L, L), 200, 200, periodic=False) == [])
+    zoom = G.void_circles(c, r, L, 2, 50.0, [0, 1], (90.0, 40.0), (100.0, 60.0), 100, 100)
+    check("a zoom window: only what reaches it, in its own pixels (10 per Mpc across, 5 up: an ellipse)",
+          np.allclose(zoom, [(80.0, 50.0, 60.0, 30.0, 1)]), str(zoom))
+    xs = G.void_circles(c, r, L, 0, 10.0, [1, 2], (0.0, 0.0), (L, L), 100, 100)
+    check("an x slice: the remaining axes y, z", np.allclose(xs, [(20.0, 47.0, 5.0, 5.0, 0)]), str(xs))
+
+
+def run_log_contract():
+    """The run-log contract (2026-10-08): a run writes '<prefix>.runlog.partial'; exit 0 renames it onto
+    '<prefix>.runlog' (the log of the grids on disk), a failure or stop onto '<prefix>.runlog.failed' (the old
+    '.runlog' untouched). The Runs browser reads the three names as ONE output set: the log of record, and a
+    newer failed, running or killed attempt noted on it (results.py). Plus the deposit and GPU-retry fixes of
+    the same round, and the Pipeline job's render chained to its pipeline call."""
+    import results as R
+    print("run-log contract 2026-10-08:")
+    base = Path(tempfile.mkdtemp(prefix="gui_runlogs_"))
+    child = None
+    try:
+        check("log_prefix: the three log names give the output prefix; any other name stays as it is",
+              [R.log_prefix(n) for n in ("a.runlog", "a.runlog.failed", "a.runlog.partial", "a.a_den", "a.runlog.tmp")]
+              == ["a", "a", "a", "a.a_den", "a.runlog.tmp"])
+        d = base / "own"
+        d.mkdir()
+        t0 = time.time() - 3600.0        # every mtime set by hand: 'newer than the log' and the 5 s rule must not ride on the clock
+        old = ("Build: PS-DTFE 1111111-dirty (built 2026-10-05T10:00:00Z)\n"
+               "RUNNING: /x/PS-DTFE in.hdf5 run --grid 512 --periodic --field density_a --ps-vertex-mass\n"
+               "   peak memory (RSS) : 2.0 GB\n   total wall time   : 1m 2s\n")
+        new = ("Build: PS-DTFE 2222222-dirty (built 2026-10-07T10:00:00Z)\n"         # the attempt: other settings
+               "RUNNING: /x/PS-DTFE in.hdf5 run --grid 256 --periodic --field density_a --ps-vertex-mass\n"
+               "terminate called after throwing an instance of 'std::bad_alloc'\n")
+        for sfx in ("a_den", "a_vel"):
+            (d / f"run.{sfx}").write_bytes(b"\0" * 32)
+            os.utime(d / f"run.{sfx}", (t0 - 10, t0 - 10))
+        _write_log(d / "run.runlog", old, t0)
+        for sfx in (".runlog.failed", ".runlog.partial", ".runlog.tmp"):
+            _write_log(d / ("run" + sfx), old, t0 + 30)      # a summary and a wall time in each
+        names = [p.name for p in R.parse_runlog(d / "run.runlog").outputs]
+        check("a run's outputs leave out every log name: '.runlog.failed', '.runlog.partial' and a script's '.runlog.tmp' "
+              "(their suffixes are '.failed', '.partial', '.tmp')", names == ["run.a_den", "run.a_vel"], str(names))
+        att = [R.parse_runlog(d / ("run" + sfx)) for sfx in (".runlog.failed", ".runlog.partial")]
+        check("... a '.failed' or '.partial' log is never ok, even with a summary and a wall time; its prefix is the output's",
+              R.parse_runlog(d / "run.runlog").ok and all(not a.ok and a.wall_seconds == 62 and a.prefix == "run"
+                                                          and [p.name for p in a.outputs] == names for a in att),
+              str([(a.ok, a.wall_seconds, a.prefix) for a in att]))
+        (d / "run.runlog.partial").unlink()
+        _write_log(d / "run.runlog.failed", new, t0 + 60)      # a NEWER failed re-run under the same name
+        none = base / "no data root"
+        recs = R.scan_runs(none, [d])
+        r = recs[0] if len(recs) == 1 else None
+        reasons = R.stale_reasons(r) if r else []
+        check("a '.runlog' and a newer '.runlog.failed' (and a '.runlog.tmp'): ONE record, the log of record with its "
+              "own build and settings, ok; the attempt noted on it ('failed', its likely cause, nothing rewritten)",
+              r is not None and r.path == d / "run.runlog" and r.ok and r.build_rev == "1111111-dirty" and r.grid == 512
+              and r.attempt == "failed" and r.attempt_log == d / "run.runlog.failed" and r.attempt_cause == "Out of memory"
+              and r.attempt_rewrote == 0, str(recs))
+        check("... the Status column's note: one 'info' line naming the .failed file and the cause (the outputs are this "
+              "run's still)", len(reasons) == 1 and reasons[0][0] == "info" and "run.runlog.failed" in reasons[0][1]
+              and "Out of memory" in reasons[0][1] and "still this run's" in reasons[0][1], str(reasons))
+        os.utime(d / "run.runlog.failed", (t0 - 60, t0 - 60))
+        r = R.scan_runs(none, [d])[0]
+        check("... a .failed OLDER than the .runlog is no attempt after it: nothing noted", r.attempt == ""
+              and r.attempt_log is None and R.stale_reasons(r) == [], f"{r.attempt!r} {R.stale_reasons(r)}")
+        os.utime(d / "run.runlog.failed", (t0 + 60, t0 + 60))
+        os.utime(d / "run.a_den", (t0 + 10, t0 + 10))         # written by the attempt, after the log of record ended
+        r = R.scan_runs(none, [d])[0]
+        note = R.attempt_note(r)
+        check("an output more than 5 s newer than the .runlog: the attempt rewrote it, a 'warning' to regenerate",
+              r.attempt_rewrote == 1 and note is not None and note[0] == "warning" and "regenerate" in note[1]
+              and "rewrote 1 of the outputs" in note[1], f"{r.attempt_rewrote} {note}")
+        os.utime(d / "run.a_den", (t0 - 10, t0 - 10))
+        (d / "run.runlog").unlink()
+        recs = R.scan_runs(none, [d])
+        r = recs[0] if len(recs) == 1 else None
+        note = R.attempt_note(r) if r else None
+        check("only a '.runlog.failed' (a first run that failed): it is the record, never ok, its 'warning' says none "
+              "has finished", r is not None and r.path == d / "run.runlog.failed" and r.prefix == "run" and not r.ok
+              and r.attempt == "failed" and note is not None and note[0] == "warning" and "none has finished" in note[1]
+              and note in R.stale_reasons(r), f"{recs} {note}")
+        # only '.runlog.partial': killed outright, or still going while a process names its root (one ps call)
+        (d / "run.runlog.failed").unlink()
+        (d / "run.runlog.tmp").unlink()
+        _write_log(d / "run.runlog.partial", new.split("terminate")[0], t0 + 30)
+        _write_log(d / "run2.runlog.partial", new.split("terminate")[0].replace(" run ", " run2 "), t0 + 30)
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", str(d / "run2")])
+        got = {rec.prefix: rec for rec in R.scan_runs(none, [d])}
+        if shutil.which("ps"):
+            check("only a '.runlog.partial': no live process names '<dir>/run' (a sibling '<dir>/run2' does not count) -> "
+                  "'killed'; the one a live process names -> 'running'; neither ok, each the record",
+                  set(got) == {"run", "run2"} and got["run"].attempt == "killed" and got["run2"].attempt == "running"
+                  and not got["run"].ok and not got["run2"].ok and got["run"].path == d / "run.runlog.partial"
+                  and R.attempt_note(got["run2"])[0] == "info",
+                  str({k: (v.attempt, v.ok, v.path.name) for k, v in got.items()}))
+        else:
+            check("only a '.runlog.partial', without ps: 'partial' (killed or still going), never ok",
+                  set(got) == {"run", "run2"} and all(v.attempt == "partial" and not v.ok for v in got.values()),
+                  str({k: v.attempt for k, v in got.items()}))
+        # a data-root snapdir that is also a custom output folder: one record, with its simulation
+        sd = base / "data" / "FAM" / "FAM-1-Dark" / "snapdir_099"
+        sd.mkdir(parents=True)
+        (sd / "ps_output.a_den").write_bytes(b"\0" * 32)
+        _write_log(sd / "ps_output.runlog", old.replace(" run ", f" {sd / 'ps_output'} "), t0)
+        _write_log(sd / "ps_output.runlog.partial", new, t0 + 30)
+        _write_log(sd / "ps_output.runlog.failed", new, t0 + 60)
+        recs = R.scan_runs(base / "data", [sd])
+        r = recs[0] if len(recs) == 1 else None
+        check("a data-root snapdir also given as an extra folder: one record, the data root's simulation kept, the newer "
+              "attempt (the .failed) noted; log_files() lists every log of the set (what Move to Trash takes)",
+              r is not None and r.sim == "FAM-1-Dark" and r.snap == 99 and r.path == sd / "ps_output.runlog"
+              and r.attempt == "failed" and [p.name for p in r.log_files()]
+              == ["ps_output.runlog", "ps_output.runlog.failed", "ps_output.runlog.partial"],
+              str([(x.sim, x.path, x.attempt, [p.name for p in x.log_files()]) for x in recs]))
+        # the linear deposit in 'Load settings' and the Options column; the PS-DTFE wording of the GPU retry
+        _write_log(d / "lin.runlog", "RUNNING: /x/PS-DTFE in.hdf5 lin --grid 64 --ps-linear-deposit\n")
+        _write_log(d / "std.runlog", "RUNNING: /x/PS-DTFE in.hdf5 std --grid 64\n")
+        lin, std = R.parse_runlog(d / "lin.runlog"), R.parse_runlog(d / "std.runlog")
+        check("settings(): a --ps-linear-deposit run turns the box on, a standard-deposit run turns it OFF (the key is "
+              "there); the Options column tells the two apart",
+              lin.settings().get("linear_deposit") is True and std.settings().get("linear_deposit") is False
+              and "linear deposit" in lin.options_text() and "linear deposit" not in std.options_text(),
+              f"{lin.settings()} {std.settings()} {lin.options_text()!r}")
+        _write_log(d / "gpu.runlog", "Build: PS-DTFE 3333333 (built 2026-10-01T09:00:00Z)\n"
+                   "RUNNING: /x/PS-DTFE in.hdf5 gpu --grid 64 --periodic --partition 2 2 2 --ps-gpu --ps-vertex-mass\n"
+                   "PS-DTFE Metal: Metal command buffer failed: Impacting Interactivity; retrying the partition deposit "
+                   "from scratch (attempt 2/3)\n   peak memory (RSS) : 1.0 GB\n   total wall time   : 12s\n")
+        g = R.parse_runlog(d / "gpu.runlog")
+        check("PS-DTFE's 'retrying the partition deposit from scratch' counts as a GPU retry; built before the DTFE "
+              "retry fix, a PS run is still not flagged (that fix is the standard DTFE's)",
+              g.gpu_retried and g.estimator == "ps" and g.gpu and R.stale_reasons(g) == [], str(R.stale_reasons(g)))
+        steps = rs.PipelineSpec(data_root=str(base / "data"), sims=["FAM-1-Dark", "FAM-2-Dark"], nu=64).steps()
+        check("a Pipeline job's render steps wait for its pipeline call: a pipeline that computed nothing exits 1 "
+              "(run_ps_pipeline.sh, 2026-10-08) and the job then skips them",
+              [(st.label, st.after) for st in steps] == [("run_ps_pipeline.sh FAM-1-Dark FAM-2-Dark", ""),
+                                                         ("plot_pointeval.py FAM-1-Dark", steps[0].label),
+                                                         ("plot_pointeval.py FAM-2-Dark", steps[0].label)],
+              str([(st.label, st.after) for st in steps]))
+    finally:
+        if child is not None:
+            child.kill()
+            child.wait()
+        shutil.rmtree(base, ignore_errors=True)
 
 
 if __name__ == "__main__":

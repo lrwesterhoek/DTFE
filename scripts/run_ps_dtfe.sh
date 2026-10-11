@@ -10,6 +10,8 @@
 #   -h / --help prints this header and runs nothing; --version the repository revision.
 #   DRY_RUN=1 ./run_ps_dtfe.sh ...   prints every snapshot's expanded command and paths, runs nothing
 #          (exit 0 when at least one snapshot is planned).
+#   Run logs, beside the outputs: <prefix>.runlog belongs to the grids on disk, <prefix>.runlog.failed
+#   to the last failed or stopped attempt, <prefix>.runlog.partial to a run still going (or killed outright).
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"   # the binaries and Makefile live one level up
@@ -235,6 +237,46 @@ if [ "${DRY_RUN}" != "1" ] && command -v caffeinate >/dev/null 2>&1; then
     caffeinate -i -m -w $$ &
 fi
 
+# The run-log contract (2026-10-08), the same in run_dtfe.sh and the launcher's own runs: while the
+# binary runs, its log is '<prefix>.runlog.partial'. Exit 0 renames it onto '<prefix>.runlog' (the log
+# of the grids now on disk) and removes a stale '<prefix>.runlog.failed'; a failure or a stop renames it
+# to '<prefix>.runlog.failed' and leaves '<prefix>.runlog' alone. The log used to be tee'd straight into
+# '<prefix>.runlog', so a re-run that failed early, or was stopped or killed, replaced the log of the
+# grids still on disk: the Runs browser then showed those grids as a failed run with the new settings,
+# and their own settings, build stamp, wall time and peak memory were gone. A '.runlog.partial' left
+# behind is a run killed outright (SIGKILL), or one still going.
+live_log=""; live_rc=""            # the .partial being written, and its binary's exit status once known
+finish_runlog() {                  # <the .partial> <the binary's exit status>
+    local part="$1" final="${1%.partial}"
+    [ -f "${part}" ] || return 0
+    # Strip ANSI colour codes so the kept log stays grep-able. Written through a temp file rather
+    # than 'sed -i': BSD sed needs a suffix ARGUMENT after -i and GNU sed does not, so the portable
+    # spelling of in-place editing is not to use it.
+    if sed -E $'s/\033\\[[0-9;]*m//g' "${part}" > "${part}.tmp" 2>/dev/null; then
+        mv "${part}.tmp" "${part}"
+    else
+        rm -f "${part}.tmp"
+    fi
+    if [ "$2" = "0" ]; then
+        mv -f "${part}" "${final}" && rm -f "${final}.failed"
+    else
+        mv -f "${part}" "${final}.failed"
+    fi
+}
+# A stop (the launcher's Stop sends SIGTERM to the binary, then to this script; ^C sends SIGINT): bash
+# runs the trap once the binary's pipeline has ended, so the attempt's log becomes '.runlog.failed'.
+# The signal is then re-raised, so a caller (run_ps_pipeline.sh) sees a stop, not a plain failure
+# it would continue past.
+on_stop() {                        # <signal name>
+    trap - "$1"
+    if [ -n "${live_log}" ] && [ -f "${live_log}" ]; then
+        finish_runlog "${live_log}" "${live_rc:-1}"
+        [ "${live_rc:-1}" = "0" ] || echo "  Stopped: snapshot ${n_str} did not finish; its log is ${live_log%.partial}.failed"
+    fi
+    kill -s "$1" $$
+}
+trap 'on_stop INT' INT; trap 'on_stop TERM' TERM; trap 'on_stop HUP' HUP
+
 echo "Starting PS-DTFE processing..."
 echo "Data directory: ${DATA_DIR}"
 echo "Grid size: ${GRID_SIZE}   Partition: [${PARTITION:-auto}]   Fields: ${FIELDS}"
@@ -371,8 +413,16 @@ for i in "${SNAPSHOTS[@]}"; do
         echo ""
         continue
     fi
-    ${TIME_WRAP[@]+"${TIME_WRAP[@]}"} "${cmd[@]}" 2>&1 | tee "${run_log}"
+    # the binary's output goes to '<run_log>.partial' until it exits (the run-log contract above);
+    # a report's temp file takes it directly
+    if [ "${AUTO_TUNE_REPORT}" = "1" ]; then
+        tee_log="${run_log}"
+    else
+        tee_log="${run_log}.partial"; live_log="${tee_log}"; live_rc=""
+    fi
+    ${TIME_WRAP[@]+"${TIME_WRAP[@]}"} "${cmd[@]}" 2>&1 | tee "${tee_log}"
     rc=${PIPESTATUS[0]}
+    live_rc="${rc}"
 
     if [ "${AUTO_TUNE_REPORT}" = "1" ]; then
         report=$(grep -a '^AUTO-TUNE-REPORT' "${run_log}" | head -1)
@@ -387,14 +437,11 @@ for i in "${SNAPSHOTS[@]}"; do
         continue
     fi
 
-    # Strip ANSI colour codes from the saved log so it stays grep-able. Written through a temp file
-    # rather than 'sed -i': BSD sed needs a suffix ARGUMENT after -i and GNU sed does not, so the
-    # portable spelling of in-place editing is not to use it.
-    if sed -E $'s/\033\\[[0-9;]*m//g' "${run_log}" > "${run_log}.tmp" 2>/dev/null; then
-        mv "${run_log}.tmp" "${run_log}"
-    else
-        rm -f "${run_log}.tmp"
-    fi
+    # de-ANSI'd, the log becomes '<prefix>.runlog' on success and '<prefix>.runlog.failed' otherwise
+    # (the contract above); the peak memory below is read from whichever it became
+    finish_runlog "${live_log}" "${rc}"
+    live_log=""
+    [ "${rc}" -eq 0 ] || run_log="${run_log}.failed"
 
     # Peak RSS, in whichever dialect TIME_WRAP produced (absent when neither exists -- then the
     # awk finds nothing and the block below is skipped).
@@ -429,7 +476,7 @@ for i in "${SNAPSHOTS[@]}"; do
         echo "  Snapshot ${n_str} processed successfully"
         n_ok=$((n_ok+1))
     else
-        echo "  Error processing snapshot ${n_str}"
+        echo "  Error processing snapshot ${n_str} (its log: ${run_log})"
         n_failed=$((n_failed+1))
     fi
     echo ""
@@ -445,7 +492,7 @@ if [ "${DRY_RUN}" = "1" ]; then
 fi
 echo "PS-DTFE processing complete: ${n_ok} processed, ${n_skipped} skipped, ${n_failed} failed."
 if [ "${n_failed}" -gt 0 ]; then
-    echo "ERROR: ${n_failed} snapshot(s) failed -- see the messages above and the .runlog files." >&2
+    echo "ERROR: ${n_failed} snapshot(s) failed; see the messages above and their .runlog.failed files." >&2
     exit 1
 fi
 if [ "${n_ok}" -eq 0 ]; then

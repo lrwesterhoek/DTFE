@@ -177,6 +177,14 @@ _THESIS_DIR = _find_thesis_dir()
 # disk IS the repo's own figures/ folder -- every mirrored figure from the move to 2026-10-06 landed there.
 THESIS_FIGURES_DIR = (_THESIS_DIR / 'Figures') if _THESIS_DIR else (_REPO_ROOT.parent.parent / 'Figures')
 
+# What the thesis's figures and tables were made from (HANDOFF 2026-10-07: TNG50-3-Dark, not -4 -- the unprefixed
+# caches equal TNG50-3-Dark_dtfe_*, tex 615/626 -- with standard DTFE). The thesis scripts name their figures without
+# either (figures_path), so only this simulation's figures of this estimator may go into the thesis Figures/ tree
+# (dtfelib.figures.save_plot_to_multiple_paths): a TNG100 run, or one on PS-DTFE grids (FieldSet's auto-detect picks
+# them when they are there, as on the T7), replaced the thesis figures under the same names (2026-10-08).
+THESIS_SIMULATION = "TNG50-3-Dark"
+THESIS_METHOD = "dtfe"
+
 LOCAL_FIGURES_ROOT = str(FIGURES_ROOT)     # dtfelib.cli: DTFE_FIGURES_ROOT, else the T7, else python/figures
 
 ANALYSIS_DIRS = {
@@ -195,8 +203,14 @@ ANALYSIS_DIRS = {
 }
 
 
+# the folders figures_path has handed out: their figures carry neither the simulation nor the estimator in their
+# names, so the thesis mirror takes them only from THESIS_SIMULATION's THESIS_METHOD grids (2026-10-08)
+THESIS_NAMED_DIRS = set(ANALYSIS_DIRS.values())
+
+
 def figures_path(analysis_key):
     subdir = ANALYSIS_DIRS.get(analysis_key, analysis_key)
+    THESIS_NAMED_DIRS.add(subdir)               # the pass-through keys too ('smoothing_comparison', 'synthesis')
     return f"{LOCAL_FIGURES_ROOT}/{subdir}"
 
 

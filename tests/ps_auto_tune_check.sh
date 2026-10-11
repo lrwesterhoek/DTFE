@@ -35,6 +35,10 @@
 #  F) --auto-tune-report (the GUI's memory check): ONE machine-readable line, exit 0, nothing
 #     written; a hand-set --partition/--max-concurrent is reported as given (the prediction uses
 #     the concurrency the run will use); DTFE_AUTO_PTS_N sizes a plane that does not exist yet.
+#  J) the machine's free memory over a plan: an explicit budget capped by it, the partition memory gate.
+#  K) partitions in flight never outnumber the threads (2026-10-08): a hand-set split with the
+#     concurrency left to the tuner, and '--max-concurrent 0' ("all threads"), each started every
+#     partition at once (64 threads for '--partition 4 4 4').
 #
 # The 2^32 GPU sub-grid guard (ps_interpolation.cc) is NOT exercised here: it needs a real
 # >4.29e9-cell partition sub-grid, i.e. >32 GB of buffers. It mirrors the validated guard in
@@ -195,7 +199,7 @@ run_f() {
 }
 F_ARGS=()
 rm -f "${TMP}"/at_f.*
-run_f PATH="${PATH}"; rc=$?
+run_f PATH="${PATH}" && rc=0 || rc=$?       # (a bare 'run_f; rc=$?' aborts under set -e before the check)
 check "F exits 0" "$([ "${rc}" = "0" ] && echo 1 || echo 0)"
 check "F prints exactly one report line" "$([ "$(grep -c '^AUTO-TUNE-REPORT ' "${LOG_F}")" = "1" ] && echo 1 || echo 0)"
 agrep "F the line carries the decision, prediction and budget" \
@@ -295,6 +299,81 @@ else
     echo "   SKIP  I2/I3 (this build has no GPU backend)"
 fi
 rm -rf "${ISCR}"
+
+# ---------- (J) the machine's free memory over a plan (2026-10-07) ----------
+# TNG50-3-Dark z=0 was SIGKILLed by macOS after 82 min: DTFE_MEM_BUDGET_GB=52 on a 64 GB Mac skipped the
+# free-memory rule, and nothing reacted while other programs took memory. DTFE_FREE_GB simulates what the
+# other programs leave free (the OS query's test hook).
+echo ">> J: an explicit budget capped by the free memory; the partition memory gate"
+run_e DTFE_FREE_GB=10 DTFE_MEM_BUDGET_GB=40
+agrep "J1 DTFE_MEM_BUDGET_GB above the free memory is capped (10 GB free - 4 GB headroom = 6 GB), saying so" \
+      "memory budget: 6 GB: DTFE_MEM_BUDGET_GB asks 40 GB, but the other programs leave 10 GB free, minus 4 GB headroom" "${LOG_E}"
+run_e DTFE_FREE_GB=10 DTFE_MEM_BUDGET_GB=5
+agrep "J2 a budget the free memory holds stays as set" "memory budget: 5 GB set by DTFE_MEM_BUDGET_GB" "${LOG_E}"
+run_e DTFE_FREE_GB=44.2 DTFE_MEM_BUDGET_GB=40.5
+agrep "J2b ... and so does one the free memory would trim by under 0.5 GB (44.2 - 4 vs 40.5): no 'but' line" \
+      "memory budget: 40.5 GB set by DTFE_MEM_BUDGET_GB" "${LOG_E}"
+run_e DTFE_RAM_GB=64 DTFE_FREE_GB=10 DTFE_MEM_BUDGET_GB=40
+agrep "J3 a simulated machine (DTFE_RAM_GB) skips the live cap: tests stay deterministic" \
+      "memory budget: 40 GB set by DTFE_MEM_BUDGET_GB" "${LOG_E}"
+# the gate: a hand-set split with the concurrency left to the tuner (its report sizes one partition), the
+# same run with ~no free memory: every partition beyond the first waits, the run completes, the grids agree
+run_j() {
+    env "$@" DTFE_RAM_GB=64 DTFE_AUTO_MINN=1000 "${BIN}" "${SNAP}" "${TMP}/at_j" --grid 64 --field density_a \
+        --input 105 --MpcUnit 1 --verbose 2 --periodic --avg-subsamples 1 --partition 2 2 2 > "${TMP}/at_j.log" 2>&1
+}
+run_j DTFE_FREE_GB=1000                      # ample by decree: the live reading would make J5b depend on the machine
+for f in a_den a_streams; do cp "${TMP}/at_j.${f}" "${TMP}/at_j_free.${f}" 2>/dev/null || true; done
+cp "${TMP}/at_j.log" "${TMP}/at_j_free.log"
+rm -f "${TMP}"/at_j.a_*                      # a gated run that writes nothing must not compare the free one
+run_j DTFE_FREE_GB=0.001 && rc=0 || rc=$?    # (a bare 'run_j; rc=$?' aborts under set -e: J4 could never fail)
+mcj=$(sed -n 's/.*building up to \([0-9]*\) partition triangulation.*/\1/p' "${TMP}/at_j.log" | head -1)
+if [ "${mcj:-1}" -ge 2 ]; then
+    check "J4 low free memory: the run still completes (exit ${rc})" "$([ "${rc}" = "0" ] && echo 1 || echo 0)"
+    agrep "J5 ... partitions wait for one in flight to finish, and it says so" "PS-DTFE memory gate: partition [0-9]+ waits" "${TMP}/at_j.log"
+    if grep -q "PS-DTFE memory gate" "${TMP}/at_j_free.log"; then
+        check "J5b with the memory free the gate holds nothing" 0
+    else
+        check "J5b with the memory free the gate holds nothing" 1
+    fi
+    if "${PY}" - "${TMP}" <<'PYEOF'
+import os, sys, numpy as np
+t = sys.argv[1]
+real = np.dtype(os.environ.get("DTFE_TEST_REAL", "float32"))   # the grids are float64 in double mode
+worst = 0.0
+for f in ("a_den", "a_streams"):
+    a = np.fromfile(f"{t}/at_j_free.{f}", real)
+    b = np.fromfile(f"{t}/at_j.{f}", real)
+    assert a.size == b.size and a.size > 0, f
+    worst = max(worst, float(np.max(np.abs(a - b) / np.maximum(np.abs(a), 1e-30))))
+print(f"   .... gated vs free: max rel {worst:.1e} (completion-order float sums)")
+sys.exit(0 if worst < 1e-5 else 1)
+PYEOF
+    then check "J6 ... and its grids equal the ungated run's to float rounding" 1
+    else check "J6 ... and its grids equal the ungated run's to float rounding" 0; fi
+else
+    echo "   SKIP  J4-J6 (the tuner ran this split one partition at a time: nothing to gate)"
+fi
+
+# ---------- (K) partitions in flight never outnumber the threads (2026-10-08) ----------
+# OMP_NUM_THREADS=2 makes the thread count the machine's own; '--partition 4 4 4' has 64 partitions. A small set
+# with the split hand-set and the concurrency left to the tuner (K1), and '--max-concurrent 0' = all threads (K2),
+# each used to start all 64 at once.
+echo ">> K: partitions in flight are capped at the threads"
+run_k() {
+    env "$@" OMP_NUM_THREADS=2 DTFE_RAM_GB=64 DTFE_FREE_GB=1000 "${BIN}" "${SNAP}" "${TMP}/at_k" --grid 16 --field density \
+        --input 105 --MpcUnit 1 --verbose 2 --periodic --partition 4 4 4 ${K_ARGS[@]+"${K_ARGS[@]}"} > "${TMP}/at_k.log" 2>&1
+}
+for k in K1 K2; do
+    if [ "${k}" = K1 ]; then K_ARGS=(); what="a hand-set split, the concurrency left to the tuner"
+    else K_ARGS=(--max-concurrent 0); what="'--max-concurrent 0'"; fi
+    run_k PATH="${PATH}" && rc=0 || rc=$?
+    mck=$(sed -n 's/.*building up to \([0-9]*\) partition triangulation.*/\1/p' "${TMP}/at_k.log" | head -1)
+    check "${k} ${what}: at most 2 of the 64 partitions at once on 2 threads (${mck:-none}, exit ${rc})" \
+          "$([ "${rc}" = "0" ] && [ -n "${mck}" ] && [ "${mck}" -le 2 ] && echo 1 || echo 0)"
+done
+K_ARGS=()
+rm -f "${TMP}"/at_k.*
 
 echo "------------------------------------------------------------"
 if [ "${FAILS}" -gt 0 ]; then

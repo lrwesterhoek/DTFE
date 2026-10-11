@@ -16,12 +16,18 @@ PRECISION = os.environ.get("DTFE_TEST_PRECISION", "single")
 DTFE_BIN = os.path.join(PROJECT_DIR, "DTFE-double" if PRECISION == "double" else "DTFE")
 # DTFE_TEST_REFERENCE_DIR: where the regression reference lives (tests/ci_suite.sh points it at a
 # scratch folder: the stored reference was made with macOS's CGAL, and another CGAL breaks Delaunay
-# ties in co-spherical configurations differently, so a Linux run creates its own there)
+# ties in co-spherical configurations differently, so a Linux run creates its own there -- and the
+# regression is then a SKIP, never a pass: it compared nothing)
 REFERENCE_DIR = os.environ.get("DTFE_TEST_REFERENCE_DIR") or os.path.join(SCRIPT_DIR, "reference")
+# DTFE_TEST_REQUIRED=1 (ci_suite.sh's double stage, after building the pair): a missing binary or
+# feature is a FAILURE, as with tests/precision.sh's skip_or_fail -- a green stage that ran no
+# assertion is worth nothing (2026-10-08)
+REQUIRED = os.environ.get("DTFE_TEST_REQUIRED") == "1"
 
 VERBOSE = False
 PASSED = 0
 FAILED = 0
+SKIPPED = 0
 
 
 def log(msg):
@@ -95,6 +101,18 @@ def report(name, success, msg=""):
     else:
         FAILED += 1
         print(f"  FAIL  {name}" + (f" -- {msg}" if msg else ""))
+
+
+def skip(name, msg, required=True):
+    """A test that did not run: counted and said (until 2026-10-08 it only dropped out of the count,
+    or printed CREATED). required: a missing binary or feature, which DTFE_TEST_REQUIRED=1 makes a
+    failure; False for what no build provides (the regression's reference in a fresh folder)."""
+    global SKIPPED
+    if required and REQUIRED:
+        report(name, False, f"DTFE_TEST_REQUIRED=1, but {msg}")
+        return
+    SKIPPED += 1
+    print(f"  SKIP  {name} -- {msg}")
 
 
 def make_lattice_particles(n_per_dim, box_size, weight=1.0):
@@ -438,11 +456,20 @@ def test_output_size_matches_grid(tmpdir):
     report(name, True)
 
 
-def _has_flag(flag):
+def _has_flag(name, flag):
     """True when the built binary's --full_help mentions the given option (feature gate for
-    tests of flags newer than the binary; captured, never piped -- see the .sh scripts)."""
+    tests of flags newer than the binary; captured, never piped -- see the .sh scripts). Else
+    test NAME is a SKIP (a failure under DTFE_TEST_REQUIRED=1); a binary that exits non-zero on
+    --full_help FAILS it: a broken binary is not one without the flag (2026-10-08)."""
     result = subprocess.run([DTFE_BIN, "--full_help"], capture_output=True, text=True)
-    return flag in result.stdout
+    binary = os.path.basename(DTFE_BIN)
+    if result.returncode != 0:
+        report(name, False, f"{binary} --full_help exited with {result.returncode}")
+        return False
+    if flag not in result.stdout:
+        skip(name, f"{binary} has no {flag}")
+        return False
+    return True
 
 
 def test_exact_average_lattice(tmpdir):
@@ -451,8 +478,7 @@ def test_exact_average_lattice(tmpdir):
     return 1 in EVERY grid cell to float rounding (the sampled average is only ~1 on
     average). Gated on the binary supporting the flag."""
     name = "exact_average_lattice"
-    if not _has_flag("--exact-average"):
-        log("skipping: binary lacks --exact-average")
+    if not _has_flag(name, "--exact-average"):
         return
     n_per_dim, box_size = 6, 10.0
     particles = make_lattice_particles(n_per_dim, box_size)
@@ -485,8 +511,7 @@ def test_exact_average_convergence(tmpdir):
     --samples grows (Sobol quasi-random sampling: deterministic, no seed involved). Gated
     on the binary supporting the flag."""
     name = "exact_average_convergence"
-    if not _has_flag("--exact-average"):
-        log("skipping: binary lacks --exact-average")
+    if not _has_flag(name, "--exact-average"):
         return
     box_size, grid = 10.0, 8
     particles = make_seeded_random_particles(300, box_size, seed=7)
@@ -545,7 +570,12 @@ def test_regression(tmpdir, update_ref=False):
         if update_ref:
             print(f"  UPDATED  {name} (reference file written)")
         else:
-            print(f"  CREATED  {name} (reference file generated on first run)")
+            # a reference made from the run under test compares nothing: a SKIP, not a silent drop from
+            # the count -- in CI and Docker every run lands here (ci_suite.sh's fresh folder), so they have
+            # no fixed-number check of the standard estimator (2026-10-08). Never a failure under
+            # DTFE_TEST_REQUIRED=1: no build can supply the reference.
+            skip(name, f"no reference in {REFERENCE_DIR}: one was written from this run, nothing compared",
+                 required=False)
         return
 
     ref_density = read_density_output(ref_file)
@@ -701,8 +731,10 @@ def main():
     VERBOSE = args.verbose
 
     if not os.path.isfile(DTFE_BIN) and PRECISION == "double":
-        print(f"SKIP: {DTFE_BIN} is not built (make DTFE PS-DTFE DOUBLE=1 builds the double pair)")
-        sys.exit(0)
+        # a skip, unless the stage built the pair and requires it (DTFE_TEST_REQUIRED=1, 2026-10-08)
+        print(("FAIL (required): " if REQUIRED else "SKIP: ")
+              + f"{DTFE_BIN} is not built (make DTFE PS-DTFE DOUBLE=1 builds the double pair)")
+        sys.exit(1 if REQUIRED else 0)
     if not os.path.isfile(DTFE_BIN):
         print(f"ERROR: DTFE binary not found at {DTFE_BIN}")
         print("Build it first with: make DTFE")
@@ -734,6 +766,8 @@ def main():
     print()
     total = PASSED + FAILED
     print(f"Results: {PASSED}/{total} passed", end="")
+    if SKIPPED:
+        print(f", {SKIPPED} skipped", end="")
     if FAILED:
         print(f", {FAILED} FAILED")
     else:

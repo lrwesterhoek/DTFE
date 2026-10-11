@@ -47,7 +47,9 @@ RUN set -eux; ARCH_FLAGS="$ARCH_FLAGS" tests/ci_suite.sh build
 # Every CPU suite against the single pair, again against the double pair, and the 2D suite. The
 # standard-DTFE regression reference stored in the repo was made with macOS's CGAL, which breaks
 # Delaunay ties in co-spherical configurations differently: ci_suite.sh gives that one test a fresh
-# reference folder (DTFE_TEST_REFERENCE_DIR) instead of deleting the tracked file.
+# reference folder (DTFE_TEST_REFERENCE_DIR) instead of deleting the tracked file, so here it writes a
+# reference and reports SKIP: the image has no fixed-number check of the standard estimator, only the
+# analytic ones.
 # 'rm -rf tests/tmp' must stay in THIS RUN: files written by a RUN are baked into that layer, and
 # deleting them later only adds a whiteout.
 RUN set -eux; \

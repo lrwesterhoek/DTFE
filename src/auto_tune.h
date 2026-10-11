@@ -19,7 +19,11 @@
      DTFE_RAM_GB        physical-RAM override in GB (default: queried from the OS); simulates a
                         machine, so the live free-memory term is skipped (tests stay deterministic)
      DTFE_MEM_FRACTION  share of RAM the budget may take (default 0.60; 0.1 .. 0.95)
-     DTFE_MEM_BUDGET_GB the budget itself, in GB -- overrides both rules above
+     DTFE_MEM_BUDGET_GB the budget itself, in GB -- overrides both rules above, but is still capped by what
+                        the other programs leave free minus the headroom (unless DTFE_RAM_GB simulates a
+                        machine): 2026-10-07 a 52 GB budget on a 64 GB Mac got TNG50-3-Dark z=0 SIGKILLed
+     DTFE_FREE_GB       test hook: the memory the other programs leave free, in GB (default: queried); the
+                        partition memory gate and the budget cap read it instead of the OS
      DTFE_AUTO_MINN     minimum particle count before auto-partitioning engages (default 2e6;
                         below it a single domain always fits and partition seams are not worth it) */
 
@@ -35,6 +39,9 @@
 #include <sys/stat.h>
 #include <fstream>
 #include <thread>      // hardware_concurrency: the point-evaluation HitSink blocks, one per thread
+#include <mutex>
+#include <condition_variable>
+#include <chrono>
 #include <dirent.h>    // autoTuneServe: the cached partition splits of a snapshot
 #include <map>
 #include <sstream>
@@ -97,12 +104,17 @@ inline double psDepositThreadBytes()
     return std::max( 2.e9, 0.2 * autoTunePhysicalRAM() );
 }
 
-// Bytes the OTHER programs leave free right now, plus what this process already holds (its
-// particles etc., which the run's model counts itself); < 0 when the OS cannot tell.
+// Bytes free for NEW allocations right now (what every program, this one included, leaves free);
+// < 0 when the OS cannot tell. DTFE_FREE_GB overrides it (tests).
 //   macOS: RAM minus Activity Monitor's "Memory Used" (app memory = anonymous - purgeable,
 //          + wired + compressed); Linux: MemAvailable. File cache counts as free: it is dropped.
-inline double autoTuneFreeForRun()
+inline double autoTuneSystemFree(double *ownBytes = nullptr)
 {
+    if ( const char *env = std::getenv("DTFE_FREE_GB") )
+    {
+        double const v = std::atof(env);
+        if ( v > 0. ) { if ( ownBytes ) *ownBytes = 0.; return v * 1.e9; }
+    }
 #ifdef __APPLE__
     int64_t mem = 0;
     size_t len = sizeof(mem);
@@ -120,7 +132,8 @@ inline double autoTuneFreeForRun()
     mach_msg_type_number_t tcount = TASK_VM_INFO_COUNT;
     if ( task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&ti, &tcount)==KERN_SUCCESS )
         own = double(ti.phys_footprint);
-    return double(mem) - used + own;
+    if ( ownBytes ) *ownBytes = own;
+    return double(mem) - used;
 #else
     double availKB = -1., ownKB = 0.;
     char key[64];
@@ -138,14 +151,26 @@ inline double autoTuneFreeForRun()
             if ( std::sscanf(line, "VmRSS: %lf kB", &value)==1 ) { ownKB = value; break; }
         std::fclose(f);
     }
-    return availKB < 0. ? -1. : (availKB + ownKB) * 1024.;
+    if ( ownBytes ) *ownBytes = ownKB * 1024.;
+    return availKB < 0. ? -1. : availKB * 1024.;
 #endif
+}
+
+// Bytes the OTHER programs leave free right now, plus what this process already holds (its
+// particles etc., which the run's model counts itself); < 0 when the OS cannot tell.
+inline double autoTuneFreeForRun()
+{
+    double own = 0.;
+    double const free = autoTuneSystemFree( &own );
+    return free < 0. ? -1. : free + own;
 }
 
 // The memory budget the tuner plans against, and a one-line account of how it was set.
 inline double autoTuneBudget(double ramBytes, std::string &why)
 {
     char buf[256];
+    bool const simulated = std::getenv("DTFE_RAM_GB") != NULL and std::atof(std::getenv("DTFE_RAM_GB")) > 0.;
+    double const headroom = 4.e9;
     if ( const char *env = std::getenv("DTFE_MEM_BUDGET_GB") )
     {
         double v = std::atof(env);
@@ -153,6 +178,19 @@ inline double autoTuneBudget(double ramBytes, std::string &why)
         {
             snprintf( buf, sizeof(buf), "%.3g GB set by DTFE_MEM_BUDGET_GB", v );
             why = buf;
+            // ... but never more than the other programs leave free minus the headroom: the budget is a
+            // plan, the machine's free memory the fact (2026-10-07: 52 GB on a 64 GB Mac, SIGKILL at 82 min).
+            // Only a cut of more than 0.5 GB is one: 44 GB free less 4 against 40 asked is the same budget, and
+            // the reason line said "asks 40 GB, but ..." for it (2026-10-08)
+            double const freeForRun = simulated ? -1. : autoTuneFreeForRun();
+            if ( freeForRun > 0. and freeForRun - headroom < v * 1.e9 - 0.5e9 )
+            {
+                double const capped = std::max( freeForRun - headroom, std::min( v * 1.e9, 1.e9 ) );
+                snprintf( buf, sizeof(buf), "%.3g GB: DTFE_MEM_BUDGET_GB asks %.3g GB, but the other programs leave "
+                          "%.3g GB free, minus %.3g GB headroom", capped/1.e9, v, freeForRun/1.e9, headroom/1.e9 );
+                why = buf;
+                return capped;
+            }
             return v * 1.e9;
         }
     }
@@ -165,9 +203,7 @@ inline double autoTuneBudget(double ramBytes, std::string &why)
     double budget = frac * ramBytes;
     snprintf( buf, sizeof(buf), "%.3g GB = %.0f%% of %.3g GB RAM", budget/1.e9, 100.*frac, ramBytes/1.e9 );
     why = buf;
-    bool const simulated = std::getenv("DTFE_RAM_GB") != NULL and std::atof(std::getenv("DTFE_RAM_GB")) > 0.;
     double const freeForRun = simulated ? -1. : autoTuneFreeForRun();
-    double const headroom = 4.e9;
     if ( freeForRun > 0. and freeForRun - headroom < budget )
     {
         budget = std::max( freeForRun - headroom, 1.e9 );
@@ -330,6 +366,7 @@ struct AutoTuneReport
     bool   valid = false;
     int    partition = 1, maxConcurrent = 1;
     double predicted = 0., fixed = 0., budget = 0., pts = 0.;   // bytes
+    double perPartition = 0.;   // bytes ONE partition in flight adds (the run's memory gate waits for this much)
     double streamsEstimate = -1., streamsBudgeted = 0.;
     std::string line() const
     {
@@ -749,7 +786,8 @@ inline AutoTuneReport autoTunePartitioning(User_options &u,
                                 + (psCaust ? 4. : 0.)                             // caustic
                                 + (psExact ? 4. : 0.)                             // streamvol
                                 + ((psVolW and psDisp) ? 16. : 0.);               // dispvel 12 + dispw 4
-            m += perTet*6.77*nOwn + 2.*gridB*subCells;
+            // + 4 B/cell: the device's mass grid is a 64-bit fixed-point sum (ps_metal_host.cc, 2026-10-08)
+            m += perTet*6.77*nOwn + 2.*gridB*subCells + 4.*subCells;
             // --ps-exact-deposit runs depositExactItems (ps_metal_host.cc): a per-tet weight total
             // (4 B) + the item list, 8 B per 16 cells of a tet's bbox window -- ~20x the tet's
             // volume in cells on the crossed-waves benchmark, at least one item -- capped at 32M items
@@ -787,7 +825,8 @@ inline AutoTuneReport autoTunePartitioning(User_options &u,
         // partitions in flight: never more than there are (one domain x 10 threads is ONE domain --
         // the old product put a 0.26M-particle run at 52 GB and the GUI's memory check believed it)
         int const inFlight = std::min( report.maxConcurrent, report.partition*report.partition*report.partition );
-        report.predicted = fixed + double(inFlight) * partitionBytes( report.partition );
+        report.perPartition = partitionBytes( report.partition );
+        report.predicted = fixed + double(inFlight) * report.perPartition;
         return report;
     };
     int const userC = u.maxConcurrent > 0 ? u.maxConcurrent : cores;
@@ -879,7 +918,11 @@ inline AutoTuneReport autoTunePartitioning(User_options &u,
     if ( N < minN and smallFits )     // small particle set AND the grid fits: one domain, or a split for SPEED
     {
         if ( not autoPart )
+        {   // the user's split at the concurrency the report states: left unset, a hand-set '--partition 4 4 4'
+            // started all 64 partitions on a 10-core machine while the report said mc=10 (2026-10-08)
+            if ( autoConc ) u.maxConcurrent = cores;
             return finishReport( userN, autoConc ? cores : userC );
+        }
         // The one stage a split parallelises is the sequential triangulation (+ vertex densities):
         // the deposit and the point evaluation already use every core inside one domain. A
         // triangulation-bound run (a slice of a small box: 1.5 s of 3 s) therefore gains from
@@ -1117,5 +1160,61 @@ inline AutoTuneReport autoTunePartitioning(User_options &u,
     return report;     // the report covers PS-DTFE only (valid = false here)
 #endif
 }
+
+/* The partition MEMORY GATE (2026-10-07). The auto-tuner plans a peak from a model; the machine's free memory
+   is the fact, and other programs change it during a run (TNG50-3-Dark z=0: planned 47 GB under a 52 GB budget,
+   SIGKILLed by macOS after 82 min with a browser and the launcher open). Before a partition starts, it waits
+   -- in 2 s steps -- while the memory the system leaves free, minus the headroom, is below what one partition
+   adds (AutoTuneReport::perPartition) AND another partition is in flight (whose finishing frees memory). With
+   none in flight it always starts, saying so: the gate can delay, never deadlock. A skipped partition and the
+   speed split's ordered merge never pass it; a cache-only one does (its loaded tessellation holds the same
+   memory). need = 0 (no auto-tune estimate: a user-given --partition) disables it. */
+struct PartitionMemoryGate
+{
+    double need = 0., headroom = 4.e9;
+    std::mutex m;
+    std::condition_variable cv;
+    int inFlight = 0, held = 0;
+    bool saidAlone = false;
+    explicit PartitionMemoryGate(double needBytes) : need(needBytes) {}
+
+    void enter(int partition, int verbose)
+    {
+        std::unique_lock<std::mutex> lock( m );
+        if ( need > 0. )
+        {
+            bool waited = false;
+            double free = autoTuneSystemFree();
+            while ( free >= 0. and free - headroom < need and inFlight > 0 )
+            {
+                if ( not waited )
+                {
+                    ++held;
+                    if ( verbose > 0 )
+                        std::fprintf( stderr, "PS-DTFE memory gate: partition %d waits (%.1f GB free, minus %.0f GB "
+                                      "headroom, < the %.1f GB it adds; %d in flight)\n", partition, free/1.e9,
+                                      headroom/1.e9, need/1.e9, inFlight );
+                    waited = true;
+                }
+                cv.wait_for( lock, std::chrono::seconds(2) );
+                free = autoTuneSystemFree();
+            }
+            if ( free >= 0. and free - headroom < need and inFlight == 0 and not saidAlone )
+            {
+                saidAlone = true;
+                if ( verbose > 0 )
+                    std::fprintf( stderr, "PS-DTFE memory gate: %.1f GB free, minus %.0f GB headroom, is below the "
+                                  "%.1f GB a partition adds -- running one partition at a time from now on\n",
+                                  free/1.e9, headroom/1.e9, need/1.e9 );
+            }
+        }
+        ++inFlight;
+    }
+    void leave()
+    {
+        { std::lock_guard<std::mutex> lock( m ); --inFlight; }
+        cv.notify_all();
+    }
+};
 
 #endif

@@ -9,8 +9,13 @@ the fold fraction of each distinct void's shells (--shells, default 0.8-1.2 R_v:
 measured void radius; --radius r_eff for the ellipsoid's, ~1.75 R_v, with 1.0-1.3) and its distance to the nearest
 sheet in units of that radius (searched within --cutout cells, default 10 smoothing lengths). The cusp and swallowtail rows are '--' unless the grid carries bit 7/8 (only --ps-caustic-cusps on
 the CPU deposit sets them); a parity-only grid (--ps-linear-deposit --ps-gpu: the fold flag without the
-collapse bits) is refused. No TNG run on the T7 carries a caustic_class grid yet (2026-10-05): the
-crossed-waves test run under the suites' temp root is the only real input so far.
+collapse bits) is refused. On the T7 only TNG100-3-Dark z = 0 carries one (2026-10-08: its ps_caustic.* grids,
+read with --prefix ps_caustic); the other boxes and snapshots need a caustics rerun.
+
+Names (2026-10-08): caustic_skeleton_z<z>.* for the defaults; a non-default option adds its tag, so a rerun with
+another one no longer overwrites them: '_<prefix>' (not ps_output), '_c6' / '_c18' (--connectivity), and with
+--voids '_reff' (--radius r_eff), '_shells<a>-<b>-...' (not the radius's default shells), '_overlaps'
+(--keep-overlaps), '_cut<N>' (--cutout) and the smoothing tag. A run without --voids removes the set's _voids.npz.
 
     python3 plot/plot_caustic_skeleton.py --sim TNG100-3-Dark --snap 99 --voids
     python3 plot/plot_caustic_skeleton.py --sim TNG50-4-Dark --snaps 99 50 --connectivity 6
@@ -124,13 +129,32 @@ def plot_skeleton(cc, summ, fold, voids, title, path):
         ax.set_xlabel(f"fold fraction of the {sh_[0]:g}-{sh_[-1]:g} {rl} shells")
         ax.set_ylabel(f"distance to the nearest sheet [{rl}]")
         ax.grid(alpha=0.3)
-        style.set_title(ax, f"{len(voids['fold'])} well-resolved voids ({int((~ok).sum())} beyond the cut-out)"
-                        if voids.get("radius", "r_eff") == "r_eff" else
-                        f"{len(voids['fold'])} distinct well-resolved voids ({int((~ok).sum())} beyond the cut-out)")
+        # 'distinct' from what was applied (summ['voids']), not from the radius: --keep-overlaps under r_v was
+        # titled 'distinct' and the distinct r_eff sample was not (2026-10-08)
+        distinct = bool(summ.get("voids", {}).get("distinct", False))
+        style.set_title(ax, f"{len(voids['fold'])} {'distinct ' if distinct else ''}well-resolved voids "
+                            f"({int((~ok).sum())} beyond the cut-out)")
     style.set_suptitle(fig, title)
     fig.tight_layout()
     style.save_plot_to_multiple_paths(fig, path, mirror=MIRROR)
     plt.close(fig)
+
+
+def skeleton_tag(args, prefix, default_shells):
+    """The file-name tag of the non-default options (2026-10-08: only the smoothing was in the name, so another
+    --connectivity, --prefix, --radius, --shells, --keep-overlaps or --cutout overwrote the default set, the
+    mirrored PNG included). The void options count only with --voids."""
+    tag = "" if prefix.rstrip(".") == "ps_output" else f"_{prefix.rstrip('.')}"
+    tag += "" if args.connectivity == 26 else f"_c{args.connectivity}"
+    if args.voids:
+        shells = [float(x) for x in args.shells.split(",") if x.strip()]
+        tag += "" if args.radius == "r_v" else "_reff"
+        if shells != [float(x) for x in default_shells.split(",")]:
+            tag += "_shells" + "-".join(f"{x:g}" for x in shells)
+        tag += "_overlaps" if args.keep_overlaps else ""
+        tag += "" if args.cutout is None else f"_cut{args.cutout}"
+        tag += f"_{pipeline.smoothing_tag()}" if pipeline.smoothing_tag() else ""   # a non-default sigma: its own files
+    return tag
 
 
 def main():
@@ -148,14 +172,17 @@ def main():
     parser.add_argument("--shells", default=None,
                         help="the shells' radii in units of --radius for the fold / sheet fractions, comma-separated "
                              "(default 0.8-1.2 R_v around the wall, or 1.0-1.3 R_eff)")
-    parser.add_argument("--keep-overlaps", action="store_true", help="--voids: every resolved void, not only the distinct ones")
+    parser.add_argument("--keep-overlaps", action="store_true",
+                        help="--voids: every resolved void, not only the distinct ones (none whose centre lies inside "
+                             "a deeper void's min(R_v, R_eff))")
     pipeline.add_smoothing_mpc_arg(parser)
     parser.add_argument("--out", default=None, help=f"output folder (default {OUTPUT_DIR}/<sim>)")
     args = parser.parse_args()
     style.apply()
     pipeline.apply_smoothing_args(args, "caustic-skeleton")    # --smooth / --smooth-mpc: the --voids catalogue's
+    default_shells = "0.8,0.9,1.0,1.1,1.2" if args.radius == "r_v" else "1.0,1.1,1.2,1.3"
     if args.shells is None:
-        args.shells = "0.8,0.9,1.0,1.1,1.2" if args.radius == "r_v" else "1.0,1.1,1.2,1.3"
+        args.shells = default_shells
     out_dir = Path(args.out).expanduser() if args.out else OUTPUT_DIR / args.sim
     MIRROR = args.out is None
     method = "ps" if args.method == "auto" else args.method
@@ -195,14 +222,15 @@ def main():
                 failed.append(snap)
             finally:
                 p.release()
-        tag = pipeline.smoothing_tag() if args.voids else ""   # --voids at a non-default sigma: its own files
-        base = out_dir / (f"caustic_skeleton_z{z:.2f}" + (f"_{tag}" if tag else ""))      # suffixes APPENDED
+        base = out_dir / (f"caustic_skeleton_z{z:.2f}" + skeleton_tag(args, fs.prefix, default_shells))  # suffixes APPENDED
         base.parent.mkdir(parents=True, exist_ok=True)
         title = f"{args.sim}  z = {z:.2f}  caustic skeleton (prefix {fs.prefix.rstrip('.')})"
         Path(f"{base}.json").write_text(json.dumps(sk.json_safe(summ), indent=1))   # no bare NaN in the JSON
         Path(f"{base}.txt").write_text(summary_text(summ, title))
         if voids is not None:
             np.savez_compressed(f"{base}_voids.npz", **voids)
+        else:                                       # no --voids, or they failed: an earlier run's file is not this set's
+            Path(f"{base}_voids.npz").unlink(missing_ok=True)
         plot_skeleton(cc, summ, sk.class_masks(cc)["indicator"]["fold"], voids, title, Path(f"{base}.png"))
         print(summary_text(summ, title))
         written.append(base)

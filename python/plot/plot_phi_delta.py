@@ -303,6 +303,7 @@ def analyze_snapshot(snapshot, redshift, output_root, sim, method, prefix=None, 
     try:
         p = pipeline.products(snapshot, redshift, sim=sim, method=method, prefix=prefix, data_root=data_root)
         _set_geometry(p.fs)
+        style.note_source(p.fs)                     # the thesis mirror takes the thesis box's standard DTFE only
         cat = p.voids()
         maxima = p.phi_maxima()
         phi_coords = np.asarray(maxima['coords'], dtype=int)

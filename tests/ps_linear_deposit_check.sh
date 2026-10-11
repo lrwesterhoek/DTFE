@@ -52,7 +52,7 @@ fi
 GPU_BUILT=0
 [ -f o_ps/.gpu_mode_off ] || GPU_BUILT=1
 # capture FIRST -- piping the binary straight into grep -q would SIGPIPE it under pipefail
-FULL_HELP="$("${BIN}" --full_help 2>/dev/null || true)"
+FULL_HELP="$("${BIN}" --full_help 2>/dev/null)" || { echo "FAIL: ${BIN} --full_help exited non-zero"; exit 1; }
 HAVE_EXACT=0
 grep -q -- '--ps-exact-deposit' <<<"${FULL_HELP}" && HAVE_EXACT=1
 
@@ -130,6 +130,7 @@ if [ "${HAVE_EXACT}" -eq 1 ]; then
         echo ">> runs 12-13 skipped (CPU-only build: no exact-deposit GPU parity to check)"
     fi
 else
+    [ "${DTFE_TEST_REQUIRED:-0}" = "1" ] && { echo "FAIL (required): this PS-DTFE has no --ps-exact-deposit" >&2; exit 1; }
     echo ">> runs 6-13 skipped (binary lacks --ps-exact-deposit)"
 fi
 

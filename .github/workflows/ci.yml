@@ -3,7 +3,7 @@
 # drift (a previous cross-platform-test.yml was removed on purpose, commit eb243c8; this job stays
 # CPU-only -- it exists to catch "does not compile on Linux", "the deposit broke" and "the GUI no
 # longer runs what it shows" regressions). The Metal GPU path is macOS-only and validated locally
-# (tests/dtfe_metal_check.sh, tests/gpu_scalar_check.sh, metal/validate_deposit.cpp).
+# (tests/dtfe_metal_check.sh, tests/gpu_scalar_check.sh, tests/gpu_mass_check.sh, metal/validate_deposit.cpp).
 # cuda-compile -- the CUDA/HIP backend (src/CGAL_triangulation/*_gpu_cuda.cu, a port of the Metal
 # kernels) compiled with nvcc in NVIDIA's toolkit image: no GPU on the runner, so this only keeps the
 # port compiling (the two .cu files are self-contained, so no CGAL is needed for this).

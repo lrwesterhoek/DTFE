@@ -338,10 +338,10 @@ endif
 .PHONY: ps_gpu_mode_check
 ps_gpu_mode_check:
 	@$(MKDIR_P) $(OBJ_DIR_PS)
-	@if [ ! -f $(OBJ_DIR_PS)/.gpu_mode_$(GPU_MODE) ] || [ ! -f $(OBJ_DIR_PS)/.dim_$(DIM) ] || [ ! -f $(OBJ_DIR_PS)/.prec_$(PRECISION) ] || [ ! -f $(OBJ_DIR_PS)/.tbb_$(TBB_PS) ] || [ ! -f $(OBJ_DIR_PS)/.deflate_$(HAVE_LIBDEFLATE) ] || { [ -n "$(FPC_STAMP)" ] && [ ! -f $(OBJ_DIR_PS)/$(FPC_STAMP) ]; }; then \
-		echo ">> PS build mode is now '$(GPU_MODE)', $(DIM)D, $(PRECISION), TBB=$(TBB_PS), libdeflate=$(HAVE_LIBDEFLATE)$(if $(FPC_STAMP),$(comma) no FMA contraction); wiping $(OBJ_DIR_PS) to avoid mixed objects"; \
-		rm -f $(OBJ_DIR_PS)/*$(OBJ_EXT) $(OBJ_DIR_PS)/*.d $(OBJ_DIR_PS)/ps_deposit_msl.h $(OBJ_DIR_PS)/.gpu_mode_* $(OBJ_DIR_PS)/.dim_* $(OBJ_DIR_PS)/.prec_* $(OBJ_DIR_PS)/.tbb_* $(OBJ_DIR_PS)/.deflate_* $(OBJ_DIR_PS)/.fpc_* $(OBJ_DIR_PS)/.metal_mode_* $(OBJ_DIR_PS)/.build_mode; \
-		touch $(OBJ_DIR_PS)/.gpu_mode_$(GPU_MODE) $(OBJ_DIR_PS)/.dim_$(DIM) $(OBJ_DIR_PS)/.prec_$(PRECISION) $(OBJ_DIR_PS)/.tbb_$(TBB_PS) $(OBJ_DIR_PS)/.deflate_$(HAVE_LIBDEFLATE) $(if $(FPC_STAMP),$(OBJ_DIR_PS)/$(FPC_STAMP)); \
+	@if [ ! -f $(OBJ_DIR_PS)/.gpu_mode_$(GPU_MODE) ] || [ ! -f $(OBJ_DIR_PS)/.dim_$(DIM) ] || [ ! -f $(OBJ_DIR_PS)/.prec_$(PRECISION) ] || [ ! -f $(OBJ_DIR_PS)/.tbb_$(TBB_PS) ] || [ ! -f $(OBJ_DIR_PS)/.deflate_$(HAVE_LIBDEFLATE) ] || [ ! -f $(OBJ_DIR_PS)/$(FLAGS_STAMP) ] || { [ -n "$(FPC_STAMP)" ] && [ ! -f $(OBJ_DIR_PS)/$(FPC_STAMP) ]; }; then \
+		echo ">> PS build mode is now '$(GPU_MODE)', $(DIM)D, $(PRECISION), $(BUILD_MODE) (flags $(FLAGS_SUM)), TBB=$(TBB_PS), libdeflate=$(HAVE_LIBDEFLATE)$(if $(FPC_STAMP),$(comma) no FMA contraction); wiping $(OBJ_DIR_PS) to avoid mixed objects"; \
+		rm -f $(OBJ_DIR_PS)/*$(OBJ_EXT) $(OBJ_DIR_PS)/*.d $(OBJ_DIR_PS)/ps_deposit_msl.h $(OBJ_DIR_PS)/.gpu_mode_* $(OBJ_DIR_PS)/.dim_* $(OBJ_DIR_PS)/.prec_* $(OBJ_DIR_PS)/.tbb_* $(OBJ_DIR_PS)/.deflate_* $(OBJ_DIR_PS)/.fpc_* $(OBJ_DIR_PS)/.flags_* $(OBJ_DIR_PS)/.metal_mode_* $(OBJ_DIR_PS)/.build_mode; \
+		touch $(OBJ_DIR_PS)/.gpu_mode_$(GPU_MODE) $(OBJ_DIR_PS)/.dim_$(DIM) $(OBJ_DIR_PS)/.prec_$(PRECISION) $(OBJ_DIR_PS)/.tbb_$(TBB_PS) $(OBJ_DIR_PS)/.deflate_$(HAVE_LIBDEFLATE) $(OBJ_DIR_PS)/$(FLAGS_STAMP) $(if $(FPC_STAMP),$(OBJ_DIR_PS)/$(FPC_STAMP)); \
 		printf '%s' "$(strip $(GPU_BUILD_ARG) $(PREC_BUILD_ARG) $(TBB_BUILD_ARG) $(DIM_BUILD_ARG))" > $(OBJ_DIR_PS)/.build_mode; \
 	fi
 
@@ -350,10 +350,10 @@ ps_gpu_mode_check:
 .PHONY: dtfe_gpu_mode_check
 dtfe_gpu_mode_check:
 	@$(MKDIR_P) $(OBJ_DIR)
-	@if [ ! -f $(OBJ_DIR)/.gpu_mode_$(GPU_MODE) ] || [ ! -f $(OBJ_DIR)/.dim_$(DIM) ] || [ ! -f $(OBJ_DIR)/.prec_$(PRECISION) ] || [ ! -f $(OBJ_DIR)/.deflate_$(HAVE_LIBDEFLATE) ] || { [ -n "$(FPC_STAMP)" ] && [ ! -f $(OBJ_DIR)/$(FPC_STAMP) ]; }; then \
-		echo ">> DTFE build mode is now '$(GPU_MODE)', $(DIM)D, $(PRECISION), libdeflate=$(HAVE_LIBDEFLATE)$(if $(FPC_STAMP),$(comma) no FMA contraction); wiping $(OBJ_DIR) to avoid mixed objects"; \
-		rm -f $(OBJ_DIR)/*$(OBJ_EXT) $(OBJ_DIR)/*.d $(OBJ_DIR)/dtfe_deposit_msl.h $(OBJ_DIR)/.gpu_mode_* $(OBJ_DIR)/.dim_* $(OBJ_DIR)/.prec_* $(OBJ_DIR)/.deflate_* $(OBJ_DIR)/.fpc_* $(OBJ_DIR)/.metal_mode_* $(OBJ_DIR)/.build_mode; \
-		touch $(OBJ_DIR)/.gpu_mode_$(GPU_MODE) $(OBJ_DIR)/.dim_$(DIM) $(OBJ_DIR)/.prec_$(PRECISION) $(OBJ_DIR)/.deflate_$(HAVE_LIBDEFLATE) $(if $(FPC_STAMP),$(OBJ_DIR)/$(FPC_STAMP)); \
+	@if [ ! -f $(OBJ_DIR)/.gpu_mode_$(GPU_MODE) ] || [ ! -f $(OBJ_DIR)/.dim_$(DIM) ] || [ ! -f $(OBJ_DIR)/.prec_$(PRECISION) ] || [ ! -f $(OBJ_DIR)/.deflate_$(HAVE_LIBDEFLATE) ] || [ ! -f $(OBJ_DIR)/$(FLAGS_STAMP) ] || { [ -n "$(FPC_STAMP)" ] && [ ! -f $(OBJ_DIR)/$(FPC_STAMP) ]; }; then \
+		echo ">> DTFE build mode is now '$(GPU_MODE)', $(DIM)D, $(PRECISION), $(BUILD_MODE) (flags $(FLAGS_SUM)), libdeflate=$(HAVE_LIBDEFLATE)$(if $(FPC_STAMP),$(comma) no FMA contraction); wiping $(OBJ_DIR) to avoid mixed objects"; \
+		rm -f $(OBJ_DIR)/*$(OBJ_EXT) $(OBJ_DIR)/*.d $(OBJ_DIR)/dtfe_deposit_msl.h $(OBJ_DIR)/.gpu_mode_* $(OBJ_DIR)/.dim_* $(OBJ_DIR)/.prec_* $(OBJ_DIR)/.deflate_* $(OBJ_DIR)/.fpc_* $(OBJ_DIR)/.flags_* $(OBJ_DIR)/.metal_mode_* $(OBJ_DIR)/.build_mode; \
+		touch $(OBJ_DIR)/.gpu_mode_$(GPU_MODE) $(OBJ_DIR)/.dim_$(DIM) $(OBJ_DIR)/.prec_$(PRECISION) $(OBJ_DIR)/.deflate_$(HAVE_LIBDEFLATE) $(OBJ_DIR)/$(FLAGS_STAMP) $(if $(FPC_STAMP),$(OBJ_DIR)/$(FPC_STAMP)); \
 		printf '%s' "$(strip $(GPU_BUILD_ARG) $(PREC_BUILD_ARG) $(DIM_BUILD_ARG))" > $(OBJ_DIR)/.build_mode; \
 	fi
 
@@ -583,6 +583,12 @@ endif
 # wiped once instead of being linked with the new ones. Clang builds carry no stamp (nothing changed).
 FPC_STAMP := $(if $(filter 1,$(CC_IS_GCC)),.fpc_off,)
 comma := ,
+# BUILD_MODE, ARCH_FLAGS and EXTRA_FLAGS change every object as well: stamped in the object dirs (the mode
+# and a checksum of the three), so a switch wipes the objects like a GPU-mode switch. Until 2026-10-08
+# 'make DTFE BUILD_MODE=debug' after a release build found every object up to date and linked the -O3
+# objects with the sanitizers; an ARCH_FLAGS / EXTRA_FLAGS change kept the old objects the same way.
+FLAGS_SUM := $(shell printf '%s' '$(subst ',,$(BUILD_MODE)|$(ARCH_FLAGS)|$(EXTRA_FLAGS))' | cksum | cut -d' ' -f1)
+FLAGS_STAMP := .flags_$(BUILD_MODE)_$(FLAGS_SUM)
 
 DTFE_INC = $(INCLUDES)
 
@@ -867,7 +873,7 @@ library-build: set_directories set_directories_2 $(addprefix $(SRC)/, $(LIB_FILE
 
 
 clean:
-	$(RM_RF) $(BIN_DIR)/DTFE$(EXE_EXT) $(BIN_DIR)/PS-DTFE$(EXE_EXT) $(BIN_DIR)/DTFE-double$(EXE_EXT) $(BIN_DIR)/PS-DTFE-double$(EXE_EXT) $(BIN_DIR)/DTFE-2d*$(EXE_EXT) $(BIN_DIR)/PS-DTFE-2d*$(EXE_EXT) ./o_2d*/*$(OBJ_EXT) ./o_ps_2d*/*$(OBJ_EXT) ./o/*$(OBJ_EXT) ./o_ps/*$(OBJ_EXT) ./o/*.d ./o_ps/*.d ./o_d/*$(OBJ_EXT) ./o_ps_d/*$(OBJ_EXT) ./o_d/*.d ./o_ps_d/*.d $(LIB_DIR)/*DTFE$(SHARED_EXT)
+	$(RM_RF) $(BIN_DIR)/DTFE$(EXE_EXT) $(BIN_DIR)/PS-DTFE$(EXE_EXT) $(BIN_DIR)/DTFE-double$(EXE_EXT) $(BIN_DIR)/PS-DTFE-double$(EXE_EXT) $(BIN_DIR)/DTFE-2d*$(EXE_EXT) $(BIN_DIR)/PS-DTFE-2d*$(EXE_EXT) ./o_2d*/*$(OBJ_EXT) ./o_ps_2d*/*$(OBJ_EXT) ./o_2d*/*.d ./o_ps_2d*/*.d ./o/*$(OBJ_EXT) ./o_ps/*$(OBJ_EXT) ./o/*.d ./o_ps/*.d ./o_d/*$(OBJ_EXT) ./o_ps_d/*$(OBJ_EXT) ./o_d/*.d ./o_ps_d/*.d $(LIB_DIR)/*DTFE$(SHARED_EXT)
 
 # ---- deps-check: verify the required headers/libraries exist BEFORE a long compile dies
 # mid-build with a cryptic missing-header error, and print the per-platform install command

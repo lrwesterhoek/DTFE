@@ -27,6 +27,7 @@
 #include <string>
 #include <vector>
 #include <sys/stat.h>
+#include <unistd.h>     // getpid: the writer's own temp name
 
 #include "canonical_path.h"
 #include "user_options.h"
@@ -107,7 +108,8 @@ struct Record
 inline void write(User_options const &u, Record const &r)
 {
     if ( u.tessellationCacheDir.empty() ) return;
-    std::string const p = path( u ), tmp = p + ".part";
+    // the temp name is this writer's own (2026-10-08): two runs sharing the cache folder truncated one '.part'
+    std::string const p = path( u ), tmp = p + ".part." + std::to_string( long( ::getpid() ) );
     std::ostringstream text;
     text << keyOf( u ) << "values\n";
     text << "N=" << r.n << '\n';

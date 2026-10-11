@@ -2127,7 +2127,9 @@ static std::string occPath(User_options const &o) { return TessellationCache::ca
 static void writeOccupancy(ServePart const &P)
 {
     std::string const desc = TessellationCache::makeDescriptor( P.opts );
-    std::string const path = occPath( P.opts ), tmp = path + ".tmp";
+    // the temp name is this writer's own (2026-10-08): the composite server and a batch run share the cache
+    // folder, and two writers of one map truncated one '.tmp' under each other
+    std::string const path = occPath( P.opts ), tmp = path + ".tmp." + std::to_string( long( ::getpid() ) );
     std::ofstream f( tmp.c_str(), std::ios::binary | std::ios::trunc );
     if ( not f ) return;
     uint32_t const len = uint32_t( desc.size() ), n = uint32_t( OCC_N );

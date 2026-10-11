@@ -345,6 +345,10 @@ DTFE_State DTFE_setup(vector<Particle_data> *allParticles,
 #endif
         AutoTuneReport const report = autoTunePartitioning( userOptions, nParticles,
                                                             not samples.empty(), gpuActive, particlePointer );
+#ifdef PHASE_SPACE
+        if ( report.valid )
+            userOptions.psPartitionBytes = report.perPartition;   // the partition memory gate (auto_tune.h)
+#endif
         if ( userOptions.autoTuneReport )   // the memory check: the decision and prediction, nothing else
         {
             std::printf( "%s\n", report.line().c_str() );
@@ -848,6 +852,11 @@ void DTFE(vector<Particle_data> *allParticles,
         int psConcurrency = totalPartitions;
         if ( userOptions.maxConcurrent > 0 and userOptions.maxConcurrent < psConcurrency )
             psConcurrency = userOptions.maxConcurrent;
+#ifdef OPEN_MP
+        // never more than the threads, like the serve paths and DTFE_parallel: '--max-concurrent 0' with a
+        // hand-set '--partition 5 5 5' started all 125 partitions at once, with no memory gate (2026-10-08)
+        psConcurrency = std::min( psConcurrency, omp_get_max_threads() );
+#endif
         if ( psConcurrency < 1 ) psConcurrency = 1;
         message << MESSAGE::cBold() << "PS-DTFE:" << MESSAGE::cReset() << " building up to "
                 << MESSAGE::cMagenta() << psConcurrency << MESSAGE::cReset() << " partition triangulation(s) concurrently"
@@ -919,15 +928,21 @@ void DTFE(vector<Particle_data> *allParticles,
         // in INDEX order, so the float sums are the same run after run; its partitions are small
         // and uniform, so waiting for the predecessor costs nothing. A memory-driven split keeps
         // merging in completion order: its partitions differ 30x in cost, and threads idling behind
-        // a slow one cost the TNG region's GPU grid 35% -- for sums the GPU's atomics make non-
-        // reproducible anyway. Waiting cannot deadlock: the dynamic schedule hands iterations out in
-        // order, so every lower index is already running or done.
+        // a slow one cost the TNG region's GPU grid 35%. The price: the merge's own adds follow the
+        // completion order, so such a run differs from the next in the last bits (in the double build
+        // and for the Metal mass grid too, which is an exact fixed-point sum per partition since
+        // 2026-10-08; measured by tests/gpu_mass_check.sh, which therefore pins --max-concurrent 1).
+        // Waiting cannot deadlock: the dynamic schedule hands iterations out in order, so every lower
+        // index is already running or done.
         bool const orderedMerge = state.options.psOrderedMerge;
         std::mutex mergeMutex;
         std::condition_variable mergeCv;
         int nextMerge = 0;
 
         ConcurrentTriangulationPlan triangulationPlan( psConcurrency, totalPartitions );
+        psGpuFallbacksTaken( true );   // counted from here; reported once after the loop
+        // a partition starts only when the machine has the memory for it (or nothing else is in flight)
+        PartitionMemoryGate memoryGate( psConcurrency > 1 ? state.options.psPartitionBytes : 0. );
 #ifdef OPEN_MP
         #pragma omp parallel for schedule(dynamic, 1) num_threads(psConcurrency)
 #endif
@@ -947,6 +962,14 @@ void DTFE(vector<Particle_data> *allParticles,
             User_options tempOpt = partitionOptions( lagRegion );
             bool const cacheOnly = not skipped and not state.options.tessellationCacheDir.empty()
                                    and psTessellationCached( tempOpt );
+            // the memory gate, BEFORE the particle copy (part of a partition's memory): a partition that builds or
+            // loads waits while the free memory cannot hold one more and another is in flight; a skipped one passes
+            // (never with the ordered merge's speed split: tiny uniform partitions). Released at the iteration's end.
+            struct GateRelease { PartitionMemoryGate *g; ~GateRelease() { if ( g ) g->leave(); } };
+            bool const gated = not skipped and not orderedMerge;
+            if ( gated )
+                memoryGate.enter( pi, userOptions.verboseLevel );
+            GateRelease const gateRelease{ gated ? &memoryGate : nullptr };
             vector<Particle_data> tempPart;
             if ( not skipped and not cacheOnly and state.options.psParticlesDeferred )
                 throwError( "internal: a partition needs its particles, but they were not read (the globals record path)." );
@@ -1004,6 +1027,17 @@ void DTFE(vector<Particle_data> *allParticles,
                      << MESSAGE::cReset() << "\n" << MESSAGE::Flush;
                 }
             }
+        }
+
+        // A GPU deposit that fell back to the CPU warns from the master thread only (the others run at
+        // verbose 0), so with partitions in flight on several threads most fallbacks were silent: say how
+        // many there were (2026-10-08)
+        if ( int const nFallback = psGpuFallbacksTaken( true ) )
+        {
+            MESSAGE::Warning warning( userOptions.verboseLevel );
+            warning << nFallback << " partition deposit pass(es) asked for the GPU and ran on the CPU instead. Only "
+                    << "the master thread's partitions print the reason (above, when one of them fell back); the "
+                    << "grids are complete, the run only took longer.\n" << MESSAGE::EndWarning;
         }
 
         // every partition copied its own particles (tempPart); the global array is not needed by

@@ -8,6 +8,11 @@ with several snapshots, the single-stream fraction of each class against redshif
 NOT in analyze.py's PLOT_SCRIPTS: that series is the standard-DTFE thesis pipeline, this needs the
 phase-space grids (streams, hidden_streams; caustic_class is optional).
 
+Names (2026-10-08): web_streams_<web>_z<z>.* and single_stream_vs_z_<web>.png for the default grids (ps_output.,
+averaged) over every snapshot of the simulation on disk; another --prefix or --raw adds '_<prefix>' / '_raw', and a
+series over fewer snapshots '_snaps<a>-<b>-...'. They all used to overwrite the default files (a ps_caustic run had
+replaced the TNG100 z = 0 T-web table, and a subset run would replace the full series).
+
     python3 plot/plot_web_streams.py --sim TNG100-3-Dark --snaps 99 67 50 40
     python3 plot/plot_web_streams.py --sim TNG100-3-Dark --snap 99 --web tweb --raw
 """
@@ -81,6 +86,12 @@ def plot_vs_redshift(rows, web_name, path):
     plt.close(fig)
 
 
+def grid_tag(fs):
+    """'' for the default grids (ps_output., volume-averaged); else '_<prefix>' and/or '_raw' (2026-10-08)."""
+    prefix = fs.prefix.rstrip(".")
+    return ("" if prefix == "ps_output" else f"_{prefix}") + ("" if fs.averaged else "_raw")
+
+
 def process(fs, sim, snap, webs, series, problems, out_dir):
     """The tables and figures of one snapshot: each web's table goes into series[web] AS SOON AS it is made
     (a later web's failure cannot lose it), a missing grid or a failure is noted in 'problems' as
@@ -109,7 +120,7 @@ def process(fs, sim, snap, webs, series, problems, out_dir):
             table["sim"], table["snapshot"], table["redshift"], table["web"] = sim, int(snap), float(z), label
             table["prefix"], table["averaged"] = fs.prefix, fs.averaged
             title = f"{sim}  z = {z:.2f}  {label}  ({'averaged' if fs.averaged else 'raw'} streams, prefix {fs.prefix.rstrip('.')})"
-            base = out_dir / f"web_streams_{key}_z{z:.2f}"              # '.png' etc. APPENDED: with_suffix would eat '.50'
+            base = out_dir / f"web_streams_{key}{grid_tag(fs)}_z{z:.2f}"     # '.png' etc. APPENDED: with_suffix would eat '.50'
             ws.save_table(table, base, title)
             plot_table(table, title, Path(f"{base}.png"))
         except (OSError, ValueError, MemoryError) as e:      # a truncated or unreadable grid (OSError incl. missing): this web only
@@ -137,10 +148,12 @@ def main():
     method = "ps" if args.method == "auto" else args.method
     series = {k: [] for k in webs}
     failed, problems = [], []                   # failed: no FieldSet / no streams at all; problems: per (snapshot, web)
+    tag = None                                  # the grids' name tag, from the first FieldSet (one --prefix / --raw per run)
     for snap in snaps:
         try:
             fs = FieldSet(sim_dir(args.sim, args.data_root) / f"snapdir_{snap:03d}", method=method,
                           averaged=not args.raw, prefix=args.prefix)
+            tag = grid_tag(fs) if tag is None else tag
             n_done = process(fs, args.sim, snap, webs, series, problems, out_dir)
         except (FileNotFoundError, ValueError, OSError) as e:    # OSError: h5py on an unreadable snapshot file
             print(f"  snapshot {snap:03d}: {e}")
@@ -148,9 +161,15 @@ def main():
             continue
         if not n_done:
             failed.append(snap)
+    # the series' default name holds the whole ladder on disk; a subset of it gets its own name, so a
+    # '--snaps 99 67 50 40' run no longer replaces the full series (a snapshot that failed still counts as asked)
+    ladder = sorted({int(d.name.split("_")[1]) for d in sim_dir(args.sim, args.data_root).glob("snapdir_*")
+                     if d.name.split("_")[1].isdigit()})
+    asked = sorted(set(snaps))
+    subset = "" if asked == ladder else "_snaps" + "-".join(str(s) for s in asked)
     for k, rows in series.items():
         if len(rows) > 1:
-            plot_vs_redshift(rows, WEBS[k][0], out_dir / f"single_stream_vs_z_{k}.png")
+            plot_vs_redshift(rows, WEBS[k][0], out_dir / f"single_stream_vs_z_{k}{tag or ''}{subset}.png")
     done = sum(len(r) for r in series.values())
     notes = [f"{lab} {what} for {s:03d}" for s, lab, what in problems]
     print(f"\n{done} table(s) written under {out_dir}"

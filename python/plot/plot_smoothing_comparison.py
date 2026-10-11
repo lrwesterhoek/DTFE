@@ -122,6 +122,7 @@ def main():
             print(f"  snapshot {snap} (z={z_cfg:.2f}), sigma={sigma:g} cells")
             try:
                 cat, fs = catalog_for(snap, sigma, args)
+                style.note_source(fs)               # the thesis mirror takes the thesis box's standard DTFE only
             except FileNotFoundError:
                 print(f"    skipping snapshot {snap} (no {args.method} fields)")
                 continue

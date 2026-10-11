@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The Linux CI suite, ONE list shared by .github/workflows/ci.yml and the Dockerfile so the two cannot
-# drift. CPU-only: the GPU suites (dtfe_metal_check, gpu_scalar_check) need a GPU build and stay local,
-# as do ps_auto_tune_check and ps_scratch_check (macOS-isms: /usr/bin/time -l, /private/tmp).
+# drift. CPU-only: the GPU suites (dtfe_metal_check, gpu_scalar_check, gpu_mass_check) need a GPU build and
+# stay local, as do ps_auto_tune_check and ps_scratch_check (macOS-isms: /usr/bin/time -l, /private/tmp).
 #
 #   tests/ci_suite.sh build     the single pair, the double pair (DOUBLE=1) and the 2D pair (DIM=2)
 #   tests/ci_suite.sh core      every CPU suite against ./DTFE and ./PS-DTFE
@@ -98,10 +98,14 @@ stage_core() {
     # AFTER the program suites: ps_caustic_class_check.sh leaves the crossed-waves run (pcc_out.*) under the
     # temp root, which the caustic-skeleton test's real-grid half reads (else it is a SKIP, not a pass)
     step "dtfelib python suite (synthetic tier; the data-backed tier skips without the T7)"; "$PY" tests/py_dtfelib_test.py
+    # the suites' own contract (2026-10-08): skips that DTFE_TEST_REQUIRED=1 turns into failures, which the double
+    # stage relies on, and run_tests.py's regression SKIP in a fresh reference folder, which it does not
+    step "skip / fail contract of run_tests.py and ps_double_check.sh"; tests/run_tests_check.sh --no-build
 }
 
 # after stage_build the pairs EXIST: a suite that would skip for a missing binary or feature is a failure here
-# (DTFE_TEST_REQUIRED=1 turns every skip_or_fail into exit 1; survey rank 20, 2026-10-05)
+# (DTFE_TEST_REQUIRED=1 turns every skip_or_fail into exit 1; survey rank 20, 2026-10-05 -- except run_tests.py's
+# regression, which SKIPs in a fresh reference folder by design: it has no Linux reference to compare with)
 stage_double() {
     step "the double pair against the single pair"; DTFE_TEST_REQUIRED=1 tests/ps_double_check.sh --no-build
     export DTFE_TEST_PRECISION=double DTFE_TEST_REQUIRED=1
@@ -121,7 +125,7 @@ stage_gui() {
     fi
 }
 
-[ "$#" -gt 0 ] || { sed -n '2,17p' "$0"; exit 2; }
+[ "$#" -gt 0 ] || { sed -n '2,14p' "$0"; exit 2; }
 for s in "$@"; do
     case "$s" in
         build|core|double|2d|gui) "stage_$s" ;;

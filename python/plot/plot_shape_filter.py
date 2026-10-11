@@ -163,6 +163,7 @@ def process_snapshot(snapshot, redshift, sim=None, method=None, prefix=None, dat
         p = pipeline.products(snapshot, redshift, sim=sim, method=method, prefix=prefix, data_root=data_root)
         cat = p.voids()
         grid_n = p.fs.grid_n
+        style.note_source(p.fs)                     # the thesis mirror takes the thesis box's standard DTFE only
         p.release()
 
         if len(cat['coords']) == 0:

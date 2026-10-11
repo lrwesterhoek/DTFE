@@ -19,8 +19,15 @@ ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$ROOT" || exit 1
 PY="${PYTHON:-python3}"
 command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/python3.14
+# a pair missing is a SKIP, or a FAILURE under DTFE_TEST_REQUIRED=1, which ci_suite.sh's double stage sets after
+# building both pairs (it used to exit 0 there too, 2026-10-08). precision.sh's skip_or_fail, inlined: sourcing
+# precision.sh would announce one precision for a suite that runs both.
+skip_or_fail() {
+    if [ "${DTFE_TEST_REQUIRED:-0}" = "1" ]; then echo "FAIL (required): $*" >&2; exit 1; fi
+    echo "SKIP: $*"; exit 0
+}
 for b in DTFE PS-DTFE DTFE-double PS-DTFE-double; do
-    [ -x "./$b" ] || { echo "SKIP: ./$b is not built (make DTFE PS-DTFE DOUBLE=1 builds the double pair)"; exit 0; }
+    [ -x "./$b" ] || skip_or_fail "./$b is not built (make DTFE PS-DTFE DOUBLE=1 builds the double pair)"
 done
 TMP="${DTFE_TEST_TMP:-${TMPDIR:-/tmp}/dtfe-tests}/double_check"
 mkdir -p "$TMP"

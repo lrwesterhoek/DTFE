@@ -917,7 +917,11 @@ def _t_void_catalog_export_body(d, cat, n_voids, n, _Prod, catalog, pipeline, co
     nanfit = np.where(res, 1.0, np.nan)
     f64 = lambda a: np.asarray(a, dtype=np.float64)
     ev = f64(cat["eigenvalues"]) / config.CELL_SIZE ** 2
-    pos, axes, orient = f64(cat["positions_mpc"]), f64(cat["semi_axes"]), f64(cat["orientations"])
+    # the cell CENTRES (2026-10-08): the cached positions_mpc are the corners, half a cell off what R_v, the profiles
+    # and the outlines centre a void on; float64 throughout (the hdf5 compare is exact)
+    pos = (f64(cat["coords"]) + 0.5) * config.CELL_SIZE
+    assert np.allclose(pos - 0.5 * config.CELL_SIZE, f64(cat["positions_mpc"]), rtol=1e-6), "positions_mpc are the corners"
+    axes, orient = f64(cat["semi_axes"]), f64(cat["orientations"])
     bbks, ratios = f64(cat["bbks_params"]), f64(cat["axis_ratios"])
     src = {"id": np.arange(n_voids), "ix": cat["coords"][:, 0], "iy": cat["coords"][:, 1], "iz": cat["coords"][:, 2],
            "x_mpc": pos[:, 0], "y_mpc": pos[:, 1], "z_mpc": pos[:, 2], "delta_c": f64(cat["delta_values"]),
@@ -1759,6 +1763,18 @@ def t_void_scripts():
             assert pop.snapshot_stats(doc)["n_deep"] == 3, (pop.snapshot_stats(doc)["n_deep"], dres)
         finally:
             config.DEEP_VOID_THRESHOLD = -0.1
+        # the names (2026-10-08): the run above read PS-DTFE's default grids, so its four files are untagged and its npz
+        # says which grids per snapshot; --keep-overlaps and another estimator write their own four, the untagged untouched
+        assert list(st["method"]) == ["ps", "ps"] and list(st["prefix"]) == ["ps_output.", "ps_output."], (st["method"], st["prefix"])
+        four = ("population_evolution{}.png", "population_distributions{}.png", "population_abundance{}.png", "population_stats{}.npz")
+        kept = {f.format(""): (popdir / f.format("")).stat().st_mtime_ns for f in four}
+        for args, tag in ((["--keep-overlaps"], "_overlaps"), (["--method", "dtfe"], "_dtfe")):
+            code, text = run(pop, args)
+            assert code == 0 and all((popdir / f.format(tag)).is_file() for f in four), (args, code, sorted(q.name for q in popdir.iterdir()), text[-400:])
+            assert {f.format(""): (popdir / f.format("")).stat().st_mtime_ns for f in four} == kept, (args, "rewrote the untagged files")
+        so, sd = npz(popdir / "population_stats_overlaps.npz"), npz(popdir / "population_stats_dtfe.npz")
+        assert not bool(so["abundance_distinct"]) and bool(st["abundance_distinct"]) and list(so["method"]) == ["ps", "ps"], so["abundance_distinct"]
+        assert list(sd["method"]) == ["dtfe", "dtfe"] and list(sd["prefix"]) == ["output.", "output."], (sd["method"], sd["prefix"])
         # a header box 1.3x config's: REFUSED before its cache is touched -- a cache voids() WOULD re-derive and
         # rewrite (no deep_threshold record) stays byte-identical; the other snapshot carries on (exit 0)
         p50 = cached(50)
@@ -1779,6 +1795,132 @@ def t_void_scripts():
         cli.DATA_ROOT = old_root
         pipeline.SnapshotProducts.voids = old_voids
         pvp.OUTPUT_DIR, pop.FIGURE_ROOT = old_out, old_fig
+        dict.update(matplotlib.rcParams, old_rc)
+        gc.redshift_table.cache_clear()
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def t_void_crossbox_outlines():
+    """plot_void_crossbox.py's per-box worker and figure, tools/void_outlines.py (the launcher's void outlines) and
+    pipeline.adopt_snapshot_grid, in process on the synthetic 64^3 ladder (_void_pin_config): the worker's counts and
+    R_v are snapshot_stats', its stacks void_profiles' over the common R_v range, a redshift without a snapshot left
+    empty; --replot draws a figure per redshift and the table, a missing box said and exit 1; the outline tool's
+    resolved centres sit on the dips, 'distinct' is catalog.distinct_mask's, its JSON strict; adopt_snapshot_grid
+    takes the grid's frame keeping sigma in Mpc and is a no-op when config is in it."""
+    import io as _io, json, os, sys as _sys, shutil, tempfile
+    from contextlib import redirect_stdout
+    import matplotlib
+    import config
+    from dtfelib import pipeline, catalog, cli, profiles
+    from dtfelib import groupcat as gc
+    n, box = 64, 64.0
+    here = Path(__file__).resolve().parent.parent / "python"
+    dirs = [str(here / "plot"), str(here / "tools")]
+    _sys.path[:0] = dirs
+    try:
+        import plot_void_population as pop
+        import plot_void_crossbox as xb
+        import void_outlines as vo
+    finally:
+        for d in dirs:
+            _sys.path.remove(d)
+    root = Path(tempfile.mkdtemp(prefix="dtfe_crossbox_"))
+    saved = {}
+    old_root, old_rc = cli.DATA_ROOT, dict(matplotlib.rcParams.copy())
+    data, out = root / "data", root / "out"
+    try:
+        _void_pin_config(root, saved, n, box)
+        saved["SMOOTHING_SIGMA_MPC"] = config.SMOOTHING_SIGMA_MPC       # adopt_snapshot_grid below moves it
+        config.SMOOTHING_SIGMA_MPC = config.SMOOTHING_SIGMA_CELLS * config.CELL_SIZE
+        _void_ladder_snapdir(data, 50, 0.5, 1, ("ps_output",))
+        _void_ladder_snapdir(data, 99, 0.0, 2, ("ps_output",))
+        gc.redshift_table.cache_clear()
+        sig = pipeline.smoothing_length_mpc()
+        with redirect_stdout(_io.StringIO()):
+            res = xb.measure("SYN", "ps", None, data, zs=(0.0, 0.5, 3.0), rv_range_sigma=(0.0, 100.0), points=60,
+                             n_boot=20)
+        assert list(res["snaps"]) == [50, 99] and np.allclose(res["redshift"], [0.5, 0.0]), (res["snaps"], res["redshift"])
+        prods = {s: pipeline.products(s, sim="SYN", method="ps", data_root=data) for s in (50, 99)}
+        for j, s in enumerate((50, 99)):
+            st = pop.snapshot_stats(prods[s].voids(), n)
+            for k in ("n_total", "n_resolved", "n_counted", "n_no_rv", "n_overlapping"):
+                assert res[k][j] == st[k], (s, k, res[k][j], st[k])
+            assert np.array_equal(xb.r_v_at(res, s), st["_r_v"]), s
+        assert list(res["pz_snap"]) == [99, 50, -1] and res["pz_count"][0] > 0, (res["pz_snap"], res["pz_count"])
+        assert list(res["pz_count"][:2]) == list(res["pz_profiled"][:2]), "every profiled void lies in a 0-150 Mpc range"
+        assert np.isnan(res["pz_density_mean"][2]).all(), "no snapshot near z = 3: its stack stays empty"
+        prof = profiles.void_profiles(prods[99], m=60, sample="resolved", radius="r_v", distinct=True)
+        want = profiles.stack(prof, edges_mpc=[0.0, 100.0 * sig], n_boot=20)
+        assert np.allclose(res["pz_density_mean"][0], want["density"]["mean"][0], equal_nan=True)
+        assert np.allclose(res["pz_v_r_lo"][0], want["v_r"]["lo"][0], equal_nan=True)
+        for p_ in prods.values():
+            p_.release()
+        # ---- the figure from the saved .npz files: two 'boxes', a third one missing
+        out.mkdir()
+        np.savez_compressed(xb.worker_path(out, "SYN", "ps", sig), **res)
+        np.savez_compressed(xb.worker_path(out, "SYN2", "ps", sig), **dict(res, sim="SYN2"))
+        buf = _io.StringIO()
+        with redirect_stdout(buf):
+            try:
+                xb.main(["--replot", "--sims", "SYN", "SYN2", "SYN3", "--out", str(out), "--smooth-mpc", repr(sig),
+                         "--z", "0", "0.5", "3"])
+                code = 0
+            except SystemExit as e:
+                code = e.code
+        names = sorted(q.name for q in out.iterdir())
+        tag = xb.sigma_tag(sig)
+        assert code == 1 and "SYN3: no" in buf.getvalue(), (code, buf.getvalue()[-400:])
+        assert all(f"crossbox_ps_{tag}_z{z}.png" in names for z in ("0.00", "0.50", "3.00")) and f"crossbox_ps_{tag}.txt" in names, names
+        table = (out / f"crossbox_ps_{tag}.txt").read_text()
+        assert table.count("SYN (ps): box 64 Mpc") == 1 and "SYN2 (ps)" in table, table[:300]
+        # ---- the launcher's void outlines: config already in the grid's frame (adopt: nothing changes); the
+        # production set (no prefix) reads the catalogue the analysis cached above, so even ~no free memory is
+        # enough, while a prefix of its own needs a build, which the memory guard refuses then
+        old_free = os.environ.get("DTFE_FREE_GB")
+        os.environ["DTFE_FREE_GB"] = "0.001"
+        try:
+            with redirect_stdout(_io.StringIO()):
+                o = vo.outlines("SYN", 99, None, data, "ps")
+                try:
+                    vo.outlines("SYN", 99, "ps_output", data, "ps")
+                    refused = ""
+                except MemoryError as e:
+                    refused = str(e)
+        finally:
+            if old_free is None:
+                os.environ.pop("DTFE_FREE_GB", None)
+            else:
+                os.environ["DTFE_FREE_GB"] = old_free
+        assert "not cached" in refused and "64^3" in refused, refused
+        json.dumps(o, allow_nan=False)                      # strict JSON: NaN radii are null
+        cat = pipeline.products(99, sim="SYN", method="ps", data_root=data)
+        c99 = cat.voids()
+        cat.release()
+        assert o["n_grid"] == n and o["box_mpc"] == box and len(o["centres_mpc"]) == len(c99["coords"]), o["n_grid"]
+        res_rows = np.nonzero(o["resolved"])[0]
+        dips = np.array([(16, 16, 16), (44, 20, 40), (20, 48, 30), (50, 50, 10), (8, 36, 54), (36, 6, 26)]) + 0.5
+        cen = np.asarray(o["centres_mpc"])[res_rows]
+        dist = np.abs(((cen[:, None, :] - dips[None]) + box / 2) % box - box / 2).max(axis=2).min(axis=1)
+        assert res_rows.size == 6 and dist.max() <= 1.5, (res_rows.size, dist)
+        rv = catalog.r_v_mpc(c99)
+        assert o["distinct"] == catalog.distinct_mask(c99, c99["well_resolved"].astype(bool) & np.isfinite(rv), n).tolist()
+        # ---- adopt_snapshot_grid: a 512 frame meets the 64^3 grid: the grid's frame, sigma kept in Mpc
+        config.FIELD_RESOLUTION, config.CELL_SIZE = 512, box / 512
+        before = config.SMOOTHING_SIGMA_CELLS * config.CELL_SIZE        # 0.1875 Mpc: under one cell of the 64^3 grid
+        pr = pipeline.products(99, sim="SYN", method="ps", data_root=data)
+        try:
+            got = pipeline.adopt_snapshot_grid(pr)
+            assert got == (1.0, box, n) and config.FIELD_RESOLUTION == n and config.CELL_SIZE == 1.0, got
+            assert np.isclose(config.SMOOTHING_SIGMA_CELLS * config.CELL_SIZE, before) and np.isclose(config.SMOOTHING_SIGMA_MPC, before)
+            assert config.FOOTPRINT_SIZE == config.footprint_for(config.SMOOTHING_SIGMA_CELLS)
+            sig_cells = config.SMOOTHING_SIGMA_CELLS
+            assert pipeline.adopt_snapshot_grid(pr) == got and config.SMOOTHING_SIGMA_CELLS == sig_cells
+        finally:
+            pr.release()
+    finally:
+        for k, v in saved.items():
+            setattr(config, k, v)
+        cli.DATA_ROOT = old_root
         dict.update(matplotlib.rcParams, old_rc)
         gc.redshift_table.cache_clear()
         shutil.rmtree(root, ignore_errors=True)
@@ -2224,7 +2366,9 @@ def t_caustic_skeleton_script():
     temp dirs): .json/.txt/.png per redshift, a strict JSON, --connectivity passed on, no mirror under --out; a
     snapshot without a grid, without a snapdir or with a parity-only grid exits 1; a failed --voids (the frame
     refusal) exits 1 with 'voids_error' in the JSON (review [25]); a delivered one writes the 'voids' block and npz
-    without a RuntimeWarning."""
+    without a RuntimeWarning. Names (2026-10-08): a non-default option tags the set ('_c6', '_reff', '_shells...',
+    '_overlaps', '_cut<N>'), a plain run removes the set's earlier _voids.npz, and the void panel's title says
+    'distinct' when the run applied it, not by the radius."""
     import io as _io, json, shutil, sys as _sys, tempfile, types, warnings
     from contextlib import redirect_stdout
     import matplotlib
@@ -2240,7 +2384,7 @@ def t_caustic_skeleton_script():
         if plot_dir not in _sys.path:
             _sys.path.insert(0, plot_dir)
         import plot_caustic_skeleton as pcs                 # BEFORE config is patched: OUTPUT_DIR is set at import
-        saved = (pcs.OUTPUT_DIR, pcs.MIRROR, pcs.pipeline)
+        saved = (pcs.OUTPUT_DIR, pcs.MIRROR, pcs.pipeline, pcs.style)
         config.THESIS_FIGURES_DIR, config.LOCAL_FIGURES_ROOT, config.CACHE_DIR = root / "mirror", str(root / "local"), root / "cache"
         pcs.OUTPUT_DIR = root / "default_out"               # never the repo's figures/ (a run without --out lands here)
         with matplotlib.rc_context():                       # main() calls style.apply(): rcParams back afterwards
@@ -2306,9 +2450,10 @@ def t_caustic_skeleton_script():
             d98 = _synthetic_snapdir(data, "SYN", 98, 0.01, n=n, grids=("den",))
             np.full((n, n, n), fold, np.float32).tofile(str(d98 / "ps_output.causticClass"))
 
-            def run(args):
+            def run(args, fresh=True):
                 out = root / "out"
-                shutil.rmtree(out, ignore_errors=True)
+                if fresh:
+                    shutil.rmtree(out, ignore_errors=True)
                 buf = _io.StringIO()
                 _sys.argv = ["plot_caustic_skeleton.py", "--sim", "SYN", "--data-root", str(data), "--out", str(out)] + args
                 with redirect_stdout(buf):
@@ -2322,7 +2467,9 @@ def t_caustic_skeleton_script():
                 def no_constant(c):
                     raise ValueError(f"bare {c} in {path.name}")
                 return json.loads(path.read_text(), parse_constant=no_constant)
-            base = ["caustic_skeleton_z0.50.json", "caustic_skeleton_z0.50.png", "caustic_skeleton_z0.50.txt"]
+            def files(tag=""):                  # a set's three files; a non-default option tags them (2026-10-08)
+                return [f"caustic_skeleton_z0.50{tag}.{e}" for e in ("json", "png", "txt")]
+            base = files()
             code, text, names = run(["--snaps", "50"])
             assert code == 0 and names == base, (code, names, text[-600:])
             j = strict(root / "out" / "caustic_skeleton_z0.50.json")
@@ -2334,7 +2481,8 @@ def t_caustic_skeleton_script():
             assert "no bit 7/8 in this grid" in t and any(ln.split()[:3] == ["cusp", "--", "--"] for ln in t.splitlines()), t
             assert not (root / "mirror").exists() and not (root / "default_out").exists()      # --out: no thesis mirror
             code, text, names = run(["--snaps", "50", "--connectivity", "6"])                   # reaches the components
-            j = strict(root / "out" / "caustic_skeleton_z0.50.json")
+            assert names == files("_c6"), names                                                 # its own files: '_c6'
+            j = strict(root / "out" / "caustic_skeleton_z0.50_c6.json")
             assert code == 0 and j["connectivity"] == 6 and j["components"]["node"]["n"] == 2 and "connectivity 6" in text, (code, j["components"])
             code, text, names = run(["--snaps", "50", "99", "98", "97"])
             assert code == 1 and names == base and "failed: [99, 98, 97]" in text, (code, names, text[-600:])
@@ -2342,8 +2490,8 @@ def t_caustic_skeleton_script():
             # --voids asked for and refused (the header's 100 Mpc / 8 cell is not config.CELL_SIZE: the frame guard)
             assert abs(100.0 / n - config.CELL_SIZE) > 1e-3 * config.CELL_SIZE, config.CELL_SIZE
             code, text, names = run(["--snaps", "50", "--voids", "--radius", "r_eff", "--keep-overlaps"])
-            assert code == 1 and names == base and "failed: [50]" in text and "voids: FAILED" in text, (code, names, text[-600:])
-            j = strict(root / "out" / "caustic_skeleton_z0.50.json")
+            assert code == 1 and names == files("_reff_overlaps") and "failed: [50]" in text and "voids: FAILED" in text, (code, names, text[-600:])
+            j = strict(root / "out" / "caustic_skeleton_z0.50_reff_overlaps.json")
             assert "cell" in j.get("voids_error", "") and "voids" not in j, j.get("voids_error")
             assert not list((root / "cache").rglob("*.npz"))                     # no catalogue written (into the temp cache)
 
@@ -2354,32 +2502,60 @@ def t_caustic_skeleton_script():
 
             class _Prod:
                 sim, fs = "SYN", _FS()
-                def voids(self):
+                def voids(self):                # + the frame, depths and an R_v (row 0) a built catalogue carries: the r_v runs
                     return dict(far, semi_axes=np.full((2, 3), 2.0 * config.CELL_SIZE, np.float32),
-                                well_resolved=np.array([True, False]))
+                                well_resolved=np.array([True, False]), cell_mpc=config.CELL_SIZE, r_v_cells=np.array([2.0, np.nan]),
+                                delta_values=np.array([-0.6, -0.4], np.float32))
                 def release(self):
                     pass
             real = saved[2]
             pcs.pipeline = types.SimpleNamespace(products=lambda *a, **kw: _Prod(), add_smoothing_mpc_arg=real.add_smoothing_mpc_arg,
                                                  apply_smoothing_args=real.apply_smoothing_args,
                                                  smoothing_length_mpc=real.smoothing_length_mpc, smoothing_tag=real.smoothing_tag)
+
+            class _TitleSpy:                    # dtfelib.figures as the script sees it, every set_title text recorded
+                def __init__(self, real_style):
+                    self.real, self.titles = real_style, []
+                def __getattr__(self, k):
+                    return getattr(self.real, k)
+                def set_title(self, ax, text, *a, **k):
+                    self.titles.append(text)
+                    return self.real.set_title(ax, text, *a, **k)
+            pcs.style = spy = _TitleSpy(saved[3])
             with warnings.catch_warnings():             # undefined medians: None, not an all-NaN / empty (nan)median (review [26]);
                 # only numpy's two messages: matplotlib's own autoscaling on the all-NaN column is not under test
                 warnings.filterwarnings("error", category=RuntimeWarning, message=r"(All-NaN slice|Mean of empty slice)")
                 code, text, names = run(["--snaps", "50", "--voids", "--cutout", "2", "--radius", "r_eff", "--keep-overlaps"])
-            assert code == 0 and names == sorted(base + ["caustic_skeleton_z0.50_voids.npz"]), (code, names, text[-600:])
-            j = strict(root / "out" / "caustic_skeleton_z0.50.json")
+            tag = "_reff_overlaps_cut2"
+            assert code == 0 and names == sorted(files(tag) + [f"caustic_skeleton_z0.50{tag}_voids.npz"]), (code, names, text[-600:])
+            j = strict(root / "out" / f"caustic_skeleton_z0.50{tag}.json")
             assert j["voids"] == {"n": 1, "fold_shell_median": 0.0, "dist_reff_median": None, "beyond_cutout": 1, "radius": "r_eff",
                                   "shells": [1.0, 1.1, 1.2, 1.3], "distinct": False, "sigma_mpc": real.smoothing_length_mpc(),
                                   "footprint_cells": config.FOOTPRINT_SIZE} and "voids_error" not in j, j
-            with np.load(root / "out" / "caustic_skeleton_z0.50_voids.npz") as zv:
+            with np.load(root / "out" / f"caustic_skeleton_z0.50{tag}_voids.npz") as zv:
                 assert sorted(zv.files) == ["bounded", "dist_cells", "dist_reff", "fold", "index", "r_eff_cells", "radius", "sheet",
                                             "shells"], zv.files
                 assert list(zv["index"]) == [0] and bool(zv["bounded"][0]) and np.isnan(zv["dist_cells"][0]) and np.isnan(zv["dist_reff"][0])
             assert not (root / "mirror").exists() and not (root / "default_out").exists()
+            # 2026-10-08: the names. The default --voids set is untagged; a plain run into the same folder rewrites the three
+            # files and removes that set's _voids.npz (an earlier run's, not this one's); other shells are '_shells...'
+            code, text, names = run(["--snaps", "50", "--voids"])
+            assert code == 0 and names == sorted(base + ["caustic_skeleton_z0.50_voids.npz"]), (code, names, text[-600:])
+            assert strict(root / "out" / "caustic_skeleton_z0.50.json")["voids"]["n"] == 1         # row 0 has an R_v of 2 cells
+            code, text, names = run(["--snaps", "50"], fresh=False)
+            assert code == 0 and names == base, (code, names, text[-400:])
+            code, text, names = run(["--snaps", "50", "--voids", "--shells", "0.8,1.0,1.2"])
+            assert code == 0 and names == sorted(files("_shells0.8-1-1.2") + ["caustic_skeleton_z0.50_shells0.8-1-1.2_voids.npz"]), names
+            # the void panel's title says 'distinct' when the run applied it (summ['voids']['distinct']), whatever the radius:
+            # it used to follow the radius (r_v = 'distinct' even under --keep-overlaps, a distinct r_eff run not)
+            for args, distinct in ((["--radius", "r_eff"], True), (["--keep-overlaps"], False)):
+                del spy.titles[:]
+                code, text, names = run(["--snaps", "50", "--voids"] + args)
+                said = [t for t in spy.titles if "well-resolved voids" in t]
+                assert code == 0 and len(said) == 1 and ("distinct" in said[0]) == distinct, (args, said, text[-300:])
     finally:
         if saved is not None:
-            pcs.OUTPUT_DIR, pcs.MIRROR, pcs.pipeline = saved
+            pcs.OUTPUT_DIR, pcs.MIRROR, pcs.pipeline, pcs.style = saved
         config.THESIS_FIGURES_DIR, config.LOCAL_FIGURES_ROOT, config.CACHE_DIR = old_cfg
         _sys.argv = old_argv
         _sys.path[:] = old_path
@@ -2419,7 +2595,9 @@ def t_webstreams_script():
     two redshifts give two sets of files (z0.50 and z0.00); the tables sum to 1; a truncated V-web grid at one
     snapshot keeps that snapshot's T-web table, is named in the summary and exits 1; a web nobody has exits 1
     only when asked for by name; an unreadable combined file between two good snapshots (review 2 #31: h5py's
-    OSError aborted the series) is a failed snapshot, the loop goes on to the next one and the series plot."""
+    OSError aborted the series) is a failed snapshot, the loop goes on to the next one and the series plot. Names
+    (2026-10-08): a series over part of the snapdirs on disk is '_snaps<a>-<b>-...' (the whole ladder untagged, a
+    failed snapshot still counted as asked), another --prefix '_<prefix>', --raw '_raw', the default files untouched."""
     import io as _io, shutil, sys as _sys, tempfile
     from contextlib import redirect_stdout
     import json
@@ -2463,7 +2641,9 @@ def t_webstreams_script():
             for z in ("0.00", "0.50"):
                 for w in ("tweb", "vweb"):
                     assert f"web_streams_{w}_z{z}.json" in names and f"web_streams_{w}_z{z}.png" in names and f"web_streams_{w}_z{z}.txt" in names, names
-            assert "single_stream_vs_z_tweb.png" in names and "4 table(s) written" in text, text[-300:]
+            # the series over 2 of the 4 snapdirs on disk is named by them (2026-10-08): it no longer replaces the full series
+            assert "single_stream_vs_z_tweb_snaps50-99.png" in names and "single_stream_vs_z_vweb_snaps50-99.png" in names \
+                and "4 table(s) written" in text and not any(q.startswith("single_stream_vs_z_tweb.") for q in names), (names, text[-300:])
             t = json.loads((out / "web_streams_tweb_z0.50.json").read_text())
             assert abs(sum(e["volume_fraction"] for e in t["classes"].values()) - 1.0) < 1e-12 and t["redshift"] == 0.5 and t["web"] == "T-web"
             assert abs(t["classes"]["node"]["stream_bins"]["1 < s <= 3"]["volume"] - 0.5) < 1e-12      # the multi-stream plane is half of class 3
@@ -2483,10 +2663,34 @@ def t_webstreams_script():
                 for w in ("tweb", "vweb"):
                     assert f"web_streams_{w}_z{z}.json" in names, (w, z, names)
             assert not any("z0.25" in q for q in names), names                  # nothing for the unreadable one
-            assert "single_stream_vs_z_tweb.png" in names and "single_stream_vs_z_vweb.png" in names, names
+            # named by the snapshots ASKED for, sorted (the failed 97 too)
+            assert "single_stream_vs_z_tweb_snaps50-97-99.png" in names and "single_stream_vs_z_vweb_snaps50-97-99.png" in names, names
             assert "4 table(s) written" in text and "no table for snapshot(s) [97]" in text, text[-400:]
             l097 = [l for l in text.splitlines() if l.startswith("  snapshot 097: ")]
             assert len(l097) == 1 and "signature" in l097[0], text[-600:]           # h5py's own reason, on 097's line
+            shutil.rmtree(out)
+            # the whole ladder on disk asked for (97 and 98's V-web failing): the untagged series
+            code, text, out = run(["--snaps", "99", "98", "97", "50"])
+            names = sorted(q.name for q in out.iterdir())
+            assert code == 1 and "single_stream_vs_z_tweb.png" in names and "single_stream_vs_z_vweb.png" in names \
+                and not any("_snaps" in q for q in names), (code, names)
+            # another grid set at 99 (--prefix ps_caustic): its own names; the default set's z = 0 tables untouched
+            _synthetic_snapdir(data, "SYN", 99, 0.0, prefix="ps_caustic")
+            kept = {q.name: q.stat().st_mtime_ns for q in out.glob("web_streams_tweb_z0.00.*")}
+            assert len(kept) == 3, kept
+            code, text, out = run(["--snaps", "99", "--prefix", "ps_caustic", "--web", "tweb"])
+            names = sorted(q.name for q in out.iterdir())
+            assert code == 0 and all(f"web_streams_tweb_ps_caustic_z0.00.{e}" in names for e in ("json", "png", "txt")), (code, names, text[-300:])
+            assert {q.name: q.stat().st_mtime_ns for q in out.glob("web_streams_tweb_z0.00.*")} == kept
+            assert json.loads((out / "web_streams_tweb_ps_caustic_z0.00.json").read_text())["prefix"] == "ps_caustic."
+            # the raw (unaveraged) grids: '_raw'
+            d99 = data / "SYN" / "snapdir_099"
+            for g in ("tweb", "streams", "hidden_streams", "den"):
+                shutil.copy(d99 / f"ps_output.a_{g}", d99 / f"ps_output.{g}")
+            code, text, out = run(["--snaps", "99", "--raw", "--web", "tweb"])
+            names = sorted(q.name for q in out.iterdir())
+            assert code == 0 and all(f"web_streams_tweb_raw_z0.00.{e}" in names for e in ("json", "png", "txt")), (code, names, text[-300:])
+            assert {q.name: q.stat().st_mtime_ns for q in out.glob("web_streams_tweb_z0.00.*")} == kept
             shutil.rmtree(out)
             code, text, out = run(["--snaps", "99", "--web", "vweb"])
             assert code == 0 and sorted(q.name for q in out.iterdir()) == ["web_streams_vweb_z0.00.json", "web_streams_vweb_z0.00.png", "web_streams_vweb_z0.00.txt"]
@@ -3101,14 +3305,492 @@ def t_thesis_mirror_outside_repo():
         assert mirror == Path(__file__).resolve().parents[2] / "Figures", mirror
 
 
+def t_distinct_claims_2026_10_08():
+    """2026-10-08: catalog.distinct_mask takes its claims from EVERY well-resolved void, each the sphere of
+    min(R_v, R_eff) (its R_eff when it has no R_v), then narrows to the caller's sample. The callers pass the voids WITH
+    an R_v, so a deeper void without one claimed nothing and the minima inside it were counted, stacked and drawn as
+    voids of their own. An unresolved void claims nothing and is never distinct. snapshot_stats' counts still add up
+    (no R_v + overlapping + counted = resolved); void_profiles' 'deep' sample is the de-duplication within the deep
+    voids, its n_overlapping counting the void a no-R_v one blocks (synthetic dicts, a 64^3 frame of config's cell)."""
+    import sys as _sys, types
+    import config
+    from dtfelib import catalog, pipeline, profiles
+    plot_dir = str(Path(__file__).resolve().parent.parent / "python" / "plot")
+    _sys.path.insert(0, plot_dir)
+    try:
+        import plot_void_population as pop
+    finally:
+        _sys.path.remove(plot_dir)
+    n, cs = 64, config.CELL_SIZE
+
+    def cat_of(rows):                   # rows of (cell, delta, R_v cells, R_eff cells, resolved, deep)
+        reff = np.array([r[3] for r in rows], np.float64)
+        return {"coords": np.array([r[0] for r in rows]), "delta_values": np.array([r[1] for r in rows], np.float32),
+                "r_v_cells": np.array([r[2] for r in rows], np.float64),
+                "semi_axes": np.repeat((reff * cs)[:, None], 3, axis=1).astype(np.float32),   # R_eff = (a b c)^(1/3)
+                "well_resolved": np.array([r[4] for r in rows]), "deep": np.array([r[5] for r in rows]),
+                "bbks_params": np.tile([0.2, 0.1], (len(rows), 1)), "cell_mpc": cs,
+                "positions_mpc": np.array([r[0] for r in rows], np.float64) * cs}
+    # A, deep without R_v (R_eff 5 cells), holds B 2 cells away (R_v 3): the R_v sample used to keep B ([F, T])
+    two = cat_of([((10, 10, 10), -0.9, np.nan, 5.0, True, True), ((12, 10, 10), -0.5, 3.0, 4.0, True, True)])
+    res, rv = two["well_resolved"], catalog.r_v_mpc(two)
+    assert catalog.distinct_mask(two, res & np.isfinite(rv), n).tolist() == [False, False], catalog.distinct_mask(two, res & np.isfinite(rv), n)
+    assert catalog.distinct_mask(two, res, n).tolist() == [True, False], catalog.distinct_mask(two, res, n)
+    # + C apart, D an UNRESOLVED deeper void 1 cell from E: D claims nothing (E stays distinct) and is never distinct itself
+    five = cat_of([((10, 10, 10), -0.9, np.nan, 5.0, True, True), ((12, 10, 10), -0.5, 3.0, 4.0, True, True),
+                   ((40, 40, 40), -0.6, 4.0, 4.0, True, True), ((30, 10, 10), -0.95, 6.0, 5.0, False, True),
+                   ((31, 10, 10), -0.4, 2.0, 3.0, True, False)])
+    assert catalog.distinct_mask(five, np.ones(5, bool), n).tolist() == [True, False, True, False, True]
+    # snapshot_stats: A no R_v, B overlapping (inside A's R_eff), C and E counted -- 1 + 1 + 2 = the 4 resolved
+    st = pop.snapshot_stats(five, n)
+    assert (st["n_resolved"], st["n_no_rv"], st["n_overlapping"], st["n_counted"]) == (4, 1, 1, 2), st
+    assert st["n_no_rv"] + st["n_overlapping"] + st["n_counted"] == st["n_resolved"]
+    assert np.allclose(st["_r_v"], [4.0 * cs, 2.0 * cs]) and not np.isclose(st["_r_v"], 3.0 * cs).any(), st["_r_v"]   # not B's
+    # void_profiles: 'deep' (A, C, B -- a depth prefix) == the de-duplication within the deep voids; B blocked by A
+    # counts as overlapping; 'resolved' also loses E (2 cells from C, inside its 4)
+    prof_cat = cat_of([((10, 10, 10), -0.9, np.nan, 5.0, True, True), ((12, 10, 10), -0.7, 3.0, 4.0, True, True),
+                       ((40, 40, 40), -0.8, 4.0, 4.0, True, True), ((42, 40, 40), -0.3, 3.0, 3.0, True, False),
+                       ((20, 50, 20), -0.2, 3.0, 3.0, True, False)])
+
+    class _FS:
+        grid_n, method = n, "dtfe"
+        meta = types.SimpleNamespace(box_mpc=cs * n, redshift=0.0)
+        def has(self, name):
+            return False
+        def density(self, units="mean"):
+            return np.ones((n, n, n), np.float32)
+
+    class _Prod:
+        sim, fs = config.SIMULATION, _FS()
+        def voids(self):
+            return prof_cat
+    deep = prof_cat["well_resolved"] & prof_cat["deep"]
+    rows = np.nonzero(deep)[0]
+    within = pipeline.distinct_voids(prof_cat["coords"][rows], prof_cat["delta_values"][rows], prof_cat["r_v_cells"][rows], n,
+                                     catalog.r_eff_mpc(prof_cat)[rows] / cs)
+    want = [int(r) for r in rows[within & np.isfinite(prof_cat["r_v_cells"][rows])]]
+    pd_ = profiles.void_profiles(_Prod(), bins=(0.5, 1.0), m=20, sample="deep")
+    assert list(pd_["index"]) == want == [2] and pd_["n_no_radius"] == 1 and pd_["n_overlapping"] == 1, (list(pd_["index"]), want, pd_["n_overlapping"])
+    pr = profiles.void_profiles(_Prod(), bins=(0.5, 1.0), m=20, sample="resolved")
+    assert list(pr["index"]) == [2, 4] and pr["n_overlapping"] == 2 and pr["dropped"] == 0, (list(pr["index"]), pr["n_overlapping"])
+
+
+def t_cache_atomic_2026_10_08():
+    """2026-10-08: a cache is written whole or not at all (pipeline._save_npz: a sibling temp file, then os.replace). A
+    normal save leaves one file; a save interrupted midway (KeyboardInterrupt from an array) the previous file
+    byte-identical and no temp sibling. A cut, empty or non-zip cache (a write killed before this) is 'unreadable' to
+    _cached and rebuilt by voids() with ONE write -- it used to raise on every later load; tools/void_outlines.py turns
+    a damaged cache member into its clean 'no void catalogue' exit."""
+    import io as _io, os as _os, shutil, sys as _sys, tempfile, types, zipfile
+    from contextlib import redirect_stdout
+    import config
+    from dtfelib import pipeline
+    from dtfelib import fields as dtfe
+    tmp = Path(tempfile.mkdtemp(prefix="dtfe_atomic_"))
+    old_cache, old_save = config.CACHE_DIR, pipeline._save_npz
+    vo = old_outlines = None
+    old_sim = _os.environ.get("DTFE_SIM")
+    try:
+        config.CACHE_DIR = tmp / "cache"
+        d = tmp / "npz"
+        d.mkdir()
+        p = d / "x.npz"
+        pipeline._save_npz(p, a=np.arange(5))
+        assert sorted(q.name for q in d.iterdir()) == ["x.npz"], sorted(q.name for q in d.iterdir())
+        with np.load(p) as z:
+            assert list(z["a"]) == [0, 1, 2, 3, 4]
+        before = p.read_bytes()
+
+        class _Interrupt:                                        # numpy 2 passes dtype/copy, 1.26 dtype only
+            def __array__(self, *a, **k):
+                raise KeyboardInterrupt
+        try:
+            pipeline._save_npz(p, a=np.arange(7), b=_Interrupt())  # 'a' is in the zip when 'b' interrupts it
+            raise AssertionError("the interrupted save returned")
+        except KeyboardInterrupt:
+            pass
+        assert p.read_bytes() == before and sorted(q.name for q in d.iterdir()) == ["x.npz"], sorted(q.name for q in d.iterdir())
+        # _cached: a damaged cache with the grid there is unreadable, said, None (not BadZipFile / EOFError / ValueError)
+        grid = tmp / "ps_output.a_den"
+        grid.write_bytes(b"0")
+
+        class _FS:
+            method = "ps"
+            def _field_path(self, name):
+                return grid
+        sp = pipeline.SnapshotProducts(50, sim="SYN")
+        sp._fs = _FS()
+        cp = sp._cpath("voids")
+        sp._save(cp, {"a": np.arange(2000)})
+        assert sp._cached("voids") == cp
+        whole = cp.read_bytes()
+        for what, data in (("cut", whole[: len(whole) // 2]), ("empty", b""), ("not a zip", b"not a zip file " * 8)):
+            cp.write_bytes(data)
+            buf = _io.StringIO()
+            with redirect_stdout(buf):
+                got = sp._cached("voids")
+            assert got is None and f"cached {cp.name} is unreadable" in buf.getvalue(), (what, got, buf.getvalue())
+        # voids() over a cut catalogue cache, the grid present: rebuilt from the field and written once, then read
+        n = 16
+        rng = np.random.default_rng(2)
+        delta = 0.05 * rng.normal(size=(n, n, n)).astype(np.float32)
+        idx = np.indices((n, n, n))
+        r2 = sum((((idx[k] - 8 + n // 2) % n) - n // 2) ** 2 for k in range(3))
+        delta -= (0.8 * np.exp(-0.5 * r2 / 4.0)).astype(np.float32)
+        delta_s = dtfe.smooth_field(delta, sigma=1.0)
+        hess = pipeline.hessian_from_field(delta_s)
+
+        class _P(pipeline.SnapshotProducts):
+            delta_smoothed = property(lambda self: delta_s)
+            hessian = property(lambda self: hess)
+            @property
+            def fs(self):
+                return types.SimpleNamespace(method="dtfe", grid_n=n, _field_path=lambda name: grid,
+                                             meta=types.SimpleNamespace(box_mpc=config.CELL_SIZE * n, redshift=1.0))
+        pv = _P("050", 1.0, sim="SYN")
+        vp = pv._cpath("voids")
+        vp.write_bytes(whole[: len(whole) // 2])
+        saves = []
+        pipeline._save_npz = lambda path, **a: (saves.append(Path(path).name), old_save(path, **a))[1]
+        buf = _io.StringIO()
+        with redirect_stdout(buf):
+            cat = pv.voids()
+        assert saves == [vp.name] and "is unreadable" in buf.getvalue() and len(cat["coords"]) >= 1, (saves, buf.getvalue())
+        with np.load(vp) as z:
+            assert "coords" in z.files and "grid_stamp" in z.files, z.files
+        buf = _io.StringIO()
+        with redirect_stdout(buf):
+            again = pv.voids()
+        assert saves == [vp.name] and buf.getvalue() == "" and np.array_equal(again["coords"], cat["coords"]), (saves, buf.getvalue())
+        assert not list(Path(config.CACHE_DIR).rglob("*.tmp.npz"))
+        # tools/void_outlines.py: a damaged member (BadZipFile, which _cached cannot see) is the clean exit, not a traceback
+        tools = str(Path(__file__).resolve().parent.parent / "python" / "tools")
+        _sys.path.insert(0, tools)
+        try:
+            import void_outlines as vo
+        finally:
+            _sys.path.remove(tools)
+        old_outlines = vo.outlines
+
+        def damaged(*a, **k):
+            raise zipfile.BadZipFile("Bad CRC-32 for file 'coords.npy'")
+        vo.outlines = damaged
+        _os.environ["DTFE_SIM"] = "SYN"
+        try:
+            vo.main(["--sim", "SYN", "--snap", "99"])
+            raise AssertionError("void_outlines.main returned on a damaged cache")
+        except SystemExit as e:
+            assert str(e.code).startswith("no void catalogue for SYN snapshot 99: Bad CRC-32"), e.code
+    finally:
+        config.CACHE_DIR, pipeline._save_npz = old_cache, old_save
+        if vo is not None and old_outlines is not None:
+            vo.outlines = old_outlines
+        if old_sim is None:
+            _os.environ.pop("DTFE_SIM", None)
+        else:
+            _os.environ["DTFE_SIM"] = old_sim
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def t_void_tracking_script():
+    """plot_void_tracking.py (2026-10-08; it had no test): catalog_at lets the frame guard's ValueError through (it read
+    as 'no field grids'), gives Nones for a snapshot without grids and releases the products every time; main() turns a
+    refused reference snapshot into a 'REFUSED' exit before any tree is read; the set's name tag (_set_tag); _remove_stale
+    removes only THIS set's void<K> files the run did not write, and nothing when it tracked no void."""
+    import io as _io, shutil, sys as _sys, tempfile, types
+    from contextlib import redirect_stdout
+    from dtfelib import pipeline
+    plot_dir = str(Path(__file__).resolve().parent.parent / "python" / "plot")
+    _sys.path.insert(0, plot_dir)
+    try:
+        import plot_void_tracking as pvt
+    finally:
+        _sys.path.remove(plot_dir)
+    ns = types.SimpleNamespace
+    tmp = Path(tempfile.mkdtemp(prefix="dtfe_vtrack_"))
+    old_products, old_argv = pipeline.products, list(_sys.argv)
+    released = []
+
+    class _Prod:
+        fs = ns(grid_n=8, method="dtfe", prefix="output.")
+        def __init__(self, exc):
+            self.exc = exc
+        def voids(self):
+            if self.exc is not None:
+                raise self.exc
+            return {"coords": np.zeros((0, 3), int)}
+        def release(self):
+            released.append(1)
+    try:
+        args = ns(sim="SYN", method="auto", prefix=None, data_root=None, snap=99)
+        refusal = ValueError("the snapshot's cell is 0.4 Mpc: run with DTFE_SIM=SYN")
+        pipeline.products = lambda *a, **k: _Prod(refusal)
+        try:
+            pvt.catalog_at(99, args)
+            raise AssertionError("catalog_at swallowed the frame refusal")
+        except ValueError as e:
+            assert "DTFE_SIM=SYN" in str(e), str(e)
+        pipeline.products = lambda *a, **k: _Prod(FileNotFoundError("snapshot directory not found"))
+        assert pvt.catalog_at(99, args) == (None, None, None)
+        pipeline.products = lambda *a, **k: _Prod(None)
+        cat, n, grids = pvt.catalog_at(99, args)
+        assert n == 8 and grids == ("dtfe", "output.") and len(released) == 3, (n, grids, released)
+        # main(): the reference snapshot refused -> SystemExit naming it, before TreeSet (no trees on disk here)
+        pipeline.products = lambda *a, **k: _Prod(refusal)
+        _sys.argv = ["plot_void_tracking.py", "--sim", "SYN", "--snap", "99", "--data-root", str(tmp)]
+        buf = _io.StringIO()
+        with redirect_stdout(buf):
+            try:
+                pvt.main()
+                code = 0
+            except SystemExit as e:
+                code = e.code
+        assert isinstance(code, str) and code.startswith("snapshot 99 of SYN: REFUSED: ") and "DTFE_SIM=SYN" in code, code
+        # the set's tag: '' for PS-DTFE's default grids from snapshot 99, else the grids and the reference snapshot
+        assert pvt._set_tag(ns(snap=99), ("ps", "ps_output.")) == ""
+        assert pvt._set_tag(ns(snap=67), ("dtfe", "output.")) == "_dtfe_snap67"
+        assert pvt._set_tag(ns(snap=99), ("ps", "ps_caustic.")) == "_ps_caustic"
+        # _remove_stale: void0..5 of three sets ('' in R_v, its R_eff figures, a dtfe set); voids 0, 1, 3 written now
+        out = tmp / "vt"
+        out.mkdir()
+        made = []
+        for k in range(6):
+            made += [f"void{k}_evolution.png", f"void{k}_track.npz", f"void{k}_evolution_reff.png",
+                     f"void{k}_evolution_dtfe.png", f"void{k}_track_dtfe.npz"]
+        made.append("voids_summary.png")
+        for f in made:
+            (out / f).write_bytes(b"x")
+        with redirect_stdout(_io.StringIO()):
+            pvt._remove_stale(out, ns(tag="", radius="r_v"), {0, 1, 3})
+        gone = sorted(set(made) - {q.name for q in out.iterdir()})
+        assert gone == sorted(f"void{k}_{s}" for k in (2, 4, 5) for s in ("evolution.png", "track.npz")), gone
+        buf = _io.StringIO()
+        with redirect_stdout(buf):
+            pvt._remove_stale(out, ns(tag="", radius="r_v"), set())
+        assert "no void tracked" in buf.getvalue() and len(list(out.iterdir())) == len(made) - 6, buf.getvalue()
+    finally:
+        pipeline.products = old_products
+        _sys.argv = old_argv
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def t_thesis_mirror_guard():
+    """2026-10-08: a figure in a folder whose names carry neither the simulation nor the estimator
+    (config.THESIS_NAMED_DIRS: ANALYSIS_DIRS plus what figures_path hands out) goes into the thesis Figures/ tree only
+    from TNG50-3-Dark's standard-DTFE grids (figures.note_source / thesis_mirror_refusal): another DTFE_SIM, another
+    box's grids or PS-DTFE grids are refused, said once per process and without '--'; a per-simulation folder mirrors as
+    before; DTFE_NO_MIRROR turns every mirror off. analyze.py says which in its banner and closing line and hands
+    --no-mirror to its children as DTFE_NO_MIRROR (os.environ untouched; run_step stubbed: no plot script runs)."""
+    import io as _io, os as _os, shutil, sys as _sys, tempfile, types
+    from contextlib import redirect_stdout
+    from matplotlib.figure import Figure
+    import config
+    from dtfelib import figures as F, pipeline
+    import analyze
+    tmp = Path(tempfile.mkdtemp(prefix="dtfe_mirrorguard_"))
+    old = (config.LOCAL_FIGURES_ROOT, config.THESIS_FIGURES_DIR, config.SIMULATION, set(config.THESIS_NAMED_DIRS))
+    old_env = _os.environ.pop("DTFE_NO_MIRROR", None)
+    old_argv, old_step = list(_sys.argv), analyze.run_step
+    ns = types.SimpleNamespace
+
+    def reset():                                                 # process-global: each case starts from none
+        F._SOURCES.clear()
+        F._SAID.clear()
+    try:
+        reset()
+        assert pipeline.smoothing_tag() == "", "a leaked smoothing: the guard would not be reached"
+        root, mirror = tmp / "figs", tmp / "mirror"
+        config.LOCAL_FIGURES_ROOT, config.THESIS_FIGURES_DIR = str(root), mirror
+        assert config.figures_path("void_analysis") == f"{root}/void_analysis" and config.figures_path("smoothing_comparison")
+        assert {"void_analysis", "smoothing_comparison"} <= config.THESIS_NAMED_DIRS and "void_profiles" not in config.THESIS_NAMED_DIRS
+
+        def save(rel):                                           # saved locally always; mirrored?
+            F.save_plot_to_multiple_paths(Figure(figsize=(1, 1)), root / rel, dpi=10)
+            assert (root / rel).is_file(), rel
+            return (mirror / rel).is_file()
+
+        def said(text):
+            return [ln for ln in text.splitlines() if "not copied into the thesis Figures/ tree" in ln]
+        config.SIMULATION = "TNG100-3-Dark"
+        buf = _io.StringIO()
+        with redirect_stdout(buf):
+            got = (save("void_analysis/a.png"), save("smoothing_comparison/b.png"), save("void_profiles/SYN/x.png"))
+        assert got == (False, False, True), got
+        lines = said(buf.getvalue())
+        assert len(lines) == 1 and "TNG100-3-Dark" in lines[0] and "--" not in lines[0], buf.getvalue()
+        config.SIMULATION = "TNG50-3-Dark"
+        reset()
+        assert F.thesis_mirror_refusal() is None and save("void_analysis/c.png")              # nothing noted: mirrored
+        F.note_source(ns(snapdir=tmp / "TNG50-3-Dark" / "snapdir_099", method="dtfe", prefix="output."))
+        assert save("void_analysis/d.png")
+        F.note_source(ns(snapdir=tmp / "TNG50-3-Dark" / "snapdir_099", method="ps", prefix="ps_output."))
+        buf = _io.StringIO()
+        with redirect_stdout(buf):
+            assert not save("void_analysis/e.png") and not save("void_analysis/e2.png")
+        lines = said(buf.getvalue())
+        assert len(lines) == 1 and "PS-DTFE grids" in lines[0] and "--" not in lines[0], buf.getvalue()
+        reset()
+        F.note_source(ns(snapdir=tmp / "TNG100-3-Dark" / "snapdir_099", method="dtfe", prefix="output."))   # another box's
+        with redirect_stdout(_io.StringIO()):
+            assert not save("void_analysis/f.png")
+        reset()
+        _os.environ["DTFE_NO_MIRROR"] = "1"
+        assert not save("void_analysis/g.png") and not save("void_profiles/SYN/h.png")
+        del _os.environ["DTFE_NO_MIRROR"]
+        # analyze.py: the banner and the closing line say whether the mirror is on; --no-mirror reaches the children
+        steps = []
+        analyze.run_step = lambda cmd, label, env=None: (steps.append((label, env)), (0, 0.0))[1]
+
+        def run(argv, sim):
+            config.SIMULATION = sim
+            del steps[:]
+            _sys.argv = ["analyze.py"] + argv
+            buf = _io.StringIO()
+            with redirect_stdout(buf):
+                try:
+                    analyze.main()
+                    code = 0
+                except SystemExit as e:
+                    code = e.code
+            lines = [ln for ln in buf.getvalue().splitlines() if ln.startswith(("Thesis figure mirror", "All done"))]
+            assert code in (0, None) and len(lines) == 2 and all("--" not in ln for ln in lines), (code, buf.getvalue()[-600:])
+            return lines, list(steps)
+        lines, st = run(["plot", "--only", "plot_eigenvalues.py"], "TNG100-3-Dark")
+        assert lines[0] == "Thesis figure mirror: off (TNG100-3-Dark is not the thesis simulation TNG50-3-Dark)", lines
+        assert "Nothing was copied into the thesis Figures/ tree" in lines[1] and st == [("plot_eigenvalues.py", None)], (lines, st)
+        lines, st = run(["plot", "--only", "plot_eigenvalues.py", "--no-mirror"], "TNG50-3-Dark")
+        assert lines[0] == "Thesis figure mirror: off (asked for)" and len(st) == 1 and st[0][1]["DTFE_NO_MIRROR"] == "1", (lines, st)
+        assert "DTFE_NO_MIRROR" not in _os.environ
+        lines, st = run(["plot", "--only", "plot_eigenvalues.py"], "TNG50-3-Dark")
+        assert lines[0] == f"Thesis figure mirror: {mirror} (figures made from TNG50-3-Dark standard DTFE grids only)", lines
+        assert "Figures made from the thesis grids are mirrored" in lines[1] and st == [("plot_eigenvalues.py", None)], (lines, st)
+    finally:
+        reset()
+        config.LOCAL_FIGURES_ROOT, config.THESIS_FIGURES_DIR, config.SIMULATION = old[:3]
+        config.THESIS_NAMED_DIRS.clear()
+        config.THESIS_NAMED_DIRS.update(old[3])
+        _os.environ.pop("DTFE_NO_MIRROR", None)
+        if old_env is not None:
+            _os.environ["DTFE_NO_MIRROR"] = old_env
+        _sys.argv, analyze.run_step = old_argv, old_step
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def t_analyze_ladder_on_disk():
+    """analyze.py check / compute / export on the snapshots ON DISK (2026-10-08: each -3-Dark box has 9 of the 16
+    config snapshots, and a box with PS-DTFE grids alone read INCOMPLETE everywhere). check names the estimator it
+    finds and accepts PS-DTFE's grids; an absent snapdir is 'not on disk' and does not fail; an incomplete set exits 1,
+    nothing on disk at all exits 1; compute and export without ids take only the snapdirs present and say which they
+    left out (an explicit absent id still fails: t_compute_missing_data). A synthetic sim under a temp data root."""
+    import io as _io, shutil, sys as _sys, tempfile
+    from contextlib import redirect_stdout
+    import config
+    from dtfelib import cli, pipeline
+    import analyze
+    root = Path(tempfile.mkdtemp(prefix="dtfe_ladder_"))
+    old = (config.SIMULATION, cli.DATA_ROOT, config.CACHE_DIR, config.LOCAL_FIGURES_ROOT, pipeline.products, list(_sys.argv))
+    sim = "SYNLADDER"
+
+    def call(fn):
+        buf = _io.StringIO()
+        with redirect_stdout(buf):
+            try:
+                fn()
+                code = 0
+            except SystemExit as e:
+                code = e.code
+        return code, buf.getvalue()
+
+    def check():
+        _sys.argv = ["analyze.py", "check"]
+        code, text = call(analyze.main)
+        return code, text, {ln.split()[0]: ln for ln in text.splitlines() if ln.strip().startswith("snapdir_")}
+    try:
+        config.SIMULATION = sim
+        cli.use_data_root(root / "data")
+        config.CACHE_DIR, config.LOCAL_FIGURES_ROOT = root / "cache", str(root / "figures")
+        code, text, lines = check()                              # no snapdir of the ladder at all
+        assert code == 1 and "no snapshot of the config ladder" in text and len(lines) == 16, (code, text[-400:])
+        full = (("vel", 3), ("velDiv", 1), ("velShear", 6), ("velGrad", 9))     # with 'den': the five the scripts read
+        for snap in ("050", "099"):                              # the header's redshift is config's (else a mismatch)
+            _synthetic_snapdir(root / "data", sim, int(snap), config.get_redshift(snap), grids=("den",), extra=full)
+        code, text, lines = check()
+        assert code == 0 and all("OK (all PS-DTFE fields)" in lines[f"snapdir_{s}"] for s in ("050", "099")), (code, text[-800:])
+        assert sum("not on disk" in ln for ln in lines.values()) == 14 and "not on disk" in lines["snapdir_067"], lines
+        assert f"The figures will be {sim} PS-DTFE" in text and "takes TNG50-3-Dark standard DTFE figures only" in text, text[-400:]
+        (root / "data" / sim / "snapdir_050" / "ps_output.a_velGrad").unlink()
+        code, text, lines = check()
+        assert code == 1 and "INCOMPLETE (PS-DTFE): missing ps_output.a_velGrad" in lines["snapdir_050"] and "Re-run DTFE for: 050" in text, (code, text[-600:])
+        # compute / export without ids: only 050 and 099 are asked for, the 14 others named (products stubbed: no data read)
+        asked = []
+
+        class _NoData:
+            def __init__(self, snap):
+                asked.append(snap)
+                self.snapshot = snap
+            @property
+            def data_dir(self):
+                raise FileNotFoundError(f"stub: no grids read for {self.snapshot}")
+            def release(self):
+                pass
+        pipeline.products = lambda snap, z=None, **kw: _NoData(snap)
+        absent = ", ".join(s for s in config.SNAPSHOT_TO_REDSHIFT if s not in ("050", "099"))
+        code, text = call(lambda: analyze.compute([]))
+        assert code == 1 and asked == ["050", "099"] and f"Phase 1 compute: 2 snapshot(s); not on disk, left out: {absent}" in text, (code, asked, text[-600:])
+        del asked[:]
+        code, text = call(lambda: analyze.export([], root / "export"))
+        assert code == 1 and asked == ["050", "099"] and f"Not on disk, left out: {absent}" in text, (code, asked, text[-600:])
+    finally:
+        config.SIMULATION, cli.DATA_ROOT, config.CACHE_DIR, config.LOCAL_FIGURES_ROOT, pipeline.products, _sys.argv = old
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def t_pointeval_name_tags():
+    """pointeval.render_fields (2026-10-08): a non-default rendering -- project='slab', smooth > 0, fixed_range -- gets
+    its own name (<base>_slab / _smooth<s> / _fixed). They all shared the plane render's name, so they overwrote it,
+    or with force=False were skipped as 'up to date' against it. The default name and its freshness test are as before."""
+    import json, os as _os, shutil, tempfile
+    from dtfelib import pointeval
+    from dtfelib.io import FieldSet
+    root = Path(tempfile.mkdtemp(prefix="dtfe_ptstags_"))
+    try:
+        data = root / "data"
+        d = _synthetic_snapdir(data, "SYN", 50, 0.5, grids=("den",))
+        nu = nv = 8
+        np.random.default_rng(31).lognormal(0.0, 1.0, size=(2, nv, nu)).astype(np.float64).tofile(str(d / "ps_output.pts_den"))
+        t = (d / "ps_output.pts_den").stat().st_mtime
+        _os.utime(d / "ps_output.pts_den", (t - 100, t - 100))   # the source clearly older than any render (coarse clocks)
+        (data / "SYN" / "pointeval_plane_8_z.json").write_text(json.dumps(
+            {"axis": "z", "u_axis": "x", "v_axis": "y", "u0": 0.0, "u1": 100.0, "v0": 0.0, "v1": 100.0,
+             "nu": nu, "nv": nv, "planes": 2, "supersample": 1}))
+        fs = FieldSet(d, method="ps")
+        out, base = root / "out", "ps_density_pointeval_xy_plane_z0.50"
+        w, fresh = pointeval.render_fields(fs, out, fields=["density"], force=False, quiet=True)
+        assert [q.name for q in w] == [f"{base}.png"] and fresh == 0, (w, fresh)
+        plane = out / "xy_plane" / f"{base}.png"
+        stamp = plane.stat().st_mtime_ns
+        w, fresh = pointeval.render_fields(fs, out, fields=["density"], force=False, quiet=True)
+        assert w == [] and fresh == 1, (w, fresh)                # the default: up to date against its own file
+        for kw, tag in ((dict(project="slab"), "_slab"), (dict(smooth=2.0), "_smooth2"), (dict(fixed_range=True), "_fixed")):
+            w, fresh = pointeval.render_fields(fs, out, fields=["density"], force=False, quiet=True, **kw)
+            assert [q.name for q in w] == [f"{base}{tag}.png"] and fresh == 0, (kw, w, fresh)
+        assert plane.stat().st_mtime_ns == stamp, "a non-default rendering rewrote the plane render"
+        assert sorted(q.name for q in (out / "xy_plane").iterdir()) == sorted(f"{base}{tg}.png" for tg in ("", "_slab", "_smooth2", "_fixed"))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main():
     print("=" * 60)
     print(" dtfelib merger-tree / void-tracking tests")
     print("=" * 60)
     print("synthetic:")
     check("the thesis figure mirror lies outside the repo (case-insensitively: DTFE/Figures IS DTFE/figures on macOS)", t_thesis_mirror_outside_repo)
+    check("2026-10-08: the thesis mirror takes the thesis-named folders from TNG50-3-Dark standard DTFE only (said once, no '--'), per-sim folders as before, DTFE_NO_MIRROR; analyze.py's banner, closing line and --no-mirror env (synthetic)", t_thesis_mirror_guard)
     check("2026-10-07: the measured void radius R_v (analytic, periodic, overdense), distinct voids deepest first, the smoothing in Mpc (set_smoothing, DTFE_SIGMA_MPC, footprint) and its 10-cell anchor (synthetic)", t_void_radius_and_physical_smoothing)
+    check("2026-10-08: distinct_mask's claims from every resolved void (a no-R_v void blocks, an unresolved one never), snapshot_stats' counts add up, void_profiles 'deep' = the de-duplication within it (synthetic)", t_distinct_claims_2026_10_08)
     check("2026-10-07: the mirror keeps the sim folder under a root without 'figures' in its path; the cuts are 10 sigma / L/2 / 1 cell at CALL time; a cache older than its grid is rebuilt; profile bins in sigma (synthetic)", t_science_fixes_2026_10_07)
+    check("2026-10-08: _save_npz whole or not at all (an interrupted save leaves the old file, no temp); a cut / empty / non-zip cache is rebuilt with one write; void_outlines' clean exit on a damaged member (synthetic)", t_cache_atomic_2026_10_08)
     check("cross-epoch limits store: a subset run keeps the series' maxima (synthetic)", t_limits_store)
     check("map ranges: symmetric about 0, log range of an empty slice (synthetic)", t_map_limits)
     check("webstreams: stream bins + caustic class by web class, chunked == whole (synthetic)", t_webstreams)
@@ -3116,16 +3798,20 @@ def main():
     check("void cache frame: a header not config's refused before the cache is touched; frame-only, cuts-only and July caches re-derived without the field; 'deep' follows its threshold (synthetic)", t_void_cache_frame)
     check("analyze.py export: each exit clause alone, the summary, --format, a void-less catalogue, the default folder (synthetic)", t_export_driver)
     check("void profiles: exact step + outflow, periodic wrap, bulk cancels, the catalogue rows, the hidden bit, the cell-centre convention, the 16/84 band, min_count, linear v_r at z = 0 and 1 (synthetic)", t_void_profiles)
-    check("plot_void_profiles.py + plot_void_population.py end to end: npz keys + the --prefix tag, an unreadable snapshot counted failed and the next still done, abundance from each estimator's own catalogue, the one R_eff, 'deep' at the live threshold, --other-estimator at the panel only, a 1.3x header REFUSED before its cache (synthetic)", t_void_scripts)
+    check("plot_void_profiles.py + plot_void_population.py end to end: npz keys + the --prefix tag, an unreadable snapshot counted failed and the next still done, abundance from each estimator's own catalogue, the one R_eff, 'deep' at the live threshold, --other-estimator at the panel only, the population's _overlaps / _dtfe names, a 1.3x header REFUSED before its cache (synthetic)", t_void_scripts)
     check("plot_void_population.py: an unreadable snapshot file is left out and the rest analysed (synthetic)", t_void_population_unreadable)
+    check("plot_void_tracking.py: catalog_at lets a frame refusal through, main() exits REFUSED, the set's name tag, only this set's stale void<K> files removed (synthetic)", t_void_tracking_script)
+    check("plot_void_crossbox.py worker + --replot figure, tools/void_outlines.py, pipeline.adopt_snapshot_grid (synthetic)", t_void_crossbox_outlines)
     check("power spectrum: a known spectrum recovered for an even and an odd N, Parseval, mode count; linear P(k): sigma_8, D(z), f, k_eq, T(k) pinned (synthetic)", t_power_spectrum)
     check("plot_pk_compare.py end to end: names by estimator/prefix, no mirror under --out, a lone estimator's note, the Nyquist pairs (synthetic)", t_pk_script)
     check("caustic skeleton: classes, periodic merge across a face/edge/corner, 6/18/26-connectivity, components, cusp vs swallowtail bits and 'not computed', the parity-only refusal, json_safe, per-void shells + the wall distance (synthetic)", t_caustic_skeleton)
-    check("plot_caustic_skeleton.py end to end: files per redshift, strict JSON, '--' cusp rows, --connectivity, no mirror under --out, no grid / parity-only / failed --voids exit 1, void_block with no or censored voids (synthetic)", t_caustic_skeleton_script)
-    check("plot_web_streams.py end to end: files per redshift, a truncated web, an unreadable snapshot file mid-series, the exit rule (synthetic)", t_webstreams_script)
+    check("plot_caustic_skeleton.py end to end: files per redshift, strict JSON, '--' cusp rows, --connectivity, no mirror under --out, no grid / parity-only / failed --voids exit 1, void_block with no or censored voids, the option name tags, the stale _voids.npz removed, the 'distinct' title (synthetic)", t_caustic_skeleton_script)
+    check("plot_web_streams.py end to end: files per redshift, a truncated web, an unreadable snapshot file mid-series, the exit rule, the _snaps / _<prefix> / _raw name tags (synthetic)", t_webstreams_script)
     check("analyze.py compute: a missing snapdir and an unreadable snapshot file are counted failed, each with its own reason (synthetic)", t_compute_missing_data)
+    check("analyze.py check / compute / export on the snapdirs on disk: PS-DTFE grids complete, absent = 'not on disk' (no failure), incomplete or nothing at all exit 1, the default ids (synthetic)", t_analyze_ladder_on_disk)
     check("slice maps: the house-style helpers' ranges and rules; the three map scripts write the same 53 files with the house norms, floors, panel labels, orientation and sizes; empty slices skipped (synthetic)", t_slice_maps)
     check("point-eval maps: one look and one path from plot_PS_DTFE (--pointeval-only and full) and plot_pointeval.py, fresh interpreters (synthetic)", t_pointeval_style)
+    check("point-eval maps: slab / smooth / fixed-range renders get their own names, not 'up to date' against the plane render (synthetic)", t_pointeval_name_tags)
     check("sample_grid conventions", t_sample_grid)
     check("periodic helpers", t_periodic_helpers)
     check("track_center across box wrap", t_track_center_wrap)

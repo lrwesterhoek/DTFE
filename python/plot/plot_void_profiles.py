@@ -81,7 +81,8 @@ def main():
                         help="the void radius the shells and bins are in: r_v, the measured one (default), or r_eff, "
                              "the ellipsoid's curvature length (~1.75 r_v)")
     parser.add_argument("--keep-overlaps", action="store_true",
-                        help="stack every resolved void, not only the distinct ones (none inside a deeper one's R_v)")
+                        help="stack every resolved void, not only the distinct ones (none whose centre lies inside a "
+                             "deeper void's min(R_v, R_eff))")
     parser.add_argument("--edges", default=None,
                         help="radius bin edges in Mpc, comma-separated (default in smoothing lengths: R_v 0, 2.5, 3.5, 5; "
                              "R_eff 0, 5, 6, 7; and the wrap cap L/6 -- profiles.default_edges_mpc)")

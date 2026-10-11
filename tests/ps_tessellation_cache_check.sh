@@ -23,6 +23,9 @@
 #     and the block-wise writer writes exactly CGAL's bytes.
 #  J) A symlinked or relative name of the input hits the cache its absolute name wrote (canonical keys).
 #  K) libdeflate (when compiled in) and zlib read each other's chunked files.
+#  L) Two runs writing one cache folder at the same moment both succeed and leave a whole cache and no temp
+#     file: each writer has its own '<file>.part.<pid>' / '<map>.occ.tmp.<pid>' (2026-10-08).
+#  M) A save removes the temp files of DEAD writers of that file and keeps a live writer's.
 #  A2) The body is DEFLATED while magic/version/descriptor stay plaintext, so a staleness check
 #     needs no inflation. Compression takes 735 MB down to 225 MB per 1.5e6 vertices at zlib
 #     level 1 -- level 6 saves a further 5% but costs 24 s more on every write.
@@ -342,6 +345,66 @@ if echo "${RUN_OUT}" | grep -q "read with libdeflate"; then
 else
     echo "   SKIP  (this build has no libdeflate: every chunk goes through zlib)"
 fi
+
+echo ""
+echo "(L) two runs writing ONE cache folder at the same moment: each writer has its own temp file (2026-10-08)"
+# Two writers of one partition (a batch run beside the composite server, which shares the folder) both truncated
+# one '<file>.part' -- and one '<map>.occ.tmp', and the globals record's '.part' -- so the first rename could
+# publish a file with a hole. Now each writes '<file>.part.<pid>' (the map '.occ.tmp.<pid>') and renames it into
+# place. Whether the two saves really overlap depends on the timing; what must hold either way: both runs
+# succeed and reproduce the uncached run (F's ptc_part_ref), no temp file is left, and the cache they leave is
+# whole (a third run hits all 8 partitions, bit-identically).
+CC="${CACHE}-conc"; rm -rf "${CC}"; mkdir -p "${CC}"
+CARGS=(--grid "${GRID}" "${COMMON[@]}" --partition 2 2 2 --tessellation-cache "${CC}" --verbose 3)
+"${BIN}" "${SNAP}" "${TMP}/ptc_conc1" "${CARGS[@]}" > "${TMP}/ptc_conc1.log" 2>&1 & pid1=$!
+"${BIN}" "${SNAP}" "${TMP}/ptc_conc2" "${CARGS[@]}" > "${TMP}/ptc_conc2.log" 2>&1 & pid2=$!
+rc1=0; wait "${pid1}" || rc1=$?
+rc2=0; wait "${pid2}" || rc2=$?
+check "$([ "${rc1}" = "0" ] && [ "${rc2}" = "0" ] && echo 1 || echo 0)" "both concurrent runs exit 0 (${rc1}, ${rc2})"
+ntess=$(ls -1 "${CC}"/*.tess 2>/dev/null | wc -l | tr -d ' ')
+nocc=$(ls -1 "${CC}"/*.occ 2>/dev/null | wc -l | tr -d ' ')
+ntmp=$(find "${CC}" -name '*.part*' -o -name '*.tmp*' | wc -l | tr -d ' ')
+check "$([ "${ntess}" = "8" ] && [ "${nocc}" = "8" ] && [ "${ntmp}" = "0" ] && echo 1 || echo 0)" \
+      "8 cache files and 8 occupancy maps, no '.part.<pid>' or '.occ.tmp.<pid>' left (${ntess}, ${nocc}, ${ntmp})"
+same=1
+for f in "${TMP}"/ptc_part_ref.*; do
+    ext="${f##*ptc_part_ref}"
+    for g in "${TMP}/ptc_conc1${ext}" "${TMP}/ptc_conc2${ext}"; do cmp -s "${f}" "${g}" || same=0; done
+done
+check "${same}" "... both bit-identical to the uncached run"
+run "${TMP}/ptc_conc3" "${GRID}" --tessellation-cache "${CC}" --partition 2 2 2
+same=1
+for f in "${TMP}"/ptc_part_ref.*; do ext="${f##*ptc_part_ref}"; cmp -s "${f}" "${TMP}/ptc_conc3${ext}" || same=0; done
+check "$([ "$(hits)" = "8" ] && [ "${same}" = 1 ] && echo 1 || echo 0)" "a third run hits all 8 partitions ($(hits)) and reproduces the uncached run bit-for-bit"
+
+echo ""
+echo "(M) a DEAD writer's temp file is removed by the next save of that file; a live writer's is kept"
+# Per-writer names would strand a SIGKILLed writer's file (multi-GB on TNG50), so save() first removes the
+# '<file>.part.<pid>' siblings whose writer no longer exists (kill(pid, 0) fails with ESRCH). It keeps a running
+# writer's file, the old shared '<file>.part' and the files of other cache files (only a save scans, and only
+# beside the file it writes). The dead pid is one that has just exited: a fixed number could be alive on Linux.
+victim=$(ls -1 "${CC}"/*.tess 2>/dev/null | head -1)
+other=$(ls -1 "${CC}"/*.tess 2>/dev/null | sed -n 2p)
+if [ -n "${victim}" ] && [ -n "${other}" ]; then
+    sh -c 'exit 0' & dead=$!; wait "${dead}" || true
+    sleep 60 & live=$!
+    echo "dead writer" > "${victim}.part.${dead}"; echo "live writer" > "${victim}.part.${live}"
+    echo "old shared name" > "${victim}.part"; echo "dead writer" > "${other}.part.${dead}"
+    rm -f "${victim}"                                       # its partition misses, so it is saved again
+    run "${TMP}/ptc_stale" "${GRID}" --tessellation-cache "${CC}" --partition 2 2 2
+    kill "${live}" 2>/dev/null || true; wait "${live}" 2>/dev/null || true
+    check "$([ "$(hits)" = "7" ] && [ -f "${victim}" ] && echo 1 || echo 0)" "the deleted partition misses and is saved again (hits $(hits) of 8)"
+    check "$([ ! -e "${victim}.part.${dead}" ] && echo 1 || echo 0)" "... the dead writer's '.part.${dead}' beside it is removed"
+    check "$([ -f "${victim}.part.${live}" ] && echo 1 || echo 0)" "... a live writer's '.part.${live}' is kept"
+    check "$([ -f "${victim}.part" ] && [ -f "${other}.part.${dead}" ] && echo 1 || echo 0)" \
+          "... the old shared '.part' and another cache file's temp file are left alone"
+    same=1
+    for f in "${TMP}"/ptc_part_ref.*; do ext="${f##*ptc_part_ref}"; cmp -s "${f}" "${TMP}/ptc_stale${ext}" || same=0; done
+    check "${same}" "... and the run reproduces the uncached run bit-for-bit"
+else
+    check 0 "the concurrent runs left two cache files to plant temp files beside"
+fi
+rm -rf "${CC}"
 
 echo ""
 echo "------------------------------------------------------------"

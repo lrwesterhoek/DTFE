@@ -76,7 +76,7 @@ grid within ~1e-7 (atomic order), tet-touch counts identical (T14).
 
 | file | role |
 |---|---|
-| `ps_deposit.metal` | Metal compute kernels: `depositFields` (one thread per tetrahedron, mass-conserving deposit with `atomic_float` scatter; mirrors `src/CGAL_triangulation/ps_interpolation.cc`) and `depositExactItems` (the exact deposit, one thread per block of a tet's window cells). |
+| `ps_deposit.metal` | Metal compute kernels: `depositFields` (one thread per tetrahedron, mass-conserving deposit: the mass grid an exact 64-bit fixed-point sum, the moment grids an `atomic_float` scatter; mirrors `src/CGAL_triangulation/ps_interpolation.cc`) and `depositExactItems` (the exact deposit, one thread per block of a tet's window cells). |
 | `validate_deposit.cpp` | Correctness harness (T1–T14): analytic edge cases, nSub sweep, determinism, random stress CPU-vs-GPU on every grid, analytic velocity-field checks, partition sub-grid support, the flag paths, a sheared Zel'dovich pancake against an EXACT piecewise-linear pushforward reference (see below), and `depositExactItems` against the analytic cube and the one-thread path (T14: periodic, wrapped sub-grid, non-periodic). It builds the per-tet records like the host and deposits deferred tets with its CPU reference. `BENCH=1` adds a 1M-tet timing; `DUMP_PROFILES=1` prints per-bin profiles. |
 | `build_prototype.sh` | Builds the harness; offline-compiles the kernel to `ps_deposit.metallib` when Xcode's Metal toolchain is installed, else deletes any stale one (the harness would load it) and the harness compiles the source at run time. |
 | `ps_deposit.metallib` | Offline-compiled kernels; hosts load it if present, else runtime-compile the `.metal`. Git-ignored. |
@@ -101,6 +101,21 @@ gradient ≡ 0) and a linear field v = Gx recovers grad/W == G to 2e-5 in every 
 Edge cases (analytic): tet-in-one-cell mass placement, tiny-tet centroid fallback, periodic-wrap
 shift equivalence (bit-exact), degenerate-tet drop, nSub∈{1..4} mass conservation (ratio 1.0000000),
 determinism (~1e-6 atomic-order ULP).
+
+The mass grid (2026-10-08): float atomics drop every share below half an ulp of a busy cell's running
+sum, always downward -- the GPU run of TNG50-3-Dark z=0 had a box mean of 0.99941 (a few % low in
+halo-core cells with 1e6-1e7 deposits). The kernel now adds each mass share as the integer
+rint(share * 2^k) into two `atomic_uint` words per cell with a hand-made carry (`depositMass`; the host
+puts the partition's mass at 2^61..2^62 units, `psMassFixedScale` in ps_deposit_params.h): exact, and
+independent of the atomics' order, so the mass grid is bit-reproducible run to run (T6: 0 difference;
+T10: sub-grid vs full grid 0 difference). The unit must be that fine: a first try with the mean tet at
+2^32 units left the 3 kpc cells of a --ps-window zoom 5e-4 off (tests/ps_window_check.sh). Cost: 4 more
+bytes per cell on the device and a second atomic per mass share; on an M1 Max (2.1M particles, 256^3,
+nSub 3) the density-only deposit is unchanged (5.95 s) and the full field set ~2% slower (12.0 vs 11.8 s).
+The moment grids stay float; their normalizer is this mass (or momw / dispw), so in cells with ~1e7
+deposits a mass-weighted sigma^2 no longer has the mass grid's matching float loss to cancel its own.
+`PS_METAL_FLOAT_MASS=1` (and the harness's `VALIDATE_FLOAT_MASS=1`) brings back the float mass grid
+for comparison. The CUDA/HIP port still accumulates the mass in float.
 
 Random stress set (60% normal + 25% flat/caustic + 15% tiny tets): CPU-vs-GPU mean-rel agreement
 mass 4e-6, momentum 3e-6, second moment 7e-7, gradient 9e-9; stream counts differ in 0.003% of

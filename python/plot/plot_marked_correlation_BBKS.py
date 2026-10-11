@@ -196,6 +196,7 @@ def process_snapshot(snapshot, redshift, args):
 
     try:
         cat = p.voids()
+        style.note_source(p.fs)                     # the thesis mirror takes the thesis box's standard DTFE only
         p.release()
 
         pos, e_marks, p_marks, major = void_sample(cat)

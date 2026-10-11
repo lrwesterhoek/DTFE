@@ -395,6 +395,7 @@ class MainWindow(QMainWindow):
         self._runs_scanned = 0.0
         self._job_text = ""                                  # this job's output, for the failure advice
         self._tee = None                                     # the open run-log copy of the current step
+        self._tee_path = ""                                  # ... its log of record ('<root>.runlog'; written as .partial)
         self._after_job = None                               # e.g. the demo: open Explore when it finishes
         self.proc: QProcess | None = None
         self._loading = False
@@ -471,7 +472,7 @@ class MainWindow(QMainWindow):
         self.runs.load_settings.connect(self._load_run_settings)
         self.runs.explore.connect(self._explore_output)
         self.runs.message.connect(self.status_message)
-        self.runs.changed.connect(lambda: self._sync_runs_actions())
+        self.runs.changed.connect(self._runs_changed)
         self.right = QStackedWidget()
         self.right.addWidget(self._build_run_panel())
         self.right.addWidget(self.explore_view)
@@ -2391,6 +2392,7 @@ class MainWindow(QMainWindow):
         self._steps, self._step_i, self._results = steps, -1, []
         self._job_text = ""
         self._close_tee()                   # a handle left by a step that never finished must not take this job's output
+        self._tee_path = ""                 # ... nor its log be renamed at this job's first step end: it stays .partial
         G.drop_cubes()                      # Explore's cubes are this process's memory: the auto-tuner budgets from what is free
         G.cap_cubes(True)                   # ... and they stay small while the job runs (lifted in _finish_job)
         self.banner.hide()
@@ -2498,8 +2500,9 @@ class MainWindow(QMainWindow):
             return
         st, n = self._steps[self._step_i], len(self._steps)
         if st.after and any(lbl == st.after and code != 0 for lbl, code in self._results):
-            # a merge after a failed download: nothing to merge safely (half a tree set would pass)
-            self.log.appendPlainText(f"\n!! {st.label}: skipped, '{st.after}' failed; nothing merged (run the job again)")
+            # a merge after a failed download (half a tree set would pass), a render after a pipeline that computed
+            # nothing (2026-10-08): the step depends on the one before it
+            self.log.appendPlainText(f"\n!! {st.label}: skipped, '{st.after}' failed (run the job again)")
             self._results.append((st.label, 1))
             self._next_step()
             return
@@ -2507,16 +2510,24 @@ class MainWindow(QMainWindow):
         self._step_t0 = time.monotonic()
         self.log.appendPlainText(("\n" if self._step_i else "") + "$ " + st.line() + "\n")
         if st.tee:                          # '... 2>&1 | tee <file>': the run log beside the outputs
+            # written as '<file>.partial' and put in place when the step ends (_close_tee): a stopped or failed
+            # re-run under the same name truncated the log of the old grids, which stay on disk, and the Runs
+            # tab showed them as failed (the run-log contract, as the run scripts keep it; 2026-10-08)
+            part = str(st.tee) + ".partial"
             try:
-                self._tee = open(st.tee, "w")
-                self._last_log_path = str(st.tee)
+                self._tee = open(part, "w")
+                self._tee_path = str(st.tee)
+                self._last_log_path = part
                 self._sync_log_actions()
             except OSError as e:
                 self._tee = None
-                self.log.appendPlainText(f"!! cannot write the run log {st.tee}: {e}")
+                self.log.appendPlainText(f"!! cannot write the run log {part}: {e}")
         self.bar.setRange(0, 0)             # busy until a partition progress line arrives
         self.eta.setText("")
         penv = QProcessEnvironment.systemEnvironment()
+        # a pipe makes Python block-buffer print(): a plot, analysis or merge step showed nothing (no log, no
+        # problem lines, no merge chunk bar) until it exited; harmless for the binaries (2026-10-08)
+        penv.insert("PYTHONUNBUFFERED", "1")
         for k, v in st.env.items():
             penv.insert(k, v)
         self.proc = QProcess(self)
@@ -2595,7 +2606,7 @@ class MainWindow(QMainWindow):
             st = self._steps[self._step_i]
             self.log.appendPlainText(f"!! could not start {st.argv[0]}: {self.proc.errorString()}")
             self.proc = None
-            self._close_tee()               # 'finished' never comes: the run log must not stay open into the next job
+            self._close_tee(127)            # 'finished' never comes: the run log must not stay open into the next job
             self._results.append((st.label, 127))
             QTimer.singleShot(0, self._next_step)
 
@@ -2607,20 +2618,36 @@ class MainWindow(QMainWindow):
         self._buffer = ""
         st = self._steps[self._step_i]
         code = code if status == QProcess.NormalExit else -1
-        self._close_tee()                   # never raises: the job must reach _next_step even when the disk is gone
+        self._close_tee(code)               # never raises: the job must reach _next_step even when the disk is gone
         self._results.append((st.label, code))
         if code != 0 and not self._stopping:
             self.log.appendPlainText(f"!! {st.label}: exit {code}")
         self.proc = None
         self._next_step()
 
-    def _close_tee(self):
+    def _close_tee(self, code: int | None = None):
+        """Close the run-log copy. With the step's exit code it is also put in place (the run-log contract,
+        2026-10-08): '<log>.partial' becomes '<log>' on exit 0 (and a stale '<log>.failed' goes), else
+        '<log>.failed', leaving the log of the old grids alone. Without one (a write error mid-run) only the
+        handle closes; the step's end still renames it. Never raises."""
         tee, self._tee = self._tee, None
         if tee is not None:
             try:
                 tee.close()
             except OSError as e:
                 self.log.appendPlainText(f"!! the run log could not be closed ({e})")
+        if code is None or not self._tee_path:
+            return
+        final, self._tee_path = self._tee_path, ""
+        dest = final if code == 0 else final + ".failed"
+        try:
+            os.replace(final + ".partial", dest)
+            if code == 0:
+                Path(final + ".failed").unlink(missing_ok=True)     # the grids on disk are this run's now
+            self._last_log_path = dest
+        except OSError as e:
+            self.log.appendPlainText(f"!! the run log could not be renamed to {Path(dest).name} ({e})")
+        self._sync_log_actions()
 
     def _finish_job(self):
         n = len(self._steps)
@@ -2994,6 +3021,15 @@ class MainWindow(QMainWindow):
         self.q_clear_action.setEnabled(self.q_clear.isEnabled())
         for what in ("up", "down", "remove"):
             getattr(self, f"q_{what}_action").setEnabled(shown and getattr(self, "q_" + what).isEnabled())
+
+    def _runs_changed(self):
+        """The Runs browser's selection or table changed: its menu follows. After a rescan (Refresh, Move to
+        Trash, a job's end) Explore drops outputs whose grids left the disk: a trashed run stayed listed there
+        and its next slice read failed (2026-10-08)."""
+        self._sync_runs_actions()
+        if self.runs.records is not getattr(self, "_runs_seen", None):
+            self._runs_seen = self.runs.records
+            self.explore.refresh_if_vanished()
 
     def _sync_runs_actions(self, tab: int | None = None):
         if not hasattr(self, "results") or not hasattr(self, "tabs"):
@@ -3505,6 +3541,12 @@ class MainWindow(QMainWindow):
             self.refresh()
             return
         qjob = self.queue[i]
+        if self._mcheck is not None:        # a memory check started while the queue waited: its snapshot read and
+            # free-memory reading must not run beside a job (Run and Start queue refuse too). Poll again: the
+            # check's end does not call this (2026-10-08)
+            self.status.setText(f"Queue: waiting for the memory check to finish before '{qjob.title}'")
+            QTimer.singleShot(self._wait_poll_ms, self._next_queued)
+            return
         try:
             spec = qjob.build()
         except (TypeError, ValueError) as e:

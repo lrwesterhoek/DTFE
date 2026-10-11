@@ -189,6 +189,7 @@ def main():
         try:
             fs = FieldSet(sim_dir(args.sim, args.data_root) / f"snapdir_{snapshot}",   # flat or per-family
                           method=args.method, averaged=not args.raw, prefix=args.prefix)
+            style.note_source(fs)                   # the thesis mirror takes the thesis box's standard DTFE only
             r = compute_snapshot_slices(fs)
         except FileNotFoundError:
             print(f"  skipping snapshot {snapshot} (no {args.method} fields)")

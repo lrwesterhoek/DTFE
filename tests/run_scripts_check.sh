@@ -20,14 +20,20 @@
 #  G) The PER-FAMILY data layout of the Samsung T7 (<root>/<family>/<sim>, e.g. Illustris TNG/
 #     TNG100/TNG100-3-Dark), under a root whose name has a space like the T7's: the driver finds
 #     and processes the simulation there, config.sh's sim_dir puts a new simulation beside its
-#     family and lets a flat <root>/<sim> win, and run_ps_pipeline.sh discovers nested sims.
+#     family and lets a flat <root>/<sim> win, and run_ps_pipeline.sh discovers nested sims -- and exits 1
+#     when it finds nothing to compute (no data root, a mistyped SIMS, a SNAPS matching nothing).
 #  H) scripts/run_dtfe.sh -e / DTFE_EXACT_AVERAGE=1 passes --exact-average to the standard binary.
 #  I) download_snapshots.sh + merge_HDF5.py never turn a half-finished download into a merged snapshot.
 #  J) --help runs nothing (run_ps_pipeline.sh --help used to start the whole batch), --version prints the
 #     revision, an argument to the pipeline is an error, DRY_RUN=1 prints the drivers' commands and runs nothing.
 #  K) the binaries' own --help lists the phase-space / GPU / point-evaluation / server options the scripts and the
 #     launcher use (it listed none of them), and the help texts carry none of the survey's misspellings.
-#  L) scripts/install_lib.sh keeps a user's binaries through a failed rebuild: backup, restore, the failure hint.
+#  L) scripts/install_lib.sh keeps a user's binaries through a failed rebuild: backup, restore (the 2D double pair
+#     too), the failure hint; install.sh's detection of the extra sets it rebuilds (sourced alone, never run).
+#  M) the run-log contract of run_dtfe.sh / run_ps_dtfe.sh, against stand-in binaries: a run's log is
+#     <prefix>.runlog.partial while it goes, <prefix>.runlog after exit 0, <prefix>.runlog.failed after a
+#     failure or a stop; a failed, stopped or killed re-run never touches the .runlog of the grids on disk.
+#  N) the Makefile stamps BUILD_MODE, ARCH_FLAGS and EXTRA_FLAGS in the object dirs (a dry run, builds nothing).
 #
 # Usage: tests/run_scripts_check.sh [--no-build]
 
@@ -205,9 +211,10 @@ mkdir -p "${FAMROOT}/FAM-3-Dark"
 flat="$(DTFE_DATA_ROOT="${FAMROOT}" bash -c 'source scripts/config.sh; sim_dir FAM-3-Dark')"
 check "$([ "${flat}" = "${FAMROOT}/FAM-3-Dark" ] && echo 0 || echo 1)" \
       "an existing flat <root>/FAM-3-Dark wins (got '${flat}')"
-DRY_RUN=1 DTFE_DATA_ROOT="${FAMROOT}" scripts/run_ps_pipeline.sh >"${TMP}/g_pipeline.log" 2>&1 || true
+rc=0; DRY_RUN=1 DTFE_DATA_ROOT="${FAMROOT}" scripts/run_ps_pipeline.sh >"${TMP}/g_pipeline.log" 2>&1 || rc=$?
 check "$(has "${TMP}/g_pipeline.log" '^Simulations:.* FAM-1-Dark')" \
       "run_ps_pipeline.sh discovers the nested FAM-1-Dark"
+check "$([ "${rc}" = "0" ] && echo 0 || echo 1)" "... and a dry run with a snapshot to plan exits 0 (${rc})"
 # the pipeline's knobs (2026-10-04): the GPU flag follows PS_GPU, the plane's geometry reaches
 # make_image_plane.py, and a plane whose sidecar has another geometry is regenerated
 check "$(has "${TMP}/g_pipeline.log" 'run_ps_dtfe.sh -s FAM-1-Dark -g [0-9]+ -m 99')" \
@@ -220,6 +227,24 @@ check "$(has "${TMP}/g_pipeline2.log" 'PS_VOLUME_WEIGHTED=0 .*run_ps_dtfe.sh -s 
       "PS_GPU=0 drops -m and PS_VOLUME_WEIGHTED=0 is passed on"
 check "$(has "${TMP}/g_pipeline2.log" 'make_image_plane.py .*--axis z --nu [0-9]+ --planes 4 --thickness 3 --supersample 2 --center 40 --u0 0 --u1 50 --v0 0 --v1 25 -o ')" \
       "PLANES, THICKNESS, SUPERSAMPLE, CENTER and WINDOW reach make_image_plane.py"
+# finding nothing to compute is a failure (2026-10-08): with the data drive unmounted, a mistyped SIMS or
+# a SNAPS matching no snapshot the pipeline printed ALL DONE and exited 0, which the launcher showed as a success
+mkdir -p "${TMP}/empty root"
+rc=0; DTFE_DATA_ROOT="${TMP}/empty root" scripts/run_ps_pipeline.sh >"${TMP}/g_pipe_none.log" 2>&1 || rc=$?
+check "$([ "${rc}" = "1" ] && echo 0 || echo 1)" "run_ps_pipeline.sh with no simulation under the data root exits 1 (${rc})"
+check "$(has "${TMP}/g_pipe_none.log" '^!! nothing to compute')" "... says there is nothing to compute"
+check "$(lacks "${TMP}/g_pipe_none.log" 'ALL DONE')" "... and not ALL DONE"
+rc=0; DTFE_DATA_ROOT="${TMP}/no such root" scripts/run_ps_pipeline.sh >"${TMP}/g_pipe_unmounted.log" 2>&1 || rc=$?
+check "$([ "${rc}" = "1" ] && echo 0 || echo 1)" "a data root that does not exist (the drive unplugged) exits 1 (${rc})"
+check "$(has "${TMP}/g_pipe_unmounted.log" 'is the data drive mounted')" "... and asks whether the drive is mounted"
+rc=0; DRY_RUN=1 SIMS=FAM-1-Drak DTFE_DATA_ROOT="${FAMROOT}" scripts/run_ps_pipeline.sh >"${TMP}/g_pipe_typo.log" 2>&1 || rc=$?
+check "$([ "${rc}" = "1" ] && echo 0 || echo 1)" "a mistyped SIMS exits 1 (${rc})"
+check "$(has "${TMP}/g_pipe_typo.log" '^!! nothing to compute: no combined snapshot of FAM-1-Drak ')" "... naming the simulation"
+rc=0; DRY_RUN=1 SNAPS="50 67" DTFE_DATA_ROOT="${FAMROOT}" scripts/run_ps_pipeline.sh >"${TMP}/g_pipe_snaps.log" 2>&1 || rc=$?
+check "$([ "${rc}" = "1" ] && echo 0 || echo 1)" "a SNAPS matching no snapshot exits 1 (${rc})"
+check "$(has "${TMP}/g_pipe_snaps.log" 'FAM-1-Dark: no combined snapshots numbered 50 67, skipping')" "... naming the numbers it looked for"
+rc=0; DRY_RUN=1 SIMS="FAM-1-Drak FAM-1-Dark" DTFE_DATA_ROOT="${FAMROOT}" scripts/run_ps_pipeline.sh >"${TMP}/g_pipe_half.log" 2>&1 || rc=$?
+check "$([ "${rc}" = "0" ] && echo 0 || echo 1)" "one simulation of two without snapshots is a partial skip: exit 0 (${rc})"
 # a real plane (tiny), then the same geometry is reused and another one regenerates it
 "${PY}" python/tools/make_image_plane.py --combined "${FAMROOT}/FAM/FAM-1-Dark/snapdir_099/combined_099.hdf5" \
     --mpc-unit 1 --axis z --nu 8 --planes 1 -o "${FAMROOT}/FAM/FAM-1-Dark/hires_plane_z8" >/dev/null 2>&1 || true
@@ -238,6 +263,13 @@ if [ -f "${FAMROOT}/FAM/FAM-1-Dark/hires_plane_z8.json" ]; then
           "a failing geometry check is reported, not read as 'differs'"
     check "$([ "${rc5}" != "0" ] && [ -f "${FAMROOT}/FAM/FAM-1-Dark/hires_plane_z8.json" ] && echo 0 || echo 1)" \
           "... the plane is kept and the pipeline exits non-zero (${rc5})"
+    # every snapshot up to date is a success, not 'nothing to compute' (2026-10-08)
+    touch -t 203001010000 "${FAMROOT}/FAM/FAM-1-Dark/snapdir_099/ps_output.pts_den" \
+                          "${FAMROOT}/FAM/FAM-1-Dark/snapdir_099/ps_output.pts_velGrad"
+    rc6=0; DRY_RUN=1 NU=8 DTFE_DATA_ROOT="${FAMROOT}" scripts/run_ps_pipeline.sh >"${TMP}/g_pipeline6.log" 2>&1 || rc6=$?
+    check "$([ "${rc6}" = "0" ] && echo 0 || echo 1)" "every snapshot up to date still exits 0 (${rc6})"
+    check "$(has "${TMP}/g_pipeline6.log" 'FAM-1-Dark: all snapshots up to date')" "... with nothing to recompute"
+    rm -f "${FAMROOT}/FAM/FAM-1-Dark/snapdir_099/ps_output.pts_den" "${FAMROOT}/FAM/FAM-1-Dark/snapdir_099/ps_output.pts_velGrad"
 else
     echo "   SKIP  plane reuse/regeneration (make_image_plane.py could not write a plane with ${PY})"
 fi
@@ -265,6 +297,9 @@ if [ -x "${DTFE_BIN}" ]; then
     rc_bad=0; scripts/run_dtfe.sh -s BADIN -g 16 99 >"${TMP}/h_badin.log" 2>&1 || rc_bad=$?
     check "$([ "${rc_bad}" = "1" ] && echo 0 || echo 1)" "a snapshot the binary cannot read is a FAILED snapshot, exit 1 (${rc_bad})"
     check "$(has "${TMP}/h_badin.log" 'processing complete: 0 processed, 0 skipped, 1 failed')" "... counted as failed, not processed (the exit status is read before the log is post-processed)"
+    check "$([ -s "${TMP}/BADIN/snapdir_099/output.runlog.failed" ] && [ ! -e "${TMP}/BADIN/snapdir_099/output.runlog" ] \
+             && [ ! -e "${TMP}/BADIN/snapdir_099/output.runlog.partial" ] && echo 0 || echo 1)" \
+          "... its log is output.runlog.failed: no output.runlog claims grids it never wrote (2026-10-08)"
     check "$([ -f "${TMP}/HASIC/snapdir_099/output.a_den" ] && echo 0 || echo 1)" "its density grid was written"
     DTFE_EXACT_AVERAGE=1 scripts/run_dtfe.sh -s HASIC -g 16 99 >"${TMP}/h_env.log" 2>&1 || true
     # 2026-10-05: run_dtfe.sh reports failures in its exit status (it always exited 0 before), passes the
@@ -575,22 +610,165 @@ check "$(has "${TMP}/k_full_ps.log" "'MPC_UNIT'")" "... and names the Makefile's
 echo ""
 echo "(L) scripts/install_lib.sh: the binaries kept through a failed rebuild (2026-10-05, survey rank 24)."
 LREPO="${TMP}/fake_repo"; rm -rf "${LREPO}"; mkdir -p "${LREPO}"
-( cd "${LREPO}" && printf 'old DTFE\n' > DTFE && printf 'old PS-DTFE\n' > PS-DTFE && printf 'old 2d\n' > DTFE-2d && chmod +x DTFE PS-DTFE DTFE-2d
+# the 2D double pair too (2026-10-08): install.sh rebuilds it, so a failed build must be able to bring it back
+( cd "${LREPO}" && printf 'old DTFE\n' > DTFE && printf 'old PS-DTFE\n' > PS-DTFE && printf 'old 2d\n' > DTFE-2d \
+      && printf 'old 2d double\n' > DTFE-2d-double && printf 'old PS 2d double\n' > PS-DTFE-2d-double \
+      && chmod +x DTFE PS-DTFE DTFE-2d DTFE-2d-double PS-DTFE-2d-double
   source "${ROOT_DIR}/scripts/install_lib.sh"
   n="$(backup_binaries "${LREPO}/.backup")"
   echo "backed up ${n}" > "${TMP}/l_backup.log"
-  rm -f DTFE PS-DTFE DTFE-2d; printf 'half-linked\n' > PS-DTFE                 # 'make clean' then a failing build
+  rm -f DTFE PS-DTFE DTFE-2d DTFE-2d-double PS-DTFE-2d-double; printf 'half-linked\n' > PS-DTFE   # 'make clean' then a failing build
   m="$(restore_binaries "${LREPO}/.backup")"
   echo "restored ${m}" >> "${TMP}/l_backup.log"
   printf 'line1\nline2\nld: symbol not found\n' > build.log
   build_failed_hint build.log 2 > "${TMP}/l_hint.log" )
-check "$(has "${TMP}/l_backup.log" '^backed up 3$')" "backup_binaries counts the three binaries present (of the six names)"
-check "$(has "${TMP}/l_backup.log" '^restored 3$')" "restore_binaries puts the three back"
+check "$(has "${TMP}/l_backup.log" '^backed up 5$')" "backup_binaries counts the five binaries present (of the eight names)"
+check "$(has "${TMP}/l_backup.log" '^restored 5$')" "restore_binaries puts the five back"
 check "$([ "$(cat "${LREPO}/PS-DTFE")" = "old PS-DTFE" ] && [ "$(cat "${LREPO}/DTFE")" = "old DTFE" ] && [ -x "${LREPO}/DTFE-2d" ] && echo 0 || echo 1)" \
       "... byte for byte, the half-linked one replaced, the mode kept"
+check "$([ "$(cat "${LREPO}/DTFE-2d-double")" = "old 2d double" ] && [ "$(cat "${LREPO}/PS-DTFE-2d-double")" = "old PS 2d double" ] \
+         && [ -x "${LREPO}/PS-DTFE-2d-double" ] && echo 0 || echo 1)" "... the 2D double pair among them (2026-10-08)"
 check "$(has "${TMP}/l_hint.log" 'ld: symbol not found')" "build_failed_hint prints the log's tail"
 check "$(lacks "${TMP}/l_hint.log" '^line1$')" "... only the last N lines"
 check "$(has "${TMP}/l_hint.log" 'make deps-check')" "... and the usual causes"
+# install.sh rebuilds the double, 2D and 2D double sets it finds before 'make clean' (2026-10-08; a re-run threw
+# them away before). install.sh itself is never run here: its detection block, cut out between 'EXTRA_SETS=()'
+# and the 'also to be rebuilt' line, is sourced in fake folders with info() stubbed out
+sed -n '/^EXTRA_SETS=()/,/also to be rebuilt/p' scripts/install.sh > "${TMP}/l_extra_sets.sh"
+check "$(grep -q '^EXTRA_SETS=()' "${TMP}/l_extra_sets.sh" && grep -q 'DIM=2 DOUBLE=1' "${TMP}/l_extra_sets.sh" \
+         && grep -q 'also to be rebuilt' "${TMP}/l_extra_sets.sh" && echo 0 || echo 1)" \
+      "install.sh's extra-set block is found (EXTRA_SETS=() ... also to be rebuilt): a moved marker fails here, not silently"
+extra_sets() {   # <PREC_ARG> <GPU_ARG> <binaries present...>: the make arguments of each set, one [..] per line
+    local d="${TMP}/l_sets"; rm -rf "${d}"; mkdir -p "${d}"
+    ( cd "${d}" && PREC_ARG="$1" && GPU_ARG="$2" && shift 2 && for b in DTFE PS-DTFE "$@"; do : > "${b}"; done
+      info() { :; }
+      source "${TMP}/l_extra_sets.sh" || true                   # its last line is false when there is no extra set
+      for s in ${EXTRA_SETS[@]+"${EXTRA_SETS[@]}"}; do printf '[%s]' "${s}"; done )
+}
+got="$(extra_sets "" "METAL=1")"
+check "$([ -z "${got}" ] && echo 0 || echo 1)" "... the single pair alone: no extra set (${got:-none})"
+got="$(extra_sets "" "METAL=1" DTFE-2d DTFE-double DTFE-2d-double)"
+check "$([ "${got}" = "[METAL=1 DOUBLE=1][DIM=2][DIM=2 DOUBLE=1]" ] && echo 0 || echo 1)" \
+      "... DTFE-double, DTFE-2d and DTFE-2d-double present: the double set with the GPU backend, then DIM=2 and DIM=2 DOUBLE=1 (${got})"
+got="$(extra_sets "" "" PS-DTFE-2d-double)"
+check "$([ "${got}" = "[DIM=2 DOUBLE=1]" ] && echo 0 || echo 1)" "... either binary of a pair is enough: PS-DTFE-2d-double alone (${got})"
+got="$(extra_sets "DOUBLE=1" "")"
+check "$([ "${got}" = "[ DOUBLE=1]" ] && echo 0 || echo 1)" "... --double with no double pair yet builds it, CPU-only here (${got})"
+
+echo ""
+echo "(M) the run-log contract: a failed, stopped or killed re-run keeps the .runlog of the grids on disk (2026-10-08)."
+# Both drivers tee'd straight into <prefix>.runlog, so a re-run that failed early, or was stopped or killed,
+# replaced the log of the grids still on disk (the Runs browser then showed them as a failed run with the
+# new settings). Copies of the drivers run here beside STAND-IN binaries (the drivers find theirs one level
+# above their own folder), so a success, a failure, a stop and a SIGKILL are all deterministic and need no build.
+MREPO="${TMP}/runlog_repo"; MDATA="${TMP}/runlog_data"; MPID="${TMP}/m_binary.pid"
+mkdir -p "${MREPO}/scripts" "${MDATA}/SIM/snapdir_099"
+cp scripts/run_dtfe.sh scripts/run_ps_dtfe.sh scripts/config.sh "${MREPO}/scripts/"
+cat > "${MREPO}/DTFE" <<'FEOF'
+#!/usr/bin/env bash
+# stand-in binary. FAKE_MODE: ok (exit 0), fail (exit 1), hang (wait, in place of the binary, until killed),
+# report (an auto-tune report line)
+echo "RUNNING: $0 $*"
+printf 'fake attempt %s \033[1mcoloured\033[0m\n' "${FAKE_TAG:-}"
+case "${FAKE_MODE:-ok}" in
+    ok)     echo "total wall time : 1 s"; exit 0 ;;
+    fail)   echo "~~~ ERROR ~~~ a fake failure"; exit 1 ;;
+    hang)   echo $$ > "${FAKE_PID}"; exec sleep 60 ;;
+    report) echo "AUTO-TUNE-REPORT partition=1x1x1 mc=1 predicted_gb=0.1 budget_gb=1 over_budget=0"; exit 0 ;;
+esac
+FEOF
+chmod +x "${MREPO}/DTFE"
+for b in DTFE-double PS-DTFE PS-DTFE-double; do cp "${MREPO}/DTFE" "${MREPO}/${b}"; done
+: > "${MDATA}/SIM/snapdir_099/combined_099.hdf5"
+: > "${MDATA}/SIM/combined_ics.hdf5"          # run_ps_dtfe.sh: Lagrangian positions present, no h5py probe
+mdrive() {   # <driver> <log> [VAR=value ...]: the copied driver on SIM 99; echoes its exit status
+    local scr="$1" log="$2"; shift 2
+    local rc=0
+    env DTFE_DATA_ROOT="${MDATA}" "$@" "${MREPO}/scripts/${scr}" -s SIM -g 16 99 >"${log}" 2>&1 || rc=$?
+    echo "${rc}"
+}
+mhang() {    # <driver> <log> <tag>: starts a run whose binary hangs, waits until it is in place; sets mpid
+    rm -f "${MPID}"
+    env DTFE_DATA_ROOT="${MDATA}" FAKE_MODE=hang FAKE_TAG="$3" FAKE_PID="${MPID}" \
+        "${MREPO}/scripts/$1" -s SIM -g 16 99 >"$2" 2>&1 &
+    mpid=$!
+    for _ in $(seq 100); do [ -s "${MPID}" ] && break; sleep 0.1; done
+}
+for pair in "run_dtfe.sh output" "run_ps_dtfe.sh ps_output"; do
+    scr="${pair% *}"; pfx="${pair#* }"
+    L="${MDATA}/SIM/snapdir_099/${pfx}.runlog"
+    rm -f "${L}" "${L}.failed" "${L}.partial"
+    rc=$(mdrive "${scr}" "${TMP}/m_${pfx}_ok.log" FAKE_MODE=ok FAKE_TAG=first)
+    check "$([ "${rc}" = "0" ] && [ -f "${L}" ] && [ ! -e "${L}.partial" ] && [ ! -e "${L}.failed" ] && echo 0 || echo 1)" \
+          "${scr}: a good run's log is ${pfx}.runlog, and nothing else is left (exit ${rc})"
+    check "$(lacks "${L}" $'\033\\[')" "... de-ANSI'd"
+    cp "${L}" "${TMP}/m_${pfx}_first.runlog"
+    # a failure (an early error, a bad option, a missing input): the grids on disk keep their log
+    rc=$(mdrive "${scr}" "${TMP}/m_${pfx}_fail.log" FAKE_MODE=fail FAKE_TAG=second)
+    check "$([ "${rc}" = "1" ] && cmp -s "${L}" "${TMP}/m_${pfx}_first.runlog" && echo 0 || echo 1)" \
+          "... a failed re-run exits 1 and leaves the .runlog of the grids on disk byte for byte (${rc})"
+    check "$([ ! -e "${L}.partial" ] && grep -aq 'fake attempt second' "${L}.failed" && ! grep -aq $'\033\\[' "${L}.failed" && echo 0 || echo 1)" \
+          "... its own log is kept, de-ANSI'd, as ${pfx}.runlog.failed (for the failure diagnosis); no .partial left"
+    check "$(has "${TMP}/m_${pfx}_fail.log" "Error processing snapshot 099 \(its log: .*${pfx}\.runlog\.failed\)")" "... and the driver names it"
+    # a stop as the launcher's Stop does it: SIGTERM to the driver (the trap waits for the binary), then the binary
+    mhang "${scr}" "${TMP}/m_${pfx}_stop.log" third
+    check "$([ -f "${L}.partial" ] && cmp -s "${L}" "${TMP}/m_${pfx}_first.runlog" && echo 0 || echo 1)" \
+          "... while a re-run goes its log is ${pfx}.runlog.partial; the .runlog stays as it was"
+    kill -TERM "${mpid}" 2>/dev/null || true
+    sleep 0.3
+    kill -TERM "$(cat "${MPID}" 2>/dev/null)" 2>/dev/null || true
+    rc=0; wait "${mpid}" 2>/dev/null || rc=$?
+    check "$([ "${rc}" = "143" ] && echo 0 || echo 1)" "... a stopped run ends by its signal, 143, so a calling script stops too (${rc})"
+    check "$([ ! -e "${L}.partial" ] && cmp -s "${L}" "${TMP}/m_${pfx}_first.runlog" && grep -aq 'fake attempt third' "${L}.failed" && echo 0 || echo 1)" \
+          "... the stopped attempt's log is the .runlog.failed now; the .runlog is untouched, no .partial left"
+    check "$(has "${TMP}/m_${pfx}_stop.log" 'Stopped: snapshot 099 did not finish')" "... and the driver says so"
+    # a run killed outright (SIGKILL, a restart): its .partial is left, the .runlog still untouched
+    mhang "${scr}" "${TMP}/m_${pfx}_kill.log" fourth
+    kill -KILL "${mpid}" 2>/dev/null || true
+    kill -TERM "$(cat "${MPID}" 2>/dev/null)" 2>/dev/null || true       # the orphaned binary
+    wait "${mpid}" 2>/dev/null || true
+    sleep 1                                                             # its orphaned tee writes its last lines
+    check "$(grep -aq 'fake attempt fourth' "${L}.partial" && cmp -s "${L}" "${TMP}/m_${pfx}_first.runlog" && echo 0 || echo 1)" \
+          "... a run killed outright leaves its ${pfx}.runlog.partial, and the .runlog still untouched"
+    # the next success: its log is the .runlog, the stale .failed and .partial are gone
+    rc=$(mdrive "${scr}" "${TMP}/m_${pfx}_ok2.log" FAKE_MODE=ok FAKE_TAG=fifth)
+    check "$([ "${rc}" = "0" ] && grep -aq 'fake attempt fifth' "${L}" && [ ! -e "${L}.failed" ] && [ ! -e "${L}.partial" ] && echo 0 || echo 1)" \
+          "... the next good run: its log is the .runlog; the stale .runlog.failed and .runlog.partial are gone (${rc})"
+done
+# an auto-tune report writes nothing next to the data: not the .runlog, nor a .partial or .failed
+cp "${MDATA}/SIM/snapdir_099/ps_output.runlog" "${TMP}/m_before_report.runlog"
+rc=$(mdrive run_ps_dtfe.sh "${TMP}/m_report.log" FAKE_MODE=report AUTO_TUNE_REPORT=1)
+check "$([ "${rc}" = "0" ] && grep -aqE '^  AUTO-TUNE-REPORT snap=099 ' "${TMP}/m_report.log" && echo 0 || echo 1)" \
+      "run_ps_dtfe.sh AUTO_TUNE_REPORT=1 still reports (${rc})"
+check "$(cmp -s "${MDATA}/SIM/snapdir_099/ps_output.runlog" "${TMP}/m_before_report.runlog" \
+         && [ ! -e "${MDATA}/SIM/snapdir_099/ps_output.runlog.partial" ] \
+         && [ ! -e "${MDATA}/SIM/snapdir_099/ps_output.runlog.failed" ] && echo 0 || echo 1)" \
+      "... and leaves the snapshot's run logs alone"
+
+echo ""
+echo "(N) the Makefile stamps BUILD_MODE, ARCH_FLAGS and EXTRA_FLAGS in the object dirs (2026-10-08)."
+# 'make DTFE BUILD_MODE=debug' after a release build found every object up to date and linked the -O3 objects
+# with the sanitizers (an ARCH_FLAGS / EXTRA_FLAGS change kept the old objects the same way). The stamp's name
+# carries the mode and a checksum of the three, so a switch wipes the objects. A dry run of the mode check alone
+# (make -n -p) prints the stamp and builds nothing; the PS-DTFE target would start its recursive make, which
+# make runs even under -n.
+stamp() { make -n -p ps_gpu_mode_check "$@" 2>/dev/null | sed -n 's/^FLAGS_STAMP := //p' | head -1 || true; }
+s_rel="$(stamp)"; s_dbg="$(stamp BUILD_MODE=debug)"
+s_ext="$(stamp EXTRA_FLAGS=-DDTFE_STAMP_PROBE)"; s_arch="$(stamp ARCH_FLAGS=-mtune=stamp-probe)"
+s_quote="$(stamp "EXTRA_FLAGS=-DQ='1'")"
+check "$([[ "${s_rel}" =~ ^\.flags_release_[0-9]+$ ]] && [[ "${s_dbg}" =~ ^\.flags_debug_[0-9]+$ ]] \
+         && [ "${s_rel#.flags_release_}" != "${s_dbg#.flags_debug_}" ] && echo 0 || echo 1)" \
+      "BUILD_MODE=debug and the default release print different stamps (${s_rel} / ${s_dbg})"
+check "$([[ "${s_ext}" =~ ^\.flags_release_[0-9]+$ ]] && [[ "${s_arch}" =~ ^\.flags_release_[0-9]+$ ]] \
+         && [ "${s_ext}" != "${s_rel}" ] && [ "${s_arch}" != "${s_rel}" ] && echo 0 || echo 1)" \
+      "... EXTRA_FLAGS and ARCH_FLAGS change the checksum too (${s_ext} / ${s_arch})"
+check "$([[ "${s_quote}" =~ ^\.flags_release_[0-9]+$ ]] && echo 0 || echo 1)" "... and a quote in EXTRA_FLAGS still gives a stamp (${s_quote:-none})"
+OBJ_PS=o_ps; precision_double && OBJ_PS=o_ps_d
+if [ -d "${OBJ_PS}" ]; then
+    stamps="$(ls -A "${OBJ_PS}" | grep -E '^\.flags_' || true)"
+    check "$([ "$(printf '%s\n' "${stamps}" | grep -cE '^\.flags_[a-z]+_[0-9]+$')" = "1" ] && [ "$(printf '%s\n' "${stamps}" | grep -c .)" = "1" ] \
+             && echo 0 || echo 1)" "the build of ${PS_BIN} left exactly one such stamp in ${OBJ_PS} (${stamps:-none})"
+fi
 
 echo ""
 echo "------------------------------------------------------------"

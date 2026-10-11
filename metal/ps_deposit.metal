@@ -3,7 +3,8 @@
 //  One GPU thread per tetrahedron. Mirrors the CPU deposit in ps_interpolation.cc:
 //  each Lagrangian flow element carries a constant mass m = rho_bar * V_lag; the thread
 //  splits m equally among the Eulerian sub-sample points inside the simplex and scatters
-//  the shares into the (mass) grid with atomic float adds. Total deposited == m exactly,
+//  the shares into the (mass) grid with atomic adds -- an exact 64-bit fixed-point sum, see
+//  DepositParams.massFixed. Total deposited == m exactly,
 //  so the field is mass-conserving at any nSub and for any V_eul (no caustic spikes).
 //
 //  Which samples a tetrahedron contains is decided EXACTLY, i.e. identically to the CPU
@@ -69,6 +70,15 @@ struct DepositParams {
     // box: a tet straddling its edge counts every in-grid sample (pass 0 / phase 0 sumW) exactly as in
     // the full run and deposits only the samples / pieces inside, so the window equals the full run.
     int   windowMode;
+    // The mass grid's accumulator (2026-10-08). massFixed = 1: every mass share is added as the 64-bit
+    // integer rint(share * massScale) to massFx (buffer 21: two uint words per cell, low then high, the
+    // carry done by hand) -- exact, and independent of the order the atomics land in. Float atomics into
+    // 'mass' (buffer 3) dropped every share below half an ulp of a busy cell's running sum, always
+    // downward: 0.06% of the box mass at TNG50-3-Dark z=0, percents in halo-core cells with 1e7 deposits.
+    // massFixed = 0 keeps that float grid (PS_METAL_FLOAT_MASS=1, for comparison); the unused one is a
+    // 4-byte dummy. The moment grids stay float: their normalizer is this mass (or momw/dispw).
+    int   massFixed;
+    float massScale;    // 2^k (ps_deposit_params.h psMassFixedScale), so the product is exact
 };
 
 static inline float det3(thread const float A[3][3]) {
@@ -198,7 +208,31 @@ struct FieldGrids {
     device atomic_float* dispw;   // nCell     sum(m_s), its normalizer (fVolW+fDisp; else dummy)
     device atomic_float* scal;    // nCell     scalar moment sum(wm s) (fScal; else dummy)
     device atomic_float* sgrad;   // nCell*3   scalar-gradient moment sum(wm ds/dx_i) (fSGrad; else dummy)
+    device atomic_uint*  massFx;  // nCell*2   the mass as a 64-bit fixed-point sum [flat*2] low, [flat*2+1] high (massFixed; else dummy)
+    float massScale;              // its unit: 1/massScale mass
+    bool  massFixed;
 };
+
+// A mass share into the mass grid: the exact 64-bit fixed-point sum (massFixed), else a float atomic.
+// Two's-complement words: the low word's carry is read off the value its atomic returns (the add wrapped
+// iff the result is below it), and the high words add modulo 2^32, so once every thread is done the two
+// words hold the exact integer total, whatever the interleaving. The host keeps the partition's whole
+// mass below 2^62 units, so no share and no cell total overflows.
+static inline void depositMass(thread const FieldGrids& G, uint flat, float w)
+{
+    if (!G.massFixed) {
+        atomic_fetch_add_explicit(&G.mass[flat], w, memory_order_relaxed);
+        return;
+    }
+    ulong const q = as_type<ulong>(long(rint(w * G.massScale)));
+    if (q == 0ul) return;                           // below half a unit: nothing to add
+    uint const lo = uint(q), hi = uint(q >> 32);
+    ulong const at = ulong(flat) * 2ul;             // 64-bit: a sub-grid may hold up to 2^32 cells
+    uint const old = atomic_fetch_add_explicit(&G.massFx[at], lo, memory_order_relaxed);
+    uint const up = hi + ((old + lo < old) ? 1u : 0u);
+    if (up != 0u)
+        atomic_fetch_add_explicit(&G.massFx[at + 1ul], up, memory_order_relaxed);
+}
 
 // w = mass share (mass grid), wm = moment weight (== w by default; the V_eul share under
 // fVolW), obits = the tet's orientation bits for the caustic OR (fCaustic), svShare = this
@@ -222,7 +256,7 @@ static inline void depositSample(thread const FieldGrids& G, uint flat,
     // The surviving 32-bit quantity is 'flat' ITSELF (built by the callers), which caps a
     // sub-grid at 2^32 cells (~1625^3); ps_interpolation.cc guards that with a CPU fallback.
     ulong base = ulong(flat);
-    atomic_fetch_add_explicit(&G.mass[flat], w, memory_order_relaxed);
+    depositMass(G, flat, w);
     if (fVel || fDisp) {
         float vv[3];
         for (int j=0; j<3; ++j) {
@@ -395,7 +429,7 @@ static inline void exact_cell_deposit(thread const FieldGrids& G, uint flat, thr
 {
     float const wmEx = fVolW ? mo[0] : massShare;
     ulong const base = ulong(flat);
-    atomic_fetch_add_explicit(&G.mass[flat], massShare, memory_order_relaxed);
+    depositMass(G, flat, massShare);
     float const invV = 1.0f / mo[0];
     // the piece's centroid about the clip origin cc (the moments' frame), and in the vertex-0 frame
     float const loc[3] = { mo[1]*invV, mo[2]*invV, mo[3]*invV };
@@ -651,6 +685,7 @@ kernel void depositFields(
     device const float*        scal     [[buffer(18)]], // nTet*4 vertex scalars (fScal / fSGrad; else dummy)
     device atomic_float*       scalGrid [[buffer(19)]], // nCell   scalar moment (fScal; else dummy)
     device atomic_float*       sgGrid   [[buffer(20)]], // nCell*3 scalar-gradient moment (fSGrad; else dummy)
+    device atomic_uint*        massFx   [[buffer(21)]], // nCell*2 the fixed-point mass (massFixed; else dummy -- then buffer 3 is the mass)
     uint tid [[thread_position_in_grid]])
 {
     if (tid >= P.nTet) return;
@@ -706,7 +741,8 @@ kernel void depositFields(
         for (int i=0;i<3;++i) { float s=0.0f; for (int k=0;k<3;++k) s+=posInv[i][k]*ds[k]; sG[i]=s; }
     }
 
-    FieldGrids G { massGrid, momGrid, m2Grid, gradGrid, strGrid, momwGrid, caustGrid, svGrid, dvGrid, dwGrid, scalGrid, sgGrid };
+    FieldGrids G { massGrid, momGrid, m2Grid, gradGrid, strGrid, momwGrid, caustGrid, svGrid, dvGrid, dwGrid, scalGrid, sgGrid,
+                   massFx, P.massScale, P.massFixed != 0 };
 
     // --ps-volume-weighted: the tet's total moment weight is its Eulerian volume |det|/6
     // (matching the CPU volumeShare); default: the moment weight equals the mass share.
@@ -1087,6 +1123,7 @@ kernel void depositExactItems(
     device const float*        scal     [[buffer(18)]],
     device atomic_float*       scalGrid [[buffer(19)]],
     device atomic_float*       sgGrid   [[buffer(20)]],
+    device atomic_uint*        massFx   [[buffer(21)]],
     uint iid [[thread_position_in_grid]])
 {
     if (iid >= IP.nItems) return;
@@ -1122,7 +1159,8 @@ kernel void depositExactItems(
     bool const fVel = P.fVel != 0, fDisp = P.fDisp != 0, fGrad = P.fGrad != 0;
     bool const fVolW = P.fVolW != 0, fCaustic = P.fCaustic != 0, fLinear = P.fLinear != 0;
     bool const fScal = P.fScal != 0, fSGrad = P.fSGrad != 0;
-    FieldGrids G { massGrid, momGrid, m2Grid, gradGrid, strGrid, momwGrid, caustGrid, svGrid, dvGrid, dwGrid, scalGrid, sgGrid };
+    FieldGrids G { massGrid, momGrid, m2Grid, gradGrid, strGrid, momwGrid, caustGrid, svGrid, dvGrid, dwGrid, scalGrid, sgGrid,
+                   massFx, P.massScale, P.massFixed != 0 };
     float acc = 0.0f;
     for (; w < wEnd; ++w) {
         int const raw[3] = { iMin[0] + a0, iMin[1] + a1, iMin[2] + a2 };

@@ -1,5 +1,9 @@
 
+import contextlib
 import json
+import os
+import zipfile
+import zlib
 import numpy as np
 from pathlib import Path
 from scipy.ndimage import minimum_filter, maximum_filter
@@ -177,13 +181,14 @@ def void_radius_cells(delta_s, coords, sigma_cells):
 
 
 def distinct_voids(coords, delta_values, r_v_cells, n_grid, r_eff_cells=None):
-    """Which of the given voids are DISTINCT: deepest first, a void whose centre lies inside the R_v sphere of a
-    deeper void already kept is a sub-minimum of the same underdense region (periodic distances, cells). A void
-    without R_v is not distinct and claims no region -- unless r_eff_cells is given: then each void CLAIMS the
-    region of min(R_v, R_eff) (a missing one ignored), so a void without R_v still takes part with its R_eff, and the
-    tail of the deepest voids, whose R_v reaches 1.2-3 R_eff (84th percentile R_v/R_eff 1.2-1.5), no longer swallows
-    20-27% of the sample (review 2026-10-07: TNG300 z=0, 11 voids with R_v > 10 sigma dropped 99 of 365). Meant for
-    the voids of ONE sample (catalog.distinct_mask):
+    """Which of the given voids are DISTINCT: deepest first, a void whose centre lies inside the region a deeper void
+    already kept claims is a sub-minimum of the same underdense region (periodic distances, cells). With r_eff_cells
+    (catalog.distinct_mask always passes it) each void CLAIMS the sphere of min(R_v, R_eff) (a missing one ignored),
+    so a void without R_v still takes part with its R_eff, and the tail of the deepest voids, whose R_v reaches 1.2-3
+    R_eff (84th percentile R_v/R_eff 1.2-1.5), no longer swallows 20-27% of the sample (review 2026-10-07: TNG300 z=0,
+    11 voids with R_v > 10 sigma dropped 99 of 365). Without it the claim is the R_v sphere alone, and a void without
+    R_v is not distinct and claims no region. Meant for the WELL-RESOLVED voids (catalog.distinct_mask runs it over
+    all of them, then narrows the result to the caller's sample):
     the smoothed field's minima within an 11-cell footprint often share one void -- 63% of the TNG100 z=0
     resolved voids had another centre within R_eff -- while over ALL minima a few deep ones that fail the cut,
     with R_v up to 14 sigma, would swallow three quarters of the resolved sample (2026-10-07: 24 of 103 left)."""
@@ -347,6 +352,21 @@ def snapshot_frame(products):
     return cell, box, n, "header"
 
 
+def adopt_snapshot_grid(products):
+    """Make config's frame THIS snapshot's (its header's box over its grid n) for a tool that shows one snapshot --
+    the launcher's void outlines -- keeping the smoothing length in Mpc (the footprint follows, set_smoothing): a
+    256^3 or 1024^3 run, or a simulation config does not pin, gets its catalogue at the same physical sigma, cached
+    under its own namespace (r{n}_...). Returns (cell_mpc, box_mpc, n). NOT for the analysis scripts: their frame is
+    DTFE_SIM's on purpose, and snapshot_frame refuses a grid that is not in it."""
+    fs = products.fs
+    n, box = int(fs.grid_n), float(fs.meta.box_mpc)
+    if n != int(config.FIELD_RESOLUTION) or abs(box - float(config.BOX_SIZE)) > 1e-6 * box:
+        sigma_mpc = float(config.SMOOTHING_SIGMA_CELLS) * float(config.CELL_SIZE)   # not smoothing_length_mpc's floor
+        config.FIELD_RESOLUTION, config.BOX_SIZE, config.CELL_SIZE = n, box, box / n
+        set_smoothing(mpc=sigma_mpc)                 # sigma 0 (no smoothing) stays 0 cells
+    return float(config.CELL_SIZE), box, n
+
+
 def refit_catalog(cat):
     """The ellipsoid fits of a cached catalogue re-derived in THIS frame with THESE cuts: positions_mpc,
     the semi-axes, orientations, ellipticity, prolateness and well_resolved all follow from the cached
@@ -465,7 +485,19 @@ def cache_dir():
 
 
 def _save_npz(path, **arrays):
-    np.savez_compressed(path, **arrays)
+    """Write a cache whole or not at all (2026-10-08): into a sibling temp file, then os.replace onto 'path'. Written
+    in place, a build killed mid-save (a memory-pressure SIGKILL, the launcher's void helper stopped when the output
+    changes, Ctrl-C) or two processes saving the same snapshot left a cut zip that every later np.load refused. The
+    temp name ends in .npz (numpy appends one otherwise) and carries the pid, so two writers never share it."""
+    path = Path(path)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp.npz")
+    try:
+        np.savez_compressed(tmp, **arrays)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
 
 
 class SnapshotProducts:
@@ -587,15 +619,20 @@ class SnapshotProducts:
         carries the grid's (size, mtime_ns) since 2026-10-07 and must match it exactly (a copied cache, a future
         grid mtime, a grid rewritten mid-build: none fools an equality); an older cache without the stamp is
         judged by modification time (older than the grid = stale). A stale cache is rebuilt, and says so; None
-        then (and when there is no cache)."""
+        then (and when there is no cache). So is an UNREADABLE one (2026-10-08): a zip cut by a write killed before
+        _save_npz became atomic raised BadZipFile / EOFError here on every run until it was deleted by hand."""
         p = self._cpath(name)
         if not p.exists():
             return None
         stamp = self._grid_stamp()
         if stamp.size == 0:
             return p                            # no grid to compare with (a cache-only test double): use it
-        with np.load(p) as z:
-            have = z["grid_stamp"] if "grid_stamp" in z.files else None
+        try:
+            with np.load(p) as z:
+                have = z["grid_stamp"] if "grid_stamp" in z.files else None
+        except (zipfile.BadZipFile, EOFError, OSError, KeyError, ValueError, zlib.error) as e:
+            print(f"    [pipeline] cached {p.name} is unreadable ({type(e).__name__}: {e}): rebuilding it")
+            return None
         if have is not None and have.size:
             stale = not np.array_equal(have, stamp)
             why = "was built from another version of the grid"

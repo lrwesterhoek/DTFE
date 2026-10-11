@@ -195,7 +195,9 @@ class RunsBrowser(QWidget):
         r = self._sel()
         if r is None:
             return
-        files = [p for p in r.outputs if p.is_file()] + [r.path]
+        # every log of the set (.runlog, .runlog.failed, .runlog.partial: 2026-10-08), or a left-behind attempt log
+        # shows up as a failed run after the outputs are gone
+        files = [p for p in r.outputs if p.is_file()] + [r.path] + [p for p in r.log_files() if p != r.path]
         side = Path(str(r.path.parent / r.prefix) + ".gui.json")
         if side.is_file():
             files.append(side)

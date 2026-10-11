@@ -9,8 +9,8 @@ pipeline.SnapshotProducts.voids(), as CSV and HDF5, with units and the parameter
     import h5py;          f = h5py.File(paths[1]);  f.attrs["sigma_cells"];  f["voids/r_eff_mpc"][:]
 
 The columns (COLUMNS below, same order in both files) come straight from the catalogue dict: the grid
-cell of the smoothed-delta minimum and its position in Mpc, the central delta, the three Hessian
-eigenvalues (ASCENDING, as numpy.linalg.eigh gives them), the BBKS shape (e, p) and the axis ratios
+cell of the smoothed-delta minimum and that cell's CENTRE in Mpc (the dict's positions_mpc are its corner), the
+central delta, the three Hessian eigenvalues (ASCENDING, as numpy.linalg.eigh gives them), the BBKS shape (e, p) and the axis ratios
 from those eigenvalues, the ellipsoid fit (semi-axes a >= b >= c -- sorted by |lambda|, which is NOT the
 eigenvalue order -- the effective radius (a b c)^(1/3), the fit's ellipticity 1 - c/a and prolateness,
 the major and minor axis directions) and the two sample flags (well_resolved: passes
@@ -42,7 +42,7 @@ COLUMNS = (
     ("ix", "cell", "grid cell of the minimum of the smoothed delta, axis 0"),
     ("iy", "cell", "grid cell, axis 1"),
     ("iz", "cell", "grid cell, axis 2"),
-    ("x_mpc", "Mpc", "position of the cell, axis 0 (cell index x cell size; comoving, h-free)"),
+    ("x_mpc", "Mpc", "position of the cell's CENTRE, axis 0 ((cell index + 0.5) x cell size, where the profiles, R_v and the outlines put the void; comoving, h-free)"),
     ("y_mpc", "Mpc", "position, axis 1"),
     ("z_mpc", "Mpc", "position, axis 2"),
     ("delta_c", "", "central density contrast of the SMOOTHED field at the minimum"),
@@ -60,7 +60,7 @@ COLUMNS = (
     ("c_mpc", "Mpc", "ellipsoid semi-axis, smallest"),
     ("r_eff_mpc", "Mpc", "effective radius (a b c)^(1/3)"),
     ("r_v_mpc", "Mpc", "MEASURED void radius: where the spherically averaged smoothed delta around the minimum first rises to 0 (NaN without a crossing within 15 sigma / half the box; ~0.57 R_eff)"),
-    ("distinct", "0/1", "among the well-resolved voids with an R_v, none deeper holds this centre inside its R_v (deepest first): the profile / abundance sample"),
+    ("distinct", "0/1", "well resolved, with an R_v, and no deeper well-resolved void holds its centre inside the sphere of min(R_v, R_eff) that void claims (deepest first; a void without R_v claims its R_eff but is never flagged): the profile / abundance sample"),
     ("ellipticity_fit", "", "1 - c/a of the ellipsoid fit"),
     ("prolateness_fit", "", "(a^2 - b^2) / (a^2 - c^2) of the ellipsoid fit"),
     ("major_x", "", "unit vector of the major axis (a), component 0"),
@@ -114,8 +114,10 @@ def void_table(cat, n_grid: int | None = None) -> dict:
     n = len(coords)
     resolved = np.asarray(cat["well_resolved"]).astype(bool)
     nanfit = np.where(resolved, 1.0, np.nan)                   # NaN in every fit column of an unresolved void
-    pos = np.asarray(cat["positions_mpc"], dtype=np.float64)
     cell = pipeline.catalog_cell_mpc(cat) or 1.0                # the Hessian is in cell^-2 (k in radians per cell)
+    # the cell CENTRES (2026-10-08): positions_mpc holds the corners i x cell, half a cell off the (i + 0.5) x cell
+    # that R_v, the profiles, the tracking and the outlines centre every void on
+    pos = (coords.astype(np.float64) + 0.5) * cell
     ev = np.asarray(cat["eigenvalues"], dtype=np.float64).reshape(n, 3) / cell ** 2
     bbks = np.asarray(cat["bbks_params"], dtype=np.float64).reshape(n, 2)
     ratios = np.asarray(cat["axis_ratios"], dtype=np.float64).reshape(n, 2)
@@ -172,19 +174,27 @@ def r_v_mpc(cat) -> np.ndarray:
 
 
 def distinct_mask(cat, sample, n_grid: int) -> np.ndarray:
-    """Within the voids where 'sample' (bool per row) is True: the DISTINCT ones (pipeline.distinct_voids:
-    deepest first, none whose centre lies inside the region a deeper one claims, min(R_v, R_eff)). A per-sample
-    choice, made when the sample is -- so it follows the cuts, and nothing about it is cached."""
+    """The DISTINCT voids among those where 'sample' (bool per row) is True: pipeline.distinct_voids over EVERY
+    well-resolved void (deepest first, none whose centre lies inside the region a deeper kept one claims: the sphere
+    of min(R_v, R_eff), of its R_eff when it has no R_v), then narrowed to 'sample'. The claims come from all the
+    resolved voids whatever the sample (2026-10-08): the callers pass the resolved voids WITH an R_v, so a void without
+    one (the larger, deeper 10-17%) claimed nothing and the minima inside it were counted, stacked and drawn as voids
+    of their own (TNG300 z=0 at sigma 3.66 cells: 1639 distinct instead of 1585). A sample narrower by depth (the deep
+    voids) gets what a de-duplication within it would give, as nothing shallower can block a deeper void; a row that
+    is not well resolved is never distinct. Made when the sample is (so it follows the cuts); nothing of it is cached."""
     sample = np.asarray(sample, dtype=bool)
-    rows = np.nonzero(sample)[0]
     out = np.zeros(len(sample), dtype=bool)
-    if rows.size and "r_v_cells" in cat:
+    r_eff = r_eff_mpc(cat)
+    rows = np.nonzero(np.asarray(cat["well_resolved"]).astype(bool) & np.isfinite(r_eff))[0]   # the claiming voids
+    if rows.size and sample.any():
         cell = pipeline.catalog_cell_mpc(cat)
-        r_eff_cells = r_eff_mpc(cat)[rows] / cell if cell else None     # each claims min(R_v, R_eff) (distinct_voids)
+        r_eff_cells = r_eff[rows] / cell if cell else None               # each claims min(R_v, R_eff) (distinct_voids)
+        r_v_cells = np.asarray(cat["r_v_cells"], dtype=np.float64)[rows] if "r_v_cells" in cat \
+            else np.full(rows.size, np.nan)                               # a catalogue from before R_v: R_eff claims
         keep = pipeline.distinct_voids(np.asarray(cat["coords"])[rows], np.asarray(cat["delta_values"])[rows],
-                                       np.asarray(cat["r_v_cells"])[rows], int(n_grid), r_eff_cells)
+                                       r_v_cells, int(n_grid), r_eff_cells)
         out[rows[keep]] = True
-    return out
+    return out & sample
 
 
 def provenance(products, n_voids: int, frame) -> dict:

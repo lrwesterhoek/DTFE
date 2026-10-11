@@ -143,7 +143,7 @@ echo "   OK"
 # --per-stream-ids section, gated so the script still runs against binaries predating the flag
 # (capture first: 'grep -q' would SIGPIPE the binary and trip pipefail)
 HAVE_IDS=0
-FULL_HELP="$("${BIN}" --full_help 2>/dev/null || true)"
+FULL_HELP="$("${BIN}" --full_help 2>/dev/null)" || { echo "FAIL: ${BIN} --full_help exited non-zero"; exit 1; }
 if grep -q -- '--per-stream-ids' <<<"${FULL_HELP}"; then
     HAVE_IDS=1
     echo ">> run 7: pancake, serial, 'geometric', --per-stream-ids (implies --per-stream)"
@@ -159,6 +159,7 @@ if grep -q -- '--per-stream-ids' <<<"${FULL_HELP}"; then
     done
     echo "   OK"
 else
+    [ "${DTFE_TEST_REQUIRED:-0}" = "1" ] && { echo "FAIL (required): this PS-DTFE has no --per-stream-ids" >&2; exit 1; }
     echo ">> (F) skipped: this PS-DTFE binary has no --per-stream-ids"
 fi
 
@@ -209,6 +210,7 @@ PY
     echo ">> run 12: jitter-free pancake, serial, FD probe points"
     run "${TMP}/ppe_grad_fd" "${SNAP_PAN0}" --periodic --sample-points "${PTS_FD}"
 else
+    [ "${DTFE_TEST_REQUIRED:-0}" = "1" ] && { echo "FAIL (required): this PS-DTFE has no --pts-den-grad" >&2; exit 1; }
     echo ">> (G) skipped: this PS-DTFE binary has no --pts-den-grad"
 fi
 

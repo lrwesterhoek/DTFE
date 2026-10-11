@@ -15,7 +15,8 @@ the mean, v_r turned to infall and the single-stream fraction bottomed out all a
 WHAT IS SAMPLED. Every well-resolved void of the catalogue (its ellipsoid fit within config.ELLIPSOID_CUT_RULES;
 sample='deep' narrows to a central delta below config.DEEP_VOID_THRESHOLD, the tracking sample) with a radius,
 by default only the DISTINCT ones of that sample (catalog.distinct_mask: deepest first, none whose centre lies
-inside a deeper one's R_v -- neighbouring minima of one void would be stacked twice), is taken as a sphere of
+inside the sphere of min(R_v, R_eff) of a deeper resolved void, its R_eff when it has no R_v -- neighbouring minima
+of one void would be stacked twice), is taken as a sphere of
 radius R (R_v from catalog.r_v_mpc, or R_eff = (a b c)^(1/3) from catalog.r_eff_mpc) around its catalogue cell
 -- the cell's CENTRE, (i + 0.5) / N in environment.sample_grid's convention; the catalogue's positions_mpc
 are the cells' corners i x cell, half a cell apart, far below any R_eff. On each shell r = x R_eff (x in

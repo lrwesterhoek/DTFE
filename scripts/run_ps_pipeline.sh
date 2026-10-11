@@ -119,6 +119,7 @@ fresh() {
 }
 
 overall_rc=0
+n_found=0          # snapshots found (after SNAPS) over all simulations; 0 at the end is an error
 for sim in ${SIMS}; do
     simdir="$(sim_dir "${sim}")"
 
@@ -133,7 +134,8 @@ for sim in ${SIMS}; do
         fi
         snaps+=("${n}")
     done
-    if [ ${#snaps[@]} -eq 0 ]; then echo "-- ${sim}: no combined snapshots, skipping"; continue; fi
+    if [ ${#snaps[@]} -eq 0 ]; then echo "-- ${sim}: no combined snapshots${SNAPS:+ numbered ${SNAPS}}, skipping"; continue; fi
+    n_found=$((n_found + ${#snaps[@]}))
     echo ""
     echo "== ${sim}: snapshots ${snaps[*]}"
 
@@ -201,6 +203,19 @@ for sim in ${SIMS}; do
 done
 
 echo ""
+# Finding NOTHING is a failure, as in run_ps_dtfe.sh (2026-10-08): with the data drive unmounted, a
+# mistyped SIMS or a SNAPS matching no snapshot, nothing ran and this still printed ALL DONE with exit 0,
+# which the launcher's Pipeline tab showed as a success. Every snapshot found is either computed, up to
+# date, or in a simulation that failed with a '!!' line (overall_rc 1), so a partial skip stays exit 0.
+if [ "${n_found}" -eq 0 ]; then
+    echo "!! nothing to compute: no combined snapshot${SNAPS:+ numbered ${SNAPS}} of $([ -n "${SIMS// }" ] && echo ${SIMS} || echo "any simulation") under '${DATA_ROOT}'"
+    if [ ! -d "${DATA_ROOT}" ]; then
+        echo "   That folder does not exist: is the data drive mounted?"
+    else
+        echo "   Check SIMS and SNAPS, and the data root (DTFE_DATA_ROOT)."
+    fi
+    overall_rc=1
+fi
 [ ${overall_rc} -eq 0 ] && echo "ALL DONE (compute). Render figures with: python3 python/plot/plot_pointeval.py" \
     || echo "DONE WITH FAILURES (see !! lines above)"
 exit ${overall_rc}

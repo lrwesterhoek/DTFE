@@ -2,7 +2,8 @@
 # One-command reinstall + full recompile of DTFE and PS-DTFE, platform-aware.
 #
 #   ./install.sh              install any missing dependencies, wipe the build, and rebuild
-#                             BOTH binaries with the best backend for this machine:
+#                             BOTH binaries with the best backend for this machine (plus every
+#                             double or 2D pair already built, which 'make clean' deletes too):
 #                               macOS (Apple Silicon)      -> METAL=1  (GPU deposit)
 #                               Linux with nvcc / hipcc    -> CUDA=1 / HIP=1 (GPU deposit, unvalidated port)
 #                               anything else              -> CPU-only
@@ -31,7 +32,8 @@
 #     est = Estimator("snapshot.hdf5"); est(points).density
 #
 # Idempotent: safe to re-run any time; the Makefile's build-mode stamps guarantee objects
-# from different GPU modes are never mixed (a mode switch wipes the object directory).
+# from different GPU modes are never mixed (a mode switch wipes the object directory), and the
+# double and 2D pairs already built are rebuilt as well (2D: CPU-only, as the Setup wizard does).
 
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."   # run from the repo root (this script lives in scripts/)
@@ -162,6 +164,22 @@ info "step 2/6: build backend -> ${BACKEND}"
 # build goes through a log; on a failure its tail and the usual causes are printed and the old binaries
 # come back. (survey rank 24, 2026-10-05)
 info "step 3/6: make clean + rebuild (jobs: ${JOBS})"
+# 'make clean' deletes EVERY binary set, the double and 2D ones too: the sets already built are noted first
+# and rebuilt below, with the double pair's backend and the 2D programs CPU-only as the Setup wizard builds
+# them. Until 2026-10-08 a re-run rebuilt only the single pair and threw the old binaries away, so a 2D
+# pair built from the launcher's Setup (or a double pair without --double) was silently gone.
+EXTRA_SETS=()                              # make arguments per extra set, after the single pair
+EXTRA_NAMES=""
+if [ -n "$PREC_ARG" ] || [ -f DTFE-double ] || [ -f PS-DTFE-double ]; then
+    EXTRA_SETS+=("$GPU_ARG DOUBLE=1"); EXTRA_NAMES="${EXTRA_NAMES} ./DTFE-double ./PS-DTFE-double"
+fi
+if [ -f DTFE-2d ] || [ -f PS-DTFE-2d ]; then
+    EXTRA_SETS+=("DIM=2"); EXTRA_NAMES="${EXTRA_NAMES} ./DTFE-2d ./PS-DTFE-2d"
+fi
+if [ -f DTFE-2d-double ] || [ -f PS-DTFE-2d-double ]; then
+    EXTRA_SETS+=("DIM=2 DOUBLE=1"); EXTRA_NAMES="${EXTRA_NAMES} ./DTFE-2d-double ./PS-DTFE-2d-double"
+fi
+[ -n "$EXTRA_NAMES" ] && info "also to be rebuilt (built already, or asked for):${EXTRA_NAMES}"
 BUILD_LOG="$(mktemp -t dtfe-install-build.XXXXXX)"
 BACKUP_DIR="$(mktemp -d -t dtfe-install-backup.XXXXXX)"
 kept="$(backup_binaries "$BACKUP_DIR")"
@@ -176,13 +194,17 @@ on_build_error() {
 }
 trap on_build_error ERR
 make clean >/dev/null
-# shellcheck disable=SC2086  # GPU_ARG/PREC_ARG are deliberately word-split ("" or METAL=1 etc.)
+# shellcheck disable=SC2086  # GPU_ARG is deliberately word-split ("" or METAL=1 etc.)
 make DTFE    $GPU_ARG -j"$JOBS" 2>&1 | tee -a "$BUILD_LOG"
 make PS-DTFE $GPU_ARG -j"$JOBS" 2>&1 | tee -a "$BUILD_LOG"
-if [ -n "$PREC_ARG" ]; then        # the double pair: its own object directories and binary names
-    make DTFE    $GPU_ARG $PREC_ARG -j"$JOBS" 2>&1 | tee -a "$BUILD_LOG"
-    make PS-DTFE $GPU_ARG $PREC_ARG -j"$JOBS" 2>&1 | tee -a "$BUILD_LOG"
-fi
+# the double and 2D sets noted above: their own object directories and binary names; inside the trap, so a
+# failure brings the old binaries back
+for set_args in ${EXTRA_SETS[@]+"${EXTRA_SETS[@]}"}; do
+    # shellcheck disable=SC2086  # set_args is deliberately word-split ("METAL=1 DOUBLE=1", "DIM=2", ...)
+    make DTFE    $set_args -j"$JOBS" 2>&1 | tee -a "$BUILD_LOG"
+    # shellcheck disable=SC2086
+    make PS-DTFE $set_args -j"$JOBS" 2>&1 | tee -a "$BUILD_LOG"
+done
 trap - ERR
 rm -rf "$BACKUP_DIR"
 
@@ -252,7 +274,7 @@ else
 fi
 
 # ---------------------------------------------------------------- 6/6 report + verify hints
-good "step 6/6: done -- ./DTFE and ./PS-DTFE rebuilt (${BACKEND}); GUI: ${GUI_STATE}"
+good "step 6/6: done -- ./DTFE and ./PS-DTFE${EXTRA_NAMES} rebuilt (${BACKEND}); GUI: ${GUI_STATE}"
 if [ -n "$GPU_ARG" ]; then
     info "build mode stamped in o/.build_mode and o_ps/.build_mode ($GPU_ARG);"
     info "incremental rebuilds must keep it: make PS-DTFE \$(cat o_ps/.build_mode)"
