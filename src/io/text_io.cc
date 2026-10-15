@@ -337,7 +337,7 @@ void writeTextFile_redshiftConePosition(std::vector<Real> &dataToWrite,
     std::vector<Real> origin = userOptions.originPosition;// origin of the redshift cone
     Real dx[NO_DIM];
     for (size_t i=0; i<NO_DIM; ++i) dx[i] = (coneCoordinates[2*i+1]-coneCoordinates[2*i]) / grid[i];
-    Real factor = 3.14/180.; // degrees to radians
+    Real factor = Real(PI/180.); // degrees to radians (3.14/180 until 2026-10-11: angles 0.05% short, as the interpolation uses PI)
 
 #if NO_DIM==2
     for (size_t i=0; i<grid[0]; ++i)
@@ -404,7 +404,7 @@ void writeTextFile_redshiftConePosition(std::vector< Pvector<T,N> > &dataToWrite
     std::vector<Real> origin = userOptions.originPosition;// origin of the redshift cone
     Real dx[NO_DIM];
     for (size_t i=0; i<NO_DIM; ++i) dx[i] = (coneCoordinates[2*i+1]-coneCoordinates[2*i]) / grid[i];
-    Real factor = 3.14/180.; // degrees to radians
+    Real factor = Real(PI/180.); // degrees to radians (3.14/180 until 2026-10-11: angles 0.05% short, as the interpolation uses PI)
 
 #if NO_DIM==2
     for (size_t i=0; i<grid[0]; ++i)

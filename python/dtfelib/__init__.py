@@ -13,10 +13,12 @@ except ModuleNotFoundError as _e:   # the loaders and the Estimator need only nu
         raise
 from .estimator import Estimator, PointFields, find_binary
 from .cli import make_parser, make_fieldset, snapdir, sim_dir, find_sims, use_data_root, DATA_ROOT, DEFAULT_SIM, DEFAULT_SNAP
+from .cli import add_ps_gradient_arg, mean_field_wanted
 
 __all__ = [
     "FieldSet", "FIELDS", "STREAM_TOL", "SnapshotMeta", "PointPlane",
     "Estimator", "PointFields", "find_binary",
     "make_parser", "make_fieldset", "snapdir",
     "DATA_ROOT", "DEFAULT_SIM", "DEFAULT_SNAP", "sim_dir", "find_sims", "use_data_root",
+    "add_ps_gradient_arg", "mean_field_wanted",
 ]

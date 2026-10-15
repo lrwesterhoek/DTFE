@@ -5,8 +5,17 @@
 #
 # Usage:
 #   ./run_ps_dtfe.sh [-d DATA_DIR] [-s SIMULATION] [-g GRID_SIZE] [-n AVG_SUBSAMPLES] [-m] [-e] [snapshot ...]
-#     -m   run the deposit on the Apple GPU (same as PS_METAL=1; needs 'make PS-DTFE METAL=1')
+#     -m   run the deposit on the GPU (same as PS_METAL=1). The default (PS_METAL unset, 'auto') is the GPU when
+#          the binary was built with one (the Makefile's o_ps/.gpu_mode_metal|cuda|hip stamp; o_ps_d for
+#          DTFE_PRECISION=double), else the CPU; PS_METAL=0 runs the CPU deposit on a GPU build.
 #     -e   exact conservative deposit (same as PS_EXACT=1; --ps-exact-deposit, GPU-capable, slower)
+#   Production defaults (2026-10-13): GRID_SIZE 512 (config.sh), the GPU when built, vertex masses, volume-weighted
+#   velocity moments, the caustic classes, FIELDS = the nine of the thesis grids (density, velocity, its gradient /
+#   divergence / shear / vorticity, the dispersion, the T-web and the V-web), LAMBDA_TH 0.3 -- the settings of the
+#   2026-10-12 rerun of all 27 snapshots (scripts/thesis_runs.sh ps27), which adds the 4096^2 image plane.
+#   A rerun into a prefix that holds an earlier run's files: once it exits 0, the files it did not write (an image
+#   plane, caustics or a field the new run lacks) are MOVED into <prefix>.superseded/<date_time>/ with the old
+#   run log (config.sh supersede_extras; never deleted), so the folder holds one run's set.
 #   -h / --help prints this header and runs nothing; --version the repository revision.
 #   DRY_RUN=1 ./run_ps_dtfe.sh ...   prints every snapshot's expanded command and paths, runs nothing
 #          (exit 0 when at least one snapshot is planned).
@@ -14,7 +23,7 @@
 #   to the last failed or stopped attempt, <prefix>.runlog.partial to a run still going (or killed outright).
 #   Knobs (environment; each is explained where the script sets it): PARTITION MAX_CONCURRENT AVG_SUBSAMPLES THREADS
 #   SCRATCH_DIR SAMPLE_POINTS PTS_VEL_GRAD PS_METAL PS_EXACT PS_VERTEX_MASS PS_VOLUME_WEIGHTED PS_LINEAR_DEPOSIT
-#   PS_CAUSTICS PS_CAUSTIC_CUSPS PS_PARALLEL_TRI TESS_CACHE OUTPUT_PREFIX FIELDS LAMBDA_TH LAGRANGIAN_INPUT
+#   PS_CAUSTICS PS_CAUSTIC_CUSPS PS_PARALLEL_TRI PS_LAG_PADDING TESS_CACHE OUTPUT_PREFIX FIELDS LAMBDA_TH LAGRANGIAN_INPUT
 #   DTFE_PRECISION AUTO_TUNE_REPORT (1 = only the auto-tuner's memory report per snapshot, nothing computed)
 #   ORDERED_MERGE PS_RESUME. A partitioned run killed part-way resumes: when the snapshot's checkpoint
 #   (<prefix>.runlog.checkpoint, or in SCRATCH_DIR) exists, the next run passes --resume (PS_RESUME=0 starts over).
@@ -57,11 +66,17 @@ PTS_VEL_GRAD="${PTS_VEL_GRAD:-0}"   # 1 = with SAMPLE_POINTS, also write '.pts_v
                            # sample point (float64 x9). dtfelib.PointPlane derives the
                            # divergence / shear / vorticity maps from it, so this is what makes
                            # the velocity-derivative fields available to the hi-res figures.
-PS_METAL="${PS_METAL:-0}"  # 1 = run the deposit on the Apple GPU (--ps-gpu; needs 'make PS-DTFE METAL=1')
-ORDERED_MERGE="${ORDERED_MERGE:-0}"  # 1 = --ordered-merge: the partitions' grids are added in partition index order,
-                           # so two identical runs write bit-identical grids (and a killed run resumes to exactly
-                           # the grids of an uninterrupted one). Costs time when partitions differ much in cost and
-                           # MAX_CONCURRENT is above 1 (35% on a TNG region's GPU run). (2026-10-11)
+PS_METAL="${PS_METAL:-auto}"  # 1 = the deposit on the GPU (--ps-gpu), 0 = the CPU; 'auto' (default, 2026-10-13; it
+                           # was 0) = 1 when the binary is a GPU build (config.sh gpu_build_default), resolved
+                           # below once DTFE_PRECISION has chosen the binary
+ORDERED_MERGE="${ORDERED_MERGE:-1}"  # 1 (default since 2026-10-14; it was 0) = --ordered-merge: the partitions' grids are
+                           # added in partition index order, so two identical runs write bit-identical grids (and a
+                           # killed run resumes to exactly the grids of an uninterrupted one). Since 2026-10-14 the
+                           # binary's own default, and STAGED: a partition finished before its turn parks its sub-grids
+                           # in memory (while the machine has it free) and its thread goes on, so it no longer costs
+                           # the time it did (35% on a TNG region's GPU run, 2026-10-11). Passed explicitly, so the run
+                           # log says it. 0 = --completion-order-merge, the old default: added as they finish, the
+                           # grids then differ run to run in the last bits.
 PS_RESUME="${PS_RESUME:-1}"  # 1 (default) = resume a killed partitioned run: when the snapshot's checkpoint file
                            # exists (<prefix>.runlog.checkpoint/checkpoint beside the outputs, or under SCRATCH_DIR; config.sh
                            # ps_checkpoint_dir), --resume is passed and only the partitions it lacks are computed.
@@ -80,14 +95,20 @@ PS_VERTEX_MASS="${PS_VERTEX_MASS:-1}"  # 1 (default) = chart-independent tet mas
                            # then filter every density mode by 1-D(127)/D(z) (-16.5% at z=20, -3% at z=2;
                            # verified against regular DTFE on TNG50-3). Velocities are unaffected either way.
                            # Set PS_VERTEX_MASS=0 only for true-lattice Lagrangian inputs or A/B comparisons.
-PS_VOLUME_WEIGHTED="${PS_VOLUME_WEIGHTED:-0}"  # 1 = volume-weighted velocity moments (--ps-volume-weighted):
-                           # velocity/gradient/div/shear/vort/dispersion become VOLUME averages per cell
-                           # (the standard-DTFE '_a' convention that -aHf*delta refers to) instead of the
-                           # default mass-weighted (momentum-like) means. The DISPERSION is excluded and stays
-                           # mass-weighted (sigma_ij is an f-weighted CBE moment by definition) -- it comes out
-                           # bit-identical to a default run, so this ONE config is the literature-standard
-                           # estimator for every field at once. Works with the CPU and GPU (-m) deposits.
-PS_CAUSTICS="${PS_CAUSTICS:-0}"      # 1 = flag fold-caustic cells (--ps-caustics): writes '.caustic'
+_caller_vw="${PS_VOLUME_WEIGHTED:-}"   # (the caller's own value: an unset one yields to PS_LINEAR_DEPOSIT=1, below)
+PS_VOLUME_WEIGHTED="${PS_VOLUME_WEIGHTED:-1}"  # 1 (default since 2026-10-13; it was 0 here, while every thesis PS grid,
+                           # run_ps_pipeline.sh and the launcher used 1) = volume-weighted velocity moments
+                           # (--ps-volume-weighted): velocity/gradient/div/shear/vort become VOLUME averages per
+                           # cell (the standard-DTFE '_a' convention that -aHf*delta refers to) instead of the
+                           # mass-weighted (momentum-like) means of PS_VOLUME_WEIGHTED=0. The DISPERSION is
+                           # excluded and stays mass-weighted (sigma_ij is an f-weighted CBE moment by definition)
+                           # -- it comes out bit-identical to a mass-weighted run, so this ONE config is the
+                           # literature-standard estimator for every field at once. Works with the CPU and GPU (-m)
+                           # deposits. Not with PS_LINEAR_DEPOSIT=1 (the binary refuses both): left unset, it is 0
+                           # then (said below).
+PS_CAUSTICS="${PS_CAUSTICS:-1}"      # 1 (default since 2026-10-13, as the 2026-10-12 production rerun of all 27
+                           # snapshots: +33% time, +1.2 GB on TNG, every other output unchanged; it was 0) =
+                           # flag fold-caustic cells (--ps-caustics): writes '.caustic'
                            # (0/1 fold flag) and '.causticClass' -- the caustic stratification bitmask
                            # (fold parity, how many principal axes have collapsed, and the umbilic-
                            # degeneracy indicator) -- on the CPU AND the GPU deposit (byte-identical:
@@ -115,10 +136,22 @@ PS_EXACT="${PS_EXACT:-0}"  # 1 = exact conservative deposit (--ps-exact-deposit)
 DATA_DIR=""                # default: sim_dir $SIMULATION (config.sh); override with -d
 PS_LINEAR_DEPOSIT="${PS_LINEAR_DEPOSIT:-0}"  # 1 = --ps-linear-deposit: each tetrahedron's mass spread by the linear
                                  # density profile inside it (renormalized: mass-conserving); NOT with PS_VOLUME_WEIGHTED=1
+# the volume weighting's default (1) yields to an asked-for linear deposit, which the binary refuses beside it
+if [ -z "${_caller_vw}" ] && [ "${PS_LINEAR_DEPOSIT}" = "1" ]; then
+    echo "Note: PS_LINEAR_DEPOSIT=1 weights by density inside each tetrahedron, so the velocity moments stay mass-weighted (PS_VOLUME_WEIGHTED=0)"
+    PS_VOLUME_WEIGHTED=0
+fi
 PS_PARALLEL_TRI="${PS_PARALLEL_TRI:-0}"  # 1 = build each tessellation's Delaunay triangulation in parallel
                            # (--parallel-triangulation; needs the TBB build, 'make' detects the library).
                            # Faster on small sets; OFF by default because two identical runs then
                            # differ at float rounding (stream counts do not). See the binary's help.
+PS_LAG_PADDING="${PS_LAG_PADDING:-}"   # k = --ps-lag-padding k: pad each Lagrangian partition by k mean particle
+                           # spacings. Empty (default) = the binary's default, k = 8 since 2026-10-12: on a 4.1M-
+                           # particle set at 2^3 it ran ~6x faster in 3.5x less memory with identical stream counts
+                           # (density/velocity grids move in ~0.5% of cells, as two runs at PADDING 40 and 50 do).
+                           # PS_LAG_PADDING=0 = the old Eulerian rule (the PADDING fraction floored at 0.3 of a
+                           # partition: 7-9x the owned particles per TNG partition) and reuses the partition
+                           # tessellation caches written before 2026-10-12; any k > 0 rebuilds them once.
 OUTPUT_PREFIX="${OUTPUT_PREFIX:-ps_output}"   # -> <snapdir>/<prefix>.*  Override to keep incompatible runs side by
                            # side instead of clobbering, e.g. OUTPUT_PREFIX=ps_mw with PS_VOLUME_WEIGHTED=0 for the
                            # mass-weighted (physical) dispersion next to the default volume-weighted shear/divergence
@@ -216,9 +249,10 @@ PYEOF
 LAMBDA_TH="${LAMBDA_TH:-0.3}"
 # Same velocity-derivative set as run_dtfe.sh (gradient_a divergence_a shear_a vorticity_a, all
 # derived from the density-weighted multi-stream velocity gradient -- single-stream caveat above)
-# plus the PS-only dispersion; add tweb_a/vweb_a here to also classify the cosmic web.
+# plus the PS-only dispersion and the T-web / V-web classes: the nine fields of the thesis grids (the default
+# since 2026-10-13; the web classes were opt-in, so a bare run lacked what the void and web figures read).
 # Env-overridable, e.g. FIELDS="density_a velocity_a" for a lighter batch.
-FIELDS="${FIELDS:-density_a velocity_a gradient_a divergence_a shear_a vorticity_a dispersion_a}"
+FIELDS="${FIELDS:-density_a velocity_a gradient_a divergence_a shear_a vorticity_a dispersion_a tweb_a vweb_a}"
 
 cd "$REPO_ROOT" || exit 1
 
@@ -238,6 +272,12 @@ if [ ! -x "${PS_BIN}" ]; then
         echo "Error: ${PS_BIN} not found or not executable. Build it with 'make PS-DTFE'." >&2
     fi
     exit 1
+fi
+# PS_METAL=auto (the default): the GPU when this binary was built with one (2026-10-13; config.sh)
+gpu_auto=""
+if [ "${PS_METAL}" = "auto" ]; then
+    PS_METAL="$(gpu_build_default "${REPO_ROOT}" "${PS_BIN}")"
+    gpu_auto=" (PS_METAL unset: ${PS_BIN#./} is $([ "${PS_METAL}" = "1" ] && echo "a GPU" || echo "a CPU-only") build; PS_METAL=0 or 1 chooses)"
 fi
 
 n_ok=0; n_skipped=0; n_failed=0; n_planned=0   # summarised at the end; see the exit-status note there
@@ -269,6 +309,8 @@ fi
 # behind is a run killed outright (SIGKILL), or one still going.
 live_log=""; live_rc=""            # the .partial being written, and its binary's exit status once known
 live_lock=""                       # this driver's '<prefix>.runlog.lock' (config.sh run_lock_take), while held
+sup_marker=""; sup_oldlog=""       # the run's start marker and a copy of the old run log (config.sh supersede_extras)
+sup_clean() { rm -f ${sup_marker:+"${sup_marker}"} ${sup_oldlog:+"${sup_oldlog}"}; sup_marker=""; sup_oldlog=""; }
 finish_runlog() {                  # <the .partial> <the binary's exit status>
     local part="$1" final="${1%.partial}"
     [ -f "${part}" ] || return 0
@@ -297,14 +339,16 @@ on_stop() {                        # <signal name>
         [ "${live_rc:-1}" = "0" ] || echo "  Stopped: snapshot ${n_str} did not finish; its log is ${live_log%.partial}.failed"
     fi
     run_lock_release "${live_lock}"
+    sup_clean
     kill -s "$1" $$
 }
 trap 'on_stop INT' INT; trap 'on_stop TERM' TERM; trap 'on_stop HUP' HUP
-trap 'run_lock_release "${live_lock}"' EXIT   # any other way out (an error, set -u) frees the lock too
+trap 'run_lock_release "${live_lock}"; sup_clean' EXIT   # any other way out (an error, set -u) frees the lock too
 
 echo "Starting PS-DTFE processing..."
 echo "Data directory: ${DATA_DIR}"
 echo "Grid size: ${GRID_SIZE}   Partition: [${PARTITION:-auto}]   Fields: ${FIELDS}"
+echo "Deposit: $([ "${PS_METAL}" = "1" ] && echo "GPU (--ps-gpu)" || echo "CPU")${gpu_auto}   volume-weighted: ${PS_VOLUME_WEIGHTED}   caustics: ${PS_CAUSTICS}   prefix: ${OUTPUT_PREFIX}"
 echo ""
 
 for i in "${SNAPSHOTS[@]}"; do
@@ -356,6 +400,7 @@ for i in "${SNAPSHOTS[@]}"; do
     ptri_args=()
     [ "${PS_PARALLEL_TRI}" = "1" ] && ptri_args=(--parallel-triangulation)
     [ "${PS_LINEAR_DEPOSIT}" = "1" ] && ptri_args+=(--ps-linear-deposit)     # (PS_LINEAR_DEPOSIT, see the top)
+    [ -n "${PS_LAG_PADDING}" ] && ptri_args+=(--ps-lag-padding "${PS_LAG_PADDING}")   # (PS_LAG_PADDING, see the top; 0 passed too)
 
     # Point evaluation on top of the grid run (SAMPLE_POINTS=<file>, see the comment at the top).
     sp_args=()
@@ -408,7 +453,8 @@ for i in "${SNAPSHOTS[@]}"; do
     [ -n "${PARTITION}" ] && part_args+=(--partition ${PARTITION})
     [ -n "${MAX_CONCURRENT}" ] && part_args+=(--max-concurrent "${MAX_CONCURRENT}")
     [ -n "${SCRATCH_DIR}" ] && part_args+=(--scratch-dir "${SCRATCH_DIR}")
-    [ "${ORDERED_MERGE}" = "1" ] && part_args+=(--ordered-merge)
+    # 2026-10-14: the merge order said either way (the run log names it; results.py reads the flag back)
+    if [ "${ORDERED_MERGE}" = "0" ]; then part_args+=(--completion-order-merge); else part_args+=(--ordered-merge); fi
     # a killed partitioned run left its checkpoint (the binary removes it once the outputs are in place): resume it.
     # The FILE, not the folder (2026-10-11): a folder with no 'checkpoint' in it (a kill during the first write) holds
     # nothing to resume, the binary refuses '--resume' there, and every rerun of the snapshot failed the same way
@@ -469,10 +515,20 @@ for i in "${SNAPSHOTS[@]}"; do
     fi
     # the binary's output goes to '<run_log>.partial' until it exits (the run-log contract above);
     # a report's temp file takes it directly
+    sup_list=""
     if [ "${AUTO_TUNE_REPORT}" = "1" ]; then
         tee_log="${run_log}"
     else
         tee_log="${run_log}.partial"; live_log="${tee_log}"; live_rc=""
+        # what an earlier run with this prefix left, recorded before this one starts: what it does not rewrite is
+        # moved aside once it has exited 0 (config.sh supersede_extras, 2026-10-13)
+        sup_clean
+        sup_marker="$(mktemp "${TMPDIR:-/tmp}/dtfe-run-start.XXXXXX" 2>/dev/null)" || sup_marker=""
+        sup_list="$(supersede_snapshot "${output_root}")"
+        if [ -n "${sup_list}" ] && [ -f "${run_log}" ]; then
+            sup_oldlog="$(mktemp "${TMPDIR:-/tmp}/dtfe-old-runlog.XXXXXX" 2>/dev/null)" && cp -p "${run_log}" "${sup_oldlog}" \
+                || sup_oldlog=""
+        fi
     fi
     ${TIME_WRAP[@]+"${TIME_WRAP[@]}"} "${cmd[@]}" 2>&1 | tee "${tee_log}"
     rc=${PIPESTATUS[0]}
@@ -495,6 +551,8 @@ for i in "${SNAPSHOTS[@]}"; do
     # (the contract above); the peak memory below is read from whichever it became
     finish_runlog "${live_log}" "${rc}"
     live_log=""
+    [ "${rc}" -eq 0 ] && supersede_extras "${output_root}" "${sup_list}" "${sup_marker}" "${sup_oldlog}"
+    sup_clean
     run_lock_release "${live_lock}"; live_lock=""
     [ "${rc}" -eq 0 ] || run_log="${run_log}.failed"
 

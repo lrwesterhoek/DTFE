@@ -43,7 +43,9 @@
 #                 plot_pointeval.py --project slab) across a slab of THICKNESS Mpc (default 2), KxK sub-samples per pixel
 #                 averaged into pixel-area means (default 1), and "u0 u1 v0 v1" in Mpc to image
 #                 only that part of the plane (default: the whole box).
-#   PS_GPU        1 (default) = the deposit on the GPU (run_ps_dtfe.sh -m); 0 = CPU
+#   PS_GPU        1 = the deposit on the GPU (run_ps_dtfe.sh -m), 0 = the CPU; unset (auto, 2026-10-13; it was
+#                 1 on every build) = the GPU when the PS binary was built with one, as run_ps_dtfe.sh decides
+#                 (config.sh gpu_build_default: PS-DTFE, or PS-DTFE-double with DTFE_PRECISION=double)
 #   PS_VOLUME_WEIGHTED  1 (default) = volume-weighted velocity moments, the production convention
 # The other run options reach run_ps_dtfe.sh through the environment exactly as from a terminal:
 # PS_EXACT, AVG_SUBSAMPLES, PS_VERTEX_MASS, PS_CAUSTICS, PS_CAUSTIC_CUSPS, PS_PARALLEL_TRI,
@@ -83,7 +85,7 @@ PLANES="${PLANES:-1}"
 THICKNESS="${THICKNESS:-2}"
 SUPERSAMPLE="${SUPERSAMPLE:-1}"
 WINDOW="${WINDOW:-}"
-PS_GPU="${PS_GPU:-1}"
+PS_GPU="${PS_GPU:-auto}"   # auto: resolved below, as run_ps_dtfe.sh resolves its PS_METAL (2026-10-13)
 PS_VOLUME_WEIGHTED="${PS_VOLUME_WEIGHTED:-1}"
 FORCE="${FORCE:-0}"
 DRY_RUN="${DRY_RUN:-0}"
@@ -99,6 +101,15 @@ if [ -n "${WINDOW}" ]; then
     fi
     plane_args+=(--u0 "${w_u0}" --u1 "${w_u1}" --v0 "${w_v0}" --v1 "${w_v1}")
 fi
+# PS_GPU=auto (the default, 2026-10-13): the GPU when the binary run_ps_dtfe.sh will run was built with one -- the
+# drivers' rule (config.sh gpu_build_default; DTFE_PRECISION picks the binary there too). It was 1 on every build,
+# so a CPU-only build was asked for the GPU (and fell back with a warning) on every snapshot.
+gpu_auto=""
+if [ "${PS_GPU}" = "auto" ]; then
+    case "${DTFE_PRECISION:-single}" in double) ps_bin="PS-DTFE-double" ;; *) ps_bin="PS-DTFE" ;; esac
+    PS_GPU="$(gpu_build_default "${REPO_ROOT}" "${ps_bin}")"
+    gpu_auto=" (PS_GPU unset: ${ps_bin} is $([ "${PS_GPU}" = "1" ] && echo "a GPU" || echo "a CPU-only") build)"
+fi
 gpu_args=(); [ "${PS_GPU}" = "1" ] && gpu_args=(-m)
 
 if [ -z "${SIMS:-}" ]; then
@@ -109,7 +120,7 @@ if [ -z "${SIMS:-}" ]; then
     done
 fi
 echo "Simulations:${SIMS}"
-echo "Slice: axis ${AXIS}, ${NU} px, centre ${CENTER:-box/2}, planes ${PLANES}$([ "${PLANES}" != "1" ] && echo " over ${THICKNESS} Mpc"), ${SUPERSAMPLE}x${SUPERSAMPLE} sub-samples${WINDOW:+, window ${WINDOW}}   Grid: ${GRID_SIZE}^3   GPU: ${PS_GPU}   vel-grad: ${PTS_VEL_GRAD}   force: ${FORCE}"
+echo "Slice: axis ${AXIS}, ${NU} px, centre ${CENTER:-box/2}, planes ${PLANES}$([ "${PLANES}" != "1" ] && echo " over ${THICKNESS} Mpc"), ${SUPERSAMPLE}x${SUPERSAMPLE} sub-samples${WINDOW:+, window ${WINDOW}}   Grid: ${GRID_SIZE}^3   GPU: ${PS_GPU}${gpu_auto}   vel-grad: ${PTS_VEL_GRAD}   force: ${FORCE}"
 
 run() { echo "+ $*"; [ "${DRY_RUN}" = "1" ] || "$@"; }
 
@@ -207,6 +218,18 @@ for sim in ${SIMS}; do
     else
         echo "-- reusing ${plane}.bin"
     fi
+    # The points a slice of THIS plane holds: planes x nv x nu x K^2 from its sidecar (K = 1 when the sidecar
+    # predates the option), else the plane file's own count (3 float64 per point). 2026-10-11: the file times
+    # alone took an older 4096^2 slice for current against an even older hires_plane_z8192 (TNG100, TNG300: the
+    # default NU 8192), so the compute was skipped and every render failed on the size mismatch.
+    plane_pts=""
+    if [ "${plane_new}" != "1" ]; then
+        plane_pts="$("${PY}" -c 'import json, sys
+s = json.load(open(sys.argv[1]))
+print(int(s.get("planes", 1)) * int(s["nv"]) * int(s["nu"]) * int(s.get("supersample", 1)) ** 2)' "${plane}.json" 2>/dev/null)" \
+            || plane_pts=""
+        [ -n "${plane_pts}" ] || plane_pts=$(( $(wc -c < "${plane}.bin") / 24 ))
+    fi
 
     # ---- grids + point evaluation, one triangulation per snapshot ------------------------
     # PS_METAL follows PS_GPU too: -m only switches the GPU ON, an exported PS_METAL=1 would otherwise leak in
@@ -235,6 +258,13 @@ for sim in ${SIMS}; do
         if [ "${PTS_VEL_GRAD}" = "1" ] && [ ! -f "${sd}/${PREFIX}.pts_velGrad" ]; then vg_ok=0; fi
         if [ "${FORCE}" != "1" ] && [ "${plane_new}" != "1" ] && [ "${vg_ok}" = "1" ] \
             && fresh "${sd}/${PREFIX}.pts_den" "${cf}" "${plane}.bin"; then
+            # newer than the plane is not enough: it must be a slice OF this plane (see plane_pts)
+            have_pts=$(( $(wc -c < "${sd}/${PREFIX}.pts_den") / 8 ))
+            if [ "${have_pts}" != "${plane_pts}" ]; then
+                echo "-- snap ${n}: ${PREFIX}.pts_den holds ${have_pts} points, the plane ${plane_pts}: a slice of another plane, recomputing"
+                compute+=("$n")
+                continue
+            fi
             rl="${sd}/${PREFIX}.runlog"
             want="$(printf '%s\n' "${planned}" | awk -F '\t' -v s="$(printf "%03d" "$n")" '$1 == s { print $2; exit }')"
             if [ ! -f "${rl}" ]; then

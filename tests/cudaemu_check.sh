@@ -12,7 +12,14 @@
 # Per warp width it runs, each with its own DTFE_TEST_TMP so the logs can be searched afterwards:
 #   dtfe_metal_check, gpu_scalar_check, ps_linear_deposit, ps_vertex_mass, ps_volume_weighted,
 #   ps_halo_release, ps_hidden_streams, ps_caustic_class, ps_nonperiodic_test.py, point_exact_serve,
-#   ps_window_check, ps_smoke_test, gpu_mass_check
+#   ps_window_check, ps_smoke_test, gpu_mass_check, gpu_retry_check (the chunk checkpoints + cause-aware
+#   retry the port gained from the Metal host on 2026-10-11, the per-cause retry counts, and the pace recovery
+#   after a clean stretch, R7), ps_mass_exact_check (2026-10-12: the host hands its fixed-point mass words to
+#   the CPU, which adds the deferred and released tetrahedra into them -- 56% of the tets deferred there),
+#   dtfe_gpu_retry_check (2026-10-13: the standard-DTFE host dtfe_gpu_cuda.cu with the same retry policy and
+#   its exact fixed-point '_a' sums -- two runs byte-identical, a faulted run byte-identical to a clean one),
+#   ps_fixed_moments_check (2026-10-14: every moment grid of the port is an exact fixed-point sum too --
+#   addMoment in ps_gpu_cuda.cu -- two runs with other chunk sizes byte-identical in every grid)
 # and its own check of the fixed-point mass grid the port gained on 2026-10-11 (depositMass in
 # ps_gpu_cuda.cu, the Metal kernel's since 2026-10-08):
 #   E1  two --ps-gpu runs write byte-identical '.a_den' (one domain, and --partition 2 2 2
@@ -25,9 +32,8 @@
 # ("CPU emulation of the CUDA backend, <W>-lane warps") is marked PASS* -- informational for most (several
 # suites run at --verbose 1 or discard their logs; their own CPU-vs-GPU assertions and fallback greps still
 # ran), a failure for those in CUDAEMU_GPU_REQUIRED, whose logs always carry the device line.
-# Known hollow spots (2026-10-11): gpu_mass_check.sh SKIPs any non-Metal build and ps_nonperiodic_test.py
-# adds its GPU variants only for METAL=1/CUDA=1/HIP=1 build modes, so under CUDAEMU=1 both run no GPU
-# deposit until their gates learn the emulated build (E1-E3 below cover the mass grid meanwhile).
+# The gates of gpu_mass_check.sh, gpu_retry_check.sh and ps_nonperiodic_test.py accept the emulated build
+# (2026-10-11; the hollow spots of before are closed), so each runs its GPU deposits here.
 #
 # The time-aware auto-tuner splits small runs into 2^3 partitions when it predicts a speed gain, and its
 # prediction depends on the core count: on a 4- or 8-core Linux machine the CPU REFERENCE runs of
@@ -64,9 +70,10 @@ mkdir -p "$BASE"
 WARPS="${CUDAEMU_WARPS:-32 64}"
 ALL_SUITES="mass dtfe_metal_check gpu_scalar_check ps_linear_deposit_check ps_vertex_mass_check
 ps_volume_weighted_check ps_halo_release_check ps_hidden_streams_check ps_caustic_class_check
-ps_nonperiodic_test point_exact_serve_check ps_window_check ps_smoke_test gpu_mass_check"
+ps_nonperiodic_test point_exact_serve_check ps_window_check ps_smoke_test gpu_mass_check gpu_retry_check
+ps_mass_exact_check dtfe_gpu_retry_check ps_fixed_moments_check"
 SUITES="${CUDAEMU_SUITES:-$ALL_SUITES}"
-REQUIRED="${CUDAEMU_GPU_REQUIRED:-mass dtfe_metal_check ps_window_check}"
+REQUIRED="${CUDAEMU_GPU_REQUIRED:-mass dtfe_metal_check ps_window_check gpu_retry_check ps_mass_exact_check dtfe_gpu_retry_check ps_fixed_moments_check}"
 # suites that run the CPU path only by design (the smoke test) are never reported NO-GPU
 CPU_ONLY="ps_smoke_test"
 
@@ -143,7 +150,7 @@ for W in $WARPS; do
         if [ "$rc" -ne 0 ]; then status=FAIL
         elif grep -q "^SKIP" "$T/stdout.txt"; then status=SKIP
         elif [ "$s" = ps_nonperiodic_test ] && ! grep -q " GPU " "$T/stdout.txt"; then
-            status="PASS (CPU only)"       # its GPU variants need a METAL/CUDA/HIP build-mode stamp
+            status="PASS (CPU only)"       # its GPU variants did not run (a build-mode stamp without a GPU backend)
         elif [ "$ngpu" -eq 0 ] && ! [[ " $CPU_ONLY " == *" $s "* ]]; then
             status="PASS*"
             [[ " $REQUIRED " == *" $s "* ]] && status="FAIL (no emulated GPU run)"

@@ -2,8 +2,9 @@
 
 Each distinct well-resolved void (the profile / abundance sample, catalog.distinct_mask: the FOLLOWED voids) of
 every snapshot of the ladder is linked to the voids of the next one by its MATTER (dtfelib.lagrangian): its member
-particles -- those within R_v of its centre -- are found again by ParticleID, and the voids holding them there are
-its descendants. The descendants are drawn from EVERY minimum of the next catalogue with a usable radius (2026-10-11,
+particles -- those within R_v of its centre, at most lagrangian.FATE_MAX_SIGMA (15) smoothing lengths (2026-10-11:
+the R_v search reaches 24 since, the membership spheres stay at the 15 the census was made with) -- are found again
+by ParticleID, and the voids holding them there are its descendants. The descendants are drawn from EVERY minimum of the next catalogue with a usable radius (2026-10-11,
 lagrangian.void_pool; the followed ones with their R_v), not from the followed ones alone: at z = 0 those are a fifth
 of the minima, and the morning's census counted a void whose matter sat in an unfollowed minimum as vanished.
 Classes (Lagrangian linking, lagrangian.py's constants): SURVIVE (>= 50% of the members in one followed descendant),
@@ -25,8 +26,9 @@ Outputs (figures/void_fate/<sim>/):
                     followed one
   fate_census.npz   the per-interval class counts, the chained survival and the direct --ref-snap -> last link
 The per-interval links (shared-particle contingency tables) are cached in the pipeline cache
-(<sim>_<method>_fate_<a>_<b>.npz, rebuilt when either catalogue's voids changed, and once for the descendant pool:
-lagrangian.LINK_VERSION); the classes are taken at plot
+(<sim>_<method>_fate_<a>_<b>.npz, rebuilt when either catalogue's voids or R_v settings changed -- the catalogue's
+own r_v_settings record, 2026-10-11 -- and once for the descendant pool: lagrangian.LINK_VERSION); the classes are
+taken at plot
 time, so a changed lagrangian.SURVIVE_FRAC / SPLIT_FRAC needs no particle read. Those names are PS-DTFE's default
 grids; another estimator or --prefix adds '_<method>' / '_<prefix>', --exclusive '_exclusive' (each particle in one
 void only: the nearest centre in R_v units; the default follows C6, overlapping spheres share particles), a
@@ -114,22 +116,31 @@ def census(snaps, args, tag):
     intervals = []
     ref = next((s for s in snaps if s.snap == args.ref_snap), None)
     direct_wanted = ref is not None and ref is not snaps[-1]
-    for a, b in zip(snaps[:-1], snaps[1:]):
-        print(f"  link snap {a.snap} -> {b.snap}", flush=True)
-        lk = L.cached_link(a, b, tag)
-        fate = L.classify(lk)
-        intervals.append((a, b, lk, fate))
-        a.drop_members(keep_prog=a is ref)        # the reference snapshot's progenitors are kept for the direct link
-        if not (b is snaps[-1] and direct_wanted):
-            b.drop_members(keep_prog=True)        # its pool has served; as the next progenitor only its followed voids
     direct = None
-    if direct_wanted:
-        print(f"  direct link snap {ref.snap} -> {snaps[-1].snap}", flush=True)
-        lk = L.cached_link(ref, snaps[-1], tag)
-        direct = (ref, snaps[-1], lk, L.classify(lk))
+    for a, b in zip(snaps[:-1], snaps[1:]):
+        last = b is snaps[-1]
+        # the last snapshot's pool is streamed ONCE for both of its links (2026-10-11: the pool is no longer held
+        # between them); its own followed members are never needed (no next interval)
+        progs = [a] + ([ref] if last and direct_wanted and ref is not a else [])
+        print(f"  link snap {a.snap} -> {b.snap}" + (f" (and the direct link {ref.snap} -> {b.snap})"
+                                                       if len(progs) > 1 else ""), flush=True)
+        lks = L.cached_links(progs, b, tag, keep_prog=not last)
+        fate = L.classify(lks[0])
+        intervals.append((a, b, lks[0], fate))
+        if last and direct_wanted:
+            lk = lks[-1]
+            direct = (ref, b, lk, fate if lk is lks[0] and ref is a else L.classify(lk))
+        a.drop_members(keep_prog=a is ref)        # the reference snapshot's progenitors are kept for the direct link
+        b.drop_members(keep_prog=not last)        # as the next progenitor only its followed voids
     for s in snaps:
         s.drop_members()
     return intervals, direct
+
+
+def r_v_mpc(a):
+    """The followed voids' MEASURED R_v in Mpc (the catalogue's), for the table and the figure: a.radii are the
+    membership spheres, capped at lagrangian.FATE_MAX_SIGMA smoothing lengths (2026-10-11), not the void's size."""
+    return np.asarray(a.cat["r_v_cells"], dtype=np.float64)[a.rows] * float(a.cell)
 
 
 def write_table(intervals, ztab, path, exclusive=False):
@@ -138,7 +149,8 @@ def write_table(intervals, ztab, path, exclusive=False):
             "f_sample", "n_split")
     with open(path, "w") as f:
         f.write(f"# void fate per interval (plot_void_fate.py, {time.strftime('%Y-%m-%d')}); SURVIVE_FRAC "
-                f"{L.SURVIVE_FRAC}, SPLIT_FRAC {L.SPLIT_FRAC}; members = particles within R_v of the centre"
+                f"{L.SURVIVE_FRAC}, SPLIT_FRAC {L.SPLIT_FRAC}; members = particles within R_v of the centre, at "
+                f"most {L.FATE_MAX_SIGMA:g} smoothing lengths (r_v_mpc: the catalogue's R_v, uncapped)"
                 f"{' (exclusive: each to its nearest centre in R_v units)' if exclusive else ''}; "
                 f"row / desc_row = pipeline catalogue rows (desc_row: any minimum of the next catalogue with a usable "
                 f"radius; desc_in_sample 1 = a followed void, 0 = not, -1 = no descendant); desc_n_main = progenitors "
@@ -146,14 +158,15 @@ def write_table(intervals, ztab, path, exclusive=False):
                 f"over every void, f_sample = the largest in a followed void; enclosed_delta = members / mean - 1\n")
         f.write(",".join(cols) + "\n")
         for a, b, lk, fate in intervals:
-            vol = 4.0 / 3.0 * np.pi * a.radii ** 3
+            vol = 4.0 / 3.0 * np.pi * a.radii ** 3          # the membership sphere: what the members fill
+            rv_a = r_v_mpc(a)
             for k, row in enumerate(a.rows):
                 pos = (a.cat["coords"][row] + 0.5) * a.cell
                 nm = int(lk.n_prog_members[k])
                 d = fate["desc"][k]
                 enc = nm / (a.n_particles * vol[k]) - 1.0 if a.n_particles else np.nan
                 vals = (a.snap, f"{ztab.get(a.snap, np.nan):.4f}", b.snap, f"{ztab.get(b.snap, np.nan):.4f}", int(row),
-                        *(f"{v:.4f}" for v in pos), f"{a.radii[k] * a.box:.4f}",
+                        *(f"{v:.4f}" for v in pos), f"{rv_a[k]:.4f}",
                         f"{float(a.cat['delta_values'][row]):.4f}", nm, f"{enc:.4f}", L.CLASSES[fate["cls"][k]],
                         int(b.pool_rows[d]) if d >= 0 else -1, int(fate["in_sample"][k]) if d >= 0 else -1,
                         int(fate["n_main"][k]), f"{fate['f_desc'][k]:.4f}", f"{fate['f_max'][k]:.4f}",
@@ -198,7 +211,7 @@ def plot_census(intervals, direct, chain, ztab, args, path):
     ax.legend(fontsize=9)
 
     sig = pipeline.smoothing_length_mpc()
-    rv = np.concatenate([a.radii * a.box / sig for a, _b, _l, _f in intervals])
+    rv = np.concatenate([r_v_mpc(a) / sig for a, _b, _l, _f in intervals])     # the measured R_v, not the cap
     dc = np.concatenate([np.asarray(a.cat["delta_values"], float)[a.rows] for a, _b, _l, _f in intervals])
     cls = np.concatenate([f["cls"] for _a, _b, _l, f in intervals])
     for ax, x, edges, xlab in ((axes[1, 0], rv, np.geomspace(max(np.nanmin(rv), 1e-3), np.nanmax(rv) * 1.0001, 8)

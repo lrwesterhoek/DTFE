@@ -24,9 +24,11 @@
 
 #include "gpu_host.h"
 #include "ps_deposit_params.h"
+#include "ps_mass_audit.h"     // PS_MASS_AUDIT=1: the fixed-point grid's exact total
 #include "ps_deposit_msl.h"   // generated: static const char PS_DEPOSIT_MSL[]
 #include <atomic>
 extern std::atomic<int> psGpuRetries;   // ps_interpolation.cc (run_progress.h)
+extern std::atomic<int> psGpuRetriesByCause[4];   // ... by cause: innocent, timeout, oom, other (2026-10-11)
 #include "../message.h"       // ANSI colour helpers only (retry warning below)
 
 namespace {
@@ -101,142 +103,20 @@ std::string gpuDeviceName()
 // three failures in a row sent it to the CPU. Now every pass keeps a snapshot of the buffers its kernel writes
 // (the accumulator grids, the exact items' sumW, the per-tet masses the kernel negates when it defers a tet),
 // taken at the pass's start and every DTFE_GPU_CHECKPOINT_CHUNKS chunks; a failed buffer (which may have
-// deposited part or all of its atomics) restores the last snapshot and continues from its chunk.
+// deposited part or all of its atomics) restores the last snapshot and continues from its chunk. The policy's
+// pieces (GpuFault, the pace, the fault hook, GpuSnapshot) live in gpu_metal_retry.h since 2026-10-13, shared
+// with the standard-DTFE host (dtfe_metal_host.cc); the pass loop is psGpuDepositFields' runChunked below.
 namespace {
 
-// What a failed command buffer says about its cause. Both watchdog flavours share Metal's Timeout code (2), so
-// the description is read first:
-//   Victim    "Innocent Victim": another process's buffer hung the GPU and ours was collateral -> retry at
-//             once at the same pace (slowing down would only cost time, our buffers were not the problem)
-//   Watchdog  "Impacting Interactivity" / a GPU timeout: our buffers starved the display -> shorter buffers,
-//             wider gaps (the pacing the chunking exists for)
-//   Resource  out of memory, page fault, invalid resource, internal: escalate as for the watchdog and let the
-//             system settle 2 s first
-//   Fatal     device removed / not permitted / access revoked: no retry can help -> straight to the CPU
-enum class GpuFault { Victim, Watchdog, Resource, Fatal };
+#include "gpu_metal_retry.h"
 
-char const* gpuFaultName(GpuFault f)
+// the run's retry counters (ps_interpolation.cc's), by gpuRetryCause's index
+void countGpuRetry(GpuFault f, long code, std::string const& desc)
 {
-    switch (f)
-    {
-        case GpuFault::Victim:   return "innocent victim";
-        case GpuFault::Watchdog: return "watchdog";
-        case GpuFault::Resource: return "resource";
-        default:                 return "fatal";
-    }
+    int const k = gpuRetryCause(f, code, desc);
+    ++psGpuRetries;
+    ++psGpuRetriesByCause[k];
 }
-
-GpuFault classifyGpuFault(long code, std::string const& desc)
-{
-    auto has = [&](char const* s) { return desc.find(s) != std::string::npos; };
-    if (has("Innocent Victim") || has("InnocentVictim")) return GpuFault::Victim;
-    if (has("Impacting Interactivity") || has("ImpactingInteractivity") || has("Timeout")
-        || code == long(MTL::CommandBufferErrorTimeout)) return GpuFault::Watchdog;
-    if (code == long(MTL::CommandBufferErrorDeviceRemoved) || code == long(MTL::CommandBufferErrorNotPermitted)
-        || code == long(MTL::CommandBufferErrorAccessRevoked)) return GpuFault::Fatal;
-    return GpuFault::Resource;
-}
-
-// The dispatch pace, kept for the rest of the PROCESS once escalated (as dtfe_metal_host.cc's ChunkState does
-// per run): a machine whose display load killed one partition's buffers will kill the next one's at the same
-// pace. Guarded by ctxMutex (only touched inside psGpuDepositFields).
-struct GpuPace { double targetSec = 0.25; useconds_t gapUs = 8000; };
-GpuPace& gpuPace() { static GpuPace p; return p; }
-
-// The test hook DTFE_GPU_FAULT_AT=<k>[:<kind>]: the k-th command buffer of the PROCESS (1-based, counted over
-// every pass and partition; buffers that failed for real are not counted) runs to completion -- its atomics ARE deposited, the worst case of a buffer killed
-// late -- and is then reported as failed, so only a correct restore keeps the grids exact. Kinds: 'innocent'
-// (default), 'timeout', 'oom', and 'persist' (every buffer from the k-th on fails as an innocent victim: the
-// retry policy must then give the partition to the CPU). One-shot except 'persist'.
-struct GpuFaultHook { long at = 0; std::string kind = "innocent"; long count = 0; bool fired = false; };
-GpuFaultHook& gpuFaultHook()
-{
-    static GpuFaultHook h = [] {
-        GpuFaultHook r;
-        if (const char* env = getenv("DTFE_GPU_FAULT_AT"))
-        {
-            r.at = atol(env);
-            if (const char* colon = strchr(env, ':')) r.kind = colon + 1;
-        }
-        return r;
-    }();
-    return h;
-}
-
-// true (and the injected error's description in 'desc', its code in 'code') when this buffer is to fail
-bool gpuFaultInjected(std::string& desc, long& code)
-{
-    GpuFaultHook& h = gpuFaultHook();
-    if (h.at <= 0) return false;
-    ++h.count;
-    bool const persist = h.kind == "persist";
-    if (h.count < h.at || (h.fired && !persist)) return false;
-    h.fired = true;
-    code = 0;
-    if (h.kind == "timeout")  { desc = "injected fault (DTFE_GPU_FAULT_AT): Impacting Interactivity"; code = long(MTL::CommandBufferErrorTimeout); }
-    else if (h.kind == "oom") { desc = "injected fault (DTFE_GPU_FAULT_AT): out of memory"; code = long(MTL::CommandBufferErrorOutOfMemory); }
-    else desc = std::string("injected fault (DTFE_GPU_FAULT_AT") + (persist ? ", persistent" : "") + "): Innocent Victim";
-    return true;
-}
-
-// One snapshot of a set of buffers, host-side. A buffer known to be all zeros is recorded as such (no copy):
-// the first pass's grids at its start, so a short deposit never allocates the spare copy at all.
-struct GpuSnapshot
-{
-    struct Blob { std::unique_ptr<char[]> p; size_t n = 0; bool zero = false; };
-    std::vector<MTL::Buffer*> bufs;
-    std::vector<Blob> blobs;
-    size_t start = 0;      // the pass's first thread NOT yet covered by the snapshot
-    bool   valid = false;
-    int    taken = 0;      // periodic snapshots (not the pass-start ones)
-    double sec   = 0.;     // time spent copying
-    size_t bytes = 0;      // largest snapshot held
-
-    // copies every buffer (zeroMask[i]: buffer i is known zero, not copied); false when the host memory for the
-    // spare copy is not there (the caller then runs without checkpoints)
-    bool take(std::vector<MTL::Buffer*> const& bs, std::vector<bool> const& zeroMask, size_t at)
-    {
-        auto const t0 = std::chrono::steady_clock::now();
-        if (blobs.size() < bs.size()) blobs.resize(bs.size());
-        // allocate everything BEFORE copying anything: a failed allocation leaves the previous snapshot whole
-        for (size_t i = 0; i < bs.size(); ++i)
-        {
-            Blob& b = blobs[i];
-            size_t const n = bs[i]->length();
-            if ((i < zeroMask.size() && zeroMask[i]) || (b.p && b.n >= n)) continue;
-            b.p.reset(new (std::nothrow) char[n]);
-            b.n = b.p ? n : 0;
-            if (!b.p) return false;
-        }
-        bufs = bs;
-        size_t held = 0;
-        for (size_t i = 0; i < bs.size(); ++i)
-        {
-            Blob& b = blobs[i];
-            b.zero = i < zeroMask.size() && zeroMask[i];
-            if (b.zero) continue;
-            size_t const n = bs[i]->length();
-            std::memcpy(b.p.get(), bs[i]->contents(), n);
-            held += n;
-        }
-        start = at;
-        valid = true;
-        bytes = std::max(bytes, held);
-        sec += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        return true;
-    }
-    void restore()
-    {
-        auto const t0 = std::chrono::steady_clock::now();
-        for (size_t i = 0; i < bufs.size(); ++i)
-        {
-            size_t const n = bufs[i]->length();
-            if (blobs[i].zero) std::memset(bufs[i]->contents(), 0, n);
-            else std::memcpy(bufs[i]->contents(), blobs[i].p.get(), n);
-        }
-        sec += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    }
-};
 
 } // namespace
 
@@ -251,6 +131,7 @@ bool psGpuDepositFields(std::vector<float>& verts,
                           int nSub, bool periodic,
                           bool fVel, bool fDisp, bool fGrad, bool fLinear,
                           bool fVolW, bool fCaustic, bool fExact, bool fScal, bool fSGrad, bool windowMode,
+                          double massExtra, PSFixedUnits const& fxUnits,
                           PSGpuGrids& out, std::vector<uint32_t>& deferred, std::string& err)
 {
     std::lock_guard<std::mutex> lock(ctxMutex());   // serialize dispatches (single queue)
@@ -258,33 +139,74 @@ bool psGpuDepositFields(std::vector<float>& verts,
     if (!c.ready) { err = c.err; return false; }
 
     // only the requested moment grids are allocated, host- and device-side: the m2 (24 B/cell)
-    // and grad (36 B/cell) grids dominate the deposit's footprint and most runs need neither
+    // and grad (36 B/cell) grids dominate the deposit's footprint and most runs need neither.
+    // A grid the caller gave a fixed-point unit (fxUnits, 2026-10-14) is a 64-bit integer sum: 8 B per component
+    // in place of the float's 4, bound at its float index AND at its word index (22 + slot, ps_deposit.metal).
     size_t const nCell = subDims[0] * subDims[1] * subDims[2];
-    size_t const momBytes  = fVel  ? nCell * 12 : 4;
-    size_t const m2Bytes   = fDisp ? nCell * 24 : 4;
-    size_t const gradBytes = fGrad ? nCell * 36 : 4;
-    size_t const momwBytes  = fVolW    ? nCell * 4 : 4;
-    size_t const caustBytes = fCaustic ? nCell * 4 : 4;
-    size_t const svBytes    = fExact   ? nCell * 4 : 4;
     bool   const fDispOwn   = fVolW && fDisp;   // dispersion keeps its own mass-weighted mean+normalizer
-    size_t const dvBytes    = fDispOwn ? nCell * 12 : 4;
-    size_t const dwBytes    = fDispOwn ? nCell * 4  : 4;
-    size_t const scalBytes  = fScal  ? nCell * 4  : 4;
-    size_t const sgBytes    = fSGrad ? nCell * 12 : 4;
-    out.mass.assign(nCell, 0.f);
-    out.mom.assign(fVel ? nCell * 3 : 0, 0.f);
-    out.m2.assign(fDisp ? nCell * 6 : 0, 0.f);
-    out.grad.assign(fGrad ? nCell * 9 : 0, 0.f);
+    bool const sel[PS_FX_N] = { fVel, fDisp, fGrad, fVolW, fExact, fDispOwn, false, fScal, fSGrad };
+    bool fxOn[PS_FX_N];
+    uint32_t fxMask = 0;
+    for (int g = 0; g < PS_FX_N; ++g)
+    {
+        fxOn[g] = sel[g] && fxUnits.scale[g] > 0.f;
+        if (fxOn[g]) fxMask |= 1u << g;
+    }
+    auto gridBytes4 = [&](int g, size_t comps) -> size_t { return sel[g] ? nCell * comps * (fxOn[g] ? 8 : 4) : 4; };
+    size_t const momBytes  = gridBytes4(PS_FX_MOM, 3);
+    size_t const m2Bytes   = gridBytes4(PS_FX_M2, 6);
+    size_t const gradBytes = gridBytes4(PS_FX_GRAD, 9);
+    size_t const momwBytes  = gridBytes4(PS_FX_MOMW, 1);
+    size_t const caustBytes = fCaustic ? nCell * 4 : 4;
+    size_t const svBytes    = gridBytes4(PS_FX_SV, 1);
+    size_t const dvBytes    = gridBytes4(PS_FX_DV, 3);
+    size_t const scalBytes  = gridBytes4(PS_FX_SCAL, 1);
+    size_t const sgBytes    = gridBytes4(PS_FX_SG, 3);
+    // the mass grid as an exact 64-bit fixed-point sum (2026-10-08; DepositParams.massFixed in the kernel
+    // says why). PS_METAL_FLOAT_MASS=1 keeps the float atomics of before, for comparison. The unit covers the
+    // caller's own deposits too (massExtra, 2026-10-12): it adds the deferred and released tets into these words.
+    float massScale = 1.f;
+    bool massFixed = false;
+    {
+        double totalMass = massExtra > 0. ? massExtra : 0.;
+        for (float const mt : masses) totalMass += double(mt);
+        bool const floatMass = getenv("PS_METAL_FLOAT_MASS") && atoi(getenv("PS_METAL_FLOAT_MASS")) != 0;
+        massFixed = !floatMass && psMassFixedScale(totalMass, massScale);
+    }
+    // the dispersion's own normalizer sums exactly the mass grid's shares: with both exact it is not deposited
+    // at all (the caller reads the mass words; PSGpuGrids::dispwIsMass), else the float atomics of before
+    bool const dispwIsMass = fDispOwn && massFixed && fxUnits.scale[PS_FX_DW] > 0.f;
+    if (dispwIsMass) fxMask |= 1u << PS_FX_DW;
+    size_t const dwBytes    = (fDispOwn && !dispwIsMass) ? nCell * 4 : 4;
+    bool const sumWFixed = fExact && fxUnits.sumW;
+    if (sumWFixed) fxMask |= PS_FX_SUMW_BIT;
+    out.dispwIsMass = dispwIsMass;
+    for (int g = 0; g < PS_FX_N; ++g) { out.fx[g].clear(); out.fxScale[g] = fxOn[g] ? fxUnits.scale[g] : 0.f; }
+    // fixed point: the words are handed over as they are (out.massFx, filled from the device grid at the end;
+    // 'mass' stays empty), else the float grid
+    out.mass.assign(massFixed ? 0 : nCell, 0.f);
+    out.massFx.clear();
+    out.massScale = massFixed ? massScale : 0.f;
+    // a fixed-point grid comes back as words (out.fx[g]) and leaves its float vector EMPTY
+    out.mom.assign(fVel && !fxOn[PS_FX_MOM] ? nCell * 3 : 0, 0.f);
+    out.m2.assign(fDisp && !fxOn[PS_FX_M2] ? nCell * 6 : 0, 0.f);
+    out.grad.assign(fGrad && !fxOn[PS_FX_GRAD] ? nCell * 9 : 0, 0.f);
     out.streams.assign(nCell, 0u);
-    out.momw.assign(fVolW ? nCell : 0, 0.f);
+    out.momw.assign(fVolW && !fxOn[PS_FX_MOMW] ? nCell : 0, 0.f);
     out.caustic.assign(fCaustic ? nCell : 0, 0u);
-    out.streamvol.assign(fExact ? nCell : 0, 0.f);
-    out.dispvel.assign(fDispOwn ? nCell * 3 : 0, 0.f);
-    out.dispw.assign(fDispOwn ? nCell : 0, 0.f);
-    out.scal.assign(fScal ? nCell : 0, 0.f);
-    out.sgrad.assign(fSGrad ? nCell * 3 : 0, 0.f);
+    out.streamvol.assign(fExact && !fxOn[PS_FX_SV] ? nCell : 0, 0.f);
+    out.dispvel.assign(fDispOwn && !fxOn[PS_FX_DV] ? nCell * 3 : 0, 0.f);
+    out.dispw.assign(fDispOwn && !dispwIsMass ? nCell : 0, 0.f);
+    out.scal.assign(fScal && !fxOn[PS_FX_SCAL] ? nCell : 0, 0.f);
+    out.sgrad.assign(fSGrad && !fxOn[PS_FX_SG] ? nCell * 3 : 0, 0.f);
+    static size_t const fxComps[PS_FX_N] = { 3, 6, 9, 1, 1, 3, 1, 1, 3 };
     deferred.clear();
-    if (masses.empty()) return true;    // nothing to deposit (empty partition)
+    if (masses.empty())                 // nothing to deposit (empty partition; the caller may still add released tets)
+    {
+        if (massFixed) out.massFx.assign(nCell, 0);
+        for (int g = 0; g < PS_FX_N; ++g) if (fxOn[g]) out.fx[g].assign(nCell * fxComps[g], 0);
+        return true;
+    }
     if (verts.size() != masses.size() * size_t(PS_TET_STRIDE))
     {
         err = "tet record size mismatch (verts must hold PS_TET_STRIDE floats per tet)";
@@ -313,17 +235,10 @@ bool psGpuDepositFields(std::vector<float>& verts,
     P.fScal    = (fScal  && not scal.empty()) ? 1 : 0;
     P.fSGrad   = (fSGrad && not scal.empty()) ? 1 : 0;
     P.windowMode = windowMode ? 1 : 0;
-    // the mass grid as an exact 64-bit fixed-point sum (2026-10-08; DepositParams.massFixed in the kernel
-    // says why). PS_METAL_FLOAT_MASS=1 keeps the float atomics of before, for comparison.
-    {
-        double totalMass = 0.;
-        for (float const mt : masses) totalMass += double(mt);
-        float scale = 1.f;
-        bool const floatMass = getenv("PS_METAL_FLOAT_MASS") && atoi(getenv("PS_METAL_FLOAT_MASS")) != 0;
-        P.massFixed = (!floatMass && psMassFixedScale(totalMass, scale)) ? 1 : 0;
-        P.massScale = scale;
-    }
-    bool const massFixed = P.massFixed != 0;
+    P.massFixed = massFixed ? 1 : 0;   // (the unit is chosen above)
+    P.massScale = massScale;
+    P.fxMask = fxMask;                 // the moment grids' fixed-point sums (the caller's units, above)
+    for (int g = 0; g < PS_FX_N; ++g) P.fxScale[g] = fxOn[g] ? fxUnits.scale[g] : 0.f;
     size_t const massBytes   = massFixed ? 4 : nCell * 4;   // the float grid (buffer 3), else a dummy
     size_t const massFxBytes = massFixed ? nCell * 8 : 4;   // the fixed-point grid (buffer 21), else a dummy
 
@@ -427,6 +342,9 @@ bool psGpuDepositFields(std::vector<float>& verts,
     // allocated at the first checkpoint and held until the partition's deposit returns.
     long ckChunks = -1;
     if (const char* env = getenv("DTFE_GPU_CHECKPOINT_CHUNKS")) { ckChunks = atol(env); if (ckChunks < 0) ckChunks = 0; }
+    // DTFE_GPU_PACE_RECOVER_SEC=<s>: the clean GPU work after which an escalated pace steps back (GpuPace above)
+    double paceRecoverSec = 90.;
+    if (const char* env = getenv("DTFE_GPU_PACE_RECOVER_SEC")) { double v = atof(env); if (v >= 0.) paceRecoverSec = v; }
     std::vector<MTL::Buffer*> const gridBufs = { bMass, bMassFx, bMom, bM2, bGrad, bStr, bMomW, bCaust, bSV, bDV, bDW, bScal, bSG };
     GpuSnapshot snap;
     int nFailed = 0, nResumedCk = 0;   // failed buffers of this deposit, and how many resumed from a periodic checkpoint
@@ -486,9 +404,9 @@ bool psGpuDepositFields(std::vector<float>& verts,
 
             if (failed)
             {
-                ++psGpuRetries;   // the run's progress sidecar counts every failed buffer (run_progress.h)
                 ++nFailed;
                 GpuFault const cause = classifyGpuFault(code, desc);
+                countGpuRetry(cause, code, desc);   // the run's counters count every failed buffer (run_progress.h)
                 lastErr = std::string("Metal command buffer failed: ") + desc + " [" + gpuFaultName(cause) + "]";
                 failsHere = (failsHere > 0 && start < failEnd) ? failsHere + 1 : 1;
                 failEnd = std::max(failEnd, start + n);
@@ -503,6 +421,7 @@ bool psGpuDepositFields(std::vector<float>& verts,
                 {   // escalate (for the rest of the process): 4x shorter buffers, wider gaps, smaller chunk
                     pace.targetSec = std::max(pace.targetSec / 4.0, 0.02);
                     pace.gapUs     = std::min(pace.gapUs * 3, useconds_t(50000));
+                    pace.cleanSec  = 0.;
                     chunk = std::max(chunk / 4, minChunk);
                     baseChunk = std::max(baseChunk / 2, MIN_CHUNK);
                 }
@@ -532,6 +451,19 @@ bool psGpuDepositFields(std::vector<float>& verts,
                 if (scale > 4.0) scale = 4.0;
                 chunk = std::min(std::max(size_t(double(chunk) * scale), minChunk), MAX_CHUNK);
             }
+            if (pace.targetSec < GPU_PACE_TARGET0 || pace.gapUs > GPU_PACE_GAP0)
+            {   // an escalated pace steps back after a clean stretch of GPU work (GpuPace above)
+                pace.cleanSec += el + pace.gapUs / 1e6;
+                if (pace.cleanSec >= paceRecoverSec)
+                {
+                    pace.targetSec = std::min(pace.targetSec * 4.0, GPU_PACE_TARGET0);
+                    pace.gapUs     = std::max(pace.gapUs / 3, GPU_PACE_GAP0);
+                    fprintf(stderr, "PS-DTFE Metal: %.0f s of GPU work without a fault -- pace eased to %.0f ms "
+                                    "buffers, %.0f ms gaps%s\n", pace.cleanSec, pace.targetSec * 1e3, pace.gapUs / 1e3,
+                            pace.targetSec >= GPU_PACE_TARGET0 && pace.gapUs <= GPU_PACE_GAP0 ? " (the default)" : "");
+                    pace.cleanSec = 0.;
+                }
+            }
             long const every = ckChunks >= 0 ? ckChunks : std::max(1L, long(std::lround(10.0 / pace.targetSec)));
             if (ckOn && every > 0 && long(sinceCk) >= every && start < nThreads)
             {   // the queue is drained (waitUntilCompleted above): the buffers hold exactly [0, start)
@@ -545,6 +477,20 @@ bool psGpuDepositFields(std::vector<float>& verts,
                     pso == c.psoItems ? "depositExactItems" : "depositFields", nThreads, nBuf, busy,
                     std::chrono::duration<double>(std::chrono::steady_clock::now() - tRun).count());
         return true;
+    };
+
+    // the moment grids' word views (2026-10-14): each fixed-point grid's buffer again at 22 + its slot, where the
+    // kernel reads it as two uint words per component (a float grid's slot gets the same buffer; unused there)
+    auto bindWords = [&](MTL::ComputeCommandEncoder* enc)
+    {
+        enc->setBuffer(bMom,  0, 22);
+        enc->setBuffer(bM2,   0, 23);
+        enc->setBuffer(bGrad, 0, 24);
+        enc->setBuffer(bMomW, 0, 25);
+        enc->setBuffer(bSV,   0, 26);
+        enc->setBuffer(bDV,   0, 27);
+        enc->setBuffer(bScal, 0, 28);
+        enc->setBuffer(bSG,   0, 29);
     };
 
     // depositFields over the tets [0,nT) of the given records. The grids are bound whole; the
@@ -578,6 +524,7 @@ bool psGpuDepositFields(std::vector<float>& verts,
             enc->setBuffer(bScal, 0, 19);
             enc->setBuffer(bSG,   0, 20);
             enc->setBuffer(bMassFx, 0, 21);
+            bindWords(enc);
         });
     };
 
@@ -639,7 +586,8 @@ bool psGpuDepositFields(std::vector<float>& verts,
             fprintf(stderr, "PS-DTFE Metal: exact items: %zu tets, %zu items of %u cells, window bound %.3g cells\n",
                     nTetTotal, nItems, blockCells, total);
         bItems = c.dev->newBuffer(std::max<size_t>(nItems, 1) * 2 * sizeof(uint32_t), MTL::ResourceStorageModeShared);
-        bSumW  = c.dev->newBuffer(std::max<size_t>(nTetTotal, 1) * sizeof(float), MTL::ResourceStorageModeShared);
+        // the per-tet weight totals: a float each, or (sumWFixed, 2026-10-14) two uint words in the tet's own unit
+        bSumW  = c.dev->newBuffer(std::max<size_t>(nTetTotal, 1) * (sumWFixed ? 8 : sizeof(float)), MTL::ResourceStorageModeShared);
         if (!bItems || !bSumW)
         {
             // too big for GPU-visible memory: the one-thread-per-tet kernel still works
@@ -691,6 +639,8 @@ bool psGpuDepositFields(std::vector<float>& verts,
             enc->setBuffer(bScal, 0, 19);
             enc->setBuffer(bSG,   0, 20);
             enc->setBuffer(bMassFx, 0, 21);
+            bindWords(enc);
+            enc->setBuffer(bSumW, 0, 30);   // the same buffer as 16: its words when sumWFixed
         });
     };
 
@@ -705,9 +655,10 @@ bool psGpuDepositFields(std::vector<float>& verts,
     {
         float* mb = static_cast<float*>(bM->contents());
         float const* sw = static_cast<float const*>(bSumW->contents());
+        int64_t const* swx = static_cast<int64_t const*>(bSumW->contents());   // (sumWFixed: the words, little-endian)
         std::vector<uint32_t> left;
         for (size_t t = 0; t < nTetTotal; ++t)
-            if (mb[t] > 0.f && !(sw[t] > 0.f)) left.push_back(uint32_t(t));
+            if (mb[t] > 0.f && !(sumWFixed ? swx[t] > 0 : sw[t] > 0.f)) left.push_back(uint32_t(t));
         if (left.empty()) return true;
         size_t const nL = left.size();
         bool const compact = nL <= nTetTotal / 16;
@@ -756,7 +707,7 @@ bool psGpuDepositFields(std::vector<float>& verts,
     bool success;
     if (useItems)
     {
-        std::memset(bSumW->contents(), 0, nTetTotal * sizeof(float));
+        std::memset(bSumW->contents(), 0, nTetTotal * (sumWFixed ? 8 : sizeof(float)));
         success = runItems(0) && runItems(1) && runLeftovers();
     }
     else
@@ -779,33 +730,47 @@ bool psGpuDepositFields(std::vector<float>& verts,
 
     // tets the kernel could not classify exactly (a sample within float rounding of a face):
     // it negated their masses and deposited nothing; the caller deposits them on the CPU
+    bool const massAudit = PSMassAudit::on();
     {
         float const* mb = static_cast<float const*>(bM->contents());
+        double deferredMass = 0.;
         for (size_t t = 0; t < nTetTotal; ++t)
-            if (mb[t] < 0.f) deferred.push_back(uint32_t(t));
+            if (mb[t] < 0.f) { deferred.push_back(uint32_t(t)); deferredMass -= double(mb[t]); }
+        if (massAudit) out.auditDeferredMass = deferredMass;
     }
 
     if (massFixed)
     {
-        uint32_t const* fx = static_cast<uint32_t const*>(bMassFx->contents());
-        for (size_t i = 0; i < nCell; ++i)
-            out.mass[i] = float(psMassFixedValue(fx[2*i], fx[2*i + 1], P.massScale));
+        // the words themselves (2026-10-12; they were decoded to float here, and the CPU deposit of the deferred
+        // tets then added its shares to those floats -- rounding away every share below half an ulp of a busy
+        // cell, always downward: 1.6e-5 of the box mass at TNG50-3-Dark z=0.5, 1.2% of one partition's deferred
+        // mass). Low word first: on this little-endian host each pair is the int64 (ps_deposit_params.h).
+        out.massFx.resize(nCell);
+        std::memcpy(out.massFx.data(), bMassFx->contents(), nCell * 8);
+        if (massAudit)
+        {   // the exact integer total (the partition's mass is below 2^62 units: no overflow)
+            int64_t q = 0;
+            for (size_t i = 0; i < nCell; ++i) q += out.massFx[i];
+            out.auditFixedTotal = psMassFixedMass(q, massScale);
+        }
     }
     else
         std::memcpy(out.mass.data(), bMass->contents(), nCell * 4);
-    if (fVel)  std::memcpy(out.mom.data(),  bMom->contents(),  nCell * 12);
-    if (fDisp) std::memcpy(out.m2.data(),   bM2->contents(),   nCell * 24);
-    if (fGrad) std::memcpy(out.grad.data(), bGrad->contents(), nCell * 36);
-    std::memcpy(out.streams.data(), bStr->contents(),  nCell * 4);
-    if (fVolW)    std::memcpy(out.momw.data(),    bMomW->contents(),  nCell * 4);
-    if (fCaustic) std::memcpy(out.caustic.data(), bCaust->contents(), nCell * 4);
-    if (fExact)   std::memcpy(out.streamvol.data(), bSV->contents(), nCell * 4);
-    if (fDispOwn) {
-        std::memcpy(out.dispvel.data(), bDV->contents(), nCell * 12);
-        std::memcpy(out.dispw.data(),   bDW->contents(), nCell * 4);
+    // each moment grid: its words (fixed point, 2026-10-14; each low/high pair IS the int64 on this little-endian
+    // host, as for the mass) or its floats
+    MTL::Buffer* const fxBuf[PS_FX_N] = { bMom, bM2, bGrad, bMomW, bSV, bDV, nullptr, bScal, bSG };
+    std::vector<float>* const flt[PS_FX_N] = { &out.mom, &out.m2, &out.grad, &out.momw, &out.streamvol, &out.dispvel,
+                                               nullptr, &out.scal, &out.sgrad };
+    for (int g = 0; g < PS_FX_N; ++g)
+    {
+        if (!sel[g] || !fxBuf[g]) continue;
+        size_t const n = nCell * fxComps[g];
+        if (fxOn[g]) { out.fx[g].resize(n); std::memcpy(out.fx[g].data(), fxBuf[g]->contents(), n * 8); }
+        else std::memcpy(flt[g]->data(), fxBuf[g]->contents(), n * 4);
     }
-    if (fScal)  std::memcpy(out.scal.data(),  bScal->contents(), nCell * 4);
-    if (fSGrad) std::memcpy(out.sgrad.data(), bSG->contents(),   nCell * 12);
+    std::memcpy(out.streams.data(), bStr->contents(),  nCell * 4);
+    if (fCaustic) std::memcpy(out.caustic.data(), bCaust->contents(), nCell * 4);
+    if (fDispOwn && !dispwIsMass) std::memcpy(out.dispw.data(), bDW->contents(), nCell * 4);
 
     for (MTL::Buffer* b : {bV,bU,bM,bD,bSc,bP,bMass,bMassFx,bMom,bM2,bGrad,bStr,bMomW,bCaust,bSV,bDV,bDW,bScal,bSG}) b->release();
     pool->release();

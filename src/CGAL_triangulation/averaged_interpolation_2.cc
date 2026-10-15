@@ -372,7 +372,7 @@ void interpolateRedshiftCone_averaged_2(DT &dt,
                     Real tempR = r + uni()*dx[0];
                     Real tempTheta = theta + uni()*dx[1];
                     tempX = origin[0] + tempR*cos(tempTheta);
-                    tempY = origin[0] + tempR*sin(tempTheta);
+                    tempY = origin[1] + tempR*sin(tempTheta);   // origin[1]: it read origin[0] until 2026-10-11
                     samplePoint = Point(tempX,tempY);
                     current = dt.locate( samplePoint,lt,li,previous );
 #elif NO_DIM==3

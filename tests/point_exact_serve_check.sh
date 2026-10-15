@@ -63,6 +63,13 @@
 #     a non-periodic standard cloud with negative coordinates reproduces a linear field.
 #  T) the tessellation cache keys on --periodic: a non-periodic run never loads the cache a
 #     periodic run wrote (it did until 2026-09-30).
+#  P) THE STANDARD SERVER'S PADDING (2026-10-13): dtfelib.Estimator passes '--padding 15' to the standard binary
+#     (dtfelib.estimator.STANDARD_PADDING, run_dtfe.sh's value) unless the caller gives one; the phase-space server
+#     keeps the binary's own. On demo/z0_64 (z = 0), at two 200^2-point planes 0.05 Mpc inside the box faces, the
+#     default server is bit-identical to '--sample-points --padding 15' and within 1e-10 of '--padding 30', while the
+#     binary's default 5 is off by up to ~4% at several hundred points -- with coverage 1 everywhere, so nothing
+#     flagged it. (The standard references of S and V5 run at '--padding 15' for the same reason.) SKIP P2 without
+#     the demo file.
 #
 # Usage:
 #   tests/point_exact_serve_check.sh              # build, run, check
@@ -138,8 +145,9 @@ run "${PS_BIN}" "${TMP}/pxs_ps_p"    --sample-points "${PARTS}"
 run "${PS_BIN}" "${TMP}/pxs_ps_c_P2" --sample-points "${CENTRES}" --partition 2 2 2
 run "${PS_BIN}" "${TMP}/pxs_ps_p_P2" --sample-points "${PARTS}"   --partition 2 2 2
 DTFE_PTS_THREADS=1 run "${PS_BIN}" "${TMP}/pxs_ps_c_T1" --sample-points "${CENTRES}"
-run "${DTFE_BIN}"    "${TMP}/pxs_st_c"    --sample-points "${CENTRES}"
-run "${DTFE_BIN}"    "${TMP}/pxs_st_p"    --sample-points "${PARTS}"
+# (at the standard server's padding, dtfelib.estimator.STANDARD_PADDING: V5 compares them with it bit for bit)
+run "${DTFE_BIN}"    "${TMP}/pxs_st_c"    --sample-points "${CENTRES}" --padding 15
+run "${DTFE_BIN}"    "${TMP}/pxs_st_p"    --sample-points "${PARTS}"   --padding 15
 # the grid deposit on the cell-centre grid itself (nSub=1: one sample per cell, at its centre)
 RUN_GRID="${GRID}" run "${PS_BIN}" "${TMP}/pxs_dep"    --partition 1 1 1
 RUN_GRID="${GRID}" run "${PS_BIN}" "${TMP}/pxs_dep_P2" --partition 2 2 2
@@ -294,6 +302,48 @@ with Estimator(snap, mpc_unit=1, phase_space=False) as est:
           and np.array_equal(a.streams, st_c)
           and np.array_equal(b.density, a.density[::997]))
     check("V5", ok, "standard --serve: full walk and cell-index requests bit-identical to --sample-points")
+    st_cmd = list(est.command)
+
+# ---------------- P: the standard server's padding
+from dtfelib.estimator import STANDARD_PADDING
+def paddings(cmd):
+    return [cmd[i + 1] for i, a in enumerate(cmd) if a in ("--padding", "--paddingMpc")]
+with Estimator(snap, mpc_unit=1, phase_space=False, options=["--padding", "20"]) as est:
+    own = paddings(est.command)
+with Estimator(snap, mpc_unit=1) as est:
+    ps_pad = paddings(est.command)
+check("P1", paddings(st_cmd) == [f"{STANDARD_PADDING:g}"] and STANDARD_PADDING == 15.0 and own == ["20"]
+      and ps_pad == [], f"Estimator --padding: standard default {paddings(st_cmd)}, a caller's own {own} (once), "
+      f"PS-DTFE {ps_pad} (the binary's own)")
+import subprocess
+demo = _os.path.join(_os.getcwd(), "demo", "z0_64.gadget")
+STBIN = "./DTFE-double" if PREC == "double" else "./DTFE"
+if _os.path.isfile(demo):
+    u = (np.arange(200) + 0.5) * 100.0 / 200
+    Y, Z = np.meshgrid(u, u, indexing="ij")
+    F = np.concatenate([np.stack([np.full(Y.size, x), Y.ravel(), Z.ravel()], 1) for x in (0.05, 99.95)])
+    F.tofile(f"{tmp}/pxs_faces.bin")
+    ref = {}
+    for pad in (5, 15, 30):
+        r = subprocess.run([STBIN, demo, f"{tmp}/pxs_face_p{pad}", "--grid", "8", "--periodic", "--field", "density",
+                            "--input", "101", "--sample-points", f"{tmp}/pxs_faces.bin", "--padding", str(pad)],
+                           capture_output=True, text=True)
+        ref[pad] = pts(f"pxs_face_p{pad}", "den") if r.returncode == 0 else None
+    with Estimator(demo, phase_space=False, input_type=101) as est:
+        got = est(F)
+    if any(v is None for v in ref.values()):
+        check("P2", False, "a --sample-points reference run on demo/z0_64 failed")
+    else:
+        rel = lambda a, b: np.abs(a - b) / np.abs(b)
+        off5 = rel(ref[5], ref[30])
+        ok = (np.array_equal(got.density, ref[15]) and float(rel(got.density, ref[30]).max()) < 1e-10
+              and got.streams.min() == 1 and float(off5.max()) > 1e-3)
+        check("P2", ok, f"demo/z0_64 face planes: the default server == --padding 15 bit for bit "
+              f"({np.array_equal(got.density, ref[15])}), max rel {float(rel(got.density, ref[30]).max()):.1e} from "
+              f"--padding 30; the binary's 5: {int((off5 > 1e-6).sum())} of {F.shape[0]} points off by up to "
+              f"{100 * float(off5.max()):.1f}%, coverage still {got.streams.min()}..{got.streams.max()}")
+else:
+    print("   SKIP P2 (demo/z0_64.gadget is not here)")
 
 # ---------------- C: the composite server
 kw = dict(mpc_unit=1, per_stream=True, per_stream_ids=True, lagrangian_positions=True,
@@ -458,7 +508,8 @@ if fails:
     print(f"RESULT: FAIL ({', '.join(fails)})")
     sys.exit(1)
 print("RESULT: PASS  (exact tie-consistent point location in both binaries; --serve answers "
-      "bit-identical to --sample-points; composite servers, per-stream q(x)/scalars, from_arrays)")
+      "bit-identical to --sample-points; composite servers, per-stream q(x)/scalars, from_arrays; "
+      "the standard server's padding)")
 PY
 
 echo "============================================================"

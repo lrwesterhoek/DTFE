@@ -386,6 +386,23 @@ class MainWindow(QMainWindow):
         self.custom = custom or self._restore("custom", rs.CustomSpec)
         if custom is None and not self._restore_json("custom", None):
             self.custom.gpu = rs.gpu_built("ps")            # a fresh custom-snapshot job uses the GPU when built
+        # 2026-10-13: standard DTFE's production cell average is the exact one (rs.production_deposit). A state saved
+        # before then holds the launcher's old start, 'sampled', for a standard-DTFE Grids or Custom job (the
+        # Monte-Carlo average, never really chosen: it was the only start): moved to 'exact' ONCE; the Monte-Carlo
+        # average stays selectable, and a later choice of it is kept
+        if self.remember and not self._restore_json("dtfe_exact_start", False):
+            for sp, given in ((self.spec, spec), (self.custom, custom)):
+                if given is None and sp.estimator == "dtfe" and sp.deposit == "sampled":
+                    sp.deposit = "exact"
+            self.settings.setValue("dtfe_exact_start", json.dumps(True))
+        # 2026-10-14: the partitions merge in index order by default (the staged merge; run_ps_dtfe.sh ORDERED_MERGE=1,
+        # the binary's default). A state saved before then holds the old start, off, on the Grids, Pipeline and Custom
+        # tabs (never really chosen: it was the start): moved to on ONCE; unticking it later is kept
+        if self.remember and not self._restore_json("ordered_merge_start", False):
+            for sp, given in ((self.spec, spec), (self.pipe, pipeline), (self.custom, custom)):
+                if given is None and not sp.ordered_merge:
+                    sp.ordered_merge = True
+            self.settings.setValue("ordered_merge_start", json.dumps(True))
         # where custom-snapshot jobs wrote outputs (the Runs browser and Explore look there too)
         self.custom_dirs: list[str] = [d for d in self._restore_json("custom_dirs", []) if isinstance(d, str)]
         self.user_presets: dict = self._restore_json("presets", {})
@@ -438,8 +455,9 @@ class MainWindow(QMainWindow):
         import explore as X
         import runs_view as RV
         self.explore_view = X.ExploreView()
+        # the Save options live in the launcher's settings when it remembers them (2026-10-14)
         self.explore = X.ExploreControls(self.explore_view, lambda: self.root_edit.text().strip(),
-                                         self._custom_output_dirs)
+                                         self._custom_output_dirs, settings=self.settings if self.remember else None)
         self.explore.status.connect(self.status_message)
         self.explore.changed.connect(lambda: self._sync_explore_actions())
         # on the Explore tab, left / right step through the slices (shift: 10 at a time) and up / down
@@ -823,6 +841,8 @@ class MainWindow(QMainWindow):
         grp = QButtonGroup(self)
         grp.addButton(self.ps_radio)
         grp.addButton(self.dtfe_radio)
+        # before _changed (slots run in connection order): the deposit choice follows the estimator (2026-10-13)
+        self.ps_radio.toggled.connect(lambda on: self._estimator_switched(self.deposit_combo, on))
         self.ps_radio.toggled.connect(self._changed)
         est.addWidget(self.ps_radio)
         est.addWidget(self.dtfe_radio)
@@ -833,8 +853,10 @@ class MainWindow(QMainWindow):
         self.deposit_combo.addItem(P.label("exact"), "exact")
         self.deposit_combo.setItemData(0, P.tooltip("sampled"), Qt.ToolTipRole)
         self.deposit_combo.setItemData(1, P.tooltip("exact"), Qt.ToolTipRole)
+        # the estimator from the radio, not the spec: an estimator switch changes the combo before _read_widgets
         self.deposit_combo.currentIndexChanged.connect(
-            lambda _i: self._deposit_changed(self.deposit_combo, self.gpu_check, self.spec.estimator))
+            lambda _i: self._deposit_changed(self.deposit_combo, self.gpu_check,
+                                             "ps" if self.ps_radio.isChecked() else "dtfe"))
         f.addRow("Deposit", self.deposit_combo)
         gr = QHBoxLayout()
         self.grid_combo = _grid_combo(self)
@@ -903,6 +925,24 @@ class MainWindow(QMainWindow):
                                 "more at larger sizes)" if estimator == "ps" else
                                 "exact cell averages: the GPU is ticked (6.6x faster than the CPU at 0.26M particles)")
         self._changed()
+
+    def _estimator_switched(self, combo: QComboBox, ps_now: bool):
+        """An estimator switch by the user moves the deposit choice to the new estimator's production setting
+        (rs.production_deposit, 2026-10-13): PS-DTFE the sampled deposit, standard DTFE the exact cell average,
+        run_dtfe.sh's default; the launcher kept 'sampled', so a standard job ran the biased Monte-Carlo average
+        unless it was changed by hand. (With two choices, 'a choice at the old estimator's production setting
+        follows to the new one's' is the same rule.) The other choice stays selectable afterwards."""
+        if self._loading:
+            return
+        want = rs.production_deposit("ps" if ps_now else "dtfe")
+        if combo.currentData() != want:
+            gpu = self.gpu_check if combo is self.deposit_combo else self.o_gpu
+            was = gpu.isChecked()
+            combo.setCurrentIndex(max(combo.findData(want), 0))      # its signal: the GPU tick, _changed
+            on_gpu = ", on the GPU (6.6x faster than the CPU)" if gpu.isChecked() and not was else ""
+            self.status_message(f"standard DTFE: the exact cell average, its production setting{on_gpu}; the "
+                                "Monte-Carlo average stays selectable" if not ps_now else
+                                "PS-DTFE: the sampled deposit, its production setting")
 
     @staticmethod
     def _deposit_texts(combo: QComboBox, ps: bool):
@@ -975,8 +1015,8 @@ class MainWindow(QMainWindow):
         start_over = QCheckBox("Start over: do not resume a killed run's checkpoint")
         start_over.setToolTip("A partitioned run that was killed keeps a checkpoint of its finished partitions, and the "
                               "next run of the same job continues from it. Ticked, the run starts from the beginning "
-                              "and replaces the checkpoint (PS_RESUME=0): needed when the settings changed since, as "
-                              "the program then refuses to resume.")
+                              "and replaces the checkpoint (PS_RESUME=0; standard DTFE: DTFE_RESUME=0): needed when "
+                              "the settings changed since, as the program then refuses to resume.")
         start_over.toggled.connect(self._changed)
         f.addRow("", start_over)
         prec = QComboBox()
@@ -1073,6 +1113,7 @@ class MainWindow(QMainWindow):
         grp = QButtonGroup(self)
         grp.addButton(self.o_ps)
         grp.addButton(self.o_dtfe)
+        self.o_ps.toggled.connect(lambda on: self._estimator_switched(self.o_deposit, on))   # (the Grids tab's rule)
         self.o_ps.toggled.connect(self._changed)
         est.addWidget(self.o_ps)
         est.addWidget(self.o_dtfe)
@@ -1119,8 +1160,8 @@ class MainWindow(QMainWindow):
         self.o_deposit.setItemData(0, P.tooltip("sampled"), Qt.ToolTipRole)
         self.o_deposit.setItemData(1, P.tooltip("exact"), Qt.ToolTipRole)
         self.o_deposit.currentIndexChanged.connect(lambda _i: self._deposit_changed(self.o_deposit, self.o_gpu,
-                                                                                    self.custom.estimator,
-                                                                                    self.custom.dim))
+                                                                                    "ps" if self.o_ps.isChecked()
+                                                                                    else "dtfe", self.custom.dim))
         f.addRow("Deposit", self.o_deposit)
         self.o_gpu = QCheckBox(P.label("gpu"))
         self.o_gpu.setToolTip(P.tooltip("gpu"))
@@ -1488,6 +1529,7 @@ class MainWindow(QMainWindow):
         about.setWordWrap(True)
         about.setToolTip(f"python/{fs.script}, {PER_TEXT[fs.per]}  →  {rs.FIGURES_ROOT / fs.output}")
         f.addRow(about)
+        rows: dict[str, QHBoxLayout] = {}
         for o in fs.opts:
             if o.kind == "bool":
                 w = QCheckBox(o.label)
@@ -1523,7 +1565,27 @@ class MainWindow(QMainWindow):
             if o.help:
                 w.setToolTip(o.help)
             self.opt_widgets[(fs.key, o.key)] = (o, w)
-            f.addRow("" if o.kind == "bool" else o.label, w)
+            if not o.row:
+                f.addRow("" if o.kind == "bool" else o.label, w)
+                continue
+            # options sharing a row title sit side by side under it, each with its short label (2026-10-11)
+            if o.row not in rows:
+                line = QHBoxLayout()
+                line.setContentsMargins(0, 0, 0, 0)
+                rows[o.row] = line
+                title = QLabel(o.row)
+                f.addRow(title, line)
+            line = rows[o.row]
+            if o.kind != "bool":
+                lab = QLabel(o.label)
+                lab.setToolTip(o.help)
+                line.addWidget(lab)
+            if o.kind == "text":
+                w.setPlaceholderText("")
+                w.setMaximumWidth(90)
+            line.addWidget(w, 1 if o.kind == "text" else 0)
+        for line in rows.values():
+            line.addStretch(1)
         return page
 
     @staticmethod
@@ -2278,7 +2340,7 @@ class MainWindow(QMainWindow):
         self.pt_check.setText(P.label("parallel_triangulation") + tbb_note)
         self.pt_check.setEnabled(ps)
         self.om_check.setEnabled(ps)                # a PS-DTFE option (standard DTFE has no partition merge order)
-        self.so_check.setEnabled(ps)                # only run_ps_dtfe.sh checkpoints and resumes (2026-10-11)
+        self.so_check.setEnabled(True)              # both drivers checkpoint and resume (run_dtfe.sh since 2026-10-13)
         for combo in (self.prec_combo, self.o_prec, self.p_prec):     # the double pair's state, in words
             i = combo.findData("double")
             built = rs.binary_built("ps", "double") and rs.binary_built("dtfe", "double")
@@ -2363,7 +2425,8 @@ class MainWindow(QMainWindow):
         self.estimate.setText(self._estimate(tab, steps))
         self.run_btn.setEnabled(self.proc is None and not blocked and self._mcheck is None)
         self.queue_btn.setEnabled(not blocked)
-        checkable = ((tab == GRIDS and self.spec.estimator == "ps" and bool(self.spec.snapshots)
+        # both estimators (2026-10-13: the standard binary's auto-tuner reports too; it was PS-only)
+        checkable = ((tab == GRIDS and bool(self.spec.snapshots)
                       and bool(self.spec.sim) and Path(job.data_root).is_dir())
                      or (tab == PIPELINE and bool(self.pipe.sims) and Path(job.data_root).is_dir())
                      or (tab == OWN and self._custom_checkable()))
@@ -3008,12 +3071,13 @@ class MainWindow(QMainWindow):
         for attr, text, keys, what in (("open_output_action", "Open Output…", "Ctrl+O", "open"),
                                        ("find_outputs_action", "Look for Outputs Again", "", "find"),
                                        ("save_image_action", "Save Image…", "Ctrl+S", "save"),
+                                       ("save_options_action", "Save Options…", "", "save_options"),
                                        ("zoom_out_action", "Zoom Out", "Ctrl+Shift+O", "zoom"),
                                        ("grid_action", "Figure Grid", "Ctrl+G", "grid"),
                                        ("server_action", "Start Query Server", "", "server")):
             if attr == "server_action":
                 explore_menu.addSeparator()
-            action = QAction(text, self, enabled=what in ("open", "find"))
+            action = QAction(text, self, enabled=what in ("open", "find", "save_options"))
             if keys:
                 action.setShortcut(QKeySequence(keys))
             action.triggered.connect(lambda _=False, what=what: self._explore_menu(what))
@@ -3160,10 +3224,11 @@ class MainWindow(QMainWindow):
         x = self.explore
         if what in ("open", "find") and self.tabs.currentIndex() != EXPLORE:
             self.tabs.setCurrentIndex(EXPLORE)
-        if what == "grid" and self.tabs.currentIndex() != EXPLORE:
+        if what in ("grid", "save_options") and self.tabs.currentIndex() != EXPLORE:
             self.tabs.setCurrentIndex(EXPLORE)
         {"open": lambda: x._open_other(), "find": lambda: x.refresh_outputs(),
-         "save": lambda: x._save_image(), "zoom": lambda: x.zoom_out(),
+         "save": lambda: x._save_image(), "save_options": lambda: x.open_save_options(),
+         "zoom": lambda: x.zoom_out(),
          "grid": lambda: x.grid_toggle.setChecked(not x.grid_toggle.isChecked()),
          "server": lambda: x._server_button()}[what]()
 
@@ -3408,7 +3473,7 @@ class MainWindow(QMainWindow):
         self._read_widgets()
         tab = self.tabs.currentIndex()
         if tab == GRIDS:
-            if self.spec.estimator != "ps" or not self.spec.snapshots:
+            if not self.spec.snapshots:         # either estimator: run_ps_dtfe.sh or run_dtfe.sh AUTO_TUNE_REPORT=1
                 return
             key = self.spec.memory_key()
             passes = [(self.spec.sim, None, sorted(self.spec.snapshots))]
@@ -3544,9 +3609,10 @@ class MainWindow(QMainWindow):
         self.refresh()
 
     def _custom_checkable(self) -> bool:
-        """The Custom tab's memory check needs the phase-space binary and an existing snapshot file."""
+        """The Custom tab's memory check needs the estimator's binary and an existing snapshot file (the standard
+        binary reports since 2026-10-13; it was the phase-space one only)."""
         c = self.custom
-        return (c.estimator == "ps" and bool(c.input_file) and Path(c.input_file).expanduser().is_file()
+        return (bool(c.input_file) and Path(c.input_file).expanduser().is_file()
                 and c.binary().is_file())
 
     def _memory_lines(self, tab: int) -> list[tuple[str, str]]:
@@ -3554,7 +3620,7 @@ class MainWindow(QMainWindow):
         if self._mcheck is not None:
             return [("info", "checking memory…")]
         out: list[tuple[str, str]] = []
-        if tab == GRIDS and self.spec.estimator == "ps" and self.spec.sim:
+        if tab == GRIDS and self.spec.sim:
             s = self.spec
             res = self.mem_results.get(s.memory_key(), {})
             fits, unchecked = [], []
@@ -3565,8 +3631,9 @@ class MainWindow(QMainWindow):
                 elif r.get("over_budget"):
                     out.append(("warning", f"snapshot {n:03d} needs ~{r['predicted_gb']:.0f} GB, over the "
                                            f"{r['budget_gb']:.0f} GB budget: it will swap and slow the machine "
-                                           "(a smaller slice plane, no velocity gradient at the slice, fewer "
-                                           "fields or a scratch directory lower it)"))
+                                           + ("(a smaller slice plane, no velocity gradient at the slice, fewer "
+                                              "fields or a scratch directory lower it)" if s.estimator == "ps" else
+                                              "(fewer fields, a smaller padding or a scratch directory lower it)")))
                 else:
                     fits.append(r)
             if fits and not unchecked:
@@ -3576,7 +3643,7 @@ class MainWindow(QMainWindow):
             elif unchecked and (s.slice_plane or s.grid >= 512):
                 out.append(("info", "memory not checked for " + " ".join(f"{n:03d}" for n in unchecked)
                                     + " yet ('Check memory')"))
-        elif tab == OWN and self.custom.estimator == "ps" and self.custom.input_file:
+        elif tab == OWN and self.custom.input_file:
             c = self.custom
             r = self.mem_results.get(c.memory_key(), {}).get((Path(c.input_file).name, 0, None))
             if r is None:
@@ -3589,8 +3656,7 @@ class MainWindow(QMainWindow):
                                        "budget: it will swap and slow the machine (a smaller grid, fewer fields "
                                        "or a scratch directory lower it)"))
             else:
-                split = (f"{r['partition']}{'²' if c.dim == 2 else '³'} partitions, {r['mc']} at a time"
-                         if r.get("partition", 1) > 1 else "one tessellation")
+                split = rs.report_split_text(r, c.estimator, c.dim)
                 out.append(("ok", f"memory: fits (~{r['predicted_gb']:.0f} of the {r['budget_gb']:.0f} GB budget; "
                                   f"the auto-tuner plans {split})"))
         elif tab == PIPELINE:

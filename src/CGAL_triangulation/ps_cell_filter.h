@@ -15,6 +15,8 @@
 
 #ifdef PHASE_SPACE   // both consumers (ps_interpolation.cc, ps_point_eval.cc) are PS-only
 
+#include <algorithm>   // std::sort / std::max in the labelling-independent degeneracy scale
+
 // Geometry of a cell that passed psFilterCell().
 struct PSCellGeometry
 {
@@ -40,8 +42,9 @@ struct PSCellGeometry
 // puts more sample points inside the bbox). A collapsed cell has no reliable Eulerian
 // volume, so drop it; an adjacent non-degenerate stream covers the region. NOTE: this must
 // stay consistent with matrixInverse()'s degeneracy criterion. With both tests relative, the
-// pre-filter below (|det| < 1e-6 avgEdge^3) already implies it (avgEdge^3 >= the product of
-// the edge lengths, by AM-GM), so this check is now a safety net -- keep it anyway: the zero
+// pre-filter below (|det| < 1e-6 avgEdge^3, avgEdge the largest vertex-star mean) already implies
+// it (avgEdge^3 >= the product of the vertex-0 edge lengths, by AM-GM, for any labelling), so this
+// check is now a safety net -- keep it anyway: the zero
 // sentinel is what the "square" artefact came from, and the Metal kernel mirrors it.
 // 'skipOwnership': apply every CHART-INDEPENDENT filter (dummy, hull artefact, degeneracy)
 // but NOT the Lagrangian-partition ownership tiling. Used by the --ps-vertex-mass degree
@@ -78,19 +81,30 @@ inline bool psFilterCell(Cell_handle &cell,
 
     // Lagrangian-partition ownership: padding zones overlap, so keep a cell only if its
     // Lagrangian centroid (not an arbitrary vertex) lies in the primary box -> tiles without double-counting
+    //
+    // Decided as sum_v (x_v - edge) against 0, per edge (2026-10-13) -- lo <= centroid < hi exactly when
+    // sum (x_v - lo) >= 0 and sum (x_v - hi) < 0. Each x_v - edge is a difference of two Reals, exact in double,
+    // and where the answer is close (every vertex within a tetrahedron's extent of the edge) so is their sum, in
+    // any order CGAL lists the vertices. A tetrahedron and its periodic copy -- an exact shift by L at the
+    // periodic seam (subpartition.h psPeriodicSeam), whose period's edges are exactly L apart -- therefore get
+    // complementary answers bit for bit: one of them is owned, never both or neither. The old test (the raw
+    // coordinates summed, divided by NO_DIM+1, compared) gives the same answers whenever that sum is exact,
+    // i.e. unless a coordinate ~2^-29 of the others' size made it round.
     if ( !skipOwnership && !userOptions.lagrangianRegion.isNullBox() )
     {
-        double cen[NO_DIM];
-        for (int d = 0; d < NO_DIM; ++d) cen[d] = 0.;
-        for (int v = 0; v <= NO_DIM; ++v)
-            for (int d = 0; d < NO_DIM; ++d)
-                cen[d] += double(cell->vertex(v)->point()[d]);
         bool owned = true;
-        for (int d = 0; d < NO_DIM; ++d)
+        for (int d = 0; d < NO_DIM && owned; ++d)
         {
-            cen[d] /= double(NO_DIM + 1);
-            if ( cen[d] < userOptions.lagrangianRegion[2*d] || cen[d] >= userOptions.lagrangianRegion[2*d+1] )
-            { owned = false; break; }
+            double const lo = double(userOptions.lagrangianRegion[2*d]);
+            double const hi = double(userOptions.lagrangianRegion[2*d+1]);
+            double sLo = 0., sHi = 0.;
+            for (int v = 0; v <= NO_DIM; ++v)
+            {
+                double const x = double(cell->vertex(v)->point()[d]);
+                sLo += x - lo;
+                sHi += x - hi;
+            }
+            if ( sLo < 0. || sHi >= 0. ) owned = false;
         }
         if (!owned) { return false; }
     }
@@ -187,19 +201,55 @@ inline bool psFilterCell(Cell_handle &cell,
     g.cellAbsDet = std::fabs(g.cellDet);
 
     // drop only degenerate cells (near-zero Eulerian volume -> divergent 1/volume density).
-    // |det| < tol*(mean edge)^3 is resolution-independent; caustics stay well above it.
+    // |det| < tol*(mean edge)^3 is resolution-independent.
+    //
+    // The edge scale is the LARGEST over the NO_DIM+1 vertices of the mean squared length of the edges
+    // meeting there (2026-10-12). It used to be the edges at vertex 0 only -- and which vertex CGAL calls 0
+    // follows the insertion history, so it differs between a single triangulation and every --partition /
+    // --padding / --ps-lag-padding / parallel-insert variant of it. Folded tetrahedra at a caustic sit right
+    // at the cut (a 32^3 crossed-wave test: ratios 2e-7 .. 1.2e-6 for the four labellings of one tet), so ~20
+    // of them were kept by one run and dropped by the other: their whole mass (most are centroid-fallback
+    // tets) appeared or vanished in one cell -- '.a_den' 0.7 relative in ~40 cells, hidden-stream flags and
+    // '.a_streams' samples flipping, and with --ps-vertex-mass the degrees (and so every neighbour's mass)
+    // changing too. A function of the tetrahedron, not of its labelling, makes the kept set the same in
+    // every run. The maximum (not the 6-edge mean) because it bounds the vertex-0 scale of EVERY labelling:
+    // a kept tet then passes matrixInverse()'s relative test (product of the vertex-0 rows <= their mean^3,
+    // AM-GM) and the GPU kernels' float re-check (vertex-0 mean) whatever order it arrives in, so neither
+    // can reintroduce the order dependence. Only the order-ambiguous tets change: kept under every
+    // labelling -> still kept, dropped under every labelling -> still dropped.
     double const DEGENERATE_DET_TOL = 1.e-6;
     {
-        double avgEdge2 = 0.;
-        for (int v = 0; v < NO_DIM; ++v)
+        // squared edge lengths, each unordered pair once (wrapped positions, the frame of Ax)
+        double e2[NO_DIM+1][NO_DIM+1];
+        for (int v = 0; v <= NO_DIM; ++v)
         {
-            double len2 = 0.;
-            for (int i = 0; i < NO_DIM; ++i)
-                len2 += g.Ax[v][i] * g.Ax[v][i];
-            avgEdge2 += len2;
+            e2[v][v] = 0.;
+            for (int w = v + 1; w <= NO_DIM; ++w)
+            {
+                double len2 = 0.;
+                for (int i = 0; i < NO_DIM; ++i)
+                {
+                    double const d = double(g.eulerPos[w][i]) - double(g.eulerPos[v][i]);
+                    len2 += d * d;
+                }
+                e2[v][w] = e2[w][v] = len2;
+            }
         }
-        avgEdge2 /= NO_DIM;
-        double edgeScale = avgEdge2 * std::sqrt(avgEdge2); // avgEdge^3
+        double maxAvgEdge2 = 0.;
+        for (int v = 0; v <= NO_DIM; ++v)
+        {
+            // the star's lengths summed in ascending order: the same bits whatever the labelling
+            double star[NO_DIM];
+            int n = 0;
+            for (int w = 0; w <= NO_DIM; ++w)
+                if (w != v) star[n++] = e2[v][w];
+            std::sort(star, star + NO_DIM);
+            double avgEdge2 = 0.;
+            for (int k = 0; k < NO_DIM; ++k) avgEdge2 += star[k];
+            avgEdge2 /= NO_DIM;
+            maxAvgEdge2 = std::max(maxAvgEdge2, avgEdge2);
+        }
+        double edgeScale = maxAvgEdge2 * std::sqrt(maxAvgEdge2); // (max over vertices of the mean edge)^3
         if (g.cellAbsDet < DEGENERATE_DET_TOL * edgeScale) { return false; }
     }
 
@@ -218,6 +268,62 @@ inline bool psFilterCell(Cell_handle &cell,
     }
 
     return true;
+}
+
+
+/* --ps-vertex-mass, shared by the grid deposit (ps_interpolation.cc) and the point evaluation (ps_point_eval.cc,
+   2026-10-13). The grid deposit's degree pass and share mass moved here unchanged, so that both read one
+   definition.
+
+   psForEachDepositingCell(dt, ..., f) calls f(cell, geometry) for every finite cell that DEPOSITS -- every
+   chart-independent drop filter of psFilterCell, the Lagrangian ownership skipped (it decides WHICH partition
+   deposits a cell, not WHETHER; see the 'skipOwnership' note above) -- in the tessellation's cell order.
+   psVertexDegreePass counts those cells per vertex after a reset, so a second pass over the same tessellation
+   (the unaveraged and averaged grid passes share one) gives the same counts. A tetrahedron's mass is then the sum
+   of its vertices' weight/degree shares (psVertexShareMass), so the masses of the deposited tetrahedra add up to
+   the particles' masses exactly. */
+template <class F>
+inline void psForEachDepositingCell(DT &dt, User_options &userOptions, Box &boxCoordinates, F &&f)
+{
+    size_t degDropped = 0;   // local counter: the deposit loop reports its own
+#if NO_DIM==2
+    for (DT::Finite_faces_iterator itC = dt.finite_faces_begin(); itC != dt.finite_faces_end(); ++itC)
+#else
+    for (DT::Finite_cells_iterator itC = dt.finite_cells_begin(); itC != dt.finite_cells_end(); ++itC)
+#endif
+    {
+        Cell_handle cell = itC;
+        PSCellGeometry dgeo;
+        if ( !psFilterCell(cell, userOptions, boxCoordinates, true, &degDropped, dgeo,
+                           /*skipOwnership=*/true) )
+            continue;
+        f( cell, dgeo );
+    }
+}
+
+inline void psVertexDegreePass(DT &dt, User_options &userOptions, Box &boxCoordinates)
+{
+    for (DT::Finite_vertices_iterator vit = dt.finite_vertices_begin(); vit != dt.finite_vertices_end(); ++vit)
+        vit->info().psDegree() = 0;
+    psForEachDepositingCell( dt, userOptions, boxCoordinates, [](Cell_handle &cell, PSCellGeometry const &)
+    {
+        for (int v = 0; v <= NO_DIM; ++v)
+            cell->vertex(v)->info().psDegree() += 1;
+    } );
+}
+
+// per-tet vertex-share mass: sum over the cell's vertices of weight/degree (a degree that is not positive -- not
+// computed, or every incident cell dropped -- contributes nothing)
+inline double psVertexShareMass(Cell_handle const &cell)
+{
+    double m = 0.;
+    for (int v = 0; v <= NO_DIM; ++v)
+    {
+        int32_t const deg = cell->vertex(v)->info().psDegree();
+        if (deg > 0)
+            m += double(cell->vertex(v)->info().weight()) / double(deg);
+    }
+    return m;
 }
 
 #endif  // PHASE_SPACE

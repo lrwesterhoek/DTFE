@@ -281,10 +281,12 @@ def main():
               and str(sim / "hires_plane_z64.json") in w.pipe.steps()[1].argv)
 
         print("pipeline options:")
+        # 2026-10-13: the caustic classes are on by default (run_ps_dtfe.sh's default, the production runs'), so the
+        # cusps box is enabled (unticked) from the start
         check("the run options show the scripts' defaults; cusps wait for caustics, the slab and projection for planes",
               w.p_deposit.currentData() == "sampled" and w.p_nsub.value() == 3 and w.p_nsub.isEnabled()
-              and w.p_gpu.isChecked() and w.p_vm.isChecked() and w.p_vw.isChecked() and not w.p_ca.isChecked()
-              and not w.p_cu.isEnabled() and not w.p_pt.isHidden() and w.p_planes.value() == 1
+              and w.p_gpu.isChecked() and w.p_vm.isChecked() and w.p_vw.isChecked() and w.p_ca.isChecked()
+              and w.p_cu.isEnabled() and not w.p_cu.isChecked() and not w.p_pt.isHidden() and w.p_planes.value() == 1
               and not w.p_thick.isEnabled() and w.p_super.value() == 1 and not w.p_rproject.isEnabled()
               and w.p_render_box.isEnabled() and w.p_rsmoothd.value() == rs.POINTEVAL_DERIVATIVE_SMOOTH)
         w.p_ca.setChecked(True)
@@ -491,6 +493,29 @@ def main():
         w.grid_combo.setCurrentText("16")
         qa.processEvents()
         check("changed settings are not covered by the old check", any("memory not checked" in t for t in lines()))
+        # 2026-10-13: standard DTFE too -- run_dtfe.sh AUTO_TUNE_REPORT=1 asks the standard binary's own tuner (the
+        # button was PS-only, and the binary printed 'AUTO-TUNE-REPORT unsupported')
+        w.dtfe_radio.setChecked(True)
+        w.plane_combo.setCurrentIndex(0)                         # no slice: a standard slice needs one triangulation
+        qa.processEvents()
+        check("'Check memory' is offered for a standard-DTFE grids run too",
+              w.spec.estimator == "dtfe" and w.mem_btn.isEnabled() and w.mem_action.isEnabled())
+        w.mem_btn.click()
+        wait_check(w, 120)
+        res = w.mem_results.get(w.spec.memory_key(), {})
+        check("... and its report covers both snapshots, which fit", {(SIM, 50, None), (SIM, 99, None)} <= set(res)
+              and any(t.startswith("✔") and "memory: all 2 snapshots fit" in t for t in lines()), str(lines()))
+        check("... from run_dtfe.sh, writing nothing beside the data",
+              not list((sim / "snapdir_099").glob("output.*")) and not list((sim / "snapdir_050").glob("output.*")),
+              str(list((sim / "snapdir_099").glob("output.*"))))
+        os.environ["DTFE_MEM_BUDGET_GB"] = "0.0001"
+        w.mem_btn.click()
+        wait_check(w, 120)
+        check("... over the budget: a warning per snapshot with the standard run's own remedies",
+              sum("over the" in t and "budget" in t and "smaller padding" in t for t in lines()) == 2, str(lines()))
+        del os.environ["DTFE_MEM_BUDGET_GB"]
+        w.ps_radio.setChecked(True)
+        qa.processEvents()
 
         rs.ADAPTIVE_MIN_NU, min_nu = 64, rs.ADAPTIVE_MIN_NU      # small planes for a small box
         w.tabs.setCurrentIndex(A.PIPELINE)
@@ -709,6 +734,43 @@ def main():
               str([(j.kind, j.state) for j in w3.queue]))
         w2.close()
         w3.close()
+        # 2026-10-13 (integration item 8): a state saved before then holds the launcher's old start, 'sampled', for a
+        # standard-DTFE job: it opens at the exact cell average, once; a Monte-Carlo choice made afterwards is kept
+        import json as _json
+        mig = QSettings(str(tmp / "gui_mig.ini"), QSettings.IniFormat)
+        mig.setValue("spec", _json.dumps(rs.RunSpec(data_root=str(data), estimator="dtfe", deposit="sampled").to_dict()))
+        mig.setValue("custom", _json.dumps(rs.CustomSpec(estimator="dtfe", deposit="sampled").to_dict()))
+        mig.sync()
+        wm = A.MainWindow(remember=True, settings=QSettings(str(tmp / "gui_mig.ini"), QSettings.IniFormat))
+        moved = (wm.spec.deposit, wm.custom.deposit, wm.deposit_combo.currentData(), wm.o_deposit.currentData())
+        wm.deposit_combo.setCurrentIndex(wm.deposit_combo.findData("sampled"))
+        qa.processEvents()
+        wm.close()
+        wk = A.MainWindow(remember=True, settings=QSettings(str(tmp / "gui_mig.ini"), QSettings.IniFormat))
+        check("a saved standard-DTFE job at the old start 'sampled' opens at the exact cell average (Grids and Custom "
+              "tabs), once: a Monte-Carlo choice made afterwards survives the next restart",
+              moved == ("exact",) * 4 and wk.spec.estimator == "dtfe" and wk.spec.deposit == "sampled"
+              and wk.custom.deposit == "exact", f"{moved} {wk.spec.deposit} {wk.custom.deposit}")
+        wk.close()
+        # 2026-10-14: the partitions merge in index order by default (the staged merge); a state saved before then
+        # holds the old start, the tick off, on the Grids, Pipeline and Custom tabs: on, once; unticking it is kept
+        mig2 = QSettings(str(tmp / "gui_mig2.ini"), QSettings.IniFormat)
+        mig2.setValue("spec", _json.dumps(rs.RunSpec(data_root=str(data), ordered_merge=False).to_dict()))
+        mig2.setValue("pipeline", _json.dumps(rs.PipelineSpec(ordered_merge=False).to_dict()))
+        mig2.setValue("custom", _json.dumps(rs.CustomSpec(ordered_merge=False).to_dict()))
+        mig2.sync()
+        wo = A.MainWindow(remember=True, settings=QSettings(str(tmp / "gui_mig2.ini"), QSettings.IniFormat))
+        moved = (wo.spec.ordered_merge, wo.pipe.ordered_merge, wo.custom.ordered_merge,
+                 wo.om_check.isChecked(), wo.p_om.isChecked(), wo.o_om.isChecked())
+        wo.om_check.setChecked(False)
+        qa.processEvents()
+        wo.close()
+        wq = A.MainWindow(remember=True, settings=QSettings(str(tmp / "gui_mig2.ini"), QSettings.IniFormat))
+        check("a saved job at the old ordered-merge start (off) opens with the partitions merged in index order (Grids, "
+              "Pipeline and Custom tabs), once: unticking it afterwards survives the next restart",
+              moved == (True,) * 6 and not wq.spec.ordered_merge and wq.pipe.ordered_merge and wq.custom.ordered_merge,
+              f"{moved} {wq.spec.ordered_merge} {wq.pipe.ordered_merge} {wq.custom.ordered_merge}")
+        wq.close()
 
         new_user_features(qa, w, tmp, data, sim)
         launcher_run_log(qa, w, tmp)
@@ -913,23 +975,36 @@ def new_user_features(qa, w, tmp, data, sim):
     w.deposit_combo.setCurrentIndex(w.deposit_combo.findData("sampled"))
     w.gpu_check.setChecked(False)
     qa.processEvents()
-    # standard DTFE: the same choice is its exact cell average (run_dtfe.sh -e), in its own words
+    # standard DTFE: the same choice is its cell average (run_dtfe.sh -e = the exact one), in its own words. Switching
+    # the estimator moves the choice to the new estimator's production setting (2026-10-13, integration item 8): for
+    # standard DTFE the exact cell average (it started at the biased Monte-Carlo one), which ticks the GPU (when built)
+    def dtfe_e(text):
+        return any("run_dtfe.sh" in ln and " -e " in ln + " " for ln in text.splitlines())
     w.dtfe_radio.setChecked(True)
     qa.processEvents()
+    check("standard DTFE: switching to it moves the choice to the exact cell average (its production setting), "
+          "ticks the GPU (when built) and puts -e and DTFE_EXACT_AVERAGE=1 on the run_dtfe.sh line",
+          w.deposit_combo.isEnabled() and w.deposit_combo.currentData() == "exact"
+          and w.deposit_combo.itemText(w.deposit_combo.findData("exact")) == P.label("exact_dtfe")
+          and w.spec.estimator == "dtfe" and w.spec.deposit == "exact" and w.gpu_check.isChecked() == rs.gpu_built("dtfe")
+          and dtfe_e(w.cmd_view.toPlainText()) and "DTFE_EXACT_AVERAGE=1" in w.cmd_view.toPlainText()
+          and not w.nsub_spin.isEnabled(), w.cmd_view.toPlainText())
+    w.deposit_combo.setCurrentIndex(w.deposit_combo.findData("sampled"))
+    qa.processEvents()
+    check("... the Monte-Carlo average stays selectable: DTFE_EXACT_AVERAGE=0 and no -e",
+          w.spec.deposit == "sampled" and "DTFE_EXACT_AVERAGE=0" in w.cmd_view.toPlainText()
+          and not dtfe_e(w.cmd_view.toPlainText()), w.cmd_view.toPlainText())
     w.gpu_check.setChecked(False)
     w.deposit_combo.setCurrentIndex(w.deposit_combo.findData("exact"))
     qa.processEvents()
-    check("standard DTFE: the deposit choice stays available as its exact cell average, ticks the GPU (when "
-          "built) and puts -e on the run_dtfe.sh line",
-          w.deposit_combo.isEnabled() and w.deposit_combo.itemText(w.deposit_combo.findData("exact")) == P.label("exact_dtfe")
-          and w.spec.estimator == "dtfe" and w.spec.deposit == "exact" and w.gpu_check.isChecked() == rs.gpu_built("dtfe")
-          and any("run_dtfe.sh" in ln and " -e " in ln + " " for ln in w.cmd_view.toPlainText().splitlines())
-          and not w.nsub_spin.isEnabled(), w.cmd_view.toPlainText())
-    w.deposit_combo.setCurrentIndex(w.deposit_combo.findData("sampled"))
+    check("... and picking the exact average by hand ticks the GPU (when built)",
+          w.spec.deposit == "exact" and w.gpu_check.isChecked() == rs.gpu_built("dtfe"))
     w.ps_radio.setChecked(True)
     qa.processEvents()
-    check("... and back on PS-DTFE the choice reads as the phase-space deposit again",
-          w.deposit_combo.itemText(w.deposit_combo.findData("exact")) == P.label("exact") and w.spec.estimator == "ps")
+    check("... and back on PS-DTFE the choice reads as the phase-space deposit again, at its production setting "
+          "(the sampled deposit, sub-samples editable)",
+          w.deposit_combo.itemText(w.deposit_combo.findData("exact")) == P.label("exact") and w.spec.estimator == "ps"
+          and w.spec.deposit == "sampled" and w.deposit_combo.currentData() == "sampled" and w.nsub_spin.isEnabled())
     w.gpu_check.setChecked(False)
     qa.processEvents()
     w.user_presets["mine"] = P.capture(w.spec)
@@ -968,6 +1043,21 @@ def new_user_features(qa, w, tmp, data, sim):
           and Path(w.o_file.text()) == Path(demo.input_file), w.custom.input_file)
     w.custom = keep_custom
     w._load_into_widgets()
+    # 2026-10-13 (integration items 6, 8): the Custom tab's standard run starts at the exact cell average and pads with
+    # 15 mean spacings (the binary's own 5 leaves wrong values near the box faces); PS-DTFE keeps its own padding
+    w.o_dtfe.setChecked(True)
+    qa.processEvents()
+    cmd = w.cmd_view.toPlainText()
+    check("Custom tab: switching to standard DTFE moves the choice to the exact cell average; its command passes "
+          "--exact-average and '--padding 15'",
+          w.custom.estimator == "dtfe" and w.custom.deposit == "exact" and w.o_deposit.currentData() == "exact"
+          and w.o_deposit.itemText(w.o_deposit.findData("exact")) == P.label("exact_dtfe")
+          and "--exact-average" in cmd and "--padding 15" in cmd and "--ps-exact-deposit" not in cmd, cmd)
+    w.o_ps.setChecked(True)
+    qa.processEvents()
+    check("... back on PS-DTFE: the sampled deposit again, no '--padding'",
+          w.custom.estimator == "ps" and w.custom.deposit == "sampled" and "--padding" not in w.cmd_view.toPlainText()
+          and "--avg-subsamples" in w.cmd_view.toPlainText(), w.cmd_view.toPlainText())
     check("a periodic box: no alpha-shape row", not w.o_snap_form.isRowVisible(w.o_alpha)
           and "ps-alpha-shape" not in w.cmd_view.toPlainText())
     w.o_periodic.setChecked(False)
@@ -1011,6 +1101,22 @@ def new_user_features(qa, w, tmp, data, sim):
     lines = [w.checks.item(i).text() for i in range(w.checks.count())]
     check("... and the binary's report says it fits, with the auto-tuner's split",
           any("memory: fits" in t and "auto-tuner plans" in t for t in lines), str(lines))
+    w.custom.estimator = "dtfe"                       # 2026-10-13: the standard binary reports too
+    w._load_into_widgets()
+    w._changed()
+    qa.processEvents()
+    check("the custom tab offers 'Check memory' for a standard-DTFE run of the file too",
+          w.custom.estimator == "dtfe" and w.mem_btn.isVisible() and w.mem_btn.isEnabled())
+    w.mem_btn.click()
+    qa.processEvents()
+    wait_check(w, 120)
+    lines = [w.checks.item(i).text() for i in range(w.checks.count())]
+    check("... and the standard binary's report fits, its plan said as standard DTFE runs it (threads per domain)",
+          any("memory: fits" in t and ("one domain," in t or "one after another" in t) for t in lines), str(lines))
+    w.custom.estimator = "ps"
+    w._load_into_widgets()
+    w._changed()
+    qa.processEvents()
 
     print("runs:")
     w.results.setCurrentIndex(w.results.indexOf(w.log))
@@ -2325,9 +2431,11 @@ def new_user_features(qa, w, tmp, data, sim):
     x.zoom_exact.setChecked(True)
     geo = x._geometry()
     cmd, root_, grid_, _e = x.exact_zoom_command(x.current, geo[0], geo[1], geo[2], (geo[3][0], geo[4][0]), (geo[3][1], geo[4][1]), 48)
-    check("the exact zoom's command: the standard binary on the region, one slice cell thick, the exact average",
+    check("the exact zoom's command: the standard binary on the region, one slice cell thick, the exact average, "
+          "padded by the query server's 15 spacings (the binary's own 5 is too thin at the region's faces)",
           cmd is not None and cmd[0].endswith("DTFE") and "--regionMpc" in cmd and "--exact-average" in cmd
           and cmd[cmd.index("--grid") + 1:cmd.index("--grid") + 4].count("1") == 1
+          and "--padding" in cmd and cmd[cmd.index("--padding") + 1] == "15"
           and "--" not in w.explore_view.title.text(), str(cmd))
     x.zoom_res.setValue(64)                           # (64 is the spin box's minimum)
     ref = region_mean(x, img.height() // 4, img.width() // 4, img.height() // 2, img.width() // 2)
@@ -2809,7 +2917,7 @@ def two_d_gui(qa, w, tmp):
     check("... its exact zoom: DTFE-2d on a 4-number region, a 64 x 64 grid, the exact average",
           cmd is not None and Path(cmd[0]).name == "DTFE-2d" and ri > 0 and cmd[ri + 5] == "--field"
           and cmd[cmd.index("--grid") + 1:cmd.index("--grid") + 3] == ["64", "64"] and "--exact-average" in cmd
-          and "--gpu" not in cmd, str(cmd))
+          and "--gpu" not in cmd and "--padding" in cmd and cmd[cmd.index("--padding") + 1] == "15", str(cmd))
     x._dragged(img.height() // 4, img.width() // 4, img.height() // 2, img.width() // 2)
     ok = wait_for(lambda: x.is_zoomed() and not x._zoom_pending and bool(x._zoom.get("exact")) and not x._exact_running, 120)
     check("... which runs and shows 64² positive cells", ok and x._plane.shape == (64, 64)

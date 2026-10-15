@@ -5,6 +5,11 @@ Method-, snapshot- and simulation-agnostic via the shared dtfelib.FieldSet layer
     python3 plot/plot_shear_triaxial.py                    # TNG50-4-Dark, full series, auto method
     python3 plot/plot_shear_triaxial.py --method dtfe
     python3 plot/plot_shear_triaxial.py --snap 99          # single snapshot only
+
+PS-DTFE grids (2026-10-13): the shear is the MEAN-FIELD one by default -- the traceless symmetric FFT gradient of
+the PS velocity grid (FieldSet.load('shear', mean_field=True)), the tensor standard DTFE stores; the binary's PS
+grids hold the stream average of each stream's gradient <grad v> (dtfelib/io.py, the note above FIELDS) and
+'--ps-gradient stored' uses them. The summary's 'Data source' line says which.
 """
 
 import _bootstrap  # noqa: F401  (puts python/ on sys.path)
@@ -16,7 +21,7 @@ from dtfelib import fields as dtfe
 from dtfelib.figures import save_plot_to_multiple_paths
 import config
 from dtfelib import figures as style
-from dtfelib import make_parser, sim_dir
+from dtfelib import make_parser, sim_dir, add_ps_gradient_arg, mean_field_wanted
 from dtfelib.io import FieldSet
 
 style.apply()
@@ -118,8 +123,18 @@ def visualize_triaxiality(T_slice, slice_dim, redshift, box_size, save_path):
     plt.close(fig)
 
 
-def compute_snapshot_slices(fs):
-    if fs.has('gradient'):
+def compute_snapshot_slices(fs, mean_field=True):
+    if mean_field and fs.method == 'ps':
+        # the shear of the mean flow (module docstring): the 5 components, which is all the tensor needs and
+        # less memory than the 9-component gradient
+        if not fs.has('shear', mean_field=True):
+            print("  No velocity grid to derive the mean-field shear from (--ps-gradient stored reads the PS grids)")
+            return None
+        print("  Computing the mean-field velocity shear from the velocity grid (FFT)")
+        field = fs.load('shear', mean_field=True)
+        tensor_slice = shear_tensor_slice_from_5comp
+        source = '5-component shear, mean field (FFT of the PS velocity grid)'
+    elif fs.has('gradient'):
         print("  Loading 9-component velocity gradient field")
         field = fs.load('gradient')
         tensor_slice = shear_tensor_slice_from_grad9
@@ -170,6 +185,7 @@ def main():
     snap_action = parser._option_string_actions['--snap']
     snap_action.default = None
     snap_action.help = "process only this snapshot (default: full snapshot series)"
+    add_ps_gradient_arg(parser)
     args = parser.parse_args()
 
     if args.snap is not None:
@@ -190,7 +206,7 @@ def main():
             fs = FieldSet(sim_dir(args.sim, args.data_root) / f"snapdir_{snapshot}",   # flat or per-family
                           method=args.method, averaged=not args.raw, prefix=args.prefix)
             style.note_source(fs)                   # the thesis mirror takes the thesis box's standard DTFE only
-            r = compute_snapshot_slices(fs)
+            r = compute_snapshot_slices(fs, mean_field=mean_field_wanted(args))
         except FileNotFoundError:
             print(f"  skipping snapshot {snapshot} (no {args.method} fields)")
             continue

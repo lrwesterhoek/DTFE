@@ -5,7 +5,11 @@
 #   B  a complete split of THIS snapshot in the cache: reused, nothing rebuilt
 #   C  a split cached for ANOTHER snapshot: ignored (the scan compares the snapshot's key lines)
 #   D  a cached split too coarse for the memory budget: not reused, and said so
-# A small set and a small DTFE_MEM_BUDGET_GB force the composite path; every cache is a fresh folder.
+#   E  a split cached under ANOTHER partition padding ('--ps-lag-padding 0', i.e. every partition cache written
+#      before 2026-10-12): ignored -- the run would miss all of it (2026-10-12)
+# A small set and a small DTFE_MEM_BUDGET_GB force the composite path; every cache is a fresh folder. 40^3 and
+# 0.075 GB (2026-10-12): with the default '--ps-lag-padding 8' a 24^3 set pads a coarse partition by a third of
+# the box, so no budget kept A finer than a cached 3^3 that still fits (B); at 40^3 0.06-0.09 GB all give A = 4^3.
 # Usage: tests/serve_split_check.sh [--no-build]
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -23,15 +27,15 @@ TMP="${DTFE_TEST_TMP:-${TMPDIR:-/tmp}/dtfe-tests}/serve_split"; rm -rf "$TMP"; m
 echo "============================================================"
 echo " composite server split check"
 echo "============================================================"
-"$PY" tests/generate_ps_test_data.py --out "$TMP/a.hdf5" --n 24 --box 100 >/dev/null
-"$PY" tests/generate_ps_test_data.py --out "$TMP/b.hdf5" --n 24 --box 100 --seed 7 >/dev/null
+"$PY" tests/generate_ps_test_data.py --out "$TMP/a.hdf5" --n 40 --box 100 >/dev/null
+"$PY" tests/generate_ps_test_data.py --out "$TMP/b.hdf5" --n 40 --box 100 --seed 7 >/dev/null
 COMMON=( --periodic --MpcUnit 1 )
-seed() {   # seed <cache> <snapshot> <n>: a grid run with --partition n n n writes that split's partitions
+seed() {   # seed <cache> <snapshot> <n> [args]: a grid run with --partition n n n writes that split's partitions
     "$BIN" "$2" "$TMP/g" --grid 16 "${COMMON[@]}" --field density --partition "$3" "$3" "$3" \
-        --tessellation-cache "$1" > "$TMP/seed.log" 2>&1
+        --tessellation-cache "$1" "${@:4}" > "$TMP/seed.log" 2>&1
 }
 serve() {  # serve <cache>: the auto split of a.hdf5's server; prints "<n> <reason> | <partitions built>"
-    DTFE_MEM_BUDGET_GB=0.019 "$BIN" "$TMP/a.hdf5" "$TMP/srv" "${COMMON[@]}" --serve --tessellation-cache "$1" \
+    DTFE_MEM_BUDGET_GB=0.075 "$BIN" "$TMP/a.hdf5" "$TMP/srv" "${COMMON[@]}" --serve --tessellation-cache "$1" \
         < /dev/null > "$TMP/srv.log" 2>&1
     local line; line="$(grep -a -F 'AUTO-TUNE (serve)' "$TMP/srv.log")"
     local n; n="$(sed -n 's/.*composite of \([0-9]*\)^3 partitions.*/\1/p' <<<"$line")"
@@ -60,6 +64,11 @@ mkdir -p "$TMP/c_coarse"; seed "$TMP/c_coarse" "$TMP/a.hdf5" 2
 IFS='|' read -r nD whyD builtD <<<"$(serve "$TMP/c_coarse")"
 check "$([ "$nD" = "$nA" ] && [[ "$whyD" == *too\ coarse* ]] && echo 1)" \
       "D this snapshot's 2^3 set, too coarse for the budget: not reused (${nD}^3, ${whyD})"
+
+mkdir -p "$TMP/c_pad0"; seed "$TMP/c_pad0" "$TMP/a.hdf5" 3 --ps-lag-padding 0
+IFS='|' read -r nE whyE builtE <<<"$(serve "$TMP/c_pad0")"
+check "$([ "$nE" = "$nA" ] && [[ "$whyE" == nothing\ cached* ]] && echo 1)" \
+      "E this snapshot's 3^3 set under the Eulerian padding ('--ps-lag-padding 0'): ignored (${nE}^3, ${whyE})"
 
 echo "------------------------------------------------------------"
 if [ "$fails" -gt 0 ]; then echo "RESULT: FAIL ($fails)"; exit 1; fi

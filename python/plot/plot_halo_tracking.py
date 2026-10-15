@@ -17,7 +17,9 @@ Per tracked subhalo, walking back in time from --snap:
                 class at the halo position, sampled from the DTFE or PS-DTFE grids of
                 every snapshot on disk (--method ps|dtfe|auto via dtfelib.FieldSet, so it
                 works identically for both estimators). Grids are loaded once per snapshot
-                for all tracked halos.
+                for all tracked halos. The V-web is the MEAN-FIELD one for both (2026-10-13):
+                a PS output's is derived from its velocity grid, the V-web standard DTFE
+                stores; '--ps-gradient stored' samples the stored PS grid (stream average).
 
 Selection: --subhalo ID [ID ...] (SubfindIDs at --snap), or --top N most massive centrals
 (default 5) chosen from the trees themselves.
@@ -26,7 +28,9 @@ Examples:
   python3 plot/plot_halo_tracking.py --sim TNG50-3-Dark                 # top 5 centrals, z=0
   python3 plot/plot_halo_tracking.py --sim TNG50-3-Dark --subhalo 0 17 --method dtfe
   python3 plot/plot_halo_tracking.py --sim TNG300-3-Dark --top 10 --method ps
-Outputs: figures/halo_tracking/<sim>/subhalo<ID>_evolution.png + branch data as .npz.
+Outputs: figures/halo_tracking/<sim>/subhalo<ID>_evolution.png + branch data as .npz (named
+_<prefix> / _raw after the ID's files for --prefix / --raw: their environment comes from other grids;
+_stored for --ps-gradient stored).
 """
 
 import _bootstrap  # noqa: F401  (puts python/ on sys.path)
@@ -36,7 +40,7 @@ from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
 
-from dtfelib import make_parser
+from dtfelib import make_parser, use_data_root, add_ps_gradient_arg, mean_field_wanted
 from dtfelib.trees import TreeSet
 from dtfelib import groupcat as gc
 from dtfelib import environment as env
@@ -125,11 +129,17 @@ def track_one(ts: TreeSet, sim: str, snap0: int, subfind0: int, hubble: float,
     return out
 
 
-def add_environment(tracks: dict, sim: str, method: str):
+def add_environment(tracks: dict, sim: str, method: str, prefix: str | None = None, averaged: bool = True,
+                    mean_field: bool = True):
     """Sample the field environment for every tracked halo, one grid load per snapshot.
 
     tracks: {subfind0: track dict}. Adds env_density / env_tweb / env_vweb arrays in place
     (NaN where no field grids exist on disk) and returns the set of sampled snapshots.
+    prefix / averaged: the grid set (--prefix, e.g. ps_caustic) and the '_a' fields or not (--raw), as every
+    other script reads them (2026-10-11: both were dropped, so the default ps_output grids were sampled whatever
+    the launcher's Figures tab had chosen).
+    mean_field: a PS-DTFE output's V-web is the mean-field one, the V-web standard DTFE stores (2026-10-13; derived
+    from the velocity grid once per snapshot, environment.sample_fields_at); False = the stored PS grid.
     """
     for t in tracks.values():
         for name in ENV_FIELDS:
@@ -141,7 +151,8 @@ def add_environment(tracks: dict, sim: str, method: str):
         where = [(sid, i) for sid, t in tracks.items() for i in np.nonzero(t["snap"] == s)[0]]
         pos = np.array([tracks[sid]["pos_ckpc_h"][i] for sid, i in where])
         try:
-            smp = env.sample_fields_at(sim, s, pos, ENV_FIELDS, method=method)
+            smp = env.sample_fields_at(sim, s, pos, ENV_FIELDS, method=method, averaged=averaged, prefix=prefix,
+                                       mean_field=mean_field)
         except (FileNotFoundError, ValueError):
             skipped.append(s)
             continue
@@ -157,7 +168,7 @@ def add_environment(tracks: dict, sim: str, method: str):
     return sampled
 
 
-def plot_one(t: dict, sim: str, subfind0: int, snap0: int, outdir: Path):
+def plot_one(t: dict, sim: str, subfind0: int, snap0: int, outdir: Path, tag: str = ""):
     x = t["redshift"]
     xlabel = "redshift z"
     if not np.isfinite(x).any():
@@ -236,9 +247,9 @@ def plot_one(t: dict, sim: str, subfind0: int, snap0: int, outdir: Path):
 
     outdir.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
-    fig.savefig(outdir / f"subhalo{subfind0}_evolution.png", dpi=200, bbox_inches="tight")
+    fig.savefig(outdir / f"subhalo{subfind0}_evolution{tag}.png", dpi=200, bbox_inches="tight")
     plt.close(fig)
-    np.savez_compressed(outdir / f"subhalo{subfind0}_branch.npz",
+    np.savez_compressed(outdir / f"subhalo{subfind0}_branch{tag}.npz",
                         **{k: v for k, v in t.items() if isinstance(v, np.ndarray)})
 
 
@@ -255,7 +266,11 @@ def main():
     parser = make_parser("Track subhalo size/shape/orientation/mergers/environment along "
                          "SubLink main-progenitor branches.")
     extra(parser)
+    add_ps_gradient_arg(parser)
     args = parser.parse_args()
+    # --data-root for the trees, group catalogues, headers and grids alike (2026-10-11: it was parsed and ignored,
+    # so a run with another root still read the default one, or failed with the data drive unplugged)
+    use_data_root(args.data_root)
 
     ts = TreeSet(args.sim)
     print(f"{args.sim}: {len(ts.paths)} SubLink chunks in {ts.dir}")
@@ -301,15 +316,22 @@ def main():
             t["merger_x"], t["merger_ratio"] = np.empty(0), np.empty(0)
         tracks[int(sid)] = t
 
+    # '--ps-gradient stored' changes nothing for standard DTFE (its stored V-web IS the mean field): named only for PS
+    stored_ps = not mean_field_wanted(args) and args.method != "dtfe"
     if tracks and not args.no_environment:
-        add_environment(tracks, args.sim, args.method)
+        add_environment(tracks, args.sim, args.method, prefix=args.prefix, averaged=not args.raw,
+                        mean_field=mean_field_wanted(args))
         for t in tracks.values():
-            t["env_method"] = args.method
+            t["env_method"] = args.method + (f", {args.prefix}" if args.prefix else "") + (", raw" if args.raw else "") \
+                + (", stored PS gradient" if stored_ps else "")
 
     outdir = FIGURE_ROOT / args.sim
+    # another grid set's environment gets its own files (the default ones keep their names)
+    tag = "" if args.no_environment else (f"_{args.prefix.rstrip('.')}" if args.prefix else "") + ("_raw" if args.raw else "") \
+        + ("_stored" if stored_ps else "")       # the stored PS V-web (--ps-gradient stored): its own files
     for sid, t in tracks.items():
-        plot_one(t, args.sim, sid, args.snap, outdir)
-        print(f"    -> {outdir / f'subhalo{sid}_evolution.png'}")
+        plot_one(t, args.sim, sid, args.snap, outdir, tag)
+        print(f"    -> {outdir / f'subhalo{sid}_evolution{tag}.png'}")
     print("Done.")
 
 

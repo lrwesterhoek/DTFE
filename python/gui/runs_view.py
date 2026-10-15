@@ -172,6 +172,8 @@ class RunsBrowser(QWidget):
                 status = "▶ " + (R.progress_text(r.progress) or "running")
             elif r.attempt == "resumable":                     # K2: killed with its checkpoint kept (2026-10-11)
                 status = "⏸ resumable"
+            elif r.gpu_retries:                                # G1: the log's GPU retry tally, per cause (2026-10-11)
+                status += ", " + R.retries_text(r.gpu_retries, r.gpu_retries_by_cause)
             vstate, vwhy = self.void_states.get(str(r.path), ("", ""))
             voids = VOID_TEXT.get(vstate, "…" if R.void_candidate(r) and self._void_gen else "")
             cells = [r.sim or "custom", "" if r.snap is None else f"{r.snap:03d}", r.prefix,
@@ -237,6 +239,10 @@ class RunsBrowser(QWidget):
                   f"{_gb(r.peak_rss_gb)} resident",
                   f"outputs   {len(r.outputs)} files, {r.size_bytes / 1e9:.2f} GB",
                   f"settings  {r.options_text() or '—'}" + (f", {r.grid}{'²' if r.dim == 2 else '³'} grid" if r.grid else "")]
+        if r.gpu_retries:           # the log's closing tally (G1, 2026-10-11)
+            lines.append(f"retries   {R.retries_text(r.gpu_retries, r.gpu_retries_by_cause)} of the deposit")
+        elif r.gpu_retried:
+            lines.append("retries   the GPU deposit was restarted (this log has no per-cause tally)")
         vstate, vwhy = self.void_states.get(str(r.path), ("", ""))
         if vstate:
             lines.append(f"voids     {vstate}" + (f" ({vwhy})" if vwhy else ""))
@@ -309,7 +315,10 @@ def running_cells(e: dict) -> list[str]:
         state = "died: the process is gone, its progress file left behind"
     retries = p.get("gpu_retries") if isinstance(p, dict) else None
     if state.startswith("running") and retries:
-        state += f", {retries} GPU retries"
+        try:        # per cause when the sidecar has them (G1, 2026-10-11)
+            state += ", " + R.retries_text(int(retries), p.get("gpu_retries_by_cause"))
+        except (TypeError, ValueError):
+            state += f", {retries} GPU retries"
     return [e.get("sim") or "custom", "" if e.get("snap") is None else f"{int(e['snap']):03d}",
             e.get("name") or "", str(e.get("pid") or ""), str(p.get("phase") or "—"), done, eta, _gb(gb),
             R.format_duration(e.get("elapsed_s")) if e.get("elapsed_s") is not None else "—", state]

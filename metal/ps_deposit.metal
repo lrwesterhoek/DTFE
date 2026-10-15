@@ -4,7 +4,7 @@
 //  each Lagrangian flow element carries a constant mass m = rho_bar * V_lag; the thread
 //  splits m equally among the Eulerian sub-sample points inside the simplex and scatters
 //  the shares into the (mass) grid with atomic adds -- an exact 64-bit fixed-point sum, see
-//  DepositParams.massFixed. Total deposited == m exactly,
+//  DepositParams.massFixed; since 2026-10-14 every moment grid too, see DepositParams.fxMask. Total deposited == m exactly,
 //  so the field is mass-conserving at any nSub and for any V_eul (no caustic spikes).
 //
 //  Which samples a tetrahedron contains is decided EXACTLY, i.e. identically to the CPU
@@ -17,6 +17,18 @@
 
 #include <metal_stdlib>
 using namespace metal;
+
+// PS_COLUMNS=1: the sampled deposit enumerates the sample columns inside the tet instead of walking its
+// whole bbox window (depositFields). A MEASURED prototype, OFF (2026-10-11): the survey estimated 15-30x
+// fewer sample tests on real z=0 tets, but the kernel time A/B (sum of the Metal busy seconds, --grid 256,
+// nSub 3, 2 x 2 x 2 partitions, ABAB) was 3.2 -> 4.4 s on a 128^3 pancake, 26.5 -> 25.9 s on 64^3
+// crossed waves (A k = 3), 20.5 -> 29.6 s on 128^3 crossed waves, and 88.7 -> 66.3 s (1.34x) on one
+// partition of strongly stretched 64^3 crossed waves (A k = 8): the per-column searches cost about what
+// the skipped tests saved, and the inside samples' atomics remain. Turn it on here (and rebuild) to retry
+// it on a real snapshot.
+#ifndef PS_COLUMNS
+#define PS_COLUMNS 0
+#endif
 
 struct DepositParams {
     float boxLo[3];
@@ -76,10 +88,27 @@ struct DepositParams {
     // 'mass' (buffer 3) dropped every share below half an ulp of a busy cell's running sum, always
     // downward: 0.06% of the box mass at TNG50-3-Dark z=0, percents in halo-core cells with 1e7 deposits.
     // massFixed = 0 keeps that float grid (PS_METAL_FLOAT_MASS=1, for comparison); the unused one is a
-    // 4-byte dummy. The moment grids stay float: their normalizer is this mass (or momw/dispw).
+    // 4-byte dummy. (The moment grids followed on 2026-10-14: fxMask below.)
     int   massFixed;
     float massScale;    // 2^k (ps_deposit_params.h psMassFixedScale), so the product is exact
+    // The MOMENT grids as exact 64-bit fixed-point sums (2026-10-14; ps_deposit_params.h PSFxGrid lists them).
+    // Float atomics into them changed the last bits of every velocity, dispersion and gradient cell run to run (the
+    // order the atomics land in sets the rounding); the integers rint(value * fxScale[g]) add up to the same words
+    // in any order, as the mass does. fxMask bit g = grid g is fixed-point: its words (two uint per component, low
+    // then high) are bound at buffer FX_BUF + its slot (the SAME buffer as its float index, sized 8 B per
+    // component -- the standard deposit's scheme, metal/dtfe_deposit.metal), in units of 1/fxScale[g], a power of
+    // two the host takes from a bound of everything the pass deposits into the grid (no cell can overflow). Bit
+    // FX_DW instead says "dispw is not deposited": it would sum exactly the mass grid's shares, so the host reads
+    // the mass words. FX_SUMW_BIT: the exact items' per-tet weight totals are fixed-point too (depositExactItems).
+    // 0 = every moment grid a float sum, as before (PS_METAL_FLOAT_MOMENTS=1 on the host).
+    uint  fxMask;
+    float fxScale[9];   // [g], g = FX_MOM ... FX_SG (FX_DW unused)
 };
+
+// the moment grids' indices (ps_deposit_params.h PSFxGrid -- keep in step) and the buffer slots of their words
+constant uint FX_MOM = 0, FX_M2 = 1, FX_GRAD = 2, FX_MOMW = 3, FX_SV = 4, FX_DV = 5, FX_DW = 6, FX_SCAL = 7, FX_SG = 8;
+constant uint FX_SUMW_BIT = 1u << 16;
+// words of MOM, M2, GRAD, MOMW, SV, DV, SCAL, SG at buffers 22..29 (DW has none), the items' sumW words at 30
 
 static inline float det3(thread const float A[3][3]) {
     return A[0][0]*(A[1][1]*A[2][2]-A[1][2]*A[2][1])
@@ -211,7 +240,42 @@ struct FieldGrids {
     device atomic_uint*  massFx;  // nCell*2   the mass as a 64-bit fixed-point sum [flat*2] low, [flat*2+1] high (massFixed; else dummy)
     float massScale;              // its unit: 1/massScale mass
     bool  massFixed;
+    // 2026-10-14: the moment grids' fixed-point views -- the same buffers as the float pointers above, read as two
+    // uint words per component -- for the grids whose fxMask bit is set (DepositParams.fxMask)
+    device atomic_uint*  momX;
+    device atomic_uint*  m2X;
+    device atomic_uint*  gradX;
+    device atomic_uint*  momwX;
+    device atomic_uint*  svX;
+    device atomic_uint*  dvX;
+    device atomic_uint*  scalX;
+    device atomic_uint*  sgX;
+    uint  fxMask;
+    constant float* fxScale;      // DepositParams.fxScale
 };
+
+// One 64-bit two's-complement integer q into the two-word cell 'at' of x: the low word's carry is read off the
+// value its atomic returns (the add wrapped iff the result is below it), and the high words add modulo 2^32, so
+// once every thread is done the two words hold the exact integer total, whatever the interleaving.
+static inline void addFixedQ(device atomic_uint* x, ulong at, ulong q)
+{
+    if (q == 0ul) return;                           // below half a unit: nothing to add
+    uint const lo = uint(q), hi = uint(q >> 32);
+    uint const old = atomic_fetch_add_explicit(&x[at * 2ul], lo, memory_order_relaxed);
+    uint const up = hi + ((old + lo < old) ? 1u : 0u);
+    if (up != 0u)
+        atomic_fetch_add_explicit(&x[at * 2ul + 1ul], up, memory_order_relaxed);
+}
+
+// One share v of a moment grid (component index 'at' = flat * comps + c): the fixed-point words when its fxMask
+// bit is set -- rint(v * scale), scale = 2^k so the float product is exact, the integer the host adds for the
+// same float (ps_deposit_params.h psFixedShare) -- else the float atomic of before.
+static inline void addMoment(device atomic_float* f, device atomic_uint* x, thread const FieldGrids& G, uint g,
+                             ulong at, float v)
+{
+    if ((G.fxMask >> g) & 1u) addFixedQ(x, at, as_type<ulong>(long(rint(v * G.fxScale[g]))));
+    else atomic_fetch_add_explicit(&f[at], v, memory_order_relaxed);
+}
 
 // A mass share into the mass grid: the exact 64-bit fixed-point sum (massFixed), else a float atomic.
 // Two's-complement words: the low word's carry is read off the value its atomic returns (the add wrapped
@@ -224,14 +288,8 @@ static inline void depositMass(thread const FieldGrids& G, uint flat, float w)
         atomic_fetch_add_explicit(&G.mass[flat], w, memory_order_relaxed);
         return;
     }
-    ulong const q = as_type<ulong>(long(rint(w * G.massScale)));
-    if (q == 0ul) return;                           // below half a unit: nothing to add
-    uint const lo = uint(q), hi = uint(q >> 32);
-    ulong const at = ulong(flat) * 2ul;             // 64-bit: a sub-grid may hold up to 2^32 cells
-    uint const old = atomic_fetch_add_explicit(&G.massFx[at], lo, memory_order_relaxed);
-    uint const up = hi + ((old + lo < old) ? 1u : 0u);
-    if (up != 0u)
-        atomic_fetch_add_explicit(&G.massFx[at + 1ul], up, memory_order_relaxed);
+    // (64-bit cell offsets inside addFixedQ: a sub-grid may hold up to 2^32 cells)
+    addFixedQ(G.massFx, ulong(flat), as_type<ulong>(long(rint(w * G.massScale))));
 }
 
 // w = mass share (mass grid), wm = moment weight (== w by default; the V_eul share under
@@ -263,7 +321,7 @@ static inline void depositSample(thread const FieldGrids& G, uint flat,
             vv[j]=u0[j];
             for (int i=0;i<3;++i) vv[j]+=vG[i][j]*rel[i];
             if (fVel)
-                atomic_fetch_add_explicit(&G.mom[base*3ul+ulong(j)], vv[j]*wm, memory_order_relaxed);
+                addMoment(G.mom, G.momX, G, FX_MOM, base*3ul+ulong(j), vv[j]*wm);
         }
         if (fDisp) {
             // sigma_ij is a moment of f -> always MASS-weighted (w), even when the velocity
@@ -271,32 +329,33 @@ static inline void depositSample(thread const FieldGrids& G, uint flat,
             ulong c=0;
             for (int i=0;i<3;++i)
                 for (int j=i;j<3;++j)
-                    atomic_fetch_add_explicit(&G.m2[base*6ul + c++], w*vv[i]*vv[j], memory_order_relaxed);
+                    addMoment(G.m2, G.m2X, G, FX_M2, base*6ul + c++, w*vv[i]*vv[j]);
             if (fVolW) {   // its own mass-weighted mean + normalizer (the mom grid is volume-weighted)
                 for (int j=0;j<3;++j)
-                    atomic_fetch_add_explicit(&G.dispvel[base*3ul+ulong(j)], vv[j]*w, memory_order_relaxed);
-                atomic_fetch_add_explicit(&G.dispw[flat], w, memory_order_relaxed);
+                    addMoment(G.dispvel, G.dvX, G, FX_DV, base*3ul+ulong(j), vv[j]*w);
+                if (((G.fxMask >> FX_DW) & 1u) == 0u)   // (else the mass grid is it)
+                    atomic_fetch_add_explicit(&G.dispw[flat], w, memory_order_relaxed);
             }
         }
     }
     if (fGrad)
         for (int j=0;j<3;++j)
             for (int i=0;i<3;++i)
-                atomic_fetch_add_explicit(&G.grad[base*9ul + ulong(j*3+i)], vG[i][j]*wm, memory_order_relaxed);
+                addMoment(G.grad, G.gradX, G, FX_GRAD, base*9ul + ulong(j*3+i), vG[i][j]*wm);
     if (fScal) {   // the linear scalar profile at the sample, moment-weighted like the velocity
         float sv = s0;
         for (int i=0;i<3;++i) sv += sG[i]*rel[i];
-        atomic_fetch_add_explicit(&G.scal[flat], sv*wm, memory_order_relaxed);
+        addMoment(G.scal, G.scalX, G, FX_SCAL, base, sv*wm);
     }
     if (fSGrad)
         for (int i=0;i<3;++i)
-            atomic_fetch_add_explicit(&G.sgrad[base*3ul + ulong(i)], sG[i]*wm, memory_order_relaxed);
+            addMoment(G.sgrad, G.sgX, G, FX_SG, base*3ul + ulong(i), sG[i]*wm);
     if (fVolW)
-        atomic_fetch_add_explicit(&G.momw[flat], wm, memory_order_relaxed);
+        addMoment(G.momw, G.momwX, G, FX_MOMW, base, wm);
     if (fCaustic)
         atomic_fetch_or_explicit(&G.caustic[flat], obits, memory_order_relaxed);
     if (fExact)
-        atomic_fetch_add_explicit(&G.sv[flat], svShare, memory_order_relaxed);
+        addMoment(G.sv, G.svX, G, FX_SV, base, svShare);
     if (countStream)
         atomic_fetch_add_explicit(&G.streams[flat], 1u, memory_order_relaxed);
     // '.hidden_streams' bit 2: mass from a tet none of whose samples lies in this cell (the centroid
@@ -366,6 +425,10 @@ struct ExactTet {
     // the sum over its in-grid pieces), so the grid keeps exactly the share of its mass inside it
     bool   straddle;
     float  wFull;
+    // the unit of this tet's weight total in the items' fixed-point sumW (FX_SUMW_BIT, 2026-10-14): 2^k with the
+    // bound V (|the linear density| at most dMax under fLinear: V dMax) at 2^59..2^60 units, so the sum of its
+    // pieces' weights -- which is that total to float rounding -- stays far below 2^63
+    float  wScale;
 };
 
 // The tet's whole deposit weight: its volume, or under fLinear the integral of the linear density
@@ -440,7 +503,7 @@ static inline void exact_cell_deposit(thread const FieldGrids& G, uint flat, thr
             vb[j] = E.u0[j];
             for (int i=0; i<3; ++i) vb[j] += E.vG[i][j]*cen[i];
             if (fVel)
-                atomic_fetch_add_explicit(&G.mom[base*3ul+ulong(j)], vb[j]*wmEx, memory_order_relaxed);
+                addMoment(G.mom, G.momX, G, FX_MOM, base*3ul+ulong(j), vb[j]*wmEx);
         }
         if (fDisp) {
             // exact second moment of the linear profile: <v_a v_b> over the piece
@@ -460,34 +523,34 @@ static inline void exact_cell_deposit(thread const FieldGrids& G, uint flat, thr
                     for (int i=0; i<3; ++i)
                         for (int k=0; k<3; ++k)
                             gcg += E.vG[i][a]*cov[i][k]*E.vG[k][b];
-                    atomic_fetch_add_explicit(&G.m2[base*6ul + c2++],
-                                              massShare*(vb[a]*vb[b] + gcg), memory_order_relaxed);
+                    addMoment(G.m2, G.m2X, G, FX_M2, base*6ul + c2++, massShare*(vb[a]*vb[b] + gcg));
                 }
             if (fVolW) {
                 for (int j=0;j<3;++j)
-                    atomic_fetch_add_explicit(&G.dispvel[base*3ul+ulong(j)], vb[j]*massShare, memory_order_relaxed);
-                atomic_fetch_add_explicit(&G.dispw[flat], massShare, memory_order_relaxed);
+                    addMoment(G.dispvel, G.dvX, G, FX_DV, base*3ul+ulong(j), vb[j]*massShare);
+                if (((G.fxMask >> FX_DW) & 1u) == 0u)   // (else the mass grid is it)
+                    atomic_fetch_add_explicit(&G.dispw[flat], massShare, memory_order_relaxed);
             }
         }
     }
     if (fGrad)
         for (int j=0; j<3; ++j)
             for (int i=0; i<3; ++i)
-                atomic_fetch_add_explicit(&G.grad[base*9ul + ulong(j*3+i)], E.vG[i][j]*wmEx, memory_order_relaxed);
+                addMoment(G.grad, G.gradX, G, FX_GRAD, base*9ul + ulong(j*3+i), E.vG[i][j]*wmEx);
     if (fScal) {   // exact mean of the linear scalar profile over the piece (the velocity's construction)
         float sb = E.s0;
         for (int i=0; i<3; ++i) sb += E.sG[i]*cen[i];
-        atomic_fetch_add_explicit(&G.scal[flat], sb*wmEx, memory_order_relaxed);
+        addMoment(G.scal, G.scalX, G, FX_SCAL, base, sb*wmEx);
     }
     if (fSGrad)
         for (int i=0; i<3; ++i)
-            atomic_fetch_add_explicit(&G.sgrad[base*3ul + ulong(i)], E.sG[i]*wmEx, memory_order_relaxed);
+            addMoment(G.sgrad, G.sgX, G, FX_SG, base*3ul + ulong(i), E.sG[i]*wmEx);
     if (fVolW)
-        atomic_fetch_add_explicit(&G.momw[flat], wmEx, memory_order_relaxed);
+        addMoment(G.momw, G.momwX, G, FX_MOMW, base, wmEx);
     if (fCaustic)
         atomic_fetch_or_explicit(&G.caustic[flat], E.obits, memory_order_relaxed);
     // exact cell-mean multiplicity share V_int/V_cell, and the raw tet-touch count
-    atomic_fetch_add_explicit(&G.sv[flat], mo[0]*E.invCellVol, memory_order_relaxed);
+    addMoment(G.sv, G.svX, G, FX_SV, base, mo[0]*E.invCellVol);
     atomic_fetch_add_explicit(&G.streams[flat], 1u, memory_order_relaxed);
 }
 
@@ -686,6 +749,15 @@ kernel void depositFields(
     device atomic_float*       scalGrid [[buffer(19)]], // nCell   scalar moment (fScal; else dummy)
     device atomic_float*       sgGrid   [[buffer(20)]], // nCell*3 scalar-gradient moment (fSGrad; else dummy)
     device atomic_uint*        massFx   [[buffer(21)]], // nCell*2 the fixed-point mass (massFixed; else dummy -- then buffer 3 is the mass)
+    // 2026-10-14: the moment grids' fixed-point words (fxMask), the same buffers as 4, 5, 6, 10, 12, 13, 19, 20
+    device atomic_uint*        momX     [[buffer(22)]],
+    device atomic_uint*        m2X      [[buffer(23)]],
+    device atomic_uint*        gradX    [[buffer(24)]],
+    device atomic_uint*        momwX    [[buffer(25)]],
+    device atomic_uint*        svX      [[buffer(26)]],
+    device atomic_uint*        dvX      [[buffer(27)]],
+    device atomic_uint*        scalX    [[buffer(28)]],
+    device atomic_uint*        sgX      [[buffer(29)]],
     uint tid [[thread_position_in_grid]])
 {
     if (tid >= P.nTet) return;
@@ -742,7 +814,8 @@ kernel void depositFields(
     }
 
     FieldGrids G { massGrid, momGrid, m2Grid, gradGrid, strGrid, momwGrid, caustGrid, svGrid, dvGrid, dwGrid, scalGrid, sgGrid,
-                   massFx, P.massScale, P.massFixed != 0 };
+                   massFx, P.massScale, P.massFixed != 0, momX, m2X, gradX, momwX, svX, dvX, scalX, sgX,
+                   P.fxMask, P.fxScale };
 
     // --ps-volume-weighted: the tet's total moment weight is its Eulerian volume |det|/6
     // (matching the CPU volumeShare); default: the moment weight equals the mass share.
@@ -786,12 +859,16 @@ kernel void depositFields(
         for (int e=0; e<3; ++e) { lo = min(lo, Ax[e][dd]); hi = max(hi, Ax[e][dd]); }
         iMin[dd] = ic0[dd] + int(floor(f0[dd] + lo / P.dx[dd]));
         iMax[dd] = ic0[dd] + int(floor(f0[dd] + hi / P.dx[dd])) + 1;
-        // straddle is decided on the tet's own bbox, before the sample margin below (a tet whose
-        // bbox stays inside the grid has no sample beyond it)
+        // straddle is decided on the tet's own bbox (a tet whose bbox stays inside the grid has no
+        // sample beyond it)
         if (!P.periodic && (iMin[dd] < 0 || iMax[dd] > P.nGrid[dd])) straddle = true;
-        // the exact deposit clips the bbox window directly (no sub-samples), so the +-1
-        // sub-sample margin would only add empty clips -- same guard as the CPU path
-        if (P.nSub>1 && !fExact) { iMin[dd]-=1; iMax[dd]+=1; }
+        // No one-cell sample margin around this window (dropped 2026-10-11, all three backends): a
+        // sub-sample sits at (k + 0.5)/nSub of its cell, >= 1/(2 nSub) inside it, so every sample in
+        // the bbox lies in a cell of [floor(lo), floor(hi)] -- exactly this window. The ring's
+        // samples were all outside (each classified, 2 passes x nSub^3 per cell: 1.8-2.7x the
+        // window cells of real TNG50 z=0 tets), and the classification is window-independent (the
+        // per-sample stage-2 bounds of classifySample never exceed the window's B), so the samples
+        // kept and the deferrals are the same.
         iMinC[dd] = iMin[dd]; iMaxC[dd] = iMax[dd];
         if (!P.periodic) {
             if (iMinC[dd] < 0)           iMinC[dd] = 0;
@@ -927,6 +1004,111 @@ kernel void depositFields(
             if (N==0u) break;      // nothing in the grid: centroid fallback (or nothing) below
             share = m / float(N + Nout);
         }
+#if PS_COLUMNS
+        // COLUMN enumeration of the in-grid samples (prototype, 2026-10-11, off: see PS_COLUMNS at the
+        // top): instead of every sample of the bbox window, only the sample columns (along z) inside
+        // the tet's xy projection, and along each column only the run whose four face values are not
+        // certainly negative (the count_beyond_grid machinery: affine along the column, certified at
+        // 2B). The samples in the certain-inside run are the ones classifySample calls inside, the
+        // rest of the run goes through classifySample itself, and a sample outside the footprint is
+        // geometrically outside. So the samples kept are the cell loop's (the '.streams' grid was
+        // byte-identical in every A/B). The deferrals can only drop: a sample just outside the
+        // footprint that classifySample could not decide deferred its tet in the cell loop (12466 ->
+        // 12458 tets on 48^3 crossed waves), and those few tets then land in the fixed-point mass grid
+        // instead of the CPU's float sum (the mass moves at 1e-6 in their cells). Under fLinear the
+        // pass-0 weight sum is a float sum in the cell loop's order, so that deposit keeps the loop.
+        if (!fLinear) {
+            int const Sz0 = iMinC[2] * nSub, Sz1 = iMaxC[2] * nSub;
+            int const Sy0 = iMinC[1] * nSub, Sy1 = iMaxC[1] * nSub;
+            float const Tin[4]  = { 2.0f*B[0], 2.0f*B[1], 2.0f*B[2], 2.0f*B[3] };
+            float const Tpos[4] = { -2.0f*B[0], -2.0f*B[1], -2.0f*B[2], -2.0f*B[3] };
+            BeyondColumn col;
+            col.ic0z = ic0[2]; col.f0z = f0[2]; col.dxz = P.dx[2]; col.nSub = nSub; col.invNSub = invNSub;
+            float const Vx[4] = { 0.0f, Ax[0][0], Ax[1][0], Ax[2][0] };
+            float const Vy[4] = { 0.0f, Ax[0][1], Ax[1][1], Ax[2][1] };
+            // a sample's x offset and a vertex's are each within rho of the exact ones (rho also covers
+            // the edges' own float rounding, u T dx), so the projected footprint is widened by 2 rho
+            float const xPad = 1.0e-4f * P.dx[0] + 2.0f * rho[0];
+            bool const countAll = P.windowMode != 0 && pass == 0;   // a window counts samples outside its sub-box too
+            for (int sx = iMinC[0] * nSub; sx < iMaxC[0] * nSub; ++sx) {
+                int const kx = (sx >= 0) ? sx / nSub : -((-sx + nSub - 1) / nSub);
+                int const wg0 = P.periodic ? wrapIdx(kx, P.nGrid[0]) : kx;
+                int l0 = wg0 - P.subOrigin[0];
+                if (l0 < 0) l0 += P.nGrid[0];
+                bool const in0 = l0 >= 0 && l0 < P.subDims[0];
+                if (!in0 && !countAll) continue;
+                float const tx = sample_tc(sx, nSub, invNSub, ic0[0], f0[0]);
+                float const rx = tx * P.dx[0];
+                // the tet's y extent at this x: over the six projected edges that cross it (the hull's
+                // boundary is among them), each widened by its slope times the x uncertainty
+                float yMin = INFINITY, yMax = -INFINITY;
+                for (int i = 0; i < 3; ++i)
+                    for (int j = i + 1; j < 4; ++j) {
+                        float const xi = Vx[i], xj = Vx[j];
+                        if (rx < min(xi, xj) - xPad || rx > max(xi, xj) + xPad) continue;
+                        float y0 = min(Vy[i], Vy[j]), y1 = max(Vy[i], Vy[j]);
+                        float const ddx = fabs(xj - xi);
+                        if (ddx > 4.0f * xPad) {
+                            float const t = clamp((rx - xi) / (xj - xi), 0.0f, 1.0f);
+                            float const y = Vy[i] + t * (Vy[j] - Vy[i]);
+                            float const pad = fabs(Vy[j] - Vy[i]) * (2.0f * xPad / ddx);
+                            y0 = max(y0, y - pad); y1 = min(y1, y + pad);
+                        }
+                        yMin = min(yMin, y0);
+                        yMax = max(yMax, y1);
+                    }
+                if (!(yMin <= yMax)) continue;       // this sample row misses the tet
+                yMin -= 4.0f * rho[1]; yMax += 4.0f * rho[1];
+                int const pLo = max(Sy0, int(floor((yMin / P.dx[1] + float(ic0[1]) + f0[1]) * float(nSub) - 0.5f)) - 2);
+                int const pHi = min(Sy1, int(ceil((yMax / P.dx[1] + float(ic0[1]) + f0[1]) * float(nSub) - 0.5f)) + 3);
+                for (int sy = pLo; sy < pHi; ++sy) {
+                    int const ky = (sy >= 0) ? sy / nSub : -((-sy + nSub - 1) / nSub);
+                    int const wg1 = P.periodic ? wrapIdx(ky, P.nGrid[1]) : ky;
+                    int l1 = wg1 - P.subOrigin[1];
+                    if (l1 < 0) l1 += P.nGrid[1];
+                    bool const in1 = in0 && l1 >= 0 && l1 < P.subDims[1];
+                    if (!in1 && !countAll) continue;
+                    float const ty = sample_tc(sy, nSub, invNSub, ic0[1], f0[1]);
+                    float const ry = ty * P.dx[1];
+                    // the column's certain-inside run [aIn, bIn) and the run [aPos, bPos) not certainly
+                    // outside (short columns: all of it, classified one by one)
+                    int aIn = 0, bIn = 0, aPos = Sz0, bPos = Sz1;
+                    if (Sz1 - Sz0 > 16) {
+                        for (int a = 0; a < 3; ++a) {
+                            col.P[a] = sg * (C[a][0]*rx + C[a][1]*ry);
+                            col.Q[a] = sg * C[a][2];
+                        }
+                        col.P[3] = sg * (detC - (C[0][0]*rx + C[0][1]*ry + C[1][0]*rx + C[1][1]*ry + C[2][0]*rx + C[2][1]*ry));
+                        col.Q[3] = -sg * (C[0][2] + C[1][2] + C[2][2]);
+                        column_run(col, Sz0, Sz1, Tpos, aPos, bPos);
+                        if (aPos >= bPos) continue;          // the whole column is outside
+                        column_run(col, aPos, bPos, Tin, aIn, bIn);
+                        if (aIn >= bIn) { aIn = 0; bIn = 0; }
+                    }
+                    for (int sz = aPos; sz < bPos; ++sz) {
+                        int const kz = (sz >= 0) ? sz / nSub : -((-sz + nSub - 1) / nSub);
+                        int const wg2 = P.periodic ? wrapIdx(kz, P.nGrid[2]) : kz;
+                        int l2 = wg2 - P.subOrigin[2];
+                        if (l2 < 0) l2 += P.nGrid[2];
+                        bool const inSub = in1 && l2 >= 0 && l2 < P.subDims[2];
+                        if (!inSub && !countAll) continue;
+                        float const tz = sample_tc(sz, nSub, invNSub, ic0[2], f0[2]);
+                        float const tc[3] = { tx, ty, tz };
+                        float rel[3] = { rx, ry, tz * P.dx[2] };
+                        int const cls = (sz >= aIn && sz < bIn) ? 1 : classifySample(C, M, detC, sg, B, Bdet, rel, tc, P);
+                        if (cls == 0 && pass == 0) { masses[tid] = -m; return; }   // nothing deposited yet
+                        if (cls <= 0) continue;
+                        if (pass == 0) { N++; continue; }
+                        uint const flat = (uint(l0)*uint(P.subDims[1]) + uint(l1))*uint(P.subDims[2]) + uint(l2);
+                        float const wm = fVolW ? mw / float(N + Nout) : share;
+                        float const sv = fExact ? (tetVol*invCellVol)/float(N + Nout) : 0.0f;
+                        depositSample(G, flat, rel, share, wm, obits, u0, vG, s0, sG, fVel, fDisp, fGrad, fVolW, fCaustic, fExact, sv, true, false, fScal, fSGrad);
+                    }
+                }
+            }
+            continue;   // next pass
+        }
+#endif
         // the in-grid cells only (the clamped window): the samples beyond the grid are counted by
         // count_beyond_grid, and walking a large straddling tet's whole window here cost up to ~10^6
         // empty iterations per thread. The bounds B stay those of the unclamped window.
@@ -1098,6 +1280,18 @@ static inline bool exact_tet_setup(uint tet, device const float* verts, device c
     E.faces = tet_planes(E.t1, E.t2, E.t3);
     E.hcell = float3(0.5f*P.dx[0], 0.5f*P.dx[1], 0.5f*P.dx[2]);
     E.wFull = exact_full_weight(fabs(d)/6.0f, P.fLinear != 0, E.d0, E.dG, E.t1, E.t2, E.t3);
+    E.wScale = 1.0f;
+    if ((P.fxMask & FX_SUMW_BIT) != 0u) {
+        float wb = fabs(d)/6.0f;
+        if (P.fLinear != 0) {
+            float dMax = 0.0f;
+            for (int v=0; v<4; ++v) dMax = max(dMax, fabs(dens[ulong(tet)*4ul+ulong(v)]));
+            wb *= dMax;
+        }
+        int e = 0;
+        (void)frexp(wb, e);                        // wb < 2^e
+        E.wScale = (wb > 0.0f && isfinite(wb)) ? ldexp(1.0f, clamp(59 - e, -126, 126)) : 1.0f;
+    }
     return true;
 }
 
@@ -1124,6 +1318,18 @@ kernel void depositExactItems(
     device atomic_float*       scalGrid [[buffer(19)]],
     device atomic_float*       sgGrid   [[buffer(20)]],
     device atomic_uint*        massFx   [[buffer(21)]],
+    device atomic_uint*        momX     [[buffer(22)]],
+    device atomic_uint*        m2X      [[buffer(23)]],
+    device atomic_uint*        gradX    [[buffer(24)]],
+    device atomic_uint*        momwX    [[buffer(25)]],
+    device atomic_uint*        svX      [[buffer(26)]],
+    device atomic_uint*        dvX      [[buffer(27)]],
+    device atomic_uint*        scalX    [[buffer(28)]],
+    device atomic_uint*        sgX      [[buffer(29)]],
+    // FX_SUMW_BIT (2026-10-14): sumW as two words per tet, the same buffer as 16 -- phase 0 adds each item's
+    // weight as an integer in the tet's own unit (ExactTet.wScale), so the total no longer depends on the order the
+    // items land in (a float atomic did, and every share m / sumW with it: the mass grid too)
+    device atomic_uint*        sumWX    [[buffer(30)]],
     uint iid [[thread_position_in_grid]])
 {
     if (iid >= IP.nItems) return;
@@ -1132,8 +1338,9 @@ kernel void depositExactItems(
     float const m = masses[tet];
     if (m <= 0.0f) return;           // deferred by an earlier, retried attempt
     bool const deposit = IP.phase == 1u;
+    bool const sumWFixed = (P.fxMask & FX_SUMW_BIT) != 0u;
     float s = 0.0f;
-    if (deposit) {
+    if (deposit && !sumWFixed) {
         s = atomic_load_explicit(&sumW[tet], memory_order_relaxed);
         if (!(s > 0.0f)) return;     // left to depositFields (host)
     }
@@ -1141,6 +1348,15 @@ kernel void depositExactItems(
     ExactTet E;
     int iMin[3], iMax[3];
     if (!exact_tet_setup(tet, verts, vels, dens, scal, P, E, iMin, iMax)) return;
+    if (deposit && sumWFixed) {      // the exact total, converted to float: the same float whatever the order
+        // (from the two words separately: a 64-bit integer built from two atomic loads crashed the Metal compiler
+        // service when it built this pipeline -- XPC_ERROR_CONNECTION_INTERRUPTED, macOS 27, 2026-10-14 -- as the
+        // standard deposit found for its threadgroup table)
+        uint const lo = atomic_load_explicit(&sumWX[ulong(tet)*2ul], memory_order_relaxed);
+        int const hi = as_type<int>(atomic_load_explicit(&sumWX[ulong(tet)*2ul+1ul], memory_order_relaxed));
+        if (hi < 0 || (hi == 0 && lo == 0u)) return;   // left to depositFields (host)
+        s = (float(hi) * 4294967296.0f + float(lo)) / E.wScale;
+    }
     // a tet cut by the grid face keeps only its inside share: normalized by its whole weight --
     // as is every tet of a --ps-window run (only its window pieces are clipped)
     float const shareFac = deposit ? m / ((E.straddle || P.windowMode != 0) ? max(s, E.wFull) : s) : 0.0f;
@@ -1160,7 +1376,8 @@ kernel void depositExactItems(
     bool const fVolW = P.fVolW != 0, fCaustic = P.fCaustic != 0, fLinear = P.fLinear != 0;
     bool const fScal = P.fScal != 0, fSGrad = P.fSGrad != 0;
     FieldGrids G { massGrid, momGrid, m2Grid, gradGrid, strGrid, momwGrid, caustGrid, svGrid, dvGrid, dwGrid, scalGrid, sgGrid,
-                   massFx, P.massScale, P.massFixed != 0 };
+                   massFx, P.massScale, P.massFixed != 0, momX, m2X, gradX, momwX, svX, dvX, scalX, sgX,
+                   P.fxMask, P.fxScale };
     float acc = 0.0f;
     for (; w < wEnd; ++w) {
         int const raw[3] = { iMin[0] + a0, iMin[1] + a1, iMin[2] + a2 };
@@ -1173,6 +1390,8 @@ kernel void depositExactItems(
         if (!deposit) acc += wt;
         else exact_cell_deposit(G, flat, mo, wt * shareFac, E, fVel, fDisp, fGrad, fVolW, fCaustic, fScal, fSGrad, cc);
     }
-    if (!deposit && acc > 0.0f)
-        atomic_fetch_add_explicit(&sumW[tet], acc, memory_order_relaxed);
+    if (!deposit && acc > 0.0f) {
+        if (sumWFixed) addFixedQ(sumWX, ulong(tet), as_type<ulong>(long(rint(acc * E.wScale))));
+        else atomic_fetch_add_explicit(&sumW[tet], acc, memory_order_relaxed);
+    }
 }

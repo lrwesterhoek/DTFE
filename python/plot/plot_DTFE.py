@@ -5,7 +5,9 @@ All file naming, grid geometry, units and metadata come from dtfelib.FieldSet; d
 plotted MEAN-NORMALIZED (rho/rho_bar, identical colorbars for both estimators;
 FieldSet auto-detects the on-disk convention). --method defaults to
 'dtfe' (this is the standard-DTFE plot script); pass --method ps to plot the PS-DTFE
-versions of the same fields.
+versions of the same fields -- the divergence and the shear of PS's MEAN flow by default
+(2026-10-13; derived from its velocity grid, the quantities standard DTFE stores),
+'--ps-gradient stored' for the PS binary's stream-averaged grids.
 
     python3 plot/plot_DTFE.py                          # TNG50-4-Dark, full snapshot series
     python3 plot/plot_DTFE.py --snap 99                # single snapshot
@@ -20,7 +22,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.ndimage import gaussian_filter
 
-from dtfelib import make_parser, FieldSet, sim_dir
+from dtfelib import make_parser, FieldSet, sim_dir, add_ps_gradient_arg, mean_field_wanted
 from dtfelib import figures as style
 from dtfelib.fields import extract_2d_slice as extract_slice, extract_velocity_slice
 
@@ -140,11 +142,15 @@ def process_snapshot(args, snap):
         if PROCESS_VELOCITY and fs.has('velocity'):
             fields['velocity'] = fs.load('velocity')
 
-        if PROCESS_DIVERGENCE and fs.has('divergence'):
-            fields['divergence'] = fs.load('divergence')
+        # under --method ps the divergence and the shear of the MEAN flow by default (2026-10-13), the quantities a
+        # standard-DTFE map shows: FieldSet.load(..., mean_field=True) derives them from the PS velocity grid
+        # ('--ps-gradient stored': the binary's PS grids, the stream average <grad v>); standard DTFE reads its grids
+        mean_field = mean_field_wanted(args)
+        if PROCESS_DIVERGENCE and fs.has('divergence', mean_field=mean_field):
+            fields['divergence'] = fs.load('divergence', mean_field=mean_field)
 
-        if PROCESS_SHEAR and fs.has('shear'):
-            fields['shear'] = fs.load('shear')
+        if PROCESS_SHEAR and fs.has('shear', mean_field=mean_field):
+            fields['shear'] = fs.load('shear', mean_field=mean_field)
 
     except FileNotFoundError:
         print(f"  skipping snapshot {snap:03d} (no {args.method} fields)")
@@ -196,6 +202,7 @@ def main():
     parser.add_argument("--snaps", type=int, nargs="+", default=None,
                         help="snapshot numbers to process (default: --snap if given, "
                              f"else the full series {SNAPSHOTS})")
+    add_ps_gradient_arg(parser)
     args = parser.parse_args()
 
     if args.snaps is not None:

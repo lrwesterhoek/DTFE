@@ -50,6 +50,42 @@ extern "C"
 
 
 
+// A particle dataset must hold one row per particle of 'cols' values (cols 0: a 1-D dataset). HDF5's read()
+// writes the WHOLE dataset into the buffer, so until 2026-10-11 a 3-column snapshot read by a 2D binary wrote 3N
+// values into a 2N buffer (a heap overflow: a segfault, or exit 0 with a garbage grid) and a 2-column one read
+// by a 3D binary was a misaligned short read of a wrong grid at exit 0.
+static void HDF5_checkParticleDataset(DataSet const &dataset, char const *group, char const *name,
+                                      long long nParticles, int cols, char const *file)
+{
+    DataSpace const space = dataset.getSpace();
+    int const rank = space.getSimpleExtentNdims();
+    hsize_t dims[2] = {0, 0};
+    if ( rank == 1 or rank == 2 ) space.getSimpleExtentDims( dims );
+    long long const nCols = rank == 2 ? (long long)dims[1] : 0;
+    std::ostringstream what;
+    what << "'" << group << "/" << name << "' in '" << file << "' ";
+    if ( cols > 0 and rank == 2 and nCols != cols and (nCols == 2 or nCols == 3) )
+    {
+        what << "holds " << nCols << " coordinates per particle, but this binary is built for " << NO_DIM
+             << " dimensions: run a " << nCols << "D snapshot with the "
+             << ( nCols == 2 ? "2D binaries (DTFE-2d / PS-DTFE-2d, 'make ... DIM=2')" : "3D binaries (DTFE / PS-DTFE)" ) << ".";
+        throwError( what.str() );
+    }
+    if ( rank != (cols > 0 ? 2 : 1) or (long long)dims[0] != nParticles or (cols > 0 and nCols != cols) )
+    {
+        what << "has the wrong shape: expected " << nParticles;
+        if ( cols > 0 ) what << " x " << cols; else what << " values (1-D)";
+        what << " for the " << nParticles << " particles the header gives, found a rank-" << rank << " dataset";
+        if ( rank >= 1 ) what << " of " << (long long)dims[0];
+        if ( rank == 2 ) what << " x " << nCols;
+        what << ".";
+        throwError( what.str() );
+    }
+}
+
+
+
+
 // Reads selected entries of the Gadget header from an HDF5 file (particle number, mass array,
 // box length, number of files per snapshot, cosmology), not the full header.
 void HDF5_readGadgetHeader(std::string filename,
@@ -138,6 +174,7 @@ static void HDF5_readCoordinatesBlock(H5File *file,
         Group *group = new Group( file->openGroup(buf) );
 
         DataSet dataset = group->openDataSet("Coordinates");
+        HDF5_checkParticleDataset( dataset, buf, "Coordinates", gadgetHeader.npart[type], NO_DIM, file->getFileName().c_str() );
 
         dataset.read( &(positions[dataOffset]), REAL_H5_TYPE );
         delete group;
@@ -179,6 +216,7 @@ static void HDF5_readMassesBlock(H5File *file,
             if ( H5Lexists(group->getId(), massName, H5P_DEFAULT) <= 0 )
                 throwError( "The header gives no common mass for particle type ", type, " (MassTable = 0), but neither a 'Mass' nor a 'Masses' dataset exists in '", buf, "'." );
             DataSet dataset = group->openDataSet(massName);
+            HDF5_checkParticleDataset( dataset, buf, massName, gadgetHeader.npart[type], 0, file->getFileName().c_str() );
 
             dataset.read( &(weights[dataOffset]), REAL_H5_TYPE );
             delete group;
@@ -208,6 +246,7 @@ static void HDF5_readVelocitiesBlock(H5File *file,
         Group *group = new Group( file->openGroup(buf) );
 
         DataSet dataset = group->openDataSet("Velocities");
+        HDF5_checkParticleDataset( dataset, buf, "Velocities", gadgetHeader.npart[type], NO_DIM, file->getFileName().c_str() );
 
         dataset.read( &(velocities[dataOffset]), REAL_H5_TYPE );
         delete group;
@@ -231,6 +270,7 @@ static void HDF5_readGasTemperatureBlock(H5File *file,
     message << "\t reading the gas temperature ..." << MESSAGE::Flush;
     Group *group = new Group( file->openGroup( "/PartType0" ) );
     DataSet dataset = group->openDataSet("Temperature");
+    HDF5_checkParticleDataset( dataset, "/PartType0", "Temperature", gadgetHeader.npart[0], 0, file->getFileName().c_str() );
     Real *tempData = new Real[ gadgetHeader.npart[0] ];
     dataset.read( tempData, REAL_H5_TYPE );
     delete group;
@@ -343,6 +383,7 @@ void HDF5_readGadgetData(std::string filename,
             snprintf( buf, sizeof(buf), "/PartType%d", type );
             group = new Group( file->openGroup(buf) );
             DataSet dataset = group->openDataSet("ParticleIDs");
+            HDF5_checkParticleDataset( dataset, buf, "ParticleIDs", gadgetHeader.npart[type], 0, filename.c_str() );
             dataset.read( &(readData->_particleIDs[dataOffset]), PredType::NATIVE_UINT64 );
             delete group;
             dataOffset += gadgetHeader.npart[type];
@@ -372,6 +413,7 @@ void HDF5_readGadgetData(std::string filename,
             }
 
             DataSet dataset = group->openDataSet("InitialCoordinates");
+            HDF5_checkParticleDataset( dataset, buf, "InitialCoordinates", gadgetHeader.npart[type], NO_DIM, filename.c_str() );
             dataset.read( &(lagPositions[dataOffset]), REAL_H5_TYPE );
             delete group;
             dataOffset += gadgetHeader.npart[type] * NO_DIM;
@@ -588,6 +630,7 @@ void HDF5_readGadgetData_HI(std::string filename,
 
         group = new Group( file->openGroup( "/PartType0/ElementAbundance" ) );
         DataSet dataset = group->openDataSet("Hydrogen");
+        HDF5_checkParticleDataset( dataset, "/PartType0/ElementAbundance", "Hydrogen", gadgetHeader.npart[0], 0, filename.c_str() );
         float *hydrogenMassFraction = new float[ gadgetHeader.npart[0] ];
         dataset.read( hydrogenMassFraction, PredType::NATIVE_FLOAT );
         delete group;
@@ -595,6 +638,8 @@ void HDF5_readGadgetData_HI(std::string filename,
         group = new Group( file2->openGroup( "/PartType0" ) );
         DataSet datasetMolecular = group->openDataSet("MolecularHydrogenMassFraction");
         DataSet datasetHydrogen = group->openDataSet("HydrogenOneFraction");
+        HDF5_checkParticleDataset( datasetMolecular, "/PartType0", "MolecularHydrogenMassFraction", gadgetHeader.npart[0], 0, h1FileName.c_str() );
+        HDF5_checkParticleDataset( datasetHydrogen, "/PartType0", "HydrogenOneFraction", gadgetHeader.npart[0], 0, h1FileName.c_str() );
         
         float *molecularMassFraction = new float[ gadgetHeader.npart[0] ];
         datasetMolecular.read( molecularMassFraction, PredType::NATIVE_FLOAT );
@@ -651,8 +696,8 @@ void HDF5_readGadgetFile_HI(std::string filename,
     // HI content is defined only for gas, so reject any other requested species
     bool otherSpecies = false;
     for (int i=1; i<6; ++i)
-        if ( userOptions->readParticleSpecies[1] )
-            otherSpecies = true;
+        if ( userOptions->readParticleSpecies[i] )     // [i]: it tested [1] five times until 2026-10-11, so gas
+            otherSpecies = true;                        // plus stars/black holes passed with raw stellar masses
     if ( otherSpecies )
         throwError( "You asked for the function that reads in the HI data yet you also asked for reading other particle species. This does not make sense." );
     if ( userOptions->additionalOptions.empty() )

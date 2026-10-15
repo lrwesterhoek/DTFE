@@ -171,9 +171,13 @@ for geo, title in (("pan", "pancake"), ("crw", "crossed waves")):
             check(f"Z serial == --partition 2 2 2 on {ext} (to float rounding)", d < 1e-5, f"max |diff| = {d:.1e}")
         else:
             check(f"Z serial == --partition 2 2 2 on {ext}", np.array_equal(a, b))
-        if gpu and _os.environ.get("DTFE_TEST_PRECISION") == "double" and ext == ".a_streams":
+        if gpu and _os.environ.get("DTFE_TEST_PRECISION") == "double" and ext in (".streams", ".a_streams"):
             # double build: the GPU gets float copies of the double tetrahedra (ps_double_check D5), so a
-            # sample on a face may count differently; the integer grids and both flag grids stay exact
+            # sample on a face may count differently; both flag grids stay exact. '.streams' (one sample per
+            # cell) too, since 2026-10-13: its exact match held by luck of the vertex labelling -- the
+            # 2026-10-12 binary already counts 2 streams instead of 3 in one crossed-wave cell with
+            # '--padding 20' (the CPU grids bit-identical), and the periodic-seam fix (which changes the
+            # padded point set, so CGAL's labelling) shows the same cell at the default padding
             g = load(f"{base}_gpu", ext)
             fr = float(np.mean(a != g)); d = float(np.abs(a.astype(np.float64) - g).max())
             check(f"Z CPU ~ GPU on {ext} (double build: float kernel geometry)", fr <= 1e-4,

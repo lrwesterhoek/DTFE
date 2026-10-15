@@ -67,11 +67,17 @@ void PCS_interpolation(vector<Particle_data> *particles,
 
 // PCS kernel policy for the shared engine. Kernel W(x) = (1/6)(4-6x^2+3|x|^3) for |x|<1,
 // (1/6)(2-|x|)^3 for 1<=|x|<2, else 0; support radius 2, so 4 cells per dimension. Boundary
-// particles use the same weights with out-of-grid cells clipped.
+// particles use the same weights with out-of-grid cells clipped (clipStencil, the engine).
 struct PCS_kernel
 {
     static int const STENCIL = 4;
     static constexpr double PAD_CELLS = 2.0;    // PCS kernel extends 2 cells from center
+    // The 4 cells are the host cell f of (position - half a cell), i.e. the cell whose CENTRE is the nearest
+    // one to the left, f-1 .. f+2, and s = 0.5 + temp the distance to f's centre -- the distances d0..d3 below.
+    // Without the offset (until 2026-10-11) f was the cell holding the particle and s its distance to f's
+    // LEFT EDGE: every particle's mass landed half a cell further along every axis (a deposit's centroid
+    // +0.50 cells; the grid was the field moved by +dx/2)
+    static constexpr double CELL_OFFSET = 0.5;
     static char const* name() { return "PCS"; }
 
     static void interiorWeights( Real temp, Real weight[4] )
@@ -94,24 +100,7 @@ struct PCS_kernel
     static void boundaryCells( int tempInt, Real temp, size_t nGridJ, int /*j*/,
                                int cell[4], Real weight[4], int &cellCount )
     {
-        // weights for cells tempInt-1, tempInt, tempInt+1, tempInt+2
-        Real allWeights[4];
-        interiorWeights( temp, allWeights );
-
-        int allCells[4] = { tempInt - 1, tempInt, tempInt + 1, tempInt + 2 };
-
-        // keep only in-grid cells
-        int count = 0;
-        for (int k=0; k<4; ++k)
-        {
-            if ( allCells[k] >= 0 and allCells[k] < int(nGridJ) )
-            {
-                cell[count] = allCells[k];
-                weight[count] = allWeights[k];
-                count++;
-            }
-        }
-        cellCount = count;
+        clipStencil<PCS_kernel>( tempInt, temp, nGridJ, cell, weight, cellCount );
     }
 };
 

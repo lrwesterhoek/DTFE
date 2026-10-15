@@ -1,0 +1,615 @@
+#!/usr/bin/env python3
+"""The launcher's 2026-10-11 additions (python/gui): run-directory files of a run going (contract C1) in the Runs
+browser, the memory status strip, the 'Running now' panel, the void-catalogue status and its build job, keep-awake,
+the new Plots sets, the memory check's log; (2026-10-14) the Explore menu's Save Options….
+
+Three tiers:
+  * HEADLESS (always run; Ubuntu CI, numpy 1.26): results.py / runspec.py / void_cache.py on synthetic run folders
+    and synthetic processes (a 'sleep' renamed to look like PS-DTFE through bash's exec -a, or run through a
+    symlink named PS-DTFE where ps's comm must say so).
+  * QT (when PySide6 imports, else SKIP): the RunningNow table, the Runs browser's Voids column, the window's
+    status strip, 'Build void catalogue' -> a queue job, and a failed memory-check pass landing in the log.
+  * DATA-BACKED (the T7 mounted, else SKIP): the void-catalogue status of the real TNG100-3-Dark grids.
+
+Usage:  python3 tests/py_gui_app2_test.py            (exit 0 = pass)
+        ~/.venvs/dtfe-gui/bin/python tests/py_gui_app2_test.py    (also the Qt tier)
+"""
+
+import atexit
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "python" / "gui"))
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+os.environ["DTFE_GUI_NO_NOTIFY"] = "1"
+_FIGS_TMP = tempfile.mkdtemp(prefix="gui_app2_figs_")
+os.environ["DTFE_FIGURES_ROOT"] = _FIGS_TMP      # before runspec is imported: no test figure on the T7
+atexit.register(shutil.rmtree, _FIGS_TMP, True)
+
+import results as R  # noqa: E402
+import runspec as rs  # noqa: E402
+
+PASS, FAIL, SKIP = [], [], []
+
+
+def check(name, cond, detail=""):
+    (PASS if cond else FAIL).append(name)
+    print(f"  {'PASS' if cond else 'FAIL'}  {name}" + ("" if cond or not detail else f"  [{str(detail)[:400]}]"))
+
+
+def skip(name, why):
+    SKIP.append(name)
+    print(f"  SKIP  {name}  ({why})")
+
+
+def dead_pid() -> int:
+    p = subprocess.Popen(["true"])
+    p.wait()
+    return p.pid
+
+
+def snapdir(tmp: Path, sim: str = "TNGX-1-Dark", snap: int = 99) -> Path:
+    d = tmp / "TNGX" / sim / f"snapdir_{snap:03d}"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+LOG_OK = ("Build: PS-DTFE abc123 (built 2026-10-10T12:00:00Z)\nRUNNING: ./PS-DTFE in.hdf5 {root} --grid 8 --periodic\n"
+          "SUMMARY\n  total wall time : 1m 2s\n  peak memory (RSS) : 1.5 GB\n")
+
+
+# ---------------------------------------------------------------------- C1 in the Runs browser
+def t_run_files(tmp: Path):
+    print("C1 run-directory files (results.py):")
+    d = snapdir(tmp)
+    root = d / "ps_output"
+    (d / "ps_output.runlog").write_text(LOG_OK.format(root=root))
+    old = time.time() - 100
+    os.utime(d / "ps_output.runlog", (old, old))
+    (d / "ps_output.a_den").write_bytes(b"\0" * 64)
+    os.utime(d / "ps_output.a_den", (old - 10, old - 10))
+    (d / "ps_output.a_vel.part.4242").write_bytes(b"\0" * 32)
+    (d / "ps_output.runlog.partial").write_text(LOG_OK.splitlines()[0] + "\n[partitions 3/10 | 30%] elapsed 1m\n")
+    lock = d / "ps_output.runlog.lock"
+    lock.mkdir()
+    (lock / "pid").write_text(str(os.getpid()))
+    # a live process ps names PS-DTFE: 'sleep' run through a symlink of that name (comm = the symlink's path on
+    # macOS, its basename on Linux); killed as soon as the scan is done (the concurrent launcher tests poll pgrep)
+    fake_bin = tmp / "bin" / "PS-DTFE"
+    fake_bin.parent.mkdir(exist_ok=True)
+    fake_bin.symlink_to(shutil.which("sleep") or "/bin/sleep")
+    fake = subprocess.Popen([str(fake_bin), "30"])
+    prog = {"pid": fake.pid, "phase": "deposit", "done": 3, "total": 10, "elapsed_s": 60, "eta_s": 7380,
+            "rss_gb": 12.5, "gpu_retries": 1, "updated": time.time()}
+    (d / "ps_output.runlog.progress").write_text(json.dumps(prog))
+    check("is_run_file: the sidecar (and its .tmp), the lock and '<grid>.part.<pid>' are run files; grids and logs "
+          "are not", all(R.is_run_file(n) for n in ("ps_output.runlog.progress", "ps_output.runlog.progress.tmp",
+                                                     "ps_output.runlog.lock", "ps_output.a_den.part.123"))
+          and not any(R.is_run_file(n) for n in ("ps_output.a_den", "ps_output.runlog", "ps_output.runlog.partial",
+                                                  "ps_output.partition")))
+    try:
+        time.sleep(0.2)
+        recs = R.scan_runs(tmp)
+    finally:
+        fake.kill()
+        fake.wait()
+    check("one record for the output set: the lock and the sidecar are not run logs", len(recs) == 1,
+          [(r.path.name, r.attempt) for r in recs])
+    rec = recs[0]
+    names = sorted(p.name for p in rec.outputs)
+    check("outputs: the grid only, never the '.part.<pid>', the sidecar or the lock", names == ["ps_output.a_den"], names)
+    check("a '.partial' whose sidecar pid is alive is 'running' with the sidecar read", rec.attempt == "running"
+          and rec.progress is not None and rec.progress.get("state") == "running", (rec.attempt, rec.progress))
+    note = R.attempt_note(rec)
+    text = R.progress_text(rec.progress)
+    check("progress_text: phase, done/total (percent), ETA, memory, GPU retries; the attempt note carries it",
+          text == "deposit 3/10 (30%), ETA 2h 03m, 12.5 GB, 1 GPU retries" and note is not None and text in note[1],
+          (text, note))
+    # the sidecar's pid alive but another program's (pids wrap within a day of the launcher's polling): this
+    # process is python, not a DTFE binary, so the run was killed (2026-10-11: a bare pid test said 'running')
+    prog["pid"] = os.getpid()
+    (d / "ps_output.runlog.progress").write_text(json.dumps(prog))
+    rec = R.scan_runs(tmp)[0]
+    check("a sidecar pid now held by a program that is not a DTFE binary reads 'died', the attempt 'killed'",
+          rec.attempt == "killed" and (rec.progress or {}).get("state") == "died", (rec.attempt, rec.progress))
+    # the same sidecar with a dead pid: the run was killed outright
+    prog["pid"] = dead_pid()
+    (d / "ps_output.runlog.progress").write_text(json.dumps(prog))
+    rec = R.scan_runs(tmp)[0]
+    check("a dead pid in the sidecar: the attempt reads 'killed' and the progress 'died'",
+          rec.attempt == "killed" and "died" in R.progress_text(rec.progress), (rec.attempt, rec.progress))
+    check("read_progress: None for a missing or broken sidecar", R.read_progress(d / "nope.progress") is None
+          and (d.joinpath("bad.runlog.progress").write_text("{not json") and R.read_progress(d / "bad.runlog.progress")
+               is None))
+    (d / "bad.runlog.progress").unlink()
+    shutil.rmtree(lock)
+    for f in ("ps_output.runlog.partial", "ps_output.runlog.progress", "ps_output.a_vel.part.4242"):
+        (d / f).unlink()
+
+
+def t_parse_cache(tmp: Path):
+    print("run-log cache (results.parse_runlog):")
+    d = snapdir(tmp, snap=50)
+    log = d / "ps_output.runlog"
+    log.write_text(LOG_OK.format(root=d / "ps_output"))
+    a = R.parse_runlog(log, "TNGX-1-Dark", 50)
+    key = str(log)
+    cached = key in R._LOG_CACHE
+    real_read = Path.read_text
+    calls = []
+
+    def counting(self, *aa, **kk):
+        if str(self) == key:
+            calls.append(1)
+        return real_read(self, *aa, **kk)
+    Path.read_text = counting
+    try:
+        b = R.parse_runlog(log, "TNGX-1-Dark", 50)
+        n_unchanged = len(calls)
+        log.write_text(LOG_OK.format(root=d / "ps_output").replace("1m 2s", "2m 4s") + "more\n")
+        c = R.parse_runlog(log, "TNGX-1-Dark", 50)
+    finally:
+        Path.read_text = real_read
+    check("an unchanged log is not read again (cache by size and mtime), with the same fields",
+          cached and n_unchanged == 0 and (a.wall_seconds, a.binary, a.ok, a.grid) == (b.wall_seconds, b.binary, b.ok, b.grid),
+          (cached, n_unchanged, a.wall_seconds, b.wall_seconds))
+    check("... a rewritten log is read again", len(calls) == 1 and c.wall_seconds == 124.0, (len(calls), c.wall_seconds))
+    log.unlink()
+
+
+# ---------------------------------------------------------------------- memory strip, running now
+def t_memory():
+    print("memory status (runspec.memory_status / memory_text):")
+    m = rs.memory_status()
+    check("memory_status: the three keys; a number for free memory on macOS and Linux",
+          set(m) == {"free_gb", "swap_used_gb", "swap_total_gb"}
+          and (m["free_gb"] is None if sys.platform not in ("darwin", "linux") else m["free_gb"] > 0), m)
+    old = os.environ.get("DTFE_FREE_GB")
+    os.environ["DTFE_FREE_GB"] = "12.5"
+    try:
+        m2 = rs.memory_status()
+    finally:
+        if old is None:
+            os.environ.pop("DTFE_FREE_GB")
+        else:
+            os.environ["DTFE_FREE_GB"] = old
+    check("... DTFE_FREE_GB overrides the free reading (as for the C++ programs)", m2["free_gb"] == 12.5, m2)
+    txt = rs.memory_text({"free_gb": 31.24, "swap_used_gb": 1.42, "swap_total_gb": 4.0},
+                         {"runs": [(812, "PS-DTFE", 37.1)], "servers": [(90, "DTFE", None)]})
+    check("memory_text: free, swap, each run and server with its memory; no '--'",
+          txt == "free 31.2 GB · swap 1.4 of 4.0 GB · PS-DTFE pid 812, 37.1 GB · DTFE server pid 90" and "--" not in txt,
+          txt)
+
+
+def t_running_now(tmp: Path):
+    print("running now (runspec.parse_run_args / running_now / progress_files):")
+    a = rs.parse_run_args("./PS-DTFE /Volumes/Samsung T7/Illustris TNG/TNG50/TNG50-3-Dark/snapdir_099/combined_099.hdf5 "
+                          "/Volumes/Samsung T7/Illustris TNG/TNG50/TNG50-3-Dark/snapdir_099/ps_output --grid 512 --periodic")
+    check("parse_run_args: paths with spaces, the simulation and snapshot from the snapdir",
+          a == {"exe": "PS-DTFE", "input": "/Volumes/Samsung T7/Illustris TNG/TNG50/TNG50-3-Dark/snapdir_099/combined_099.hdf5",
+                "output": "/Volumes/Samsung T7/Illustris TNG/TNG50/TNG50-3-Dark/snapdir_099/ps_output",
+                "sim": "TNG50-3-Dark", "snap": 99}, a)
+    check("... a custom run (no snapdir) and a line that is not a run", rs.parse_run_args(
+        "/x/DTFE-double /data/my run.hdf5 /out/my run --grid 64")["output"] == "/out/my run"
+        and rs.parse_run_args("/x/DTFE-double /data/my run.hdf5 /out/my run --grid 64")["sim"] == ""
+        and rs.parse_run_args("sleep 30")["output"] == "")
+    d = snapdir(tmp, snap=33)
+    out = d / "ps_output"
+    live = {"pid": 0, "phase": "triangulation", "done": 2, "total": 8, "eta_s": 600, "rss_gb": 3.0, "elapsed_s": 50,
+            "gpu_retries": 0, "updated": time.time()}
+    # a 'sleep' that looks like PS-DTFE to ps (bash's exec -a sets its argv[0] to the whole command line)
+    fake = f"{ROOT}/PS-DTFE {d}/combined_033.hdf5 {out} --grid 8 --periodic"
+    proc = subprocess.Popen(["bash", "-c", 'exec -a "$0" sleep 30', fake])
+    try:
+        time.sleep(0.3)
+        live["pid"] = proc.pid
+        Path(str(out) + ".runlog.progress").write_text(json.dumps(live))
+        left = snapdir(tmp, snap=17) / "ps_output.runlog.progress"
+        left.write_text(json.dumps(dict(live, pid=dead_pid(), done=5)))
+        files = rs.progress_files(tmp)
+        check("progress_files: every sidecar under the data root's snapdirs",
+              sorted(p.name for p in files) == ["ps_output.runlog.progress"] * 2 and len(files) == 2, files)
+        got = rs.running_now(files, {"runs": [(proc.pid, "PS-DTFE", 2.5)], "servers": []})
+        by = {e["state"]: e for e in got}
+        e = by.get("running", {})
+        check("running_now: the live run with its simulation, snapshot, output, ps elapsed time and sidecar",
+              len(got) == 2 and e.get("sim") == "TNGX-1-Dark" and e.get("snap") == 33 and e.get("output") == str(out)
+              and (e.get("progress") or {}).get("done") == 2 and e.get("gb") == 2.5 and e.get("elapsed_s") is not None,
+              got)
+        dd = by.get("died", {})
+        check("... and the leftover sidecar of a dead pid reads 'died' with its snapshot",
+              dd.get("snap") == 17 and dd.get("sim") == "TNGX-1-Dark" and (dd.get("progress") or {}).get("done") == 5, dd)
+        # the sidecar's pid must be a live DTFE binary to ps (results.dtfe_pid_alive, 2026-10-11): the exec -a
+        # 'sleep' above is 'sleep' to Linux's comm, so a symlink named PS-DTFE runs this one
+        fake_bin = tmp / "bin" / "PS-DTFE"
+        fake_bin.parent.mkdir(exist_ok=True)
+        if not fake_bin.is_symlink():
+            fake_bin.symlink_to(shutil.which("sleep") or "/bin/sleep")
+        other = subprocess.Popen([str(fake_bin), "30"])
+        time.sleep(0.2)
+        Path(str(out) + ".runlog.progress").write_text(json.dumps(dict(live, pid=other.pid)))
+        alone = rs.running_now(files, {"runs": [], "servers": []})
+        other.kill()
+        other.wait()
+        check("... a live sidecar whose process is not among the runs is left to its own process row",
+              [(e["state"], e["snap"]) for e in alone] == [("died", 17)], alone)
+    finally:
+        proc.kill()
+        proc.wait()
+        Path(str(out) + ".runlog.progress").unlink(missing_ok=True)
+        left.unlink(missing_ok=True)
+
+
+def t_keep_awake():
+    print("keep-awake (runspec.keep_awake_argv):")
+    script = rs.keep_awake_argv(["bash", str(rs.PS_SCRIPT), "-s", "TNG50-3-Dark"], 1234)
+    binary = rs.keep_awake_argv([str(ROOT / "PS-DTFE"), "in.hdf5", "out"], 1234)
+    if sys.platform == "darwin" and shutil.which("caffeinate"):
+        check("a run script keeps itself awake; a binary run directly (the Custom tab) gets caffeinate -i -m -w pid",
+              script is None and binary is not None and binary[1:] == ["-i", "-m", "-w", "1234"], (script, binary))
+    else:
+        check("no caffeinate here: no keep-awake command", script is None and binary is None, (script, binary))
+
+
+# ---------------------------------------------------------------------- Plots sets, void catalogue
+def t_plot_sets(tmp: Path):
+    print("Plots sets (runspec.FIGURE_SETS):")
+    base = dict(data_root=str(tmp), sim="TNGX-1-Dark", snapshots=[33, 99])
+    keys = [fs.key for fs in rs.FIGURE_SETS]
+    check("the new sets are registered and the thesis set stays last",
+          all(k in keys for k in ("crossbox", "voidevol", "voidenv", "voidfate", "voidconv", "voidcat")) and keys[-1] == "thesis", keys)
+    plain = {st.argv[1].split("/")[-1]: st for st in rs.PlotSpec(
+        sets=["voidtrack", "crossbox", "voidevol", "voidenv", "voidfate", "voidconv", "voidcat"], **base).steps()}
+    cb = plain["plot_void_crossbox.py"].argv
+    check("defaults: the cross-box comparison gets only its boxes and the data root; "
+          "the C5 scripts and the convergence check (K4) '--sim SIM'; one catalogue build per snapshot",
+          cb[2:] == ["--sims", "TNG50-3-Dark", "TNG100-3-Dark", "TNG300-3-Dark", "--data-root", str(tmp)]
+          and all(plain[n].argv[2:] == ["--sim", "TNGX-1-Dark"] for n in
+                  ("plot_void_profile_evolution.py", "plot_void_environment.py", "plot_void_fate.py",
+                   "plot_void_convergence.py"))
+          and plain["plot_void_convergence.py"].env.get("DTFE_SIM") == "TNGX-1-Dark"
+          and [st.argv[2:] for st in rs.PlotSpec(sets=["voidcat"], **base).steps()]
+          == [["build", "--sim", "TNGX-1-Dark", "--snap", str(n), "--method", "ps"] for n in (33, 99)],
+          {k: v.argv[2:] for k, v in plain.items()})
+    opts = {"crossbox": {"sims": "TNG50-3-Dark TNG100-3-Dark", "smooth_mpc": 3.0, "z": "0 2", "n_boot": 50, "replot": True},
+            "voidtrack": {"radius": "r_eff", "smooth_mpc": 2.1625}}
+    got = {st.argv[1].split("/")[-1]: st.argv for st in rs.PlotSpec(sets=["crossbox", "voidtrack"], options=opts,
+                                                                       method="dtfe", prefix="ps_mw", **base).steps()}
+    c, t = got["plot_void_crossbox.py"], got["plot_void_tracking.py"]
+    check("... the options reach their flags (boxes, method, prefix, smoothing, redshifts, bootstrap, replot; the "
+          "tracking's radius and smoothing in Mpc)",
+          c[c.index("--sims") + 1:c.index("--data-root")] == ["TNG50-3-Dark", "TNG100-3-Dark"]
+          and c[c.index("--method") + 1] == "dtfe" and c[c.index("--prefix") + 1] == "ps_mw"
+          and c[c.index("--smooth-mpc") + 1] == "3" and c[c.index("--z") + 1:c.index("--z") + 3] == ["0", "2"]
+          and c[c.index("--n-boot") + 1] == "50" and "--replot" in c
+          and t[t.index("--radius") + 1] == "r_eff" and t[t.index("--smooth-mpc") + 1] == "2.1625", (c, t))
+    # every flag the launcher passes is one the script's own parser knows (scripts other agents may still be writing
+    # are judged only once they exist)
+    flat = {n: a for n, a in list(got.items()) + [(k, v.argv) for k, v in plain.items()]}
+    for name, argv in sorted(flat.items()):
+        script = ROOT / "python" / ("gui" if name == "void_cache.py" else "plot") / name
+        if not script.is_file():
+            skip(f"{name}: its flags in its help", "not in this checkout yet")
+            continue
+        h = subprocess.run([sys.executable, str(script), "--help"], capture_output=True, text=True, timeout=120,
+                           env=dict(os.environ, MPLBACKEND="Agg"))
+        flags = [x for x in argv[2:] if x.startswith("--")]
+        check(f"{name}: every flag in its own help ({' '.join(flags)})", h.returncode == 0
+              and all(f in h.stdout for f in flags), h.stderr[-300:] or [f for f in flags if f not in h.stdout])
+    texts = [fs.title + " " + fs.about + " " + " ".join(o.label + " " + o.help for o in fs.opts)
+             for fs in rs.FIGURE_SETS if fs.key in ("crossbox", "voidevol", "voidenv", "voidfate", "voidconv", "voidcat", "voidtrack")]
+    check("no '--' in the new sets' texts", not [x for x in texts if "--" in x])
+    sp = rs.PlotSpec(sets=["voidcat", "voidfate"], **base)
+    (tmp / "TNGX" / "TNGX-1-Dark").mkdir(parents=True, exist_ok=True)
+    probs = sp.problems()
+    absent = not (ROOT / "python" / "plot" / "plot_void_fate.py").is_file()
+    check("problems: no grids for the catalogue build is a warning; a script not in the checkout an error",
+          any(lv == "warning" and "no grids" in m for lv, m in probs)
+          and (any(lv == "error" and "plot_void_fate.py" in m for lv, m in probs) == absent), probs)
+
+
+def t_void_status_headless(tmp: Path):
+    print("void catalogue status (results.void_status / void_cache.py):")
+    import void_cache as VC
+    check("void_cache.products_prefix: the method's own prefix is the untagged namespace",
+          VC.products_prefix("ps", "ps_output") is None and VC.products_prefix("dtfe", "output") is None
+          and VC.products_prefix("ps", "ps_mw") == "ps_mw" and VC.products_prefix("ps", "") is None)
+    d = snapdir(tmp, snap=4)
+    (d / "ps_output.runlog").write_text(LOG_OK.format(root=d / "ps_output"))
+    (d / "ps_output.a_den").write_bytes(b"\0" * 64)
+    rec = next(r for r in R.scan_runs(tmp) if r.snap == 4)
+    check("void_candidate: a finished TNG 3D run with a density grid (not a custom run, not a failed one)",
+          R.void_candidate(rec) and not R.void_candidate(R.RunRecord(path=d / "x.runlog", ok=True))
+          and not R.void_candidate(R.RunRecord(path=rec.path, sim=rec.sim, snap=4, prefix="ps_output",
+                                               binary="PS-DTFE", ok=False, outputs=rec.outputs)))
+    st = R.void_status([rec], tmp, python=sys.executable)
+    check("a grid that is no real FieldSet: one 'error' row with a reason, nothing built", st.get(str(rec.path), ("",))[0]
+          == "error" and st[str(rec.path)][1], st)
+    st = R.void_status([rec], tmp, python=str(tmp / "no-such-python"))
+    check("... and a helper that cannot start reads 'error' too (never an exception)",
+          st.get(str(rec.path), ("",))[0] == "error", st)
+    for f in ("ps_output.runlog", "ps_output.a_den"):
+        (d / f).unlink()
+
+
+def t_void_status_t7():
+    print("data-backed void status (TNG100-3-Dark on the T7):")
+    root = Path(os.environ.get("DTFE_DATA_ROOT") or "/Volumes/Samsung T7/Illustris TNG")
+    sd = rs.sim_dir("TNG100-3-Dark", str(root)) / "snapdir_099"
+    if not (sd / "ps_output.runlog").is_file() or not (sd / "ps_output.a_den").is_file():
+        skip("void status of TNG100-3-Dark 099", f"no grids under {sd}")
+        return
+    rec = R.parse_runlog(sd / "ps_output.runlog", "TNG100-3-Dark", 99)
+    t0 = time.time()
+    st = R.void_status([rec], root, python=sys.executable)
+    state, why = st.get(str(rec.path), ("", ""))
+    check(f"the production catalogue reads cached, stale or absent, never error ({state}: {why}; "
+          f"{time.time() - t0:.1f} s)", state in ("cached", "stale", "absent"), st)
+
+
+# ---------------------------------------------------------------------- Qt
+def t_qt(tmp: Path):
+    print("Qt (runs_view.RunningNow / RunsBrowser, app.MainWindow):")
+    try:
+        from PySide6.QtCore import QEventLoop, QSettings, QTimer
+        from PySide6.QtWidgets import QApplication
+    except ImportError as e:
+        skip("the Qt tier", f"PySide6 not importable: {e}")
+        return
+    app = QApplication.instance() or QApplication([])
+    import runs_view as RV
+
+    def spin(ms):
+        loop = QEventLoop()
+        QTimer.singleShot(ms, loop.quit)
+        loop.exec()
+    rn = RV.RunningNow()
+    rn.show_entries([{"pid": 812, "name": "PS-DTFE", "gb": 37.1, "elapsed_s": 3600, "sim": "TNG50-3-Dark", "snap": 99,
+                      "output": "/x/ps_output", "state": "running",
+                      "progress": {"phase": "deposit", "done": 9, "total": 27, "eta_s": 7200, "gpu_retries": 2}},
+                     {"pid": 77, "name": "", "gb": None, "elapsed_s": None, "sim": "TNG50-3-Dark", "snap": 33,
+                      "output": "/x/ps_output", "state": "died", "progress": {"done": 5, "total": 27, "rss_gb": 9.0}}])
+    row = lambda k: [rn.table.item(k, c).text() for c in range(rn.table.columnCount())]   # noqa: E731
+    check("RunningNow: simulation, snapshot, program, pid, phase, done/total, ETA, memory, elapsed, state",
+          row(0) == ["TNG50-3-Dark", "099", "PS-DTFE", "812", "deposit", "9/27 (33%)", "2h 00m", "37.1 GB", "1h 00m",
+                     "running, 2 GPU retries"] and row(1)[1] == "033" and row(1)[-1].startswith("died")
+          and row(1)[7] == "9.0 GB" and "1 died" in rn.note.text(), (row(0), row(1), rn.note.text()))
+    rn.table.selectRow(1)
+    stop_dead = rn.b_stop.isEnabled()
+    rn.table.selectRow(0)
+    check("... Stop only for a run that is going", not stop_dead and rn.b_stop.isEnabled())
+    check("... no '--' in what it shows", not any("--" in x for k in (0, 1) for x in row(k)))
+
+    # the Runs browser: the Voids column filled from a background status (a fake helper that answers 'stale')
+    d = snapdir(tmp, sim="TNGQ-1-Dark", snap=99)
+    (d / "ps_output.runlog").write_text(LOG_OK.format(root=d / "ps_output"))
+    (d / "ps_output.a_den").write_bytes(b"\0" * 64)
+    fake = tmp / "fake_python.sh"
+    fake.write_text('#!/bin/sh\ncat >/dev/null\necho \'[{"state": "stale", "why": "built from another version"}]\'\n')
+    fake.chmod(0o755)
+    rb = RV.RunsBrowser(lambda: str(tmp), lambda: [], str(fake))
+    rb.reload()
+    for _ in range(50):
+        if rb.void_states:
+            break
+        spin(100)
+    col = RV.COLUMNS.index("Voids")
+    k = next((i for i, r in enumerate(rb._rows) if r.sim == "TNGQ-1-Dark"), None)
+    check("RunsBrowser: the Voids column reads the background status ('stale'), the build button follows the selection",
+          k is not None and rb.table.item(k, col).text() == "stale", (k, rb.void_states))
+    got = []
+    rb.build_voids.connect(got.append)
+    rb.table.selectRow(k)
+    rb.b_voids.click()
+    check("... 'Build void catalogue' emits the selected run", len(got) == 1 and got[0].sim == "TNGQ-1-Dark")
+    rb.filter.setText("voids stale")
+    check("... and the filter knows the state", len(rb._rows) >= 1 and all(
+        rb.void_states.get(str(r.path), ("",))[0] == "stale" for r in rb._rows))
+    # K2 (2026-10-11): a killed run with its checkpoint directory shows 'resumable' in the Status column
+    dk = snapdir(tmp, sim="TNGK-1-Dark", snap=99)
+    (dk / "ps_output.runlog.partial").write_text(f"RUNNING: ./PS-DTFE in.hdf5 {dk / 'ps_output'} --grid 8 "
+                                                 "--partition 2 2 2\n")
+    (dk / "ps_output.runlog.checkpoint").mkdir()
+    rb.filter.setText("")
+    rb.reload()
+    kk = next((i for i, r in enumerate(rb._rows) if r.sim == "TNGK-1-Dark"), None)
+    status = rb.table.item(kk, RV.COLUMNS.index("Status")).text() if kk is not None else None
+    if shutil.which("ps"):
+        check("RunsBrowser: a killed run with its checkpoint shows 'resumable', its tooltip says the job resumes it",
+              status is not None and "resumable" in status
+              and "resum" in rb.table.item(kk, RV.COLUMNS.index("Status")).toolTip(), status)
+    else:
+        skip("RunsBrowser: 'resumable'", "no ps here: a '.partial' run cannot be called killed")
+
+    import app as A
+    ini = tmp / "launcher.ini"
+    w = A.MainWindow(remember=False, settings=QSettings(str(ini), QSettings.IniFormat))
+    try:
+        w.root_edit.setText(str(tmp))
+        for _ in range(60):
+            if w.mem_strip.text():
+                break
+            spin(100)
+        check("the window's status strip shows free memory (off the GUI thread)",
+              w.mem_strip.text().startswith("free ") or w.mem_strip.text() == "memory: unknown", w.mem_strip.text())
+        check("a 'Running now' tab beside Runs", w.results.indexOf(w.running_now) == w.results.indexOf(w.runs) + 1)
+        t_qt_save_options(w)
+        rec = R.parse_runlog(d / "ps_output.runlog", "TNGQ-1-Dark", 99)
+        n0 = len(w.queue)
+        w.queue_void_build(rec)
+        job = w.queue[-1] if len(w.queue) > n0 else None
+        steps = job.build().steps() if job else []
+        check("'Build void catalogue' queues a Plots job: void_cache.py build for the run's snapshot and method",
+              job is not None and job.kind == "plots" and len(steps) == 1
+              and steps[0].argv[1].endswith("void_cache.py") and steps[0].argv[2:] ==
+              ["build", "--sim", "TNGQ-1-Dark", "--snap", "99", "--method", "ps"]
+              and steps[0].env.get("DTFE_SIM") == "TNGQ-1-Dark", steps and steps[0].argv)
+        del w.queue[n0:]
+        # a failed memory-check pass: its output goes into the log the status line points to
+        class _P:
+            def readAllStandardOutput(self):
+                return b""
+        p = _P()
+        w.mem_results["k"] = {}
+        w._mcheck = {"tab": A.GRIDS, "key": "k", "passes": [], "done": 0, "spec": None, "first": {},
+                     "proc": p, "current": ("TNGQ-1-Dark", None, [99]),
+                     "buf": "Error: input file not found: combined_099.hdf5\n"}
+        w._check_pass_done(p, 1)
+        check("a failed memory-check pass: 'see the log', and the log has its output",
+              "see the log" in w.status.text() and "input file not found" in w.log.toPlainText(),
+              (w.status.text(), w.log.toPlainText()[-300:]))
+        check("the queue box names every kind that waits (custom included: HEAVY_KINDS)",
+              "custom" in w.q_wait.text() and all(k in rs.HEAVY_KINDS for k in ("grids", "pipeline", "custom")))
+        # K1 (2026-10-11): the ordered-merge tick on the Grids, Pipeline and Custom tabs reaches each job, and
+        # 'Load settings' of a run made with it ticks it again (and of one without, unticks it)
+        for cb in (w.om_check, w.p_om, w.o_om):
+            cb.setChecked(True)
+        w._read_widgets()
+        check("the ordered-merge tick reaches the Grids, Pipeline and Custom jobs (ORDERED_MERGE=1 / --ordered-merge)",
+              w.spec.command()[1].get("ORDERED_MERGE") == "1" and w.pipe.command()[1].get("ORDERED_MERGE") == "1"
+              and "--ordered-merge" in w.custom.command(),
+              (w.spec.ordered_merge, w.pipe.ordered_merge, w.custom.ordered_merge))
+        w.om_check.setChecked(False)
+        (d / "om.runlog").write_text(LOG_OK.format(root=d / "om").replace("--periodic", "--periodic --ordered-merge"))
+        w._load_run_settings(R.parse_runlog(d / "om.runlog", "TNGQ-1-Dark", 99))
+        on = w.om_check.isChecked()
+        w._load_run_settings(R.parse_runlog(d / "ps_output.runlog", "TNGQ-1-Dark", 99))
+        check("'Load settings' carries the ordered merge: on for a run made with it, off for one without",
+              on and not w.om_check.isChecked(), on)
+        # 2026-10-11: the start-over tick (Grids, Pipeline) reaches run_ps_dtfe.sh as PS_RESUME=0; the banner of a
+        # refused resume ticks it; its text has no '--'; 'Load settings' leaves it alone (a one-off choice)
+        so, pso = getattr(w, "so_check", None), getattr(w, "p_so", None)
+        ok = so is not None and pso is not None
+        if ok:
+            so.setChecked(True)
+            pso.setChecked(True)
+            w._read_widgets()
+            ticked = (w.spec.command()[1].get("PS_RESUME"), w.pipe.command()[1].get("PS_RESUME"))
+            so.setChecked(False)
+            w._read_widgets()
+            off = w.spec.command()[1].get("PS_RESUME")
+            w._job_tab = A.GRIDS
+            w._banner_action("start_over")
+            banner = so.isChecked()
+            w._load_run_settings(R.parse_runlog(d / "ps_output.runlog", "TNGQ-1-Dark", 99))
+            ok = (ticked == ("0", "0") and off == "1" and banner and so.isChecked()
+                  and "--" not in so.text() + so.toolTip() and "PS_RESUME=0" in so.toolTip())
+        check("the start-over tick reaches the Grids and Pipeline jobs (PS_RESUME=0, else 1), the refused-resume banner "
+              "ticks it, no '--' in its text, 'Load settings' leaves it", ok,
+              (getattr(w.spec, "start_over", None), getattr(w.pipe, "start_over", None)))
+        t_qt_void_options(w)
+        t_qt_gpu_retries(tmp)
+    finally:
+        w._machine_timer.stop()
+        w.close()
+        spin(200)
+
+
+def t_qt_save_options(w):
+    """The Explore menu's Save Options… (2026-10-14): right after Save Image…, enabled without a map, it brings up
+    Explore and the Save options dialog; a window that does not remember its settings keeps them for the session."""
+    import app as A
+    menu = next(a.menu() for a in w.menuBar().actions() if a.text() == "Explore")
+    acts = [a for a in menu.actions() if not a.isSeparator()]
+    k = acts.index(w.save_options_action) if w.save_options_action in acts else -1
+    opened = []
+    real = w.explore.open_save_options
+    w.explore.open_save_options = lambda: opened.append(w.tabs.currentIndex()) or True
+    try:
+        w.tabs.setCurrentIndex(A.GRIDS)
+        w.save_options_action.trigger()
+    finally:
+        w.explore.open_save_options = real
+    check("Explore > Save Options…: after Save Image…, enabled with no map shown, opens the dialog on the Explore tab; "
+          "remember off: the options are not written to the settings",
+          k > 0 and acts[k - 1] is w.save_image_action and w.save_options_action.text() == "Save Options…"
+          and w.save_options_action.isEnabled() and opened == [A.EXPLORE] and w.explore._settings is None
+          and "--" not in w.save_options_action.text(), (k, opened, w.save_options_action.isEnabled()))
+
+
+def t_qt_void_options(w):
+    """The void scripts' own options on the Plots tab (2026-10-11): grouped options share one form row (compact),
+    and what the widgets say reaches the job's commands (= the exported script)."""
+    import app as A
+    keys = [fs.key for fs in rs.FIGURE_SETS]
+    page = w.fig_stack.widget(keys.index("skeleton"))
+    opts = rs.FIGURE_SET["skeleton"].opts
+    want_rows = 1 + len({o.row for o in opts if o.row}) + sum(1 for o in opts if not o.row)
+    null_w = w.opt_widgets[("skeleton", "null_draws")][1]
+    sheet_w = w.opt_widgets[("skeleton", "sheet_min_density")][1]
+    page.resize(700, 600)
+    page.show()
+    page.layout().activate()
+    check("Plots tab: the skeleton's grouped options share form rows (two widgets on one line), each with a tooltip",
+          page.layout().rowCount() == want_rows and null_w.geometry().y() == sheet_w.geometry().y()
+          and null_w.toolTip() and sheet_w.toolTip(),
+          (page.layout().rowCount(), want_rows, null_w.geometry(), sheet_w.geometry()))
+    page.hide()
+    w.tabs.setCurrentIndex(A.PLOTS)
+    for i in range(w.fig_list.count()):
+        it = w.fig_list.item(i)
+        it.setCheckState(A.Qt.Checked if it.data(A.Qt.UserRole) in ("voidtrack", "skeleton") else A.Qt.Unchecked)
+    w.opt_widgets[("voidtrack", "link")][1].setCurrentText("particles")
+    w.opt_widgets[("voidtrack", "exclusive")][1].setChecked(True)
+    w.opt_widgets[("skeleton", "min_component_mass")][1].setValue(0.001)
+    w._read_widgets()
+    argv = {Path(st.argv[1]).name: st.argv for st in w.plots.steps()}
+    tr, sk = argv.get("plot_void_tracking.py", []), argv.get("plot_caustic_skeleton.py", [])
+    check("... and the widgets' values reach the job's commands (what an export writes)",
+          tr[tr.index("--link") + 1:tr.index("--link") + 2] == ["particles"] and "--exclusive" in tr
+          and sk[sk.index("--min-component-mass") + 1:][:1] == ["0.001"] and "--null-draws" not in sk,
+          (w.plots.sets, tr, sk))
+
+
+def t_qt_gpu_retries(tmp: Path):
+    """G1 (2026-10-11): the Runs tab shows the GPU deposit retries per cause: the 'Running now' state from the
+    sidecar, a finished run's status and details from its log's closing line."""
+    import runs_view as RV
+    rn = RV.RunningNow()
+    rn.show_entries([{"pid": 9, "name": "PS-DTFE", "sim": "S", "snap": 99, "state": "running",
+                      "progress": {"phase": "deposit", "gpu_retries": 3,
+                                   "gpu_retries_by_cause": {"innocent": 2, "timeout": 0, "oom": 1, "other": 0}}}])
+    state = rn.table.item(0, rn.table.columnCount() - 1).text()
+    root = tmp / "retries_root"
+    d = snapdir(root, sim="TNGR-1-Dark", snap=99)
+    (d / "ps_output.runlog").write_text(LOG_OK.format(root=d / "ps_output")
+                                        + "GPU deposit retries: 2 (innocent 0, timeout 2, oom 0, other 0)\n")
+    (d / "ps_output.a_den").write_bytes(b"\0" * 64)
+    rb = RV.RunsBrowser(lambda: str(root), lambda: [], sys.executable)
+    rb.reload()
+    k = next((i for i, r in enumerate(rb._rows) if r.sim == "TNGR-1-Dark"), None)
+    status = rb.table.item(k, RV.COLUMNS.index("Status")).text() if k is not None else ""
+    if k is not None:
+        rb.table.selectRow(k)
+    detail = rb.detail.toPlainText()
+    check("Runs tab: GPU retries per cause in 'Running now' (sidecar) and a finished run's status and details (log)",
+          state == "running, 3 GPU retries (innocent 2, oom 1)" and status.endswith("2 GPU retries (timeout 2)")
+          and "2 GPU retries (timeout 2)" in detail, (state, status, detail[-400:]))
+
+
+def main() -> int:
+    tmp = Path(tempfile.mkdtemp(prefix="gui_app2_"))
+    atexit.register(shutil.rmtree, tmp, True)
+    t_run_files(tmp)
+    t_parse_cache(tmp)
+    t_memory()
+    t_running_now(tmp)
+    t_keep_awake()
+    t_plot_sets(tmp)
+    t_void_status_headless(tmp)
+    t_qt(tmp)
+    t_void_status_t7()
+    print("-" * 60)
+    print(f"RESULT: {len(PASS)} passed, {len(FAIL)} failed, {len(SKIP)} skipped")
+    return 1 if FAIL else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

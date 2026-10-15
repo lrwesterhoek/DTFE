@@ -9,7 +9,11 @@ the fold fraction of each distinct void's shells (--shells, default 0.8-1.2 R_v:
 measured void radius; --radius r_eff for the ellipsoid's, ~1.75 R_v, with 1.0-1.3) and its distance to the nearest
 sheet in units of that radius (searched within --cutout cells, default 10 smoothing lengths). The cusp and swallowtail rows are '--' unless the grid carries bit 7/8 (only --ps-caustic-cusps on
 the CPU deposit sets them); a parity-only grid (--ps-linear-deposit --ps-gpu: the fold flag without the
-collapse bits) is refused. On the T7 only TNG100-3-Dark z = 0 carries one (2026-10-08: its ps_caustic.* grids,
+collapse bits) is refused. THE FOLD (2026-10-13) is FieldSet.fold_mask() -- streams > 1 or '.hidden_streams' bit 1,
+the geometric 'a folded tetrahedron overlaps the cell' -- for the fractions, the void shells, the null and the
+outline alike: the caustic_class grids written before that day set their fold bits per deposited sample and miss
+every fold thinner than the sampling (TNG100-3-Dark z=1: 21.0% of the cells against 33.6%), so the fold numbers
+of earlier runs of this script were low; the collapse classes (bits 2-5) are still per sample. On the T7 only TNG100-3-Dark z = 0 carries one (2026-10-08: its ps_caustic.* grids,
 read with --prefix ps_caustic); the other boxes and snapshots need a caustics rerun.
 
 Names (2026-10-08): caustic_skeleton_z<z>.* for the defaults; a non-default option adds its tag, so a rerun with
@@ -287,14 +291,18 @@ def main():
                 raise FileNotFoundError(f"no caustic_class grid in {snapdir} (a --ps-caustics run writes one)")
             cc = np.rint(fs.load("caustic_class")).astype(np.int32)
             sk.class_masks(cc)                              # refuses a parity-only grid (no collapse bits) here, not later
+            fold = fs.fold_mask()                           # the geometric fold, exact for pre-2026-10-13 grids too
             den = fs.density(units="mean")
             z, cell = fs.meta.redshift, fs.cell_mpc
         except (FileNotFoundError, ValueError, OSError) as e:
             print(f"  snapshot {snap:03d}: {e}")
             failed.append(snap)
             continue
-        summ = sk.skeleton_summary(cc, den, cell_mpc=cell, connectivity=args.connectivity)
-        summ.update(sim=args.sim, snapshot=int(snap), redshift=float(z), prefix=fs.prefix)
+        summ = sk.skeleton_summary(cc, den, cell_mpc=cell, connectivity=args.connectivity, fold=fold)
+        # what the fold was built from (FieldSet.fold_mask): 'streams > 1 | hidden_streams bit 1 | ...' is the exact flag
+        fold_from = [what for what, grid in (("streams > 1", "streams"), ("hidden_streams bit 1", "hidden_streams"),
+                                             ("caustic_class parity", "caustic_class")) if fs.has(grid)]
+        summ.update(sim=args.sim, snapshot=int(snap), redshift=float(z), prefix=fs.prefix, fold_source=" | ".join(fold_from))
         voids = None
         if args.voids:
             p = pipeline.products(snap, z, sim=args.sim, method=method, prefix=args.prefix, data_root=args.data_root)
@@ -303,7 +311,7 @@ def main():
                 cat = p.voids()
                 cutout = args.cutout if args.cutout is not None else int(round(10 * pipeline.smoothing_length_mpc() / cell_c))
                 shells = [float(x) for x in args.shells.split(",") if x.strip()]
-                cm = sk.class_masks(cc)
+                cm = sk.class_masks(cc, fold)
                 masks = {"fold": cm["indicator"]["fold"], "sheet": cm["cumulative"]["sheet"]}
                 if args.sheet_min_density > 0:          # before the components: a dense wall, not a flake, is kept
                     masks["sheet"] = masks["sheet"] & (np.asarray(den) > args.sheet_min_density)
@@ -340,7 +348,7 @@ def main():
             np.savez_compressed(f"{base}_voids.npz", **voids)
         else:                                       # no --voids, or they failed: an earlier run's file is not this set's
             Path(f"{base}_voids.npz").unlink(missing_ok=True)
-        plot_skeleton(cc, summ, sk.class_masks(cc)["indicator"]["fold"], voids, title, Path(f"{base}.png"))
+        plot_skeleton(cc, summ, fold, voids, title, Path(f"{base}.png"))
         print(summary_text(summ, title))
         written.append(base)
     print(f"\n{len(written)} snapshot(s) under {out_dir}" + (f"; failed: {failed}" if failed else ""))

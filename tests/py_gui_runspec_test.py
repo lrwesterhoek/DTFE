@@ -83,7 +83,8 @@ def main():
         auto = rs.RunSpec(data_root=str(tmp), sim="TNG100-3-Dark", snapshots=[4])
         check("auto partition/concurrency pass nothing (the binary auto-tunes)",
               "PARTITION" not in auto.command()[1] and "MAX_CONCURRENT" not in auto.command()[1])
-        dt = rs.RunSpec(data_root=str(tmp), sim="TNG100-3-Dark", snapshots=[4], estimator="dtfe", gpu=False)
+        dt = rs.RunSpec(data_root=str(tmp), sim="TNG100-3-Dark", snapshots=[4], estimator="dtfe", gpu=False,
+                        deposit="sampled")
         check("DTFE argv uses run_dtfe.sh with no PS options",
               dt.command()[0] == [str(rs.DTFE_SCRIPT), "-s", "TNG100-3-Dark", "-g", "512", "4"]
               and "FIELDS" not in dt.command()[1])
@@ -92,6 +93,35 @@ def main():
         check("standard DTFE with the exact choice: run_dtfe.sh -e (the exact cell average), named in the queue",
               dte.command()[0] == [str(rs.DTFE_SCRIPT), "-s", "TNG100-3-Dark", "-g", "512", "-e", "4"]
               and rs.job_summary("grids", dte).endswith(", exact"), str(dte.command()[0]))
+        # 2026-10-13: run_dtfe.sh's default is the exact average, and -e only switches it on: the job pins the knob
+        check("... the cell average is pinned both ways (DTFE_EXACT_AVERAGE=0 for 'sampled', 1 for 'exact')",
+              dt.command()[1].get("DTFE_EXACT_AVERAGE") == "0" and dte.command()[1].get("DTFE_EXACT_AVERAGE") == "1",
+              f"{dt.command()[1]} {dte.command()[1]}")
+        # 2026-10-13 (integration item 8): a standard-DTFE job STARTS at the exact cell average, run_dtfe.sh's and the
+        # production setting; a PS-DTFE job at the sampled deposit; a choice saved in a settings dict is kept
+        dflt = rs.RunSpec(data_root=str(tmp), sim="TNG100-3-Dark", snapshots=[4], estimator="dtfe", gpu=False)
+        check("a standard-DTFE job starts at the exact cell average (-e, DTFE_EXACT_AVERAGE=1), a PS-DTFE one at the "
+              "sampled deposit, Grids and Custom alike; a saved choice is kept, a settings dict without one gets the "
+              "estimator's own",
+              dflt.deposit == "exact" and "-e" in dflt.command()[0] and dflt.command()[1]["DTFE_EXACT_AVERAGE"] == "1"
+              and rs.RunSpec().deposit == "sampled" and rs.CustomSpec().deposit == "sampled"
+              and rs.CustomSpec(estimator="dtfe").deposit == "exact"
+              and rs.production_deposit("dtfe") == "exact" and rs.production_deposit("ps") == "sampled"
+              and rs.RunSpec.from_dict({"estimator": "dtfe", "deposit": "sampled"}).deposit == "sampled"
+              and rs.RunSpec.from_dict({"estimator": "dtfe"}).deposit == "exact"
+              and rs.CustomSpec.from_dict(rs.CustomSpec(estimator="dtfe", deposit="sampled").to_dict()).deposit
+              == "sampled", f"{dflt.deposit} {dflt.command()}")
+        def _script_default(script, var):    # the driver's own default, read from its 'VAR="${VAR:-...}"' line
+            out = subprocess.run(["bash", "-c", f'eval "$(grep -E "^{var}=" "$1" | head -1)"; printf %s "${{{var}}}"', "_",
+                           str(script)], capture_output=True, text=True, env={"PATH": os.environ.get("PATH", "")})
+            return out.stdout
+        check("the launcher's defaults are the drivers' (2026-10-13): the field lists, the caustics, the volume weighting",
+              _script_default(rs.PS_SCRIPT, "FIELDS").split() == rs.PS_DEFAULT_FIELDS
+              and _script_default(rs.DTFE_SCRIPT, "FIELDS").split() == rs.DTFE_FIELDS
+              and _script_default(rs.PS_SCRIPT, "PS_CAUSTICS") == "1" and rs.RunSpec().caustics and rs.PipelineSpec().caustics
+              and _script_default(rs.PS_SCRIPT, "PS_VOLUME_WEIGHTED") == "1" and rs.RunSpec().volume_weighted
+              and rs.PipelineSpec().volume_weighted and rs.RunSpec().grid == rs.PipelineSpec().grid == 512,
+              f"{_script_default(rs.PS_SCRIPT, 'FIELDS')!r} {_script_default(rs.DTFE_SCRIPT, 'FIELDS')!r}")
         check("to_dict/from_dict round trip", rs.RunSpec.from_dict(spec.to_dict()) == spec)
 
         print("checks:")
@@ -153,6 +183,8 @@ def main():
         for n in (4, 99):
             for ext in ("pts_den", "pts_velGrad"):
                 (sim / f"snapdir_{n:03d}" / f"ps_output.{ext}").touch()
+            # a slice OF this plane: 64 x 64 float64 (the count is compared since 2026-10-11)
+            (sim / f"snapdir_{n:03d}" / "ps_output.pts_den").write_bytes(b"\0" * 8 * 64 * 64)
         # explicit times: "newer" is STRICT (the script's -nt), and Linux stamps files from a
         # coarse clock, so files made milliseconds apart can share one mtime (failed on Ubuntu)
         now = time.time()
@@ -168,6 +200,15 @@ def main():
         pipe.force = True
         check("stale(): FORCE recomputes everything", pipe.stale("TNG100-3-Dark") == ([4, 99], 2))
         pipe.force = False
+        # 2026-10-11: a slice newer than the plane but of ANOTHER plane size (TNG100's 4096^2 slices beside an
+        # older hires_plane_z8192) read as current: the script skipped the compute and every render failed
+        den4 = sim / "snapdir_004" / "ps_output.pts_den"
+        den4.write_bytes(b"\0" * 8 * 32 * 32)
+        os.utime(den4, (now, now))
+        check("stale(): a slice of another plane size is stale, though newer than the plane (its point count)",
+              pipe.stale("TNG100-3-Dark") == ([4, 99], 2), str(pipe.stale("TNG100-3-Dark")))
+        den4.write_bytes(b"\0" * 8 * 64 * 64)
+        os.utime(den4, (now, now))
         lv, msg = levels(rs.PipelineSpec(data_root=str(tmp), sims=[]))
         check("pipeline: no simulations is an error", "error" in lv and "no simulations" in msg, msg)
         lv, msg = levels(rs.PipelineSpec(data_root=str(tmp), sims=["TNG100-3-Dark"], center="half"))
@@ -198,8 +239,8 @@ def main():
         check("the series is one call with every snapshot",
               by["plot_DTFE.py"] == [["--sim", "TNG100-3-Dark", "--snaps", "4", "99", "--method", "ps",
                                       "--smooth", "1.5"]], str(by["plot_DTFE.py"]))
-        check("point-eval maps: comma lists, fields de-spaced, --force, NO grid smoothing",
-              by["plot_pointeval.py"] == [["--sims", "TNG100-3-Dark", "--snaps", "4,99", "--fields",
+        check("point-eval maps: comma lists, fields de-spaced, --force, NO grid smoothing, the estimator (2026-10-11)",
+              by["plot_pointeval.py"] == [["--sims", "TNG100-3-Dark", "--snaps", "4,99", "--method", "ps", "--fields",
                                            "density,velDiv", "--force"]], str(by["plot_pointeval.py"]))
         pan = by["plot_pointeval_panels.py"]
         check("panels: per snapshot, its own grid prefix, the plane, an -o under python/figures",
@@ -223,6 +264,10 @@ def main():
         plane_reads()
         plot_options(tmp)
         plot_void_sets(tmp)
+        plot_void_script_options(tmp)
+        fixed_r_size_function(tmp)
+        crossbox_smoothing_constant()
+        gpu_retry_causes(tmp)
         explore_extras(tmp)
         check("every plot step sets DTFE_SIM and MPLBACKEND=Agg (several scripts call plt.show())",
               all(stp.env["DTFE_SIM"] == "TNG100-3-Dark" and stp.env["MPLBACKEND"] == "Agg"
@@ -376,6 +421,19 @@ def main():
         st = grids.check_step()
         check("a grids check is the SAME run_ps_dtfe.sh call plus AUTO_TUNE_REPORT=1",
               st.argv == grids.command()[0] and st.env == dict(grids.command()[1], AUTO_TUNE_REPORT="1"))
+        # 2026-10-13: the standard binary's tuner reports too, through run_dtfe.sh's own AUTO_TUNE_REPORT
+        sgrids = rs.RunSpec(data_root=str(tmp), sim="TNG100-3-Dark", snapshots=[99, 4], estimator="dtfe")
+        sst = sgrids.check_step()
+        check("... and a standard-DTFE grids check is the same run_dtfe.sh call plus AUTO_TUNE_REPORT=1",
+              sst.argv == sgrids.command()[0] and sst.argv[0].endswith("run_dtfe.sh")
+              and sst.env == dict(sgrids.command()[1], AUTO_TUNE_REPORT="1"), str(sst.argv))
+        check("the plan as the launcher says it: PS-DTFE runs mc partitions at a time, standard DTFE its partitions "
+              "one after another with mc threads each",
+              rs.report_split_text({"partition": 4, "mc": 5}, "ps") == "4³ partitions, 5 at a time"
+              and rs.report_split_text({"partition": 1, "mc": 10}, "ps") == "one tessellation"
+              and rs.report_split_text({"partition": 4, "mc": 4}, "dtfe") == "4³ partitions one after another, 4 threads each"
+              and rs.report_split_text({"partition": 1, "mc": 1}, "dtfe", 2) == "one domain, 1 thread"
+              and rs.report_split_text({"partition": 3, "mc": 9}, "dtfe", 2) == "3² partitions one after another, 9 threads each")
         check("the memory key ignores the snapshot choice but not the settings",
               rs.RunSpec(data_root=str(tmp), sim="TNG100-3-Dark", snapshots=[4]).memory_key()
               == rs.RunSpec(data_root=str(tmp), sim="TNG100-3-Dark", snapshots=[99]).memory_key()
@@ -445,11 +503,65 @@ def main():
         void_outline_geometry()
         run_log_contract()
         launcher_2026_10_11()
+        cpp_fix_flags_2026_10_11()
+        pts_conventions_flag_2026_10_13()
+        estimator_per_snapshot(tmp)
     finally:
         shutil.rmtree(tmp.parent)
     print("-" * 60)
     print(f"RESULT: {len(PASS)} passed, {len(FAIL)} failed")
     return 1 if FAIL else 0
+
+
+def estimator_per_snapshot(tmp: Path):
+    """2026-10-11: the void catalogue build resolves estimator 'auto' per snapshot (it turned 'auto' into 'ps' while
+    its check accepted a snapdir with standard-DTFE grids only, so the job failed there), and the point-evaluated
+    sets read the estimator's own slice (they assumed ps_output, so a standard-DTFE slice beside PS-DTFE grids could
+    not be rendered)."""
+    import json
+    print("estimator per snapshot:")
+    root = tmp.parent / "est_root"
+    sp = root / "BOX-1-Dark"
+    for n in (4, 99):
+        (sp / f"snapdir_{n:03d}").mkdir(parents=True, exist_ok=True)
+    (sp / "snapdir_004" / "output.a_den").touch()                       # standard DTFE only
+    (sp / "snapdir_099" / "ps_output.a_den").touch()                    # both
+    (sp / "snapdir_099" / "output.a_den").touch()
+
+    def methods(**kw):
+        spec = rs.PlotSpec(data_root=str(root), sim="BOX-1-Dark", snapshots=[99, 4], sets=["voidcat"], **kw)
+        return [st.argv[st.argv.index("--method") + 1] for st in spec.steps()]
+    auto = rs.PlotSpec(data_root=str(root), sim="BOX-1-Dark", snapshots=[4, 99], sets=["voidcat"])
+    lv, msg = levels(auto)
+    check("void catalogue build, estimator auto: standard DTFE where only output.* grids are, PS-DTFE where "
+          "ps_output.* are; the check agrees (no missing grids)",
+          methods() == ["dtfe", "ps"] and "no " not in msg and "error" not in lv, f"{methods()} {msg}")
+    check("... a chosen estimator, or a grid prefix (PS-DTFE), wins",
+          methods(method="dtfe") == ["dtfe", "dtfe"] and methods(prefix="ps_caustic") == ["ps", "ps"]
+          and methods(method="ps") == ["ps", "ps"], f"{methods(method='dtfe')} {methods(prefix='ps_caustic')}")
+
+    side = sp / "hires_plane_z16.json"
+    side.write_text(json.dumps({"box": 100.0, "nu": 16, "nv": 16, "planes": 1}))
+    sd = sp / "snapdir_099"
+    (sd / "output.pts_den").write_bytes(b"\0" * 8 * 16 * 16)            # a standard-DTFE slice beside PS-DTFE grids
+
+    def pts(**kw):
+        spec = rs.PlotSpec(data_root=str(root), sim="BOX-1-Dark", snapshots=[99], sets=["pointeval", "panels"],
+                           options={"panels": {"plane": str(side)}}, **kw)
+        st = {Path(x.argv[1]).name: x.argv for x in spec.steps()}
+        pe, pa = st["plot_pointeval.py"], st["plot_pointeval_panels.py"]
+        return (pe[pe.index("--method") + 1] if "--method" in pe else "auto", pa[pa.index("--prefix") + 1],
+                any("no point-evaluated slice" in m for _, m in spec.problems()))
+    check("point-evaluated sets, estimator DTFE: plot_pointeval gets --method dtfe, the panels read output.pts_*, "
+          "and the check finds the slice",
+          pts(method="dtfe") == ("dtfe", str(sd / "output"), False), str(pts(method="dtfe")))
+    check("... auto: the slice that is there (output.pts_* here, though PS-DTFE grids are beside it); PS-DTFE: "
+          "ps_output.pts_*, and its absence is warned about",
+          pts() == ("auto", str(sd / "output"), False) and pts(method="ps") == ("ps", str(sd / "ps_output"), True),
+          f"{pts()} {pts(method='ps')}")
+    (sd / "ps_output.pts_den").write_bytes(b"\0" * 8 * 16 * 16)
+    check("... auto with both slices: PS-DTFE first, as before",
+          pts() == ("auto", str(sd / "ps_output"), False), str(pts()))
 
 
 def gpu_branches(tmp: Path, snap: Path):
@@ -515,9 +627,20 @@ def _gpu_advice_checks(tmp: Path, snap: Path):
     check("standard DTFE exact: the custom command passes --exact-average (not the PS flag), and without the GPU "
           "both specs say the GPU is ~6.6x faster (when built)",
           "--exact-average" in cex.command() and "--ps-exact-deposit" not in cex.command()
-          and "--exact-average" not in rs.CustomSpec(input_file=str(snap), estimator="dtfe").command()
+          and "--exact-average" not in rs.CustomSpec(input_file=str(snap), estimator="dtfe", deposit="sampled").command()
           and (any("6.6x" in m for _, m in dex.problems()) and any("6.6x" in m for _, m in cex.problems())) == dt_gpu,
           str(cex.problems()))
+    # 2026-10-13 (integration items 6 and 8): the Custom tab's standard run starts at the exact cell average and pads
+    # with 15 mean spacings (dtfelib.estimator.STANDARD_PADDING, run_dtfe.sh's and the standard server's value) instead
+    # of the binary's 5, which leaves wrong values within a few spacings of a box face; PS-DTFE keeps its own padding
+    cd0, cd2 = (rs.CustomSpec(input_file=str(snap), estimator="dtfe").command(),
+                rs.CustomSpec(input_file=str(snap), estimator="dtfe", dim=2, deposit="sampled").command())
+    cps = rs.CustomSpec(input_file=str(snap), estimator="ps").command()
+    check("the Custom tab's standard run: --exact-average by default and '--padding 15' (3D and 2D, either average); "
+          "a PS-DTFE run passes no --padding",
+          "--exact-average" in cd0 and rs.STANDARD_PADDING == 15.0
+          and all(c.count("--padding") == 1 and c[c.index("--padding") + 1] == "15" for c in (cd0, cd2))
+          and "--padding" not in cps and "--exact-average" not in cd2, f"{cd0} {cd2} {cps}")
 
 
 def tick_helpers():
@@ -734,6 +857,24 @@ def new_features(tmp: Path, sim: Path):
     st = c1.check_step()
     check("custom check step: the run's own command in report mode, named after the file",
           st.argv[:-1] == c1.command() and st.argv[-1] == "--auto-tune-report" and "cloud.hdf5" in st.label, st.label)
+    # 2026-10-13: the standard binary answers the same report-mode call (it printed 'AUTO-TUNE-REPORT unsupported'),
+    # here on a real (synthetic) snapshot: the fixture above has no velocities
+    import subprocess as sp              # (a plain 'subprocess' is a local of this function, imported further down)
+    std_in = work / "std_in.hdf5"
+    sp.run([sys.executable, str(ROOT / "tests" / "generate_ps_test_data.py"), "--out", str(std_in), "--n", "16"],
+           capture_output=True, check=False)
+    cs = rs.CustomSpec(input_file=str(std_in), estimator="dtfe", grid=32, output_dir=str(work), output_name="std")
+    sst = cs.check_step()
+    check("custom check step, standard DTFE: the standard binary's own command in report mode",
+          sst.argv[:-1] == cs.command() and sst.argv[-1] == "--auto-tune-report" and Path(sst.argv[0]).name == "DTFE")
+    if Path(sst.argv[0]).is_file() and std_in.is_file():
+        r = sp.run(sst.argv, env=dict(os.environ, **sst.env, DTFE_RAM_GB="64"), capture_output=True, text=True,
+                   cwd=str(ROOT))
+        rec = rs.parse_reports(r.stdout).get(0, {})
+        check("... which reports a plan the launcher parses (partition, threads, prediction, budget)",
+              r.returncode == 0 and rec.get("partition", 0) >= 1 and rec.get("mc", 0) >= 1
+              and rec.get("predicted_gb", 0) > 0 and rec.get("budget_gb") == 38.4
+              and not list(work.glob("std.*")), r.stdout[-400:])
     q = rs.QueuedJob.of("custom", c)
     check("custom: a queued custom-snapshot job rebuilds and has a summary",
           q.build() == c and q.title.startswith("Custom snapshot · cloud.hdf5 · PS-DTFE 64³"), q.title)
@@ -901,6 +1042,23 @@ def new_features(tmp: Path, sim: Path):
     cc = rs.CustomSpec()
     P.apply_preset(cc, P.BUILTIN_PRESETS["Publication"][1], planes)
     check("a preset applies to a custom-snapshot job too (fields it lacks are skipped)", cc.grid == 512 and cc.caustics)
+    # 2026-10-13: the thesis presets give a standard-DTFE job its production cell average (the exact one; they set the
+    # Monte-Carlo one before), a PS-DTFE job the sampled deposit; 'Quick look' samples both
+    sd, sp, ql, cd = (rs.RunSpec(estimator="dtfe", deposit="sampled"), rs.RunSpec(deposit="exact"),
+                      rs.RunSpec(estimator="dtfe"), rs.CustomSpec(estimator="dtfe", deposit="sampled"))
+    ch = P.apply_preset(sd, P.BUILTIN_PRESETS["Standard"][1], planes)
+    P.apply_preset(sp, P.BUILTIN_PRESETS["Standard"][1], planes)
+    P.apply_preset(ql, P.BUILTIN_PRESETS["Quick look"][1], planes)
+    P.apply_preset(cd, P.BUILTIN_PRESETS["Publication"][1], planes)
+    check("preset 'Standard'/'Publication' on standard DTFE: the exact cell average; on PS-DTFE the sampled deposit; "
+          "'Quick look' samples both; a preset naming the estimator follows it",
+          sd.deposit == "exact" and "deposit" in ch and sp.deposit == "sampled" and ql.deposit == "sampled"
+          and cd.deposit == "exact" and "deposit_dtfe" not in sd.to_dict()
+          and P.apply_preset(rs.RunSpec(estimator="dtfe"), {"estimator": "ps", "deposit": "sampled",
+                                                            "deposit_dtfe": "exact"}) == ["estimator", "deposit"],
+          f"{sd.deposit} {sp.deposit} {ql.deposit} {cd.deposit} {ch}")
+    check("the standard-DTFE averaging labels name the exact one the default",
+          "default" in P.label("exact_dtfe") and "default" not in P.label("sampled_dtfe"))
     real = P.flag_help("PS-DTFE")
     if real:
         check("the binary's own --full_help: every production flag has a description",
@@ -950,6 +1108,49 @@ def new_features(tmp: Path, sim: Path):
           np.allclose(o.slice("velocity", 2, 0, "norm"), np.linalg.norm(vel[:, :, 0], axis=-1), rtol=1e-6)
           and np.allclose(o.slice("velocity", 2, 0, "y"), vel[:, :, 0, 1]))
     check("value(): one cell", abs(o.value("density", (2, 3, 4)) - float(den[2, 3, 4])) < 1e-6)
+    # 2026-10-13 (integration item 9): the 'caustic' map of a periodic PS run is the EXACT fold flag,
+    # dtfelib.io.caustic_is_fold(class mask, streams=, hidden=), not the stored '.caustic' -- which the grids made before
+    # 2026-10-13 set only where a folded tetrahedron deposited a sample (21.0% of TNG100-3-Dark z=1 against 33.6%). A
+    # non-periodic run (its sidecar) and an output without a streams grid show the stored grid; 'caustic_class' stays raw
+    from dtfelib.io import caustic_is_fold
+    fd = work / "fold"
+    fd.mkdir(exist_ok=True)
+    st = np.ones((n, n, n), np.float32)
+    st[1, 2, 3] = 3.0                                   # multi-stream cells: a fold
+    st[4, :, 5] = 3.0
+    st[0, 0, 0] = 0.0                                   # an empty cell
+    hid = np.zeros((n, n, n), np.float32)
+    hid[2, 2, 3] = 1.0                                  # bit 1: a fold thinner than the sampling
+    hid[3, 3, 3] = 2.0                                  # bit 2 alone: mass of an unsampled tetrahedron, no fold
+    ccm = np.full((n, n, n), 1 + 4, np.float32)          # a positive tetrahedron with k = 0 everywhere
+    ccm[6, 6, 3] = 1 + 2 + 8                             # both parity bits: a fold by the class mask
+    raw = np.zeros((n, n, n), np.float32)
+    raw[1, 2, 3] = 1.0                                  # the old per-sample flag: one of the fold cells only
+    for sfx, arr in (("a_den", den), ("a_streams", st), ("a_hidden_streams", hid), ("caustic", raw),
+                     ("causticClass", ccm)):
+        (fd / f"fold.{sfx}").write_bytes(arr.tobytes())
+    want = caustic_is_fold(ccm, streams=st, hidden=hid)
+    of = G.OutputSet(fd / "fold")
+    planes_ok = all(np.array_equal(of.slice("caustic", ax, k), np.take(want, k, axis=ax).astype(np.float64))
+                    for ax in range(3) for k in (0, 2, 3, 5))
+    check("Explore's caustic map of a periodic PS run: the exact fold flag on every axis (streams > 1, hidden bit 1, "
+          "the class mask's fold bits; not hidden bit 2 alone or an empty cell), also in value(); the class map stays raw",
+          of.fold_exact() and planes_ok and want[1, 2, 3] and want[4, 0, 5] and want[2, 2, 3] and want[6, 6, 3]
+          and not want[3, 3, 3] and not want[0, 0, 0] and int(want.sum()) == 1 + n + 1 + 1
+          and of.value("caustic", (2, 2, 3)) == 1.0 and of.value("caustic", (3, 3, 3)) == 0.0
+          and np.array_equal(of.slice("caustic_class", 2, 3), ccm[:, :, 3].astype(np.float64)),
+          f"{of.fold_exact()} {planes_ok} {int(want.sum())}")
+    (fd / "fold.gui.json").write_text(json.dumps({"estimator": "ps", "periodic": False, "dim": 3}))
+    onp = G.OutputSet(fd / "fold")
+    nd = work / "fold_nostreams"
+    nd.mkdir(exist_ok=True)
+    for sfx, arr in (("a_den", den), ("caustic", raw)):
+        (nd / f"fold.{sfx}").write_bytes(arr.tobytes())
+    ons = G.OutputSet(nd / "fold")
+    check("... a non-periodic run (the union over-flags there) and an output without a streams grid show the stored "
+          "'.caustic'", not onp.fold_exact() and np.array_equal(onp.slice("caustic", 2, 3), raw[:, :, 3])
+          and not ons.fold_exact() and np.array_equal(ons.slice("caustic", 2, 3), raw[:, :, 3]))
+    (fd / "fold.gui.json").unlink()
     check("cell_center / plane_point", np.allclose(o.cell_center((0, 0, 7)), [5, 5, 75])
           and list(o.plane_point(2, 7, 1, 2)) == [1, 2, 7])
     ar = o.arrow_field("velocity", 2, 0, per_side=4)
@@ -1206,7 +1407,8 @@ def two_d(tmp: Path):
     _write_log(log, "Build: DTFE 3e0c1a65fd-dirty (built 2026-10-01T10:00:00Z)\n"
                "RUNNING: /x/DTFE in.hdf5 r2 --grid 64 --periodic --CIC --interlace\n")
     old = R.stale_reasons(R.parse_runlog(log))
-    _write_log(log, "Build: DTFE 3e0c1a65fd-dirty (built 2026-10-03T08:00:00Z)\n"
+    # built after the 2026-10-11 interlace-pass2 / cic-faces fixes too (cpp_fix_flags_2026_10_11 has the window)
+    _write_log(log, "Build: DTFE 3e0c1a65fd-dirty (built 2026-10-12T08:00:00Z)\n"
                "RUNNING: /x/DTFE in.hdf5 r2 --grid 64 --periodic --CIC --interlace\n")
     new = R.stale_reasons(R.parse_runlog(log))
     check("stale outputs: an interlaced grid made before the phase fix is flagged, a newer one is not",
@@ -1264,10 +1466,11 @@ def point_window_linear(tmp: Path):
     both = rs.CustomSpec(input_file=str(snap), linear_deposit=True, volume_weighted=True)
     bad = rs.CustomSpec(input_file=str(snap), window=[float("nan")])
     notes = [m for lv, m in dt.problems() if lv == "info"]
-    check("... refused where the binary would refuse: standard DTFE points with an explicit split, a window with a web "
-          "class, linear + volume weighting, an unreadable window; a window left from PS-DTFE is ignored by a "
-          "standard-DTFE run (a note, not a block: its field is greyed there)",
-          any("ONE triangulation" in m for m in errs(dt)) and not any("window" in m for m in errs(dt))
+    check("... refused where the binary would refuse: a window with a web class, linear + volume weighting, an "
+          "unreadable window; standard DTFE points with an explicit split are fine since 2026-10-13 (the binary answers "
+          "them per partition); a window left from PS-DTFE is ignored by a standard-DTFE run (a note, not a block: its "
+          "field is greyed there)",
+          not any("triangulation" in m for m in errs(dt)) and not any("window" in m for m in errs(dt))
           and any("ignores it" in m for m in notes)
           and any("whole periodic grid" in m for m in errs(webw)) and any("linear deposit" in m for m in errs(both))
           and any("window needs 6 numbers" in m for m in errs(bad)), f"{errs(dt)} {errs(webw)} {errs(both)} {errs(bad)}")
@@ -1281,9 +1484,12 @@ def point_window_linear(tmp: Path):
             if lv == "error"]
     check("a Custom standard-DTFE run with only the dispersion ticked is refused (it would pass a bare --field)",
           any("no field standard DTFE computes" in m for m in nodt), str(nodt))
-    sp = rs.RunSpec(estimator="dtfe", slice_plane=str(pts), partition=2, **base).problems()
-    check("... a standard-DTFE slice with an explicit partition is an error (one triangulation)",
-          any(lv == "error" and "ONE triangulation" in m for lv, m in sp), str(sp))
+    sp = rs.RunSpec(estimator="dtfe", slice_plane=str(pts), partition=2, **base)
+    check("... a standard-DTFE slice with an explicit partition runs since 2026-10-13 (each partition answers its "
+          "share of the points): no error, SAMPLE_POINTS and PARTITION both passed",
+          not any(lv == "error" and "triangulation" in m for lv, m in sp.problems())
+          and sp.command()[1].get("SAMPLE_POINTS") == str(pts) and sp.command()[1].get("PARTITION") == "2 2 2",
+          f"{sp.problems()} {sp.command()[1]}")
 
 
 def plot_options(tmp: Path):
@@ -1367,6 +1573,225 @@ def plot_void_sets(tmp: Path):
           any(lvl == "error" and "cells and in Mpc" in m for lvl, m in both.problems())
           and any(lvl == "warning" and "causticClass" in m for lvl, m in sk.problems()),
           f"{both.problems()} | {sk.problems()}")
+
+
+# (set key, option key) -> (script, the script's constant that is its default, or a literal) (2026-10-11)
+_VOID_SCRIPT_DEFAULTS = {
+    ("voidpop", "size_smooth"): ("plot_void_population", "SIZE_SMOOTH_CELLS"),
+    ("voidpop", "size_rv"): ("plot_void_population", "SIZE_FUNCTION_RV"),
+    ("voidpop", "fixed_r_smooth"): ("plot_void_population", "FIXED_R_SMOOTH_CELLS"),
+    ("voidfate", "ref_snap"): ("plot_void_fate", "REF_SNAP"),
+    ("voidconv", "rv_range"): ("plot_void_convergence", "DEFAULT_RV_RANGE"),
+    ("skeleton", "null_draws"): ("plot_caustic_skeleton", "NULL_DRAWS"),
+}
+
+
+def plot_void_script_options(tmp: Path):
+    """The void scripts' own options on the Plots tab (2026-10-11): population size function, tracking link,
+    fate links, convergence factors, environment factor and R_v definition, profile-evolution R_v definition,
+    skeleton null and wall cuts. Defaults equal the scripts' own and add no flag; every set value reaches its
+    flag, each one the script's parser knows; a malformed list is an error, not a crash in the script."""
+    import subprocess as _sp
+    repo = Path(__file__).resolve().parents[1]
+    base = dict(data_root=str(tmp), sim="TNG100-3-Dark", snapshots=[50, 99])
+    sets = ["voidpop", "voidtrack", "voidfate", "voidconv", "voidenv", "voidevol", "skeleton"]
+    new = {"voidpop": ("size_smooth", "size_rv"), "voidtrack": ("link", "exclusive"),
+           "voidfate": ("exclusive", "ref_snap"), "voidconv": ("factors", "match_sigma", "rv_range"),
+           "voidenv": ("factor", "r_v_definition"), "voidevol": ("rv_definition",),
+           "skeleton": ("null_draws", "min_component", "min_component_mass", "sheet_min_density", "all_caustic")}
+    have = {k: {o.key for o in rs.FIGURE_SET[k].opts} for k in sets}
+    missing = [f"{k}.{o}" for k, os_ in new.items() for o in os_ if o not in have[k]]
+    check("the void scripts' options are Plots-tab options, each with a tooltip and no '--' in its text",
+          not missing and all(o.help and "--" not in o.help + o.label for k in sets for o in rs.FIGURE_SET[k].opts
+                              if o.key in new[k]), str(missing))
+    if missing:
+        return
+    flags = ("--size-smooth", "--size-rv", "--link", "--exclusive", "--ref-snap", "--factors", "--match-sigma",
+             "--rv-range", "--factor", "--r-v-definition", "--rv-definition", "--null-draws", "--min-component",
+             "--min-component-mass", "--sheet-min-density", "--all-caustic")
+    plain = " ".join(" ".join(st.argv) for st in rs.PlotSpec(sets=sets, **base).steps())
+    check("... the defaults add none of their flags", not any(f" {f} " in plain + " " for f in flags), plain)
+    # the defaults against the scripts' own: dtfelib's constants imported, the plot scripts' read in a subprocess
+    # (they import matplotlib)
+    sys.path.insert(0, str(repo / "python"))
+    from dtfelib import convergence as cv, classify
+    code = ("import sys, json; sys.path[:0] = ['plot', '.']; import importlib; out = {}\n"
+            + "".join(f"out['{s}.{c}'] = getattr(importlib.import_module('{s}'), '{c}')\n"
+                      for s, c in _VOID_SCRIPT_DEFAULTS.values())
+            + "print(json.dumps(out))")
+    import json
+    r = _sp.run([rs.PYTHON, "-c", code], capture_output=True, text=True, cwd=repo / "python",
+                env=dict(os.environ, MPLBACKEND="Agg"))
+    try:
+        consts = json.loads(r.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        consts = {}
+    d = {(k, o.key): o.default for k in sets for o in rs.FIGURE_SET[k].opts}
+    want = {key: consts.get(f"{s}.{c}") for key, (s, c) in _VOID_SCRIPT_DEFAULTS.items()}
+    want[("voidconv", "rv_range")] = " ".join(f"{v:g}" for v in want[("voidconv", "rv_range")] or ())
+    want[("voidpop", "fixed_r_smooth")] = " ".join(f"{v:g}" for v in want[("voidpop", "fixed_r_smooth")] or ())
+    want.update({("voidconv", "factors"): " ".join(map(str, cv.DEFAULT_FACTORS)),
+                 ("voidconv", "match_sigma"): cv.DEFAULT_MATCH_SIGMA, ("voidenv", "factor"): classify.ENV_FACTOR,
+                 ("voidtrack", "link"): "trees", ("voidenv", "r_v_definition"): "crossing",
+                 ("voidevol", "rv_definition"): "crossing"})
+    off = {key: (d.get(key), v) for key, v in want.items() if d.get(key) != v}
+    check("... and they equal the scripts' own defaults", consts and not off, f"{off} {r.stderr[-300:]}")
+    opts = {"voidpop": {"size_smooth": 0.0, "size_rv": "ridge"},
+            "voidtrack": {"link": "particles", "exclusive": True},
+            "voidfate": {"exclusive": True, "ref_snap": 50},
+            "voidconv": {"factors": "2, 4 8", "match_sigma": 1.5, "rv_range": "2 6"},
+            "voidenv": {"factor": 3.0, "r_v_definition": "delta08"}, "voidevol": {"rv_definition": "ridge"},
+            "skeleton": {"null_draws": 0, "min_component": 100, "min_component_mass": 0.001,
+                         "sheet_min_density": 2.5, "all_caustic": True}}
+    got = {st.argv[1].split("/")[-1]: st.argv for st in rs.PlotSpec(sets=sets, options=opts, **base).steps()}
+
+    def after(name, flag, n=1):
+        a = got.get(name, [])
+        return a[a.index(flag) + 1:a.index(flag) + 1 + n] if flag in a else None
+    sk = got.get("plot_caustic_skeleton.py", [])
+    check("... the set values reach their flags (size smoothing 0 is a value, not the default)",
+          after("plot_void_population.py", "--size-smooth") == ["0"]
+          and after("plot_void_population.py", "--size-rv") == ["ridge"]
+          and after("plot_void_tracking.py", "--link") == ["particles"] and "--exclusive" in got["plot_void_tracking.py"]
+          and after("plot_void_fate.py", "--ref-snap") == ["50"] and "--exclusive" in got["plot_void_fate.py"]
+          and after("plot_void_convergence.py", "--factors", 3) == ["2", "4", "8"]
+          and after("plot_void_convergence.py", "--match-sigma") == ["1.5"]
+          and after("plot_void_convergence.py", "--rv-range", 2) == ["2", "6"]
+          and after("plot_void_environment.py", "--factor") == ["3"]
+          and after("plot_void_environment.py", "--r-v-definition") == ["delta08"]
+          and after("plot_void_profile_evolution.py", "--rv-definition") == ["ridge"]
+          and after("plot_caustic_skeleton.py", "--null-draws") == ["0"]
+          and after("plot_caustic_skeleton.py", "--min-component") == ["100"]
+          and after("plot_caustic_skeleton.py", "--min-component-mass") == ["0.001"]
+          and after("plot_caustic_skeleton.py", "--sheet-min-density") == ["2.5"]
+          and "--all-caustic" in sk and "--snaps" not in sk, str(got))
+    unknown = []
+    for name, a in got.items():
+        helptext = _sp.run([rs.PYTHON, str(repo / "python" / "plot" / name), "--help"], capture_output=True, text=True,
+                           cwd=repo / "python", env=dict(os.environ, MPLBACKEND="Agg")).stdout
+        unknown += [f"{name} {f}" for f in a if f.startswith("--") and f not in helptext]
+    check("... every flag one the script's own parser knows (--help)", not unknown, str(unknown))
+    bad = rs.PlotSpec(sets=["voidconv"], options={"voidconv": {"factors": "2 x", "rv_range": "3"}}, **base)
+    allc = rs.PlotSpec(sets=["skeleton"], options={"skeleton": {"all_caustic": True}},
+                       **dict(base, snapshots=[]))
+    trees = rs.PlotSpec(sets=["voidtrack"], options={"voidtrack": {"exclusive": True}}, **base)
+    msgs = " | ".join(m for lv, m in bad.problems() + trees.problems() if lv == "error")
+    check("... a malformed factor list or R_v range, one void per particle with the tree link are errors; every "
+          "caustic snapshot needs none selected",
+          "factors" in msgs and "R_v range" in msgs and "particle link" in msgs
+          and not any(lv == "error" and "no snapshots" in m for lv, m in allc.problems()),
+          f"{msgs} || {allc.problems()}")
+
+
+def fixed_r_size_function(tmp: Path):
+    """The Void population set's 'size function at fixed R' tick (2026-10-11): a step of its own with the script's
+    fixed-R flag and its smoothings, run with DTFE_VOID_GATE=none in ITS environment (the script refuses it gated)
+    and shown in the exported command; the population step and the job's other steps keep the caller's gate."""
+    import subprocess as _sp
+    repo = Path(__file__).resolve().parents[1]
+    base = dict(data_root=str(tmp), sim="TNG100-3-Dark", snapshots=[50, 99])
+    opts_ = {o.key: o for o in rs.FIGURE_SET["voidpop"].opts}
+    new = ("size_fixed_r", "fixed_r_smooth", "fixed_r_smooth_mpc")
+    check("fixed R: the tick and its smoothings are Void population options on one row, each with a tooltip, no '--'",
+          all(k in opts_ for k in new) and len({opts_[k].row for k in new if k in opts_}) == 1
+          and all(opts_[k].row and opts_[k].help and "--" not in opts_[k].help + opts_[k].label for k in new
+                  if k in opts_), str(sorted(opts_)))
+    if not all(k in opts_ for k in new):
+        return
+    plain = rs.PlotSpec(sets=["voidpop"], method="ps", **base).steps()
+    check("... off by default: one population step, no fixed-R flag, no gate in its environment",
+          len(plain) == 1 and not any("fixed-r" in a for a in plain[0].argv) and "DTFE_VOID_GATE" not in plain[0].env,
+          str([st.argv for st in plain]))
+    on = rs.PlotSpec(sets=["voidpop", "voidprof"], method="ps", prefix="ps_x", smooth=0.0,
+                     options={"voidpop": {"size_fixed_r": True, "smooth_mpc": 2.1625}}, **base)
+    st = on.steps()
+    fr = [s for s in st if "--size-fixed-r" in s.argv]
+    others = [s for s in st if "--size-fixed-r" not in s.argv]
+    a = fr[0].argv if fr else []
+    check("... ticked: a step of its own after the population one, the estimator and prefix, the script's default "
+          "smoothings (no flag), no population smoothing or snapshots",
+          len(fr) == 1 and len(st) == 3 and st[1] is fr[0] and "plot_void_population.py" in a[1]
+          and a[2:] == ["--sim", "TNG100-3-Dark", "--method", "ps", "--prefix", "ps_x", "--size-fixed-r"]
+          and "--smooth-mpc" in st[0].argv, str(a))
+    script = rs.export_script(st, "fixed R")
+    check("... run ungated: DTFE_VOID_GATE=none in that step's environment and in its exported command; the population "
+          "and the other sets' steps keep no gate of the launcher's",
+          bool(fr) and fr[0].env.get("DTFE_VOID_GATE") == "none" and "DTFE_VOID_GATE=none" in fr[0].line()
+          and script.count("DTFE_VOID_GATE=none") == 1 and fr[0].env.get("DTFE_SIM") == "TNG100-3-Dark"
+          and all("DTFE_VOID_GATE" not in s.env for s in others), script)
+
+    def fr_args(cells, mpc):
+        s = rs.PlotSpec(sets=["voidpop"], options={"voidpop": {"size_fixed_r": True, "fixed_r_smooth": cells,
+                                                               "fixed_r_smooth_mpc": mpc}}, **base)
+        argv = s.steps()[-1].argv
+        return argv[argv.index("--size-fixed-r") + 1:], [m for lv, m in s.problems() if lv == "error"]
+    tng300, mpc_only, cells_only, dflt = (fr_args("3, 2", "2.1625"), fr_args("", "2.1625"), fr_args("5 3", ""),
+                                          fr_args("10 5 3", ""))
+    check("... the smoothings reach their flags: cells beside Mpc spelled out (the script takes exactly those given), "
+          "Mpc alone, other cells alone; the default adds none",
+          tng300 == (["--fixed-r-smooth", "3", "2", "--fixed-r-smooth-mpc", "2.1625"], [])
+          and mpc_only == (["--fixed-r-smooth-mpc", "2.1625"], []) and cells_only == (["--fixed-r-smooth", "5", "3"], [])
+          and dflt == ([], []), f"{tng300} {mpc_only} {cells_only} {dflt}")
+    bad, empty, neg = fr_args("10 x", ""), fr_args("", ""), fr_args("0 5", "")
+    check("... a word that is no number, no smoothing at all, or one of 0 is an error before the job runs",
+          any("positive numbers" in m for m in bad[1]) and any("needs a smoothing" in m for m in empty[1])
+          and any("positive numbers" in m for m in neg[1]), f"{bad[1]} {empty[1]} {neg[1]}")
+    helptext = _sp.run([rs.PYTHON, str(repo / "python" / "plot" / "plot_void_population.py"), "--help"],
+                       capture_output=True, text=True, cwd=repo / "python", env=dict(os.environ, MPLBACKEND="Agg")).stdout
+    flags = {f for f in a + tng300[0] if f.startswith("--")}
+    check("... every flag one the script's own parser knows (--help)", flags and all(f in helptext for f in flags),
+          str(sorted(f for f in flags if f not in helptext)))
+
+
+def crossbox_smoothing_constant():
+    """G2 (2026-10-11): the cross-box smoothing is python/config.py's CROSSBOX_SMOOTHING_MPC (2.1625 when an older
+    config lacks it): a changed config value is the launcher's default and its unchanged-default test."""
+    code = ("import sys; sys.path[:0] = ['python', 'python/gui']; import config; "
+            "config.CROSSBOX_SMOOTHING_MPC = 3.25; import runspec as rs; "
+            "print(rs.CROSSBOX_SMOOTH_MPC, rs.FIGURE_SET['crossbox'].opts[1].default, "
+            "'--smooth-mpc' in rs.PlotSpec(sim='X', sets=['crossbox']).steps()[0].argv)")
+    r = subprocess.run([rs.PYTHON, "-c", code], capture_output=True, text=True, cwd=ROOT,
+                       env=dict(os.environ, DTFE_FIGURES_ROOT=FIGS_TMP))
+    check("the cross-box smoothing comes from config.CROSSBOX_SMOOTHING_MPC (default and its no-flag test)",
+          r.stdout.split() == ["3.25", "3.25", "False"], r.stdout + r.stderr[-400:])
+    code0 = ("import sys; sys.path[:0] = ['python', 'python/gui']; import config\n"
+             "if hasattr(config, 'CROSSBOX_SMOOTHING_MPC'): del config.CROSSBOX_SMOOTHING_MPC\n"
+             "import runspec as rs; print(rs.CROSSBOX_SMOOTH_MPC)")
+    r = subprocess.run([rs.PYTHON, "-c", code0], capture_output=True, text=True, cwd=ROOT,
+                       env=dict(os.environ, DTFE_FIGURES_ROOT=FIGS_TMP))
+    check("... and 2.1625 when the config has no such constant", r.stdout.strip() == "2.1625", r.stdout + r.stderr[-400:])
+
+
+def gpu_retry_causes(tmp: Path):
+    """G1 (2026-10-11): the GPU deposit retries by cause, from the run log's closing line ('GPU deposit retries: N
+    (innocent a, timeout b, oom c, other d)') and from the progress sidecar's 'gpu_retries_by_cause'."""
+    import results as R
+    d = Path(tempfile.mkdtemp(prefix="gui_retries_"))
+    try:
+        log = d / "ps_output.runlog"
+        log.write_text("RUNNING: /x/PS-DTFE in.hdf5 out --grid 64 --ps-gpu\n  total wall time : 1m 2s\n"
+                       "  peak memory (RSS) : 3.5 GB\nGPU deposit retries: 3 (innocent 0, timeout 2, oom 1, other 0)\n")
+        rec = R.parse_runlog(log)
+        rec2 = R.parse_runlog(log)     # the second read comes from the log cache
+        txt = R.retries_text(rec.gpu_retries, rec.gpu_retries_by_cause) if hasattr(R, "retries_text") else ""
+        check("a run log's retry line: the total and the causes (the cached read too), the nonzero causes named",
+              getattr(rec, "gpu_retries", None) == 3 and not rec.gpu_retried    # no from-scratch restart message
+              and getattr(rec, "gpu_retries_by_cause", None) == {"innocent": 0, "timeout": 2, "oom": 1, "other": 0}
+              and getattr(rec2, "gpu_retries_by_cause", None) == rec.gpu_retries_by_cause
+              and txt == "3 GPU retries (timeout 2, oom 1)", f"{getattr(rec, 'gpu_retries', None)} "
+                                                              f"{getattr(rec, 'gpu_retries_by_cause', None)} {txt!r}")
+        plain = d / "plain.runlog"
+        plain.write_text("RUNNING: /x/PS-DTFE in.hdf5 plain\n  total wall time : 1s\n")
+        p = R.parse_runlog(plain)
+        side = {"phase": "deposit", "gpu_retries": 2, "gpu_retries_by_cause": {"innocent": 1, "timeout": 0,
+                                                                                 "oom": 0, "other": 1}}
+        check("... none without the line; a sidecar's causes reach progress_text (its total alone as before)",
+              getattr(p, "gpu_retries", None) == 0 and not getattr(p, "gpu_retries_by_cause", None)
+              and R.progress_text(side) == "deposit, 2 GPU retries (innocent 1, other 1)"
+              and R.progress_text({"phase": "deposit", "gpu_retries": 1}) == "deposit, 1 GPU retries",
+              R.progress_text(side))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def explore_extras(tmp: Path):
@@ -1499,6 +1924,9 @@ def audit_claims():
     got = (R.time_estimate(recs, **kw), R.time_estimate(recs, precision="double", **kw))
     check("time estimates: a double-precision run (2x slower) never predicts a single one, nor a 2D run a 3D one",
           got == ((100, 1), (1000, 1)), str(got))
+    # a run under a second ('total wall time : 0s') still has a time (2026-10-12: it was dropped as if it had none)
+    fast = R.time_estimate([rec(0.0, "PS-DTFE"), rec(0.0, "PS-DTFE")], **kw)
+    check("... and runs under a second ('0s') still give an estimate", fast == (0.0, 2), str(fast))
 
 
 def run_options(tmp: Path):
@@ -1540,8 +1968,9 @@ def pipeline_options(tmp: Path, sim: Path):
     run_keys = ("PS_EXACT", "AVG_SUBSAMPLES", "PS_GPU", "PS_VERTEX_MASS", "PS_VOLUME_WEIGHTED", "PS_CAUSTICS",
                 "PS_CAUSTIC_CUSPS", "PS_PARALLEL_TRI", "PLANES", "SUPERSAMPLE")
     env = rs.PipelineSpec(**base).command()[1]
+    # 2026-10-13: the caustic classes are on by default (run_ps_dtfe.sh's default and the production runs')
     check("defaults: every run option is spelled out for run_ps_dtfe.sh (a stray PS_* in the login shell cannot leak in)",
-          [env[k] for k in run_keys] == ["0", "3", "1", "1", "1", "0", "0", "0", "1", "1"]
+          [env[k] for k in run_keys] == ["0", "3", "1", "1", "1", "1", "0", "0", "1", "1"]
           and "THICKNESS" not in env and "WINDOW" not in env, str(env))
     q = rs.PipelineSpec(**base, deposit="exact", nsub=1, gpu=False, vertex_mass=False, volume_weighted=False,
                         caustics=True, caustic_cusps=True, parallel_triangulation=True, planes=16, thickness=3.5,
@@ -1561,7 +1990,7 @@ def pipeline_options(tmp: Path, sim: Path):
           st.env.get("DTFE_AUTO_PTS_N") == str(16 * 32 * 16 * 4) and q.plane_points(32) == 16 * 32 * 16 * 4
           and rs.PipelineSpec(**base).plane_points() == 64 * 64, str(st.env.get("DTFE_AUTO_PTS_N")))
     keys = {name: rs.PipelineSpec(**base, **kw).memory_key() for name, kw in
-            (("plain", {}), ("caustics", dict(caustics=True)), ("super", dict(supersample=2)),
+            (("plain", {}), ("caustics", dict(caustics=False)), ("super", dict(supersample=2)),
              ("render", dict(render_smooth=3.0, render_fields="density", render_fixed_range=True, thickness=9.0)))}
     check("the memory key follows the compute options, not the render ones (nor the thickness)",
           len({keys["plain"], keys["caustics"], keys["super"]}) == 3 and keys["render"] == keys["plain"])
@@ -1643,7 +2072,7 @@ def pipeline_options(tmp: Path, sim: Path):
     check("... the defaults add nothing, and 'slab' of a single plane is the plane itself",
           not any(f in a0 for f in ("--fields", "--project", "--smooth", "--smooth-derivatives", "--fixed-range",
                                     "--force")), str(a0))
-    lv, msg = levels(rs.PipelineSpec(**base, caustic_cusps=True))
+    lv, msg = levels(rs.PipelineSpec(**base, caustic_cusps=True, caustics=False))
     check("cusps without caustics is an error (the Grids tab's rule, shared)", "error" in lv and "cusps" in msg, msg)
     lv, msg = levels(rs.PipelineSpec(**base, planes=4))
     check("a handful of planes warns about ghosting", "warning" in lv and "ghosts" in msg, msg)
@@ -2098,6 +2527,16 @@ def run_log_contract():
               lin.settings().get("linear_deposit") is True and std.settings().get("linear_deposit") is False
               and "linear deposit" in lin.options_text() and "linear deposit" not in std.options_text(),
               f"{lin.settings()} {std.settings()} {lin.options_text()!r}")
+        # 2026-10-13: a standard-DTFE run's cell average reaches 'Load settings' both ways (it was left as it was)
+        _write_log(d / "dx.runlog", "RUNNING: /x/DTFE in.hdf5 dx --grid 64 --periodic --exact-average --padding 15\n")
+        _write_log(d / "dm.runlog", "RUNNING: /x/DTFE in.hdf5 dm --grid 64 --periodic --padding 15\n")
+        dx, dm = R.parse_runlog(d / "dx.runlog"), R.parse_runlog(d / "dm.runlog")
+        check("settings(): a standard run with --exact-average loads the exact choice, one without the Monte-Carlo one; "
+              "the Options column says 'exact average'",
+              dx.settings().get("deposit") == "exact" and dm.settings().get("deposit") == "sampled"
+              and dx.settings().get("estimator") == "dtfe" and "exact average" in dx.options_text()
+              and "exact average" not in dm.options_text() and "exact average" not in lin.options_text(),
+              f"{dx.settings()} {dm.settings()} {dx.options_text()!r}")
         _write_log(d / "gpu.runlog", "Build: PS-DTFE 3333333 (built 2026-10-01T09:00:00Z)\n"
                    "RUNNING: /x/PS-DTFE in.hdf5 gpu --grid 64 --periodic --partition 2 2 2 --ps-gpu --ps-vertex-mass\n"
                    "PS-DTFE Metal: Metal command buffer failed: Impacting Interactivity; retrying the partition deposit "
@@ -2129,29 +2568,42 @@ def launcher_2026_10_11():
     try:
         snap = base / "cloud.hdf5"
         on = rs.RunSpec(sim="TNG50-4", snapshots=[99], ordered_merge=True).command()[1]
-        off = rs.RunSpec(sim="TNG50-4", snapshots=[99]).command()[1]
+        off = rs.RunSpec(sim="TNG50-4", snapshots=[99], ordered_merge=False).command()[1]
         pon = rs.PipelineSpec(sims=["TNG50-4"], ordered_merge=True)
+        # 2026-10-14: ON by default (the staged merge in index order: run_ps_dtfe.sh's and the binary's default); off
+        # is the old merge as partitions finish (ORDERED_MERGE=0 / --completion-order-merge)
         check("ordered merge: Grids and Pipeline jobs set ORDERED_MERGE for run_ps_dtfe.sh (spelled out when off, so a "
-              "stray export cannot leak in), the Pipeline's memory check too; the Custom tab passes the flag (PS only)",
+              "stray export cannot leak in), the Pipeline's memory check too; the Custom tab passes the flag (PS only); "
+              "on by default since 2026-10-14, off = --completion-order-merge",
               on.get("ORDERED_MERGE") == "1" and off.get("ORDERED_MERGE") == "0"
+              and rs.RunSpec(sim="TNG50-4", snapshots=[99]).command()[1].get("ORDERED_MERGE") == "1"
               and pon.command()[1].get("ORDERED_MERGE") == "1"
               and pon.check_step("TNG50-4", [99], 1024).env.get("ORDERED_MERGE") == "1"
-              and rs.PipelineSpec(sims=["TNG50-4"]).command()[1].get("ORDERED_MERGE") == "0"
+              and rs.PipelineSpec(sims=["TNG50-4"]).command()[1].get("ORDERED_MERGE") == "1"
+              and rs.PipelineSpec(sims=["TNG50-4"], ordered_merge=False).command()[1].get("ORDERED_MERGE") == "0"
               and "--ordered-merge" in rs.CustomSpec(input_file=str(snap), ordered_merge=True).command()
-              and "--ordered-merge" not in rs.CustomSpec(input_file=str(snap)).command()
-              and "--ordered-merge" not in rs.CustomSpec(input_file=str(snap), estimator="dtfe",
-                                                         ordered_merge=True).command(), str(on))
+              and "--ordered-merge" in rs.CustomSpec(input_file=str(snap)).command()
+              and "--completion-order-merge" in rs.CustomSpec(input_file=str(snap), ordered_merge=False).command()
+              and "--ordered-merge" not in rs.CustomSpec(input_file=str(snap), ordered_merge=False).command()
+              and not {"--ordered-merge", "--completion-order-merge"} & set(
+                  rs.CustomSpec(input_file=str(snap), estimator="dtfe", ordered_merge=True).command()), str(on))
         d = base / "runs"
         d.mkdir()
         _write_log(d / "om.runlog", "RUNNING: /x/PS-DTFE in.hdf5 om --grid 64 --partition 2 2 2 --ordered-merge\n"
                    "   total wall time   : 12s\n")
         _write_log(d / "plain.runlog", "RUNNING: /x/PS-DTFE in.hdf5 plain --grid 64 --partition 2 2 2\n"
                    "   total wall time   : 12s\n")
+        _write_log(d / "co.runlog", "RUNNING: /x/PS-DTFE in.hdf5 co --grid 64 --partition 2 2 2 --completion-order-merge\n"
+                   "   total wall time   : 12s\n")
         om, plain = R.parse_runlog(d / "om.runlog"), R.parse_runlog(d / "plain.runlog")
-        check("ordered merge: settings() carries it (and turns it OFF for a run without it), the Options column says it, "
-              "and the settings load into a RunSpec",
-              om.settings().get("ordered_merge") is True and plain.settings().get("ordered_merge") is False
+        co = R.parse_runlog(d / "co.runlog")
+        # 2026-10-14: a run without either flag loads today's default (on); only '--completion-order-merge' turns it off
+        check("ordered merge: settings() carries it (ON for a run without a flag, today's default; OFF for a "
+              "--completion-order-merge run), the Options column says which, and the settings load into a RunSpec",
+              om.settings().get("ordered_merge") is True and plain.settings().get("ordered_merge") is True
+              and co.settings().get("ordered_merge") is False
               and "ordered merge" in om.options_text() and "ordered merge" not in plain.options_text()
+              and "completion-order merge" in co.options_text()
               and all(hasattr(rs.RunSpec(), k) for k in om.settings()), f"{om.settings()} {om.options_text()!r}")
         import presets as P
         check("ordered merge: the tick's label has no '--', and names the option it stands for",
@@ -2192,11 +2644,16 @@ def launcher_2026_10_11():
                    "~~~ ERROR ~~~\n", t0)
         (d / "cu.runlog.checkpoint").mkdir()
         _write_log(d / "gone.runlog.partial", "RUNNING: /x/PS-DTFE in.hdf5 gone --grid 64\n", t0)
+        # 2026-10-13: a killed partitioned STANDARD run (run_dtfe.sh resumes it too, DTFE_RESUME) is 'resumable' alike
+        _write_log(sd / "output.runlog.partial", "RUNNING: /x/DTFE in.hdf5 output --grid 64 --partition 2 2 2\n"
+                   "DTFE: checkpoints of the merged grids go to 'output.runlog.checkpoint' (at most ~5% of the run; "
+                   "removed when the outputs are written; '--resume' continues a killed run from it).\n", t0)
+        (sd / "output.runlog.checkpoint").mkdir()
         check("a checkpoint directory and its files are run files (never an output, never a log)",
               R.is_run_file("ck.runlog.checkpoint") and R.is_run_file("ck.runlog.checkpoint.tmp")
               and not R.is_run_file("ck.runlog") and not R.is_run_file("ck.a_den"))
         got = {r.prefix: r for r in R.scan_runs(base / "root", [d])}
-        ck, ck2, gone = got.get("ck"), got.get("ck2"), got.get("gone")
+        ck, ck2, gone, sk = got.get("ck"), got.get("ck2"), got.get("gone"), got.get("output")
         rf, rf0, cu = got.get("rf"), got.get("rf0"), got.get("cu")
         if shutil.which("ps"):
             check("a killed run with its checkpoint is 'resumable' (a failed attempt after a finished log too); one "
@@ -2206,6 +2663,9 @@ def launcher_2026_10_11():
                   and ck2 is not None and ck2.ok and ck2.attempt == "resumable"
                   and gone is not None and gone.attempt == "killed",
                   str({k: (v.attempt, [p.name for p in v.outputs]) for k, v in got.items()}))
+            check("... a killed standard-DTFE run with its checkpoint too (run_dtfe.sh resumes since 2026-10-13)",
+                  sk is not None and sk.estimator == "dtfe" and sk.attempt == "resumable",
+                  str(None if sk is None else (sk.estimator, sk.attempt)))
             n1, n2 = R.attempt_note(ck), R.attempt_note(ck2)
             check("... and its note says the same job resumes it, and names the start-over tick",
                   n1 is not None and "resum" in n1[1] and n2 is not None and "resum" in n2[1]
@@ -2232,16 +2692,99 @@ def launcher_2026_10_11():
               and not R.RESUME_REFUSED.search("removed when the outputs are written; '--resume' continues a killed "
                                               "run from it)"), str(dg))
         # the start-over tick: PS_RESUME=0 for run_ps_dtfe.sh, spelled out as 1 otherwise (a stray export cannot leak in)
-        check("start over: Grids and Pipeline jobs set PS_RESUME=0 when ticked, 1 otherwise; the memory check ignores it",
+        check("start over: Grids and Pipeline jobs set PS_RESUME=0 (standard Grids jobs DTFE_RESUME=0) when ticked, 1 "
+              "otherwise; the memory check ignores it",
               rs.RunSpec(sim="TNG50-4", snapshots=[99], start_over=True).command()[1].get("PS_RESUME") == "0"
               and off.get("PS_RESUME") == "1"
               and rs.PipelineSpec(sims=["TNG50-4"], start_over=True).command()[1].get("PS_RESUME") == "0"
               and rs.PipelineSpec(sims=["TNG50-4"]).command()[1].get("PS_RESUME") == "1"
+              and rs.RunSpec(estimator="dtfe", sim="TNG50-4", snapshots=[99], start_over=True).command()[1].get("DTFE_RESUME") == "0"
+              and rs.RunSpec(estimator="dtfe", sim="TNG50-4", snapshots=[99]).command()[1].get("DTFE_RESUME") == "1"
               and rs.RunSpec(start_over=True).memory_key() == rs.RunSpec().memory_key()
               and rs.PipelineSpec(start_over=True).memory_key() == rs.PipelineSpec().memory_key()
               and "start_over" not in om.settings(), str(off))
     finally:
         shutil.rmtree(base, ignore_errors=True)
+
+
+def cpp_fix_flags_2026_10_11():
+    """results.KNOWN_FIXES for the cpp-bug fixes of 2026-10-11: an interlaced grid without a region (pass 2 gridded
+    the same cells), PCS (no padding, half-cell shift), CIC (extrapolated face and seam cells), and a fractional
+    region or padding on a box whose axes differ (the [i%2] axis indexing). Grids built between the interlace-phase
+    fix (2026-10-02) and 2026-10-11T23:00 are flagged at their level, the same commands built after it are not."""
+    import results as R
+    print("stale outputs: the cpp-bug fixes of 2026-10-11:")
+    work = Path(tempfile.mkdtemp(prefix="gui_cppfix_"))
+    try:
+        log = work / "r.runlog"
+
+        def reasons(built, args):
+            _write_log(log, f"Build: DTFE 3e0c1a65fd-dirty (built {built})\nRUNNING: /x/DTFE in.hdf5 r --grid 64 {args}\n")
+            return R.stale_reasons(R.parse_runlog(log))
+
+        before, after = "2026-10-05T08:00:00Z", "2026-10-12T08:00:00Z"
+        has = lambda got, lvl, word: any(lv == lvl and word in m for lv, m in got)   # noqa: E731
+        cases = (   # (arguments, the (level, word) the old build must show, words no message may hold)
+            ("--periodic --TSC --interlace", [("error", "second pass")], ["PCS", "CIC"]),
+            ("--periodic --TSC --interlace --regionMpc 0 50 0 50 0 50", [], ["second pass"]),
+            ("--periodic --TSC --interlace --region 0 0.5 0 0.5 0 0.5", [], ["second pass"]),
+            ("--periodic --PCS", [("error", "PCS")], ["CIC", "second pass"]),
+            ("--periodic --CIC", [("warning", "CIC")], ["PCS"]),
+            ("--box 0 100 0 100 0 200 --region 0 1 0 1 0.5 1", [("error", "fractional region")], ["padding"]),
+            ("--box 10 110 10 110 20 120 --region 0 1 0 1 0.5 1", [("error", "fractional region")], []),
+            ("--box 0 100 0 100 0 100 --region 0 1 0 1 0.5 1 --padding 0.05", [], ["fractional"]),
+            ("--box 0 100 0 100 0 200 --padding 0.05", [("warning", "fractional padding")], ["fractional region"]),
+            ("--box 10 110 10 110 20 120 --padding 0.05", [], ["fractional"]),
+            ("--box 0 100 0 100 0 200 --regionMpc 0 100 0 100 100 200 --paddingMpc 5 5 5 5 10 10", [], ["fractional"]),
+        )
+        bad = []
+        for args, want, never in cases:
+            old, new = reasons(before, args), reasons(after, args)
+            gone = [w for _, w in want] + never          # after the fix: none of the messages
+            if not all(has(old, lvl, w) for lvl, w in want) or any(w in m for _, m in old for w in never) \
+                    or any(w in m for _, m in new for w in gone):
+                bad.append(f"{args}: old {old} | new {new}")
+        check("KNOWN_FIXES: grids built before 2026-10-11T23:00 are flagged for interlace without a region (error), "
+              "PCS (error), CIC (warning), a fractional region (error) or padding (warning) on a box whose axes "
+              "differ; the same commands built after it, and the unaffected ones, are not", not bad, " || ".join(bad))
+        check("the new KNOWN_FIXES messages are launcher text (no '--')",
+              not [f.key for f in R.KNOWN_FIXES if "--" in f.message], "")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def pts_conventions_flag_2026_10_13():
+    """results.KNOWN_FIXES 'pts-grid-conventions' (the parity batch of 2026-10-13): a PS image plane built before the
+    points followed the grids' --ps-vertex-mass / --ps-volume-weighted is flagged (warning); the same command built
+    after it is not, nor a plane without the two grid options, one asked for '--pts-conventions legacy', a PS run
+    without a plane, or a standard plane."""
+    import results as R
+    print("stale outputs: PS image planes in the grids' conventions (2026-10-13):")
+    work = Path(tempfile.mkdtemp(prefix="gui_ptsconv_"))
+    try:
+        log = work / "r.runlog"
+
+        def flagged(exe, built, args):
+            _write_log(log, f"Build: {exe} 3e0c1a65fd-dirty (built {built})\nRUNNING: /x/{exe} in.hdf5 r --grid 64 {args}\n")
+            return any(lv == "warning" and "image plane made before" in m for lv, m in R.stale_reasons(R.parse_runlog(log)))
+
+        before, after = "2026-10-13T12:56:00Z", "2026-10-14T08:00:00Z"
+        plane = "--periodic --sample-points p.bin --pts-vel-grad"
+        cases = (   # (binary, arguments, flagged when built before, after)
+            ("PS-DTFE", f"{plane} --ps-vertex-mass --ps-volume-weighted", True, False),
+            ("PS-DTFE", f"{plane} --ps-volume-weighted", True, False),
+            ("PS-DTFE", f"{plane} --ps-vertex-mass --ps-volume-weighted --pts-conventions legacy", False, False),
+            ("PS-DTFE", plane, False, False),
+            ("PS-DTFE", "--periodic --ps-vertex-mass --ps-volume-weighted", False, False),
+            ("DTFE", plane, False, False),
+        )
+        bad = [f"{exe} {args}" for exe, args, b, a in cases
+               if flagged(exe, before, args) != b or flagged(exe, after, args) != a]
+        check("KNOWN_FIXES pts-grid-conventions: a PS plane with the grids' vertex masses or volume weighting built "
+              "before 2026-10-13T20:00 is flagged, the same built after it, a legacy or option-less plane, a PS run "
+              "without a plane and a standard plane are not", not bad, " || ".join(bad))
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 if __name__ == "__main__":

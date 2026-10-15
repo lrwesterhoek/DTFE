@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The launcher's 2026-10-11 additions (python/gui): run-directory files of a run going (contract C1) in the Runs
 browser, the memory status strip, the 'Running now' panel, the void-catalogue status and its build job, keep-awake,
-the new Plots sets, the memory check's log.
+the new Plots sets, the memory check's log; (2026-10-14) the Explore menu's Save Options….
 
 Three tiers:
   * HEADLESS (always run; Ubuntu CI, numpy 1.26): results.py / runspec.py / void_cache.py on synthetic run folders
@@ -440,6 +440,7 @@ def t_qt(tmp: Path):
         check("the window's status strip shows free memory (off the GUI thread)",
               w.mem_strip.text().startswith("free ") or w.mem_strip.text() == "memory: unknown", w.mem_strip.text())
         check("a 'Running now' tab beside Runs", w.results.indexOf(w.running_now) == w.results.indexOf(w.runs) + 1)
+        t_qt_save_options(w)
         rec = R.parse_runlog(d / "ps_output.runlog", "TNGQ-1-Dark", 99)
         n0 = len(w.queue)
         w.queue_void_build(rec)
@@ -479,9 +480,15 @@ def t_qt(tmp: Path):
         (d / "om.runlog").write_text(LOG_OK.format(root=d / "om").replace("--periodic", "--periodic --ordered-merge"))
         w._load_run_settings(R.parse_runlog(d / "om.runlog", "TNGQ-1-Dark", 99))
         on = w.om_check.isChecked()
+        # 2026-10-14: off only for a run made with '--completion-order-merge' (a run without a flag loads today's
+        # default, on)
+        (d / "co.runlog").write_text(LOG_OK.format(root=d / "co").replace("--periodic", "--periodic --completion-order-merge"))
+        w._load_run_settings(R.parse_runlog(d / "co.runlog", "TNGQ-1-Dark", 99))
+        off = not w.om_check.isChecked()
         w._load_run_settings(R.parse_runlog(d / "ps_output.runlog", "TNGQ-1-Dark", 99))
-        check("'Load settings' carries the ordered merge: on for a run made with it, off for one without",
-              on and not w.om_check.isChecked(), on)
+        check("'Load settings' carries the ordered merge: on for a run made with it (and for one without a flag, "
+              "today's default), off for a --completion-order-merge run",
+              on and off and w.om_check.isChecked(), (on, off))
         # 2026-10-11: the start-over tick (Grids, Pipeline) reaches run_ps_dtfe.sh as PS_RESUME=0; the banner of a
         # refused resume ticks it; its text has no '--'; 'Load settings' leaves it alone (a one-off choice)
         so, pso = getattr(w, "so_check", None), getattr(w, "p_so", None)
@@ -503,10 +510,94 @@ def t_qt(tmp: Path):
         check("the start-over tick reaches the Grids and Pipeline jobs (PS_RESUME=0, else 1), the refused-resume banner "
               "ticks it, no '--' in its text, 'Load settings' leaves it", ok,
               (getattr(w.spec, "start_over", None), getattr(w.pipe, "start_over", None)))
+        t_qt_void_options(w)
+        t_qt_gpu_retries(tmp)
     finally:
         w._machine_timer.stop()
         w.close()
         spin(200)
+
+
+def t_qt_save_options(w):
+    """The Explore menu's Save Options… (2026-10-14): right after Save Image…, enabled without a map, it brings up
+    Explore and the Save options dialog; a window that does not remember its settings keeps them for the session."""
+    import app as A
+    menu = next(a.menu() for a in w.menuBar().actions() if a.text() == "Explore")
+    acts = [a for a in menu.actions() if not a.isSeparator()]
+    k = acts.index(w.save_options_action) if w.save_options_action in acts else -1
+    opened = []
+    real = w.explore.open_save_options
+    w.explore.open_save_options = lambda: opened.append(w.tabs.currentIndex()) or True
+    try:
+        w.tabs.setCurrentIndex(A.GRIDS)
+        w.save_options_action.trigger()
+    finally:
+        w.explore.open_save_options = real
+    check("Explore > Save Options…: after Save Image…, enabled with no map shown, opens the dialog on the Explore tab; "
+          "remember off: the options are not written to the settings",
+          k > 0 and acts[k - 1] is w.save_image_action and w.save_options_action.text() == "Save Options…"
+          and w.save_options_action.isEnabled() and opened == [A.EXPLORE] and w.explore._settings is None
+          and "--" not in w.save_options_action.text(), (k, opened, w.save_options_action.isEnabled()))
+
+
+def t_qt_void_options(w):
+    """The void scripts' own options on the Plots tab (2026-10-11): grouped options share one form row (compact),
+    and what the widgets say reaches the job's commands (= the exported script)."""
+    import app as A
+    keys = [fs.key for fs in rs.FIGURE_SETS]
+    page = w.fig_stack.widget(keys.index("skeleton"))
+    opts = rs.FIGURE_SET["skeleton"].opts
+    want_rows = 1 + len({o.row for o in opts if o.row}) + sum(1 for o in opts if not o.row)
+    null_w = w.opt_widgets[("skeleton", "null_draws")][1]
+    sheet_w = w.opt_widgets[("skeleton", "sheet_min_density")][1]
+    page.resize(700, 600)
+    page.show()
+    page.layout().activate()
+    check("Plots tab: the skeleton's grouped options share form rows (two widgets on one line), each with a tooltip",
+          page.layout().rowCount() == want_rows and null_w.geometry().y() == sheet_w.geometry().y()
+          and null_w.toolTip() and sheet_w.toolTip(),
+          (page.layout().rowCount(), want_rows, null_w.geometry(), sheet_w.geometry()))
+    page.hide()
+    w.tabs.setCurrentIndex(A.PLOTS)
+    for i in range(w.fig_list.count()):
+        it = w.fig_list.item(i)
+        it.setCheckState(A.Qt.Checked if it.data(A.Qt.UserRole) in ("voidtrack", "skeleton") else A.Qt.Unchecked)
+    w.opt_widgets[("voidtrack", "link")][1].setCurrentText("particles")
+    w.opt_widgets[("voidtrack", "exclusive")][1].setChecked(True)
+    w.opt_widgets[("skeleton", "min_component_mass")][1].setValue(0.001)
+    w._read_widgets()
+    argv = {Path(st.argv[1]).name: st.argv for st in w.plots.steps()}
+    tr, sk = argv.get("plot_void_tracking.py", []), argv.get("plot_caustic_skeleton.py", [])
+    check("... and the widgets' values reach the job's commands (what an export writes)",
+          tr[tr.index("--link") + 1:tr.index("--link") + 2] == ["particles"] and "--exclusive" in tr
+          and sk[sk.index("--min-component-mass") + 1:][:1] == ["0.001"] and "--null-draws" not in sk,
+          (w.plots.sets, tr, sk))
+
+
+def t_qt_gpu_retries(tmp: Path):
+    """G1 (2026-10-11): the Runs tab shows the GPU deposit retries per cause: the 'Running now' state from the
+    sidecar, a finished run's status and details from its log's closing line."""
+    import runs_view as RV
+    rn = RV.RunningNow()
+    rn.show_entries([{"pid": 9, "name": "PS-DTFE", "sim": "S", "snap": 99, "state": "running",
+                      "progress": {"phase": "deposit", "gpu_retries": 3,
+                                   "gpu_retries_by_cause": {"innocent": 2, "timeout": 0, "oom": 1, "other": 0}}}])
+    state = rn.table.item(0, rn.table.columnCount() - 1).text()
+    root = tmp / "retries_root"
+    d = snapdir(root, sim="TNGR-1-Dark", snap=99)
+    (d / "ps_output.runlog").write_text(LOG_OK.format(root=d / "ps_output")
+                                        + "GPU deposit retries: 2 (innocent 0, timeout 2, oom 0, other 0)\n")
+    (d / "ps_output.a_den").write_bytes(b"\0" * 64)
+    rb = RV.RunsBrowser(lambda: str(root), lambda: [], sys.executable)
+    rb.reload()
+    k = next((i for i, r in enumerate(rb._rows) if r.sim == "TNGR-1-Dark"), None)
+    status = rb.table.item(k, RV.COLUMNS.index("Status")).text() if k is not None else ""
+    if k is not None:
+        rb.table.selectRow(k)
+    detail = rb.detail.toPlainText()
+    check("Runs tab: GPU retries per cause in 'Running now' (sidecar) and a finished run's status and details (log)",
+          state == "running, 3 GPU retries (innocent 2, oom 1)" and status.endswith("2 GPU retries (timeout 2)")
+          and "2 GPU retries (timeout 2)" in detail, (state, status, detail[-400:]))
 
 
 def main() -> int:

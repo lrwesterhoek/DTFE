@@ -157,6 +157,11 @@ int main( int argc, char *argv[] )
     if ( userOptions.interlace )
     {
         // Interlacing: interpolate twice (original + half-cell offset), average in Fourier space.
+        // without '--periodic' the second pass grids the region moved by half a cell (below): without a region
+        // that leaves the data box, so refuse before the first pass rather than after it (2026-10-11)
+        if ( !userOptions.periodic and !userOptions.regionOn )
+            throwError( "'--interlace' without '--periodic' needs a '--region' or '--regionMpc' at least half a cell "
+                        "inside the data box: the second pass grids that region moved by half a cell." );
         if ( !userOptions.periodic )
         {
             MESSAGE::Warning warning( userOptions.verboseLevel );
@@ -177,16 +182,42 @@ int main( int argc, char *argv[] )
 
         if ( !density1.empty() )
         {
-            // second pass: shift the box origin by half a cell along every axis
+            // second pass: the grid moved by half a cell along every axis. Until 2026-10-11 this shifted
+            // 'region' only, which the pass-2 setup (updateEntries, DTFE_preparePadding, the PS path) reset to
+            // the box when no '--region' was given: pass 2 gridded the SAME cells, and the output was pass 1
+            // low-passed by 0.5(1+e^{-ik.dx/2}) and moved half a cell, not de-aliased.
+            //   periodic: move the PARTICLES by -dx/2 instead (wrapped into the box), which is the same grid for
+            //     every estimator and needs no region: PS-DTFE refuses '--region' (it would crop an Eulerian box
+            //     of a Lagrangian tessellation), and its displacements are unwrapped modulo the box anyway
+            //   non-periodic: a '--region' is required (checked above); shift it, it survives the setup
             User_options shiftedOptions = userOptions;
             shiftedOptions.interlace = false;  // guard against future re-entrant refactoring
             size_t const *nGrid = &(shiftedOptions.gridSize[0]);
-            for (int d = 0; d < NO_DIM; ++d)
+            if ( userOptions.periodic )
             {
-                Real cellSize = (shiftedOptions.region[2*d+1] - shiftedOptions.region[2*d]) / nGrid[d];
-                shiftedOptions.region[2*d]   += cellSize / Real(2.);
-                shiftedOptions.region[2*d+1] += cellSize / Real(2.);
+                Real half[NO_DIM], lo[NO_DIM], len[NO_DIM];
+                for (int d = 0; d < NO_DIM; ++d)
+                {
+                    half[d] = (userOptions.region[2*d+1] - userOptions.region[2*d]) / nGrid[d] / Real(2.);
+                    lo[d]   = userOptions.boxCoordinates[2*d];
+                    len[d]  = userOptions.boxCoordinates[2*d+1] - lo[d];
+                }
+                for (Particle_data &p : particlesCopy)
+                    for (int d = 0; d < NO_DIM; ++d)
+                    {
+                        p.pos[d] -= half[d];
+                        if ( p.pos[d] < lo[d] ) p.pos[d] += len[d];
+                    }
+                // the moved particles are another tessellation: never load (or overwrite) pass 1's cached one
+                shiftedOptions.tessellationCacheDir.clear();
             }
+            else
+                for (int d = 0; d < NO_DIM; ++d)
+                {
+                    Real cellSize = (shiftedOptions.region[2*d+1] - shiftedOptions.region[2*d]) / nGrid[d];
+                    shiftedOptions.region[2*d]   += cellSize / Real(2.);
+                    shiftedOptions.region[2*d+1] += cellSize / Real(2.);
+                }
 
             Quantities uQ2, aQ2;
             DTFE( &particlesCopy, samplingCoordinates, shiftedOptions, &uQ2, &aQ2 );
@@ -248,6 +279,25 @@ int main( int argc, char *argv[] )
 #endif
             std::cout << MESSAGE::cYellowD() << "   peak memory (RSS) : " << MESSAGE::cReset()
                       << MESSAGE::cMagenta() << std::setprecision(4) << peakGB << " GB" << MESSAGE::cReset() << "\n" << std::flush;
+        }
+        // the auto-tuner's predicted peak against the measured one (2026-10-11), both in GB of 1e9 B (the tuner's
+        // unit; the RSS line above is in 2^30 B, as the run scripts' footprint): a model that drifts low shows up
+        // in every runlog instead of only when someone reads two logs side by side (run_progress.h)
+        double const predicted = runProgressPredicted();
+        double maxRss = -1.;
+        double const measured = runProgressPeak( &maxRss );
+        if ( predicted > 0. and measured > 0. )
+        {
+            char line[256];
+            std::snprintf( line, sizeof(line), "%.2f GB predicted (auto-tune) vs %.2f GB measured (%s; max RSS %.2f GB): "
+                           "%+.2f GB, %+.0f%% (GB of 1e9 B)", predicted/1.e9, measured/1.e9,
+#ifdef __APPLE__
+                           "peak footprint",
+#else
+                           "max RSS",
+#endif
+                           maxRss/1.e9, (measured - predicted)/1.e9, 100.*(measured - predicted)/predicted );
+            std::cout << MESSAGE::cYellowD() << "   memory model      : " << MESSAGE::cReset() << line << "\n" << std::flush;
         }
         std::cout << MESSAGE::cYellowD() << "   total wall time   : " << MESSAGE::cReset()
                   << MESSAGE::cGreen() << MESSAGE::formatDuration(wallSec) << MESSAGE::cReset() << "\n"

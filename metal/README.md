@@ -112,11 +112,19 @@ T10: sub-grid vs full grid 0 difference). The unit must be that fine: a first tr
 2^32 units left the 3 kpc cells of a --ps-window zoom 5e-4 off (tests/ps_window_check.sh). Cost: 4 more
 bytes per cell on the device and a second atomic per mass share; on an M1 Max (2.1M particles, 256^3,
 nSub 3) the density-only deposit is unchanged (5.95 s) and the full field set ~2% slower (12.0 vs 11.8 s).
-The moment grids stay float; their normalizer is this mass (or momw / dispw), so in cells with ~1e7
-deposits a mass-weighted sigma^2 no longer has the mass grid's matching float loss to cancel its own.
+Since 2026-10-14 the moment grids are fixed-point sums too (`PSDepositParams.fxMask`, word views at buffers
+22-29; the exact items' per-tet weight totals at 30), each in its own unit from a bound the caller sums
+(`PSFixedBounds`, `psMomentFixedScale` in ps_deposit_params.h); `PS_METAL_FLOAT_MOMENTS=1` keeps the float atomics.
+(Before, their normalizer was this exact mass while they stayed float, so in cells with ~1e7 deposits a
+mass-weighted sigma^2 no longer had the mass grid's matching float loss to cancel its own.)
 `PS_METAL_FLOAT_MASS=1` (and the harness's `VALIDATE_FLOAT_MASS=1`) brings back the float mass grid
 for comparison. The CUDA/HIP port has the same fixed-point grid since 2026-10-11 (PS_GPU_FLOAT_MASS=1, or the Metal
 spelling, for its float grid); tests/cudaemu_check.sh runs the parity suites on it through the CPU emulation.
+Since 2026-10-12 the hosts hand the words over unconverted (`PSGpuGrids::massFx`), and the CPU adds the
+tetrahedra the kernel deferred, and the `--ps-halo-release` centroid deposits, as the same integers (the
+single-precision build; ps_interpolation.cc `massFx`): their float adds had put TNG50-3-Dark z=0.5 at a box
+mean of 1 - 1.63e-5, every bit of it the deferred deposit. A CPU-only deposit sums into such a grid too; the
+float density is formed once per cell after the loop (tests/ps_mass_exact_check.sh).
 
 Random stress set (60% normal + 25% flat/caustic + 15% tiny tets): CPU-vs-GPU mean-rel agreement
 mass 4e-6, momentum 3e-6, second moment 7e-7, gradient 9e-9; stream counts differ in 0.003% of
@@ -288,11 +296,13 @@ whole run 12.9 s shared against 10.6 s per-call.
 
 **Double-precision binaries.** `make DTFE PS-DTFE DOUBLE=1 METAL=1` builds `DTFE-double` / `PS-DTFE-double`
 with the same kernels: the extraction narrows the double tetrahedra to float for the GPU and the
-float sums are added into the double grids (everything else in those binaries is double). Their
+float sums are added into the double grids (everything else in those binaries is double; the standard binary's
+exact fixed-point sums of 2026-10-13 reach them rounded to float). Their
 GPU deposits match their own CPU runs within the parity class above (`tests/ps_double_check.sh`, D5).
 
 Knobs: `DTFE_GPU_ITEM_SAMPLES`, `DTFE_GPU_CACHE_K=2|4|8`, `DTFE_GPU_TABLE=0`, `DTFE_GPU_ITEMS=0`,
-`DTFE_GPU_SHARED=1` (+ `DTFE_GPU_SHARED_GB` cap), `DTFE_METAL_TIMING=1` (per batch: items, samples,
+`DTFE_GPU_SHARED=1` (+ `DTFE_GPU_SHARED_GB` cap), `DTFE_METAL_FLOAT_GRIDS=1` / `DTFE_GPU_FLOAT_GRIDS=1` (the float
+atomics instead of the exact fixed-point sums of 2026-10-13, for A/B), `DTFE_METAL_TIMING=1` (per batch: items, samples,
 table size, chunks, retries, M samples/s, pipeline occupancy, cells per SIMD group),
 `DTFE_GPU_DEBUG_NOWRITE` / `DTFE_GPU_DEBUG_NOATOMIC=1|2|3` (timing experiments). Whole runs (CPU / GPU, 2026-10-01 evening): 7.1M particles at 512³ 39.1 / 17.3 s (with the velocity
 gradient 48.2 / 32.0 s; the per-tet kernel of the morning: 396.7 s), 2.1M at 512³ 24.6 / 10.6 s
@@ -303,7 +313,8 @@ sums per table entry and per flush.
 A retry (never seen with items) **drains the queue** before re-zeroing: the per-tet kernel's retried
 512³ runs differed run to run by a whole sample in void cells (2e-2 of max|v|, against 3e-6 without
 retries), consistent with atomics of a killed buffer landing after the memset; the parity test's
-repeated GPU run pins the reproducibility at 1e-4.
+repeated GPU run pins the reproducibility at 1e-4. Since 2026-10-13 a failed buffer restores the batch's last
+checkpoint (the PS policy, `gpu_metal_retry.h`) instead of re-zeroing the owner box; the drain stays.
 
 ## CUDA / HIP (Linux): `make <target> CUDA=1` or `HIP=1` — a port of these kernels
 
@@ -408,8 +419,12 @@ machine remains the final word.
 ## Caveats
 
 - Single GPU; no multi-GPU. Unified memory (`StorageModeShared`) avoids host↔device copies on Apple Si.
-- Atomic-add ordering is non-deterministic → ULP-level run-to-run variation (fine for science, not
-  bit-reproducible). For tighter determinism, accumulate via `atomic_uint` fixed-point.
+- Atomic-add ordering is non-deterministic → ULP-level run-to-run variation where the sums are float (fine for
+  science, not bit-reproducible): the PS velocity and dispersion moments, the standard shared full grid
+  (`DTFE_GPU_SHARED=1`) and the `*_FLOAT_GRIDS=1` A/B modes. Accumulation via `atomic_uint` fixed-point is done for
+  the PS mass grid (2026-10-08) and every standard-DTFE `_a` grid (2026-10-13; chunks aligned to 256 items so the
+  SIMD-group sums are fixed), which are bit-reproducible (the PS mass grid per partition: several partitions in
+  flight are still added in float in the order they finish, unless `--ordered-merge`).
 - Requires Metal 3 (Apple7+/M-series) for native `atomic_float`. Verified on M1 Max.
 - Fields grids at 512³ are 20 floats/cell ≈ 10.7 GB (mass 1 + momentum 3 + σ second-moment 6 +
   gradient 9 + streams 1). Fits M1 Max 64 GB unified memory; use the partition sub-grid (integration

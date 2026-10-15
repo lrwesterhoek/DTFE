@@ -161,6 +161,64 @@ def t_exclusive_members():
     assert np.array_equal(mp.ids, m.ids) and np.array_equal(mp.void, m.void) and np.array_equal(mp.n_members, m.n_members)
 
 
+def _lexsort_exclusive_ref(chunks, centres, radii, n_s):
+    """The exclusive pairs as _chunk_pairs made them until 2026-10-11 (every (id, q) pair of a chunk lexsorted, the
+    first per id kept): ([(ids, void, chunk index) per chunk], particles whose nearest q is tied between spheres)
+    -- the reference of the running best."""
+    from scipy.spatial import cKDTree
+    out, ties = [], 0
+    for ids, frac in chunks:
+        tree = cKDTree(np.mod(frac, 1.0), boxsize=1.0 + 1e-12, balanced_tree=False, compact_nodes=False)
+        ci, cv, cq, cx = [], [], [], []
+        for v in range(radii.size):
+            idx = np.asarray(tree.query_ball_point(centres[v], radii[v]), dtype=np.int64)
+            if not idx.size:
+                continue
+            d = frac[idx] - centres[v]
+            d -= np.rint(d)
+            q = np.sqrt(np.einsum("ij,ij->i", d, d)) / radii[v]
+            ci.append(ids[idx]), cv.append(np.full(idx.size, v, np.int32)), cx.append(idx)
+            cq.append((q + (2.0 if v >= n_s else 0.0)).astype(np.float32))
+        ci, cv, cq, cx = map(np.concatenate, (ci, cv, cq, cx))
+        o = np.lexsort((cq, ci))
+        first = np.ones(o.size, dtype=bool)
+        first[1:] = ci[o][1:] != ci[o][:-1]
+        out.append((ci[o][first], cv[o][first], cx[o][first]))
+        tie = np.zeros(o.size, dtype=bool)
+        tie[1:] = ~first[1:] & first[:-1] & (cq[o][1:] == cq[o][:-1])
+        ties += int(tie.sum())
+    return out, ties
+
+
+def t_exclusive_running_best():
+    """2026-10-11: the exclusive partition is a running per-particle best, not a lexsort of every pair -- the same
+    (id, void, index) as the lexsort, ties (equal q: the lower sphere) included, with and without the pool rule."""
+    from dtfelib import lagrangian as L
+    rng = np.random.default_rng(11)
+    n = 40000
+    frac = np.round(rng.random((n, 3)) * 32) / 32          # a lattice: many particles at EQUAL q from two centres
+    ids = (rng.permutation(5 * n)[:n] + 3).astype(np.uint64)
+    c = np.round(rng.random((30, 3)) * 32) / 32
+    r = rng.choice([0.09, 0.125, 0.2], 30)                  # repeated radii: exact ties of q
+    chunks = [(ids[:17000], frac[:17000]), (ids[17000:], frac[17000:])]
+    want, ties = _lexsort_exclusive_ref(chunks, c, r, 18)
+    assert ties > 20, f"the lattice must make tied q's ({ties})"
+    lexsort = np.lexsort
+    def no_lexsort(*a, **k):
+        raise AssertionError("the exclusive members lexsorted the chunk's pairs")
+    np.lexsort = no_lexsort
+    try:
+        got = list(L._chunk_pairs(chunks, c, r, True, 18, with_index=True))
+        plain = list(L._chunk_pairs(chunks, c, r, True, 18))
+    finally:
+        np.lexsort = lexsort
+    assert len(got) == len(plain) == len(want) == 2
+    for (wi, wv, wx), g, p in zip(want, got, plain):
+        assert len(g[0]) == 1 and np.array_equal(g[0][0], wi) and np.array_equal(g[1][0], wv), "pairs differ"
+        assert np.array_equal(g[3][0], wx) and np.array_equal(p[0][0], wi) and np.array_equal(p[1][0], wv)
+        assert g[1][0].dtype == np.int32 and g[3][0].dtype == np.int64
+
+
 def t_combined_reader():
     import h5py
     from dtfelib import lagrangian as L
@@ -243,6 +301,10 @@ class FakeVoidSnapshot:
     def prog_members(self):
         from dtfelib import lagrangian as L
         return L.VoidSnapshot.prog_members(self)
+
+    def stream_links(self, progs, keep_prog=True):
+        from dtfelib import lagrangian as L
+        return L.VoidSnapshot.stream_links(self, progs, keep_prog)
 
     def drop_members(self, keep_prog=False):
         from dtfelib import lagrangian as L
@@ -391,6 +453,187 @@ def t_void_pool():
     assert np.allclose(r, [3.0, 5.0, 6.0, 6.0, 7.0]), r      # followed: R_v; row 1 min(6, 8); 2: R_eff 6; 3: R_v
     c, rad = L.void_spheres(cat, n, rows, r)
     assert np.allclose(rad, r / n) and np.allclose(c[0], (50.5) / n)
+
+
+def t_membership_cap():
+    """2026-10-11: the membership spheres are capped at FATE_MAX_SIGMA (15) smoothing lengths -- the R_v search reaches
+    24 since that day, the census keeps the spheres its numbers come from: a followed void and a pool minimum whose
+    radius exceeds the cap get the capped sphere (an explicit sigma, or config's), one below it keeps its radius, the
+    particles between the cap and R_v are no members, the catalogue's R_v is untouched, and a link cache made with an
+    uncapped sphere is relinked while one the cap does not change is served."""
+    import config
+    from dtfelib import lagrangian as L
+    n, sig = 128, 2.0
+    cap = 30.0                                                       # 15 sigma of 2 cells
+    assert L.FATE_MAX_SIGMA == 15.0 and L.membership_cap_cells(sig) == cap
+    assert L.membership_cap_cells(0.0) == L.FATE_MAX_SIGMA           # sigma < 1 cell counts as one (the R_v search's)
+    coords = np.array([[10, 10, 10], [64, 64, 64], [100, 30, 60], [30, 100, 90], [5, 70, 110]])
+    # rows 0, 1 followed (R_v 40 > cap, 12 < cap); 2: R_v 50, R_eff 50; 3: R_eff 12 only; 4: R_v 35, R_eff 40
+    rv = np.array([40.0, 12.0, 50.0, np.nan, 35.0])
+    semi = np.array([[1.0] * 3, [1.0] * 3, [25.0] * 3, [6.0] * 3, [20.0] * 3])     # Mpc, cell 0.5: R_eff in cells x 2
+    cat = {"coords": coords, "r_v_cells": rv.copy(), "well_resolved": np.ones(5, bool), "semi_axes": semi,
+           "cell_mpc": 0.5, "delta_values": -0.5 * np.ones(5)}
+    rows, r = L.void_pool(cat, n, np.array([0, 1]), sigma_cells=sig)
+    assert rows.tolist() == [0, 1, 2, 3, 4], rows
+    assert np.allclose(r, [cap, 12.0, cap, 12.0, cap]), f"the pool's radii are not capped at {cap} cells: {r}"
+    c, rad = L.void_spheres(cat, n, rows[:2], r[:2])
+    assert np.allclose(rad, [cap / n, 12.0 / n])
+    saved = config.SMOOTHING_SIGMA_CELLS
+    config.SMOOTHING_SIGMA_CELLS = sig                               # the default: the catalogue's served smoothing
+    try:
+        _rows, r_def = L.void_pool(cat, n, np.array([0, 1]))
+        _c, rad_def = L.void_spheres(cat, n, [0, 1])                 # R_v spheres without radii: capped too
+    finally:
+        config.SMOOTHING_SIGMA_CELLS = saved
+    assert np.array_equal(r_def, r) and np.allclose(rad_def, rad), (r_def, rad_def)
+    assert np.array_equal(cat["r_v_cells"], rv, equal_nan=True), "the measured R_v must not change"
+    # members: within the capped sphere only (20 cells in, 35 cells out, although R_v is 40)
+    ids = np.array([5, 9], dtype=np.uint64)
+    frac = np.mod(c[0] + np.array([[20.0, 0, 0], [35.0, 0, 0]]) / n, 1.0)
+    m = L.void_members([(ids, frac)], c[:1], rad[:1])
+    assert m.n_members.tolist() == [1] and m.ids.tolist() == [5], (m.n_members, m.ids)
+    # the link caches compare the spheres: a link made with B1's uncapped sphere is relinked once it is capped, a
+    # sphere the cap leaves alone keeps its cache
+    saved_cache = config.CACHE_DIR
+    config.CACHE_DIR = Path(_TMP) / "cache_cap"
+    try:
+        a, b, _c3 = _fake_ladder()
+        L.cached_link(a, b, log=lambda m: None)
+        assert b.reads == 1
+        same = FakeVoidSnapshot(67, b._particles, b.centres, np.minimum(b.radii, 0.2))      # the cap binds nowhere
+        msgs = []
+        L.cached_link(a, same, log=msgs.append)
+        assert same.reads == 0 and not msgs, msgs
+        capped = FakeVoidSnapshot(67, b._particles, b.centres, np.minimum(b.radii, 0.06))  # B1: 0.08 -> 0.06
+        L.cached_link(a, capped, log=msgs.append)
+        assert capped.reads == 1 and any("other voids" in q for q in msgs), msgs
+    finally:
+        config.CACHE_DIR = saved_cache
+
+
+def _link_arrays_equal(x, y):
+    return all(np.array_equal(getattr(x, k), getattr(y, k)) and getattr(x, k).dtype == getattr(y, k).dtype
+               for k in ("prog", "desc", "count", "n_prog_members", "n_desc_members")) and x.n_desc_sample == y.n_desc_sample
+
+
+def t_stream_identical():
+    """2026-10-11: link_stream (the census's descendant side, never holding the pool's member pairs) gives the SAME
+    links as link(a, void_members(pool)) -- prog, desc, count, members, dtypes -- for two progenitor sets at once,
+    across chunks and the wrap, with and without 'exclusive'; the followed members it keeps are exactly
+    void_members(pool).sample(); and its peak allocation is far below holding the pool (tracemalloc)."""
+    import tracemalloc
+    from dtfelib import lagrangian as L
+    rng = np.random.default_rng(11)
+    n = 120_000
+    ids = (rng.permutation(n) * 3 + 7).astype(np.uint64)
+    fa, fb = rng.random((n, 3)), rng.random((n, 3))
+    # progenitors: 30 overlapping spheres (wrap included); the pool: 12 followed + 40 large unfollowed (each particle
+    # in ~4 pool spheres: the pairs outnumber the particles, as on TNG100)
+    ca, ra = rng.random((30, 3)), rng.uniform(0.05, 0.12, 30)
+    cp = np.vstack([rng.random((12, 3)), rng.random((40, 3))])
+    rp = np.concatenate([rng.uniform(0.05, 0.1, 12), rng.uniform(0.2, 0.3, 40)])
+    chunks_a = [(ids[i:i + 17_000], fa[i:i + 17_000]) for i in range(0, n, 17_000)]
+    chunks_b = [(ids[i:i + 23_000], fb[i:i + 23_000]) for i in range(0, n, 23_000)]
+    for excl in (False, True):
+        a1 = L.void_members(chunks_a, ca, ra, exclusive=excl)
+        a2 = L.void_members(chunks_a, ca[:9], ra[:9] * 1.3, exclusive=excl)
+        pool = L.void_members(chunks_b, cp, rp, exclusive=excl, n_sample=12)
+        assert pool.ids.size > 2 * n or excl, pool.ids.size
+        want = [L.link(a1, pool), L.link(a2, pool, block=5000)]
+        got, sample = L.link_stream([a1, a2], chunks_b, cp, rp, exclusive=excl, n_sample=12, block=9_000)
+        assert len(got) == 2 and all(_link_arrays_equal(g, w) for g, w in zip(got, want)), f"exclusive={excl}"
+        saved, L.DENSE_MAX = L.DENSE_MAX, 0                 # the sparse accumulation (a huge k_a x k_b table)
+        try:
+            sparse, _s = L.link_stream([a1, a2], chunks_b, cp, rp, exclusive=excl, n_sample=12, keep_sample=False)
+        finally:
+            L.DENSE_MAX = saved
+        assert all(_link_arrays_equal(g, w) for g, w in zip(sparse, want)), f"sparse, exclusive={excl}"
+        assert sum(int(lk.count.size) for lk in got) > 100
+        ref = pool.sample()
+        assert np.array_equal(sample.ids, ref.ids) and np.array_equal(sample.void, ref.void), f"exclusive={excl}"
+        assert np.array_equal(sample.n_members, ref.n_members) and sample.n_particles == ref.n_particles == n
+        assert np.array_equal(sample.radii, ref.radii) and sample.n_sample == 12
+        assert [L.CLASSES[c] for c in L.classify(got[0])["cls"]] == [L.CLASSES[c] for c in L.classify(want[0])["cls"]]
+        got2, none = L.link_stream([a1], chunks_b, cp, rp, exclusive=excl, n_sample=12, keep_sample=False)
+        assert none is None and _link_arrays_equal(got2[0], want[0])
+        # 2026-10-11: chunks in worker threads change nothing, bit for bit (one worker is the path before them)
+        for w in (1, 3, 8):
+            g, smp = L.link_stream([a1, a2], chunks_b, cp, rp, exclusive=excl, n_sample=12, block=9_000, workers=w)
+            assert all(_link_arrays_equal(x, y) for x, y in zip(g, want)), f"workers {w}, exclusive={excl}"
+            assert np.array_equal(smp.ids, ref.ids) and np.array_equal(smp.void, ref.void) and smp.n_particles == n
+        par = list(L._chunk_pairs(chunks_b, cp, rp, excl, 12, workers=3))
+        ser = list(L._chunk_pairs(chunks_b, cp, rp, excl, 12, workers=1))
+        assert len(par) == len(ser) == len(chunks_b) and all(
+            len(x[0]) == len(y[0]) and all(np.array_equal(p, q) for p, q in zip(x[0] + x[1], y[0] + y[1]))
+            for x, y in zip(par, ser))
+    # the packed (id << 32 | void) in-place sort, and its fallback when an id needs more than 32 bits mid-way
+    # (separate arrays + stable argsort): both the order of the stable argsort of the arrival order
+    big = [(ids[i:i + 17_000] + (np.uint64(1) << np.uint64(40) if i >= 51_000 else np.uint64(0)), fb[i:i + 17_000])
+           for i in range(0, n, 17_000)]
+    for chunks in (chunks_b, big):
+        got_i, got_v = [], []
+        for c_i, c_v, _n in L._chunk_pairs(chunks, cp, rp, False, 12):
+            got_i += c_i
+            got_v += c_v
+        ref_i, ref_v = np.concatenate(got_i), np.concatenate(got_v)
+        o = np.argsort(ref_i, kind="stable")
+        m = L.void_members(chunks, cp, rp, n_sample=12)
+        assert np.array_equal(m.ids, ref_i[o]) and np.array_equal(m.void, ref_v[o]) and m.ids.dtype == np.uint64
+    # memory: the pool's pairs (12 B each, plus their sort) are what the old path held; the stream holds a chunk's
+    # (15 chunks here; a real snapshot has 12-30 of 8e6 particles)
+    a1 = L.void_members(chunks_a, ca, ra)
+    small = [(ids[i:i + 8_000], fb[i:i + 8_000]) for i in range(0, n, 8_000)]
+    tracemalloc.start()
+    L.link(a1, L.void_members(small, cp, rp, n_sample=12))
+    _c, peak_old = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    tracemalloc.start()
+    L.link_stream([a1], small, cp, rp, n_sample=12, keep_sample=False, workers=1)   # one chunk at a time
+    _c, peak_new = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert peak_new < 0.5 * peak_old, (peak_new, peak_old)
+
+
+def t_link_cache_r_v_key():
+    """2026-10-11 (G3): the link caches are keyed on both catalogues' R_v settings (their r_v_settings record): a
+    changed R_v search rebuilds the link even when the spheres it recorded are the same; a cache without the record
+    (made before it) is rebuilt once; an unchanged one is served."""
+    import config
+    from dtfelib import lagrangian as L
+    import plot_void_fate as F
+    saved = config.CACHE_DIR
+    config.CACHE_DIR = Path(_TMP) / "cache_rv"
+    try:
+        a, b, _c = _fake_ladder()
+        rec = np.array([0.2, 15.0, 128, 2, -0.8])
+        a.r_v_settings, b.r_v_settings = rec, rec.copy()
+        F.census([a, b], SimpleNamespace(sim="SYN-1", ref_snap=-1), "")
+        p = L.link_cache_path(a, b)
+        with np.load(p) as z:
+            assert np.array_equal(z["prog_r_v_settings"], rec) and np.array_equal(z["desc_r_v_settings"], rec)
+            arrays = {k: z[k] for k in z.files}
+        msgs = []
+        reads = b.reads
+        L.cached_link(a, b, log=msgs.append)
+        assert b.reads == reads and not msgs, ("an unchanged cache must be served", msgs)
+        b.r_v_settings = np.array([0.2, 25.0, 128, 2, -0.8])          # the R_v search reaches further: same spheres
+        lk = L.cached_link(a, b, log=msgs.append)
+        assert b.reads == reads + 1, "a link made with other R_v settings must be rebuilt"
+        assert any("other R_v settings" in m for m in msgs), msgs
+        with np.load(p) as z:
+            assert np.array_equal(z["desc_r_v_settings"], b.r_v_settings)
+        assert [L.CLASSES[c] for c in L.classify(lk)["cls"]] == ["survive", "merge", "merge", "split", "vanish"]
+        np.savez(p, **{k: v for k, v in arrays.items() if "r_v_settings" not in k})   # a cache from before the key
+        b.r_v_settings = rec
+        msgs.clear()
+        L.cached_link(a, b, log=msgs.append)
+        assert b.reads == reads + 2 and any("recorded their catalogues' R_v settings" in m for m in msgs), msgs
+        # a catalogue's own record is the key; without one, today's settings (pipeline.r_v_settings)
+        from dtfelib import pipeline
+        assert np.array_equal(L.r_v_record({"r_v_settings": rec}), rec)
+        assert np.array_equal(L.r_v_record({}), pipeline.r_v_settings())
+    finally:
+        config.CACHE_DIR = saved
 
 
 # ---------------------------------------------------------------- the tracker on synthetic merger trees
@@ -568,14 +811,23 @@ def main():
           "main progenitor, chain, thresholds", t_link_classes)
     check("lagrangian: exclusive members (a partition: nearest centre in R_v units, across chunks and the wrap)",
           t_exclusive_members)
+    check("2026-10-11: exclusive members by a running per-particle best == the lexsort of every pair (ties: the lower "
+          "sphere; the pool rule; the chunk index), no lexsort", t_exclusive_running_best)
     check("lagrangian: the combined-snapshot reader (chunks, fractions, members from file == in memory)", t_combined_reader)
     check("plot_void_fate: census classes, the link cache (reuse, rebuild on other voids), chained survival, "
           "figure, table", t_fate_census_script)
     check("lagrangian.void_pool: followed first with R_v, then min(R_v, R_eff) / R_eff / R_v, none left out",
           t_void_pool)
+    check("2026-10-11: membership spheres capped at FATE_MAX_SIGMA smoothing lengths (followed and pool; config's sigma "
+          "by default; R_v untouched; no members beyond the cap; uncapped link caches relinked)", t_membership_cap)
     check("descendant pool (2026-10-11): matter in an unfollowed minimum is 'unresolved', not 'vanish'; matter in no "
           "void vanishes; the followed void preferred; chains end at unfollowed voids; table; version-1 cache "
           "rebuilt", t_pool_unresolved)
+    check("2026-10-11: the streamed link (pool never held) == link(a, void_members(pool)) for two progenitor sets, "
+          "exclusive or not, in worker threads or not; kept followed members == .sample(); "
+          "far lower peak allocation", t_stream_identical)
+    check("2026-10-11 (G3): link caches keyed on both catalogues' R_v settings (changed -> relinked, unrecorded -> "
+          "relinked once, unchanged -> served)", t_link_cache_r_v_key)
     check("plot_void_tracking: tracker on synthetic merger trees (select_tracers, tracer_branches, frozen identity, "
           "the right void per snapshot, skip), figures + bands on log(1+z)", t_tracker_trees)
     check("plot_void_tracking --link particles: the main-progenitor walk, link share, the _particles tag, --exclusive "

@@ -37,8 +37,12 @@ SNAPSHOTS=(99)
 
 # Interpolation grid cells per axis and padding (mean interparticle spacings).
 # Environment-overridable like DATA_ROOT above. The run scripts source this file BEFORE parsing
-# their flags, so precedence is:  -g flag  >  environment  >  the default here.
-GRID_SIZE="${GRID_SIZE:-${DTFE_GRID_SIZE:-1024}}"
+# their flags, so precedence is:  -g flag  >  environment  >  the default here. PADDING's 50 is the PS-DTFE
+# scripts' default; run_dtfe.sh has its own, 15 (complete at z = 0 on TNG50/100/300, 2026-10-12; see there).
+# GRID_SIZE 512 since 2026-10-13: the production grids of both estimators (every thesis grid on the T7, and
+# run_ps_pipeline.sh's and the launcher's default) are 512^3; the 1024 here made a bare driver run a grid 8x the
+# production one (~14 GB per field set, a scratch dir needed) that nothing downstream reads.
+GRID_SIZE="${GRID_SIZE:-${DTFE_GRID_SIZE:-512}}"
 PADDING="${PADDING:-${DTFE_PADDING:-50}}"
 
 # Subdirectory prefix of the snapshot chunks inside the simulation directory.
@@ -178,10 +182,110 @@ run_lock_release() {
     return 0
 }
 
-# ps_checkpoint_dir <output root> [<scratch dir>]: where PS-DTFE keeps the checkpoint of a partitioned run
+# gpu_build_default <repo root> <binary>: 1 when the Makefile built <binary> (./DTFE, ./DTFE-double, ./PS-DTFE,
+# ./PS-DTFE-double) with a GPU backend, else 0 -- the drivers' default for DTFE_METAL / PS_METAL ('auto', 2026-10-13:
+# every production grid ran on the GPU, but a driver run without -m ran on the CPU). The answer is the stamp the
+# Makefile's mode check leaves in the pair's object folder (o, o_d, o_ps, o_ps_d): '.gpu_mode_metal', '_cuda' or
+# '_hip'. The binary itself cannot be asked: '--help' lists --gpu / --ps-gpu in every build and '--version' names no
+# backend. NOT the launcher's rule (python/gui/runspec.py gpu_built: any stamp but '.gpu_mode_off'), on purpose: the
+# CI's 'cudaemu' build emulates the CUDA kernels on the CPU, far slower than the CPU path, so it is no GPU here (-m
+# still switches it on). No object folder (binaries copied without their build) = 0. A stale stamp (a binary put
+# back by install_lib.sh after a failed rebuild in another mode) costs nothing: '--gpu' on a CPU build falls back to
+# the CPU with a warning, and the CPU on a GPU build is slower, not different.
+gpu_build_default() {
+    local root="$1" obj m
+    case "${2##*/}" in
+        DTFE) obj=o ;;
+        DTFE-double) obj=o_d ;;
+        PS-DTFE) obj=o_ps ;;
+        PS-DTFE-double) obj=o_ps_d ;;
+        *) echo 0; return 0 ;;
+    esac
+    for m in metal cuda hip; do
+        [ -e "${root}/${obj}/.gpu_mode_${m}" ] && { echo 1; return 0; }
+    done
+    echo 0
+}
+
+# ---- a rerun's left-over files (2026-10-13, audit finding 7) -------------------------------------------------
+# The binary replaces its outputs as a set (output_staging.h: '<file>.part.<pid>' renamed into place only once all
+# are written), but it never removed what an EARLIER run with the same prefix wrote and this one does not: a rerun
+# without the image plane, the caustics or the T-web left the old '.pts_*', '.caustic*' or '.a_tweb*' beside the new
+# grids, a mixed set that read as one run (the README promised a folder never holds a mix). Now the drivers, after a
+# run that EXITED 0, move every '<prefix>.*' file the run did not write into '<prefix>.superseded/<stamp>/' beside
+# them -- moved, never deleted -- with a copy of the old run's log, so the moved files keep their provenance.
+# 'Did not write': the file existed before the run with the same inode (the binary renames every output into place,
+# so a written file is a new inode) AND is not newer than the run's start (the one output written in place, a
+# thread's '.badGridPoints<n>', keeps its inode but not its time). A failed, stopped or killed run moves nothing:
+# the old set stays complete, as the run-log contract keeps its log. Neither a dry run nor an auto-tune report
+# writes anything, so neither moves anything. Not moved: the run's own bookkeeping ('<prefix>.runlog' and every
+# '<prefix>.runlog.*': the failed / partial log, the lock, the progress sidecar, a PS checkpoint), the launcher's
+# settings sidecar '<prefix>.gui.json' and the binary's own '<file>.part.<pid>' (output_staging.h handles those).
+# The launcher's Runs browser does not see the folder (it reads '<snapdir>/<prefix>.runlog*' and only the FILES
+# '<prefix>.*' as a run's outputs).
+#
+# supersede_snapshot <output root>: what a run may later supersede, recorded BEFORE it starts -- one line
+# '<inode> <name>' per candidate file (stdout); the caller keeps the text and passes it back afterwards.
+supersede_snapshot() {
+    local root="$1" f n ino
+    for f in "${root}".*; do
+        [ -f "${f}" ] && [ ! -L "${f}" ] || continue        # files only: '.superseded/', '.runlog.lock/' are folders
+        n="${f##*/}"
+        case "${n#"${root##*/}"}" in
+            .runlog|.runlog.*|.gui.json|*.part.[0-9]*) continue ;;
+        esac
+        ino="$(ls -id -- "${f}" 2>/dev/null | awk '{ print $1 }')"
+        [[ "${ino}" =~ ^[0-9]+$ ]] || continue
+        printf '%s %s\n' "${ino}" "${n}"
+    done
+    return 0
+}
+# supersede_extras <output root> <recorded list> <run start marker file> <saved old runlog or ''>: after a run that
+# exited 0, moves each recorded file the run did not write (same inode, not newer than the marker) into
+# '<root>.superseded/<YYYY-MM-DD_HHMMSS>/' (the marker's time; '-<pid>' added when that folder exists), with the
+# saved old log as '<prefix>.runlog' there. Prints one line per move and a summary; a failed move is said and left
+# (the run itself succeeded). Never deletes, never overwrites ('mv -n', checked). Returns 0.
+supersede_extras() {
+    local root="$1" list="$2" marker="$3" oldlog="$4" dir pfx line ino n f now dest moved=0 failed=0
+    [ -n "${list}" ] || return 0
+    dir="${root%/*}"; pfx="${root##*/}"
+    while IFS= read -r line; do
+        [ -n "${line}" ] || continue
+        ino="${line%% *}"; n="${line#* }"; f="${dir}/${n}"
+        [ -f "${f}" ] || continue                                  # gone (the binary removed it): nothing to do
+        now="$(ls -id -- "${f}" 2>/dev/null | awk '{ print $1 }')"
+        [ "${now}" = "${ino}" ] || continue                        # a new inode: this run wrote it
+        [ -n "${marker}" ] && [ "${f}" -nt "${marker}" ] && continue   # rewritten in place by this run
+        if [ -z "${dest:-}" ]; then
+            dest="${root}.superseded/$(date -r "${marker}" '+%Y-%m-%d_%H%M%S' 2>/dev/null || date '+%Y-%m-%d_%H%M%S')"
+            [ -e "${dest}" ] && dest="${dest}-$$"
+            if ! mkdir -p "${dest}"; then
+                echo "  Warning: cannot create '${dest}': the earlier run's files this run did not write stay beside the new grids" >&2
+                return 0
+            fi
+        fi
+        if [ -e "${dest}/${n}" ] || ! mv -n "${f}" "${dest}/${n}" || [ -e "${f}" ]; then
+            echo "  Warning: could not move '${n}' into ${dest} (left in place)" >&2
+            failed=$((failed + 1)); continue
+        fi
+        echo "  Superseded: ${n} (an earlier run's; this run did not write it)"
+        moved=$((moved + 1))
+    done <<< "${list}"
+    if [ "${moved}" -gt 0 ] && [ -n "${oldlog}" ] && [ -f "${oldlog}" ] && [ ! -e "${dest}/${pfx}.runlog" ]; then
+        cp -p "${oldlog}" "${dest}/${pfx}.runlog" 2>/dev/null || true
+    fi
+    if [ "${moved}" -gt 0 ]; then
+        echo "  ${moved} file(s) of an earlier run with this prefix moved to ${dest} (nothing deleted; its run log copied there)"
+    fi
+    [ -n "${dest:-}" ] && [ "${moved}" -eq 0 ] && rmdir "${dest}" "${root}.superseded" 2>/dev/null
+    return 0
+}
+
+# ps_checkpoint_dir <output root> [<scratch dir>]: where PS-DTFE -- and since 2026-10-13 standard DTFE, by the same
+# rule -- keeps the checkpoint of a partitioned run
 # (2026-10-11, src/partition_checkpoint.h directoryFor -- keep the two in step): '<output>.runlog.checkpoint'
 # beside the outputs, or with a scratch dir '<scratch>/<basename>.<FNV-1a 64 of the absolute output path, 16
-# hex>.runlog.checkpoint'. run_ps_dtfe.sh passes '--resume' when its 'checkpoint' file exists. The absolute path is the one the
+# hex>.runlog.checkpoint'. run_ps_dtfe.sh and run_dtfe.sh pass '--resume' when its 'checkpoint' file exists. The absolute path is the one the
 # binary sees: a relative output is taken from the physical current directory (getcwd, so 'pwd -P').
 ps_checkpoint_dir() {
     local out="$1" scratch="${2:-}"

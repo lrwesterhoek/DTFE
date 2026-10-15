@@ -10,7 +10,7 @@
    tests/dtfe_metal_check.sh and metal/validate_deposit.cpp (Metal; the CUDA/HIP port is
    compiled and fallback-tested on Linux, not yet validated on hardware).
 
-   This header is self-contained (no DTFE/CGAL/backend includes). */
+   This header is self-contained (no DTFE/CGAL/backend includes; ps_deposit_params.h is plain C++). */
 
 #ifndef GPU_HOST_HEADER
 #define GPU_HOST_HEADER
@@ -19,6 +19,8 @@
 #include <cstddef>
 #include <string>
 #include <vector>
+
+#include "ps_deposit_params.h"   // PSFxGrid / PSFixedUnits: the moment grids' fixed-point words (2026-10-14)
 
 // Name of the backend compiled into this binary ("Metal", "CUDA" or "HIP").
 std::string gpuBackendName();
@@ -34,7 +36,16 @@ std::string gpuDeviceName();
 // streams are always produced.
 struct PSGpuGrids
 {
-    std::vector<float>    mass;     // subTotal      accumulated MASS (density = mass / cellVolume)
+    // The MASS grid (density = mass / cellVolume), in one of two forms (2026-10-12):
+    //   massScale > 0  'massFx' holds each cell's exact 64-bit fixed-point sum in units of 1/massScale (the
+    //                  kernels' own words, handed over unconverted) and 'mass' stays EMPTY. The caller adds the
+    //                  GPU-deferred and released tetrahedra into the same integers and converts to float once
+    //                  (ps_interpolation.cc), so no deposit after the kernel rounds a share away.
+    //   massScale = 0  the float grid in 'mass' (PS_METAL_FLOAT_MASS=1 / PS_GPU_FLOAT_MASS=1, kept for A/B, or a
+    //                  total mass that gives no usable unit) and 'massFx' stays EMPTY.
+    std::vector<float>    mass;     // subTotal      accumulated MASS (float form; see above)
+    std::vector<int64_t>  massFx;   // subTotal      accumulated MASS (fixed-point form; see above)
+    float                 massScale = 0.f;
     std::vector<float>    mom;      // subTotal*3    weighted velocity moment  [i*3+j]   (fVel)
     std::vector<float>    m2;       // subTotal*6    weighted 2nd moment, upper triangle [i*6+c] (fDisp)
     std::vector<float>    grad;     // subTotal*9    weighted velocity-gradient moment [i*9+j*3+i'] (fGrad)
@@ -46,6 +57,17 @@ struct PSGpuGrids
     std::vector<float>    streamvol;// subTotal      exact cell-mean multiplicity sum(V_int)/V_cell (fExact; else EMPTY). 'streams' then carries the raw integer tet-touch count.
     std::vector<float>    scal;     // subTotal      scalar moment sum(wm s), one component (fScal; else EMPTY)
     std::vector<float>    sgrad;    // subTotal*3    scalar-gradient moment sum(wm ds/dx_i) [i*3+d] (fSGrad; else EMPTY)
+    // The moment grids as exact fixed-point sums (2026-10-14, PSFxGrid in ps_deposit_params.h): fxScale[g] > 0 =
+    // grid g came back as the kernels' 64-bit words in fx[g] (subTotal x its components, the float vector's
+    // layout), in units of 1/fxScale[g], and its float vector above stays EMPTY -- the caller adds the deferred
+    // and released tetrahedra into the same integers and converts once, as for the mass. 0 = the float vector.
+    // dispwIsMass: the kernel did not deposit 'dispw' (the fixed mass grid sums the same shares): read massFx.
+    std::vector<int64_t>  fx[PS_FX_N];
+    float                 fxScale[PS_FX_N] = {};
+    bool                  dispwIsMass = false;
+    // PS_MASS_AUDIT=1 (ps_mass_audit.h) only, else -1: the fixed-point mass grid's exact total and the
+    // (float) masses of the tets the kernel deferred, summed by the host before it converts/frees them
+    double auditFixedTotal = -1., auditDeferredMass = -1.;
 };
 
 // Runs the mass-conserving tetrahedral deposit on the default GPU device. 'verts' holds one
@@ -80,6 +102,12 @@ struct PSGpuGrids
 // windowMode (--ps-window): the sub-box is a window of the full grid, not a partition's own box --
 // every sample / clipped piece of a tet is counted for its normalization as in the full run, only
 // those inside the sub-box are deposited.
+// massExtra (2026-10-12): the mass the caller adds to the mass grid itself on top of 'masses' (the
+// --ps-halo-release centroid deposits); the fixed-point unit (psMassFixedScale) is set from sum(masses) +
+// massExtra, so the caller's own integer adds cannot overflow a cell. The deferred tets are part of 'masses'.
+// fxUnits (2026-10-14): the units of the moment grids, chosen by the caller from bounds that cover its own adds
+// too (the deferred and released tets): a grid with scale > 0 is deposited as an exact fixed-point sum and
+// handed back as words (out.fx), the rest as float atomics; sumW makes the exact items' weight totals exact.
 // Returns false with 'err' set if there is no device / setup fails; outputs untouched in
 // that case, zeroed otherwise.
 // CONSUMES verts/vels/masses/dens/scal (several GB per partition at scale): the backend frees each one
@@ -95,6 +123,7 @@ bool psGpuDepositFields(std::vector<float>& verts,   // nTet*PS_TET_STRIDE: the 
                         int nSub, bool periodic,
                         bool fVel, bool fDisp, bool fGrad, bool fLinear,
                         bool fVolW, bool fCaustic, bool fExact, bool fScal, bool fSGrad, bool windowMode,
+                        double massExtra, PSFixedUnits const& fxUnits,
                         PSGpuGrids& out, std::vector<uint32_t>& deferred, std::string& err);
 
 
@@ -129,6 +158,12 @@ struct DTFEGpuGrids
 // deposits the linear interpolant's integral over each piece; 'cnts' then only marks the
 // single-cell tetrahedra (0), which take the centroid fast path as on the CPU. Matches the CPU's
 // double-precision r3d to float rounding.
+// Since 2026-10-13 the device sums every grid as an exact 64-bit fixed-point integer per cell (dtfe_gpu_fixed.h
+// sets the units from a bound of the batch's shares; metal/dtfe_deposit.metal's header says how the kernels keep
+// the sum independent of the order their threads add in) and the host converts each cell to these floats once,
+// so two runs give byte-identical grids (DTFE_METAL_FLOAT_GRIDS=1 / DTFE_GPU_FLOAT_GRIDS=1 keep the float atomics
+// for A/B). A failed command buffer / kernel resumes from the batch's last checkpoint, the PS deposit's policy
+// (gpu_metal_retry.h / gpu_cuda_retry.cuh); a false return after the upload means that policy gave up.
 bool dtfeGpuDepositAveraged1(std::vector<float>& verts,      // nTet*12: 4 vertices, region-relative
                              std::vector<float>& dens,       // nTet*4:  vertex densities
                              std::vector<float>& vels,       // nTet*12: 4 vertex velocities (empty if unused)
@@ -154,7 +189,9 @@ bool dtfeGpuDepositAveraged1(std::vector<float>& verts,      // nTet*12: 4 verti
 // the CPU (or via the per-call path) into its own sub-grid, and the final merge ADDS the GPU
 // grids into the main grid -- a cell is non-zero in exactly one of the two.
 // Result gives read pointers (accumulated value*volume, full-grid layout; a pointer is null for
-// a field not requested) that stay valid until End; End frees the GPU grids.
+// a field not requested) that stay valid until End; End frees the GPU grids. The shared grid keeps the float
+// atomic sums (2026-10-13: its one unit would have to suit every batch, which no batch's bound sets), and a
+// failed buffer restarts its batch from the zeroed owner box, without periodic checkpoints.
 bool dtfeGpuSharedBegin(const size_t fullGrid[3], bool fDen, bool fVel, bool fGrad, bool fScal, bool fSGrad, std::string& err);
 bool dtfeGpuSharedActive();
 bool dtfeGpuSharedDeposit(std::vector<float>& verts, std::vector<float>& dens, std::vector<float>& vels,

@@ -25,14 +25,25 @@ PANELS = ("density", "sheet", "streams")
 
 
 def load_planes(prefix: Path, side: dict):
-    shape = (side["planes"], side["nv"], side["nu"])
+    """(density, streams), each (planes, nv, nu). A plane made with --supersample K holds KxK sub-samples per pixel
+    (make_image_plane.py writes planes x nv*K x nu*K points): the density is averaged over each block, the pixel-area
+    mean dtfelib.io.PointPlane makes too; the stream count, a whole number, takes the block's largest. 2026-10-11:
+    the K was ignored, so every K > 1 plane died here with 'wrong --plane or --prefix?'."""
+    k = int(side.get("supersample", 1))
+    planes, nv, nu = int(side["planes"]), int(side["nv"]), int(side["nu"])
+    shape = (planes, nv * k, nu * k)
     n = shape[0] * shape[1] * shape[2]
     den = np.fromfile(f"{prefix}.pts_den", dtype=np.float64)
     streams = np.fromfile(f"{prefix}.pts_streams", dtype=np.int32)
     if den.size != n or streams.size != n:
         raise SystemExit(f"{prefix}.pts_* hold {den.size}/{streams.size} points, but the "
-                         f"sidecar describes {n} ({shape}); wrong --plane or --prefix?")
-    return den.reshape(shape), streams.reshape(shape)
+                         f"sidecar describes {n} ({shape}{f', {k}x{k} sub-samples per pixel' if k > 1 else ''}); "
+                         f"wrong --plane or --prefix?")
+    den, streams = den.reshape(shape), streams.reshape(shape)
+    if k > 1:
+        den = den.reshape(planes, nv, k, nu, k).mean(axis=(2, 4))
+        streams = streams.reshape(planes, nv, k, nu, k).max(axis=(2, 4))
+    return den, streams
 
 
 def stream_cmap_norm(smax: int):
@@ -109,7 +120,9 @@ def main() -> None:
                 rgba = cmap(LogNorm(vmin=vmin, vmax=vmax)(np.clip(proj, vmin, vmax)), bytes=True)
             out = base if (len(panels) == 1 and args.output) else \
                 base.with_name(f"{base.stem}_{name}{base.suffix}")
-            plt.imsave(out, rgba[::-1])          # flip: same origin='lower' as the figure
+            # flip: same origin='lower' as the figure. A COPY: matplotlib < 3.9 hands the reversed view to PIL,
+            # which refuses a non-C-contiguous array (every --image run failed there, 2026-10-11; CI's numpy 1.26 set)
+            plt.imsave(out, np.ascontiguousarray(rgba[::-1]))
             print(f"wrote {out}  ({side['nu']} x {side['nv']} px, pixel-exact, no decorations)")
         return
 

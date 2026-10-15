@@ -5,6 +5,13 @@ simulation- and snapshot-agnostic. Snapshots without fields on disk are skipped.
 
     python3 plot/plot_velDiv_den.py                    # all snapshots, TNG50-4-Dark, auto method
     python3 plot/plot_velDiv_den.py --method dtfe --snap 99
+
+PS-DTFE grids (2026-10-13): the divergence is the MEAN FIELD div<v> by default -- the FFT divergence of the PS
+velocity grid (FieldSet.load('divergence', mean_field=True)), the quantity standard DTFE stores and linear theory
+predicts (theta = -a H f delta for the mean flow). The binary's own PS grid is the stream average of each stream's
+divergence <div v>, whose box mean is +40 km/s/Mpc at TNG100-3-Dark z=1 from multi-stream cells (dtfelib/io.py, the
+note above FIELDS), which the through-origin fit below cannot absorb; '--ps-gradient stored' still uses it. The
+summary file names which one a PS run used.
 """
 
 import _bootstrap  # noqa: F401  (puts python/ on sys.path)
@@ -16,7 +23,7 @@ import matplotlib.colors as colors
 from scipy.stats import pearsonr
 from dtfelib import fields as dtfe
 from dtfelib.figures import save_plot_to_multiple_paths
-from dtfelib import FieldSet, make_parser, sim_dir
+from dtfelib import FieldSet, make_parser, sim_dir, add_ps_gradient_arg, mean_field_wanted
 import config
 from dtfelib import figures as style
 
@@ -205,6 +212,13 @@ def create_residual_plot(residual_slice, slice_dim, box_size, residual_norm, red
     save_plot_to_multiple_paths(fig, filepath, dpi=DPI, bbox_inches='tight', facecolor='white')
     plt.close(fig)
 
+def _ps_divergence_source(args):
+    """Which divergence a PS-DTFE run of this script uses, for the log and the summary file."""
+    if mean_field_wanted(args):
+        return "mean field div<v> (FFT divergence of the velocity grid; --ps-gradient mean-field)"
+    return "stored stream average <div v> (the binary's grid; --ps-gradient stored)"
+
+
 def process_snapshot(snapshot, redshift, args):
     print(f"\nProcessing snapshot {snapshot} (z={redshift:.2f})")
 
@@ -223,10 +237,14 @@ def process_snapshot(snapshot, redshift, args):
         style.note_source(fs)                       # the thesis mirror takes the thesis box's standard DTFE only
         print("Loading fields")
         density_field = fs.density(units='mean')   # rho/rho_bar for BOTH methods
-        velDiv_field = fs.load('divergence')
+        # the mean-field div<v> for BOTH methods by default: standard DTFE's stored grid, PS's computed from its
+        # velocity grid (module docstring); '--ps-gradient stored' reads PS's stream-averaged grid instead
+        velDiv_field = fs.load('divergence', mean_field=mean_field_wanted(args))
+        if fs.method == 'ps':
+            print(f"  PS divergence: {_ps_divergence_source(args)}")
     except FileNotFoundError as e:
         print(f"skipping snapshot {snapshot} (no {args.method} fields): {e}")
-        return
+        return None
 
     box_size = fs.meta.box_mpc
 
@@ -300,6 +318,11 @@ def process_snapshot(snapshot, redshift, args):
         with open(summary_file, 'w') as f:
             f.write(f"Velocity Divergence-Density Analysis Summary\n")
             f.write(f"Snapshot: {snapshot}, Redshift: {redshift:.2f}\n")
+            # what the numbers were made from: the folder is shared by every simulation and estimator
+            f.write(f"Simulation: {args.sim}, estimator: {fs.method}, grids: {fs.prefix.rstrip('.')}*"
+                    f"{', raw' if args.raw else ''}\n")
+            if fs.method == 'ps':                   # (a standard-DTFE summary is unchanged: its grid is the mean field)
+                f.write(f"Divergence: {_ps_divergence_source(args)}\n")
             f.write(f"{'='*50}\n\n")
             f.write(f"Cosmological Parameters:\n")
             f.write(f"  Scale factor a = {a_scale:.4f}\n")
@@ -318,49 +341,32 @@ def process_snapshot(snapshot, redshift, args):
             f.write(f"  Residual range: [{np.min(residual_slice_stats):.1f}, {np.max(residual_slice_stats):.1f}] km/s/Mpc\n")
         
         print(f"Completed snapshot {snapshot}")
-        
+        # this snapshot's numbers for the evolution summary, at the precision its summary file carries (the
+        # summary was rebuilt from those files before 2026-10-11: the same figures and table for the same run)
+        return {"redshift": redshift, "theory": float(f"{slope_theory:.2f}"), "measured": float(f"{slope_reg:.2f}"),
+                "diff": float(f"{(slope_reg - slope_theory) / slope_theory * 100:.1f}"),
+                "pearson_r": float(f"{pearson_r:.4f}"), "rms": float(f"{residual_rms:.2f}")}
+
     except Exception as e:
         print(f"Error processing snapshot {snapshot}: {str(e)}")
         import traceback
         traceback.print_exc()
+        return None
 
-def create_evolution_summary():
+def create_evolution_summary(results):
+    """The redshift evolution from THIS run's snapshots (process_snapshot's numbers). 2026-10-11: it re-read every
+    snapshot_*/analysis_summary_z*.txt of the config ladder in a folder shared by all simulations and estimators, so
+    a snapshot this run skipped (no grids) or another simulation's older run filled in points of another box."""
     print("\nCreating evolution summary")
-    
-    redshifts = []
-    theoretical_slopes = []
-    measured_slopes = []
-    differences = []
-    pearson_rs = []
-    residual_rmss = []
+
+    redshifts = [r["redshift"] for r in results]
+    theoretical_slopes = [r["theory"] for r in results]
+    measured_slopes = [r["measured"] for r in results]
+    differences = [r["diff"] for r in results]
+    pearson_rs = [r["pearson_r"] for r in results]
+    residual_rmss = [r["rms"] for r in results]
 
     output_path = Path(OUTPUT_DIR)
-
-    import re
-    for snapshot, redshift in SNAPSHOT_TO_REDSHIFT.items():
-        summary_file = output_path / f'snapshot_{snapshot}_z{redshift:.2f}' / f'analysis_summary_z{redshift:.2f}.txt'
-
-        if summary_file.exists():
-            try:
-                with open(summary_file, 'r') as f:
-                    content = f.read()
-
-                theory_match = re.search(r'Theoretical slope = ([-\d.]+) km/s/Mpc', content)
-                linear_match = re.search(r'Linear regime slope = ([-\d.]+) km/s/Mpc', content)
-                diff_match = re.search(r'Difference from theory = ([-\d.]+)%', content)
-                r_match = re.search(r'Linear-regime Pearson r = ([-\d.]+)', content)
-                rms_match = re.search(r'Residual RMS \(linear regime\) = ([-\d.]+)', content)
-
-                if theory_match and linear_match and diff_match:
-                    redshifts.append(redshift)
-                    theoretical_slopes.append(float(theory_match.group(1)))
-                    measured_slopes.append(float(linear_match.group(1)))
-                    differences.append(float(diff_match.group(1)))
-                    pearson_rs.append(float(r_match.group(1)) if r_match else np.nan)
-                    residual_rmss.append(float(rms_match.group(1)) if rms_match else np.nan)
-
-            except Exception as e:
-                print(f"  Warning: Could not read summary for z={redshift:.2f}: {e}")
 
     if len(redshifts) > 0:
         sorted_idx = np.argsort(redshifts)
@@ -427,6 +433,7 @@ def main():
     # this script iterates ALL snapshots by default; --snap restricts to one.
     # --smooth defaults to the configured raw-maps sigma (behavior-preserving).
     parser.set_defaults(snap=None, smooth=SMOOTHING_SIGMA)
+    add_ps_gradient_arg(parser)
     args = parser.parse_args()
 
     snapshot_items = list(SNAPSHOT_TO_REDSHIFT.items())
@@ -439,20 +446,23 @@ def main():
     print(f"Starting velocity divergence-density analysis")
     print(f"Processing {len(snapshot_items)} snapshots")
 
-    processed_count = 0
+    results = []
     failed_snapshots = []
 
     for snapshot, redshift in snapshot_items:
         try:
-            process_snapshot(snapshot, redshift, args)
-            processed_count += 1
+            r = process_snapshot(snapshot, redshift, args)
         except Exception as e:
             print(f"Failed to process snapshot {snapshot} (z={redshift:.2f}): {str(e)}")
             failed_snapshots.append((snapshot, redshift))
+            continue
+        if r is not None:                       # a skipped snapshot (no grids) or a failed one is not processed
+            results.append(r)
+    processed_count = len(results)
 
     if processed_count > 1:
         try:
-            create_evolution_summary()
+            create_evolution_summary(results)
         except Exception as e:
             print(f"Failed to create evolution summary: {str(e)}")
 

@@ -150,13 +150,17 @@ def profile_grids(grids: dict, centers_frac, r_eff_cells, bins=DEFAULT_BINS, m: 
         out["single"] = np.full((len(r_eff), len(bins)), np.nan)
     if not len(r_eff):
         return out
+    if single is not None:
+        # converted ONCE (2026-10-11): inside the bin loop it was a fresh 512 MB float32 copy of a 512^3 mask per bin
+        # (30 bins); the ngp gather reads the same values either way
+        single = np.asarray(single).astype(np.float32)
     for j, x in enumerate(bins):
         radii = x * r_eff
         out["density"][:, j] = shell_means(grids["density"], centers, radii, dirs)
         if vel is not None:
             out["v_r"][:, j] = shell_means(vel, centers, radii, dirs, radial=True)
         if single is not None:
-            out["single"][:, j] = shell_means(single.astype(np.float32), centers, radii, dirs, mode="ngp")
+            out["single"][:, j] = shell_means(single, centers, radii, dirs, mode="ngp")
     return out
 
 

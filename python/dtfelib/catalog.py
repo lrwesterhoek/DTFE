@@ -61,7 +61,7 @@ COLUMNS = (
     ("b_mpc", "Mpc", "ellipsoid semi-axis, middle"),
     ("c_mpc", "Mpc", "ellipsoid semi-axis, smallest"),
     ("r_eff_mpc", "Mpc", "effective radius (a b c)^(1/3)"),
-    ("r_v_mpc", "Mpc", "MEASURED void radius: where the spherically averaged smoothed delta around the minimum first rises to 0 (NaN without a crossing within 15 sigma / half the box; ~0.57 R_eff)"),
+    ("r_v_mpc", "Mpc", "MEASURED void radius: where the spherically averaged smoothed delta around the minimum first rises to 0 (NaN without a crossing within r_v_max_sigma (24 since 2026-10-11) / half the box; ~0.57 R_eff)"),
     ("r_v_delta08_mpc", "Mpc", "radius where the ENCLOSED smoothed density contrast Delta(<R) first reaches -0.8 going outward (r_v_delta08 in the header; NaN when the minimum is not below it or it is not reached within the search range)"),
     ("r_v_ridge_mpc", "Mpc", "radius of the maximum of the spherically averaged smoothed delta (the compensation ridge) within the R_v search range (NaN when the maximum is the outermost shell)"),
     ("distinct", "0/1", "well resolved, with an R_v, and no deeper well-resolved void holds its centre inside the sphere of min(R_v, R_eff) that void claims (deepest first; a void without R_v claims its R_eff but is never flagged): the profile / abundance sample"),

@@ -93,6 +93,30 @@ def make_parser(description: str = "") -> argparse.ArgumentParser:
     return p
 
 
+# The PS-DTFE velocity-gradient family a figure script uses (2026-10-13): the scripts that set PS beside standard DTFE
+# or linear theory -- plot_velDiv_den, plot_cosmic_web, plot_web_streams, plot_shear_triaxial, plot_DTFE,
+# plot_halo_tracking -- read PS's divergence / shear / vorticity / gradient / V-web as the MEAN FIELD by default,
+# the quantity standard DTFE stores (FieldSet.load(name, mean_field=True); dtfelib/fields.py), and '--ps-gradient
+# stored' gives back the binary's PS grids, the stream average <grad v>. Standard-DTFE grids are read as stored
+# either way (they are the mean field).
+PS_GRADIENT_CHOICES = ("mean-field", "stored")
+
+
+def add_ps_gradient_arg(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """Register '--ps-gradient {mean-field,stored}' (default mean-field) on a script's parser; returns it."""
+    parser.add_argument("--ps-gradient", choices=PS_GRADIENT_CHOICES, default="mean-field",
+                        help="PS-DTFE grids only: which velocity-gradient family to use for PS -- 'mean-field' "
+                             "(default): the derivatives of the PS velocity grid, grad<v>, the quantity standard "
+                             "DTFE stores, computed by FFT; 'stored': the binary's PS grids, the stream average "
+                             "<grad v> of each stream's own gradient. Standard-DTFE grids are always read as stored.")
+    return parser
+
+
+def mean_field_wanted(args) -> bool:
+    """True unless the script was run with '--ps-gradient stored' (a parser without the flag: True)."""
+    return getattr(args, "ps_gradient", "mean-field") != "stored"
+
+
 def snapdir(args) -> Path:
     return sim_dir(args.sim, args.data_root) / f"snapdir_{args.snap:03d}"
 

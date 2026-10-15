@@ -2,7 +2,8 @@
 abundance and the stacked profiles properties of the voids, or of the grid, the particle mass, the field estimator?
 
 Three rows per redshift (dtfelib.convergence holds the machinery; every definition is the pipeline's: minima,
-ellipsoid gate, crossing R_v, the distinct sample of catalog.distinct_mask, profiles.profile_grids / stack):
+the void gate of DTFE_VOID_GATE (none in the thesis recipe: rows (a) and (b) are R_v statistics), crossing R_v, the
+distinct sample of catalog.distinct_mask, profiles.profile_grids / stack):
 
   (a) GRID      the snapshot's density grid block-averaged by --factors (512^3 -> 256^3, 128^3: exactly the cell
                 average a coarser deposit gives), voids found at the SAME sigma in Mpc (the footprint following it),
@@ -10,8 +11,9 @@ ellipsoid gate, crossing R_v, the distinct sample of catalog.distinct_mask, prof
                 coarse / native of the matched voids, their centre offset, the fractions unmatched both ways, the
                 abundance dn/dlnR_v and the stacked density in r / R_v (R_v in --rv-range smoothing lengths)
   (b) MASS      TNG50-3 / TNG100-3 / TNG300-3 at one common sigma (plot_void_crossbox.py's per-box .npz files, read
-                only; --crossbox-dir, --crossbox-smooth-mpc): dn/dlnR_v, the median R_v against z and the stacked
-                density at z. Different initial conditions: a comparison of distributions, cosmic variance included
+                only, those of this run's gate; --crossbox-dir, --crossbox-smooth-mpc): dn/dlnR_v, the median R_v
+                against z and the stacked density at z. Different initial conditions: a comparison of distributions,
+                cosmic variance included
   (c) ESTIMATOR DTFE against PS-DTFE on the same snapshot (output.* AND ps_output.* grids), void by void: R_v ratio
                 DTFE / PS-DTFE, central delta of both, abundance; and a per-void table (txt)
 A panel that cannot be drawn (no crossbox products, no snapshot with both estimators' grids) says so on the figure
@@ -51,7 +53,7 @@ FIGURE_ROOT = Path(config.LOCAL_FIGURES_ROOT) / "void_convergence"
 CROSSBOX_ROOT = Path(config.LOCAL_FIGURES_ROOT) / "void_crossbox"
 DEFAULT_Z = (0.0, 1.0)
 DEFAULT_RV_RANGE = (2.5, 5.0)        # the stacks' R_v range in smoothing lengths (plot_void_crossbox's)
-CROSSBOX_SIGMA_MPC = 2.1625          # plot_void_crossbox.DEFAULT_SIGMA_MPC
+CROSSBOX_SIGMA_MPC = config.CROSSBOX_SMOOTHING_MPC          # plot_void_crossbox.DEFAULT_SIGMA_MPC
 Z_TOLERANCE = 0.05
 PER_VOLUME = 1.0e6                   # densities per (100 Mpc)^3
 
@@ -164,18 +166,23 @@ def estimator_table(est, path):
 
 
 def load_crossbox(args):
-    """(b): the crossbox per-box results at the common sigma; [] (said) when none is there."""
+    """(b): the crossbox per-box results at the common sigma UNDER THIS PROCESS'S VOID GATE (plot_void_crossbox's own
+    file tag, sigma_tag: '_gatenone' under DTFE_VOID_GATE=none); [] (said) when none is there. 2026-10-11 (review):
+    the glob was the gated name only, so an ungated run found no files and row (b) was lost -- the thesis recipe ran
+    the whole check gated for it, though rows (a) and (b) are R_v statistics, which the thesis takes ungated."""
     import plot_void_crossbox as cb
     d = Path(args.crossbox_dir).expanduser()
+    tag = cb.sigma_tag(args.crossbox_smooth_mpc)
     out = []
-    for p in sorted(d.glob(f"crossbox_*_{args.method}_s{float(args.crossbox_smooth_mpc):.6g}Mpc.npz")):
+    for p in sorted(d.glob(f"crossbox_*_{args.method}_{tag}.npz")):
         try:
             out.append(cb.load(p))
         except (OSError, ValueError, KeyError) as e:
             print(f"  crossbox: {p.name} unreadable ({e}), left out")
     if not out:
-        print(f"  crossbox: no per-box products in {d} at sigma {args.crossbox_smooth_mpc:g} Mpc: row (b) not drawn "
-              f"(run plot_void_crossbox.py first, or give --crossbox-dir)")
+        print(f"  crossbox: no per-box products in {d} at sigma {args.crossbox_smooth_mpc:g} Mpc under the "
+              f"{pipeline.void_gate()} gate (*_{tag}.npz): row (b) not drawn (run plot_void_crossbox.py first with the "
+              f"same DTFE_VOID_GATE, or give --crossbox-dir)")
     return out
 
 

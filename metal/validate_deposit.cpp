@@ -147,7 +147,7 @@ static void cpuDeposit(const std::vector<float>& verts, const std::vector<float>
         for(int dd=0;dd<3;++dd){
             iMin[dd]=int(std::floor((lo[dd]-P.boxLo[dd])/P.dx[dd]));
             iMax[dd]=int(std::floor((hi[dd]-P.boxLo[dd])/P.dx[dd]))+1;
-            if(nSub>1){iMin[dd]-=1;iMax[dd]+=1;}
+            // no sample margin (2026-10-11, as the kernel): every sub-sample lies inside its own cell
             if(!P.periodic && (std::max(iMin[dd],0)>=P.nGrid[dd] || std::min(iMax[dd],P.nGrid[dd])<=0)) beyond=true;
         }
         if(beyond) continue;
@@ -338,9 +338,13 @@ struct Gpu {
             e->setBuffer(bSV,0,12); e->setBuffer(bDV,0,13); e->setBuffer(bDW,0,14);
             e->setBuffer(bSc,0,18); e->setBuffer(bScal,0,19); e->setBuffer(bSG,0,20);
             e->setBuffer(bMassFx,0,21);
+            // the moment grids' fixed-point views (2026-10-14; unused while P.fxMask is 0, bound like the kernel's host)
+            e->setBuffer(bMom,0,22); e->setBuffer(bM2,0,23); e->setBuffer(bG,0,24); e->setBuffer(bW,0,25);
+            e->setBuffer(bSV,0,26); e->setBuffer(bDV,0,27); e->setBuffer(bScal,0,28); e->setBuffer(bSG,0,29);
             if(bI){
                 uint32_t const IP[4]={uint32_t(nThreads),phase,itemCells,0u};
                 e->setBuffer(bI,0,15); e->setBuffer(bSW,0,16); e->setBytes(IP,sizeof IP,17);
+                e->setBuffer(bSW,0,30);
             }
             NS::UInteger tg=pso->maxTotalThreadsPerThreadgroup(); if(tg>256)tg=256;
             if(nThreads) e->dispatchThreads(MTL::Size(nThreads,1,1),MTL::Size(tg,1,1));
@@ -445,6 +449,9 @@ static void makeParams(DepositParams& P,int n,float box,int nSub,int periodic){
     P.nSub=nSub;P.periodic=periodic;P.fVel=1;P.fDisp=1;P.fGrad=1;P.fLinear=0;P.fVolW=0;P.fCaustic=0;P.fExact=0;P.nTet=0;
     P.fScal=0;P.fSGrad=0;   // the scalar buffers (18-20) are bound as dummies: no scalar test here
     P.windowMode=0;         // the sub-grid tests are partition boxes, not windows
+    // the moment grids as float sums (2026-10-14: the kernel's fixed-point moment path, fxMask, is exercised by the
+    // binary's suites -- tests/ps_fixed_moments_check.sh; this harness compares the float grids with its CPU reference)
+    P.fxMask=0; for(int g=0;g<PS_FX_N;++g) P.fxScale[g]=0.f;
 }
 static std::vector<float> linVel(const std::vector<float>& verts){
     // simple linear velocity field v = (2x - y, 0.5z, -x + y) at each vertex

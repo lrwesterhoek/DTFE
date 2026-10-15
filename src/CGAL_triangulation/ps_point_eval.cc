@@ -28,6 +28,12 @@
      'geometric' the constant per-tetrahedron density m_tet / V_eul (= rho_bar V_lag/V_eul)
                  -- the density whose cell-averaged, quantized rendering the mass-conserving
                  grid deposit produces. Discontinuous across tetrahedra, conserves mass.
+   Both follow the run's grid conventions since 2026-10-13 ('--pts-conventions grid', the default):
+   under --ps-vertex-mass they carry the grid's tetrahedron masses through a per-vertex mass-model
+   ratio, under --ps-volume-weighted the per-point velocity, its gradient and the scalar are
+   equal-volume stream means (see 'The grid deposit's conventions at the points' below);
+   '--pts-conventions legacy' keeps rho_bar V_lag and density weighting. A partitioned run's stream
+   records are checkpointed per partition for '--resume' ('--resume with --sample-points' below).
 
    The candidate search buckets the (static, read-only) QUERY POINTS on a uniform grid and
    streams the partition's tetrahedra through it: each kept tetrahedron looks up only the
@@ -108,6 +114,9 @@ typedef DT::Finite_cells_iterator PSFiniteCellIterator;
 #include <thread>
 #include <vector>
 #include <unistd.h>   // --serve: dup/dup2/read/write on the protocol channel
+#include <sstream>    // --resume: the point-record files' text headers
+#include <dirent.h>   // --resume: an earlier run's point-record files
+#include <sys/stat.h> // --resume: a point-record file's size
 #ifdef OPEN_MP
 #include <omp.h>
 #endif
@@ -222,6 +231,10 @@ struct Context
     bool   ptsScalar = false;       // --pts-scalar: also interpolate the vertex scalars per stream
     bool   ptsLagrangian = false;   // --pts-lagrangian (PS): also record each stream's Lagrangian coordinate
     bool   useGeometric = false;    // variant used for totals, weights and per-stream output
+    // the grid deposit's conventions, followed by the points since 2026-10-13 ('--pts-conventions grid', the
+    // default; 'legacy' clears both): see the notes at interpolatePoints_phaseSpace and psPointEvalFinalize
+    bool   vertexMass = false;      // --ps-vertex-mass: the grid's tetrahedron masses in both per-stream densities
+    bool   volumeWeighted = false;  // --ps-volume-weighted: equal-volume stream means (velocity, its gradient, scalars)
     bool   periodic = false;
     double rhoBar = 1.;             // output densities are rho/rhoBar (grid convention)
     double boxLo[NO_DIM], boxLen[NO_DIM];
@@ -235,6 +248,9 @@ struct Context
     // one; a composite server's partition owns its own region. The PS worker's ownership is the
     // Lagrangian-centroid test inside psFilterCell (the partition's lagrangianRegion) instead.
     OwnBox own;
+    // a batch '--sample-points --partition' run set a partition's box here (psPointEvalSetOwnership,
+    // 2026-10-13): finalize() then words its overlap warning for partitions
+    bool   ownPartitioned = false;
 
     size_t nPoints = 0;
     std::vector<double> pos;        // 3*nPoints, wrapped into the box when periodic
@@ -252,6 +268,10 @@ struct Context
     // held its partition's hits UNPACKED (~200 B each) until one merge at the end: 16.8M points
     // at 2.1M particles peaked at 28 GB. Now a worker holds one block at most.
     std::vector< std::vector<unsigned char> > recBlocks;
+    // the partition each block's records belong to (psPointEvalSetPartition; -1 outside a partition loop), one
+    // per block: a worker's sink serves one triangulation, so a block never mixes partitions. The '--resume'
+    // checkpoint saves a merged partition's blocks (2026-10-13)
+    std::vector<int> recBlockPart;
     size_t nRecs = 0;
     RecLayout layout;
 
@@ -275,6 +295,10 @@ struct Context
 static Context g_ctx;
 static std::mutex g_mergeMutex;   // guards g_ctx.recBlocks while workers hand over their blocks
 
+// the partition the calling thread deposits (psPointEvalSetPartition): read where a triangulation's cell walk
+// starts, and carried by its sinks onto their worker threads
+static thread_local int g_curPartition = -1;
+
 // A worker thread's hits: packed at once (point index + RecLayout bytes) and handed to the shared
 // store whenever the block reaches FLUSH_BYTES -- a thread never holds more than one block.
 struct HitSink
@@ -282,6 +306,7 @@ struct HitSink
     static constexpr size_t FLUSH_BYTES = size_t(16) << 20;
     std::vector<unsigned char> buf;
     size_t n = 0;
+    int part = -1;                  // the partition whose triangulation this sink walks (g_ctx.recBlockPart)
 
     void push_back(std::pair<uint32_t, StreamRec> const &h)
     {
@@ -299,6 +324,7 @@ struct HitSink
         buf.shrink_to_fit();
         std::lock_guard<std::mutex> lock( g_mergeMutex );
         g_ctx.recBlocks.push_back( std::move(buf) );
+        g_ctx.recBlockPart.push_back( part );
         g_ctx.nRecs += n;
         buf = std::vector<unsigned char>();
         n = 0;
@@ -463,6 +489,7 @@ void forEachCellParallel(DT &dt, int nThreads, Work work)
         nThreads = int( std::min<size_t>( size_t(std::max(1, nThreads)), g_cellList->size() / (8 * BLOCK) + 1 ) );
     size_t const nT = size_t( std::max(1, nThreads) );
     std::vector<HitSink> hits( nT );
+    for (HitSink &h : hits) h.part = g_curPartition;   // this thread's partition, for the worker threads below
     std::vector<std::exception_ptr> errors( nT );
 
     auto run = [&](int t)
@@ -602,6 +629,9 @@ void psPointEvalInit(User_options &userOptions)
     g_ctx.useGeometric = userOptions.psStreamDensityGeometric;
     g_ctx.periodic     = userOptions.periodic;
 #ifdef PHASE_SPACE
+    // the grid deposit's mass model and velocity weighting, unless '--pts-conventions legacy' (2026-10-13)
+    g_ctx.vertexMass     = userOptions.psVertexMass and not userOptions.psPtsLegacyConventions;
+    g_ctx.volumeWeighted = userOptions.psVolumeWeighted and not userOptions.psPtsLegacyConventions;
     g_ctx.rhoBar       = double( userOptions.averageDensity );   // PS vertex densities are physical
 #else
     g_ctx.rhoBar       = 1.;   // standard vertexDensity() already normalizes by averageDensity
@@ -645,12 +675,68 @@ void psPointEvalInit(User_options &userOptions)
             << " sample points from '" << MESSAGE::cBlue() << userOptions.psSamplePointsFile
             << MESSAGE::cReset() << "' (per-stream density: "
             << MESSAGE::cMagenta() << (g_ctx.useGeometric ? "geometric" : "dtfe") << MESSAGE::cReset()
+            << (g_ctx.vertexMass ? " with the grids' vertex-share masses" : "")
+            << (g_ctx.volumeWeighted ? ", volume-weighted stream means" : "")
             << (g_ctx.perStream ? ", writing per-stream records" : "")
             << (g_ctx.perStreamIds ? " + stream ids" : "")
             << (g_ctx.ptsDenGrad ? ", writing density gradients" : "")
             << (g_ctx.ptsVelGrad ? ", writing velocity gradients" : "")
             << (g_ctx.ptsScalar ? ", writing scalar values" : "")
             << (g_ctx.ptsLagrangian ? ", writing Lagrangian positions" : "") << ").\n" << MESSAGE::Flush;
+}
+
+
+/* Partitioned point evaluation in the standard binary (2026-10-13; ps_point_eval.h). The Eulerian tessellation of
+   the whole box is cut into the partitions' sub-boxes, each triangulated with its padding, and a tetrahedron is
+   OWNED by the partition whose sub-box holds its centroid (vertices min-image wrapped to vertex 0, standardCell).
+   The sub-boxes tile the box -- neighbours share the SAME float cut (optimalPartitionSplit forms both sides from one
+   expression), half-open [lo, hi) -- so every tetrahedron of the single tessellation has exactly one owner, and the
+   exact, tie-consistent containment (pointInTet) hands every point to exactly one of them: the same tetrahedron
+   the single-domain run finds, wherever the owner's padding reproduces its neighbourhood (the vertex densities come
+   from the owner's own triangulation, so the values agree to float rounding). Only the box's outer faces need care:
+   on a periodic box they are the single run's primary-box faces, bit for bit, so the two images of a tetrahedron
+   that straddles the seam are told apart exactly as in the single run; on a non-periodic one they open to
+   infinity, as the single run keeps every tetrahedron. The composite server used to compare float coordinates
+   for the outer faces (non-periodic only; periodic ones were the float cut), the same whenever the last cut lands
+   on the box face -- a box from 0 on its 64-per-axis split grid. */
+void psPointEvalOwnBox(double const lo[], double const hi[], bool const outerLo[], bool const outerHi[],
+                       double ownLo[], double ownHi[])
+{
+    double const inf = std::numeric_limits<double>::infinity();
+    for (int d = 0; d < NO_DIM; ++d)
+    {
+        ownLo[d] = lo[d];
+        ownHi[d] = hi[d];
+        if ( outerLo[d] ) ownLo[d] = g_ctx.periodic ? g_ctx.boxLo[d] : -inf;
+        // the expression psPointEvalInit gives the single triangulation's own.hi
+        if ( outerHi[d] ) ownHi[d] = g_ctx.periodic ? g_ctx.boxLo[d] + g_ctx.boxLen[d] : inf;
+    }
+}
+
+void psPointEvalSetOwnership(double const *ownLo, double const *ownHi)
+{
+#ifndef PHASE_SPACE
+    if ( ownLo != nullptr and ownHi != nullptr )
+    {
+        g_ctx.own.on = true;
+        for (int d = 0; d < NO_DIM; ++d)
+        {
+            g_ctx.own.lo[d] = ownLo[d];
+            g_ctx.own.hi[d] = ownHi[d];
+        }
+        g_ctx.ownPartitioned = true;
+        return;
+    }
+    // the single-triangulation default (psPointEvalInit)
+    g_ctx.own.on = g_ctx.periodic;
+    for (int d = 0; d < NO_DIM; ++d)
+    {
+        g_ctx.own.lo[d] = g_ctx.boxLo[d];
+        g_ctx.own.hi[d] = g_ctx.boxLo[d] + g_ctx.boxLen[d];
+    }
+#else
+    (void)ownLo; (void)ownHi;   // PS-DTFE owns by the Lagrangian centroid (psFilterCell)
+#endif
 }
 
 
@@ -730,6 +816,7 @@ void setQueryRecords()
 {
     // fresh records and outputs (finalize fills the out* arrays; the ragged ones append)
     std::vector< std::vector<unsigned char> >().swap( g_ctx.recBlocks );
+    std::vector<int>().swap( g_ctx.recBlockPart );
     g_ctx.nRecs = 0;
     if ( std::getenv("DTFE_PTS_FULL_RECORDS") )     // test switch: store every member, as before
         g_ctx.layout.init( true, true, true, true, true );   // packing (tests/ps_point_eval_check.sh compares)
@@ -817,10 +904,111 @@ inline bool anyPointInBuckets(int const bLo[NO_DIM], int const bHi[NO_DIM])
 
 #ifdef PHASE_SPACE
 
+namespace psPointEvalDetail {
+
+/* The grid deposit's conventions at the points (2026-10-13, '--pts-conventions grid', the default).
+
+   The 13 October audit found the production planes and grids of the same run measuring different things: the
+   grids used --ps-vertex-mass (tetrahedron masses from the particles, m_tet = sum_v m_v/deg_v) and
+   --ps-volume-weighted (volume-weighted velocity moments), the planes rho_bar*V_lag masses and density-weighted
+   stream means. With TNG's evolved z = 127 positions as the Lagrangian input rho_bar*V_lag carries the initial
+   contrast, so every density mode of a plane came out filtered by 1 - D(z_ic)/D(z): at z = 20 the 4096^2 plane's
+   contrast was 0.81-0.82 times the grid's (rms 0.211 against 0.280), and its multi-stream velocity divergence 2-4x
+   smaller.
+
+   Under --ps-vertex-mass both point estimators now carry the grid's tetrahedron masses, through ONE number per
+   vertex: the ratio of the two mass models over the vertex's star of depositing tetrahedra,
+
+       c_v = sum_{t in star(v)} m_tet / sum_{t in star(v)} rho_bar V_lag(t)      (the grid's / rho_bar V_lag),
+
+   i.e. the Lagrangian density of the grid's masses around v in units of rho_bar (the IC contrast the default
+   masses miss, plus their vertex-share noise). Then
+     'dtfe'       rho_v -> rho_v c_v: the vertex density rho_bar V_lag(star)/V_eul(star) becomes
+                  M(star)/V_eul(star), the grid's mass around v over its Eulerian volume (exactly so where
+                  no cell of the star is dropped: vertexDensity sums every cell, c_v the depositing ones);
+     'geometric'  rho_tet -> rho_tet <c_v>, the mean over the tetrahedron's vertices: (V_lag/V_eul)(t) times the
+                  local Lagrangian density. Over the depositing cells this conserves the grid's mass exactly,
+                  sum_t V_lag(t) <c_v> rho_bar = sum_v M(star_v)/(d+1) = sum_t m_tet.
+   With the default masses c_v = 1 and both are the old estimators. Why not m_tet/V_eul(t) itself, the grid's own
+   per-tetrahedron density: near-lattice initial conditions (TNG's) tile with near-flat slivers whose equal vertex
+   shares give them a normal mass in almost no volume -- a cell average of the grid holds that mass, a POINT is
+   almost never inside such a sliver: on a 32^3 crossed-wave box (jitter 0.05) a 64^3 point set's mean density
+   came out 0.89 instead of 1. And not standard DTFE's (d+1) m_v/V_eul(star) either: on a near-lattice the star
+   volumes vary with the tetrahedralization, which M(star) averages over the star (a scipy prototype on a uniform
+   24^3 lattice, jitter 0.01: vertex std 0.19 against 0.08). The non-periodic hull cells keep their constant density,
+   corrected the same way; the density gradient (--pts-den-grad) belongs to the corrected 'dtfe' profile. Under
+   --ps-volume-weighted the per-point velocity, its gradient and the scalar are equal-weight stream means
+   (psPointEvalFinalize). '--pts-conventions legacy' keeps the old estimators; without the two grid options both
+   choices run the same code, byte for byte.
+
+   c_v is computed by prepareVertexMass over the whole tessellation (the batch worker per partition, before the
+   grid deposit, which recounts its degrees after a reset; a server once per tessellation it builds or loads) and
+   left in the vertex's volumeAccumulator() -- vertexDensity's scratch, unused once the vertex densities are set,
+   and not cached with the tessellation. Its two passes over the depositing cells (psForEachDepositingCell, the
+   grid's own walk) keep their per-vertex sums in a side table indexed through psDegree() (20 B per vertex, freed
+   at the end), which then gets the vertex's true degree back. */
+inline void prepareVertexMass(DT &dt, User_options &userOptions)
+{
+    Box boxCoordinates = userOptions.region;
+    size_t const nV = dt.number_of_vertices();
+    if ( nV > size_t( std::numeric_limits<int32_t>::max() ) )
+        throwError( "--ps-vertex-mass point evaluation: more than 2^31 vertices in one tessellation." );
+    // (0) index the vertices through psDegree
+    {
+        int32_t k = 0;
+        for (DT::Finite_vertices_iterator vit = dt.finite_vertices_begin(); vit != dt.finite_vertices_end(); ++vit)
+            vit->info().psDegree() = k++;
+    }
+    std::vector<int32_t> deg( nV, 0 );
+    std::vector<double> lagStar( nV, 0. ), massStar( nV, 0. );
+    double const invFact = 1. / factorial( NO_DIM );
+    auto lagVolume = [invFact](Cell_handle &cell)
+    {
+        double Lag[NO_DIM][NO_DIM];
+        for (int v = 0; v < NO_DIM; ++v)
+            for (int i = 0; i < NO_DIM; ++i)
+                Lag[v][i] = double(cell->vertex(v+1)->point()[i]) - double(cell->vertex(0)->point()[i]);
+        return std::fabs( determinant(Lag) ) * invFact;
+    };
+    // (1) the degrees (the grid's) and the Lagrangian star volumes
+    psForEachDepositingCell( dt, userOptions, boxCoordinates, [&](Cell_handle &cell, PSCellGeometry const &)
+    {
+        double const vl = lagVolume( cell );
+        for (int v = 0; v <= NO_DIM; ++v)
+        {
+            size_t const k = size_t( cell->vertex(v)->info().psDegree() );
+            deg[k] += 1;
+            lagStar[k] += vl;
+        }
+    } );
+    // (2) the grid's tetrahedron masses (psVertexShareMass's sum, from the table's degrees) summed per star
+    psForEachDepositingCell( dt, userOptions, boxCoordinates, [&](Cell_handle &cell, PSCellGeometry const &)
+    {
+        double m = 0.;
+        for (int v = 0; v <= NO_DIM; ++v)
+        {
+            int32_t const d = deg[ size_t( cell->vertex(v)->info().psDegree() ) ];
+            if ( d > 0 ) m += double( cell->vertex(v)->info().weight() ) / double( d );
+        }
+        for (int v = 0; v <= NO_DIM; ++v)
+            massStar[ size_t( cell->vertex(v)->info().psDegree() ) ] += m;
+    } );
+    // (3) c_v into volumeAccumulator, the true degree back into psDegree
+    double const rhoBar = double( userOptions.averageDensity );
+    for (DT::Finite_vertices_iterator vit = dt.finite_vertices_begin(); vit != dt.finite_vertices_end(); ++vit)
+    {
+        size_t const k = size_t( vit->info().psDegree() );
+        vit->info().volumeAccumulator() = lagStar[k] > 0. ? massStar[k] / ( rhoBar * lagStar[k] ) : 0.;
+        vit->info().psDegree() = deg[k];
+    }
+}
+
+} // namespace psPointEvalDetail
+
 /* Collects this partition's stream contributions for every query point. Called once per
    Lagrangian partition (and once for a single-triangulation run) after vertexDensity().
-   The tessellation is read-only here; the cells are split over pointEvalThreads() threads,
-   and concurrent workers only synchronize on the short record merge at the end. */
+   The tessellation is read-only here (apart from the vertex-mass pass above); the cells are split over
+   pointEvalThreads() threads, and concurrent workers only synchronize on the short record merge at the end. */
 void interpolatePoints_phaseSpace(DT &dt, User_options &userOptions)
 {
     if ( not g_ctx.active || dt.number_of_vertices() < NO_DIM + 1 )
@@ -828,6 +1016,13 @@ void interpolatePoints_phaseSpace(DT &dt, User_options &userOptions)
 
     Box boxCoordinates = userOptions.region;
     double const avgDens = double( userOptions.averageDensity );
+    // --ps-vertex-mass under the grid conventions: the vertices' mass-model ratios. A server ran the pass when it
+    // built or loaded the tessellation (a request must not repeat a whole-tessellation pass); a batch partition
+    // runs it when its walk first meets a tetrahedron with query points in reach, so the many partitions a plane
+    // never reaches skip it. The pass runs once and alone (call_once); the walk reads no field it writes before.
+    bool const vertexMass = g_ctx.vertexMass;
+    bool const vertexMassLazy = vertexMass and not userOptions.psServe;
+    std::once_flag vertexMassOnce;
 
     forEachCellParallel( dt, pointEvalThreads(),
                          [&](Cell_handle &cell, HitSink &hits)
@@ -848,6 +1043,8 @@ void interpolatePoints_phaseSpace(DT &dt, User_options &userOptions)
         int bLo[NO_DIM], bHi[NO_DIM];
         if ( not tetBucketRange(eulerPos, relLo, relHi, bLo, bHi) ) { return; }
         if ( not anyPointInBuckets(bLo, bHi) ) { return; }
+        if ( vertexMassLazy )
+            std::call_once( vertexMassOnce, [&]() { prepareVertexMass( dt, userOptions ); } );
 
         // double-precision inverse for the evaluation (same zero criterion as above)
         double inv[NO_DIM][NO_DIM];
@@ -865,6 +1062,14 @@ void interpolatePoints_phaseSpace(DT &dt, User_options &userOptions)
                 for (int i = 0; i < NO_DIM; ++i)
                     Lag[v][i] = double(cell->vertex(v+1)->point()[i]) - double(cell->vertex(0)->point()[i]);
             denGeo = avgDens * std::fabs(determinant(Lag)) / cellAbsDet;
+            // --ps-vertex-mass under the grid conventions: times the mean mass-model ratio of the vertices (above)
+            if ( vertexMass )
+            {
+                double c = 0.;
+                for (int v = 0; v <= NO_DIM; ++v)
+                    c += cell->vertex(v)->info().volumeAccumulator();
+                denGeo *= c / double( NO_DIM + 1 );
+            }
             if (denGeo < 0.) denGeo = 0.;
             if ( g_ctx.psCaustics )
                 tetCaustic = (PSCausticClass::CausticMask)
@@ -880,6 +1085,10 @@ void interpolatePoints_phaseSpace(DT &dt, User_options &userOptions)
             for (size_t j = 0; j < noVelComp; ++j)
                 vel[v][j] = double( cell->vertex(v)->info().velocity(j) );
         }
+        // the 'dtfe' vertex densities with the grid's masses: rho_v c_v = M(star)/V_eul(star) (the note above)
+        if ( vertexMass )
+            for (int v = 0; v <= NO_DIM; ++v)
+                rho[v] *= cell->vertex(v)->info().volumeAccumulator();
         // --pts-scalar: the vertices' scalar values; --pts-lagrangian: their Lagrangian positions
         // (the triangulation's own points). A tetrahedron is compact in Lagrangian space, so the
         // differences need no wrap; only the interpolated q is wrapped into the box.
@@ -1284,6 +1493,9 @@ void psPointEvalFinalize(User_options const &userOptions)
 
     size_t covered = 0, multi = 0;
     size_t maxStreams = 0;
+#ifndef PHASE_SPACE
+    size_t overlapped = 0;                  // points inside more than one owned tetrahedron (said below)
+#endif
     std::vector<StreamRec> recs;            // one point's records, unpacked (the buffer is reused)
     for (size_t i = 0; i < N; ++i)
     {
@@ -1302,7 +1514,10 @@ void psPointEvalFinalize(User_options const &userOptions)
         // second record ever appear, both interpolate the same continuous field, so keep the
         // deterministic sorted-first one and the coverage count stays an honest 0/1.
         if ( recs.size() > 1 )
+        {
             recs.resize( 1 );
+            ++overlapped;                   // said after the loop
+        }
 #endif
 
         size_t const nS = recs.size();
@@ -1355,7 +1570,52 @@ void psPointEvalFinalize(User_options const &userOptions)
             for (int d = 0; d < NO_DIM; ++d)
                 g_ctx.outDenGrad[i*NO_DIM + d] = gsum[d] * invRhoBar;
         }
-        if ( W > 0. )
+        if ( g_ctx.volumeWeighted and nS > 0 )
+        {
+            // --ps-volume-weighted under the grid conventions (2026-10-13): the grid weights each stream's
+            // velocity, gradient and scalar by the Eulerian volume it fills in the cell, and at a point every one
+            // of its streams fills the point -- equal shares, so the plain mean over the streams (the sorted
+            // order, as above). The DISPERSION stays what the grid keeps it: the mass-weighted second moment about
+            // the mass-weighted mean (the f-weighted CBE moment; see '--ps-volume-weighted').
+            double const invN = 1. / double( nS );
+            double sum1[noVelComp] = {0.}, sumG[NO_DIM*NO_DIM] = {0.}, sumS[noScalarComp] = {0.};
+            for (size_t s = 0; s < nS; ++s)
+            {
+                for (size_t j = 0; j < noVelComp; ++j)
+                    sum1[j] += recs[s].vel[j];
+                if ( g_ctx.ptsVelGrad )
+                    for (int q = 0; q < NO_DIM*NO_DIM; ++q)
+                        sumG[q] += recs[s].vgrad[q];
+                if ( g_ctx.ptsScalar )
+                    for (size_t j = 0; j < noScalarComp; ++j)
+                        sumS[j] += recs[s].scal[j];
+            }
+            for (size_t j = 0; j < noVelComp; ++j)
+                g_ctx.outVel[i*noVelComp+j] = sum1[j] * invN;
+            if ( g_ctx.ptsVelGrad )
+                for (int q = 0; q < NO_DIM*NO_DIM; ++q)
+                    g_ctx.outVelGrad[i*NO_DIM*NO_DIM + q] = sumG[q] * invN;
+            if ( g_ctx.ptsScalar )
+                for (size_t j = 0; j < noScalarComp; ++j)
+                    g_ctx.outScalar[i*noScalarComp + j] = sumS[j] * invN;
+            if ( nS > 1 and W > 0. )
+            {
+                double const invW = 1. / W;
+                double vm[noVelComp];
+                for (size_t j = 0; j < noVelComp; ++j)
+                    vm[j] = mom1[j] * invW;
+                size_t c = 0;
+                for (int a = 0; a < NO_DIM; ++a)
+                    for (int b = a; b < NO_DIM; ++b)
+                    {
+                        double s2 = mom2[c] * invW - vm[a] * vm[b];
+                        if (a == b && s2 < 0.) s2 = 0.;   // variance: clamp FP-noise negatives
+                        g_ctx.outDisp[i*noDispComp + c] = s2;
+                        ++c;
+                    }
+            }
+        }
+        else if ( W > 0. )
         {
             double const invW = 1. / W;
             for (size_t j = 0; j < noVelComp; ++j)
@@ -1409,6 +1669,7 @@ void psPointEvalFinalize(User_options const &userOptions)
 
     }
     std::vector< std::vector<unsigned char> >().swap( g_ctx.recBlocks );
+    std::vector<int>().swap( g_ctx.recBlockPart );
     g_ctx.nRecs = 0;
     g_ctx.finalized = true;
 
@@ -1418,6 +1679,28 @@ void psPointEvalFinalize(User_options const &userOptions)
             << MESSAGE::cMagenta() << maxStreams << MESSAGE::cReset() << "."
             << ( covered < N ? "  (uncovered points lie outside the tessellation or in empty regions)" : "" )
             << "\n" << MESSAGE::Flush;
+#ifndef PHASE_SPACE
+    // The safety net above used to be silent (2026-10-13). The Eulerian tessellation gives every point exactly one
+    // containing tetrahedron (exact containment), and on a periodic box every point has one. A second record, or
+    // none on a periodic box, means that a tetrahedron was OWNED twice or not at all: by partitions (or a composite
+    // server's) whose padding does not reproduce the tessellation near their faces, or -- the same in a single run --
+    // by the two images of a tetrahedron across a periodic box face, whose centroids come from periodic copies that
+    // the box shift rounds (measured on a box at 131020-131120 Mpc: 6 doubles and 15 holes in 17600 points, the
+    // partitioned run identical; on a box starting at 0 the -L copies are exact and the +L ones round at ~ulp(L)).
+    bool const holes = g_ctx.periodic and covered < N;
+    if ( overlapped > 0 or holes )
+    {
+        MESSAGE::Warning warning( userOptions.verboseLevel );
+        if ( overlapped > 0 )
+            warning << overlapped << " of " << N << " points lie inside more than one owned tetrahedron (each keeps the "
+                    << "first in the deterministic order). ";
+        if ( holes )
+            warning << ( N - covered ) << " of " << N << " points are covered by none, although the box is periodic. ";
+        warning << "Either " << ( g_ctx.ownPartitioned ? "the partitions' '--padding'" : "'--padding'" ) << " is too small "
+                << "(increase it), or, for a few points next to a periodic box face, the rounding of the periodic copies made a "
+                << "tetrahedron across the face owned by both of its images or by neither.\n" << MESSAGE::EndWarning;
+    }
+#endif
 }
 
 
@@ -1470,11 +1753,15 @@ void psPointEvalWriteOutputs(User_options const &userOptions)
                               : "point density gradients (float64 x 3, d(rho/rho_bar)/dx_i, 'dtfe' profile)" );
     if ( g_ctx.ptsVelGrad )
         writeRaw( ".pts_velGrad", g_ctx.outVelGrad.data(), g_ctx.outVelGrad.size() * sizeof(double),
-                  NO_DIM == 2 ? "point velocity gradients (float64 x 4, [d*2+j] = dv_j/dx_d, density-weighted stream mean)"
-                              : "point velocity gradients (float64 x 9, [d*3+j] = dv_j/dx_d, density-weighted stream mean)" );
+                  g_ctx.volumeWeighted
+                  ? ( NO_DIM == 2 ? "point velocity gradients (float64 x 4, [d*2+j] = dv_j/dx_d, equal-volume stream mean)"
+                                  : "point velocity gradients (float64 x 9, [d*3+j] = dv_j/dx_d, equal-volume stream mean)" )
+                  : ( NO_DIM == 2 ? "point velocity gradients (float64 x 4, [d*2+j] = dv_j/dx_d, density-weighted stream mean)"
+                                  : "point velocity gradients (float64 x 9, [d*3+j] = dv_j/dx_d, density-weighted stream mean)" ) );
     if ( g_ctx.ptsScalar )
         writeRaw( ".pts_scalar", g_ctx.outScalar.data(), g_ctx.outScalar.size() * sizeof(double),
-                  "point scalar values (float64, density-weighted mean over the streams)" );
+                  g_ctx.volumeWeighted ? "point scalar values (float64, equal-volume mean over the streams)"
+                                       : "point scalar values (float64, density-weighted mean over the streams)" );
     if ( g_ctx.perStream )
     {
         writeRaw( ".pts_stream_offsets", g_ctx.outOffsets.data(),
@@ -1504,6 +1791,195 @@ void psPointEvalWriteOutputs(User_options const &userOptions)
                       NO_DIM == 2 ? "per-stream Lagrangian coordinates (float64 x 2, the initial position of each stream's matter)"
                                   : "per-stream Lagrangian coordinates (float64 x 3, the initial position of each stream's matter)" );
     }
+}
+
+
+/* ---- '--resume' with '--sample-points' (2026-10-13) --------------------------------------------------------
+
+   Every production run log said 'no checkpoints: a --sample-points run cannot be resumed': the planes are made by
+   the grid runs themselves, so a killed run (TNG50-3-Dark z = 0: 2.5 h, partitions 5-10 in flight; a future
+   8192^2 plane) restarted from zero. The point evaluation's only accumulators are the stream records, and each
+   record belongs to the one partition that owns its tetrahedron; but they were one pool, filled by every
+   partition in flight, so a checkpoint could not say which of them went with the partitions it lists. Now every
+   block carries its partition (a sink serves one triangulation, so a block never mixes two), and a checkpoint
+   (partition_checkpoint.h) writes, BEFORE its manifest, one file per merged partition not saved yet:
+
+       <checkpoint dir>/points.<i>   a text header -- the magic line, 'hash' (the checkpoint key's), 'partition',
+                                     'points' (the point count), 'entry_bytes' (uint32 point index + the packed
+                                     record, RecLayout), 'records', 'header-end' -- then the entries as stored
+
+   written once each (a temp file, fsync, rename). '--resume' reads the files of the partitions its manifest lists
+   back into the store and skips those partitions. psPointEvalFinalize sorts each point's records into a strict
+   order before any sum, so it does not matter which records were read back and which computed: the '.pts_*'
+   outputs are byte-identical to an uninterrupted run's (tests/ps_resume_points_check.sh). The files hold the
+   bytes the run keeps in memory anyway, once: a 4096^2 plane with --pts-vel-grad at z = 0 (~4 streams per point,
+   118 B per entry) writes ~8 GB over the whole run, inside the checkpoint's 5% time throttle and room rule.
+   The STANDARD binary's partition loop tags its records the same way since 2026-10-14 (DTFE.cpp; one record per
+   point there, from the partition owning its tetrahedron), so a standard '--sample-points --partition' run is
+   checkpointed and resumed by the same files ('DTFE-PS-POINTS 1' names the format, shared by both binaries; the
+   key hash in each header keeps a standard run's files from being read into a PS run and the other way round). */
+
+namespace psPointEvalDetail {
+
+static char const *const POINTS_MAGIC = "DTFE-PS-POINTS 1";
+
+static std::string pointsPath(std::string const &dir, size_t pi)
+{
+    return dir + "/points." + std::to_string( pi );
+}
+
+// the (data, bytes) of every stored block of each partition to save, taken under the store's lock: another
+// partition's flush may move the block VECTORS (the outer vector grows), never their buffers, and a saved
+// partition's blocks are complete (it merged after its cell walk flushed every sink)
+static std::vector< std::vector< std::pair<unsigned char const *, size_t> > >
+blocksToSave(std::vector<char> const &merged, std::vector<char> const &saved)
+{
+    std::vector< std::vector< std::pair<unsigned char const *, size_t> > > parts( merged.size() );
+    std::lock_guard<std::mutex> lock( g_mergeMutex );
+    for (size_t k = 0; k < g_ctx.recBlocks.size(); ++k)
+    {
+        int const p = g_ctx.recBlockPart[k];
+        if ( p < 0 or size_t(p) >= merged.size() or not merged[size_t(p)] or saved[size_t(p)] ) continue;
+        parts[size_t(p)].push_back( std::make_pair( g_ctx.recBlocks[k].data(), g_ctx.recBlocks[k].size() ) );
+    }
+    return parts;
+}
+
+} // namespace psPointEvalDetail
+
+
+void psPointEvalSetPartition(int const partition)
+{
+    g_curPartition = partition;
+}
+
+double psPointEvalUnsavedBytes(std::vector<char> const &merged, std::vector<char> const &saved)
+{
+    if ( not g_ctx.active ) return 0.;
+    double bytes = 0.;
+    for (auto const &part : blocksToSave( merged, saved ))
+        for (auto const &b : part) bytes += double( b.second );
+    return bytes;
+}
+
+bool psPointEvalSavePartitions(std::string const &dir, std::string const &keyHash, std::vector<char> const &merged,
+                               std::vector<char> &saved, std::string &why)
+{
+    if ( not g_ctx.active ) return true;
+    size_t const E = sizeof(uint32_t) + g_ctx.layout.bytes;
+    auto const parts = blocksToSave( merged, saved );
+    for (size_t pi = 0; pi < merged.size(); ++pi)
+    {
+        if ( not merged[pi] or saved[pi] ) continue;
+        size_t bytes = 0;
+        for (auto const &b : parts[pi]) bytes += b.second;
+        std::ostringstream h;
+        h << POINTS_MAGIC << "\nhash " << keyHash << "\npartition " << pi << "\npoints " << g_ctx.nPoints
+          << "\nentry_bytes " << E << "\nrecords " << bytes / E << "\nheader-end\n";
+        std::string const header = h.str();
+        std::string const path = pointsPath( dir, pi );
+        std::string const tmp = path + ".tmp." + std::to_string( long( ::getpid() ) );
+        FILE *f = std::fopen( tmp.c_str(), "wb" );
+        if ( not f ) { why = "cannot write '" + tmp + "': " + std::strerror( errno ); return false; }
+        bool ok = std::fwrite( header.data(), 1, header.size(), f ) == header.size();
+        for (auto const &b : parts[pi])
+            if ( ok ) ok = std::fwrite( b.first, 1, b.second, f ) == b.second;
+        ok = ok and std::fflush( f ) == 0 and ::fsync( ::fileno( f ) ) == 0;
+        int const err = errno;
+        ok = ( std::fclose( f ) == 0 ) and ok;
+        if ( not ok or std::rename( tmp.c_str(), path.c_str() ) != 0 )
+        {
+            why = "writing the point records '" + tmp + "' failed: " + std::strerror( ok ? errno : err );
+            std::remove( tmp.c_str() );
+            return false;
+        }
+        saved[pi] = 1;
+    }
+    return true;
+}
+
+bool psPointEvalLoadPartitions(std::string const &dir, std::string const &keyHash, std::vector<char> const &merged,
+                               std::string &why)
+{
+    if ( not g_ctx.active ) return true;
+    size_t const E = sizeof(uint32_t) + g_ctx.layout.bytes;
+    size_t const CHUNK = std::max<size_t>( 1, HitSink::FLUSH_BYTES / E ) * E;   // blocks the size the sinks hand over
+    for (size_t pi = 0; pi < merged.size(); ++pi)
+    {
+        if ( not merged[pi] ) continue;
+        std::string const path = pointsPath( dir, pi );
+        std::ifstream in( path, std::ios::binary );
+        if ( not in ) { why = "the point records of partition " + std::to_string( pi ) + " ('" + path + "') are missing"; return false; }
+        std::string line;
+        std::string hash;
+        long long part = -1, points = -1, entry = -1, records = -1;
+        bool ended = false;
+        if ( not std::getline( in, line ) or line != POINTS_MAGIC ) { why = "'" + path + "' is not a point-record file"; return false; }
+        while ( std::getline( in, line ) )
+        {
+            if ( line == "header-end" ) { ended = true; break; }
+            std::istringstream ls( line );
+            std::string tag;
+            ls >> tag;
+            if ( tag == "hash" ) ls >> hash;
+            else if ( tag == "partition" ) ls >> part;
+            else if ( tag == "points" ) ls >> points;
+            else if ( tag == "entry_bytes" ) ls >> entry;
+            else if ( tag == "records" ) ls >> records;
+        }
+        if ( not ended ) { why = "the header of '" + path + "' is incomplete"; return false; }
+        if ( hash != keyHash or part != (long long)pi )
+        { why = "'" + path + "' belongs to another run or partition (key hash " + hash + ", this run " + keyHash + ")"; return false; }
+        if ( points != (long long)g_ctx.nPoints or entry != (long long)E or records < 0 )
+        {
+            why = "'" + path + "' holds " + std::to_string( points ) + " points with " + std::to_string( entry ) + "-byte "
+                  "entries, this run " + std::to_string( g_ctx.nPoints ) + " and " + std::to_string( E ) + " (another sample-point "
+                  "file or record layout, e.g. DTFE_PTS_FULL_RECORDS)";
+            return false;
+        }
+        long long const start = (long long)in.tellg();
+        struct stat st;
+        if ( ::stat( path.c_str(), &st ) != 0 or (unsigned long long)st.st_size != (unsigned long long)start + (unsigned long long)records * E )
+        { why = "'" + path + "' is not the size its header lists (cut or damaged)"; return false; }
+        size_t left = size_t( records ) * E;
+        while ( left > 0 )
+        {
+            size_t const n = std::min( left, CHUNK );
+            std::vector<unsigned char> blk( n );
+            if ( not in.read( reinterpret_cast<char *>( blk.data() ), std::streamsize( n ) ) )
+            { why = "reading '" + path + "' failed"; return false; }
+            for (size_t k = 0; k < n; k += E)
+            {
+                uint32_t pt;
+                std::memcpy( &pt, blk.data() + k, sizeof(uint32_t) );
+                if ( size_t( pt ) >= g_ctx.nPoints ) { why = "'" + path + "' names a point beyond this run's"; return false; }
+            }
+            std::lock_guard<std::mutex> lock( g_mergeMutex );
+            g_ctx.recBlocks.push_back( std::move( blk ) );
+            g_ctx.recBlockPart.push_back( int( pi ) );
+            g_ctx.nRecs += n / E;
+            left -= n;
+        }
+    }
+    return true;
+}
+
+void psPointEvalRemoveUnsaved(std::string const &dir, std::vector<char> const &saved)
+{
+    DIR *d = ::opendir( dir.c_str() );
+    if ( not d ) return;
+    std::vector<std::string> stale;
+    while ( dirent *e = ::readdir( d ) )
+    {
+        std::string const n = e->d_name;
+        if ( n.rfind( "points.", 0 ) != 0 or n.find( ".tmp." ) != std::string::npos ) continue;
+        char *end = nullptr;
+        unsigned long long const pi = std::strtoull( n.c_str() + 7, &end, 10 );
+        if ( end == n.c_str() + 7 or *end != '\0' ) continue;
+        if ( pi >= saved.size() or not saved[size_t(pi)] ) stale.push_back( dir + "/" + n );
+    }
+    ::closedir( d );
+    for (auto const &s : stale) std::remove( s.c_str() );
 }
 
 
@@ -1912,6 +2388,11 @@ template <typename Evaluate>
     size_t const nCells = index.cells.size();
     int const bucketFloor = int( std::pow( double(nCells) / 16., 1. / double(NO_DIM) ) );
     std::vector<Cell_handle> candidates;
+#ifdef PHASE_SPACE
+    // --ps-vertex-mass under the grid conventions: the vertex degrees and star volumes, once for every request
+    if ( g_ctx.vertexMass )
+        prepareVertexMass( dt, userOptions );
+#endif
 
     serveHandshake( uint64_t( dt.number_of_vertices() ), 1u, 1u );
     {
@@ -2247,6 +2728,10 @@ static bool ensureResident(size_t const p, double &loadSeconds)
     auto const t0 = std::chrono::steady_clock::now();
     std::unique_ptr<DT> dt( new DT );
     if ( not TessellationCache::tryLoad( *dt, P.opts ) ) return false;
+#ifdef PHASE_SPACE
+    if ( g_ctx.vertexMass )   // the grid conventions' vertex-mass pass, once per load (not per request)
+        prepareVertexMass( *dt, P.opts );
+#endif
     loadSeconds += std::chrono::duration<double>( std::chrono::steady_clock::now() - t0 ).count();
     P.dt = std::move( dt );
     return true;
@@ -2334,7 +2819,13 @@ void psServeCompositeAddPartition(int const index, User_options &partOptions,
                 dt.reset();             // out of core: reloaded when a request needs it
             }
             else
+            {
+#ifdef PHASE_SPACE
+                if ( g_ctx.vertexMass )   // the grid conventions' vertex-mass pass, once (not per request)
+                    prepareVertexMass( *dt, P.opts );
+#endif
                 P.dt = std::move( dt ); // no cache (or it could not be written): stays in memory
+            }
         }
     }
 
@@ -2736,6 +3227,13 @@ void psPointEvalInit(User_options &)
 }
 void psPointEvalFinalize(User_options const &) {}
 void psPointEvalWriteOutputs(User_options const &) {}
+void psPointEvalSetPartition(int) {}
+double psPointEvalUnsavedBytes(std::vector<char> const &, std::vector<char> const &) { return 0.; }
+bool psPointEvalSavePartitions(std::string const &, std::string const &, std::vector<char> const &,
+                               std::vector<char> &, std::string &) { return true; }
+bool psPointEvalLoadPartitions(std::string const &, std::string const &, std::vector<char> const &,
+                               std::string &) { return true; }
+void psPointEvalRemoveUnsaved(std::string const &, std::vector<char> const &) {}
 void psServeRedirectStdout() {}
 [[noreturn]] void psServe(DT &, User_options &)
 {
@@ -2756,6 +3254,11 @@ void psServeCompositeAddPartition(int, User_options &, std::function<void(std::v
 int psOccupancyTouchesWindow(User_options const &, User_options const &) { return -1; }
 bool psTessellationCached(User_options const &) { return false; }
 void psWriteOccupancyIfMissing(DT &, User_options &) {}
+void psPointEvalOwnBox(double const lo[], double const hi[], bool const *, bool const *, double ownLo[], double ownHi[])
+{
+    for (int d = 0; d < NO_DIM; ++d) { ownLo[d] = lo[d]; ownHi[d] = hi[d]; }
+}
+void psPointEvalSetOwnership(double const *, double const *) {}
 
 #endif // NO_DIM
 
@@ -2782,7 +3285,8 @@ void psWriteOccupancyIfMissing(DT &, User_options &) {}
 #include <random>
 
 double psEstimateMeanStreams(std::vector<Particle_data> const &particles, double const boxLoIn[3],
-                             double const boxLenIn[3], bool const periodic, int *patchesUsed)
+                             double const boxLenIn[3], bool const periodic, int *patchesUsed,
+                             double const *regionLo, double const *regionHi)
 {
     typedef CGAL::Exact_predicates_inexact_constructions_kernel EK;
     typedef CGAL::Triangulation_vertex_base_with_info_3<uint32_t, EK> EVb;
@@ -2822,9 +3326,78 @@ double psEstimateMeanStreams(std::vector<Particle_data> const &particles, double
     for (int d=0; d<3; ++d)
         G[d] = std::max( 2, int(boxLen[d] / (20.*spacing)) );
     size_t const nCells = size_t(G[0]) * size_t(G[1]) * size_t(G[2]);
-    size_t const K = std::min( nCells, size_t(256) );
-    std::vector<size_t> order( nCells );
-    for (size_t c=0; c<nCells; ++c) order[c] = c;
+    auto wrapped = [&](Real v, int d) {                        // (non-periodic: the bounding box holds every position)
+        double x = double(v) - boxLo[d];
+        if ( periodic ) x -= boxLen[d] * std::floor( x / boxLen[d] );
+        return x;
+    };
+    auto cellOf = [&](Particle_data const &part) {
+        size_t c = 0;
+        for (int d=0; d<3; ++d)
+        {
+            int g = int( wrapped(part.lagPos[d], d) / boxLen[d] * G[d] );
+            c = c * size_t(G[d]) + size_t( std::min( std::max(g, 0), G[d]-1 ) );
+        }
+        return c;
+    };
+    // The length of [lo,hi] inside the region on axis d, over the periodic images (2026-10-11)
+    auto overlap = [&](double lo, double hi, int d) {
+        double sum = 0.;
+        for (int k = (periodic ? -1 : 0); k <= (periodic ? 1 : 0); ++k)
+        {
+            double const sh = k * boxLenIn[d];
+            sum += std::max( 0., std::min( hi + sh, regionHi[d] ) - std::max( lo + sh, regionLo[d] ) );
+        }
+        return sum;
+    };
+
+    // '--sample-points' region (2026-10-11): the candidate patches are the Lagrangian cells whose Eulerian image
+    // meets the region -- the image's bounding box from one pass over the particles, each position taken at its
+    // minimum image from the cell's Lagrangian centre (displacements stay below half a box), so a cell across the
+    // box edge is not stretched over the whole axis
+    bool useRegion = regionLo != nullptr and regionHi != nullptr;
+    double regionVol = 1.;
+    std::vector<size_t> order;
+    if ( useRegion )
+    {
+        for (int d=0; d<3; ++d) regionVol *= std::max( 0., regionHi[d] - regionLo[d] );
+        std::vector<double> eLo( 3*nCells, std::numeric_limits<double>::max() ), eHi( 3*nCells, -std::numeric_limits<double>::max() );
+        for (size_t i=0; i<N; ++i)
+        {
+            size_t const c = cellOf( particles[i] );
+            size_t r = c;
+            for (int d=2; d>=0; --d)
+            {
+                int const g = int( r % size_t(G[d]) );
+                r /= size_t(G[d]);
+                double x = double( particles[i].pos[d] );
+                if ( periodic )
+                {
+                    double const qc = boxLo[d] + (g + 0.5) * boxLen[d] / G[d];
+                    x -= boxLenIn[d] * std::nearbyint( (x - qc) / boxLenIn[d] );
+                }
+                eLo[3*c+d] = std::min( eLo[3*c+d], x );
+                eHi[3*c+d] = std::max( eHi[3*c+d], x );
+            }
+        }
+        for (size_t c=0; c<nCells; ++c)
+        {
+            bool meets = eHi[3*c] >= eLo[3*c];
+            for (int d=0; d<3 and meets; ++d)
+                meets = ( periodic and eHi[3*c+d] - eLo[3*c+d] >= boxLenIn[d] )
+                        or overlap( eLo[3*c+d], eHi[3*c+d], d ) > 0.
+                        or ( eHi[3*c+d] == eLo[3*c+d] and eLo[3*c+d] >= regionLo[d] and eLo[3*c+d] <= regionHi[d] );
+            if ( meets ) order.push_back( c );
+        }
+        if ( order.size() < 16 or not (regionVol > 0.) ) { useRegion = false; order.clear(); }
+    }
+    size_t const nCand = useRegion ? order.size() : nCells;
+    if ( not useRegion )
+    {
+        order.resize( nCells );
+        for (size_t c=0; c<nCells; ++c) order[c] = c;
+    }
+    size_t const K = std::min( nCand, size_t(256) );
     std::mt19937_64 rng( 20260929 );                          // fixed: the same data, the same estimate
     std::shuffle( order.begin(), order.end(), rng );
     std::vector<int> patchOf( nCells, -1 );
@@ -2833,20 +3406,40 @@ double psEstimateMeanStreams(std::vector<Particle_data> const &particles, double
     // one pass: the particles of the chosen patches, by their Lagrangian position (wrapped into
     // the box: initial positions can stray a little outside it)
     std::vector< std::vector<uint32_t> > members( K );
-    auto wrapped = [&](Real v, int d) {                        // (non-periodic: the bounding box holds every position)
-        double x = double(v) - boxLo[d];
-        if ( periodic ) x -= boxLen[d] * std::floor( x / boxLen[d] );
-        return x;
-    };
+    double const margin = 3.*spacing;
     for (size_t i=0; i<N; ++i)
     {
-        size_t c = 0;
+        if ( not useRegion )
+        {
+            size_t const c = cellOf( particles[i] );
+            if ( patchOf[c] >= 0 ) members[ patchOf[c] ].push_back( uint32_t(i) );
+            continue;
+        }
+        // with a region the counted tetrahedra must TILE the Lagrangian space (a patch shrunk by its margin would
+        // count a slab that falls in the margins as empty: 0.7 instead of 1 stream on a 1-D pancake), so a patch
+        // counts the tetrahedra with their centroid in its WHOLE cell and also holds the particles within the
+        // margin around it -- a particle near a cell face belongs to up to 8 patches
+        int gs[3][2], ng[3];
         for (int d=0; d<3; ++d)
         {
-            int g = int( wrapped(particles[i].lagPos[d], d) / boxLen[d] * G[d] );
-            c = c * size_t(G[d]) + size_t( std::min( std::max(g, 0), G[d]-1 ) );
+            double const w = boxLen[d] / G[d];
+            double const xq = wrapped( particles[i].lagPos[d], d );
+            int const g = std::min( std::max( int( xq / w ), 0 ), G[d]-1 );
+            ng[d] = 0;
+            gs[d][ng[d]++] = g;
+            double const f = xq - g * w;
+            int const gn = f < margin ? g - 1 : ( w - f < margin ? g + 1 : g );
+            if ( gn != g )
+            {
+                if ( gn >= 0 and gn < G[d] ) gs[d][ng[d]++] = gn;
+                else if ( periodic ) gs[d][ng[d]++] = ( gn + G[d] ) % G[d];
+            }
         }
-        if ( patchOf[c] >= 0 ) members[ patchOf[c] ].push_back( uint32_t(i) );
+        for (int a=0; a<ng[0]; ++a) for (int b=0; b<ng[1]; ++b) for (int e=0; e<ng[2]; ++e)
+        {
+            size_t const c = ( size_t(gs[0][a]) * size_t(G[1]) + size_t(gs[1][b]) ) * size_t(G[2]) + size_t(gs[2][e]);
+            if ( patchOf[c] >= 0 ) members[ patchOf[c] ].push_back( uint32_t(i) );
+        }
     }
 
     double sumEuler = 0., sumLag = 0.;
@@ -2863,14 +3456,24 @@ double psEstimateMeanStreams(std::vector<Particle_data> const &particles, double
             int const g = int( cell % size_t(G[d]) );
             cell /= size_t(G[d]);
             double const w = boxLen[d] / G[d];
-            lo[d] = g * w + 3.*spacing;
-            hi[d] = (g + 1) * w - 3.*spacing;
+            lo[d] = useRegion ? g * w : g * w + margin;       // region: the whole cell (the members reach past it)
+            hi[d] = useRegion ? (g + 1) * w : (g + 1) * w - margin;
         }
+        // a region patch's members can come from across the periodic boundary: their Lagrangian position is taken
+        // at its minimum image from the cell's centre
+        auto lagAt = [&](uint32_t i, int d) {
+            double qv = wrapped( particles[i].lagPos[d], d );
+            if ( useRegion and periodic )
+            {
+                double const cen = 0.5 * (lo[d] + hi[d]);
+                qv -= boxLen[d] * std::nearbyint( (qv - cen) / boxLen[d] );
+            }
+            return qv;
+        };
         std::vector< std::pair<EK::Point_3, uint32_t> > pts;
         pts.reserve( idx.size() );
         for (uint32_t i : idx)
-            pts.emplace_back( EK::Point_3( wrapped(particles[i].lagPos[0], 0), wrapped(particles[i].lagPos[1], 1),
-                                           wrapped(particles[i].lagPos[2], 2) ), i );
+            pts.emplace_back( EK::Point_3( lagAt(i, 0), lagAt(i, 1), lagAt(i, 2) ), i );
         EDT dt( pts.begin(), pts.end() );
         for (auto c = dt.finite_cells_begin(); c != dt.finite_cells_end(); ++c)
         {
@@ -2904,15 +3507,33 @@ double psEstimateMeanStreams(std::vector<Particle_data> const &particles, double
                      + a[0][2]*(a[1][0]*a[2][1] - a[1][1]*a[2][0]);
             };
             sumLag   += std::fabs( det(eq) );
-            sumEuler += std::fabs( det(ex) );
+            double vE = std::fabs( det(ex) );
+            if ( useRegion )      // the share of its Eulerian extent inside the region, axis by axis
+                for (int d=0; d<3; ++d)
+                {
+                    double lo = 0., hi = 0.;
+                    for (int v=0; v<3; ++v) { lo = std::min( lo, ex[v][d] ); hi = std::max( hi, ex[v][d] ); }
+                    lo += x[0][d];
+                    hi += x[0][d];
+                    double const len = hi - lo;
+                    vE *= len > 1e-12 * boxLenIn[d] ? std::min( 1., overlap( lo, hi, d ) / len )
+                                                    : ( overlap( lo - 0.5e-12 * boxLenIn[d], lo + 0.5e-12 * boxLenIn[d], d ) > 0. ? 1. : 0. );
+                }
+            sumEuler += vE;
         }
         ++used;
     }
     if ( patchesUsed ) *patchesUsed = used;
-    return sumLag > 0. ? sumEuler / sumLag : -1.;
+    if ( not (sumLag > 0.) ) return -1.;
+    if ( not useRegion ) return sumEuler / sumLag;
+    // Eulerian volume inside the region per Lagrangian volume, times the Lagrangian volume of every cell that
+    // meets it (the others put nothing there), over the region's volume
+    double const cellVol = boxLen[0]/G[0] * boxLen[1]/G[1] * boxLen[2]/G[2];
+    return sumEuler / sumLag * double(nCand) * cellVol / regionVol;
 }
 #else
-double psEstimateMeanStreams(std::vector<Particle_data> const &, double const *, double const *, bool, int *patchesUsed)
+double psEstimateMeanStreams(std::vector<Particle_data> const &, double const *, double const *, bool, int *patchesUsed,
+                             double const *, double const *)
 {
     if ( patchesUsed ) *patchesUsed = 0;
     return -1.;

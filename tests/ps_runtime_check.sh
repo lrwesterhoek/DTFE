@@ -12,7 +12,21 @@
 #       folder is missing writes the whole set to $TMPDIR/dtfe-rescue/<folder>_<name>, byte-identical to a
 #       normal run, says so and exits 3
 #   R5  the progress sidecar '<output>.runlog.progress' while a run goes: the contract's keys, phase
-#       'partitions', done counting up to total
+#       'partitions', done counting up to total; since 2026-10-11 also predicted_gb (-1 here: the split and the
+#       concurrency are given, so the tuner predicts nothing) and peak_gb (> 0)
+#   R6  the SUMMARY's 'memory model' line (2026-10-11): a run whose concurrency the auto-tuner picks prints its
+#       predicted peak against the measured one (macOS: the peak footprint), both positive; R5's run, with
+#       nothing left to the tuner, prints none
+#   R7  the STAGED ordered merge, the default since 2026-10-14. Partition 0 is held 2 s before its merge
+#       (DTFE_TEST_DELAY_PARTITION=0:2), so the others finish first: with NO merge flag the run says it merges in
+#       index order, its 'ordered merge:' line counts staged partitions (> 0, none waiting), and every output is
+#       byte-identical to R1's '--ordered-merge' run; DTFE_MERGE_STAGE_GB=0 (no staging: the old ordered merge) and
+#       a machine with no free memory (DTFE_FREE_GB=0.001: no room to stage) wait instead and are byte-identical too;
+#       '--completion-order-merge' says so, stages nothing and equals R1 to float rounding; it and '--ordered-merge'
+#       together are refused; a default run killed after 10 merges (DTFE_TEST_EXIT_AFTER_PARTITIONS=10) while
+#       partitions are staged has checkpointed exactly partitions 0-9 (the merge order is the index order) and
+#       resumes to R1's grids byte for byte; with the concurrency left to the auto-tuner (the memory gate guards
+#       every partition start) a partition is always staged, and the grids equal DTFE_MERGE_STAGE_GB=0's byte for byte
 # Usage: tests/ps_runtime_check.sh [--no-build]   (--no-build is accepted and ignored: the binaries are used as built)
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -49,6 +63,49 @@ for r in o1 o2; do OMP_NUM_THREADS=4 "$BIN" "$SNAP" "$TMP/$r" "${C[@]}" --partit
     > "$TMP/$r.log" 2>&1 || { echo "FAIL: $r (see $TMP/$r.log)"; exit 1; }; done
 grep -q "partition merge order  : partition index" "$TMP/o1.log"; check "R1 the run says it merges in index order" $?
 same "$TMP/o1" "$TMP/o2"; check "R1 two --ordered-merge runs at --max-concurrent 4: byte-identical grids" $?
+
+echo ">> R7: the staged ordered merge (the default since 2026-10-14), partition 0 held back 2 s"
+"$BIN" --help 2>&1 | grep -q -- "--completion-order-merge"; check "R7 '--completion-order-merge' is in the help" $?
+R7=(env OMP_NUM_THREADS=4 DTFE_TEST_DELAY_PARTITION=0:2 "$BIN" "$SNAP")
+P3=(--partition 3 3 3 --max-concurrent 4)
+"${R7[@]}" "$TMP/st" "${C[@]}" "${P3[@]}" > "$TMP/st.log" 2>&1 || { echo "FAIL: st (see $TMP/st.log)"; exit 1; }
+nst="$(sed -n 's/.*ordered merge: \([0-9]*\) partition(s) finished before their turn.*/\1/p' "$TMP/st.log")"
+nwt="$(sed -n 's/.* \([0-9]*\) waited for their turn.*/\1/p' "$TMP/st.log")"
+grep -q "partition merge order  : partition index" "$TMP/st.log" && grep -q "PS-DTFE: partitions merge in index order" "$TMP/st.log" \
+    && [ "${nst:-0}" -gt 0 ] && [ "${nwt:-1}" = 0 ]
+check "R7 no merge flag: index order, ${nst:-?} partition(s) staged, ${nwt:-?} waited" $?
+same "$TMP/o1" "$TMP/st"; check "R7 ... every output byte-identical to the --ordered-merge run (R1)" $?
+DTFE_MERGE_STAGE_GB=0 "${R7[@]}" "$TMP/st0" "${C[@]}" "${P3[@]}" > "$TMP/st0.log" 2>&1 || { echo "FAIL: st0 (see $TMP/st0.log)"; exit 1; }
+DTFE_FREE_GB=0.001 "${R7[@]}" "$TMP/stf" "${C[@]}" "${P3[@]}" > "$TMP/stf.log" 2>&1 || { echo "FAIL: stf (see $TMP/stf.log)"; exit 1; }
+grep -q "ordered merge: 0 partition(s) finished before their turn" "$TMP/st0.log" && ! grep -q " 0 waited for their turn" "$TMP/st0.log" \
+    && grep -q "ordered merge: 0 partition(s) finished before their turn" "$TMP/stf.log" && grep -q "(no room to stage)" "$TMP/stf.log" \
+    && same "$TMP/o1" "$TMP/st0" && same "$TMP/o1" "$TMP/stf"
+check "R7 DTFE_MERGE_STAGE_GB=0 and no free memory: nothing staged, partitions wait their turn, byte-identical" $?
+"${R7[@]}" "$TMP/co" "${C[@]}" "${P3[@]}" --completion-order-merge > "$TMP/co.log" 2>&1 || { echo "FAIL: co (see $TMP/co.log)"; exit 1; }
+grep -q "partition merge order  : completion order" "$TMP/co.log" && ! grep -q "ordered merge:" "$TMP/co.log" \
+    && "$PY" - "$TMP/o1" "$TMP/co" <<'PYEOF'
+import numpy as np, os, sys
+REAL = np.dtype(os.environ.get("DTFE_TEST_REAL", "float32"))
+for e in ("den", "a_den", "vel"):
+    a, b = (np.fromfile(f"{p}.{e}", dtype=REAL).astype(np.float64) for p in sys.argv[1:3])
+    if a.size != b.size or not a.size or np.abs(a - b).max() > 1e-5 * max(np.abs(a).max(), 1e-300): sys.exit(1)
+PYEOF
+check "R7 --completion-order-merge: completion order, nothing staged, the grids equal R1's to float rounding" $?
+"$BIN" "$SNAP" "$TMP/bad" "${C[@]}" "${P3[@]}" --ordered-merge --completion-order-merge > "$TMP/bad.log" 2>&1; rc=$?
+[ "$rc" != 0 ] && grep -q "contradict each other" "$TMP/bad.log" && [ ! -e "$TMP/bad.den" ]
+check "R7 '--ordered-merge --completion-order-merge' refused (exit $rc)" $?
+DTFE_TEST_EXIT_AFTER_PARTITIONS=10 "${R7[@]}" "$TMP/sk" "${C[@]}" "${P3[@]}" > "$TMP/sk.log" 2>&1; rc1=$?
+bits="$(grep -a -m1 '^merged ' "$TMP/sk.runlog.checkpoint/checkpoint" 2>/dev/null | awk '{print $2}')"
+OMP_NUM_THREADS=4 "$BIN" "$SNAP" "$TMP/sk" "${C[@]}" "${P3[@]}" --resume > "$TMP/sk2.log" 2>&1; rc2=$?
+[ "$rc1" = 137 ] && [ "$bits" = "111111111100000000000000000" ] && [ "$rc2" = 0 ] && same "$TMP/o1" "$TMP/sk"
+check "R7 killed after 10 merges with partitions staged (exit $rc1): partitions 0-9 checkpointed (${bits:-none}), resumed byte-identical (exit $rc2)" $?
+# the gate-guarded case: '--partition 3 3 3' with the concurrency left to the tuner (psPartitionBytes > 0)
+GA=(env DTFE_RAM_GB=64 DTFE_FREE_GB=1000 OMP_NUM_THREADS=4 DTFE_TEST_DELAY_PARTITION=0:2 "$BIN" "$SNAP")
+"${GA[@]}" "$TMP/sg" "${C[@]}" --partition 3 3 3 > "$TMP/sg.log" 2>&1 || { echo "FAIL: sg (see $TMP/sg.log)"; exit 1; }
+DTFE_MERGE_STAGE_GB=0 "${GA[@]}" "$TMP/sg0" "${C[@]}" --partition 3 3 3 > "$TMP/sg0.log" 2>&1 || { echo "FAIL: sg0 (see $TMP/sg0.log)"; exit 1; }
+nsg="$(sed -n 's/.*ordered merge: \([0-9]*\) partition(s) finished before their turn.*/\1/p' "$TMP/sg.log")"
+grep -q "the memory gate admits the next partition" "$TMP/sg.log" && [ "${nsg:-0}" -gt 0 ] && same "$TMP/sg0" "$TMP/sg"
+check "R7 auto-tuned concurrency (the memory gate guards the starts): ${nsg:-?} staged, byte-identical to DTFE_MERGE_STAGE_GB=0" $?
 
 echo ">> R2: the look-ahead on the CPU deposit (DTFE_PS_OVERLAP=1) against --ps-no-overlap"
 "$BIN" "$SNAP" "$TMP/n1" "${C[@]}" --partition 3 3 3 --max-concurrent 1 --ps-no-overlap > "$TMP/n1.log" 2>&1 \
@@ -154,17 +211,30 @@ wait "$BPID"; rc=$?
 "$PY" - "$P5.snaps" "$BPID" "$P5.runlog.progress" <<'PYEOF'
 import json, os, sys
 snaps = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
-keys = {"pid", "phase", "done", "total", "elapsed_s", "eta_s", "rss_gb", "gpu_retries", "updated"}
+keys = {"pid", "phase", "done", "total", "elapsed_s", "eta_s", "rss_gb", "gpu_retries", "predicted_gb", "peak_gb",
+        "updated"}
 parts = [s for s in snaps if s.get("phase") == "partitions"]
 ok = (bool(snaps) and all(keys <= set(s) for s in snaps) and all(s["pid"] == int(sys.argv[2]) for s in snaps)
       and len(parts) >= 2 and all(p["total"] == 64 for p in parts)
       and [p["done"] for p in parts] == sorted(p["done"] for p in parts) and max(p["done"] for p in parts) >= 32
-      and all(p["rss_gb"] > 0 for p in parts) and not os.path.exists(sys.argv[3]))
+      and all(p["rss_gb"] > 0 and p["peak_gb"] > 0 and p["predicted_gb"] == -1 for p in parts)
+      and not os.path.exists(sys.argv[3]))
 print(f"    {len(snaps)} snapshots read, phases {sorted({s.get('phase') for s in snaps})}, "
       f"done up to {max([p['done'] for p in parts] or [0])}/64")
 sys.exit(0 if ok else 1)
 PYEOF
 check "R5 the sidecar carries the contract's keys, counts the partitions up and is gone at the end" $?
+
+echo ">> R6: the SUMMARY's predicted-vs-measured memory line"
+"$BIN" "$SNAP" "$TMP/mm" --grid 32 --periodic --input 105 --MpcUnit 1 --verbose 1 --field density \
+    --partition 2 2 2 > "$TMP/mm.log" 2>&1 || { echo "FAIL: mm (see $TMP/mm.log)"; exit 1; }
+"$PY" - "$TMP/mm.log" "$P5.log" <<'PYEOF'
+import re, sys
+m = re.search(r"memory model\s*:\s*([\d.]+) GB predicted \(auto-tune\) vs ([\d.]+) GB measured", open(sys.argv[1]).read())
+print(f"    {m.group(0) if m else 'no memory model line'}")
+sys.exit(0 if m and float(m.group(1)) > 0 and float(m.group(2)) > 0 and "memory model" not in open(sys.argv[2]).read() else 1)
+PYEOF
+check "R6 an auto-tuned run prints its predicted and measured peak (and a run without a plan prints none)" $?
 
 echo "RESULT: $PASS passed, $FAILS failed"
 [ "$FAILS" = 0 ] || exit 1

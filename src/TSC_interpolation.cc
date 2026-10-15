@@ -66,12 +66,13 @@ void TSC_interpolation(vector<Particle_data> *particles,
 
 
 
-// TSC kernel policy for the shared engine: quadratic weights over a 3-cell stencil, with the
-// original edge-case handling for boundary particles.
+// TSC kernel policy for the shared engine: quadratic weights over a 3-cell stencil; boundary
+// particles use the stencil clipped to the grid (2026-10-11, see the engine).
 struct TSC_kernel
 {
     static int const STENCIL = 3;
     static constexpr double PAD_CELLS = 1.0;
+    static constexpr double CELL_OFFSET = 0.0;
     static char const* name() { return "TSC"; }
 
     static void interiorWeights( Real temp, Real weight[3] )
@@ -85,37 +86,7 @@ struct TSC_kernel
                                int cell[3], Real weight[3], int &cellCount )
     {
         if ( temp<-0.5 or temp>0.5 ) cout << temp << "\t" << j << "\t" << tempInt << "\n";
-
-        if ( tempInt==-1 )
-        {
-            cell[0] = 0; cellCount = 1;
-            weight[0] = .5 * (0.5+temp) * (0.5+temp);
-        }
-        else if ( tempInt==0 )
-        {
-            cell[0] = 0; cell[1] = 1; cellCount = 2;
-            weight[0] = .75 - temp * temp;
-            weight[1] = .5 * (0.5+temp) * (0.5+temp);
-        }
-        else if ( tempInt==int(nGridJ)-1 )
-        {
-            cell[0] = nGridJ-2; cell[1] = nGridJ-1; cellCount = 2;
-            weight[0] = .5 * (0.5-temp) * (0.5-temp);
-            weight[1] = .75 - temp * temp;
-        }
-        else if ( tempInt==int(nGridJ) )
-        {
-            cell[0] = nGridJ-1; cellCount = 1;
-            weight[0] = .5 * (0.5-temp) * (0.5-temp);
-        }
-        else if ( not( tempInt<-1 or tempInt>int(nGridJ) ) )
-        {
-            cell[0] = tempInt-1;
-            cell[1] = tempInt;
-            cell[2] = tempInt+1;
-            cellCount = 3;
-            interiorWeights( temp, weight );
-        }
+        clipStencil<TSC_kernel>( tempInt, temp, nGridJ, cell, weight, cellCount );
     }
 };
 

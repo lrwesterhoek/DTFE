@@ -108,6 +108,14 @@ if os.environ.get("DTFE_SIGMA_MPC"):
     FOOTPRINT_SIZE = footprint_for(SMOOTHING_SIGMA_CELLS)
 SMOOTHING_SIGMA_MPC = SMOOTHING_SIGMA_CELLS * CELL_SIZE
 
+# The cross-box comparison's common smoothing length in Mpc (2026-10-11, contract G2): 10.0002 TNG100-3-Dark cells
+# (110.7 Mpc / 512; production 10 cells = 2.16245 Mpc), the 2026-10-07 comparison's value, kept so its results stay
+# comparable. ONE number every Python user imports -- plot_void_crossbox.DEFAULT_SIGMA_MPC, analyze.py's cache
+# inventory (CACHE_SMOOTHING_MPC), the launcher (gui/runspec.py) -- because it names cache namespaces
+# (r512_s21.4291_f23 on TNG50): 2.16 next to 2.1625 on 2026-10-11 morning made a second, unreachable namespace.
+# scripts/thesis_runs.sh keeps the literal (a recipe of the runs made), commented with this name.
+CROSSBOX_SMOOTHING_MPC = 2.1625
+
 GRADIENT_THRESHOLD = 0.1
 
 DEEP_VOID_THRESHOLD = -0.1
@@ -227,8 +235,82 @@ def figures_path(analysis_key):
 
 # DTFE_CACHE_DIR (2026-10-11) moves the derived-product caches (python/cache: the void catalogues, slices, limits)
 # elsewhere, e.g. off iCloud Drive, which syncs every catalogue; unset, the default and every existing cache stay.
-CACHE_DIR = Path(os.path.expanduser(os.environ['DTFE_CACHE_DIR'])) if os.environ.get('DTFE_CACHE_DIR') \
-    else _REPO_ROOT / 'cache'
+# Since the evening of 2026-10-11 a PERSISTENT per-user setting does the same without an environment variable: the
+# one line of cache_setting_file() (~/.config/dtfe/cache_dir, or under $XDG_CONFIG_HOME), written by
+# 'analyze.py cache --move DIR' and the launcher's setup, which move the existing cache there first. Order: the
+# variable, then the setting, then python/cache. The repository lives in iCloud Drive on Luuk's Mac, so the 1.2 GB of
+# catalogues were synced on every rebuild.
+DEFAULT_CACHE_DIR = _REPO_ROOT / 'cache'
+
+
+def cache_setting_file():
+    """The per-user file holding the cache folder (one line; read at config import, after DTFE_CACHE_DIR).
+    $XDG_CONFIG_HOME/dtfe/cache_dir, else ~/.config/dtfe/cache_dir -- read at call time, so a test can point it at a
+    temp folder."""
+    base = os.environ.get('XDG_CONFIG_HOME') or os.path.join('~', '.config')
+    return Path(os.path.expanduser(base)) / 'dtfe' / 'cache_dir'
+
+
+def read_cache_setting(path=None):
+    """The folder the setting names (~ expanded), or None: no file, an empty or relative line, or unreadable (a
+    broken setting must not stop every script: the default is used and the setting can be rewritten)."""
+    try:
+        line = Path(cache_setting_file() if path is None else path).read_text().strip().splitlines()
+    except (OSError, UnicodeDecodeError):
+        return None
+    d = Path(os.path.expanduser(line[0].strip())) if line and line[0].strip() else None
+    return d if d is not None and d.is_absolute() else None
+
+
+def write_cache_setting(folder, path=None):
+    """Record 'folder' as the cache folder (atomically: a temp file renamed over the setting). Returns the file."""
+    f = Path(cache_setting_file() if path is None else path)
+    f.parent.mkdir(parents=True, exist_ok=True)
+    tmp = f.with_name(f"{f.name}.{os.getpid()}.tmp")
+    tmp.write_text(str(Path(os.path.expanduser(str(folder))).resolve()) + "\n")
+    os.replace(tmp, f)
+    return f
+
+
+def _cache_dir_and_source():
+    if os.environ.get('DTFE_CACHE_DIR'):
+        return Path(os.path.expanduser(os.environ['DTFE_CACHE_DIR'])), 'DTFE_CACHE_DIR'
+    d = read_cache_setting()
+    if d is not None:
+        return d, f"the setting in {cache_setting_file()}"
+    return DEFAULT_CACHE_DIR, 'default'
+
+
+CACHE_DIR, CACHE_DIR_SOURCE = _cache_dir_and_source()
+
+
+ICLOUD_MARKER = os.path.join('Mobile Documents', 'com~apple~CloudDocs')
+
+
+def in_icloud(path):
+    """Whether 'path' lies in iCloud Drive (~/Library/Mobile Documents/com~apple~CloudDocs/...): synced, so a
+    cache of gigabytes there is uploaded on every rebuild and may be evicted to the cloud."""
+    return ICLOUD_MARKER in str(Path(os.path.expanduser(str(path))).resolve())
+
+
+def local_cache_dir():
+    """Where a cache outside the repository goes by default: ~/Library/Caches/DTFE on macOS (never synced, never
+    backed up by Time Machine), $XDG_CACHE_HOME/dtfe or ~/.cache/dtfe elsewhere."""
+    import sys
+    if sys.platform == 'darwin':
+        return Path.home() / 'Library' / 'Caches' / 'DTFE'
+    return Path(os.path.expanduser(os.environ.get('XDG_CACHE_HOME') or os.path.join('~', '.cache'))) / 'dtfe'
+
+
+def icloud_cache_offer(repo_root=None, cache_dir=None):
+    """The folder to offer for the caches (local_cache_dir) when the repository sits in iCloud Drive AND the cache
+    is still inside it (the setup's question, 2026-10-11); None when there is nothing to offer: the repository is
+    not synced, or the cache already lives elsewhere (DTFE_CACHE_DIR or the setting)."""
+    repo = Path(_REPO_ROOT.parent if repo_root is None else repo_root)
+    cache = Path(CACHE_DIR if cache_dir is None else cache_dir)
+    if not in_icloud(repo) or not in_icloud(cache):
+        return None
+    return local_cache_dir()
 
 
 PERCENTILE_CLIP = (0.5, 99.5)

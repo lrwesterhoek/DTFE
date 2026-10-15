@@ -1,7 +1,9 @@
 """First-run setup: the four things a new user needs before the launcher is any use.
 
   1  Data folder      where simulations and grids live (defaults to the configured root when it
-                      exists -- an external disk that is unplugged is said so -- else ~/DTFE-data)
+                      exists -- an external disk that is unplugged is said so -- else ~/DTFE-data); and, when
+                      the repository sits in iCloud Drive with the analysis caches still inside it, an offer
+                      to keep those caches outside it (2026-10-11: analyze.py cache --move, the same move)
   2  Programs         are DTFE / PS-DTFE built, with which GPU backend (Metal, CUDA, HIP) and (PS-DTFE) the TBB parallel
                       triangulation, are the optional double-precision pair and the 2D programs there,
                       and does the Python that runs the figure scripts have its packages? 'Build' runs
@@ -31,6 +33,7 @@ from PySide6.QtWidgets import (
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import runspec as rs  # noqa: E402
+import config  # noqa: E402  (python/ is on the path: runspec puts it there)
 
 TNG_REGISTER = "https://www.tng-project.org/users/register/"
 
@@ -87,6 +90,14 @@ def build_command(double: bool = False, dim: int = 3) -> list[str]:
 BINARIES = ("PS-DTFE", "DTFE")
 DOUBLE_BINARIES = ("PS-DTFE-double", "DTFE-double")
 TWO_D_BINARIES = ("PS-DTFE-2d", "DTFE-2d")
+
+
+def cache_move_command(folder) -> list[str]:
+    """The command that moves the analysis caches to 'folder' and records it as their folder: analyze.py's own
+    'cache --move' (copy, verify, then remove; refused while a run or a figure script may be using the cache --
+    the launcher itself is the command's parent and is left out, then pointed at the new folder)."""
+    return [rs.PYTHON, str(rs.REPO_ROOT / "python" / "analyze.py"), "cache", "--move",
+            str(Path(str(folder)).expanduser()), "--yes"]
 
 
 def save_api_key(key: str, path: Path = rs.API_KEY_FILE) -> None:
@@ -151,6 +162,33 @@ class SetupDialog(QDialog):
         if data_root and not Path(data_root).is_dir():
             pv.addWidget(self._text(f"(The configured folder {data_root} is not there right now. An external "
                                     "disk that is unplugged? Choose it again once it is connected.)"))
+        # the analysis caches out of iCloud Drive (2026-10-11): offered only while the repository is synced AND the
+        # caches are still inside it (config.icloud_cache_offer); the move is analyze.py's own, run as a process so
+        # a gigabyte of copying never freezes the dialog
+        self._cache_proc: QProcess | None = None
+        self.cache_offer = config.icloud_cache_offer()
+        self.cache_box = QWidget()
+        cv = QVBoxLayout(self.cache_box)
+        cv.setContentsMargins(0, 12, 0, 0)
+        cv.addWidget(self._text(
+            "This repository is in iCloud Drive, which uploads every file in it. The analysis caches (void "
+            f"catalogues, slices; now in {config.CACHE_DIR}) are rewritten whenever a catalogue is rebuilt: "
+            "kept outside iCloud they are neither uploaded nor evicted. Every script and the launcher then use "
+            "the new folder (the setting is saved for you)."))
+        row = QHBoxLayout()
+        self.cache_dir = QLineEdit(str(self.cache_offer or config.local_cache_dir()))
+        row.addWidget(self.cache_dir, 1)
+        b = QToolButton(text="…")
+        b.clicked.connect(self._browse_cache)
+        row.addWidget(b)
+        self.cache_btn = QPushButton("Move the caches there")
+        self.cache_btn.clicked.connect(self._move_cache)
+        row.addWidget(self.cache_btn)
+        cv.addLayout(row)
+        self.cache_info = self._text("")
+        cv.addWidget(self.cache_info)
+        pv.addWidget(self.cache_box)
+        self.cache_box.setVisible(self.cache_offer is not None)
         pv.addStretch(1)
         self.pages.addWidget(p)
 
@@ -273,6 +311,60 @@ class SetupDialog(QDialog):
         if d:
             self.root.setText(d)
 
+    def _browse_cache(self):
+        d = QFileDialog.getExistingDirectory(self, "Cache folder", self.cache_dir.text())
+        if d:
+            self.cache_dir.setText(d)
+
+    def _move_cache(self):
+        """Run cache_move_command for the folder shown; its output in the note below the row."""
+        if self._cache_proc is not None:
+            return
+        folder = self.cache_dir.text().strip()
+        if not folder:
+            self.cache_info.setText("choose a folder first")
+            return
+        cmd = cache_move_command(folder)
+        self._cache_target = Path(folder).expanduser().resolve()
+        self._cache_out = []
+        self._cache_proc = QProcess(self)
+        self._cache_proc.setWorkingDirectory(str(rs.REPO_ROOT / "python"))
+        self._cache_proc.setProcessChannelMode(QProcess.MergedChannels)
+        self._cache_proc.readyReadStandardOutput.connect(self._cache_output)
+        self._cache_proc.finished.connect(self._cache_done)
+        self._cache_proc.errorOccurred.connect(self._cache_error)
+        self.cache_btn.setEnabled(False)
+        self.cache_info.setText("moving the caches (copied and verified before the old ones are removed)…")
+        self._cache_proc.start(cmd[0], cmd[1:])
+
+    def _cache_output(self):
+        if self._cache_proc is not None:
+            text = bytes(self._cache_proc.readAllStandardOutput()).decode(errors="replace")
+            self._cache_out += [ln for ln in text.splitlines() if ln.strip()]
+
+    def _cache_error(self, err):
+        if err != QProcess.FailedToStart or self._cache_proc is None:
+            return
+        self.cache_info.setText(f"cannot start {rs.PYTHON}: {self._cache_proc.errorString()}")
+        self._cache_proc = None
+        self.cache_btn.setEnabled(True)
+
+    def _cache_done(self, code, _status):
+        self._cache_output()
+        self._cache_proc = None
+        lines = self._cache_out
+        if code == 0:
+            # this process reads catalogues too (Explore, the Runs status): point it at the new folder now
+            config.CACHE_DIR, config.CACHE_DIR_SOURCE = self._cache_target, f"the setting in {config.cache_setting_file()}"
+            last = next((ln for ln in reversed(lines) if ln.startswith("Moved") or "already there" in ln),
+                        lines[-1] if lines else "")
+            self.cache_info.setText(f"✔ {last.strip()}")
+            self.cache_box.setEnabled(False)
+        else:
+            why = [ln.strip().lstrip("!").strip() for ln in lines if ln.strip().startswith("!!")]
+            self.cache_info.setText("not moved: " + (" ".join(why) if why else "\n".join(lines[-4:])))
+            self.cache_btn.setEnabled(True)
+
     def _build_note(self, *_):
         cmds = [" ".join(c) for c in self._build_commands()]
         self.build_note.setText("runs: " + "; then ".join(cmds) + "   (a few minutes each; needs CGAL, Boost, "
@@ -370,6 +462,8 @@ class SetupDialog(QDialog):
         self.accept()
 
     def reject(self):
+        if self._cache_proc is not None:     # a move is waited for, never killed between its renames and removals
+            self._cache_proc.waitForFinished(-1)
         if self._build is not None:
             self._build.kill()
             self._build.waitForFinished(3000)

@@ -39,6 +39,8 @@ if str(REPO_ROOT / "python") not in sys.path:
 
 from dtfelib.cli import DATA_ROOT, FIGURES_ROOT, find_sims, sim_dir  # noqa: E402  (after the path fix-up)
 from dtfelib.io import plane_geometry_matches  # noqa: E402
+from dtfelib.estimator import STANDARD_PADDING  # noqa: E402  (the Custom tab's standard '--padding', 2026-10-13)
+import config  # noqa: E402  (python/config.py: only dtfelib.cli at import; its h5py is lazy)
 
 PS_SCRIPT = REPO_ROOT / "scripts" / "run_ps_dtfe.sh"
 DTFE_SCRIPT = REPO_ROOT / "scripts" / "run_dtfe.sh"
@@ -62,8 +64,9 @@ def _current_figures_root(d: dict) -> dict:
 PYTHON = os.environ.get("PY") or shutil.which("python3") or sys.executable
 PIPELINE_PY_DEFAULT = "/opt/homebrew/bin/python3"         # run_ps_pipeline.sh's own PY default
 
-# (name passed to --field, label). run_ps_dtfe.sh takes any subset via FIELDS; its default is
-# the first seven. run_dtfe.sh has a FIXED list (DTFE_FIELDS) -- the GUI shows it read-only.
+# (name passed to --field, label). run_ps_dtfe.sh takes any subset via FIELDS; its default is all nine since
+# 2026-10-13 (the T-web and V-web joined the production set; it was the first seven). run_dtfe.sh takes the subset
+# it computes (no dispersion), its default DTFE_FIELDS.
 PS_FIELDS = [
     ("density_a", "density"),
     ("velocity_a", "velocity"),
@@ -75,12 +78,15 @@ PS_FIELDS = [
     ("tweb_a", "T-web"),
     ("vweb_a", "V-web"),
 ]
-PS_DEFAULT_FIELDS = [n for n, _ in PS_FIELDS[:7]]
+# run_ps_dtfe.sh's FIELDS default (2026-10-13: the nine of the thesis grids, the T-web and V-web included; a Grids or
+# Pipeline job passes FIELDS only when its ticks differ, so this must stay the script's default)
+PS_DEFAULT_FIELDS = [n for n, _ in PS_FIELDS]
 WEB_FIELDS = ("tweb_a", "vweb_a")        # the cosmic-web classes: the only consumers of lambda_th
 LAMBDA_TH_DEFAULT = 0.3                  # run_ps_dtfe.sh / run_dtfe.sh LAMBDA_TH (the binary alone: 0.0, so a Custom
                                          # run classified differently from a scripted one before 2026-10-05)
-DTFE_FIELDS = ["density_a", "velocity_a", "gradient_a", "divergence_a", "shear_a", "vorticity_a"]
-DTFE_ALLOWED_FIELDS = DTFE_FIELDS + list(WEB_FIELDS)   # what the standard binary computes (no dispersion: PS only)
+# run_dtfe.sh's FIELDS default (2026-10-13: with the T-web and V-web, as its production grids), likewise mirrored
+DTFE_FIELDS = ["density_a", "velocity_a", "gradient_a", "divergence_a", "shear_a", "vorticity_a"] + list(WEB_FIELDS)
+DTFE_ALLOWED_FIELDS = list(DTFE_FIELDS)  # what the standard binary computes (no dispersion: PS only)
 
 
 def dtfe_fields(fields) -> list[str]:
@@ -93,21 +99,31 @@ _FIELD_BYTES = {"density_a": 4, "velocity_a": 12, "gradient_a": 36, "divergence_
                 "shear_a": 36, "vorticity_a": 36, "dispersion_a": 24, "tweb_a": 72, "vweb_a": 52}
 
 
+def production_deposit(estimator: str) -> str:
+    """The deposit choice of an estimator's production grids, what a job starts at (2026-10-13): PS-DTFE the sampled
+    deposit (nSub^3 samples per cell), standard DTFE the exact cell average ('--exact-average', run_dtfe.sh's default
+    since 2026-10-13; its Monte-Carlo average lost 0.17-0.29% of the mass in the old grids). The launcher started
+    both at 'sampled', so a standard job ran the Monte-Carlo average unless it was changed by hand."""
+    return "exact" if estimator == "dtfe" else "sampled"
+
+
 @dataclass
 class RunSpec:
     data_root: str = str(DATA_ROOT)
     sim: str = ""
     snapshots: list[int] = field(default_factory=list)
     estimator: str = "ps"            # "ps" (run_ps_dtfe.sh) | "dtfe" (run_dtfe.sh)
-    deposit: str = "sampled"         # PS: "sampled" (nSub^3 samples/cell) | "exact" (r3d clipping);
-                                     # standard DTFE: "sampled" (Monte-Carlo cell means) | "exact" (--exact-average)
+    deposit: str = ""                # PS: "sampled" (nSub^3 samples/cell) | "exact" (r3d clipping);
+                                     # standard DTFE: "sampled" (Monte-Carlo cell means) | "exact" (--exact-average);
+                                     # "" (not given) = the estimator's production one, production_deposit()
     grid: int = 512
     nsub: int = 3
     fields: list[str] = field(default_factory=lambda: list(PS_DEFAULT_FIELDS))
     gpu: bool = True
     vertex_mass: bool = True         # --ps-vertex-mass (script default on; needed for TNG IC inputs)
     volume_weighted: bool = True     # --ps-volume-weighted (the production convention)
-    caustics: bool = False
+    caustics: bool = True            # --ps-caustics: on since 2026-10-13, as run_ps_dtfe.sh's default and every
+                                     # production PS grid (the 2026-10-12 rerun; +33% time, +1.2 GB on TNG)
     caustic_cusps: bool = False
     parallel_triangulation: bool = False   # --parallel-triangulation (opt-in: faster small runs, repeats differ at rounding)
     precision: str = "single"        # "single" (./PS-DTFE, ./DTFE) | "double" (the -double pair: float64 end to end, ~2x memory)
@@ -121,11 +137,18 @@ class RunSpec:
     mem_budget_gb: float = 0.0       # DTFE_MEM_BUDGET_GB: the auto-tuner's memory budget; 0 = its own (free RAM)
     tess_cache: str = ""             # TESS_CACHE: reuse the tessellation across runs (a local folder); "" = none
     linear_deposit: bool = False     # PS_LINEAR_DEPOSIT: --ps-linear-deposit (density-weighted inside each tet)
-    ordered_merge: bool = False      # ORDERED_MERGE: --ordered-merge (partitions merged in index order: bit-identical
-                                     # repeats; a fast partition then waits for the slower lower-numbered ones)
+    ordered_merge: bool = True       # ORDERED_MERGE: --ordered-merge (partitions merged in index order: bit-identical
+                                     # repeats). ON by default since 2026-10-14, as in run_ps_dtfe.sh and the binary
+                                     # (the staged merge: a partition finished early waits in memory, its thread goes
+                                     # on); off = ORDERED_MERGE=0, --completion-order-merge (the old default)
     start_over: bool = False         # PS_RESUME=0: a killed run's checkpoint is NOT resumed, the run starts from the
                                      # beginning and replaces it (2026-10-11: the launcher had no way to, and a
-                                     # refused resume -- other settings, an incomplete checkpoint -- failed every time)
+                                     # refused resume -- other settings, an incomplete checkpoint -- failed every time;
+                                     # standard jobs too since 2026-10-13: run_dtfe.sh's DTFE_RESUME=0)
+
+    def __post_init__(self):
+        if not self.deposit:            # 2026-10-13: a standard-DTFE job starts at the exact cell average
+            self.deposit = production_deposit(self.estimator)
 
     # ------------------------------------------------------------------ data
     def sim_path(self) -> Path:
@@ -167,9 +190,8 @@ class RunSpec:
         else:
             if self.slice_plane and not Path(self.slice_plane).is_file():
                 out.append(("error", f"slice file not found: {self.slice_plane}"))
-            if self.slice_plane and self.partition > 0:
-                out.append(("error", "a hi-res slice with standard DTFE evaluates ONE triangulation: set Partition to "
-                                     "auto (the binary refuses an explicit split)"))
+            # (a hi-res slice with an explicit Partition was refused here until 2026-10-13: the standard binary now
+            # answers the slice's points per partition, each from the tetrahedra it owns)
             out += gpu_advice(self.gpu, self.deposit, dtfe_fields(self.fields) or DTFE_FIELDS, dm_particles(self.sim),
                               "dtfe", grid=self.grid, precision=self.precision)
 
@@ -216,6 +238,12 @@ class RunSpec:
                 env["SAMPLE_POINTS"] = str(self.slice_plane)
                 env["PTS_VEL_GRAD"] = "1" if self.slice_vel_grad else "0"
             env["DTFE_METAL"] = "1" if self.gpu else "0"     # -m only switches the GPU ON; pin the env knob too
+            # and the cell average, both ways: run_dtfe.sh's default is the exact one since 2026-10-13, so a
+            # 'sampled' job without this would run exact (-e, like -m, only switches it on)
+            env["DTFE_EXACT_AVERAGE"] = "1" if self.deposit == "exact" else "0"
+            # the start-over tick reaches run_dtfe.sh too (2026-10-13: it resumes a killed partitioned run by itself,
+            # DTFE_RESUME as run_ps_dtfe.sh's PS_RESUME), spelled out both ways: a stray export cannot leak in
+            env["DTFE_RESUME"] = "0" if self.start_over else "1"
             if self.gpu:
                 argv.append("-m")
             if self.deposit == "exact":
@@ -252,8 +280,9 @@ class RunSpec:
         return _memory_key(self, ("snapshots", "lambda_th", "tess_cache", "start_over"))
 
     def check_step(self) -> "Step":
-        """The same run_ps_dtfe.sh call in report mode: the binary's own memory prediction per
-        snapshot, nothing computed or written. PS-DTFE only (the report covers its tuner)."""
+        """The same run_ps_dtfe.sh / run_dtfe.sh call in report mode: the binary's own memory prediction per
+        snapshot, nothing computed or written. Both estimators since 2026-10-13 (the standard binary's tuner
+        reported 'unsupported' before, and the launcher offered the check for PS-DTFE only)."""
         argv, env = self.command()
         env["AUTO_TUNE_REPORT"] = "1"
         return Step(f"memory check {self.sim}", argv, env)
@@ -431,8 +460,8 @@ def _busy_problems() -> list[tuple[str, str]]:
 
 
 # ---------------------------------------------------------------------- memory check
-# run_ps_dtfe.sh AUTO_TUNE_REPORT=1 prints, per snapshot, what the binary's own auto-tuner would
-# decide and how much memory it predicts -- the same model and stream estimate a real run uses.
+# run_ps_dtfe.sh (and, since 2026-10-13, run_dtfe.sh) AUTO_TUNE_REPORT=1 prints, per snapshot, what the binary's
+# own auto-tuner would decide and how much memory it predicts -- the same model and stream estimate a real run uses.
 # The binary itself (a custom-snapshot run) prints the line without 'snap=': it is keyed 0.
 _REPORT = re.compile(r"AUTO-TUNE-REPORT (?:snap=(\d+) )?(\w+=.*)$")
 
@@ -454,6 +483,18 @@ def parse_reports(text: str) -> dict[int, dict]:
                 pass
         out[int(m.group(1) or 0)] = rec
     return out
+
+
+def report_split_text(rec: dict, estimator: str, dim: int = 3) -> str:
+    """How a report's plan reads (2026-10-13): PS-DTFE runs 'mc' of its partitions at a time; standard DTFE runs its
+    partitions one after another, each triangulated by 'mc' threads (sub-boxes) at once -- the same report line, two
+    meanings of mc (auto_tune.h AutoTuneReport)."""
+    p, mc = int(rec.get("partition", 1)), int(rec.get("mc", 1))
+    power = "²" if dim == 2 else "³"
+    if estimator == "ps":
+        return f"{p}{power} partitions, {mc} at a time" if p > 1 else "one tessellation"
+    threads = f"{mc} thread{'s' if mc != 1 else ''}"
+    return f"{p}{power} partitions one after another, {threads} each" if p > 1 else f"one domain, {threads}"
 
 
 def _memory_key(spec, ignore: tuple) -> str:
@@ -554,14 +595,14 @@ class PipelineSpec:
     gpu: bool = True                # PS_GPU: the script's -m
     vertex_mass: bool = True        # PS_VERTEX_MASS (needed for TNG IC inputs)
     volume_weighted: bool = True    # PS_VOLUME_WEIGHTED (the production convention)
-    caustics: bool = False          # PS_CAUSTICS
+    caustics: bool = True           # PS_CAUSTICS (on since 2026-10-13: run_ps_dtfe.sh's default, the production runs')
     caustic_cusps: bool = False     # PS_CAUSTIC_CUSPS
     parallel_triangulation: bool = False   # PS_PARALLEL_TRI
     lambda_th: float = LAMBDA_TH_DEFAULT   # LAMBDA_TH
     mem_budget_gb: float = 0.0      # DTFE_MEM_BUDGET_GB, see RunSpec
     tess_cache: str = ""            # TESS_CACHE (run_ps_pipeline.sh forwards it to run_ps_dtfe.sh)
     linear_deposit: bool = False    # PS_LINEAR_DEPOSIT, see RunSpec
-    ordered_merge: bool = False     # ORDERED_MERGE (run_ps_pipeline.sh's run_ps_dtfe.sh inherits it), see RunSpec
+    ordered_merge: bool = True      # ORDERED_MERGE (run_ps_pipeline.sh's run_ps_dtfe.sh inherits it), see RunSpec
     start_over: bool = False        # PS_RESUME=0 (inherited the same way), see RunSpec
     output_prefix: str = "ps_output"
     precision: str = "single"       # "double" = the PS-DTFE-double binary (DTFE_PRECISION), see RunSpec
@@ -656,18 +697,29 @@ class PipelineSpec:
 
     def stale(self, sim: str, nu: int | None = None) -> tuple[list[int], int]:
         """(snapshots the pipeline would compute, snapshots on disk) -- the script's own test:
-        <prefix>.pts_den newer than the combined file and the plane (+ .pts_velGrad present), and a
-        plane file of this job's geometry (a differing one is regenerated: everything is stale then)."""
+        <prefix>.pts_den newer than the combined file and the plane and holding the plane's point count
+        (+ .pts_velGrad present), and a plane file of this job's geometry (a differing one is regenerated:
+        everything is stale then). The count (2026-10-11): a 4096^2 slice newer than an older 8192^2 plane
+        read as current, so the script skipped the compute and every render failed on the size mismatch."""
+        import json
         sp = sim_dir(sim, self.data_root)
         plane_bin = self.plane_json(sim, nu).with_suffix(".bin")
         plane_ok = (plane_bin.is_file() and self.plane_json(sim, nu).is_file()
                     and self.plane_matches(sim, nu) is not False)
+        want_pts = None
+        if plane_ok:                        # planes x nv x nu x K^2 from the sidecar, as run_ps_pipeline.sh counts
+            try:
+                s = json.loads(self.plane_json(sim, nu).read_text())
+                want_pts = int(s.get("planes", 1)) * int(s["nv"]) * int(s["nu"]) * int(s.get("supersample", 1)) ** 2
+            except (OSError, ValueError, KeyError, TypeError):
+                want_pts = plane_points(plane_bin)
         todo, total = [], 0
         for f in sorted(sp.glob("snapdir_*/combined_[0-9][0-9][0-9].hdf5")):
             n, total = int(f.stem.split("_")[1]), total + 1
             den = f.parent / f"{self.output_prefix}.pts_den"
             fresh = (not self.force and plane_ok
                      and den.is_file() and den.stat().st_mtime > max(f.stat().st_mtime, plane_bin.stat().st_mtime)
+                     and den.stat().st_size // 8 == want_pts
                      and (not self.vel_grad or (f.parent / f"{self.output_prefix}.pts_velGrad").is_file()))
             if not fresh:
                 todo.append(n)
@@ -921,7 +973,8 @@ def _plot_env(data_root: str, sim: str) -> dict[str, str]:
 class Opt:
     """One option of a figure set. kind: bool | int | float | choice | text | plane | multi (a checklist of
     'choices', the value a comma-separated string of the ticked ones). limits: a float's (min, max, decimals)
-    when the default box (0-1000, 2 decimals) cannot hold its values."""
+    when the default box (0-1000, 2 decimals) cannot hold its values. row: options sharing one row title sit
+    side by side on one line under it (the void scripts' own options, 2026-10-11: compact), label then short."""
     key: str
     label: str
     kind: str
@@ -929,6 +982,7 @@ class Opt:
     choices: tuple = ()
     help: str = ""
     limits: tuple = ()
+    row: str = ""
 
 
 # analyze.py's core plot scripts (its PLOT_SCRIPTS: kept equal by the runspec test) + the synthesis figure,
@@ -958,9 +1012,12 @@ _RAW = Opt("raw", "Unaveraged fields", "bool", False,
            help="The raw fields instead of the volume-averaged ones")
 _PLANE = Opt("plane", "Image plane", "plane", "",
              help="the plane sidecar (.json) the .pts_* files were evaluated on")
+# the common cross-box smoothing (contract G2, 2026-10-11): python/config.py's, one number for every Python user;
+# 2.1625 (10.0002 TNG100-3-Dark cells) while a config predates the constant
+CROSSBOX_SMOOTH_MPC = float(getattr(config, "CROSSBOX_SMOOTHING_MPC", 2.1625))
 # the void scripts' smoothing in Mpc (2026-10-07): the same physical scale in every box, the minima window following
 _SMOOTH_MPC = Opt("smooth_mpc", "Void smoothing in Mpc (0 = the default 10 cells)", "float", 0.0,
-                  help="e.g. 2.1625, TNG100's 10 cells: TNG50, TNG100 and TNG300 then find the same voids; "
+                  help=f"e.g. {CROSSBOX_SMOOTH_MPC:g}, TNG100's 10 cells: TNG50, TNG100 and TNG300 then find the same voids; "
                        "the outputs get their own names", limits=(0.0, 100.0, 4))
 _RADIUS = Opt("radius", "Void radius", "choice", "r_v", ("r_v", "r_eff"),
               help="r_v: the measured radius, where the smoothed density around the void rises back to the mean; "
@@ -969,7 +1026,108 @@ _OVERLAPS = Opt("keep_overlaps", "Keep overlapping voids", "bool", False,
                 help="also the voids whose centre lies inside the region of a deeper void")
 
 CROSSBOX_SIMS = "TNG50-3-Dark TNG100-3-Dark TNG300-3-Dark"     # plot_void_crossbox.py's own defaults
-CROSSBOX_SMOOTH_MPC = 2.1625
+
+# the void scripts' own options (2026-10-11), their defaults the scripts' (the runspec test compares them): only a
+# changed value adds its flag, so the exported command shows exactly what runs
+RV_DEFINITIONS = ("crossing", "delta08", "ridge")      # dtfelib.catalog.R_V_DEFINITIONS (not imported: launch time)
+SIZE_SMOOTH_CELLS = 5.0         # plot_void_population.SIZE_SMOOTH_CELLS
+SIZE_FUNCTION_RV = "delta08"    # plot_void_population.SIZE_FUNCTION_RV
+FIXED_R_SMOOTH_CELLS = "10 5 3"     # plot_void_population.FIXED_R_SMOOTH_CELLS (the size function at fixed R)
+FATE_REF_SNAP = 33             # plot_void_fate.REF_SNAP (z = 2)
+CONV_FACTORS = "2 4"            # dtfelib.convergence.DEFAULT_FACTORS
+CONV_MATCH_SIGMA = 1.0          # dtfelib.convergence.DEFAULT_MATCH_SIGMA
+CONV_RV_RANGE = "2.5 5"         # plot_void_convergence.DEFAULT_RV_RANGE
+ENV_FACTOR = 2.0                # dtfelib.classify.ENV_FACTOR
+ENV_CRITERIA = ("velocity", "density_smoothed", "density_raw")   # dtfelib.classify.CRITERIA, the first the default
+SKELETON_NULL_DRAWS = 50        # plot_caustic_skeleton.NULL_DRAWS
+_RV_HELP = ("crossing: where the smoothed density first rises back to the mean; delta08: where the enclosed contrast "
+            "reaches -0.8; ridge: the compensation ridge")
+_POP_OPTS = (
+    Opt("size_rv", "R_v", "choice", SIZE_FUNCTION_RV, (SIZE_FUNCTION_RV,) + tuple(d for d in RV_DEFINITIONS
+                                                                                   if d != SIZE_FUNCTION_RV)
+        + ("delta08raw",),
+        help="the void radius of the size function figure: " + _RV_HELP + " (the default, the theory's radius; "
+             "crossing while a catalogue lacks it); delta08raw: the same -0.8 radius on the unsmoothed density "
+             "(2026-10-11)", row="Size function"),
+    Opt("size_smooth", "smoothing (cells)", "float", SIZE_SMOOTH_CELLS,
+        help=f"the size function's own catalogue smoothing in grid cells (default {SIZE_SMOOTH_CELLS:g}: at the "
+             "production 10 cells the delta08 radius is mostly below the smoothing and undefined); 0 = the "
+             "catalogue of the other figures", limits=(0.0, 100.0, 2), row="Size function"),
+    # the size function at fixed R (2026-10-11): a job step of its own (the script's flag makes ONLY that figure),
+    # run with DTFE_VOID_GATE=none in its environment: it is defined on the ungated voids and refuses the gate
+    Opt("size_fixed_r", "size function at fixed R", "bool", False,
+        help="also the size function at fixed radius: the raw -0.8 radius of the distinct voids from catalogues at "
+             "the smoothings beside, against the Vdn model over the radii where every smoothing is complete, at "
+             "z = 0, 0.5, 1 and 2 (void_population/<sim>/gatenone). Its own step, run UNGATED (DTFE_VOID_GATE=none, "
+             "shown in the command): the ellipsoid gate cuts the large voids differently at each smoothing",
+        row="Fixed R"),
+    Opt("fixed_r_smooth", "cells", "text", FIXED_R_SMOOTH_CELLS,
+        help=f"the fixed-R catalogues' smoothings in grid cells, space-separated (default {FIXED_R_SMOOTH_CELLS}); "
+             "together with the Mpc ones the run uses exactly the smoothings in both boxes (clear this one for the "
+             "Mpc ones alone)", row="Fixed R"),
+    Opt("fixed_r_smooth_mpc", "Mpc", "text", "",
+        help=f"fixed-R smoothings in Mpc, the same scale in every box (e.g. {CROSSBOX_SMOOTH_MPC:g}, the cross-box "
+             "smoothing); TNG300-3-Dark has no common range at 10 5 3 cells: use "
+             f"{CROSSBOX_SMOOTH_MPC:g} Mpc with 3 2 cells there", row="Fixed R"))
+_TRACK_OPTS = (
+    Opt("link", "link", "choice", "trees", ("trees", "particles"),
+        help="how a void is followed back in time: trees, along the merger-tree tracers; particles, by its member "
+             "particles (the earlier void that gave it most of them; reads the combined snapshots once, the links "
+             "are then cached)", row="Followed by"),
+    Opt("exclusive", "each particle in one void", "bool", False,
+        help="with the particle link only: a particle inside several voids' spheres belongs to the one whose centre "
+             "is nearest in units of its R_v (the fate figure's partitioned links); at z of 1 and more the spheres "
+             "overlap", row="Followed by"))
+_FATE_OPTS = (
+    Opt("ref_snap", "direct link from snap", "int", FATE_REF_SNAP,
+        help=f"also link this snapshot directly to the last one (default {FATE_REF_SNAP}, z = 2); one not among the "
+             "linked snapshots adds no direct link", row="Links"),
+    Opt("exclusive", "each particle in one void", "bool", False,
+        help="a particle inside several voids' spheres goes to the one whose centre is nearest in units of its R_v "
+             "(a partition of the matter: overlapping high-z voids cannot both pass half their matter to one "
+             "descendant); its files are tagged '_exclusive'", row="Links"))
+_CONV_OPTS = (
+    Opt("factors", "grid factors", "text", CONV_FACTORS,
+        help="block-averaging factors of the grid, space-separated whole numbers (default 2 4: 512 to 256 and 128 "
+             "cells)", row="Convergence"),
+    Opt("match_sigma", "match (σ)", "float", CONV_MATCH_SIGMA,
+        help=f"the radius two voids match within, in smoothing lengths (default {CONV_MATCH_SIGMA:g})",
+        limits=(0.0, 100.0, 2), row="Convergence"),
+    Opt("rv_range", "stack R_v (σ)", "text", CONV_RV_RANGE,
+        help="the stacks' R_v range in smoothing lengths, two numbers lo hi (default 2.5 5)", row="Convergence"))
+_ENV_OPTS = (
+    Opt("criterion", "criterion", "choice", ENV_CRITERIA[0], ENV_CRITERIA,
+        help="what makes a void void-in-cloud: velocity (default): net infall of the shell between 2 and 3 R_v; "
+             "density_smoothed: the smoothed density enclosed within 3 R_v above the mean; density_raw: the raw "
+             "density enclosed within the factor below (2026-10-11)", row="Void type"),
+    Opt("factor", "within (R_v)", "float", ENV_FACTOR,
+        help=f"density_raw only: its raw density contrast is taken within this many R_v (default {ENV_FACTOR:g}, "
+             f"Ceccarelli et al. 2013); the default criterion is the infall of the shell between 2 and 3 R_v, "
+             f"which this does not change", limits=(0.0, 100.0, 2), row="Void type"),
+    Opt("r_v_definition", "R_v", "choice", "crossing", RV_DEFINITIONS,
+        help="which void radius: " + _RV_HELP + "; a catalogue without it is rebuilt by the pipeline", row="Void type"))
+_EVOL_OPTS = (
+    Opt("rv_definition", "Void radius", "choice", "crossing", RV_DEFINITIONS,
+        help="the void radius the profiles are scaled by: " + _RV_HELP + "; one the catalogue lacks falls back to "
+             "crossing"),)
+_SKEL_OPTS = (
+    Opt("null_draws", "null draws", "int", SKELETON_NULL_DRAWS,
+        help="per-void statistics: realisations of the random-sphere null (one sphere per void at a random cell, "
+             f"with its radius), the voids' medians as z-scores against it (default {SKELETON_NULL_DRAWS}; 0 = no "
+             "null; another count tags the set)", row="Per void"),
+    Opt("sheet_min_density", "walls denser than", "float", 0.0,
+        help="per-void statistics: count only the sheet cells denser than this many times the mean (default 0: "
+             "every one); the single-fold sheet percolates through the voids, its dense part is the walls",
+        limits=DENSITY_LIMITS, row="Per void"),
+    Opt("min_component", "min component (cells)", "int", 0,
+        help="per-void statistics: the shells and the wall distance on sheet components of at least this many "
+             "cells only (default 0: every sheet cell)", row="Sheet components"),
+    Opt("min_component_mass", "and mass fraction", "float", 0.0,
+        help="per-void statistics: and of at least this fraction of the box's mass (default 0)",
+        limits=(0.0, 1.0, 5), row="Sheet components"),
+    Opt("all_caustic", "Every snapshot with caustic grids (instead of the selected ones)", "bool", False,
+        help="every snapshot of the simulation that has a caustic class grid under this prefix; the snapshot "
+             "selection is then not used"))
 
 FIGURE_SETS: tuple[FigureSet, ...] = (
     FigureSet("fields", "Field slice maps", "plot/plot_PS_DTFE.py", "snapshot",
@@ -1016,11 +1174,11 @@ FIGURE_SETS: tuple[FigureSet, ...] = (
               "Counts, sizes, shapes and depths of all voids at every snapshot with grids.",
               "void_population/<sim>",
               opts=(Opt("panel_selected", "Distribution panels at the selected snapshots", "bool", False,
-                        help="default: config.PANEL_SNAPSHOTS"), _OVERLAPS, _SMOOTH_MPC)),
+                        help="default: config.PANEL_SNAPSHOTS"), _OVERLAPS, _SMOOTH_MPC) + _POP_OPTS),
     FigureSet("voidtrack", "Void tracking", "plot/plot_void_tracking.py", "sim",
               "Size, BBKS shape and orientation of the deepest voids followed back in time "
               "through the merger trees.", "void_tracking/<sim>",
-              opts=(_REF, Opt("n_voids", "Voids", "int", 5), _RADIUS, _SMOOTH_MPC)),
+              opts=(_REF, Opt("n_voids", "Voids", "int", 5), _RADIUS, _SMOOTH_MPC) + _TRACK_OPTS),
     # the cross-box comparison (2026-10-11): several boxes at ONE smoothing in Mpc; it takes the boxes itself
     # (--sims), not the selected simulation
     FigureSet("crossbox", "Void statistics across boxes", "plot/plot_void_crossbox.py", "sim",
@@ -1029,7 +1187,8 @@ FIGURE_SETS: tuple[FigureSet, ...] = (
               "per 512 cubed snapshot) unless only redrawn.", "void_crossbox", common=False,
               opts=(Opt("sims", "Boxes", "text", CROSSBOX_SIMS, help="space-separated simulation names"),
                     Opt("smooth_mpc", "Common smoothing in Mpc", "float", CROSSBOX_SMOOTH_MPC,
-                        help="2.1625 = 10.0002 TNG100-3-Dark cells, the earlier results' value",
+                        help=f"{CROSSBOX_SMOOTH_MPC:g} = config.CROSSBOX_SMOOTHING_MPC (2.1625 = 10.0002 TNG100-3-Dark "
+                             "cells, the earlier results' value)",
                         limits=(0.0, 100.0, 4)),
                     Opt("z", "Redshifts of the bottom row", "text", "0 0.5 1", help="space-separated, one figure each"),
                     Opt("n_boot", "Bootstrap resamples (0 = the script's default)", "int", 0),
@@ -1038,19 +1197,20 @@ FIGURE_SETS: tuple[FigureSet, ...] = (
     # arguments (--sim and the common grid options)
     FigureSet("voidevol", "Void profile evolution", "plot/plot_void_profile_evolution.py", "sim",
               "The stacked void density profiles across redshift, with the Hamaus, Sutter and Wandelt (2014) fit.",
-              "void_profile_evolution/<sim>"),
+              "void_profile_evolution/<sim>", opts=_EVOL_OPTS),
     FigureSet("voidenv", "Void environment", "plot/plot_void_environment.py", "sim",
-              "Voids in clouds against voids in voids (Ceccarelli et al. 2013): the density contrast within two "
-              "void radii, and how the two kinds evolve.", "void_environment/<sim>"),
+              "Voids in clouds against voids in voids: by default the infall of the shell between 2 and 3 void "
+              "radii (the density within two radii, Ceccarelli et al. 2013, as a choice), and how the two kinds "
+              "evolve.", "void_environment/<sim>", opts=_ENV_OPTS),
     FigureSet("voidfate", "Void fate", "plot/plot_void_fate.py", "sim",
               "What becomes of each void between snapshots, linked by its member particles: survives, merges, "
-              "splits or vanishes.", "void_fate/<sim>"),
+              "splits or vanishes.", "void_fate/<sim>", opts=_FATE_OPTS),
     # the convergence check (contract K4, 2026-10-11): registered by name, default arguments '--sim SIM' (like
     # every void script it needs DTFE_SIM, which _plot_env sets) plus the common grid options when set
     FigureSet("voidconv", "Void convergence", "plot/plot_void_convergence.py", "sim",
               "Resolution and estimator convergence of the void statistics: abundance, R_v and stacked profiles "
               "at different grid resolutions, and PS-DTFE against standard DTFE on the same voids.",
-              "void_convergence/<sim>"),
+              "void_convergence/<sim>", opts=_CONV_OPTS),
     # the catalogue itself, for the Runs tab's 'Build void catalogue' (2026-10-11): the pipeline's cached
     # catalogue of the selected snapshots' grids, as the Explore outlines and the void figures read it
     FigureSet("voidcat", "Void catalogue build", "gui/void_cache.py", "snapshot",
@@ -1085,7 +1245,7 @@ FIGURE_SETS: tuple[FigureSet, ...] = (
     FigureSet("skeleton", "Caustic skeleton", "plot/plot_caustic_skeleton.py", "series",
               "Walls, filaments and nodes from the collapse classes of a run with caustics on, and per void the "
               "fold fraction around its wall and the distance to the nearest wall.", "caustic_skeleton/<sim>",
-              opts=(Opt("voids", "Per-void statistics", "bool", True), _RADIUS, _OVERLAPS, _SMOOTH_MPC)),
+              opts=(Opt("voids", "Per-void statistics", "bool", True), _RADIUS, _OVERLAPS, _SMOOTH_MPC) + _SKEL_OPTS),
     FigureSet("thesis", "Thesis analysis set", "analyze.py", "series",
               "The core analysis figures (eigenvalues, void shapes, correlations, ...) through "
               "analyze.py: 'compute' fills python/cache from the standard-DTFE grids with the "
@@ -1130,6 +1290,33 @@ class PlotSpec:
             a += ["--smooth", f"{self.smooth:g}"]
         return a
 
+    def _snap_estimator(self, n: int) -> str:
+        """'ps' or 'dtfe' for snapshot n: the estimator chosen, else what a script's FieldSet(method='auto') loads
+        there (a grid prefix means PS-DTFE; PS-DTFE grids when present, else standard DTFE). 2026-10-11: the void
+        catalogue build turned 'auto' into 'ps' while its check accepted a snapdir with standard-DTFE grids only,
+        so the job failed on every snapshot of such a box."""
+        if self.method in ("ps", "dtfe"):
+            return self.method
+        sd = self.sim_path() / f"snapdir_{n:03d}"
+        if self.prefix or has_outputs(sd, "ps_output", "ps"):
+            return "ps"
+        return "dtfe" if has_outputs(sd, "", "dtfe") else "ps"
+
+    def _pts_prefix(self, n: int) -> str:
+        """The '.pts_*' prefix (without the dot) the point-evaluated sets read for snapshot n: the grid prefix when
+        one is set, else the estimator's own (output for standard DTFE); with 'auto' the slice that is there, PS-DTFE
+        first, as plot_pointeval.py picks it. 2026-10-11: both sets assumed ps_output, so a standard-DTFE hi-res
+        slice could not be rendered from the launcher once PS-DTFE grids sat beside it."""
+        if self.prefix:
+            return self.prefix
+        if self.method in ("ps", "dtfe"):
+            return "ps_output" if self.method == "ps" else "output"
+        sd = self.sim_path() / f"snapdir_{n:03d}"
+        for pre in ("ps_output", "output"):
+            if (sd / f"{pre}.pts_den").is_file():
+                return pre
+        return "ps_output"
+
     def _void_args(self, key) -> list[str]:
         """The void options a set has: the radius, overlapping voids, the smoothing in Mpc."""
         names = {o.key for o in FIGURE_SET[key].opts}
@@ -1141,6 +1328,88 @@ class PlotSpec:
         if "smooth_mpc" in names and float(self.opt(key, "smooth_mpc")) > 0:
             a += ["--smooth-mpc", f"{float(self.opt(key, 'smooth_mpc')):g}"]
         return a
+
+    @staticmethod
+    def _numbers(text, kind=float) -> list | None:
+        """'2, 4 8' -> [2, 4, 8]; None when a word is no number of that kind."""
+        try:
+            return [kind(w) for w in str(text).replace(",", " ").split()]
+        except ValueError:
+            return None
+
+    def _script_args(self, key) -> list[str]:
+        """The void scripts' own options (2026-10-11): a flag only for a value other than the script's default."""
+        names = {o.key for o in FIGURE_SET[key].opts}
+        a = []
+
+        def num(opt_key, flag, default):
+            v = float(self.opt(key, opt_key))
+            if opt_key in names and v != default:
+                a.extend([flag, f"{v:g}"])
+        if key == "voidpop":
+            if self.opt(key, "size_rv") != SIZE_FUNCTION_RV:
+                a += ["--size-rv", str(self.opt(key, "size_rv"))]
+            num("size_smooth", "--size-smooth", SIZE_SMOOTH_CELLS)
+        elif key in ("voidtrack", "voidfate"):
+            if key == "voidtrack" and self.opt(key, "link") != "trees":
+                a += ["--link", str(self.opt(key, "link"))]
+            if key == "voidfate" and int(self.opt(key, "ref_snap")) != FATE_REF_SNAP:
+                a += ["--ref-snap", str(int(self.opt(key, "ref_snap")))]
+            if self.opt(key, "exclusive"):
+                a.append("--exclusive")
+        elif key == "voidconv":
+            f = self._numbers(self.opt(key, "factors"), int)
+            if f and f != self._numbers(CONV_FACTORS, int):
+                a += ["--factors", *map(str, f)]
+            num("match_sigma", "--match-sigma", CONV_MATCH_SIGMA)
+            r = self._numbers(self.opt(key, "rv_range"))
+            if r and r != self._numbers(CONV_RV_RANGE):
+                a += ["--rv-range", *(f"{v:g}" for v in r)]
+        elif key == "voidenv":
+            if self.opt(key, "criterion") != ENV_CRITERIA[0]:
+                a += ["--criterion", str(self.opt(key, "criterion"))]
+            num("factor", "--factor", ENV_FACTOR)
+            if self.opt(key, "r_v_definition") != "crossing":
+                a += ["--r-v-definition", str(self.opt(key, "r_v_definition"))]
+        elif key == "voidevol":
+            if self.opt(key, "rv_definition") != "crossing":
+                a += ["--rv-definition", str(self.opt(key, "rv_definition"))]
+        elif key == "skeleton":
+            if int(self.opt(key, "null_draws")) != SKELETON_NULL_DRAWS:
+                a += ["--null-draws", str(int(self.opt(key, "null_draws")))]
+            if int(self.opt(key, "min_component")) > 0:
+                a += ["--min-component", str(int(self.opt(key, "min_component")))]
+            num("min_component_mass", "--min-component-mass", 0.0)
+            num("sheet_min_density", "--sheet-min-density", 0.0)
+            if self.opt(key, "all_caustic"):
+                a.append("--all-caustic")
+        return a
+
+    def _fixed_r_smoothings(self) -> tuple[list | None, list | None]:
+        """The size function at fixed R's smoothings as typed: (cells, Mpc), None for a word that is no number."""
+        return (self._numbers(self.opt("voidpop", "fixed_r_smooth")),
+                self._numbers(self.opt("voidpop", "fixed_r_smooth_mpc")))
+
+    def _fixed_r_step(self, base: list[str], env: dict[str, str]) -> Step:
+        """The Void population set's size function at fixed R (2026-10-11): its own call, since the script's
+        --size-fixed-r makes ONLY that figure (the population figures stay in their step, under the caller's gate),
+        and UNGATED in its own environment: the script refuses it under the ellipsoid gate. A copy of env, which
+        every step of the job shares. The estimator and grid prefix only: the smoothings are its own (the common
+        --smooth and the population's --smooth-mpc would only mislead), and so are its snapshots (z = 0, 0.5, 1, 2)."""
+        cells, mpc = self._fixed_r_smoothings()
+        a = base + ["--sim", self.sim]
+        if self.method != "auto":
+            a += ["--method", self.method]
+        if self.prefix:
+            a += ["--prefix", self.prefix]
+        a.append("--size-fixed-r")
+        # the script takes exactly the smoothings given (either list alone means only those): the cells are spelled
+        # out beside Mpc ones, left to the script's own default otherwise
+        if cells and (mpc or cells != self._numbers(FIXED_R_SMOOTH_CELLS)):
+            a += ["--fixed-r-smooth", *(f"{v:g}" for v in cells)]
+        if mpc:
+            a += ["--fixed-r-smooth-mpc", *(f"{v:g}" for v in mpc)]
+        return Step(f"{Path(base[1]).name} size function at fixed R", a, dict(env, DTFE_VOID_GATE="none"))
 
     def steps(self) -> list[Step]:
         out: list[Step] = []
@@ -1164,6 +1433,8 @@ class PlotSpec:
                 a = base + ["--sims", self.sim, "--snaps", ",".join(map(str, snaps))]
                 if self.opt(key, "plane"):
                     a += ["--plane", str(self.opt(key, "plane"))]
+                if self.method != "auto":           # a standard-DTFE slice beside PS-DTFE grids (2026-10-11)
+                    a += ["--method", self.method]
                 if self.prefix:
                     a += ["--prefix", self.prefix]
                 if str(self.opt(key, "fields")).strip():
@@ -1187,7 +1458,7 @@ class PlotSpec:
                     sd = self.sim_path() / f"snapdir_{n:03d}"
                     png = Path(self.figures_root) / "pointeval_panels" / self.sim / \
                         f"snap{n:03d}_{Path(plane).stem or 'plane'}.png"
-                    a = base + ["--prefix", str(sd / (self.prefix or "ps_output")), "--plane", plane,
+                    a = base + ["--prefix", str(sd / self._pts_prefix(n)), "--plane", plane,
                                 "-o", str(png)]
                     if self.opt(key, "panels") != "density,sheet,streams":
                         a += ["--panels", str(self.opt(key, "panels")).replace(" ", "")]
@@ -1205,9 +1476,13 @@ class PlotSpec:
                 a = base + ["--sim", self.sim] + self._common()
                 if self.opt(key, "panel_selected") and snaps:
                     a += ["--panel-snaps", *map(str, snaps)]
-                out.append(Step(name, a + self._void_args(key), env))
+                out.append(Step(name, a + self._void_args(key) + self._script_args(key), env))
+                if self.opt(key, "size_fixed_r"):
+                    out.append(self._fixed_r_step(base, env))
             elif key in ("voidprof", "webstreams", "pk", "skeleton"):
-                a = base + ["--sim", self.sim, "--snaps", *map(str, snaps)] + self._common()
+                # every caustic snapshot: the script picks them itself and ignores a snapshot list
+                every = key == "skeleton" and self.opt(key, "all_caustic")
+                a = base + ["--sim", self.sim] + ([] if every else ["--snaps", *map(str, snaps)]) + self._common()
                 if key == "voidprof" and self.opt(key, "sample") != "resolved":
                     a += ["--sample", str(self.opt(key, "sample"))]
                 if key == "webstreams" and self.opt(key, "web") != "both":
@@ -1219,11 +1494,12 @@ class PlotSpec:
                         a += ["--ref-snap", "-1"]
                 if key == "skeleton" and self.opt(key, "voids"):
                     a.append("--voids")
-                out.append(Step(f"{name} {len(snaps)} snapshots", a + self._void_args(key), env))
+                out.append(Step(name + (" every caustic snapshot" if every else f" {len(snaps)} snapshots"),
+                                a + self._void_args(key) + self._script_args(key), env))
             elif key == "voidtrack":
                 out.append(Step(name, base + ["--sim", self.sim, "--snap", str(self.opt(key, "ref"))]
                                 + self._common() + ["--n-voids", str(self.opt(key, "n_voids"))]
-                                + self._void_args(key), env))
+                                + self._void_args(key) + self._script_args(key), env))
             elif key == "crossbox":
                 a = base + ["--sims", *str(self.opt(key, "sims")).replace(",", " ").split(),
                             "--data-root", str(self.data_root)]
@@ -1243,11 +1519,10 @@ class PlotSpec:
                     a += ["--out", str(Path(self.figures_root) / "void_crossbox")]
                 out.append(Step(name, a, env))      # its per-box workers get their own DTFE_SIM
             elif key in ("voidevol", "voidenv", "voidfate", "voidconv"):
-                out.append(Step(name, base + ["--sim", self.sim] + self._common(), env))
+                out.append(Step(name, base + ["--sim", self.sim] + self._common() + self._script_args(key), env))
             elif key == "voidcat":
-                method = self.method if self.method in ("ps", "dtfe") else "ps"
                 for n in snaps:
-                    a = base + ["build", "--sim", self.sim, "--snap", str(n), "--method", method]
+                    a = base + ["build", "--sim", self.sim, "--snap", str(n), "--method", self._snap_estimator(n)]
                     if self.prefix:
                         a += ["--prefix", self.prefix]
                     out.append(Step(f"void catalogue snap {n:03d}", a, env))
@@ -1285,7 +1560,8 @@ class PlotSpec:
         snaps = sorted(self.snapshots)
         need_snaps = [k for k in self.sets
                       if FIGURE_SET[k].per in ("snapshot", "series")
-                      and not (k == "thesis" and self.opt(k, "mode") in ("plot", "check"))]
+                      and not (k == "thesis" and self.opt(k, "mode") in ("plot", "check"))
+                      and not (k == "skeleton" and self.opt(k, "all_caustic"))]
         if need_snaps and not snaps:
             out.append(("error", "no snapshots selected (needed by: "
                                  + ", ".join(FIGURE_SET[k].title for k in need_snaps) + ")"))
@@ -1307,13 +1583,14 @@ class PlotSpec:
                 has_grids(sp / f"snapdir_{n:03d}", "dtfe", "") for n in snaps):
             out.append(("warning", "the DTFE series plots standard-DTFE grids by default; "
                                    "set the estimator to PS-DTFE to plot those instead"))
-        prefix = self.prefix or "ps_output"
         for k in ("pointeval", "panels"):
             if k not in self.sets:
                 continue
-            missing = [n for n in snaps if not (sp / f"snapdir_{n:03d}" / f"{prefix}.pts_den").is_file()]
+            missing = [n for n in snaps if not (sp / f"snapdir_{n:03d}" / f"{self._pts_prefix(n)}.pts_den").is_file()]
             if missing:
-                out.append(("warning", f"{FIGURE_SET[k].title}: no point-evaluated slice ({prefix}.pts_den) for "
+                pre = sorted({self._pts_prefix(n) for n in missing})
+                out.append(("warning", f"{FIGURE_SET[k].title}: no point-evaluated slice "
+                                       f"({' or '.join(p + '.pts_den' for p in pre)}) for "
                                        + " ".join(f"{n:03d}" for n in missing)
                                        + "; run the pipeline or a hi-res slice first"))
             plane = str(self.opt(k, "plane"))
@@ -1341,7 +1618,25 @@ class PlotSpec:
                and float(self.opt(k, "smooth_mpc")) > 0]
         if mpc and self.smooth > 0:
             out.append(("error", "the smoothing is given in cells and in Mpc (" + ", ".join(mpc) + "): use one"))
-        if "skeleton" in self.sets:
+        if "voidtrack" in self.sets and self.opt("voidtrack", "exclusive") and self.opt("voidtrack", "link") != "particles":
+            # the script's own parser refuses it (merger-tree tracers have no member particles)
+            out.append(("error", "Void tracking: 'each particle in one void' needs the particle link"))
+        if "voidconv" in self.sets:
+            # free-text lists (2026-10-11): refused here, not as an argparse error in the job's log
+            f = self._numbers(self.opt("voidconv", "factors"), int)
+            if not f or min(f) < 2:
+                out.append(("error", "Void convergence: the grid factors must be whole numbers of 2 or more"))
+            r = self._numbers(self.opt("voidconv", "rv_range"))
+            if not r or len(r) != 2 or not 0 <= r[0] < r[1]:
+                out.append(("error", "Void convergence: the stack R_v range must be two numbers, low then high"))
+        if "voidpop" in self.sets and self.opt("voidpop", "size_fixed_r"):
+            # the fixed-R smoothings are free text (2026-10-11): refused here, not as the script's error in the log
+            cells, mpc = self._fixed_r_smoothings()
+            if cells is None or mpc is None or any(v <= 0 for v in cells + mpc):
+                out.append(("error", "Void population: the fixed-R smoothings must be positive numbers"))
+            elif not cells and not mpc:
+                out.append(("error", "Void population: the size function at fixed R needs a smoothing in cells or Mpc"))
+        if "skeleton" in self.sets and not self.opt("skeleton", "all_caustic"):
             cc = (self.prefix or "ps_output") + ".causticClass"
             missing = [n for n in snaps if not (sp / f"snapdir_{n:03d}" / cc).is_file()]
             if missing:
@@ -1632,7 +1927,7 @@ class CustomSpec:
     lagrangian_file: str = ""
     grid: int = 128
     nsub: int = 3
-    deposit: str = "sampled"
+    deposit: str = ""               # as RunSpec's: "" = the estimator's production one (standard DTFE: the exact average)
     fields: list[str] = field(default_factory=lambda: ["density_a", "velocity_a", "dispersion_a"])
     gpu: bool = False
     vertex_mass: bool = False       # needed when the initial positions are PERTURBED (e.g. TNG's z=127)
@@ -1652,7 +1947,7 @@ class CustomSpec:
     mem_budget_gb: float = 0.0      # DTFE_MEM_BUDGET_GB in the binary's environment, see RunSpec
     tess_cache: str = ""            # --tessellation-cache <folder>; "" = none
     linear_deposit: bool = False    # --ps-linear-deposit (PS only; not with the volume-weighted velocities)
-    ordered_merge: bool = False     # --ordered-merge (PS only), see RunSpec
+    ordered_merge: bool = True      # --ordered-merge (PS only; off: --completion-order-merge), see RunSpec
     sample_points: str = ""         # --sample-points <file>: the fields at these points too ('.pts_*'); "" = none
     pts_vel_grad: bool = True       # ... with the velocity gradient at each point (--pts-vel-grad)
     window: list[float] = field(default_factory=list)   # --ps-window x0 x1 y0 y1 [z0 z1] in Mpc: only these cells
@@ -1663,6 +1958,10 @@ class CustomSpec:
     demo_n: int = 0                 # > 0: first generate the synthetic demo snapshot (crossed waves, n^3) ...
     demo_file: str = ""             # ... but only at THIS path (demo_spec sets it): the setting is persisted, and
                                     # before 2026-10-05 any later missing input quietly became a demo
+
+    def __post_init__(self):
+        if not self.deposit:            # 2026-10-13: a standard-DTFE run starts at the exact cell average
+            self.deposit = production_deposit(self.estimator)
 
     def name(self) -> str:
         return self.output_name.strip() or (Path(self.input_file).stem if self.input_file else "output")
@@ -1722,8 +2021,9 @@ class CustomSpec:
                 a += ["--ps-alpha-shape", f"{self.alpha_shape:g}"]
             if self.linear_deposit:
                 a.append("--ps-linear-deposit")
-            if self.ordered_merge:
-                a.append("--ordered-merge")
+            # the merge order said either way (2026-10-14: index order is the binary's default; the flag keeps it in
+            # the run log, which 'Load settings' reads back)
+            a.append("--ordered-merge" if self.ordered_merge else "--completion-order-merge")
             if self.halo_release > 0:
                 a += ["--ps-halo-release", _num(self.halo_release)]
             if len(self.window) == 2 * self.dim:
@@ -1733,6 +2033,10 @@ class CustomSpec:
                 a.append("--gpu")
             if self.deposit == "exact":
                 a.append("--exact-average")
+            # the padding (2026-10-13): the binary's own 5 mean spacings leave wrong values within a few spacings of
+            # a box face (or of the --box region's faces); 15, run_dtfe.sh's and the standard server's value
+            # (dtfelib.estimator.STANDARD_PADDING). PS-DTFE pads in Lagrangian space by its own rules: nothing added
+            a += ["--padding", f"{STANDARD_PADDING:g}"]
         if self.partition > 0:
             a += ["--partition"] + [str(self.partition)] * self.dim
         if self.max_concurrent > 0:
@@ -1805,6 +2109,9 @@ class CustomSpec:
             b = hdf5_boxsize(f)
             if b:
                 d["box_mpc"] = [0.0, b / self.mpc_unit] * self.dim
+        # the header's redshift: Explore scales the u-unit velocities by sqrt(a) with it (2026-10-11: it was never
+        # read, so a z > 0 snapshot's velocities showed 1/sqrt(a) too large); None = no scaling
+        d["redshift"] = hdf5_redshift(f) if f.is_file() and self.input_type == 105 else None
         return d
 
     def problems(self) -> list[tuple[str, str]]:
@@ -1893,9 +2200,8 @@ class CustomSpec:
         if self.sample_points:
             if not Path(self.sample_points).expanduser().is_file():
                 out.append(("error", f"sample-points file not found: {self.sample_points}"))
-            if not ps and self.partition > 0:
-                out.append(("error", "sample points with standard DTFE evaluate ONE triangulation: set Partition to "
-                                     "auto (the binary refuses an explicit split)"))
+            # (standard DTFE with an explicit Partition was refused here until 2026-10-13: the binary now answers
+            # the points per partition, each from the tetrahedra it owns)
         if self.window:
             if not ps:
                 out.append(("info", "the window is a PS-DTFE option: this standard-DTFE run ignores it"))
@@ -1965,6 +2271,17 @@ def hdf5_boxsize(path) -> float | None:
         with h5py.File(path, "r") as h:
             b = float(h["Header"].attrs["BoxSize"])
         return b if b > 0 else None
+    except Exception:
+        return None
+
+
+def hdf5_redshift(path) -> float | None:
+    """The Gadget header's Redshift of an HDF5 snapshot, or None (no file, no header, no such attribute)."""
+    try:
+        import h5py
+        with h5py.File(path, "r") as h:
+            hd = h["Header"].attrs
+            return float(hd["Redshift"]) if "Redshift" in hd else None
     except Exception:
         return None
 

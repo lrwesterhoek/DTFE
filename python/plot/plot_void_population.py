@@ -28,8 +28,39 @@ Outputs (figures/void_population/<sim>/):
                               10 cells the delta08 radius lies below sigma and exists for only 31-47% of the distinct
                               voids. That png is named population_size_function_ss<cells>.png
                               (untagged only with --size-smooth 0: the figures' own catalogue); a non-default
-                              --size-smooth also tags population_stats '_ss<cells>'
-  population_stats.npz        every per-snapshot statistic, the abundance curves included
+                              --size-smooth also tags population_stats '_ss<cells>'.
+                              --size-rv delta08raw (2026-10-11): the same -0.8 rule on the RAW density about the
+                              same centres (dtfelib.raw_radius, cached beside the catalogue), png and npz tagged
+                              '_delta08raw'. Defined for 73-100% of the distinct voids (vs 1-45%), TNG100 and TNG300
+                              agree at 2.1625 Mpc, measured/Vdn 0.04-0.17 at the median; but the sample's median
+                              radius still follows the smoothing (TNG100 z = 0: 4.4 / 2.4 / 1.5 Mpc at 10 / 5 / 3
+                              cells) and the ellipsoid gate cuts the large voids, so NEITHER radius makes the
+                              comparison a test of Vdn and 'delta08' stays the default (the figure says why;
+                              SIZE_FUNCTION_CAVEAT holds the numbers). Ungated (DTFE_VOID_GATE=none), the raw
+                              abundance at fixed R above ~3 sigma converges with the smoothing (measured/Vdn at
+                              8 Mpc, z = 0: 0.8-0.9 at 10, 5 and 3 cells)
+  population_size_function_fixedR.png (+ .npz)  --size-fixed-r ONLY (2026-10-11; DTFE_VOID_GATE=none required, written
+                              into the 'gatenone' folder): the size function at FIXED radius -- n(>R) and dn/dlnR of
+                              the raw -0.8 radius of the distinct ungated voids from catalogues at several smoothings
+                              (--fixed-r-smooth, default 10 5 3 cells; --fixed-r-smooth-mpc in Mpc), only over the
+                              common complete range (3 x the largest sigma up to the radius with 5 voids above it in
+                              the scarcest smoothing, at least x1.15 wide; --fixed-r-range sets it), against Vdn with
+                              Poisson and 3^3 sub-cube bootstrap errors, the ratio per bin and over the range, its
+                              scatter across smoothings and a verdict per z (z = 0, 0.5, 1, 2; the smoothings compared
+                              on the PAIRED bootstrap, 2026-10-11). Non-default smoothings or a range tag the name:
+                              _c3-2_m2.1625, _R6.5-9. RESULT (TNG100 at 10/5/3 cells, TNG300 at 2.1625 Mpc/3/2 cells):
+                              at z = 0 TNG100 0.84-1.01 of Vdn (consistent, no significant difference between its
+                              smoothings), TNG300 0.58-0.84 (4% errors, still following the smoothing). Above Vdn at
+                              z >= 0.5 ONLY at the larger smoothings (z = 0.5: TNG100 10 cells 2.16, TNG300 2.1625 Mpc
+                              / 3 cells 1.69 / 1.42; z = 1 TNG300 3.55 / 2.40); at the smallest smoothing in each box
+                              the excess is gone at z = 0.5 (TNG100 5 / 3 cells 0.90 / 1.17, TNG300 2 cells 0.95), so
+                              the high-z excess depends on the smoothing, and the smoothings disagree at every z but
+                              TNG100 z = 0 (numbers below FIXED_R_SNAPS).
+                              --fixed-r-recentre (2026-10-12): each void re-centred on the raw density first
+                              (dtfelib.raw_radius RE-CENTRING), png/npz tagged '_rc'; --fixed-r-distinct raw: the
+                              distinct voids by their raw spheres (largest first, no overlap), tagged '_draw'. Neither
+                              is the default (measured below FIXED_R_SNAPS: re-centring removes most of TNG300's
+                              smoothing dependence but halves the z = 0 count and breaks TNG100 z = 0)
 The figures are in the house style (dtfelib.figures: serif, config.DPI, titles only with config.SHOW_TITLES) and
 mirrored like the thesis figures (2026-10-11). The counts of resolved and distinct voids against z are set by the
 ellipsoid gate (the 10 sigma max-axis cut turns on as the voids grow): the evolution figure draws the minima with an
@@ -50,9 +81,10 @@ from pathlib import Path
 
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.ticker import FormatStrFormatter
 
 import config
-from dtfelib import pipeline, catalog, theory
+from dtfelib import pipeline, catalog, theory, raw_radius
 from dtfelib import make_parser, use_data_root
 from dtfelib import figures as style
 from dtfelib import environment as env
@@ -62,6 +94,29 @@ FIGURE_ROOT = Path(config.LOCAL_FIGURES_ROOT) / "void_population"
 PCT = (16, 50, 84)   # band percentiles
 SIZE_FUNCTION_RV = "delta08"     # the R_v definition of the size function (catalog.R_V_DEFINITIONS, contract C3): the
                                  # theory's radius is where the enclosed contrast reaches DELTA_V_NONLINEAR = -0.8
+RAW_RV = "delta08raw"            # the enclosed -0.8 radius on the RAW density about the same centres (dtfelib.raw_radius,
+                                 # 2026-10-11): not a catalogue key, measured here (cached beside the catalogue)
+SIZE_RV_CHOICES = ("crossing", "delta08", "ridge", RAW_RV)
+# Why the size function is NOT a test of Vdn with either -0.8 radius, said on the figure under the definition drawn
+# (2026-10-11, rawradius; TNG100-3-Dark z = 0, 0.5, 1, 2 and TNG300-3-Dark z = 0, 1, catalogues at 10 / 5 / 3 cells):
+#   delta08    (smoothed field) a smoothing length: median 0.7-1.06 sigma at 10/5/3/2 cells, defined for 1-45% of the
+#              distinct voids, measured/Vdn 1e-3-1e-2.
+#   delta08raw (raw density, dtfelib.raw_radius) defined for 73-100% of the distinct voids (z <= 1: 94-100%), TNG100
+#              and TNG300 agree at the common 2.1625 Mpc (z = 0 median 4.40 / 4.37 Mpc, measured/Vdn 0.15 / 0.13;
+#              z = 1 3.16 / 3.19 Mpc, 0.10 / 0.11), measured/Vdn 0.04-0.17 at the median (z <= 1). BUT the sample's
+#              median still follows the smoothing that found the centres: TNG100 z = 0 4.40 / 2.44 / 1.53 Mpc at
+#              10 / 5 / 3 cells (d ln R / d ln sigma 0.88; TNG300 0.69), because each smoothing finds voids down to
+#              ~2 sigma and the ellipsoid gate (max semi-axis 10 sigma) removes the large ones. So the default stays
+#              'delta08' (the rule: delta08raw only if it is defined for >= 50% AND does not scale with sigma).
+#              Ungated (DTFE_VOID_GATE=none) the abundance at fixed R above ~3 sigma converges: measured/Vdn at
+#              R = 8 Mpc, z = 0, 0.81 / 0.79 / 0.91 at 10 / 5 / 3 cells -- the one place it is close to a test.
+SIZE_FUNCTION_CAVEAT = {
+    "delta08": "not a test of Vdn: the smoothed-field -0.8 radius is a smoothing length (median 0.7-1.1 sigma at "
+               "10, 5, 3, 2 cells)",
+    RAW_RV: "not a test of Vdn: the sample's median radius follows the smoothing that found the centres "
+            "(TNG100 z = 0: 4.4, 2.4, 1.5 Mpc at 10, 5, 3 cells) and the ellipsoid gate removes the large voids; "
+            "ungated, measured/Vdn at 8 Mpc (z = 0) is 0.8-0.9 at 10, 5 and 3 cells",
+}
 SIZE_FUNCTION_MODEL = "vdn"      # theory.void_size_function's model ('vdn' or 'svdw')
 RATIO_HALF_WIDTH = 0.25          # the measured/theory ratio at the median R_v: counts in ln R within +-0.25 of it
 RATIO_SHOWN = (1e-3, 1e3)        # the ratio panel's range (a high-z ratio is astronomically large: printed, not drawn)
@@ -75,6 +130,71 @@ SIZE_SMOOTH_CELLS = 5.0          # the size function's catalogue smoothing in ce
                                  # 1.06, 1.03, 0.91 sigma) and measured/Vdn stays 1e-3-1e-2: the -0.8 sphere of a
                                  # minimum is a smoothing length, not a converged void size
 MIRROR = True                    # into the thesis Figures/ tree as well (dtfelib.figures; DTFE_NO_MIRROR turns it off)
+# The size function at FIXED radius (--size-fixed-r, 2026-10-11, sizefn): the raw -0.8 radius (dtfelib.raw_radius) of
+# the distinct UNGATED voids from catalogues at several smoothings, compared only where every smoothing is complete. The
+# lead (rawradius, same day): ungated, the abundance at fixed R above ~3 sigma stopped depending on the smoothing and
+# measured/Vdn at 8 Mpc, z = 0 was 0.8-0.9 at 10, 5 and 3 cells; this figure makes that a test per z. MEASURED
+# (measured/Vdn over the common range from 6.49 Mpc; +- the larger of Poisson and bootstrap; the smoothings compared on
+# the PAIRED sub-cube bootstrap, chi^2 for 2 dof, 95% point 6.0 -- rerun 2026-10-11 after review-science):
+#   TNG100 10 / 5 / 3 cells: z = 0 0.93 / 0.84 / 1.01 +- 0.15 (paired chi^2 1.1: no significant difference; consistent
+#     with Vdn); z = 0.5 2.16 / 0.90 / 1.17 +- 0.3-0.4 (paired chi^2 14.3: disagree); z = 1 and 2 no common range
+#     (18 / 8 / 3 and 0 voids above 6.49 Mpc).
+#   TNG300 2.1625 Mpc / 3 / 2 cells (1.77 / 1.18 Mpc; at 10 / 5 / 3 cells 3 sigma is 17.7 Mpc: no range at any z):
+#     z = 0 0.84 / 0.78 / 0.58 +- 0.03-0.04, z = 0.5 1.69 / 1.42 / 0.95, z = 1 3.55 / 2.40 / 1.59, z = 2 no range
+#     (paired chi^2 80 / 119 / 112: disagree at every z).
+#   Until 2026-10-11 the last dn/dlnR bin of the scarcest smoothing also counted the void at r_hi (np.histogram's closed
+#   last bin): its per-bin ratio was up to 2x high (TNG100 z = 0.5, 5 cells: 1.68, now 0.84); the whole-range ratios
+#   above never included it.
+#   Cross-box at 2.1625 Mpc, R 6.5-9 Mpc: z = 0 0.81 +- 0.15 / 0.78 +- 0.05, z = 0.5 2.32 +- 0.40 / 1.64 +- 0.08, z = 1
+#     4.9 +- 1.3 / 3.55 +- 0.22 (TNG100 / TNG300).
+# So the fixed-R abundance converges with sigma only to TNG100's 15%: at TNG300's 4% the smaller the smoothing the
+# FEWER voids above a fixed R at every z (untested guess: a large void's deepest minimum at small sigma sits off
+# its centre, so the raw -0.8 sphere about it is smaller). The excess above Vdn at z >= 0.5 is itself
+# smoothing-dependent, NOT one factor: it holds at the larger smoothings (z = 0.5 TNG100 10 cells 2.16, TNG300
+# 2.1625 Mpc / 3 cells 1.69 / 1.42; z = 1 TNG300 3.55 / 2.40, rising with z) but is gone at the smallest smoothing in
+# each box at z = 0.5 (TNG100 5 / 3 cells 0.90 / 1.17, TNG300 2 cells 0.95; at z = 1 TNG300 2 cells is still 1.59).
+# THE OFF-CENTRE GUESS TESTED (2026-10-12, recentre; z = 0 / 0.5 / 1, same smoothings, paired chi^2 in brackets):
+#   Mechanism, from matching the voids above r_lo of the largest smoothing to the smaller one's minima inside their
+#   raw spheres (TNG300 z = 0, 765 voids at 2.1625 Mpc; at 2 cells): 311 still a distinct void above r_lo, 243 only
+#   minima with SMALLER raw spheres (the off-centre case), 208 a minimum with a large sphere that catalog.distinct_mask
+#   dropped for a deeper, smaller one beside it. So the guess holds for about half of the deficit.
+#   --fixed-r-recentre (minimum of the 1-cell-smoothed raw density within 0.5 R0, iterated): the centres move by a
+#   median 0.9-1.6 sigma in every box, but the -0.8 sphere about the raw minimum is SMALLER for 70-88% of the voids
+#   (median R/R0 0.81-0.93): the emptiest point is not the centre of the largest empty sphere.
+#     TNG300 0.45/0.47/0.51 [7.4], 0.88/0.89/0.89 [0.1], 1.60/1.45/1.43 [5.9]   (was [80], [119], [112])
+#     TNG100 0.53/0.84/1.07 [10.3] at z = 0 (was 0.93/0.84/1.01 [1.1]); no common range at z >= 0.5
+#     TNG50  0.38/0.47/0.59 [4.2], 0.58/0.68/0.84 [4.7], 0.70/0.58/1.22 [11.8] (was z = 0 0.46/0.56/0.75)
+#   It maps every catalogue onto nearly the same raw minima, so TNG300's smoothing dependence mostly goes -- but the
+#   amplitude drops (z = 0 half of Vdn), TNG100 z = 0 loses its agreement and TNG50 z = 0 moves away from 1. Against
+#   the bar set before measuring (TNG300 z = 0 stops rejecting, TNG100 z = 0 stays consistent, TNG50 z = 0 moves
+#   toward 1) it fails all three: an option, not the default. One pass instead of up to 8 gives the same ratios
+#   (TNG300 z = 0 0.47/0.48/0.51 with chi^2 3.9, so it passes the first bar; the other two fail the same way).
+#   --fixed-r-distinct raw (largest raw sphere first, no overlap): TNG50 z = 0 0.93/0.84/0.87 [0.7] (consistent with
+#   Vdn), TNG100 z = 0 1.45/1.32/1.32 [1.0] (converged, 1.36x Vdn), TNG300 1.58/1.37/1.07 [316] and z >= 0.5 2-5x Vdn
+#   with the smoothings apart: no fix for TNG300 either. With the centre rule instead of no overlap it was 2-4x Vdn.
+#   So the fixed-R abundance depends on WHICH point stands for a void and WHICH of a region's minima count, at the
+#   level of the TNG300 smoothing dependence; neither choice here removes it while keeping the amplitude.
+FIXED_R_RECENTRE = False                 # re-centre each void on the raw density before its -0.8 sphere is grown
+                                         # (raw_radius RE-CENTRING; --fixed-r-recentre / --fixed-r-no-recentre;
+                                         # the png/npz say the non-default choice: '_rc' / '_norc')
+FIXED_R_DISTINCT = "catalogue"           # which voids are distinct: 'catalogue' (catalog.distinct_mask, the smoothed
+                                         # field's deepest minimum first) or 'raw' (raw_sphere_distinct, the largest raw
+                                         # -0.8 sphere first); --fixed-r-distinct, the non-default tags '_draw' / '_dcat'
+FIXED_R_DISTINCT_CHOICES = ("catalogue", "raw")
+FIXED_R_SNAPS = (99, 67, 50, 33)         # z = 0, 0.5, 1, 2 (--panel-snaps overrides)
+FIXED_R_SMOOTH_CELLS = (10.0, 5.0, 3.0)  # the catalogues' smoothings (--fixed-r-smooth; --fixed-r-smooth-mpc in Mpc)
+FIXED_R_MIN_SIGMA = 3.0                  # the common range starts at this many LARGEST sigma: below it the voids of the
+                                         # most smoothed catalogue are missing (each smoothing finds voids down to ~2 sigma)
+FIXED_R_MIN_COUNT = 5                    # ... and ends where the scarcest smoothing still has this many voids above R:
+                                         # beyond, the box holds too few voids for a comparison (the box-limited end)
+FIXED_R_MIN_WIDTH = 1.15                 # ... and spans at least this factor in R, else it is empty (TNG300 z = 2 gave
+                                         # 6.49-6.59 Mpc with 2 and 5 voids: a 'range' that tests nothing; TNG100
+                                         # z = 0.5, 6.49-7.85 Mpc with 10-24 voids, still tests)
+FIXED_R_BINS = 6                         # ln R bins across the common range
+FIXED_R_NSUB = 3                         # bootstrap: the box cut into NSUB^3 sub-cubes, resampled with replacement
+FIXED_R_NBOOT = 500                      # (sample variance of a clustered population, beside Poisson's sqrt N)
+FIXED_R_SEED = 20261011
+FIXED_R_CONSISTENT = 2.0                 # 'consistent with Vdn': |ratio - 1| within this many errors at every smoothing
 
 
 def r_v_definition(cat, definition="crossing"):
@@ -111,12 +231,15 @@ def bbks_valid(cat):
     return np.isfinite(e) & np.isfinite(p) & (e >= 0) & (np.abs(p) <= e)
 
 
-def snapshot_stats(cat, n_grid=None, keep_overlaps=False, size_rv=SIZE_FUNCTION_RV):
+def snapshot_stats(cat, n_grid=None, keep_overlaps=False, size_rv=SIZE_FUNCTION_RV, raw=None):
     """Per-snapshot population statistics from one pipeline void catalog. The abundance sample (2026-10-07): the
     resolved voids with a measured radius R_v (catalog.r_v_mpc), only the DISTINCT ones (catalog.distinct_mask) unless
     keep_overlaps -- neighbouring minima of one void counted once. The size function's sample (2026-10-11): the same
     with R_v under 'size_rv' (r_v_definition; '_r_v_sf', its definition in 'rv_sf_definition'). 'n_rv_all' counts
-    every minimum with an R_v, no ellipsoid gate and no de-duplication: the reference beside the gated counts."""
+    every minimum with an R_v, no ellipsoid gate and no de-duplication: the reference beside the gated counts.
+    size_rv 'delta08raw' (2026-10-11) takes its radii from 'raw' (raw_radius.raw_radii of this catalogue: the
+    enclosed -0.8 radius on the RAW density, which the catalogue does not hold); without it the size function's
+    sample is the crossing one, said by the figure as for a catalogue without a definition."""
     valid = bbks_valid(cat)
     resolved = cat["well_resolved"].astype(bool)
     deep = resolved & (cat["delta_values"] < config.DEEP_VOID_THRESHOLD)
@@ -128,8 +251,12 @@ def snapshot_stats(cat, n_grid=None, keep_overlaps=False, size_rv=SIZE_FUNCTION_
     counted = with_rv if keep_overlaps else catalog.distinct_mask(cat, with_rv, int(n_grid or config.FIELD_RESOLUTION))
     # said, not silent (review 2026-10-07): the resolved voids without R_v (no crossing within 15 sigma: the larger,
     # deeper ones -- the large-R end of n(>R_v) is low by them) and those inside a deeper void's region
-    if size_rv == "crossing":
+    if size_rv == "crossing" or (size_rv == RAW_RV and raw is None):
         r_sf, sf_def, sf_sel = r_v, "crossing", counted
+    elif size_rv == RAW_RV:
+        r_sf, sf_def = np.asarray(raw["r_mpc"], dtype=np.float64), RAW_RV
+        with_sf = resolved & np.isfinite(r_sf)
+        sf_sel = with_sf if keep_overlaps else catalog.distinct_mask(cat, with_sf, int(n_grid or config.FIELD_RESOLUTION))
     else:
         r_sf, sf_def = r_v_definition(cat, size_rv)
         with_sf = resolved & np.isfinite(r_sf)
@@ -154,6 +281,10 @@ def snapshot_stats(cat, n_grid=None, keep_overlaps=False, size_rv=SIZE_FUNCTION_
         # where no sphere about the minimum is as empty as -0.8
         "frac_sf_defined": float(np.isfinite(r_sf[counted]).mean()) if counted.any() else float("nan"),
         "rv_sf_definition": sf_def,
+        # delta08raw only (2026-10-11): of the distinct (crossing R_v) voids, those whose raw enclosed contrast never
+        # went below -0.8 within reach (a wisp on the centre) and those still below at the reach (no crossing)
+        "n_sf_never_below": int(np.asarray(raw["never_below"])[counted].sum()) if sf_def == RAW_RV else 0,
+        "n_sf_capped": int(np.asarray(raw["capped"])[counted].sum()) if sf_def == RAW_RV else 0,
         "r_eff_pct": pct(r_eff, resolved),
         "r_v_pct": pct(r_v, counted),
         "e_pct": pct(e, valid),
@@ -224,6 +355,9 @@ def size_function_figure(stats, panel, ztab, box, args, methods, path) -> dict:
                              label=f"z={z:.2f}: {ratio:.3g} +- {rerr:.2g} at median {med:.3g} Mpc")
         else:
             axes[2].plot([], [], "o", color=c_, label=f"z={z:.2f}: {ratio:.3g} (off the axis)")
+        if st["rv_sf_definition"] == RAW_RV:
+            out[f"size_function_{s}_n_never_below"] = int(st.get("n_sf_never_below", 0))
+            out[f"size_function_{s}_n_capped"] = int(st.get("n_sf_capped", 0))
         print(f"  size function z={z:.2f}: {rv.size} distinct voids, median R_v {med:.3g} Mpc "
               f"({out['size_function_rv']}, defined for {st.get('frac_sf_defined', np.nan):.1%} of the distinct voids; "
               f"sigma {sig:.3g} Mpc); measured/{SIZE_FUNCTION_MODEL} there {ratio:.3g} +- {rerr:.2g} ({rn} voids "
@@ -252,24 +386,34 @@ def size_function_figure(stats, panel, ztab, box, args, methods, path) -> dict:
     axes[1].text(0.02, 0.03, f"catalogue smoothed at sigma = {config.SMOOTHING_SIGMA_CELLS:g} cells = {sig:.3g} Mpc\n"
                  f"dotted: max semi-axis cut {cut:.3g} Mpc; {no_rv} resolved voids without R_v not counted"
                  + (f"\nR_v: {out['size_function_rv']} ({args.size_rv} not in the catalogue)"
-                    if args.size_rv not in defs else f"\nR_v: {out['size_function_rv']}"),
+                    if args.size_rv not in defs else f"\nR_v: {out['size_function_rv']}")
+                 + ("\nraw density, step "
+                    f"{raw_radius.RAW_STEP_CELLS:g} cells, reach {raw_radius.RAW_REACH_FRAC:g} L; defined for "
+                    + ", ".join(f"{stats[s].get('frac_sf_defined', np.nan):.0%}" for s in panel)
+                    + "\nof the distinct voids" if RAW_RV in defs else ""),
                  transform=axes[1].transAxes, fontsize=7, color="0.3")
+    # why the comparison is not a test (2026-10-11), under the panels: inside an axis the long lines squeezed the
+    # layout
+    caveat = "\n".join(SIZE_FUNCTION_CAVEAT[d] for d in defs if d in SIZE_FUNCTION_CAVEAT)
+    if caveat:
+        fig.text(0.5, 0.01, caveat, ha="center", va="bottom", fontsize=8, color="0.25", wrap=True)
     style.set_suptitle(fig, f"{args.sim}: void size function ({'/'.join(methods)}, distinct well-resolved voids) "
                             f"against {SIZE_FUNCTION_MODEL.upper()} (delta_v = {theory.DELTA_V_LINEAR}, "
                             f"delta_c = {theory.DELTA_C})")
-    fig.tight_layout()
+    fig.tight_layout(rect=(0, 0.07 if caveat else 0, 1, 1))
     style.save_plot_to_multiple_paths(fig, path, dpi=config.DPI, mirror=MIRROR)
     plt.close(fig)
     return out
 
 
 @contextlib.contextmanager
-def smoothing_cells(cells):
-    """The process's smoothing set to 'cells' (pipeline.set_smoothing in cells: the production footprint) for the
-    block, restored after it whatever happens -- the size function's catalogue (2026-10-11)."""
+def smoothing_cells(cells=None, mpc=None):
+    """The process's smoothing set to 'cells' (pipeline.set_smoothing in cells: the production footprint) or to 'mpc'
+    (its footprint following it, as --smooth-mpc) for the block, restored after it whatever happens -- the size
+    function's catalogue (2026-10-11)."""
     saved = (config.SMOOTHING_SIGMA_CELLS, config.FOOTPRINT_SIZE, config.SMOOTHING_SIGMA_MPC)
     try:
-        pipeline.set_smoothing(cells=cells)
+        pipeline.set_smoothing(cells=cells, mpc=mpc)
         yield
     finally:
         config.SMOOTHING_SIGMA_CELLS, config.FOOTPRINT_SIZE, config.SMOOTHING_SIGMA_MPC = saved
@@ -288,6 +432,12 @@ def size_smooth_tag(size_smooth) -> str:
     return "" if math.isclose(ss, SIZE_SMOOTH_CELLS) else f"_ss{ss:g}"
 
 
+def raw_for(prod, cat, size_rv):
+    """raw_radius.raw_radii of the catalogue's well-resolved rows when the size function asks for 'delta08raw',
+    else None (2026-10-11); called while 'prod' still holds its grids."""
+    return raw_radius.raw_radii(prod, cat) if size_rv == RAW_RV else None
+
+
 def size_function_stats(args, snaps, keep_overlaps=False) -> dict:
     """snapshot_stats of the panel snapshots on the --size-smooth catalogue (its own cache namespace,
     r512_s<cells>_f11_...; built on first use, ~20 s and ~7 GB per 512^3 snapshot); to be called inside
@@ -298,13 +448,504 @@ def size_function_stats(args, snaps, keep_overlaps=False) -> dict:
         try:
             _cell, _box, n_, _src = catalog.frame_of(prod)
             cat = prod.voids()
+            raw = raw_for(prod, cat, args.size_rv)
         except (OSError, ValueError) as e:
             print(f"  size function: snap {s:3d} at {config.SMOOTHING_SIGMA_CELLS:g} cells left out: {e}")
             continue
         finally:
             prod.release()
-        out[s] = snapshot_stats(cat, n_, keep_overlaps, args.size_rv)
+        out[s] = snapshot_stats(cat, n_, keep_overlaps, args.size_rv, raw)
     return out
+
+
+# ---------------------------------------------------------------- the size function at fixed R (--size-fixed-r)
+
+def fixed_r_smoothings(cells=None, mpc=None) -> list:
+    """The fixed-R figure's smoothings as [(kind, value, sigma_mpc)], kind 'cells' or 'mpc', in this simulation's frame.
+    Neither list given: FIXED_R_SMOOTH_CELLS; either given: only those. A smoothing within 0.1% of an earlier one is
+    the same catalogue scale (TNG100's 2.1625 Mpc is 10.0002 cells) and dropped, said: counted twice it would shrink
+    the scatter across smoothings."""
+    if cells is None and mpc is None:
+        cells = FIXED_R_SMOOTH_CELLS
+    out = []
+    for kind, vals in (("cells", cells or ()), ("mpc", mpc or ())):
+        for v in vals:
+            v = float(v)
+            if v <= 0:
+                raise SystemExit(f"the fixed-R smoothings must be > 0, got {v:g} {kind}")
+            sig = max(v, 1.0) * float(config.CELL_SIZE) if kind == "cells" else max(v, float(config.CELL_SIZE))
+            same = [o for o in out if math.isclose(o[2], sig, rel_tol=1e-3)]
+            if same:
+                print(f"  size function at fixed R: {v:g} {kind} = {sig:.4g} Mpc is the catalogue of {same[0][1]:g} "
+                      f"{same[0][0]} ({same[0][2]:.4g} Mpc): counted once")
+                continue
+            out.append((kind, v, sig))
+    if not out:
+        raise SystemExit("the fixed-R size function needs at least one smoothing")
+    return sorted(out, key=lambda o: -o[2])          # largest sigma first: the legend reads in the smoothing's order
+
+
+def fixed_r_label(kind, value, sig) -> str:
+    return (f"{value:g} cells = {sig:.3g} Mpc" if kind == "cells"
+            else f"{sig:.4g} Mpc = {sig / float(config.CELL_SIZE):.3g} cells")
+
+
+def _drop_same_centre(sel, centres, depth) -> tuple:
+    """(sel without the rows whose re-centred cell another selected row already holds -- the deeper by 'depth' kept
+    --, how many were dropped)."""
+    sel = np.asarray(sel, dtype=bool).copy()
+    rows = np.nonzero(sel)[0]
+    rows = rows[np.argsort(np.asarray(depth, dtype=np.float64)[rows], kind="stable")]
+    seen, ndup = set(), 0
+    for i in rows:
+        key = tuple(int(v) for v in centres[i])
+        if key in seen:
+            sel[i] = False
+            ndup += 1
+        else:
+            seen.add(key)
+    return sel, ndup
+
+
+def raw_sphere_distinct(centres, r_cells, sample, n_grid) -> np.ndarray:
+    """The distinct voids by their RAW -0.8 spheres (2026-10-12, --fixed-r-distinct raw): among the 'sample' rows
+    with a radius, the largest sphere first, none that OVERLAPS a sphere already kept (centre distance below the sum
+    of the radii, periodic) -- the non-overlapping spheres the volume-conserving Vdn counts (Jennings, Li & Hu 2013
+    clean their spherical voids the same way). The catalogue rule (catalog.distinct_mask) keeps the DEEPEST smoothed
+    minimum of a region with its claim min(R_v, R_eff); at a small sigma a large void holds several minima and the
+    deepest is often not the one with the largest raw sphere (TNG300 z = 0, the 765 voids above 6.49 Mpc at 2.1625
+    Mpc: at 2 cells 208 held a minimum with R above 6.49 Mpc that the catalogue rule dropped). The centre rule
+    (pipeline.distinct_voids: drop only a centre INSIDE a kept sphere) was tried first and kept 3-4x Vdn: spheres
+    overlapping by up to their whole radius were all counted."""
+    r_cells = np.asarray(r_cells, dtype=np.float64)
+    centres = np.asarray(centres, dtype=np.float64).reshape(-1, 3)
+    rows = np.nonzero(np.asarray(sample, dtype=bool) & np.isfinite(r_cells))[0]
+    rows = rows[np.argsort(-r_cells[rows], kind="stable")]
+    out = np.zeros(r_cells.size, dtype=bool)
+    kc, kr, nk = np.empty((rows.size, 3)), np.empty(rows.size), 0
+    for i in rows:
+        if nk:
+            d = centres[i] - kc[:nk]
+            d -= n_grid * np.rint(d / n_grid)
+            if ((d * d).sum(axis=1) < (kr[:nk] + r_cells[i]) ** 2).any():
+                continue
+        out[i] = True
+        kc[nk], kr[nk] = centres[i], r_cells[i]
+        nk += 1
+    return out
+
+
+def fixed_r_samples(args, snaps, smooths, recentre=None, distinct=None) -> tuple:
+    """The fixed-R size function's samples, per smoothing of 'smooths' (fixed_r_smoothings): the raw -0.8 radius
+    (raw_radius.raw_radii, measured and cached on first use in that smoothing's cache namespace) of the DISTINCT voids
+    among the well-resolved ones with a raw radius, under the process's gate (main refuses anything but
+    DTFE_VOID_GATE=none), and their centres in Mpc. Returns (entries, box per snapshot, (method, prefix) per
+    snapshot); each entry {'kind', 'value', 'sigma_mpc', 'label', 'namespace', 'r': {snap: Mpc}, 'pos': {snap: (n, 3)
+    Mpc}, 'n_resolved', 'n_never_below', 'n_capped', 'n_dup': {snap: int}, 'rc': {snap: offsets and radii}}. A
+    snapshot that cannot be read is said and left out of that smoothing. recentre (default FIXED_R_RECENTRE;
+    --fixed-r-recentre / --fixed-r-no-recentre, 2026-10-12): the radii about the RE-CENTRED centres
+    (raw_radius.raw_radii(recentre=True)), the positions the re-centred ones, duplicates of one centre dropped.
+    distinct (default FIXED_R_DISTINCT; --fixed-r-distinct): 'catalogue' (catalog.distinct_mask) or 'raw'
+    (raw_sphere_distinct: by the raw spheres, largest first)."""
+    recentre = FIXED_R_RECENTRE if recentre is None else bool(recentre)
+    distinct = FIXED_R_DISTINCT if distinct is None else str(distinct)
+    entries, box, used = [], {}, {}
+    for kind, value, _sig in smooths:
+        with smoothing_cells(**{kind: value}):
+            sig = pipeline.smoothing_length_mpc()
+            ent = {"kind": kind, "value": float(value), "sigma_mpc": float(sig), "label": fixed_r_label(kind, value, sig),
+                   "namespace": pipeline._param_hash(), "r": {}, "pos": {}, "n_resolved": {}, "n_never_below": {},
+                   "n_capped": {}, "n_dup": {}, "rc": {}}
+            print(f"  size function at fixed R: catalogues at {ent['label']} (cache namespace {ent['namespace']})")
+            for s in snaps:
+                prod = pipeline.products(s, sim=args.sim, method=args.method, prefix=args.prefix,
+                                         data_root=args.data_root)
+                try:
+                    cell, box_s, n_, _src = catalog.frame_of(prod)
+                    cat = prod.voids()
+                    raw = raw_radius.raw_radii(prod, cat, recentre=recentre)
+                    used[s] = (prod.fs.method, prod.fs.prefix)
+                except (OSError, ValueError) as e:
+                    print(f"  size function at fixed R: snap {s:3d} at {ent['label']} left out: {e}")
+                    continue
+                finally:
+                    prod.release()
+                box[s] = float(box_s)
+                resolved = np.asarray(cat["well_resolved"]).astype(bool)
+                r = np.asarray(raw["r_mpc"], dtype=np.float64)
+                centres = np.asarray(raw["coords_rc"] if recentre else cat["coords"], dtype=np.int64)
+                if distinct == "raw":
+                    sel = raw_sphere_distinct(centres, r / float(cell), resolved, int(n_))
+                else:
+                    sel = catalog.distinct_mask(cat, resolved & np.isfinite(r), int(n_))
+                if recentre and distinct != "raw":           # 'raw' already keeps one of a shared centre
+                    # two minima of one void can re-centre onto the same raw minimum (2026-10-12): counted once, the
+                    # deeper catalogue row kept; the number dropped is said and saved
+                    sel, ent["n_dup"][s] = _drop_same_centre(sel, centres, np.asarray(cat["delta_values"]))
+                    r0 = np.asarray(raw["r0_mpc"], dtype=np.float64)[sel]
+                    off = np.asarray(raw["offset_cells"], dtype=np.float64)[sel]
+                    ent["rc"][s] = {"offset_cells": off, "offset_sigma": off * float(cell) / float(sig),
+                                    "r0_mpc": r0, "r_mpc": r[sel]}
+                    grown = np.isfinite(r0) & (r[sel] > r0 * (1 + 1e-9))
+                    print(f"    snap {s:3d}: re-centred {int(sel.sum())} distinct voids: median offset "
+                          f"{np.median(off):.2f} cells = {np.median(off) * float(cell) / float(sig):.2f} sigma, "
+                          f"median R/R0 {np.nanmedian(r[sel] / r0):.3f}, radius grew for {grown.mean():.0%}, "
+                          f"{ent['n_dup'][s]} duplicate centres dropped, {int((~np.isfinite(r0)).sum())} had no R0")
+                ent["r"][s] = r[sel]
+                ent["pos"][s] = (centres[sel].astype(np.float64) + 0.5) * float(cell)
+                ent["n_resolved"][s] = int(resolved.sum())
+                ent["n_never_below"][s] = int(np.asarray(raw["never_below"])[resolved].sum())
+                ent["n_capped"][s] = int(np.asarray(raw["capped"])[resolved].sum())
+        entries.append(ent)
+    return entries, box, used
+
+
+def fixed_r_range(samples, sigmas, box_mpc, r_range=None) -> tuple:
+    """The common complete range (r_lo, r_hi) in Mpc of the radius samples (one per smoothing) found at 'sigmas':
+    r_lo = FIXED_R_MIN_SIGMA x the LARGEST sigma, r_hi = the smallest over the smoothings of the radius with
+    FIXED_R_MIN_COUNT voids at or above it, at most the raw reach (raw_radius.RAW_REACH_FRAC L), empty when narrower
+    than FIXED_R_MIN_WIDTH. 'r_range' (lo, hi) replaces both (a cross-box comparison on one range). (nan, nan) when
+    it is empty."""
+    if r_range is not None:
+        lo, hi = float(r_range[0]), float(r_range[1])
+    else:
+        lo = FIXED_R_MIN_SIGMA * float(max(sigmas))
+        tops = []
+        for r in samples:
+            r = np.sort(np.asarray(r, dtype=np.float64)[np.isfinite(r)])
+            tops.append(r[-FIXED_R_MIN_COUNT] if r.size >= FIXED_R_MIN_COUNT else -np.inf)
+        hi = min(min(tops), raw_radius.RAW_REACH_FRAC * float(box_mpc))
+        if hi < FIXED_R_MIN_WIDTH * lo:
+            return np.nan, np.nan
+    return (lo, hi) if np.isfinite(lo) and np.isfinite(hi) and hi > lo else (np.nan, np.nan)
+
+
+def bootstrap_counts(r, pos, box_mpc, edges, radii, nsub=None, nboot=None, seed=None) -> dict:
+    """Sub-cube bootstrap of the counts of radii 'r' (centres 'pos', Mpc) in the bins 'edges', above each of 'radii'
+    and in [edges[0], edges[-1]): the box cut into nsub^3 cubes, nsub^3 of them drawn with replacement per draw (the
+    sample variance of a clustered population, which Poisson's sqrt N leaves out). {'hist': (nboot, nbins), 'cum':
+    (nboot, nradii), 'tot': (nboot,)}: counts per draw, for a standard deviation across the draws. The bins are
+    half-open like 'tot' (2026-10-11): edges[-1] is a sample radius (fixed_r_range's r_hi) and np.histogram's closed
+    last bin counted that void in 'hist' but not in 'tot'. The draws depend only on (nsub, nboot, seed), so calls with
+    the same three resample the same sub-cubes: fixed_r_statistics pairs the smoothings' draws on that."""
+    nsub = int(nsub or FIXED_R_NSUB)
+    nboot = int(nboot or FIXED_R_NBOOT)
+    r = np.asarray(r, dtype=np.float64)
+    pos = np.asarray(pos, dtype=np.float64).reshape(-1, 3)
+    edges, radii = np.asarray(edges, dtype=np.float64), np.asarray(radii, dtype=np.float64)
+    ncube = nsub ** 3
+    ijk = np.clip(np.floor(np.mod(pos, float(box_mpc)) / float(box_mpc) * nsub).astype(np.int64), 0, nsub - 1)
+    cube = (ijk[:, 0] * nsub + ijk[:, 1]) * nsub + ijk[:, 2]
+    hist = np.zeros((ncube, edges.size - 1))
+    cum = np.zeros((ncube, radii.size))
+    tot = np.zeros(ncube)
+    for c in range(ncube):
+        rc = r[cube == c]
+        hist[c] = np.histogram(rc[rc < edges[-1]], bins=edges)[0]
+        cum[c] = (rc[:, None] > radii[None, :]).sum(axis=0)
+        tot[c] = ((rc >= edges[0]) & (rc < edges[-1])).sum()
+    rng = np.random.default_rng(FIXED_R_SEED if seed is None else seed)
+    draws = rng.integers(0, ncube, size=(nboot, ncube))
+    mult = np.stack([np.bincount(d, minlength=ncube) for d in draws]).astype(np.float64)    # (nboot, ncube)
+    return {"hist": mult @ hist, "cum": mult @ cum, "tot": mult @ tot}
+
+
+def fixed_r_statistics(entries, box, ztab, snaps, r_range=None, model=SIZE_FUNCTION_MODEL) -> dict:
+    """The fixed-R comparison per snapshot (2026-10-11): the common range (fixed_r_range), per smoothing n(>R) and
+    dn/dlnR with Poisson and sub-cube bootstrap errors, the bin-averaged model (theory.void_dn_dlnr_binned), the ratio
+    per bin and ONE ratio per smoothing over the whole range (count / the model's count there,
+    theory.void_number_between), and their scatter across the smoothings; whether the smoothings differ is tested on the
+    paired bootstrap (paired_difference_test, 2026-10-11). Every count is half-open [lo, hi). {snap: {...}} (empty
+    range: 'empty' True)."""
+    out = {}
+    for s in snaps:
+        have = [e for e in entries if s in e["r"]]
+        z = float(ztab.get(s, np.nan))
+        if not have or s not in box:
+            continue
+        b = float(box[s])
+        vol = b ** 3
+        lo, hi = fixed_r_range([e["r"][s] for e in have], [e["sigma_mpc"] for e in have], b, r_range)
+        lo0 = FIXED_R_MIN_SIGMA * max(e["sigma_mpc"] for e in have) if r_range is None else float(r_range[0])
+        st = {"z": z, "box_mpc": b, "r_lo": lo, "r_hi": hi, "labels": [e["label"] for e in have],
+              "sigma_mpc": np.array([e["sigma_mpc"] for e in have]), "empty": not np.isfinite(lo), "per": [],
+              # the voids above the range's lower end per smoothing: said when the range is empty (why no test)
+              "n_above_lo": np.array([int((np.asarray(e["r"][s]) >= lo0).sum()) for e in have]), "lo0": lo0}
+        out[s] = st
+        if st["empty"] or not np.isfinite(z):
+            st["empty"] = True
+            continue
+        edges = np.geomspace(lo, hi, FIXED_R_BINS + 1)
+        mid = np.sqrt(edges[1:] * edges[:-1])
+        radii = np.geomspace(lo, hi, 24)
+        dln = np.log(edges[1:] / edges[:-1])
+        th_bin = theory.void_dn_dlnr_binned(edges, z, model=model)
+        th_cum = theory.void_cumulative(radii, z, model=model)
+        th_tot = theory.void_number_between(lo, hi, z, model=model)
+        st.update(edges=edges, mid=mid, radii=radii, theory_dn_dlnr=th_bin, theory_n_cum=th_cum, theory_total=th_tot)
+        boot_ratio = []
+        for e in have:
+            r = e["r"][s]
+            n_cum, err, cnt = catalog.void_abundance(r, b, radii)
+            # half-open [lo, hi) like n_total, the bootstrap and Vdn's number (2026-10-11): hi is a sample radius
+            # (the scarcest smoothing's 5th largest) that np.histogram's closed last bin counted, one void too many
+            dn, derr, dcnt = catalog.void_dn_dlnr(r[r < hi], b, edges)
+            bs = bootstrap_counts(r, e["pos"][s], b, edges, radii)
+            n_tot = int(((r >= lo) & (r < hi)).sum())
+            with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+                ratio_bin = dn / th_bin
+                p = {"label": e["label"], "sigma_mpc": e["sigma_mpc"], "n_cum": n_cum, "n_cum_err": err,
+                     "n_cum_boot": bs["cum"].std(axis=0) / vol, "count_cum": cnt,
+                     "dn_dlnr": dn, "dn_dlnr_err": derr, "dn_dlnr_boot": bs["hist"].std(axis=0) / (vol * dln),
+                     "count_bin": dcnt, "ratio_bin": ratio_bin, "ratio_bin_err": derr / th_bin,
+                     "ratio_bin_boot": bs["hist"].std(axis=0) / (vol * dln) / th_bin, "n_total": n_tot,
+                     "n_distinct": int(r.size), "n_resolved": int(e["n_resolved"].get(s, 0)),
+                     "n_never_below": int(e["n_never_below"].get(s, 0)), "n_capped": int(e["n_capped"].get(s, 0)),
+                     "n_expected": vol * th_tot, "ratio": n_tot / (vol * th_tot), "ratio_err": math.sqrt(max(n_tot, 1)) / (vol * th_tot),
+                     "ratio_boot": float(bs["tot"].std()) / (vol * th_tot)}
+            st["per"].append(p)
+            boot_ratio.append(bs["tot"] / (vol * th_tot))        # this smoothing's whole-range ratio per draw
+        rat = np.array([p["ratio"] for p in st["per"]])
+        errs = np.array([max(p["ratio_err"], p["ratio_boot"]) for p in st["per"]])
+        st["ratio_mean"] = float(np.mean(rat))
+        st["ratio_scatter"] = float(np.std(rat)) if rat.size > 1 else 0.0       # across the smoothings
+        st["ratio_err_typical"] = float(np.median(errs))
+        st["consistent"] = bool(np.all(np.abs(rat - 1.0) <= FIXED_R_CONSISTENT * errs))
+        # 'converged' = no significant difference: the ratios differ by no more than the PAIRED sub-cube bootstrap
+        # allows (2026-10-11, review-science): they are catalogues of one density field that largely count the same
+        # voids, and the sample variance in 'errs' is common to all of them and cancels in their differences. A chi^2 on
+        # independent 'errs' therefore overstates the spread of the differences and is biased toward 'agree' (it was
+        # called conservative here: the wrong direction). bootstrap_counts drew the same sub-cubes for every
+        # smoothing, so the differences per draw carry only what the catalogues do NOT share. The old chi^2 stays
+        # in the npz ('chi2') for reference only.
+        st["chi2"] = float(np.sum((rat - rat.mean()) ** 2 / np.maximum(errs, 1e-300) ** 2))
+        st["chi2_95"] = float(_chi2_95(rat.size - 1)) if rat.size > 1 else np.inf
+        st["paired_chi2"], st["paired_max_sigma"] = paired_difference_test(rat, np.array(boot_ratio))
+        st["converged"] = bool(st["paired_chi2"] <= st["chi2_95"])
+        # a forced range (--fixed-r-range) can hold almost no voids: 0 of an expected 0.04 is 'consistent' and says
+        # nothing, so the verdict is withheld below FIXED_R_MIN_COUNT voids in any smoothing
+        st["too_few"] = bool(min(p["n_total"] for p in st["per"]) < FIXED_R_MIN_COUNT)
+    return out
+
+
+def paired_difference_test(rat, boot) -> tuple:
+    """(chi^2 for n - 1 dof, the largest pairwise difference in sigma) of the ratios 'rat' (n smoothings) against
+    their PAIRED bootstrap draws 'boot' (n, nboot) -- the same resamples for every smoothing (2026-10-11): the
+    contrasts rat[k] - rat[0] with the covariance of their draws. A contrast the draws do not vary is 0 sigma when
+    the ratios agree there exactly (identical catalogues) and infinite when they do not. (0, 0) for one smoothing."""
+    rat = np.asarray(rat, dtype=np.float64)
+    boot = np.asarray(boot, dtype=np.float64).reshape(rat.size, -1)
+    if rat.size < 2:
+        return 0.0, 0.0
+    tol = 1e-9 * max(float(np.max(np.abs(rat))), 1e-300)
+
+    def _sig(d, var):
+        return 0.0 if abs(d) <= tol else (abs(d) / math.sqrt(var) if var > tol ** 2 else np.inf)
+
+    d = rat[1:] - rat[0]
+    db = boot[1:] - boot[0]
+    cov = np.atleast_2d(np.cov(db))
+    lam, vec = np.linalg.eigh(cov)
+    proj = vec.T @ d
+    chi2 = 0.0
+    for lm, pr in zip(lam, proj):
+        s_ = _sig(pr, lm)
+        chi2 = np.inf if not np.isfinite(s_) else chi2 + s_ * s_
+    pair = max(_sig(rat[k] - rat[j], float(np.var(boot[k] - boot[j], ddof=1)))
+               for k in range(rat.size) for j in range(k))
+    return float(chi2), float(pair)
+
+
+def _chi2_95(dof: int) -> float:
+    from scipy.stats import chi2
+    return chi2.ppf(0.95, dof)
+
+
+def fixed_r_verdict(st) -> str:
+    """One plain line per snapshot: the ratio per smoothing, its scatter, whether it is consistent with the model."""
+    if st.get("empty"):
+        return (f"z={st['z']:.2f}: no common complete range (from {FIXED_R_MIN_SIGMA:g} x the largest sigma to "
+                f">= {FIXED_R_MIN_COUNT} voids in every smoothing, at least x{FIXED_R_MIN_WIDTH:g} wide; voids above "
+                f"{st.get('lo0', np.nan):.3g} Mpc: "
+                + ", ".join(str(int(n)) for n in st.get("n_above_lo", ())) + "): no test")
+    err = [max(p["ratio_err"], p["ratio_boot"]) for p in st["per"]]
+    each = ", ".join(f"{p['ratio']:.2f} +- {e:.2f} ({p['n_total']} voids, Vdn {p['n_expected']:.3g})"
+                     for p, e in zip(st["per"], err))
+    off = sum(abs(p["ratio"] - 1.0) > FIXED_R_CONSISTENT * e for p, e in zip(st["per"], err))
+    verdict = ("CONSISTENT with Vdn at every smoothing" if st["consistent"]
+               else f"NOT consistent with Vdn (beyond {FIXED_R_CONSISTENT:g} errors at {off} of {len(st['per'])} "
+                    "smoothings)")
+    if st.get("too_few"):
+        verdict = f"too few voids for a test (below {FIXED_R_MIN_COUNT} in a smoothing)"
+    # worded from the PAIRED bootstrap test (2026-10-11): a non-rejection is 'no significant difference', not proof
+    # that the smoothings have converged
+    conv = "one smoothing: no convergence test" if len(st["per"]) < 2 else \
+        ("no significant difference between the smoothings" if st["converged"] else "smoothings disagree") + \
+        f" (paired bootstrap chi2 {st['paired_chi2']:.1f} for {len(st['per']) - 1} dof, largest pair " \
+        f"{st['paired_max_sigma']:.1f} sigma; scatter {st['ratio_scatter']:.2f}, error {st['ratio_err_typical']:.2f})"
+    return (f"z={st['z']:.2f}, R {st['r_lo']:.3g}-{st['r_hi']:.3g} Mpc: measured/Vdn {each}; mean "
+            f"{st['ratio_mean']:.2f}; {conv}; {verdict}")
+
+
+def fixed_r_figure(fstats, snaps, sim, methods, path, model=SIZE_FUNCTION_MODEL, recentre=False) -> dict:
+    """population_size_function_fixedR*.png (2026-10-11): one row per snapshot -- n(>R), dn/dlnR (points: Poisson
+    errors, bands: sub-cube bootstrap) of each smoothing's ungated raw-radius sample against the model (black), and
+    measured / model per bin with the one-number ratio of each smoothing in the legend -- only over the common
+    complete range. The verdict per z under the panels. Returns the arrays for the npz."""
+    rows = [s for s in snaps if s in fstats]
+    fig, axes = plt.subplots(max(len(rows), 1), 3, figsize=(15, 3.6 * max(len(rows), 1) + 1.0), squeeze=False)
+    nsm = max([len(fstats[s]["per"]) for s in rows] + [1])
+    colors = plt.cm.plasma(np.linspace(0.1, 0.8, nsm))
+    out = {"fixed_r_model": model, "fixed_r_snaps": np.array(rows, dtype=np.int64),
+           "fixed_r_min_sigma": FIXED_R_MIN_SIGMA, "fixed_r_min_count": FIXED_R_MIN_COUNT,
+           "fixed_r_nsub": FIXED_R_NSUB, "fixed_r_nboot": FIXED_R_NBOOT}
+    verdicts = []
+    for row, s in zip(axes, rows):
+        st = fstats[s]
+        verdicts.append(fixed_r_verdict(st))
+        print("  size function at fixed R: " + verdicts[-1])
+        out.update({f"fixed_r_{s}_n_above_lo": st["n_above_lo"], f"fixed_r_{s}_z": st["z"],
+                    f"fixed_r_{s}_r_lo": st["r_lo"], f"fixed_r_{s}_r_hi": st["r_hi"],
+                    f"fixed_r_{s}_labels": np.array(st["labels"]), f"fixed_r_{s}_sigma_mpc": st["sigma_mpc"]})
+        zl = f"z={st['z']:.2f}"
+        if st["empty"]:
+            for ax in row:
+                ax.text(0.5, 0.5, f"{zl}: no common complete range", ha="center", va="center", transform=ax.transAxes,
+                        fontsize=9, color="0.3")
+                ax.set_xticks([]); ax.set_yticks([])
+            continue
+        out.update({f"fixed_r_{s}_edges_mpc": st["edges"], f"fixed_r_{s}_radii_mpc": st["radii"],
+                    f"fixed_r_{s}_theory_dn_dlnr": st["theory_dn_dlnr"], f"fixed_r_{s}_theory_n_cum": st["theory_n_cum"],
+                    f"fixed_r_{s}_ratio_mean": st["ratio_mean"], f"fixed_r_{s}_ratio_scatter": st["ratio_scatter"],
+                    f"fixed_r_{s}_consistent": st["consistent"], f"fixed_r_{s}_converged": st["converged"],
+                    f"fixed_r_{s}_chi2": st["chi2"], f"fixed_r_{s}_too_few": st["too_few"],
+                    f"fixed_r_{s}_paired_chi2": st["paired_chi2"],
+                    f"fixed_r_{s}_paired_max_sigma": st["paired_max_sigma"]})
+        for k, (p, c_) in enumerate(zip(st["per"], colors)):
+            for key in ("n_cum", "n_cum_err", "n_cum_boot", "dn_dlnr", "dn_dlnr_err", "dn_dlnr_boot", "ratio_bin",
+                        "ratio_bin_err", "ratio_bin_boot", "ratio", "ratio_err", "ratio_boot", "n_total", "n_expected",
+                        "n_distinct", "n_resolved", "n_never_below", "n_capped"):
+                out[f"fixed_r_{s}_{k}_{key}"] = p[key]
+            ok, okd = p["count_cum"] > 0, p["count_bin"] > 0
+            f = 1.0 + 0.012 * (k - (nsm - 1) / 2.0)                 # a small x offset per smoothing: bars apart
+            row[0].errorbar(st["radii"][ok] * f, p["n_cum"][ok], yerr=p["n_cum_err"][ok], fmt="o", ms=3, color=c_,
+                            capsize=2, label=f"{p['label']} (n={p['n_total']})")
+            row[0].fill_between(st["radii"], np.clip(p["n_cum"] - p["n_cum_boot"], 1e-30, None),
+                                p["n_cum"] + p["n_cum_boot"], color=c_, alpha=0.15, lw=0)
+            row[1].errorbar(st["mid"][okd] * f, p["dn_dlnr"][okd], yerr=p["dn_dlnr_err"][okd], fmt="o", ms=3,
+                            color=c_, capsize=2)
+            row[1].fill_between(st["mid"], np.clip(p["dn_dlnr"] - p["dn_dlnr_boot"], 1e-30, None),
+                                p["dn_dlnr"] + p["dn_dlnr_boot"], color=c_, alpha=0.15, lw=0)
+            err = np.maximum(p["ratio_bin_err"], p["ratio_bin_boot"])
+            row[2].errorbar(st["mid"][okd] * f, p["ratio_bin"][okd], yerr=err[okd], fmt="o-", ms=3, lw=1.0, color=c_,
+                            capsize=2, label=f"{p['ratio']:.2f} +- {max(p['ratio_err'], p['ratio_boot']):.2f}")
+        row[0].plot(st["radii"], st["theory_n_cum"], color="k", lw=1.2, label=model.upper())
+        row[1].stairs(st["theory_dn_dlnr"], st["edges"], color="k", lw=1.2)
+        row[2].axhline(1.0, color="k", lw=0.8)
+        row[2].axhspan(st["ratio_mean"] - st["ratio_scatter"], st["ratio_mean"] + st["ratio_scatter"], color="0.5",
+                       alpha=0.15, lw=0)
+        for ax in row:
+            ax.set_xscale("log")
+            ax.set_xlim(st["r_lo"] * 0.95, st["r_hi"] * 1.05)
+            # the range is often under a decade: plain numbers on the minor ticks, else one '10^1' is all the axis says
+            ax.xaxis.set_major_formatter(FormatStrFormatter("%g"))
+            ax.xaxis.set_minor_formatter(FormatStrFormatter("%g"))
+            ax.tick_params(axis="x", which="minor", labelsize=7)
+            ax.grid(alpha=0.3, which="both")
+            ax.set_xlabel(r"raw $-0.8$ radius $R$ [Mpc]" + (" (re-centred)" if recentre else ""))
+        row[0].set_yscale("log"); row[1].set_yscale("log")
+        # the y range from the points and the model only: a zero bin's band or error bar reaches 0 and a log axis
+        # followed it down to 1e-30
+        for ax, keys, th in ((row[0], "n_cum", st["theory_n_cum"]), (row[1], "dn_dlnr", st["theory_dn_dlnr"])):
+            v = np.concatenate([np.asarray(th, dtype=float)] + [np.asarray(p[keys], dtype=float) for p in st["per"]])
+            v = v[np.isfinite(v) & (v > 0)]
+            if v.size:
+                ax.set_ylim(v.min() / 3.0, v.max() * 3.0)
+        row[0].set_ylabel(r"$n(>R)$ [Mpc$^{-3}$]")
+        row[1].set_ylabel(r"$dn/d\ln R$ [Mpc$^{-3}$]")
+        row[2].set_ylabel(f"measured / {model.upper()}")
+        row[0].legend(fontsize=7, title=zl, title_fontsize=8)
+        row[2].legend(fontsize=7, title="whole range (band: scatter)", title_fontsize=7)
+    fig.text(0.5, 0.005, "\n".join(verdicts) + f"\nungated distinct voids; points: Poisson, bands: {FIXED_R_NSUB}^3 "
+             f"sub-cube bootstrap; range from {FIXED_R_MIN_SIGMA:g} x the largest sigma to >= {FIXED_R_MIN_COUNT} "
+             "voids above R in every smoothing; the smoothings share one density field, so they are compared on the "
+             "paired bootstrap (the same sub-cube draws for each)",
+             ha="center", va="bottom", fontsize=7, color="0.25")
+    style.set_suptitle(fig, f"{sim}: void size function at fixed R, raw -0.8 radius"
+                            f"{' about re-centred centres' if recentre else ''}, ungated ({'/'.join(methods)}) "
+                            f"against {model.upper()}")
+    fig.tight_layout(rect=(0, 0.035 * (len(verdicts) + 2) / max(len(rows), 1), 1, 1))
+    style.save_plot_to_multiple_paths(fig, path, dpi=config.DPI, mirror=MIRROR)
+    plt.close(fig)
+    out["fixed_r_verdicts"] = np.array(verdicts)
+    return out
+
+
+def fixed_r_tag(smooths, r_range=None) -> str:
+    """The png/npz name tag of a fixed-R run: '' for the default smoothings, else '_c10-5-3' (cells) / '_m2.1625'
+    (Mpc), and '_R<lo>-<hi>' for a given range -- runs with other smoothings never overwrite each other."""
+    cells = [v for k, v, _ in smooths if k == "cells"]
+    mpc = [v for k, v, _ in smooths if k == "mpc"]
+    tag = "" if (not mpc and tuple(cells) == tuple(FIXED_R_SMOOTH_CELLS)) else \
+        (("_c" + "-".join(f"{v:g}" for v in cells)) if cells else "") + \
+        (("_m" + "-".join(f"{v:g}" for v in mpc)) if mpc else "")
+    if r_range is not None:
+        tag += f"_R{float(r_range[0]):g}-{float(r_range[1]):g}"
+    return tag
+
+
+def fixed_r_main(args, ztab) -> Path:
+    """--size-fixed-r: only the fixed-R size function figure and its npz (2026-10-11). Refuses unless
+    DTFE_VOID_GATE=none: gated, the ellipsoid gate truncates the large voids differently at each smoothing (TNG100
+    z = 0, R = 3 Mpc: 0.015 / 0.108 / 0 of Vdn at 10 / 5 / 3 cells), so there is nothing to converge."""
+    if pipeline.void_gate() != "none":
+        raise SystemExit("the size function at fixed R is defined on the UNGATED voids: run it as "
+                         f"DTFE_VOID_GATE=none DTFE_SIM={args.sim} python3 plot/plot_void_population.py --size-fixed-r")
+    smooths = fixed_r_smoothings(args.fixed_r_smooth, args.fixed_r_smooth_mpc)
+    snaps = [int(s) for s in (args.panel_snaps or FIXED_R_SNAPS)]
+    recentre = FIXED_R_RECENTRE if getattr(args, "fixed_r_recentre", None) is None else bool(args.fixed_r_recentre)
+    distinct = getattr(args, "fixed_r_distinct", None) or FIXED_R_DISTINCT
+    entries, box, used = fixed_r_samples(args, snaps, smooths, recentre, distinct)
+    if not used:
+        raise SystemExit(f"no {args.method} field grids for {args.sim} at snapshots {snaps} -- nothing to analyse")
+    fstats = fixed_r_statistics(entries, box, ztab, snaps, args.fixed_r_range)
+    methods = sorted({m for m, _p in used.values()})
+    default_prefix = {"ps": "ps_output.", "dtfe": "output."}
+    grids = "+".join(sorted({m if p == default_prefix.get(m) else p.rstrip(".") for m, p in used.values()}))
+    name_tag = "" if grids == "ps" else f"_{grids}"
+    with smoothing_cells(cells=config.PRODUCTION_SMOOTHING[0]):
+        outdir = FIGURE_ROOT / args.sim / pipeline.smoothing_tag()        # 'gatenone': the ungated products' folder
+    outdir.mkdir(parents=True, exist_ok=True)
+    tag = name_tag + fixed_r_tag(smooths, args.fixed_r_range)
+    if recentre != FIXED_R_RECENTRE:
+        tag += "_rc" if recentre else "_norc"
+    if distinct != FIXED_R_DISTINCT:
+        tag += "_draw" if distinct == "raw" else "_dcat"
+    path = outdir / f"population_size_function_fixedR{tag}.png"
+    arrs = fixed_r_figure(fstats, snaps, args.sim, methods, path, recentre=recentre)
+    # the re-centring's own numbers per smoothing and snapshot (2026-10-12): how far the centres moved, in cells and
+    # in that smoothing's sigma, the radius before (R0) and after, the duplicate centres dropped
+    for k, e in enumerate(entries):
+        for s_, d in e["rc"].items():
+            for key, v in d.items():
+                arrs[f"fixed_r_rc_{s_}_{k}_{key}"] = np.asarray(v)
+        for s_, v in e["n_dup"].items():
+            arrs[f"fixed_r_rc_{s_}_{k}_n_dup"] = int(v)
+    arrs["fixed_r_recentre"] = bool(recentre)
+    arrs["fixed_r_distinct"] = np.str_(distinct)
+    if recentre:
+        arrs["fixed_r_rc_settings"] = raw_radius.settings_rc()
+    if fstats and all(st["empty"] for st in fstats.values()):     # TNG300 at 10 / 5 / 3 cells: 3 sigma = 17.7 Mpc
+        print("  size function at fixed R: no z has a common range -- the largest smoothing sets the lower end; try "
+              f"smaller ones, e.g. fixed-r-smooth-mpc {config.CROSSBOX_SMOOTHING_MPC:g} with fixed-r-smooth 3 2")
+    np.savez_compressed(outdir / f"population_size_function_fixedR{tag}.npz",
+                        fixed_r_smoothing_kind=np.array([k for k, _v, _s in smooths]),
+                        fixed_r_smoothing_value=np.array([v for _k, v, _s in smooths]),
+                        fixed_r_smoothing_mpc=np.array([e["sigma_mpc"] for e in entries]),
+                        fixed_r_namespaces=np.array([e["namespace"] for e in entries]),
+                        box_mpc=np.array([box.get(s, np.nan) for s in snaps]), **arrs)
+    print(f"-> {path} (+ .npz)")
+    return path
 
 
 def main():
@@ -319,13 +960,43 @@ def main():
     parser.add_argument("--keep-overlaps", action="store_true",
                         help="abundance: count every resolved void with a radius, not only the distinct ones (none "
                              "whose centre lies inside a deeper void's min(R_v, R_eff))")
-    parser.add_argument("--size-rv", choices=("crossing", "delta08", "ridge"), default=SIZE_FUNCTION_RV,
+    parser.add_argument("--size-rv", choices=SIZE_RV_CHOICES, default=SIZE_FUNCTION_RV,
                         help="the R_v definition of the size function figure (default delta08: where the enclosed "
-                             "contrast reaches -0.8, the theory's radius; crossing while a catalogue lacks it)")
+                             "contrast of the smoothed field reaches -0.8, the theory's radius; crossing while a "
+                             "catalogue lacks it; delta08raw: the same on the raw density about the same centres, "
+                             "measured and cached on first use)")
     parser.add_argument("--size-smooth", type=float, default=SIZE_SMOOTH_CELLS, metavar="CELLS",
                         help=f"the size function's own catalogue smoothing in cells (default {SIZE_SMOOTH_CELLS:g}: at "
                              "the production 10 cells the delta08 radius is below sigma and mostly undefined); 0 = "
                              "the catalogue of the other figures")
+    parser.add_argument("--size-fixed-r", action="store_true",
+                        help="make ONLY the size function at fixed radius (population_size_function_fixedR.png + npz): "
+                             "the raw -0.8 radius of the ungated distinct voids from catalogues at several smoothings, "
+                             f"over the radii where every one is complete ({FIXED_R_MIN_SIGMA:g} x the largest sigma up "
+                             f"to {FIXED_R_MIN_COUNT} voids), against Vdn with Poisson and bootstrap errors, at z = 0, "
+                             "0.5, 1, 2 (panel-snaps overrides); needs DTFE_VOID_GATE=none")
+    parser.add_argument("--fixed-r-smooth", type=float, nargs="*", default=None, metavar="CELLS",
+                        help="fixed R: the catalogues' smoothings in cells (default "
+                             f"{' '.join(f'{c:g}' for c in FIXED_R_SMOOTH_CELLS)}; with fixed-r-smooth-mpc only "
+                             "the ones given)")
+    parser.add_argument("--fixed-r-smooth-mpc", type=float, nargs="*", default=None, metavar="MPC",
+                        help="fixed R: smoothings in Mpc, the same scale in every box (e.g. the cross-box "
+                             f"{config.CROSSBOX_SMOOTHING_MPC:g}); the png is tagged with the smoothings")
+    rc = parser.add_mutually_exclusive_group()
+    rc.add_argument("--fixed-r-recentre", dest="fixed_r_recentre", action="store_true", default=None,
+                    help="fixed R: re-centre each void on the raw density (its minimum after a 1-cell smoothing, "
+                         "within half the void's raw radius) before the -0.8 sphere is grown; cached apart"
+                         + (" (the default)" if FIXED_R_RECENTRE else ""))
+    rc.add_argument("--fixed-r-no-recentre", dest="fixed_r_recentre", action="store_false",
+                    help="fixed R: the catalogue's own centres (the minima of the smoothed field)"
+                         + ("" if FIXED_R_RECENTRE else " (the default)"))
+    parser.add_argument("--fixed-r-distinct", choices=FIXED_R_DISTINCT_CHOICES, default=None,
+                        help="fixed R: which voids are distinct: catalogue (the deepest smoothed minimum of a region "
+                             "first) or raw (the largest raw -0.8 sphere first, none overlapping a kept one); "
+                             f"default {FIXED_R_DISTINCT}")
+    parser.add_argument("--fixed-r-range", type=float, nargs=2, default=None, metavar=("LO", "HI"),
+                        help="fixed R: the radius range in Mpc instead of the common complete one (one range for a "
+                             "cross-box comparison)")
     pipeline.add_smoothing_mpc_arg(parser)
     args = parser.parse_args()
     style.apply()
@@ -333,6 +1004,9 @@ def main():
 
     use_data_root(args.data_root)      # --data-root for the trees, group catalogues and ladder too (2026-10-05)
     ztab = gc.redshift_table(args.sim)
+    if args.size_fixed_r:              # only that figure (2026-10-11): its own smoothings, snapshots and gate
+        fixed_r_main(args, ztab)
+        return
     ladder = sorted({int(d.name.split("_")[1]) for d in env.sim_dir(args.sim).glob("snapdir_*")})
 
     stats, method_used, prefix_used, box, other, refused = {}, {}, {}, {}, {}, []
@@ -343,6 +1017,10 @@ def main():
             cell_, box[s], _n, _src = catalog.frame_of(prod)    # the header's frame must be config's (DTFE_SIM): else refused
             cat = prod.voids()
             method_used[s], prefix_used[s] = prod.fs.method, prod.fs.prefix
+            # the raw radii only where the size function is drawn from THIS catalogue (the panel, no --size-smooth):
+            # each is a raw density grid read
+            raw = (raw_for(prod, cat, args.size_rv)
+                   if s in panel_want and not size_smooth_active(args.size_smooth) else None)
         except OSError as e:                           # no grids (FileNotFoundError: silent, as before) or an unreadable file
             if not isinstance(e, FileNotFoundError):
                 print(f"  snap {s:3d}: unreadable, left out: {e}")
@@ -354,7 +1032,7 @@ def main():
         finally:
             prod.release()
         style.note_source(prod.fs)                     # the thesis mirror's guard reads which grids these are
-        stats[s] = snapshot_stats(cat, _n, args.keep_overlaps, args.size_rv)
+        stats[s] = snapshot_stats(cat, _n, args.keep_overlaps, args.size_rv, raw)
         if args.other_estimator and s in panel_want:   # only the panel snapshots are drawn: no catalogue for the rest
             oth = pipeline.products(s, sim=args.sim, method="dtfe" if method_used[s] == "ps" else "ps",
                                     data_root=args.data_root)
@@ -504,12 +1182,15 @@ def main():
     style.save_plot_to_multiple_paths(fig, outdir / f"population_abundance{name_tag}.png", dpi=config.DPI, mirror=MIRROR)
     plt.close(fig)
 
-    sf_tag = "" if args.size_rv == SIZE_FUNCTION_RV else f"_{args.size_rv}"     # a non-default R_v: its own names (png, npz)
+    sf_tag = "" if args.size_rv == SIZE_FUNCTION_RV else f"_{args.size_rv}"     # a non-default R_v: its own npz
+    # the png is untagged only for 'delta08', whatever the default (2026-10-11): an untagged size-function png has
+    # always meant the smoothed-field delta08 radius, and a name must not change meaning
+    rv_png = "" if args.size_rv == "delta08" else f"_{args.size_rv}"
     # the png is tagged whenever its catalogue is not the other figures' ('_ss5' at the default: the mirrored untagged
     # png was the production-smoothing one this morning, and a name must not change meaning); the npz, which holds
     # every figure's statistics, only off the default (2026-10-11)
     ss_png = f"_ss{float(args.size_smooth):g}" if size_smooth_active(args.size_smooth) else ""
-    sf_path = outdir / f"population_size_function{name_tag}{sf_tag}{ss_png}.png"
+    sf_path = outdir / f"population_size_function{name_tag}{rv_png}{ss_png}.png"
     sf_tag += size_smooth_tag(args.size_smooth)
     if size_smooth_active(args.size_smooth):
         # the size function on its own, less smoothed catalogue (2026-10-11); its axes, cut and labels in that sigma

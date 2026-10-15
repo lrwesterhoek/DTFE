@@ -26,7 +26,27 @@
 #include "triangulation_common.h"
 #include <typeinfo>
 #include <stdio.h>
+#include <atomic>
+#include <cstdint>
+#include <cstring>
 #include <gsl/gsl_qrng.h>
+
+#ifndef PHASE_SPACE
+// The standard binary's GPU deposit counters (2026-10-13; the PS binary's are psGpuRetries & co. in
+// ps_interpolation.cc): the failed GPU command buffers / kernels of the run by cause -- [0] innocent victim,
+// [1] timeout (a watchdog kill), [2] out of memory, [3] any other; they sum to dtfeGpuRetries -- counted by the
+// GPU host (dtfe_metal_host.cc, dtfe_gpu_cuda.cu), read by run_progress.h for the progress sidecar's gpu_retries /
+// gpu_retries_by_cause and DTFE.cpp's closing 'GPU deposit retries:' line; and the sub-domain deposits that asked
+// for the GPU and ran on the CPU instead (DTFE.cpp's closing warning: the threads other than the master print
+// their reason only as a warning line of their own). Defined in every standard build, GPU or not.
+std::atomic<int> dtfeGpuRetries{ 0 };
+std::atomic<int> dtfeGpuRetriesByCause[4] = { { 0 }, { 0 }, { 0 }, { 0 } };
+static std::atomic<int> dtfeGpuFallbacks{ 0 };
+int dtfeGpuFallbacksTaken(bool reset)
+{
+    return reset ? dtfeGpuFallbacks.exchange( 0 ) : dtfeGpuFallbacks.load();
+}
+#endif
 
 // GPU deposit (METAL=1 / CUDA=1 / HIP=1 build, 3D only); the CPU loop below remains the fallback. MY_SCALAR
 // evaluates arbitrary user C++ per sample, which cannot run on the GPU.
@@ -87,6 +107,91 @@ void quasiRandomPointsInCell(double vM[][NO_DIM],
 }
 
 
+// A Delaunay cell with its vertices in the order the Monte-Carlo average uses (vertex 0 = the base the
+// barycentric samples are mapped from). It stands in for the CGAL cell in the field helpers
+// (field_computation.h: 'cell->vertex(i)'), which are templates on the cell type.
+struct McCell
+{
+    Vertex_handle v[NO_DIM+1];
+    inline Vertex_handle vertex(int const i) const { return v[i]; }
+    inline McCell const* operator->() const { return this; }
+};
+
+// splitmix64 finalizer: a well-mixed 64-bit hash step.
+inline uint64_t mcMix(uint64_t z)
+{
+    z += 0x9e3779b97f4a7c15ULL;
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    return z ^ (z >> 31);
+}
+// Hash of a vertex's ABSOLUTE coordinates. Every partition, thread and padding choice of one run sees the same
+// coordinates for the same vertex (a periodic image is x -/+ L, computed the same way everywhere), so the hash
+// is a property of the vertex, not of the triangulation that holds it. The coordinates are hashed as FLOATS:
+// the single and the double build then share the realization (a kpc snapshot scaled to Mpc gives float- and
+// double-rounded coordinates whose double bit patterns differ in every vertex, and the two builds' grids
+// differed by 8% rms per cell; the float patterns agree but for rare double roundings). Two vertices of one
+// cell that round to the same float hash alike and are ordered by their exact coordinates (mcVertexOrder).
+inline uint64_t mcVertexHash(Vertex_handle const &v)
+{
+    uint64_t h = 0x6a09e667f3bcc909ULL;
+    for (int d=0; d<NO_DIM; ++d)
+    {
+        float const x = float( v->point()[d] );
+        uint32_t u; std::memcpy( &u, &x, sizeof(u) );
+        h = mcMix( h ^ uint64_t(u) );
+    }
+    return h;
+}
+
+// The vertex order of the Monte-Carlo average (2026-10-13, audit finding 1). 'legacy' keeps CGAL's own order
+// (vertex(0) as the base), which the --exact-average path still uses (its results stay byte-identical) and
+// DTFE_MC_LEGACY=1 restores for the sampled path (A/B). Otherwise the NO_DIM+1 vertices are sorted by a key
+// that depends only on the cell's own vertex SET: each vertex's coordinate hash mixed with the (order-free)
+// sum of the cell's hashes, ties (never seen; 64-bit keys) broken by the coordinates.
+//   Why: the fixed Sobol prefix of n samples does not average to the centroid (barycentric slot means
+//   0.160/0.262/0.275/0.302 at n = 17, the minimum count), so each slot carries a fixed weight error, and
+//   CGAL's labelling correlates with density (slot densities 1.023/1.012/1.006/0.959 at TNG100 z=1). The
+//   product was a systematic mass loss of 0.17-0.29% in every production '_a' grid. A pseudo-random,
+//   order-free slot assignment decorrelates the slots from the density AND makes the realization of each
+//   tetrahedron independent of the insertion order, the thread count and the partition split.
+inline McCell mcVertexOrder(Finite_cells_iterator &cell,
+                            bool const legacy)
+{
+    McCell c;
+    for (int i=0; i<NO_DIM+1; ++i)
+        c.v[i] = cell->vertex(i);
+    if ( legacy )
+        return c;
+    uint64_t hv[NO_DIM+1], sum = 0;
+    for (int i=0; i<NO_DIM+1; ++i)
+    {
+        hv[i] = mcVertexHash( c.v[i] );
+        sum += hv[i];
+    }
+    uint64_t key[NO_DIM+1];
+    for (int i=0; i<NO_DIM+1; ++i)
+        key[i] = mcMix( hv[i] ^ sum );
+    auto before = [&](int const a, int const b) {   // strict order on (key, coordinates)
+        if ( key[a] != key[b] ) return key[a] < key[b];
+        for (int d=0; d<NO_DIM; ++d)
+        {
+            double const xa = double( c.v[a]->point()[d] ), xb = double( c.v[b]->point()[d] );
+            if ( xa != xb ) return xa < xb;
+        }
+        return false; };
+    int idx[NO_DIM+1];
+    for (int i=0; i<NO_DIM+1; ++i) idx[i] = i;
+    for (int i=1; i<NO_DIM+1; ++i)                    // insertion sort of NO_DIM+1 entries
+        for (int j=i; j>0 and before( idx[j], idx[j-1] ); --j)
+            std::swap( idx[j], idx[j-1] );
+    McCell s;
+    for (int i=0; i<NO_DIM+1; ++i)
+        s.v[i] = c.v[ idx[i] ];
+    return s;
+}
+
+
 
 // Returns true if the Delaunay cell's bounding box lies entirely outside the region of interest.
 inline bool cellOutsideRegion(DT & dt,
@@ -103,8 +208,10 @@ inline bool cellOutsideRegion(DT & dt,
 static int const SINGLE_GRID_CELL = 0;
 static int const MULTIPLE_GRID_CELLS = 1;
 // Classifies whether a Delaunay cell fits in one grid cell or spans several, and fills 'vertexMatrix'
-// with each non-base vertex's offset from the base vertex (used to map barycentric samples).
-int checkCellPosition(Finite_cells_iterator &cell,
+// with each non-base vertex's offset from the base vertex (used to map barycentric samples). 'Cell' is the
+// CGAL cell iterator or an McCell (the Monte-Carlo vertex order; the arithmetic is the same for both).
+template <typename Cell>
+int checkCellPosition(Cell &cell,
                       Box &regionBox,
                       Real *dx,
                       double vertexMatrix[][NO_DIM],
@@ -178,7 +285,8 @@ inline bool isGridCellIndex(size_t *totalGridSize,
 
 
 // Returns the density averaged over the cell's vertices (= its value at the cell centroid).
-inline Real averageDensity(Finite_cells_iterator &cell)
+template <typename Cell>
+inline Real averageDensity(Cell &cell)
 {
     Real temp = 0.;
     for (int i=0; i<NO_DIM+1; ++i)
@@ -186,7 +294,8 @@ inline Real averageDensity(Finite_cells_iterator &cell)
     return temp / Real(NO_DIM+1);
 }
 // Returns the velocity averaged over the cell's vertices (= its value at the cell centroid).
-inline Pvector<Real,noVelComp> averageVelocity(Finite_cells_iterator &cell)
+template <typename Cell>
+inline Pvector<Real,noVelComp> averageVelocity(Cell &cell)
 {
     Pvector<Real,noVelComp> temp = Pvector<Real,noVelComp>::zero();
     for (int i=0; i<NO_DIM+1; ++i)
@@ -194,7 +303,8 @@ inline Pvector<Real,noVelComp> averageVelocity(Finite_cells_iterator &cell)
     return temp / Real(NO_DIM+1);
 }
 // Returns the scalar averaged over the cell's vertices (= its value at the cell centroid).
-inline Pvector<Real,noScalarComp> averageScalar(Finite_cells_iterator &cell)
+template <typename Cell>
+inline Pvector<Real,noScalarComp> averageScalar(Cell &cell)
 {
     Pvector<Real,noScalarComp> temp = Pvector<Real,noScalarComp>::zero();
     for (int i=0; i<NO_DIM+1; ++i)
@@ -287,10 +397,65 @@ void interpolateGrid_averaged_1(DT &dt,
 #endif
 
 
+    // The Monte-Carlo average (2026-10-13, audit finding 1). Each tetrahedron maps the first n entries of
+    // ONE shared Sobol table into itself, and before today it did so from CGAL's vertex(0). Two things
+    // made that a BIAS, not noise: (a) a short Sobol prefix does not average to the centroid (barycentric
+    // slot means 0.160/0.262/0.275/0.302 at n = 17, the minimum count with the default --samples 100), so
+    // for the linear interpolant the tet's sampled mass is V f(sample mean), not V f(centroid); and
+    // (b) CGAL's vertex slots correlate with density. Every production '_a' grid lost 0.17-0.29% of its
+    // mass (TNG100 z=1: box mean - 1 = -2.43e-3; demo/z0_64.gadget at 128^3: -2.42e-3), and the
+    // realization changed with the thread count and the partition split (23% rms per cell between
+    // --partition 1 and 2 2 2 on the demo). Two changes, both in the CPU loop and in the GPU extraction:
+    //   - vertex order: mcVertexOrder() sorts the vertices by a hash of the cell's vertex SET (absolute
+    //     coordinates), so the base vertex and the slots are pseudo-random (no density correlation) and the
+    //     same in every partition / thread / padding: the grids of --partition 2 2 2, one thread and ten
+    //     threads now agree to float summation order (4e-6 max per cell on the demo at 128^3; a sample lying
+    //     EXACTLY on a cell face can still land on either side, as the splits round it in different region
+    //     frames: one sample in the double build's 64^3 demo grid);
+    //   - centring: every sample value is shifted by grad f . (centroid - sample mean), i.e. evaluated at
+    //     p + delta with delta = sum_j c_j (v_j - v_0), c_j = 1/(D+1) - mean_j(n) over the table prefix
+    //     actually used. For the linear interpolant the n samples then sum to n f(centroid) exactly, under
+    //     any vertex order, so a tetrahedron's mass (and momentum) is exact; only its split over the grid
+    //     cells is sampled. The shifted weights (lambda_ij + c_j) stay >= 0 for every n <= 34 (all of the
+    //     small, dense-region tetrahedra); beyond, the most negative one is -0.013 (n = 88), which would need
+    //     a 70x density contrast across one large, smooth void tetrahedron to give a negative sample.
+    // Demo (z0_64.gadget, --periodic --padding 12, density_a velocity_a), box mean - 1, old -> new:
+    // 64^3 -3.35e-3 -> +2.0e-5, 128^3 -2.42e-3 -> +4.0e-6, 128^3 -s 20 -5.5e-3 -> +9.3e-6; the remainder
+    // comes from the tetrahedra cut by the periodic box faces (their two images are labelled independently,
+    // the coordinates differ by L). rms(cell - exact)/mean: 8.3e-2 -> 6.2e-2 (64^3), 0.183 -> 0.146 (128^3).
+    // CPU == GPU as before (2150 of 128^3 cells differ by a sample on a cell face; 2235 before).
+    // --exact-average keeps CGAL's order (its grids are byte-identical to before). DTFE_MC_LEGACY=1 restores
+    // the old sampled realization (A/B, and to reproduce grids made before 2026-10-13).
+    bool const mcLegacy = getenv("DTFE_MC_LEGACY") != nullptr and atoi( getenv("DTFE_MC_LEGACY") ) != 0;
+    bool const legacyOrder = exactAvg or mcLegacy;
+    bool const centreMC = not exactAvg and not mcLegacy;
+    if ( mcLegacy and not exactAvg )
+    {
+        MESSAGE::Warning warning( userOptions.verboseLevel );
+        warning << "DTFE_MC_LEGACY=1: the Monte-Carlo '_a' average uses the pre-2026-10-13 realization (CGAL vertex order, no centring), which loses ~0.2-0.3% of the mass and depends on the partition/thread split.\n" << MESSAGE::EndWarning;
+    }
+    // samples in a multi-cell tetrahedron: proportional to its volume, at least minNN and at most maxNN
+    auto sampleCount = [&](Real const cellVolume) -> size_t {
+        size_t const tempInt = size_t(NN*cellVolume/gridCellVolume) + 1;
+        return (cellVolume/gridCellVolume>minRatio) ? (tempInt>maxNN ? maxNN:tempInt) : minNN; };
+
     // quasi-random (Sobol) sequence shared by all cells
     std::vector<Real> quasiRandomNumbers_buf(maxNN * NO_DIM);
     Real (*quasiRandomNumbers)[NO_DIM] = reinterpret_cast<Real(*)[NO_DIM]>(quasiRandomNumbers_buf.data());
     quasiRandomSequence( quasiRandomNumbers, maxNN );
+    // centring: prefix sums (double) of the table's barycentric coordinates AS STORED (Real), so the
+    // correction matches the samples actually placed; c_j(n) = 1/(D+1) - prefix_j(n)/n
+    std::vector<double> prefixSum;
+    if ( centreMC )
+    {
+        prefixSum.assign( (maxNN+1)*NO_DIM, 0. );
+        for (size_t i=0; i<maxNN; ++i)
+            for (int j=0; j<NO_DIM; ++j)
+                prefixSum[(i+1)*NO_DIM+j] = prefixSum[i*NO_DIM+j] + double(quasiRandomNumbers[i][j]);
+    }
+    auto centreWeights = [&](size_t const n, double c[NO_DIM]) {
+        for (int j=0; j<NO_DIM; ++j)
+            c[j] = 1./double(NO_DIM+1) - prefixSum[n*NO_DIM+j] / double(n); };
 
 
     // GPU deposit (--gpu, GPU build): extract flat per-tetrahedron arrays using the CPU
@@ -306,6 +471,7 @@ void interpolateGrid_averaged_1(DT &dt,
         MESSAGE::Warning warning( userOptions.verboseLevel );
         warning << "--gpu supports ONE scalar component (this build has NO_SCALARS=" << noScalarComp << "); using the CPU interpolation for this pass.\n" << MESSAGE::EndWarning;
         tryMetal = false;
+        ++dtfeGpuFallbacks;
     }
 #endif
     // the single-cell fast path ships 32-bit flat grid indices to the GPU
@@ -314,6 +480,7 @@ void interpolateGrid_averaged_1(DT &dt,
         MESSAGE::Warning warning( userOptions.verboseLevel );
         warning << "--gpu does not support more than 2^32 grid cells; using the CPU interpolation.\n" << MESSAGE::EndWarning;
         tryMetal = false;
+        ++dtfeGpuFallbacks;
     }
     if ( tryMetal )
     {
@@ -368,10 +535,13 @@ void interpolateGrid_averaged_1(DT &dt,
             if ( cellOutsideRegion(dt, itC, fullBox) )
                 continue;
 
+            // the CPU loop's vertex order (mcVertexOrder: the hashed order for the sampled average, CGAL's
+            // under --exact-average); the kernels take vertex 0 as the base, in the order given
+            McCell mc = mcVertexOrder( itC, legacyOrder );
             double vertexMatrix[NO_DIM][NO_DIM];
             int baseGridCell[NO_DIM];
             Real basePosition[NO_DIM];
-            int cellPosition = checkCellPosition( itC, boxCoordinates, dx, vertexMatrix, baseGridCell, basePosition );
+            int cellPosition = checkCellPosition( mc, boxCoordinates, dx, vertexMatrix, baseGridCell, basePosition );
             Real cellVolume = volume( dt, itC );
 
             size_t index;
@@ -379,28 +549,62 @@ void interpolateGrid_averaged_1(DT &dt,
             if ( cellPosition==SINGLE_GRID_CELL and isGridCellIndex( baseGridCell, nGrid, &index ) )
                 flat = uint32_t(index);   // cnt 0 = deposit the centroid value at 'flat'
             else
-            {
-                size_t const tempInt = size_t(NN*cellVolume/gridCellVolume) + 1;
-                cnt = uint32_t( (cellVolume/gridCellVolume>minRatio) ? (tempInt>maxNN ? maxNN:tempInt) : minNN );
-            }
+                cnt = uint32_t( sampleCount( cellVolume ) );
+
+            // Centring on the GPU without a kernel change (2026-10-13): the kernels evaluate a sample as
+            // f_0 + grad f . p with grad f built from the vertex DIFFERENCES f_j - f_0, so adding the same
+            // constant C = sum_j c_j (f_j - f_0) (= grad f . delta of the CPU loop) to all NO_DIM+1 vertex
+            // values shifts every sample value by C and leaves the gradient alone. Only for sampled tets:
+            // the single-cell fast path (cnt 0) deposits the vertex mean, which is exact already.
+            bool const centreThis = centreMC and cnt > 0;
+            double cw[NO_DIM] = {};
+            if ( centreThis ) centreWeights( cnt, cw );
+            auto shiftOf = [&](double const f[NO_DIM+1]) {
+                double c = 0.;
+                for (int j=0; j<NO_DIM; ++j) c += cw[j] * (f[j+1] - f[0]);
+                return c; };
 
             // vertex positions relative to the region's lower corner (subtracted in double, so
             // the narrowed floats match the CPU's Real basePosition exactly)
             for (int v=0; v<NO_DIM+1; ++v)
                 for (int d=0; d<NO_DIM; ++d)
-                    tetVerts.push_back( float( double(itC->vertex(v)->point()[d]) - double(boxCoordinates[2*d]) ) );
-            for (int v=0; v<NO_DIM+1; ++v)
-                tetDens.push_back( float(itC->vertex(v)->info().density()) );
+                    tetVerts.push_back( float( double(mc.v[v]->point()[d]) - double(boxCoordinates[2*d]) ) );
+            if ( centreThis )
+            {
+                double f[NO_DIM+1];
+                for (int v=0; v<NO_DIM+1; ++v) f[v] = double( mc.v[v]->info().density() );
+                double const c = shiftOf( f );
+                for (int v=0; v<NO_DIM+1; ++v) tetDens.push_back( float(f[v] + c) );
+            }
+            else
+                for (int v=0; v<NO_DIM+1; ++v)
+                    tetDens.push_back( float(mc.v[v]->info().density()) );
 #ifdef VELOCITY
             if ( needVel )
+            {
+                double c[noVelComp] = {};
+                if ( centreThis )
+                    for (size_t j=0; j<noVelComp; ++j)
+                    {
+                        double f[NO_DIM+1];
+                        for (int v=0; v<NO_DIM+1; ++v) f[v] = double( mc.v[v]->info().velocity(j) );
+                        c[j] = shiftOf( f );
+                    }
                 for (int v=0; v<NO_DIM+1; ++v)
                     for (size_t j=0; j<noVelComp; ++j)
-                        tetVels.push_back( float(itC->vertex(v)->info().velocity(j)) );
+                        tetVels.push_back( centreThis ? float( double(mc.v[v]->info().velocity(j)) + c[j] )
+                                                      : float( mc.v[v]->info().velocity(j) ) );
+            }
 #endif
 #ifdef SCALAR
             if ( needScal )
+            {
+                double f[NO_DIM+1];
+                for (int v=0; v<NO_DIM+1; ++v) f[v] = double( mc.v[v]->info().myScalar()[0] );
+                double const c = centreThis ? shiftOf( f ) : 0.;
                 for (int v=0; v<NO_DIM+1; ++v)
-                    tetScal.push_back( float(itC->vertex(v)->info().myScalar()[0]) );
+                    tetScal.push_back( centreThis ? float(f[v] + c) : float(mc.v[v]->info().myScalar()[0]) );
+            }
 #endif
             tetVols.push_back( float(cellVolume) );
             tetCnts.push_back( cnt );
@@ -522,7 +726,7 @@ void interpolateGrid_averaged_1(DT &dt,
         // the grid into the output afterwards -- so this thread's own sub-grid stays ZERO. A batch the
         // device hands back (allocation, watchdog) leaves its owner box zeroed and falls through to the
         // per-call path below, then to the CPU loop.
-        bool sharedDone = false;
+        bool sharedDone = false, sharedFailed = false;
         if ( dtfeGpuSharedActive() and userOptions.subgridOffset.size()==size_t(NO_DIM) )
         {
             size_t subOff[3] = { userOptions.subgridOffset[0], userOptions.subgridOffset[1], userOptions.subgridOffset[2] };
@@ -538,12 +742,23 @@ void interpolateGrid_averaged_1(DT &dt,
             {   // consumed by the upload but the dispatch failed: nothing left for the per-call path
                 MESSAGE::Warning warning( userOptions.verboseLevel );
                 warning << "DTFE " << gpuBackendName() << " shared grid failed for this sub-domain (" << metalErr << "); using the CPU interpolation.\n" << MESSAGE::EndWarning;
+                ++dtfeGpuFallbacks;
+                sharedFailed = true;
             }
+        }
+        // The per-call path. A deposit that fails AFTER its upload consumed the arrays (the retry policy gave up,
+        // 2026-10-13) warns too: the warning used to need the arrays still there, so such a runtime fallback to
+        // the CPU loop below was silent -- and the suites' 'using the CPU interpolation' check blind to it.
+        bool perCallOk = false, perCallFailed = false;
+        if ( not sharedDone and not sharedFailed and not tetCnts.empty() )
+        {
+            perCallOk = dtfeGpuDepositAveraged1( tetVerts, tetDens, tetVels, tetScal, tetVols, tetCnts, tetFlats,
+                                                 sobolTable, dxv, nGrid, fDen, fVel, fGrad, fScal, fSGrad, exactAvg, gpuOut, metalErr );
+            perCallFailed = not perCallOk;
         }
         if ( sharedDone )
             metalDeposited = true;
-        else if ( not tetCnts.empty() and dtfeGpuDepositAveraged1( tetVerts, tetDens, tetVels, tetScal, tetVols, tetCnts, tetFlats,
-                                                                      sobolTable, dxv, nGrid, fDen, fVel, fGrad, fScal, fSGrad, exactAvg, gpuOut, metalErr ) )
+        else if ( perCallOk )
         {
             for (size_t i=0; i<gridSize; ++i)
             {
@@ -563,10 +778,11 @@ void interpolateGrid_averaged_1(DT &dt,
             }
             metalDeposited = true;
         }
-        else if ( nTetsDeposited > 0 and not tetCnts.empty() )
+        else if ( perCallFailed )
         {
             MESSAGE::Warning warning( userOptions.verboseLevel );
             warning << "DTFE " << gpuBackendName() << " deposit unavailable (" << metalErr << "); using the CPU interpolation.\n" << MESSAGE::EndWarning;
+            ++dtfeGpuFallbacks;
         }
         else if ( nTetsDeposited == 0 )
             metalDeposited = true;              // no tetrahedra in the region: nothing to deposit either way
@@ -574,6 +790,9 @@ void interpolateGrid_averaged_1(DT &dt,
 #else
     if ( userOptions.useMetal )
     {
+#ifndef PHASE_SPACE
+        ++dtfeGpuFallbacks;
+#endif
         static bool warned = false;
         if ( !warned )
         {
@@ -611,10 +830,11 @@ void interpolateGrid_averaged_1(DT &dt,
 #endif
 
 
+        McCell mc = mcVertexOrder( itC, legacyOrder );   // vertex order (base = mc.v[0]); CGAL's under --exact-average
         double vertexMatrix[NO_DIM][NO_DIM]; // vertex differences of the Delaunay cell
         int baseGridCell[NO_DIM];  // grid cell containing the base point
         Real basePosition[NO_DIM]; // base point position relative to the box's lower-left corner
-        int cellPosition = checkCellPosition( itC, boxCoordinates, dx, vertexMatrix, baseGridCell, basePosition );
+        int cellPosition = checkCellPosition( mc, boxCoordinates, dx, vertexMatrix, baseGridCell, basePosition );
 
         Real cellVolume = volume( dt, itC );
         Real posMatrixInverse[NO_DIM][NO_DIM];  // inverse vertex position-difference matrix
@@ -625,22 +845,22 @@ void interpolateGrid_averaged_1(DT &dt,
 #ifndef MY_SCALAR
         if ( cellPosition==SINGLE_GRID_CELL and isGridCellIndex( baseGridCell, nGrid, &index ) )
         {
-            if (field.density) (*density)[index] += averageDensity(itC) * cellVolume;
+            if (field.density) (*density)[index] += averageDensity(mc) * cellVolume;
 #ifdef VELOCITY
-            if (field.velocity) (*velocity)[index] += averageVelocity(itC) * cellVolume;
+            if (field.velocity) (*velocity)[index] += averageVelocity(mc) * cellVolume;
             if (field.velocity_gradient)
             {
                 Real velGrad[NO_DIM][noVelComp];
-                velocityGrad( itC, posMatrixInverse, velGrad );
+                velocityGrad( mc, posMatrixInverse, velGrad );
                 (*velocity_gradient)[index] += velocityGradient(velGrad) * cellVolume;
             }
 #endif
 #ifdef SCALAR
-            if (field.scalar) (*scalar)[index] += averageScalar(itC) * cellVolume;
+            if (field.scalar) (*scalar)[index] += averageScalar(mc) * cellVolume;
             if (field.scalar_gradient)
             {
                 Real sGrad[NO_DIM][noScalarComp];
-                scalarGrad( itC, posMatrixInverse, sGrad );
+                scalarGrad( mc, posMatrixInverse, sGrad );
                 (*scalar_gradient)[index] += scalarGradient(sGrad) * cellVolume;
             }
 #endif
@@ -815,38 +1035,62 @@ void interpolateGrid_averaged_1(DT &dt,
 
 
         // cell spans multiple grid cells -> MC-sample inside it
-        size_t const tempInt = size_t(NN*cellVolume/gridCellVolume) + 1;
-        size_t const noRandomPoints = (cellVolume/gridCellVolume>minRatio) ? (tempInt>maxNN ? maxNN:tempInt) : minNN;
+        size_t const noRandomPoints = sampleCount( cellVolume );
         std::vector<Point> randomPoints(noRandomPoints);
         quasiRandomPointsInCell( vertexMatrix, noRandomPoints, quasiRandomNumbers, randomPoints.data() );
         Real factor = cellVolume / noRandomPoints;  // volume per sample point
-        Vertex_handle base = itC->vertex(0);
+        Vertex_handle base = mc.v[0];
+        // centring (see mcLegacy above): a sample at p (relative to the base) is DEPOSITED in p's grid cell
+        // but EVALUATED at p + delta, delta = sum_j c_j (v_j - v_0) = centroid - mean of the n samples, so
+        // the n values of a linear field sum to n f(centroid)
+        Real delta[NO_DIM] = {};
+        if ( centreMC )
+        {
+            double cw[NO_DIM];
+            centreWeights( noRandomPoints, cw );
+            for (int d=0; d<NO_DIM; ++d)
+            {
+                double t = 0.;
+                for (int j=0; j<NO_DIM; ++j) t += cw[j] * vertexMatrix[j][d];
+                delta[d] = Real(t);
+            }
+        }
 
         Real densGrad[NO_DIM];
-        densityGrad( itC, posMatrixInverse, densGrad );
+        densityGrad( mc, posMatrixInverse, densGrad );
 #ifdef VELOCITY
         Real velGrad[NO_DIM][noVelComp];
-        velocityGrad( itC, posMatrixInverse, velGrad );
+        velocityGrad( mc, posMatrixInverse, velGrad );
 #endif
 #ifdef SCALAR
         Real sGrad[NO_DIM][noScalarComp];
-        scalarGrad( itC, posMatrixInverse, sGrad );
+        scalarGrad( mc, posMatrixInverse, sGrad );
 #endif
         for (size_t i=0; i<noRandomPoints; ++i) // scatter each sample point's field value into its grid cell
         {
             if ( not isGridCellIndex( nGrid, dx, randomPoints[i], basePosition, &index ) )
                 continue;   // sample outside the region of interest
+            Point evalPoint = randomPoints[i];   // where the (linear) fields are evaluated
+            if ( centreMC )
+            {
+#if NO_DIM==2
+                evalPoint = Point( randomPoints[i][0]+delta[0], randomPoints[i][1]+delta[1] );
+#else
+                evalPoint = Point( randomPoints[i][0]+delta[0], randomPoints[i][1]+delta[1], randomPoints[i][2]+delta[2] );
+#endif
+            }
             
-            if (field.density) (*density)[index] += densityValue(densGrad,base,randomPoints[i]) * factor;
+            if (field.density) (*density)[index] += densityValue(densGrad,base,evalPoint) * factor;
 #ifdef VELOCITY
-            if (field.velocity) (*velocity)[index] += velocityValue(velGrad,base,randomPoints[i]) * factor;
+            if (field.velocity) (*velocity)[index] += velocityValue(velGrad,base,evalPoint) * factor;
             if (field.velocity_gradient) (*velocity_gradient)[index] += velocityGradient(velGrad) * factor;
 #endif
 #ifdef SCALAR
 #ifdef MY_SCALAR
-            (*scalar)[index] +=  customScalar(itC, posMatrixInverse, base, randomPoints[i]) * factor;
+            // the user's function (any C++, not linear) sees the sample itself; only linear fields are centred
+            (*scalar)[index] +=  customScalar(mc, posMatrixInverse, base, randomPoints[i]) * factor;
 #else
-            if (field.scalar) (*scalar)[index] += scalarValue(sGrad,base,randomPoints[i]) * factor;
+            if (field.scalar) (*scalar)[index] += scalarValue(sGrad,base,evalPoint) * factor;
             if (field.scalar_gradient) (*scalar_gradient)[index] += scalarGradient(sGrad) * factor;
 #endif
 #endif

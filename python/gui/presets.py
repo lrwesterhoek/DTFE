@@ -20,7 +20,9 @@ _SEVEN = ["density_a", "velocity_a", "gradient_a", "divergence_a", "shear_a", "v
 
 # name -> (one-line description, settings). The settings are RunSpec / CustomSpec fields; a
 # preset leaves every field it does not name as it was. 'slice_plane': "largest" = the largest
-# image plane found for the simulation (none: no slice).
+# image plane found for the simulation (none: no slice). 'deposit' is PS-DTFE's; 'deposit_dtfe' (2026-10-13), when
+# given, is the cell average a standard-DTFE job gets instead (the thesis settings: the exact one, standard DTFE's
+# production setting since 2026-10-13; before, 'Standard' put a standard job on the Monte-Carlo average).
 BUILTIN_PRESETS: dict[str, tuple[str, dict]] = {
     "Quick look": ("128³ grid, density and velocity only: about a minute on a laptop-sized "
                    "snapshot, for checking that everything works",
@@ -29,12 +31,12 @@ BUILTIN_PRESETS: dict[str, tuple[str, dict]] = {
                     "caustic_cusps": False, "slice_plane": ""}),
     "Standard": ("512³ grid, the seven production fields with the literature-standard weighting "
                  "(the setting of the thesis grids)",
-                 {"grid": 512, "nsub": 3, "deposit": "sampled", "fields": list(_SEVEN),
+                 {"grid": 512, "nsub": 3, "deposit": "sampled", "deposit_dtfe": "exact", "fields": list(_SEVEN),
                   "vertex_mass": True, "volume_weighted": True, "caustics": False,
                   "caustic_cusps": False, "slice_plane": ""}),
     "Publication": ("Standard + caustic stratification + a hi-res point-evaluated slice (the "
                     "largest image plane of the simulation) for figures",
-                    {"grid": 512, "nsub": 3, "deposit": "sampled", "fields": list(_SEVEN),
+                    {"grid": 512, "nsub": 3, "deposit": "sampled", "deposit_dtfe": "exact", "fields": list(_SEVEN),
                      "vertex_mass": True, "volume_weighted": True, "caustics": True,
                      "caustic_cusps": False, "slice_plane": "largest", "slice_vel_grad": True}),
     "Exact deposit": ("256³ grid with the exact tetrahedron-cell clipping instead of sampling: "
@@ -72,6 +74,8 @@ def apply_preset(spec, settings: dict, planes=()) -> list[str]:
     planes: the simulation's image-plane files, for 'slice_plane': 'largest'."""
     changed = []
     known = spec.to_dict()
+    if settings.get("estimator", known.get("estimator")) == "dtfe" and "deposit_dtfe" in settings:
+        settings = dict(settings, deposit=settings["deposit_dtfe"])     # standard DTFE: its cell average (2026-10-13)
     for k, v in settings.items():
         if k not in known:
             continue
@@ -106,14 +110,14 @@ OPTION_TEXT = {
     "exact":           ("Exact: analytic tetrahedron-cell clipping (noise-free; best on the GPU)", "--ps-exact-deposit"),
     "parallel_triangulation": ("Parallel triangulation (faster; repeats differ at float rounding)",
                                "--parallel-triangulation"),
-    "ordered_merge":   ("Merge the partitions in index order (bit-identical repeats; can be slower)",
+    "ordered_merge":   ("Merge the partitions in index order (bit-identical repeats; the default, off = as they finish)",
                         "--ordered-merge"),
     "alpha_shape":     ("Alpha shape: drop Lagrangian tetrahedra wider than this many mean particle spacings "
                         "(0 keeps the whole convex hull)", "--ps-alpha-shape"),
     "sampled":         ("Sampled: nSub³ points per cell (fast, the default)", "--avg-subsamples"),
-    "sampled_dtfe":    ("Sampled: the mean over random points in each cell (fast, the default)", "--samples"),
-    "exact_dtfe":      ("Exact: each cell the exact average of the interpolated field (noise-free; best on the GPU)",
-                        "--exact-average"),
+    "sampled_dtfe":    ("Sampled: the Monte-Carlo mean over points in each cell (faster)", "--samples"),
+    "exact_dtfe":      ("Exact: each cell the exact average of the interpolated field (noise-free; the default, "
+                        "best on the GPU)", "--exact-average"),
     "periodic":        ("The box is periodic (a cosmological simulation)", "--periodic"),
     "scalar":          ("Also interpolate a per-particle value", "--scalar-dataset"),
 }

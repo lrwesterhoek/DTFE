@@ -39,6 +39,10 @@
 #      lies on the ridge k q_x = pi where the null-direction derivative of lambda_c vanishes (the
 #      indicator marks that ridge within its fold band, as in 3D), the unmodulated pancake -- no cusps
 #      -- gets none, and no swallowtail bit is ever set in 2D
+#   CO the 2D redshift cone (DTFE-2d --redshiftCone, origin x != y): the Monte Carlo cell averages agree with the
+#      centre values (2026-10-11: the samples used origin x for y)
+#   DM a 3-column snapshot through DTFE-2d / PS-DTFE-2d (and a 2-column one through DTFE / PS-DTFE, when built)
+#      is refused with a message naming the binaries to use (2026-10-11: a segfault or a garbage grid at exit 0)
 #   EA the standard DTFE-2d's --exact-average (2D since 2026-10-02, triangles clipped by ps_clip2d.h):
 #      density 1 to float rounding on a perfect lattice (the sampled average is off by percents), mass
 #      conserved on a pancake, and the sampled average agrees with it to its own noise
@@ -132,6 +136,23 @@ RUN "$TMP/ea_lat"  ./DTFE-2d "$TMP/lat.hdf5"  "$TMP/ea_lat"  --grid 48 --periodi
 RUN "$TMP/ea_lats" ./DTFE-2d "$TMP/lat.hdf5"  "$TMP/ea_lats" --grid 48 --periodic --MpcUnit 1 --verbose 2 --field density_a --samples 400
 RUN "$TMP/ea_pan"  ./DTFE-2d "$TMP/span.hdf5" "$TMP/ea_pan"  --grid 48 --periodic --MpcUnit 1 --verbose 2 --field density_a velocity_a --exact-average
 RUN "$TMP/ea_pans" ./DTFE-2d "$TMP/span.hdf5" "$TMP/ea_pans" --grid 48 --periodic --MpcUnit 1 --verbose 2 --field density_a velocity_a --samples 400
+echo ">> a redshift cone off the diagonal (origin x != y), and snapshots of the other dimension"
+GEN --out "$TMP/cone.hdf5" --n 64 --box 100 --amplitude-factor 0.5 --crossed-waves --jitter-frac 0.02 --seed 4
+RUN "$TMP/cone" ./DTFE-2d "$TMP/cone.hdf5" "$TMP/cone" --grid 16 64 --periodic --MpcUnit 1 --verbose 2 \
+    --field density density_a --redshiftCone 2 25 0 359 --origin 30 60
+# a 3-column (3D) snapshot through the 2D binaries, a 2-column one through the 3D binaries (when built): refused
+# by name before any read -- until 2026-10-11 HDF5 wrote 3N values into a 2N buffer (a segfault or a garbage grid
+# at exit 0) or read 3N values from a 2N dataset (a garbage grid at exit 0)
+"$PY" tests/generate_ps_test_data.py --dim 3 --out "$TMP/dim3.hdf5" --n 8 --box 100 >/dev/null || { echo "FAIL data gen 3D"; exit 1; }
+: > "$TMP/dimcheck.txt"
+for pair in "./DTFE-2d dim3 3" "./PS-DTFE-2d dim3 3" "./DTFE pan 2" "./PS-DTFE pan 2"; do
+    set -- $pair
+    [ -x "$1" ] || continue
+    "$1" "$TMP/$2.hdf5" "$TMP/dim_$(basename "$1")" --grid 16 --periodic --MpcUnit 1 --field density > "$TMP/dim_$(basename "$1").log" 2>&1
+    rc=$?
+    grep -q "holds $3 coordinates per particle, but this binary is built for" "$TMP/dim_$(basename "$1").log" && said=1 || said=0
+    echo "$(basename "$1") $rc $said" >> "$TMP/dimcheck.txt"
+done
 "$PY" - "$TMP" "$G" "$ROOT" <<'PYEOF'
 import numpy as np, sys
 from pathlib import Path
@@ -370,6 +391,20 @@ px, ps_ = a48("ea_pan"), a48("ea_pans")
 check("EA2 exact average conserves mass", abs(px.mean() - 1) < 1e-6 and px.size == 48*48, f"mean {px.mean():.9f}")
 l1 = float(np.abs(px - ps_).mean() / px.mean())
 check("EA3 sampled ~ exact", l1 < 0.02, f"relative L1 |exact - sampled(400)| {l1:.1e}")
+
+# CO: the 2D redshift cone's Monte Carlo cell average (method 2) samples the cell around the origin's (x, y);
+# until 2026-10-11 it used origin x for y, so with origin (30, 60) every cell averaged the field 30 Mpc away
+cu = np.fromfile(tmp / "cone.den", np.float32).astype(np.float64)
+ca = np.fromfile(tmp / "cone.a_den", np.float32).astype(np.float64)
+l1 = float(np.abs(ca - cu).mean() / cu.mean())
+check("CO 2D cone average at its cells", ca.size == 16*64 and l1 < 0.15,
+      f"relative L1 |cell average - centre value| {l1:.3f} (field contrast {cu.std() / cu.mean():.2f}; 0.49 when displaced)")
+
+# DM: a snapshot of the other dimension is refused by name (not a segfault, not a garbage grid at exit 0)
+for line in (tmp / "dimcheck.txt").read_text().split("\n"):
+    if line.strip():
+        b, rc, said = line.split()
+        check(f"DM {b} refuses the other dimension", rc != "0" and said == "1", f"exit {rc}, message {'given' if said == '1' else 'MISSING'}")
 
 # D: the standard 2D build
 sd = np.fromfile(tmp / "std.a_den", np.float32)

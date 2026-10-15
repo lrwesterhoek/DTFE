@@ -144,6 +144,13 @@ def main():
     ap.add_argument("--mass", type=float, default=1.0,
                     help="particle mass placed in MassTable (default 1.0)")
     ap.add_argument("--seed", type=int, default=42, help="RNG seed (default 42)")
+    ap.add_argument("--offset", type=float, default=0.0,
+                    help="add this constant to every coordinate (Coordinates and InitialCoordinates): the "
+                         "periodic box becomes [offset, offset + box] on every axis, which the run must be "
+                         "told with --box (the header still says BoxSize = box). Far from the origin a float "
+                         "shift by the box length rounds -- tests/ps_periodic_seam_check.sh puts the box "
+                         "across the binade 2^17 so the +L copies of the bottom particles round to 2^-6 "
+                         "(default 0)")
     ap.add_argument("--dim", type=int, choices=(2, 3), default=3,
                     help="2 writes a 2D snapshot for the DIM=2 builds (PS-DTFE-2d / DTFE-2d): an n^2 "
                          "lattice and two-column Coordinates/Velocities/InitialCoordinates; with "
@@ -153,6 +160,9 @@ def main():
     q, x, velocity = build_pancake(args.n, args.box, args.amplitude_factor,
                                    args.jitter_frac, args.seed, args.margin_frac,
                                    args.crossed_waves, args.swallowtail, args.dim, args.modulation)
+    if args.offset != 0.0:
+        q = q + args.offset
+        x = x + args.offset
     write_snapshot(args.out, q, x, velocity, args.box, args.mass)
 
     n = x.shape[0]

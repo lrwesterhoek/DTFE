@@ -161,6 +161,25 @@ def void_size_function(r_mpc, z: float = 0.0, model: str = "vdn", delta_v: float
     return out if np.ndim(r_mpc) else float(out[0])
 
 
+def void_dn_dlnr_binned(edges_mpc, z: float = 0.0, n: int = 21, **kw) -> np.ndarray:
+    """dn/dlnR [Mpc^-3] AVERAGED in ln R over each bin of 'edges_mpc' (len(edges) - 1 values; n points per bin):
+    what a histogram of counts / (V dlnR) measures (2026-10-11). The model falls by decades across a wide bin, so its
+    value at the bin centre is not the comparison."""
+    e = np.asarray(edges_mpc, dtype=np.float64)
+    return np.array([np.mean(void_size_function(np.geomspace(lo, hi, int(n)), z, **kw))
+                     for lo, hi in zip(e[:-1], e[1:])])
+
+
+def void_number_between(r_lo_mpc: float, r_hi_mpc: float, z: float = 0.0, n: int = 81, **kw) -> float:
+    """The model's number density [Mpc^-3] of voids with r_lo <= R < r_hi: dn/dlnR integrated in ln R (trapezoid on
+    n points; 2026-10-11, the fixed-R size function's one-number ratio). 0 for an empty range."""
+    lo, hi = float(r_lo_mpc), float(r_hi_mpc)
+    if not (np.isfinite(lo) and np.isfinite(hi) and 0 < lo < hi):
+        return 0.0
+    g = np.geomspace(lo, hi, int(n))
+    return float(_trapz(void_size_function(g, z, **kw), np.log(g)))
+
+
 def void_cumulative(r_mpc, z: float = 0.0, r_max_mpc: float | None = None, **kw) -> np.ndarray:
     """n(>R) [Mpc^-3]: dn/dlnR integrated in ln R from each R to r_max_mpc (default 100 R_max(r_mpc), where the
     abundance is exp-small)."""

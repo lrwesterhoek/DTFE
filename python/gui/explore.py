@@ -29,14 +29,16 @@ from PySide6.QtCore import (QLineF, QObject, QPointF, QProcess, QProcessEnvironm
                             Signal, Slot)
 from PySide6.QtGui import QColor, QFontMetrics, QImage, QLinearGradient, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox, QProgressBar, QPushButton, QSizePolicy, QSlider,
     QSpinBox, QTableWidget, QTableWidgetItem, QToolButton, QVBoxLayout, QWidget,
 )
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import figsave as FS  # noqa: E402  (the Save options: presets, units, full resolution; 2026-10-14)
 import grids as G  # noqa: E402
 import runspec as rs  # noqa: E402
+from dtfelib.estimator import STANDARD_PADDING  # noqa: E402  (the standard server's and exact zoom's '--padding')
 
 VOID_TOOL = rs.REPO_ROOT / "python" / "tools" / "void_outlines.py"     # the voids of one snapshot, as JSON
 VOID_CACHE_DIR = None        # the helper's catalogue cache: None = the pipeline's own (config.CACHE_DIR); tests pin a temp one
@@ -72,6 +74,7 @@ GRID_MERGE_TIP = ("The panels touch (no gaps, shared axes, tick labels on the ou
 # in its name): the custom-snapshot runs, and the grid files opened by hand with the … button
 GROUP_CUSTOM = "custom snapshots"
 GROUP_OPENED = "opened files"
+KEPT_ZOOM_TEXT = "zoom window "     # the zoom line's start when a window carried from another output is not shown (2026-10-14)
 
 
 def default_cache_dir(near: str) -> Path:
@@ -83,6 +86,14 @@ def default_cache_dir(near: str) -> Path:
         return root / ".dtfe-tessellation-cache"
     base = Path.home() / ("Library/Caches" if sys.platform == "darwin" else ".cache")
     return base / "DTFE" / "tessellations"
+
+
+def kept_index(frac: float, n: int) -> int:
+    """The cell of an n-cell axis holding the place 'frac' of the box along it (0 = the low face, 1 = the high
+    one): the slice another output or redshift is shown at (2026-10-14). A place on a cell face (a coarser grid's
+    cell centre on a finer one) takes the upper cell, whatever float rounding does; clamped to the grid, so the
+    same grid gives back its own index: (i + 0.5) / n -> i."""
+    return int(min(n - 1, max(0, int(np.floor(float(frac) * n + 1e-9)))))
 
 
 # ==================================================================== the difference map (survey item 17)
@@ -169,7 +180,8 @@ class SliceWorker(QObject):
             circles, dashed, clips = grid_tile_circles(req, items)
             self.grid_done.emit({"request": req, "rgb": rgb, "labels": labels, "bar": bar,
                                  "shown": sum(1 for it in items if it is not None),
-                                 "circles": circles, "dashed": dashed, "clips": clips})
+                                 "circles": circles, "dashed": dashed, "clips": clips,
+                                 "title": grid_suptitle(req, items)})
         except Exception as e:
             self.grid_failed.emit(f"{type(e).__name__}: {e}")
 
@@ -475,8 +487,14 @@ def load_exact_planes(root, grid, redshift=None):
                               caustic=None, velocity=planes.get("velocity"), dispersion=planes.get("dispersion_tensor"),
                               sigma=planes.get("dispersion"), velocity_gradient=None, offsets=None,
                               scalar=planes.get("scalar"))
-    if "caustic" in planes:
-        f.caustic = np.rint(planes["caustic"]).astype(np.int64)
+    # f.caustic is the CLASS mask, as a point evaluation's '.pts_caustic' (the zoom's fold map masks both parity
+    # bits, its class map shows it whole). It took the 0/1 '.caustic' grid until 2026-10-13, so every exact zoom
+    # showed no fold cell at all and the class map showed 0/1. The zoom's run is new: its parity bits are the
+    # geometric overlap (the binary's fix of 2026-10-13), so the fold is exact; a '.caustic' alone stands for both bits
+    if "caustic_class" in planes:
+        f.caustic = np.rint(planes["caustic_class"]).astype(np.int64)
+    elif "caustic" in planes:
+        f.caustic = np.where(np.rint(planes["caustic"]) > 0, 3, 0).astype(np.int64)
     if "gradient" in planes:   # the grid's [j*D+i] = dv_j/dx_i -> the point evaluation's [d, j] = dv_j/dx_d
         f.velocity_gradient = planes["gradient"].reshape(shape + (dim, dim)).swapaxes(-1, -2)
     if f.density is None:
@@ -669,31 +687,61 @@ def grid_tiles(req: dict, items: list, max_tile: int = 1024) -> tuple[np.ndarray
     return out, labels, bar
 
 
-def grid_figure(req: dict, items: list, dpi: float = 200.0):
+def grid_suptitle(req: dict, items: list) -> str:
+    """The figure grid's own title, what Save figure… writes above the panels: merged, what every panel shares (the
+    quantity, the simulation) and the slice; else the slice alone ('' for 2D panels)."""
+    diff = grid_differences(items)
+    pdim = next((it["output"].dim for it in items if it), 3)
+    where = f" ({req['position']})" if req.get("position") else ""
+    slice_text = f"slice normal to {AXES[req['axis']]} at {100 * req['rel']:.0f}% of the box{where}" if pdim == 3 else ""
+    if not req["merged"]:
+        return slice_text
+    head = []
+    if len(diff["quantities"]) == 1:
+        label, ctext, _w, _t = panel_names(next(i for i in items if i))
+        head.append(label + ctext)
+    if len(diff["sims"]) == 1:
+        head.append(next(iter(diff["sims"])))
+    if slice_text:
+        head.append(slice_text)
+    return "   ·   ".join(head)
+
+
+def grid_figure(req: dict, items: list, dpi: float = 200.0, opts: dict | None = None):
     """The full matplotlib figure (what Save figure… writes): axes in Mpc, per-panel titles and colour bars,
     or -- merged -- touching panels with inside labels and the bars in one column at the right, one per
-    quantity. Returns (Figure, panel count)."""
+    quantity. 'opts' = the Save options (figsave.options; None = the defaults, this figure as it always was):
+    the title, the panel titles, frame, ticks, tick labels, axis names and their unit, the colour bars and their
+    labels, the void outlines, the font size, the width; margins 'none' tiles the panels over the whole figure
+    with nothing around them. Returns (Figure, panel count)."""
     import matplotlib
     matplotlib.use("Agg", force=False)
     from matplotlib.figure import Figure
     from matplotlib.backends.backend_agg import FigureCanvasAgg
-    rows, cols, merged, axis, rel = req["rows"], req["cols"], req["merged"], req["axis"], req["rel"]
-    fs = 1.0
-    if merged:                              # cells shaped like the data, no gap at wspace = hspace = 0
+    o_ = FS.options(opts)
+    rows, cols, merged, axis = req["rows"], req["cols"], req["merged"], req["axis"]
+    fs = float(o_["font_scale"])
+    bare = o_["margins"] == "none"          # the panels fill the figure: no title, axes or colour bars
+    bars_on = o_["colorbar"] and not bare
+    tile = merged or bare                   # panels touching on a gridspec of fixed margins (no tight_layout)
+    if tile:                                # cells shaped like the data, no gap at wspace = hspace = 0
         e0 = next(i for i in items if i)["ext"]
         aspect = (e0[3] - e0[2]) / (e0[1] - e0[0]) if e0[1] > e0[0] and e0[3] > e0[2] else 1.0
         pw, ph = 4.2, 4.2 * float(np.clip(aspect, 0.25, 4.0))
-        ml, mr, mb, mt = 0.75, 1.3, 0.6, 0.55      # margins in inches: left, the bar column, bottom, top
+        if bare:
+            ml = mr = mb = mt = 0.0
+        else:                                # margins in inches: left, the bar column, bottom, top
+            ml, mr, mb, mt = 0.75, (1.3 if bars_on else 0.2), 0.6, (0.55 if o_["title"] else 0.2)
         size_in = (pw * cols + ml + mr, ph * rows + mb + mt)
     else:
         size_in = (4.8 * cols, 4.2 * rows)
     fig = Figure(figsize=size_in, dpi=dpi)
     FigureCanvasAgg(fig)
     W, H = size_in
-    if merged:
+    if tile:
         left, right_edge, bottom, top = ml / W, 1.0 - mr / W, mb / H, 1.0 - mt / H
         gs = fig.add_gridspec(rows, cols, left=left, right=right_edge, bottom=bottom, top=top, wspace=0.0, hspace=0.0)
-        axes = gs.subplots(sharex=True, sharey=True, squeeze=False)
+        axes = gs.subplots(sharex=merged, sharey=merged, squeeze=False)
     else:
         axes = fig.subplots(rows, cols, squeeze=False)
     diff = grid_differences(items)
@@ -706,36 +754,44 @@ def grid_figure(req: dict, items: list, dpi: float = 200.0):
             continue
         shown += 1
         o = it["output"]
+        um, _note = FS.unit_map(o, it["rest"], o_["unit"], G.hubble(o) if o_["unit"] == "mpc_h" else None)
+        e = um.ext(it["ext"])
         data = it["plane"].T
         if it["log"]:
             data = np.log10(np.where(data > 0, data, np.nan))
         hi = it["hi"] if it["hi"] > it["lo"] else it["lo"] + 1.0
-        im = ax.imshow(data, origin="lower", extent=it["ext"], cmap=it["cmap"], vmin=it["lo"], vmax=hi,
+        im = ax.imshow(data, origin="lower", extent=e, cmap=it["cmap"], vmin=it["lo"], vmax=hi,
                        aspect="equal", interpolation="nearest")
-        if it.get("voids"):                 # the panel's own voids, as on screen (2026-10-11)
-            e = it["ext"]
+        if it.get("voids") and o_["voids"]:  # the panel's own voids, as on screen (2026-10-11)
             to_mpc = lambda cs: [(e[0] + x, e[3] - y, rx, k) for x, y, rx, _ry, k in cs]   # noqa: E731
             G.draw_void_circles_mpl(ax, to_mpc(panel_void_circles(it, axis, e[1] - e[0], e[3] - e[2])),
                                     to_mpc(panel_void_circles(it, axis, e[1] - e[0], e[3] - e[2], "r_eff")))
         label, ctext, who, when = panel_names(it)
-        unit = "Mpc" if o.box is not None else "cells"
-        ax.set_xlabel(f"{AXES[it['rest'][0]]} [{unit}]", fontsize=8 * fs)
-        ax.set_ylabel(f"{AXES[it['rest'][1]]} [{unit}]", fontsize=8 * fs)
-        ax.tick_params(labelsize=7 * fs)
-        tag = f" · {type_tag(o)}" if diff["by_prefix"] and type_tag(o) else ""
-        if merged:
-            bars.setdefault((it["field"], it["component"]), (im, it))
-            ax.text(0.03, 0.97, panel_label(it, diff), transform=ax.transAxes, va="top", ha="left",
-                    fontsize=8 * fs, color="white", bbox=dict(facecolor="black", alpha=0.45, edgecolor="none", pad=2))
+        if bare:
+            ax.set_axis_off()
         else:
-            ax.set_title(f"{label}{ctext}\n{who}" + (f" · {when}" if when else "") + tag, fontsize=9 * fs)
-            cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.03)
-            cb.set_label(("log₁₀ " if it["log"] else "") + label + ctext, fontsize=8 * fs)
-            cb.ax.tick_params(labelsize=7 * fs)
-    pdim = next((it["output"].dim for it in items if it), 3)
-    where = f" ({req['position']})" if req.get("position") else ""
-    slice_text = f"slice normal to {AXES[axis]} at {100 * rel:.0f}% of the box{where}" if pdim == 3 else ""
-    if merged:
+            FS.style_axes(ax, o_, (AXES[it["rest"][0]], AXES[it["rest"][1]]), um.name, fontsize=8 * fs,
+                          ticksize=7 * fs)
+        tag = f" · {type_tag(o)}" if diff["by_prefix"] and type_tag(o) else ""
+        if tile:
+            if merged and bars_on:
+                bars.setdefault((it["field"], it["component"]), (im, it))
+            if o_["panel_titles"]:
+                ax.text(0.03, 0.97, panel_label(it, diff), transform=ax.transAxes, va="top", ha="left",
+                        fontsize=8 * fs, color="white", bbox=dict(facecolor="black", alpha=0.45, edgecolor="none",
+                                                                  pad=2))
+        else:
+            if o_["panel_titles"]:
+                ax.set_title(f"{label}{ctext}\n{who}" + (f" · {when}" if when else "") + tag, fontsize=9 * fs)
+            if bars_on:
+                cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.03)
+                if o_["colorbar_label"]:
+                    cb.set_label(("log₁₀ " if it["log"] else "") + label + ctext, fontsize=8 * fs)
+                cb.ax.tick_params(labelsize=7 * fs)
+    auto = grid_suptitle(req, items)
+    if bare:
+        pass                                # nothing around the panels
+    elif merged:
         # tick and axis labels on the outer edges only -- of the panels DRAWN: an empty panel in the bottom
         # row (three outputs in a 2 x 2) must not leave its column without an x axis
         drawn = [[axes[r][c].axison for c in range(cols)] for r in range(rows)]
@@ -746,7 +802,7 @@ def grid_figure(req: dict, items: list, dpi: float = 200.0):
                     continue
                 lowest = not any(drawn[rr][c] for rr in range(r + 1, rows))
                 leftmost = not any(drawn[r][cc] for cc in range(c))
-                ax.tick_params(labelbottom=lowest, labelleft=leftmost)
+                ax.tick_params(labelbottom=lowest and o_["tick_labels"], labelleft=leftmost and o_["tick_labels"])
                 if not lowest:
                     ax.set_xlabel("")
                 if not leftmost:
@@ -762,22 +818,42 @@ def grid_figure(req: dict, items: list, dpi: float = 200.0):
             label, ctext, _w, _t = panel_names(it)
             text = ("log₁₀ " if it["log"] else "") + label + ("\n" + ctext.strip() if ctext else "")
             size = 8 * fs * float(np.clip(h * H / 1.6, 0.6, 1.0))   # a short bar (many of them): smaller text
-            cb.set_label(text, fontsize=size)
+            if o_["colorbar_label"]:
+                cb.set_label(text, fontsize=size)
             cb.ax.tick_params(labelsize=min(7 * fs, size))
-        head = []
-        if len(diff["quantities"]) == 1:
-            label, ctext, _w, _t = panel_names(next(i for i in items if i))
-            head.append(label + ctext)
-        if len(diff["sims"]) == 1:
-            head.append(next(iter(diff["sims"])))
-        if slice_text:
-            head.append(slice_text)
-        fig.suptitle("   ·   ".join(head), fontsize=9 * fs, y=1.0 - 0.17 / H)
+        if o_["title"]:
+            fig.suptitle(FS.title_text(o_, auto), fontsize=9 * fs, y=1.0 - 0.17 / H)
     else:
-        if slice_text:
-            fig.suptitle(slice_text, fontsize=9 * fs, y=0.995)
+        title = FS.title_text(o_, auto) if o_["title"] else ""
+        if title:
+            fig.suptitle(title, fontsize=9 * fs, y=0.995)
         fig.tight_layout()
+    FS.fit_width(fig, o_, o_["dpi"], relayout=None if tile else fig.tight_layout)
     return fig, shown
+
+
+def grid_dpi(fig, req: dict, items: list, opts: dict) -> float:
+    """The dpi to save the grid figure at: the options', or with 'match the data' the one at which the widest
+    panel holds its plane pixel for pixel (figsave.match_dpi). The panels are the figure's first rows x cols axes."""
+    if not opts["match_data"]:
+        return float(opts["dpi"])
+    panels = fig.axes[:req["rows"] * req["cols"]]
+    return FS.match_dpi(fig, [(ax, it["img"].shape[1]) for ax, it in zip(panels, items) if it is not None])
+
+
+def grid_full_pixels(req: dict, items: list, opts: dict):
+    """The grid at full resolution: (rgb, overlay or None) for figsave.write_pixels -- the screen's tiles (grid_tiles,
+    the colours and ranges as shown) with each panel at the largest panel's own pixels instead of 1024 at most, and
+    each panel's void outlines over it, clipped to its tile, when the options keep them."""
+    sizes = [it["img"].shape[0] for it in items if it is not None]
+    T = max(sizes)
+    rgb, _labels, _bar = grid_tiles(req, items, max_tile=T)
+    if not opts["voids"]:
+        return rgb, None
+    circles, dashed, clips = grid_tile_circles(req, items, max_tile=T)
+    if not (circles or dashed):
+        return rgb, None
+    return rgb, lambda ax: FS.draw_pixel_circles(ax, rgb.shape, circles, dashed, clips)
 
 
 class ImageCanvas(QLabel):
@@ -1134,6 +1210,14 @@ class ExploreView(QWidget):
         head = QHBoxLayout()
         self.title = QLabel("<b>Explore</b>")
         head.addWidget(self.title, 1)
+        # one dialog for every save: presets, title, axes, units, colour bar, overlays, margins, full resolution,
+        # format (2026-10-14); remembered between sessions
+        self.save_opts_btn = QPushButton("Save options…")
+        self.save_opts_btn.setToolTip("How Save image and Save figure write the picture: a preset (Standard, "
+                                      "Publication, Bare image, Slide, your last choice) or each option: title, "
+                                      "frame, ticks, axis names and unit, colour bar, arrows and void outlines, "
+                                      "margins, dpi, width, full resolution, PNG, PDF, SVG or TIFF")
+        head.addWidget(self.save_opts_btn)
         self.save_btn = QPushButton("Save image…")
         head.addWidget(self.save_btn)
         v.addLayout(head)
@@ -1170,9 +1254,17 @@ class ExploreControls(QWidget):
     _to_exact = Signal(object)
     _to_stop = Signal()
 
-    def __init__(self, view: ExploreView, data_root_fn, extra_dirs_fn):
+    SAVE_KEY = "save_options"                   # the QSettings key of the Save options (JSON, 2026-10-14)
+
+    def __init__(self, view: ExploreView, data_root_fn, extra_dirs_fn, settings=None):
         super().__init__()
         self.view = view
+        # the Save options: remembered in 'settings' (the launcher's QSettings when it remembers; None = this
+        # session only, as the tests run); the defaults write what Save image and Save figure always wrote
+        self._settings = settings
+        self.save_options = FS.loads(settings.value(self.SAVE_KEY, "")) if settings is not None else FS.options()
+        self._grid_title = ""                   # the figure grid's own title (its worker sends it)
+        self._save_note = ""                    # why a saved figure's axes are not in the unit asked for
         self._data_root = data_root_fn          # () -> current data root
         self._extra_dirs = extra_dirs_fn        # () -> the custom-snapshot output directories
         self.outputs: list[tuple[str, G.OutputSet]] = []
@@ -1193,6 +1285,11 @@ class ExploreControls(QWidget):
         self._grid_busy = False                 # a tile request is with the worker; only the latest is served
         self._grid_pending = None
         self._grid_type_pref: dict = {}         # row -> (prefix, estimator) the user chose; a rebuild's fallback never replaces it
+        # the slice kept across the outputs and redshifts of one simulation (2026-10-14, Luuk's request): the first
+        # menu's entry it belongs to, the output last shown (its box, for the custom runs and opened files), the axis,
+        # the place along it as a fraction of the box (the user's own, not re-read off a coarser grid on the way) and
+        # the zoom window carried along (_carry_zoom). None until the first output is shown
+        self._keep: dict | None = None
 
         col = QVBoxLayout(self)
         g = QGroupBox("Output")
@@ -1424,9 +1521,13 @@ class ExploreControls(QWidget):
         self.grid_toggle.toggled.connect(self.show_grid)
         brow.addWidget(self.grid_toggle)
         self.grid_save_btn = QPushButton("Save figure…")
-        self.grid_save_btn.setToolTip("Write the composed figure as PNG or PDF at 200 dpi")
         self.grid_save_btn.clicked.connect(self._save_grid_dialog)
         brow.addWidget(self.grid_save_btn)
+        self.grid_opts_btn = QPushButton("Options…")
+        self.grid_opts_btn.setToolTip("The Save options (the same as the map's): title, panel titles, axes, colour "
+                                      "bars, margins, dpi, width, full resolution, format")
+        self.grid_opts_btn.clicked.connect(self.open_save_options)
+        brow.addWidget(self.grid_opts_btn)
         self.grid_shared = QCheckBox("one colour range per field")
         self.grid_shared.setChecked(True)
         self.grid_shared.setToolTip("Panels showing the same field share vmin/vmax (the union of their ranges), so "
@@ -1607,6 +1708,8 @@ class ExploreControls(QWidget):
         view.canvas.clicked.connect(self._click)
         view.canvas.dragged.connect(self._dragged)
         view.save_btn.clicked.connect(self._save_image)
+        view.save_opts_btn.clicked.connect(self.open_save_options)
+        self._save_tips()
         self._refresh_server_button()
 
     def _threads(self):
@@ -1838,12 +1941,70 @@ class ExploreControls(QWidget):
         self._grid_sync_rows()                  # the composer's menus list it too (as after a refresh)
         return self._select_output(str(o.root))
 
+    @staticmethod
+    def _same_box(a, b) -> bool:
+        """Two outputs in the same box: both in Mpc with the same corners (the axes both have), or both of unknown
+        box on grids of the same size (their positions are cells)."""
+        if a is None or b is None or (a.box is None) != (b.box is None):
+            return False
+        if a.box is None:
+            return a.n == b.n
+        d = min(a.dim, b.dim)
+        return bool(np.allclose(a.lo[:d], b.lo[:d], rtol=1e-6, atol=1e-6)
+                    and np.allclose(a.length[:d], b.length[:d], rtol=1e-6, atol=1e-6))
+
+    def _keep_for(self, prev, o) -> dict:
+        """The kept slice (self._keep) for showing output 'o' after 'prev' (2026-10-14). It is kept for another output
+        or redshift of the same simulation (the boxes are comoving: the same place is the same comoving Mpc at every
+        redshift), and for another custom run or opened file in the same box; another simulation, or a box of
+        another size, starts afresh (the middle, the whole box). On the way out of a 3D output it takes that
+        output's slice when something set the index unseen, and the zoom window on screen."""
+        m = self._keep
+        if m is not None and prev is not None and prev.dim == 3 and self._same(m.get("ref"), prev):
+            axis, index = self.axis.currentIndex(), self.index.value()
+            if m["frac"] is None or m["axis"] != axis or kept_index(m["frac"], prev.n) != index:
+                m.update(axis=axis, frac=(index + 0.5) / prev.n)
+        if (m is not None and prev is not None and not self._same(prev, o) and self.is_zoomed()
+                and self._same(self._zoom["output"], prev)):
+            z = self._zoom
+            m["zoom"] = {"axis": int(z["axis"]), "rest": list(z["rest"]), "a0": tuple(z["a0"]), "a1": tuple(z["a1"]),
+                         "res": int(z["res"]), "exact": bool(z.get("exact")), "dim": prev.dim,
+                         "unit": "Mpc" if prev.box is not None else "cells"}
+        if m is None or m["group"] != self._group(o) or not (o.sim or self._same_box(m["ref"], o)):
+            self._drop_kept_zoom()
+            m = {"group": self._group(o), "axis": None, "frac": None, "zoom": None}
+        m["ref"] = o
+        self._keep = m
+        return m
+
+    def _drop_kept_zoom(self):
+        """No zoom window carried to the next output any more (and no line saying one is kept)."""
+        if self._keep is not None and self._keep.get("zoom"):
+            self._keep["zoom"] = None
+            if self.zoom_state.text().startswith(KEPT_ZOOM_TEXT):
+                self.zoom_state.setText("")
+
+    def _remember_slice(self):
+        """The user chose the slice (the index, the slider, the arrow keys, the axis, a void's centre, a restored
+        state): its place in the box is what another output or redshift shows (2026-10-14); a zoom window carried
+        from another output goes with the old slice."""
+        o, m = self.current, self._keep
+        if o is None or o.dim == 2 or m is None or not self._same(m.get("ref"), o):
+            return
+        self._drop_kept_zoom()
+        m.update(axis=self.axis.currentIndex(), frac=(self.index.value() + 0.5) / o.n)
+
     def _show_output(self, o):
         """Show an output: its field list, info line, slice controls, and the first map. The same
-        output again (after a refresh: a new object for the same files) keeps the slice."""
+        output again (after a refresh: a new object for the same files) keeps the slice. Another output or
+        redshift of the same simulation keeps it too (2026-10-14): the same axis, the same place in the box at the
+        nearest cell of this grid, and the zoom window where it can be shown (_carry_zoom); another simulation, or
+        a custom run or opened file in a box of another size, starts at the middle with the whole box (_keep_for).
+        A 2D output shows its one plane and leaves the kept slice to the next 3D output."""
         prev = self.current
         same_grid = self._same(prev, o) and prev.n == o.n and prev.dim == o.dim
         slice_now = self.index.value()
+        m = self._keep if same_grid and self._keep is not None else self._keep_for(prev, o)
         self.current = o
         keep = self.field.currentData()
         self.field.blockSignals(True)
@@ -1863,21 +2024,29 @@ class ExploreControls(QWidget):
         self.info.setText(f"{grid} · {box}" + (f" · z = {o.redshift:.2f}" if o.redshift is not None else ""))
         self.info.setToolTip(str(o.root) + ".*")
         flat = o.dim == 2               # a 2D grid is its one plane: no axis, no slice to choose
+        kept = not flat and not same_grid and m["frac"] is not None     # another output where the slice is kept
         self.axis.blockSignals(True)
         if flat:
             self.axis.setCurrentIndex(2)
+        elif kept:
+            self.axis.setCurrentIndex(m["axis"])    # (a 2D output on the way set it to z)
         self.axis.setEnabled(not flat)
         self.axis.blockSignals(False)
+        index = 0 if flat else slice_now if same_grid else kept_index(m["frac"], o.n) if kept else o.n // 2
         for w in (self.index, self.slider):
             w.blockSignals(True)
             w.setRange(0, 0 if flat else o.n - 1)
-            w.setValue(0 if flat else slice_now if same_grid else o.n // 2)
+            w.setValue(index)
             w.setEnabled(not flat)
             w.blockSignals(False)
+        if not flat and m["frac"] is None:          # the first 3D output of a simulation: the middle, remembered
+            m.update(axis=self.axis.currentIndex(), frac=(index + 0.5) / o.n)
         self._pts_fill()                    # BEFORE the field's render: it reads the menu (this output's planes)
         self._voids_sync()                  # BEFORE the render too: the outlines are drawn with the map
         self._field_changed()
         self._refresh_server_button()
+        if not self._same(prev, o):
+            self._carry_zoom()              # AFTER the render: it dropped the other output's zoom
 
     def _field_changed(self, *_):
         o = self.current
@@ -1915,18 +2084,21 @@ class ExploreControls(QWidget):
         self.render()
 
     def _axis_changed(self, *_):
+        self._remember_slice()
         self.render()
 
     def _index_spin(self, v):
         self.slider.blockSignals(True)
         self.slider.setValue(v)
         self.slider.blockSignals(False)
+        self._remember_slice()
         self.render()
 
     def _index_slider(self, v):
         self.index.blockSignals(True)
         self.index.setValue(v)
         self.index.blockSignals(False)
+        self._remember_slice()
         self.render()
 
     def step_slice(self, delta: int):
@@ -2602,6 +2774,81 @@ class ExploreControls(QWidget):
         void = f"      {G.void_info(self._void_result(), k, short=True)}" if k is not None else ""
         self.view.readout.setText(f"{xyz} {unit}      {where}      value = {value:.5g}{both}{void}")
 
+    # ---------------------------------------------------------------- saving: the Save options (2026-10-14)
+    def set_save_options(self, opts: dict, remember: bool = True) -> None:
+        """Use these Save options from now on; remembered between sessions (without a typed title) when the launcher
+        remembers its settings."""
+        self.save_options = FS.options(opts)
+        if remember and self._settings is not None:
+            self._settings.setValue(self.SAVE_KEY, FS.dumps(self.save_options))
+        self._save_tips()
+
+    def _save_tips(self):
+        d = FS.describe(self.save_options)
+        self.view.save_btn.setToolTip(f"Save the map ({d}; Save options… to change), or its values as .npy or .csv")
+        self.grid_save_btn.setToolTip(f"Write the composed figure ({d}; Options… to change)")
+
+    def _map_title(self) -> str:
+        """The single map's own title, as the window shows it (the saved figure's title unless one was typed)."""
+        return self.view.title.text().replace("<b>", "").replace("</b>", "")
+
+    def save_context(self) -> dict:
+        """What the Save options dialog needs to know of the picture on screen: the grid or a map, arrows and outlines
+        shown, the box's h (Mpc/h offered only when known), a box at all, the figure's own title, the full-resolution
+        image size in pixels."""
+        ctx = {"grid": bool(self._grid_shown), "arrows": False, "voids": False, "hubble": None, "box": True,
+               "auto_title": "", "pixels": None}
+        if self._grid_shown:
+            req = self.grid_request()
+            panels = [p for p in (req or {}).get("panels", []) if p]
+            hs = [G.hubble(p["output"]) for p in panels]
+            ctx["hubble"] = hs[0] if hs and all(hs) else None
+            ctx["box"] = all(p["output"].box is not None for p in panels)
+            ctx["voids"] = bool(self.view.canvas.circles or self.view.canvas.dashed)
+            ctx["auto_title"] = self._grid_title
+            if req is not None and panels:
+                T = max(p["output"].n for p in panels)
+                gap = 0 if req["merged"] else 6
+                ctx["pixels"] = (req["cols"] * T + gap * (req["cols"] - 1), req["rows"] * T + gap * (req["rows"] - 1))
+        elif self._req is not None and self._plane is not None:
+            o = self._req["output"]
+            ctx["arrows"] = self._arrows is not None and self._arrows.get("vmax", 0) > 0
+            ctx["voids"] = self._void_result() is not None and self.view.canvas.circles is not None
+            ctx["hubble"] = G.hubble(o)
+            ctx["box"] = o.box is not None
+            ctx["auto_title"] = self._map_title()
+            ctx["pixels"] = (int(self._plane.shape[0]), int(self._plane.shape[1]))    # plane rows = horizontal axis
+        return ctx
+
+    def open_save_options(self) -> bool:
+        """The Save options dialog: OK keeps the options for every save from now on (remembered between sessions),
+        Save… keeps them and saves the map or the figure grid now. False when cancelled."""
+        dlg = FS.make_dialog(self, self.save_options, self.save_context(), can_save=self.can_save())
+        if dlg.exec() != QDialog.Accepted:
+            return False
+        self.set_save_options(dlg.options())
+        if dlg.save_now:
+            self._save_image()
+        return True
+
+    def _ask_image_path(self, title: str, stem: str, extra: list | None = None):
+        """The file dialog of a save: the image formats (the options' first) and 'extra' filters. Returns (path,
+        format or the extra filter chosen) or (None, None); the format is the name's suffix, else the filter's. A
+        format chosen here is the options' format from now on."""
+        fmt0 = self.save_options["format"]
+        images = FS.file_filters()
+        order = [t for f, t in images if f == fmt0] + [t for f, t in images if f != fmt0] + list(extra or [])
+        f, chosen = QFileDialog.getSaveFileName(self, title, str(Path.home() / f"{stem}.{FS.FORMATS[fmt0][1][0]}"),
+                                                ";;".join(order))
+        if not f:
+            return None, None
+        if chosen in (extra or []) or Path(f).suffix.lower() in (".npy", ".csv"):
+            return f, chosen
+        fmt = FS.format_of(f, next((k for k, t in images if t == chosen), fmt0))
+        if fmt != fmt0:
+            self.set_save_options(dict(self.save_options, format=fmt))
+        return str(FS.with_format(f, fmt)), fmt
+
     def _save_image(self):
         if self._grid_shown:
             self._save_grid_dialog()
@@ -2609,9 +2856,8 @@ class ExploreControls(QWidget):
         if self._plane is None:
             return
         void_filter = "CSV table of the voids outlined (*.csv)"
-        f, chosen = QFileDialog.getSaveFileName(self, "Save the map", str(Path.home() / "explore.png"),
-                                                "PNG image (*.png);;NumPy array of the values (*.npy);;"
-                                                "CSV table: x, y, value (*.csv);;" + void_filter)
+        f, chosen = self._ask_image_path("Save the map", "explore", ["NumPy array of the values (*.npy)",
+                                                                     "CSV table: x, y, value (*.csv)", void_filter])
         if not f:
             return
         if chosen == void_filter:
@@ -2626,59 +2872,148 @@ class ExploreControls(QWidget):
             except OSError as e:
                 self.status.emit(f"could not save {f}: {e}")
             return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            self.status.emit("saved " + ", ".join(self.save_png(f)))
-        except Exception:
-            self.view.canvas.grab().save(f)
-            self.status.emit(f"saved {f}")
+            written = self.save_png(f)
+            self.status.emit("saved " + ", ".join(written) + f" ({FS.describe(self.save_options)})"
+                             + (f"; {self._save_note}" if self._save_note else ""))
+        except FS.TooLarge as e:                # not the screen instead: the options asked for too much (review)
+            self.status.emit(f"could not save {f}: {e}")
+        except Exception as e:
+            if FS.format_of(f) in ("png", "tiff"):
+                self.view.canvas.grab().save(f)
+                self.status.emit(f"saved {f} as the screen shows it (the figure failed: {e})")
+            else:
+                self.status.emit(f"could not save {f}: {e}")
+        finally:
+            QApplication.restoreOverrideCursor()
 
-    def save_png(self, f) -> list[str]:
-        """The map as a matplotlib PNG at 200 dpi (axes, colour bar, arrows, the void outlines as on screen) and,
-        with outlines drawn, '<name>_voids.csv' beside it: the table of those voids (2026-10-11). The paths."""
-        req = self._req
+    def save_png(self, f, options: dict | None = None) -> list[str]:
+        """The map as a file, as the Save options say ('options', else the ones chosen; until the dialog is used,
+        the figure always written: a matplotlib PNG at 200 dpi with title, axes, colour bar, arrows and the void
+        outlines as on screen), in the format of the file's suffix (.png, .pdf, .svg, .tif). At full resolution:
+        the map's own pixels (_write_full_map). With outlines drawn, '<name>_voids.csv' beside it: the table of
+        those voids (2026-10-11). The paths."""
+        opts = FS.options(self.save_options if options is None else options)
+        fmt = FS.format_of(f, opts["format"])
         written = [str(f)]
+        self._save_note = ""
+        if opts["kind"] == "full":
+            self._write_full_map(f, fmt, opts)
+        else:
+            import matplotlib
+            matplotlib.use("Agg", force=False)
+            import matplotlib.pyplot as plt
+            with matplotlib.rc_context(FS.rc(opts, fmt)):    # the font size and the text kept as text
+                fig, dpi = self.map_figure(opts)
+                try:
+                    FS.check_pixels(*fig.get_size_inches(), dpi)     # before Agg allocates it (2026-10-14, review)
+                    fig.savefig(f, **FS.save_kwargs(opts, dpi))
+                finally:
+                    plt.close(fig)
+        if opts["voids"] and self.voids_shown():
+            written.append(self.save_voids_csv(Path(f).with_name(Path(f).stem + "_voids.csv")))
+        return written
+
+    def map_figure(self, options: dict | None = None):
+        """The decorated map as a pyplot figure and the dpi to save it at (the options' dpi, or the one matching the
+        data): title, axes (frame, ticks, tick labels, axis names in the unit chosen), colour bar and its label, the
+        arrows and void outlines as on screen, each as the options say; margins 'none' = the map alone filling the
+        figure. The caller closes it (plt.close) and applies figsave.rc for a font scale."""
+        opts = FS.options(self.save_options if options is None else options)
         import matplotlib
         matplotlib.use("Agg", force=False)
         import matplotlib.pyplot as plt
+        req = self._req
         o = req["output"]
         data = self._plane.T
         if req["log"]:
             data = np.log10(np.where(data > 0, data, np.nan))
         _, _, rest, glo, ghi, _, _ = self._geometry()    # a hi-res slice's axes are its file's, not the menu's
-        ext = [glo[0], ghi[0], glo[1], ghi[1]]
-        fig, ax = plt.subplots(figsize=(7, 6))
+        um, self._save_note = FS.unit_map(o, rest, opts["unit"], G.hubble(o) if opts["unit"] == "mpc_h" else None)
+        ext = um.ext([glo[0], ghi[0], glo[1], ghi[1]])
+        s = float(opts["font_scale"])
+        bare = opts["margins"] == "none"
+        if bare:                                # the map alone: its axes are the whole figure
+            aspect = (ext[3] - ext[2]) / (ext[1] - ext[0]) if ext[1] > ext[0] and ext[3] > ext[2] else 1.0
+            fig = plt.figure(figsize=(7, 7 * aspect))
+            ax = fig.add_axes([0, 0, 1, 1])
+            ax.set_axis_off()
+        else:
+            fig, ax = plt.subplots(figsize=(7, 6))
         lo, hi = self.view.colorbar.vrange
-        im = ax.imshow(data, origin="lower", extent=ext, cmap=req["cmap"], vmin=lo, vmax=hi)
-        unit = "Mpc" if o.box is not None else "cells"
-        ax.set_xlabel(f"{AXES[rest[0]]} [{unit}]")
-        ax.set_ylabel(f"{AXES[rest[1]]} [{unit}]")
-        ax.set_title(self.view.title.text().replace("<b>", "").replace("</b>", ""), fontsize=8)
-        fig.colorbar(im, ax=ax, label=self.view.colorbar.label)
+        kw = {"interpolation": "nearest"} if opts["match_data"] else {}
+        if bare:
+            kw["aspect"] = "auto"
+        im = ax.imshow(data, origin="lower", extent=ext, cmap=req["cmap"], vmin=lo, vmax=hi, **kw)
+        if not bare:
+            FS.style_axes(ax, opts, (AXES[rest[0]], AXES[rest[1]]), um.name)
+            if opts["title"]:
+                t = ax.set_title(FS.title_text(opts, self._map_title()), fontsize=8 * s)
+                if opts["width"] > 0 or s != 1.0:
+                    # a long title wraps rather than widening a figure of a set width or, in larger fonts (Slide),
+                    # running over the colour bar's top tick label (2026-10-14, review)
+                    t.set_wrap(True)
+            if opts["colorbar"]:
+                if opts["colorbar_label"]:
+                    fig.colorbar(im, ax=ax, label=self.view.colorbar.label)
+                else:
+                    fig.colorbar(im, ax=ax)
+        self._map_overlays(ax, opts, um, rest, glo, ghi, ext)
+        try:
+            FS.fit_width(fig, opts, opts["dpi"])
+        except FS.TooLarge:                     # a width far too large: no figure left open (2026-10-14, review)
+            plt.close(fig)
+            raise
+        dpi = FS.match_dpi(fig, [(ax, data.shape[1])]) if opts["match_data"] else opts["dpi"]
+        return fig, dpi
+
+    def _map_overlays(self, ax, opts: dict, um, rest, glo, ghi, ext) -> None:
+        """The arrows and the void outlines over a saved map as on screen, each when the options keep it, in the
+        coordinates of the unit map 'um' (the axes' unit)."""
+        o = self._req["output"]
         arrows = getattr(self, "_arrows", None)
-        if arrows is not None and arrows["vmax"] > 0:
+        if opts["arrows"] and arrows is not None and arrows["vmax"] > 0:
             h = o.length / o.n                              # cell size per axis
-            X, Y = np.meshgrid(o.lo[rest[0]] + arrows["c0"] * h[rest[0]],
-                               o.lo[rest[1]] + arrows["c1"] * h[rest[1]], indexing="ij")
+            X, Y = np.meshgrid(um.x(o.lo[rest[0]] + arrows["c0"] * h[rest[0]]),
+                               um.y(o.lo[rest[1]] + arrows["c1"] * h[rest[1]]), indexing="ij")
             ax.quiver(X, Y, arrows["u"], arrows["v"], color="white", edgecolor="black", linewidth=0.3,
                       angles="xy", scale_units="xy", pivot="middle",
-                      scale=arrows["vmax"] / (0.9 * arrows["spacing"] * h[rest[0]]), width=0.003)
+                      scale=arrows["vmax"] / (0.9 * arrows["spacing"] * h[rest[0]] * um.k[0]), width=0.003)
         res = self._void_result()
-        if res is not None and self.view.canvas.circles is not None:
+        if opts["voids"] and res is not None and self.view.canvas.circles is not None:
             axis = self._geometry()[0]
             pos = self._slice_position()
             sel = np.nonzero(res["_shown"])[0]
-            circ = [(u, v, r, int(sel[k])) for u, v, r, k in G.void_circles_mpc(
-                res["_centres"][sel], res["_r_v"][sel], float(res["box_mpc"]), axis, pos, rest, glo, ghi)]
-            dash = [] if not self.void_reff.isChecked() else [(u, v, r, int(sel[k])) for u, v, r, k in G.void_circles_mpc(
-                res["_centres"][sel], res["_r_eff"][sel], float(res["box_mpc"]), axis, pos, rest, glo, ghi)]
+            box = float(res["box_mpc"])
+            conv = lambda cs: [(um.x(u), um.y(v), r * um.k[0], int(sel[k])) for u, v, r, k in cs]   # noqa: E731
+            circ = conv(G.void_circles_mpc(res["_centres"][sel], res["_r_v"][sel], box, axis, pos, rest, glo, ghi))
+            dash = [] if not self.void_reff.isChecked() else conv(G.void_circles_mpc(
+                res["_centres"][sel], res["_r_eff"][sel], box, axis, pos, rest, glo, ghi))
             G.draw_void_circles_mpl(ax, circ, dash)
             ax.set_xlim(ext[0], ext[1])
             ax.set_ylim(ext[2], ext[3])
-        fig.savefig(f, dpi=200, bbox_inches="tight")
-        plt.close(fig)
-        if self.voids_shown():
-            written.append(self.save_voids_csv(Path(f).with_name(Path(f).stem + "_voids.csv")))
-        return written
+
+    def _write_full_map(self, f, fmt: str, opts: dict) -> None:
+        """The map at its own resolution: the screen's pixels, one per cell, zoom point or hi-res point (the colours
+        and range as shown; a hi-res slice over 4096 points a side as shown, block-averaged), the arrows and outlines
+        over them when the options keep them."""
+        req = self._req
+        rgb = None if self._grid_shown else self.view.canvas._buf
+        if rgb is None or rgb.shape[:2] != self._plane.T.shape:     # not the map's own pixels: colour them again
+            img = np.ascontiguousarray(self._plane.T[::-1])
+            rgb, _ = G.colorize(img, req["cmap"], log=req["log"], clip=(req["clip"], 100 - req["clip"]),
+                                symmetric=req.get("symmetric", False), vrange=self.view.colorbar.vrange)
+        _, _, rest, glo, ghi, _, _ = self._geometry()
+        ext = [glo[0], ghi[0], glo[1], ghi[1]]
+        arrows = self._arrows is not None and self._arrows["vmax"] > 0 and opts["arrows"]
+        voids = opts["voids"] and self._void_result() is not None and self.view.canvas.circles is not None
+
+        def overlay(ax):
+            ax.set_xlim(ext[0], ext[1])
+            ax.set_ylim(ext[2], ext[3])
+            self._map_overlays(ax, opts, FS.UnitMap(), rest, glo, ghi, ext)
+        FS.write_pixels(f, rgb, fmt, overlay if (arrows or voids) else None)
 
     def save_voids_csv(self, path) -> str:
         """The voids outlined on the map now as a CSV table (tools/void_outlines.write_csv: centre, every R_v the
@@ -3182,6 +3517,7 @@ class ExploreControls(QWidget):
         if not self._grid_shown or self._shut:
             return
         req = res["request"]
+        self._grid_title = res.get("title", "")
         self.view.canvas.setStyleSheet("")
         self.view.canvas.marker = None
         self.view.canvas.arrows = self.view.canvas.circles = self.view.canvas.dashed = None
@@ -3205,7 +3541,7 @@ class ExploreControls(QWidget):
                                 + (f" — {pos}" if pos else ""))
         self.grid_state.setText(f"{n} panel{'s' if n != 1 else ''}" + (f" at {pos}" if pos else "")
                                 + "; ← → step the slice for every panel, the slider and the colours apply too; "
-                                  "Save figure… makes the full figure (axes, colour bars) at 200 dpi, PNG or PDF")
+                                  "Save figure… makes the full figure (" + FS.describe(self.save_options) + ")")
         self.changed.emit()
 
     def _grid_failed(self, msg: str):
@@ -3234,26 +3570,42 @@ class ExploreControls(QWidget):
         self._compare_sync()
         self.changed.emit()                     # the Explore menu's Figure Grid text follows
 
-    def grid_figure(self):
+    def grid_figure(self, options: dict | None = None):
         """The full matplotlib figure of the current panels (axes in Mpc, titles or inside labels, colour
-        bars), composed on this thread at 200 dpi: what Save figure… writes. Returns (Figure, panel count)."""
+        bars), composed on this thread at 200 dpi, as the Save options say ('options', else the ones chosen):
+        what Save figure… writes. Returns (Figure, panel count)."""
         req = self.grid_request()
         if req is None:
             raise ValueError("no panel has an output (use a Fill button, or choose outputs in the table)")
-        return grid_figure(req, grid_items(req))
+        return grid_figure(req, grid_items(req), opts=self.save_options if options is None else options)
 
-    def save_grid(self, path) -> str:
-        """Write the figure of the current panels as PNG or PDF; the path written."""
-        fig, _n = self.grid_figure()
-        fig.savefig(str(path), dpi=200, bbox_inches="tight")
+    def save_grid(self, path, options: dict | None = None) -> str:
+        """Write the figure of the current panels as the Save options say ('options', else the ones chosen): PNG,
+        PDF, SVG or TIFF by the file's suffix, the decorated figure or the panels at full resolution; the path
+        written."""
+        opts = FS.options(self.save_options if options is None else options)
+        fmt = FS.format_of(path, opts["format"])
+        req = self.grid_request()
+        if req is None:
+            raise ValueError("no panel has an output (use a Fill button, or choose outputs in the table)")
+        items = grid_items(req)
+        if opts["kind"] == "full":
+            rgb, overlay = grid_full_pixels(req, items, opts)
+            FS.write_pixels(path, rgb, fmt, overlay)
+        else:
+            import matplotlib
+            with matplotlib.rc_context(FS.rc(opts, fmt)):    # the font size and the text kept as text
+                fig, _n = grid_figure(req, items, opts=opts)
+                dpi = grid_dpi(fig, req, items, opts)
+                FS.check_pixels(*fig.get_size_inches(), dpi)     # before Agg allocates it (2026-10-14, review)
+                fig.savefig(str(path), **FS.save_kwargs(opts, dpi))
         self.status.emit(f"saved {path}")
         return str(path)
 
     def _save_grid_dialog(self):
         if self.current is None:
             return
-        f, _ = QFileDialog.getSaveFileName(self, "Save the figure grid", str(Path.home() / "figure_grid.png"),
-                                           "PNG (*.png);;PDF (*.pdf)")
+        f, _fmt = self._ask_image_path("Save the figure grid", "figure_grid")
         if not f:
             return
         QApplication.setOverrideCursor(Qt.WaitCursor)
@@ -3419,6 +3771,8 @@ class ExploreControls(QWidget):
                 self._show_output(self.current)
         self._set_server_state(f"running: {info}. Click the map.")
         self.status.emit(f"query server ready ({info})")
+        if self._same(o, self.current):
+            self._carry_zoom(server_started=True)   # a zoom window kept from another output: evaluated here now
 
     def _server_failed(self, msg):
         if self._server_starting:
@@ -3479,12 +3833,19 @@ class ExploreControls(QWidget):
         res = int(self.zoom_res.value())
         depth = (self._zoom["depth"] + 1) if self.is_zoomed() else 1
         if self.zoom_exact.isChecked():
+            self._drop_kept_zoom()              # a window of the user's own replaces one carried from another output
             self._exact_zoom(o, axis, index, rest, a0, a1, res, depth)
             return
         if not self._server_running or not self._same(self._server_output, o):
             self.view.answer_title.setText("Start the query server (left) to zoom: the region is then evaluated "
                                            "again, point by point, at any resolution (or tick 'exact').")
-            return
+            return                              # (no zoom made: a window carried from another output stays kept)
+        self._drop_kept_zoom()
+        self._point_zoom(o, axis, index, rest, a0, a1, res, depth)
+
+    def _point_zoom(self, o, axis, index, rest, a0, a1, res, depth):
+        """The region a0 x a1 (Mpc, or cells without a box) of slice 'index' through the running query server, on
+        a res x res plane of points; from memory when it was evaluated a moment ago."""
         coords = [None, None, None]
         coords[axis] = np.array([o.lo[axis] + (index + 0.5) * o.length[axis] / o.n])
         coords[rest[0]] = a0[0] + (np.arange(res) + 0.5) / res * (a0[1] - a0[0])
@@ -3503,6 +3864,53 @@ class ExploreControls(QWidget):
         self._begin_zoom_progress("point")
         self._threads()
         self._to_zoom.emit(req)
+        self.changed.emit()
+
+    def _carry_zoom(self, server_started: bool = False):
+        """The zoom window kept from another output or redshift (self._keep['zoom'], 2026-10-14) on the output shown
+        now, the same Mpc window at the same resolution on this output's kept slice: from memory when this output's
+        zoom of it was made before (switching back and forth is then instant), else by the query server when it runs
+        on this output. Never by an exact run: a switch neither starts one nor asks about one (an exact zoom is a
+        drag with 'exact' ticked). Otherwise the map stays the slice, the window stays kept for the next output (or
+        for the server, once started here: server_started), and the zoom line and the status line say why."""
+        m, o = self._keep, self.current
+        w = (m or {}).get("zoom")
+        if not w or o is None or self._shut or self.is_zoomed():
+            return
+        axis, index = self.axis.currentIndex(), self.index.value()
+        (u, v), (a0, a1) = w["rest"], (w["a0"], w["a1"])
+        where = f"{AXES[u]} {a0[0]:.2f}–{a0[1]:.2f}, {AXES[v]} {a1[0]:.2f}–{a1[1]:.2f} {w['unit']}"
+        why = None
+        if o.dim != w["dim"]:
+            why = ("a 2D output shows its whole plane; the window comes back on the next 3D output" if o.dim == 2
+                   else "the window was made on a 2D output's plane")
+        elif w["unit"] != ("Mpc" if o.box is not None else "cells"):
+            why = "this output's box is not known in the window's units"
+        elif axis != w["axis"]:
+            why = "the slice axis is another one here"
+        elif self.pts_combo.currentData():
+            why = "the hi-res slice is shown (choose 'off: the grid slice' and this output again)"
+        if why is None:
+            for exact in (w["exact"], not w["exact"]):
+                hit = self._memo_get(self._memo_key(o, axis, index, a0, a1, w["res"], exact))
+                if hit is not None:
+                    self._req = self.request() or self._req     # this output's (its slice may wait behind another)
+                    self._zoomed(dict(hit[0], depth=1, memo=True, seconds=0.0), hit[1])
+                    return
+            # never an exact run (2026-10-14 review): choosing an output or stepping through redshifts must not start
+            # a PS-DTFE run over the whole snapshot or ask about one; with 'exact' ticked a drag of the window does
+            if self._server_running and self._same(self._server_output, o):
+                self._point_zoom(o, axis, index, list(w["rest"]), a0, a1, w["res"], 1)
+                return
+            if server_started:
+                return
+            why = ("no zoom of it is in memory for this output and no query server runs on it (start one here and "
+                   "the window is evaluated)")
+            if self.zoom_exact.isChecked():
+                why += "; choosing an output never starts an exact zoom: drag the window again for one"
+        text = f"{KEPT_ZOOM_TEXT}{where} kept, not shown on this output: {why}"
+        self.zoom_state.setText(text)
+        self.status.emit(text)
         self.changed.emit()
 
     def exact_zoom_command(self, o, axis: int, index: int, rest, a0, a1, res: int):
@@ -3652,6 +4060,12 @@ class ExploreControls(QWidget):
             if periodic:
                 cmd.append("--periodic")
             cmd += list(kw.get("options", []))                          # the custom snapshot's own --box
+            # the padding around the region (2026-10-13): the binary's own '--padding 5' leaves wrong values in the
+            # cells near the region's faces (as near a box face: the Delaunay tetrahedra there reach the padded
+            # set's hull); the query server's 15 (dtfelib.estimator.STANDARD_PADDING, run_dtfe.sh's default) unless
+            # the snapshot's own options carry one. Placed before '--regionMpc': its corners are followed by '--field'
+            if not any(str(v) in ("--padding", "--paddingMpc") for v in kw.get("options", [])):
+                cmd += ["--padding", f"{STANDARD_PADDING:g}"]
             cmd += ["--regionMpc", *corners, "--field", "density_a", "velocity_a", "gradient_a", "--exact-average"]
             if side.get("scalar_dataset"):
                 cmd += ["scalar_a", "scalarGradient_a", "--scalar-dataset", str(side["scalar_dataset"])]
@@ -3823,7 +4237,7 @@ class ExploreControls(QWidget):
             self.changed.emit()
 
     def _zoomed(self, req: dict, f):
-        if req.get("exact"):
+        if req.get("exact") and not req.get("memo"):    # from memory: no run ended (one may be going for another output)
             self._exact_done()
         if not req.get("memo"):
             sec = self._end_zoom_progress()
@@ -4092,7 +4506,9 @@ class ExploreControls(QWidget):
         self._compare_sync()
 
     def zoom_out(self):
-        """Back to the slice from disk (the zoom's evaluation is dropped)."""
+        """Back to the slice from disk (the zoom's evaluation is dropped), and the whole box on the next output too
+        (a zoom window kept across outputs goes, 2026-10-14)."""
+        self._drop_kept_zoom()
         if self._zoom is None:
             return
         self._clear_zoom()

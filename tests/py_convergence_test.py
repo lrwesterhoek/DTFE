@@ -273,6 +273,24 @@ def t_crossbox_and_missing():
                         pz_count=np.array([5]))
     cross = pc.load_crossbox(args)
     assert len(cross) == 1 and cross[0]["sim"] == "SYN-1"
+    # 2026-10-11 (review): an UNGATED run reads the ungated per-box files (plot_void_crossbox.sigma_tag's
+    # '_gatenone'), never the gated one -- the glob wanted the gated name only, so row (b) was lost ungated
+    import config
+    saved_gate = config.VOID_GATE
+    try:
+        config.VOID_GATE = "none"
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            assert pc.load_crossbox(args) == []
+        assert "under the none gate" in buf.getvalue(), buf.getvalue()
+        shutil.copy(d / "crossbox_SYN-1_ps_s2.1625Mpc.npz", d / "crossbox_SYN-1_ps_s2.1625Mpc_gatenone.npz")
+        got = pc.load_crossbox(args)
+        assert [str(r["sim"]) for r in got] == ["SYN-1"] and len(got) == 1, got
+        config.VOID_GATE = "ellipsoid"
+        assert len(pc.load_crossbox(args)) == 1                      # the gated run still reads only its own
+    finally:
+        config.VOID_GATE = saved_gate
+        (d / "crossbox_SYN-1_ps_s2.1625Mpc_gatenone.npz").unlink(missing_ok=True)
     rows = pc.mass_summary(cross, 0.0)
     assert len(rows) == 1 and rows[0][1] == 99 and np.allclose(rows[0][2], rv)
     grid, est = _grid_result()

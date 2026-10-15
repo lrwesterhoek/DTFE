@@ -37,6 +37,8 @@
 #include <climits>   // LONG_MAX (markFlipped's default slab bounds)
 #include <cstring>   // memcpy in the in-place cost-sort permutation
 #include <exception> // the deposit threads hand their errors back
+#include <iomanip>   // the phase-timing line
+#include <sstream>   // the phase-timing line
 #include <thread>    // the CPU deposit's threads (psDepositThreads)
 #include <type_traits>
 #include <unordered_map>   // PS_DEBUG_DEGREES self-check
@@ -61,6 +63,34 @@ int psGpuFallbacksTaken(bool reset)
 // Failed GPU deposit attempts of this run (run_progress.h: the progress sidecar's gpu_retries), counted by
 // the GPU hosts (ps_metal_host.cc, ps_gpu_cuda.cu). 2026-10-11
 std::atomic<int> psGpuRetries{ 0 };
+// ... and the same attempts by cause (2026-10-11, the sidecar's gpu_retries_by_cause and the run's closing
+// 'GPU deposit retries:' line): [0] innocent victim, [1] timeout (a watchdog kill), [2] out of memory, [3] any
+// other cause; they sum to psGpuRetries (each host bumps both for every failed buffer / kernel).
+std::atomic<int> psGpuRetriesByCause[4] = { { 0 }, { 0 }, { 0 }, { 0 } };
+
+// Wall time of the phases inside 'field interpolation' (2026-10-11). The survey of the TNG runs found the phase
+// roughly one core busy beside the GPU deposit, with nothing in the run log to say where: the extraction walk,
+// the cost sort, the GPU call, the GPU-deferred tets (whose line partitioned runs suppress) or the normalization.
+// Each pass prints its own split (at the verbosity of the '>>> Time:' lines, so a partitioned run prints it for
+// the partitions its logging thread deposits), and the run's totals so far ride along, which with several
+// concurrent partitions cover the silent ones too. Accumulated in microseconds over every pass of the run.
+namespace {
+enum PSPhase { PS_PH_SETUP, PS_PH_EXTRACT, PS_PH_SORT, PS_PH_GPU, PS_PH_COPY, PS_PH_DEFERRED, PS_PH_CPU, PS_PH_NORM, PS_PH_N };
+char const* const psPhaseName[PS_PH_N] = { "setup", "extraction walk", "cost sort", "GPU deposit", "copy-back",
+                                           "deferred tets on the CPU", "CPU deposit", "normalization" };
+std::atomic<long long> psPhaseTotalUs[PS_PH_N];
+std::atomic<long long> psPhaseTotalDeferred{ 0 };
+std::atomic<int>       psPhasePasses{ 0 };
+}
+// The run's phase totals so far (seconds per phase in the order of psPhaseName, the deferred-tet count and the
+// number of passes), for a caller that wants one closing line after a partitioned run's loop.
+void psFieldPhaseTotals(double sec[8], char const* names[8], long long &deferred, int &passes)
+{
+    static_assert( PS_PH_N == 8, "psFieldPhaseTotals hands out eight phases" );
+    for (int k = 0; k < PS_PH_N; ++k) { sec[k] = double( psPhaseTotalUs[k].load() ) * 1e-6; names[k] = psPhaseName[k]; }
+    deferred = psPhaseTotalDeferred.load();
+    passes = psPhasePasses.load();
+}
 
 // The finite cells (3D) / faces (2D) around a vertex, appended to 'out'.
 template <class Tr, class V>
@@ -104,9 +134,35 @@ static inline bool psSpanTouches(long lo, long hi, long n, bool periodic, long s
 }
 // a cell index that marks "counted for the tet's normalization, outside the window: not deposited"
 static size_t const PS_NOT_IN_WINDOW = size_t(-1);
-#if defined(PS_GPU) && NO_DIM==3
-#include "ps_deposit_params.h"   // the GPU per-tet record (psFillTetRecord)
-#endif
+// the GPU per-tet record (psFillTetRecord), and the fixed-point mass unit and shares (psMassFixedScale,
+// psMassFixedShare) that the CPU deposit uses in every build since 2026-10-12, GPU or not
+#include "ps_deposit_params.h"
+
+// One share into the fixed-point MASS grid (2026-10-12; see 'massFx' in interpolateGrid_phaseSpace): a plain add
+// where one thread owns the cell (the serial loop, a slab), a relaxed atomic add where the threads of the copy mode
+// share the grid. Integer adds commute, so the grid is the same exact sum whatever the interleaving.
+static inline void psAddMassFixed(int64_t *grid, size_t const flat, int64_t const q, bool const atomic)
+{
+    if ( q == 0 ) return;
+    if ( atomic ) __atomic_fetch_add( grid + flat, q, __ATOMIC_RELAXED );
+    else grid[flat] += q;
+}
+
+// The moment grids' fixed-point words (2026-10-14; 'fxg' in interpolateGrid_phaseSpace) and their Real grids: a
+// cell element is a Pvector (component c) or a plain Real, and the words lie in the same layout, cell by cell.
+template <class Elem> inline Real &psFxComp(Elem &e, size_t const c) { return e[c]; }
+inline Real &psFxComp(Real &e, size_t) { return e; }
+// The words of a grid become its Real grid, each component rounded once (the mass grid's conversion), and are freed.
+template <class Elem>
+inline void psFxToReal(std::vector<int64_t> &w, float const scale, std::vector<Elem> &grid, size_t const nCell)
+{
+    size_t const comps = sizeof(Elem) / sizeof(Real);
+    grid.assign( nCell, Elem() );
+    for (size_t i = 0; i < nCell; ++i)
+        for (size_t c = 0; c < comps; ++c)
+            psFxComp( grid[i], c ) = Real( psMassFixedMass( w[i*comps + c], scale ) );
+    std::vector<int64_t>().swap( w );
+}
 
 // --ps-caustics: per-tetrahedron caustic stratification bits. Included UNCONDITIONALLY -- the
 // classification is part of the CPU deposit and exists in 2D as well, so it must not sit behind
@@ -118,6 +174,9 @@ static size_t const PS_NOT_IN_WINDOW = size_t(-1);
 
 // psDepositThreadBytes: the memory the deposit threads' private copies may take (budgeted there too)
 #include "../auto_tune.h"
+
+// PS_MASS_AUDIT=1: the deposit's mass bookkeeping (opt-in diagnostic)
+#include "ps_mass_audit.h"
 
 #if NO_DIM==3
 // --ps-exact-deposit: analytic tetrahedron-cell intersection moments (Powell & Abel 2015).
@@ -565,6 +624,16 @@ void interpolateGrid_phaseSpace(DT &dt,
     size_t const *nGrid = &(userOptions.gridSize[0]);
     Box boxCoordinates = userOptions.region;
 
+    // the phase split of this pass (psPhaseTotalUs above): lap(k) books the time since the last lap to phase k
+    double phaseSec[PS_PH_N] = { 0. };
+    auto phaseMark = std::chrono::steady_clock::now();
+    auto lap = [&](int k)
+    {
+        auto const now = std::chrono::steady_clock::now();
+        phaseSec[k] += std::chrono::duration<double>( now - phaseMark ).count();
+        phaseMark = now;
+    };
+
     // Averaged fields sample each grid cell on an nSub^NO_DIM sub-grid (nSub==1 = cell centre only).
     if ( nSub < 1 ) nSub = 1;
     size_t nSamplesPerCell = 1;
@@ -674,8 +743,9 @@ void interpolateGrid_phaseSpace(DT &dt,
         for (int d = 0; d < NO_DIM; ++d) { subOrigin[d] = userOptions.psWindowLo[d]; subDims[d] = userOptions.psWindowDims[d]; }
     size_t subTotal = 1; for (int d = 0; d < NO_DIM; ++d) subTotal *= subDims[d];
     totalGrid = subTotal;   // all allocations and loops below use the sub-grid size
-    // --ps-window: a tetrahedron whose Eulerian footprint (with the sampled deposit's one-cell margin)
-    // misses the window on some axis deposits nothing: skipped before extraction / sampling
+    // --ps-window: a tetrahedron whose Eulerian footprint misses the window on some axis deposits
+    // nothing: skipped before extraction / sampling. The one-cell ring kept here for nSub > 1 is only
+    // generous (the deposits dropped their sample margin 2026-10-11: no sample lies in it)
     auto windowTouched = [&](Real const (&ep)[NO_DIM+1][NO_DIM]) -> bool
     {
         for (int d = 0; d < NO_DIM; ++d)
@@ -763,22 +833,11 @@ void interpolateGrid_phaseSpace(DT &dt,
     // exactly once globally, and padded-region vertices see their full local neighborhood, so
     // per-partition degrees match the global tessellation).
     bool const psVertexMass = userOptions.psVertexMass;
-    // the full degree pass: every finite cell once, its surviving vertices counted
+    // the full degree pass: every finite cell once, its surviving vertices counted (ps_cell_filter.h since
+    // 2026-10-13: the point evaluation runs the same pass)
     auto fullDegreePass = [&]()
     {
-        for (DT::Finite_vertices_iterator vit = dt.finite_vertices_begin(); vit != dt.finite_vertices_end(); ++vit)
-            vit->info().psDegree() = 0;
-        size_t degDropped = 0;   // local counter: the deposit loop reports its own
-        PS_FOREACH_FINITE_CELL
-        {
-            Cell_handle cell = itC;
-            PSCellGeometry dgeo;
-            if ( !psFilterCell(cell, userOptions, boxCoordinates, true, &degDropped, dgeo,
-                               /*skipOwnership=*/true) )
-                continue;
-            for (int v = 0; v <= NO_DIM; ++v)
-                cell->vertex(v)->info().psDegree() += 1;
-        }
+        psVertexDegreePass( dt, userOptions, boxCoordinates );
     };
     // --ps-window on the GPU: only the vertices of the tetrahedra that reach the window need their
     // degree, and the GPU extraction loop (single-threaded) visits exactly those -- so the degrees
@@ -816,22 +875,207 @@ void interpolateGrid_phaseSpace(DT &dt,
             vh->info().psDegree() = n;
         }
     };
-    // per-tet vertex-share mass: sum over the cell's vertices of weight/degree
-    auto psVertexShareMass = [](Cell_handle const &cell) -> double
-    {
-        double m = 0.;
-        for (int v = 0; v <= NO_DIM; ++v)
-        {
-            int32_t const deg = cell->vertex(v)->info().psDegree();
-            if (deg > 0)
-                m += double(cell->vertex(v)->info().weight()) / double(deg);
-        }
-        return m;
-    };
+    // per-tet vertex-share mass: sum over the cell's vertices of weight/degree -- psVertexShareMass(cell),
+    // ps_cell_filter.h (shared with the point evaluation since 2026-10-13)
 
-    // Allocate the requested output fields, zeroed since the cell loop accumulates into them.
+    // The MASS grid as an exact 64-bit fixed-point sum on the CPU too (2026-10-12). The GPU kernels have
+    // accumulated it that way since 2026-10-08 (metal/ps_deposit.metal depositMass), but the host decoded their
+    // words to float, and the CPU loop then added the GPU-DEFERRED tetrahedra with float '+=' into those cells --
+    // which drops every share below half an ulp of a busy cell's running sum, always downward. PS_MASS_AUDIT=1
+    // on TNG50-3-Dark z=0.5 (production flags) put the whole of the box's deficit there: grid mean - 1 = -1.63e-5,
+    // every unit of it the CPU's deferred deposit, the worst partition losing 1.2% of its 315k deferred
+    // tetrahedra's mass; TNG50 z=0 lost 8.1e-5 the same way. A partition the GPU gives up on, and every CPU-only
+    // run, deposited ALL its shares that way (1.6e-6 of the box on a 64^3 pancake on a 4^3 grid; the float sum
+    // also depended on the thread count). Now:
+    //   - after a GPU deposit, the host hands over its fixed-point words unconverted (PSGpuGrids::massFx) and
+    //     the released tets and the CPU's deferred tets add rint(share * scale) into the SAME integers, with the
+    //     GPU's unit (the kernel adds those very integers: psMassFixedShare);
+    //   - a CPU deposit starts from zero, with the unit psMassFixedScale gives an upper bound of the pass's
+    //     mass (below: the vertex weights, and rho_bar times the Lagrangian bounding box), so no cell overflows;
+    //   - the grid is converted to the float density ONCE, after the loop and before the normalization.
+    // Integer adds are exact and commute: the grid no longer depends on the thread count, the slab split or
+    // the order the atomics land in (the copy mode's threads share it through relaxed atomic adds, the serial
+    // loop and the slabs own their cells and add plainly). Only the mass grid changes: the moment grids stay
+    // float (their shares are the same float values; under weightIsDensity their normalizer is this grid).
+    // The single-precision build only: in the double build (Real = double) a fixed-point unit of 2^-62 of the
+    // pass's mass would be COARSER than double accumulation in a light cell (a void cell at 1e-10 of a
+    // partition holds ~2^28 units: 1e-9 relative per share, where a double sum keeps ~1e-16), so there the GPU
+    // words are converted to double at the copy and the CPU keeps its double '+='. PS_METAL_FLOAT_MASS=1 (and
+    // the CUDA/HIP spelling PS_GPU_FLOAT_MASS=1) bring back the float grid on the GPU and the CPU, for comparison.
+    // Memory: 8 B per sub-grid cell while it lives, where the 4 B float density grid lived; the float grid is
+    // not allocated until the conversion (nor before the GPU call, whose host words replace it), and the copy
+    // mode's private density copies are gone (auto_tune.h counts it).
+    auto envOn = [](char const *name) { char const *e = std::getenv(name); return e && std::atoi(e) != 0; };
+    bool const massFxWanted = std::is_same<Real, float>::value && field.density
+                              && !envOn("PS_METAL_FLOAT_MASS") && !envOn("PS_GPU_FLOAT_MASS");
+    std::vector<int64_t> massFx;   // totalGrid fixed-point words while massFxOn, else EMPTY
+    float massFxScale = 0.f;       // their unit: 1/massFxScale mass (a power of two)
+    bool massFxOn = false;
+
+    // The MOMENT grids as exact 64-bit fixed-point sums too (2026-10-14; the grids, their bounds and units:
+    // ps_deposit_params.h PSFxGrid). The mass grid became exact on 2026-10-08/12; every other accumulator stayed a
+    // float sum -- on the GPU float atomics in whatever order they landed (two runs differed in the last bits of
+    // every velocity, dispersion and gradient cell), on the CPU thread-private copies summed in thread order (the
+    // grids depended on the thread count; only the slab mode was thread-count independent). Now each such grid
+    // is a vector of int64 words while the pass deposits, in units of 1/scale, the shares added as rint(v*w *
+    // scale) -- exactly as the mass:
+    //   - a GPU deposit returns the words of every grid it was given a unit for (fxUnits, below: from bounds the
+    //     extraction loop sums over the very tetrahedra it hands over plus the released ones), and the released
+    //     and the deferred tetrahedra are added into those words with those units;
+    //   - a CPU deposit takes its units from the same bounds summed in one extra filter pass over the cells
+    //     (before its loop), in fixed blocks of cells, so they do not depend on the thread count either -- and are
+    //     the very units a GPU deposit of the pass takes (outside --ps-window);
+    //   - all threads add into ONE set of words (atomically in the copy mode, plainly in the serial loop and the
+    //     slabs), so the copy mode keeps no private copy of them, and each grid is converted to its Real grid once,
+    //     after the loop (fxToReal), where the density is.
+    // A grid's Real accumulator stays EMPTY while its words live (its allocation below is skipped while
+    // fxMomWanted; fxEnsureReal allocates it when a grid falls back to the float sums). The single-precision build
+    // only, like the mass: the double build keeps its double sums on the CPU (a unit of 2^-61 of the bound is
+    // coarser than a double sum in a light cell) and converts a GPU's words to double at the copy.
+    // PS_METAL_FLOAT_MOMENTS=1 (or PS_GPU_FLOAT_MOMENTS=1) brings back the float sums on the GPU and the CPU, the
+    // items' float weight totals included, for comparison (PS_METAL_FLOAT_MASS is the mass grid's own switch).
+    bool const fxGpuWanted = !envOn("PS_METAL_FLOAT_MOMENTS") && !envOn("PS_GPU_FLOAT_MOMENTS");
+    bool const fxMomWanted = fxGpuWanted && std::is_same<Real, float>::value;
+    struct FxWords { std::vector<int64_t> w; float scale = 0.f; };
+    FxWords fxg[PS_FX_CPU_N];      // grid g's words (EMPTY = its Real accumulator is in use) and their unit
+
+    // PS_MASS_AUDIT=1 (ps_mass_audit.h): what this pass should deposit, counted before the deposit in one
+    // extra filter pass -- (a) the owned vertices, (c) those of degree 0, (b) the tets that pass the filter
+    // with ownership and their mass, (d) the owned tets the drop filters reject. The deposit paths below
+    // add what they hand on and what reaches the grid; the line is printed at the end of the pass.
+    bool const massAudit = PSMassAudit::on();
+    struct MassAudit
+    {
+        double owned = 0., deg0 = 0., tets = 0., dropped = 0., after = 0.;
+        size_t nOwned = 0, nDeg0 = 0, nTets = 0, nTetsDeg0 = 0, nDropped = 0, nAfter = 0;
+        double gpuHanded = -1., gpuDeferred = -1., gpuFixed = -1., gpuFloat = -1., released = 0., releasedGain = 0.;
+        double cpuTets = 0., cpuShares = 0., cpuGain = -1.;
+        size_t nCpuTets = 0;
+    } audit;
+    auto gridSum = [&]() -> double   // the mass grid in mass units: the fixed-point words while they live (exact)
+    {
+        if ( massFxOn )
+        {
+            int64_t q = 0;
+            for (int64_t const w : massFx) q += w;
+            return psMassFixedMass( q, massFxScale );
+        }
+        double s = 0.;
+        for (Real const v : quantities->density) s += double(v);
+        return s;
+    };
+    if ( massAudit )
+    {
+        if ( degreesLazy ) { fullDegreePass(); degreesLazy = false; }   // the same counts (PS_DEBUG_DEGREES)
+        Box &own = userOptions.lagrangianRegion;
+        bool const ownsAll = own.isNullBox();
+        auto owned = [&](double const (&p)[NO_DIM]) -> bool   // psFilterCell's half-open ownership test
+        {
+            if ( ownsAll ) return true;
+            for (int d = 0; d < NO_DIM; ++d)
+                if ( p[d] < own[2*d] || p[d] >= own[2*d+1] ) return false;
+            return true;
+        };
+        for (DT::Finite_vertices_iterator vit = dt.finite_vertices_begin(); vit != dt.finite_vertices_end(); ++vit)
+        {
+#ifdef TEST_PADDING
+            if ( vit->info().isDummy() ) continue;
+#endif
+            double p[NO_DIM];
+            for (int d = 0; d < NO_DIM; ++d) p[d] = double(vit->point()[d]);
+            if ( !owned(p) ) continue;
+            double const w = double(vit->info().weight());
+            audit.owned += w; ++audit.nOwned;
+            if ( psVertexMass && vit->info().psDegree() == 0 ) { audit.deg0 += w; ++audit.nDeg0; }
+        }
+        PS_FOREACH_FINITE_CELL
+        {
+            Cell_handle cell = itC;
+            PSCellGeometry g;
+            double Lag[NO_DIM][NO_DIM];
+            for (int v = 0; v < NO_DIM; ++v)
+                for (int i = 0; i < NO_DIM; ++i)
+                    Lag[v][i] = double(cell->vertex(v+1)->point()[i]) - double(cell->vertex(0)->point()[i]);
+            double const lagMass = double(userOptions.averageDensity) * std::fabs(determinant(Lag)) / factorial(NO_DIM);
+            if ( psFilterCell(cell, userOptions, boxCoordinates, true, NULL, g) )
+            {
+                audit.tets += psVertexMass ? psVertexShareMass(cell) : lagMass;
+                ++audit.nTets;
+                if ( psVertexMass )
+                    for (int v = 0; v <= NO_DIM; ++v)
+                        if ( cell->vertex(v)->info().psDegree() == 0 ) { ++audit.nTetsDeg0; break; }   // must stay 0
+                continue;
+            }
+            bool dummy = false;
+#ifdef TEST_PADDING
+            for (int v = 0; v <= NO_DIM; ++v) dummy = dummy || cell->vertex(v)->info().isDummy();
+#endif
+            double cen[NO_DIM];
+            for (int d = 0; d < NO_DIM; ++d)
+            {
+                cen[d] = 0.;
+                for (int v = 0; v <= NO_DIM; ++v) cen[d] += double(cell->vertex(v)->point()[d]);
+                cen[d] /= double(NO_DIM + 1);
+            }
+            if ( !dummy && owned(cen) ) { audit.dropped += lagMass; ++audit.nDropped; }
+        }
+        // PS_MASS_AUDIT=2 on one domain: the per-particle closure -- a particle's shares over the kept tets
+        // of ALL its copies (periodic images) must add up to its weight; the worst offenders are listed
+        if ( PSMassAudit::level() >= 2 && PSMassAudit::partition < 0 && psVertexMass )
+        {
+            std::unordered_map<uint64_t, double> share;
+            std::unordered_map<uint64_t, std::vector<Vertex_handle> > copies;
+            for (DT::Finite_vertices_iterator vit = dt.finite_vertices_begin(); vit != dt.finite_vertices_end(); ++vit)
+            {
+#ifdef TEST_PADDING
+                if ( vit->info().isDummy() ) continue;
+#endif
+                copies[ vit->info().particleID() ].push_back( vit );
+            }
+            PS_FOREACH_FINITE_CELL
+            {
+                Cell_handle cell = itC;
+                PSCellGeometry g;
+                if ( !psFilterCell(cell, userOptions, boxCoordinates, true, NULL, g) ) continue;
+                for (int v = 0; v <= NO_DIM; ++v)
+                {
+                    int32_t const deg = cell->vertex(v)->info().psDegree();
+                    if ( deg > 0 ) share[ cell->vertex(v)->info().particleID() ] += double(cell->vertex(v)->info().weight()) / double(deg);
+                }
+            }
+            std::vector< std::pair<double, uint64_t> > bad;
+            double net = 0.;
+            for (auto const &c : copies)
+            {
+                double const w = double( c.second[0]->info().weight() );
+                double const dev = share[c.first] - w;
+                if ( std::fabs(dev) > 1e-9 * w ) { bad.emplace_back( dev, c.first ); net += dev; }
+            }
+            std::sort( bad.begin(), bad.end(), [](auto const &a, auto const &b) { return std::fabs(a.first) > std::fabs(b.first); } );
+            std::ostringstream s;
+            s << std::setprecision(9) << "PS mass audit: per-particle closure: " << bad.size() << " of " << copies.size()
+              << " particles off (net " << net << ")";
+            for (size_t i = 0; i < bad.size() && i < 6; ++i)
+            {
+                s << "\n    id " << bad[i].second << " off " << bad[i].first << ", copies (Lagrangian position: degree):";
+                for (Vertex_handle const &vh : copies[bad[i].second])
+                {
+                    s << " (";
+                    for (int d = 0; d < NO_DIM; ++d) s << vh->point()[d] << (d + 1 < NO_DIM ? " " : ": ");
+                    s << vh->info().psDegree() << ")";
+                }
+            }
+            std::fprintf( stderr, "%s\n", s.str().c_str() );
+        }
+    }
+
+    // Allocate the requested output fields, zeroed since the cell loop accumulates into them. The density not
+    // yet (2026-10-12): after a GPU deposit it is made from the GPU's mass words at the copy (so it does not sit
+    // beside the host's grids during the call), and a CPU deposit allocates it, or the fixed-point mass grid
+    // that stands in for it until the conversion (massFx above), just before its loop. A grid left over from
+    // an earlier use of 'quantities' is released here.
     if ( field.density )
-        quantities->density.assign(totalGrid, Real(0.));
+        std::vector<Real>().swap( quantities->density );
     // Dispersion needs <v>, so allocate velocity storage even when only dispersion was
     // requested -- EXCEPT under --ps-volume-weighted, where the dispersion carries its OWN
     // mass-weighted mean (disp_velocity/disp_weight below): a dispersion-only volume-weighted
@@ -841,18 +1085,29 @@ void interpolateGrid_phaseSpace(DT &dt,
     // the dispersion always needs the per-sample velocity VALUES (for sum m v_i v_j and its
     // own mean), even when the velocity GRID above is gated away -- keep the two distinct
     bool const needVelValues = haveVel || field.velocity_dispersion;
-    if ( haveVel )
+    // (fxMomWanted: allocated when the pass knows whether each one is a fixed-point sum -- fxEnsureReal)
+    if ( haveVel && !fxMomWanted )
         quantities->velocity.assign(totalGrid, Pvector<Real,noVelComp>::zero());
-    if ( field.velocity_gradient )
+    if ( field.velocity_gradient && !fxMomWanted )
         quantities->velocity_gradient.assign(totalGrid, Pvector<Real,noGradComp>::zero());
-    if ( field.velocity_dispersion )
+    if ( field.velocity_dispersion && !fxMomWanted )
         quantities->velocity_dispersion.assign(totalGrid, Pvector<Real,noDispComp>::zero());
 #ifdef SCALAR
-    if ( field.scalar )
+    if ( field.scalar && !fxMomWanted )
         quantities->scalar.assign(totalGrid, Pvector<Real,noScalarComp>::zero());
-    if ( field.scalar_gradient )
+    if ( field.scalar_gradient && !fxMomWanted )
         quantities->scalar_gradient.assign(totalGrid, Pvector<Real,noScalarGradComp>::zero());
 #endif
+    if ( fxMomWanted )
+    {   // a grid left over from an earlier use of 'quantities' is released here, as the density is above
+        std::vector< Pvector<Real,noVelComp> >().swap( quantities->velocity );
+        std::vector< Pvector<Real,noGradComp> >().swap( quantities->velocity_gradient );
+        std::vector< Pvector<Real,noDispComp> >().swap( quantities->velocity_dispersion );
+#ifdef SCALAR
+        std::vector< Pvector<Real,noScalarComp> >().swap( quantities->scalar );
+        std::vector< Pvector<Real,noScalarGradComp> >().swap( quantities->scalar_gradient );
+#endif
+    }
 
     // Per-grid-point count of overlapping streams (diagnostic; reported as the stream_count field).
     // Sampled deposit: incremented once per in-simplex sample, divided by nSub^NO_DIM at the end
@@ -888,6 +1143,8 @@ void interpolateGrid_phaseSpace(DT &dt,
     // so it also catches a folded sliver whose mass went to ANOTHER cell, which the mass flag
     // missed. Marked per tet in both deposit paths (markFlipped), OR-merged across partitions;
     // DTFE() then keeps it only where '.streams' reads single-stream (Quantities::finalizeHiddenStreams).
+    // Since 2026-10-13 it is also the '--ps-caustics' parity bit 1 (det < 0 overlaps the cell): the
+    // export below ORs it, still raw, into the caustic mask.
     std::vector<unsigned char> flippedFlag(totalGrid, 0);
     // xLo/xHi: only cells whose local x index lies in [xLo, xHi) -- the slab deposit's thread owns them
     auto markFlipped = [&](PSCellGeometry const &geo, std::vector<unsigned char> &flags,
@@ -1023,12 +1280,14 @@ void interpolateGrid_phaseSpace(DT &dt,
     // never exactly 1. Grazing slivers contribute ~0 here instead of a full +1, which also
     // makes it far more robust than the raw touch count (float GPU included).
     std::vector<Real> exactMult;
-    if ( userOptions.psExactDeposit ) exactMult.assign(totalGrid, Real(0.));
+    if ( userOptions.psExactDeposit && !fxMomWanted ) exactMult.assign(totalGrid, Real(0.));   // (fxMomWanted: fxEnsureReal)
 
     // --ps-caustics: per-cell orientation mask (bit0 = a det(Ax)>0 stream overlaps the cell,
     // bit1 = det<0). det(Ax)'s sign is the parity of the Lagrangian->Eulerian map (CGAL cells
     // are positively oriented in Lagrangian space), which flips at every fold -- both bits set
     // means a fold caustic surface crosses the cell. Exported as small exact ints in Real.
+    // Accumulated per deposited SAMPLE; the export ORs the geometric flippedFlag into bit 1, so
+    // bit 1 is the true overlap (2026-10-13), while bit 0 and the class bits stay per sample.
     bool const psCaustics = userOptions.psCaustics;
     // PSCausticClass::CausticMask, not unsigned char: the A4 indicator lives in bit 8, so a byte
     // accumulator would drop it here without any compiler diagnostic.
@@ -1079,7 +1338,7 @@ void interpolateGrid_phaseSpace(DT &dt,
     // so it always allocates the explicit weight grid.
     bool const weightIsDensity = needWeight && field.density && !psVolWeighted;
     std::vector<Real> massWeight;
-    if ( needWeight && !weightIsDensity ) massWeight.assign(totalGrid, Real(0.));
+    if ( needWeight && !weightIsDensity && !fxMomWanted ) massWeight.assign(totalGrid, Real(0.));   // (fxMomWanted: fxEnsureReal)
     // --ps-volume-weighted keeps the DISPERSION mass-weighted (sigma_ij is a moment of the
     // phase-space distribution f -- f-weighted by definition) while velocity/gradient go
     // volume-weighted. sigma_ij = <v_i v_j>_m - <v_i>_m<v_j>_m then needs its own mass-weighted
@@ -1087,11 +1346,164 @@ void interpolateGrid_phaseSpace(DT &dt,
     bool const dispNeedsOwnWeight = psVolWeighted && field.velocity_dispersion;
     std::vector<Real> dispWeight;                      // sum(m_s)
     std::vector< Pvector<Real,noVelComp> > dispVel;    // sum(m_s v_s)
-    if ( dispNeedsOwnWeight )
+    if ( dispNeedsOwnWeight && !fxMomWanted )   // (fxMomWanted: fxEnsureReal)
     {
         dispWeight.assign(totalGrid, Real(0.));
         dispVel.assign(totalGrid, Pvector<Real,noVelComp>::zero());
     }
+
+    // ---- the moment grids as fixed-point sums (2026-10-14; see fxg above) ----
+    // which grids this pass accumulates (ps_deposit_params.h PSFxGrid): MOMW is massWeight (the volume shares, or
+    // without a density grid the mass shares), DW dispWeight, RM releasedMult
+#ifdef SCALAR
+    bool const fxScalSel = field.scalar, fxSGradSel = field.scalar_gradient;
+#else
+    bool const fxScalSel = false, fxSGradSel = false;
+#endif
+    bool const fxSel[PS_FX_CPU_N] = { haveVel, bool(field.velocity_dispersion), bool(field.velocity_gradient),
+                                      needWeight && !weightIsDensity, psExact, dispNeedsOwnWeight, dispNeedsOwnWeight,
+                                      fxScalSel, fxSGradSel, !releasedMult.empty() };
+    // the Real accumulator of grid g, allocated (zeroed) if the pass has none yet: a grid that is not a fixed-point
+    // sum after all (no unit, or the GPU's float grid)
+    auto fxEnsureReal = [&](int const g)
+    {
+        if ( !fxSel[g] ) return;
+        switch ( g )
+        {
+        case PS_FX_MOM:  if ( quantities->velocity.empty() ) quantities->velocity.assign(totalGrid, Pvector<Real,noVelComp>::zero()); break;
+        case PS_FX_M2:   if ( quantities->velocity_dispersion.empty() ) quantities->velocity_dispersion.assign(totalGrid, Pvector<Real,noDispComp>::zero()); break;
+        case PS_FX_GRAD: if ( quantities->velocity_gradient.empty() ) quantities->velocity_gradient.assign(totalGrid, Pvector<Real,noGradComp>::zero()); break;
+        case PS_FX_MOMW: if ( massWeight.empty() ) massWeight.assign(totalGrid, Real(0.)); break;
+        case PS_FX_SV:   if ( exactMult.empty() ) exactMult.assign(totalGrid, Real(0.)); break;
+        case PS_FX_DV:   if ( dispVel.empty() ) dispVel.assign(totalGrid, Pvector<Real,noVelComp>::zero()); break;
+        case PS_FX_DW:   if ( dispWeight.empty() ) dispWeight.assign(totalGrid, Real(0.)); break;
+#ifdef SCALAR
+        case PS_FX_SCAL: if ( quantities->scalar.empty() ) quantities->scalar.assign(totalGrid, Pvector<Real,noScalarComp>::zero()); break;
+        case PS_FX_SG:   if ( quantities->scalar_gradient.empty() ) quantities->scalar_gradient.assign(totalGrid, Pvector<Real,noScalarGradComp>::zero()); break;
+#endif
+        case PS_FX_RM:   if ( releasedMult.empty() ) releasedMult.assign(totalGrid, Real(0.)); break;
+        default: break;
+        }
+    };
+    // components per cell of grid g (the words' layout)
+    auto fxComps = [&](int const g) -> size_t
+    {
+        switch ( g )
+        {
+        case PS_FX_MOM: case PS_FX_DV: return noVelComp;
+        case PS_FX_M2:   return noDispComp;
+        case PS_FX_GRAD: return noGradComp;
+#ifdef SCALAR
+        case PS_FX_SCAL: return noScalarComp;
+        case PS_FX_SG:   return noScalarGradComp;
+#endif
+        default: return 1;
+        }
+    };
+    // grid g becomes a fixed-point sum in units of 1/scale (its words zeroed, its Real accumulator released)
+    auto fxStart = [&](int const g, float const scale)
+    {
+        fxg[g].scale = scale;
+        fxg[g].w.assign( totalGrid * fxComps(g), 0 );
+        switch ( g )
+        {
+        case PS_FX_MOM:  std::vector< Pvector<Real,noVelComp> >().swap( quantities->velocity ); break;
+        case PS_FX_M2:   std::vector< Pvector<Real,noDispComp> >().swap( quantities->velocity_dispersion ); break;
+        case PS_FX_GRAD: std::vector< Pvector<Real,noGradComp> >().swap( quantities->velocity_gradient ); break;
+        case PS_FX_MOMW: std::vector<Real>().swap( massWeight ); break;
+        case PS_FX_SV:   std::vector<Real>().swap( exactMult ); break;
+        case PS_FX_DV:   std::vector< Pvector<Real,noVelComp> >().swap( dispVel ); break;
+        case PS_FX_DW:   std::vector<Real>().swap( dispWeight ); break;
+#ifdef SCALAR
+        case PS_FX_SCAL: std::vector< Pvector<Real,noScalarComp> >().swap( quantities->scalar ); break;
+        case PS_FX_SG:   std::vector< Pvector<Real,noScalarGradComp> >().swap( quantities->scalar_gradient ); break;
+#endif
+        case PS_FX_RM:   std::vector<Real>().swap( releasedMult ); break;
+        default: break;
+        }
+    };
+    // grid g's words become its Real grid, once (after the deposit); a no-op for a grid without words
+    auto fxToReal = [&](int const g)
+    {
+        FxWords &F = fxg[g];
+        if ( F.w.empty() ) return;
+        switch ( g )
+        {
+        case PS_FX_MOM:  psFxToReal( F.w, F.scale, quantities->velocity, totalGrid ); break;
+        case PS_FX_M2:   psFxToReal( F.w, F.scale, quantities->velocity_dispersion, totalGrid ); break;
+        case PS_FX_GRAD: psFxToReal( F.w, F.scale, quantities->velocity_gradient, totalGrid ); break;
+        case PS_FX_MOMW: psFxToReal( F.w, F.scale, massWeight, totalGrid ); break;
+        case PS_FX_SV:   psFxToReal( F.w, F.scale, exactMult, totalGrid ); break;
+        case PS_FX_DV:   psFxToReal( F.w, F.scale, dispVel, totalGrid ); break;
+        case PS_FX_DW:   psFxToReal( F.w, F.scale, dispWeight, totalGrid ); break;
+#ifdef SCALAR
+        case PS_FX_SCAL: psFxToReal( F.w, F.scale, quantities->scalar, totalGrid ); break;
+        case PS_FX_SG:   psFxToReal( F.w, F.scale, quantities->scalar_gradient, totalGrid ); break;
+#endif
+        case PS_FX_RM:   psFxToReal( F.w, F.scale, releasedMult, totalGrid ); break;
+        default: break;
+        }
+    };
+    // One kept tetrahedron's terms of the bounds (PSFixedBounds::addTet): the largest |value| it can deposit per
+    // grid, from the vertex values and the constant gradients the CPU deposit itself forms (geo.posMatInv, Real).
+    // The GPU kernel forms its gradients in float from its own record; near the degeneracy cut they may exceed
+    // these by a few per cent, which the factor 4 of headroom in the unit absorbs (psMomentFixedScale).
+    bool const fxVelBound = needVelValues || field.velocity_gradient;
+    auto fxTetBound = [&](Cell_handle const &cell, PSCellGeometry const &geo, double const tetMass, PSFixedBounds &fb)
+    {
+        double const V = geo.cellAbsDet / double(factorial(NO_DIM));
+        double const wm = psVolWeighted ? V : tetMass;
+        double vMax = 0., gMax = 0., sMax = 0., sgMax = 0.;
+        if ( fxVelBound )
+        {
+            for (int v = 0; v <= NO_DIM; ++v)
+                for (size_t j = 0; j < noVelComp; ++j)
+                    vMax = std::max( vMax, std::fabs( double( cell->vertex(v)->info().velocity(j) ) ) );
+            if ( field.velocity_gradient )
+            {
+                Real temp[NO_DIM][noVelComp], vg[NO_DIM][noVelComp];
+                for (int v = 0; v < NO_DIM; ++v)
+                    for (size_t j = 0; j < noVelComp; ++j)
+                        temp[v][j] = cell->vertex(v+1)->info().velocity(j) - cell->vertex(0)->info().velocity(j);
+                matrixMultiplication<noVelComp>( const_cast<Real (&)[NO_DIM][NO_DIM]>(geo.posMatInv), temp, vg );
+                for (int i = 0; i < NO_DIM; ++i)
+                    for (size_t j = 0; j < noVelComp; ++j) gMax = std::max( gMax, std::fabs( double(vg[i][j]) ) );
+            }
+        }
+#ifdef SCALAR
+        if ( fxScalSel || fxSGradSel )
+        {
+            for (int v = 0; v <= NO_DIM; ++v)
+                for (size_t j = 0; j < noScalarComp; ++j)
+                    sMax = std::max( sMax, std::fabs( double( cell->vertex(v)->info().myScalar()[j] ) ) );
+            if ( fxSGradSel )
+            {
+                Real temp[NO_DIM][noScalarComp], sg[NO_DIM][noScalarComp];
+                for (int v = 0; v < NO_DIM; ++v)
+                    for (size_t j = 0; j < noScalarComp; ++j)
+                        temp[v][j] = cell->vertex(v+1)->info().myScalar()[j] - cell->vertex(0)->info().myScalar()[j];
+                matrixMultiplication<noScalarComp>( const_cast<Real (&)[NO_DIM][NO_DIM]>(geo.posMatInv), temp, sg );
+                for (int i = 0; i < NO_DIM; ++i)
+                    for (size_t j = 0; j < noScalarComp; ++j) sgMax = std::max( sgMax, std::fabs( double(sg[i][j]) ) );
+            }
+        }
+#endif
+        fb.addTet( tetMass, V, wm, vMax, gMax, sMax, sgMax, double(cellVolume) );
+    };
+    // the unit of grid g from its bound; 0 (and a warning naming the grid) when the bound has none: the grid then
+    // keeps the float sums, as before 2026-10-14
+    auto fxUnit = [&](int const g, double const bound) -> float
+    {
+        static char const *const name[PS_FX_CPU_N] = { "velocity moment", "dispersion second moment", "velocity-gradient moment",
+            "moment weight", "exact multiplicity", "dispersion mean", "dispersion weight", "scalar moment",
+            "scalar-gradient moment", "released multiplicity" };
+        float scale = 0.f;
+        if ( psMomentFixedScale( bound, scale ) ) return scale;
+        MESSAGE::Warning warning( userOptions.verboseLevel );
+        warning << "PS-DTFE: the " << name[g] << " grid's bound (" << bound << ") gives no fixed-point unit; this pass "
+                << "sums it in floating point (not bit-reproducible).\n" << MESSAGE::EndWarning;
+        return 0.f;
+    };
 
     // Reusable per-tetrahedron scratch for the mass-conserving deposit (see the cell loop): the flat
     // grid index and Eulerian offset (rel = samplePos - vertex0) of every in-simplex sample point.
@@ -1193,6 +1605,12 @@ void interpolateGrid_phaseSpace(DT &dt,
         std::vector<uint32_t> tetOrd;
         tetOrd.reserve( psKeptCells );
         uint32_t cellOrdCounter = 0;
+        // the bounds of the moment grids' fixed-point units (2026-10-14, fxg): every tet that passes the filter --
+        // the ones handed to the GPU (those it will defer to the CPU included), the released ones the host deposits
+        // itself, and those of no mass -- summed per block of 256 finite cells and then block by block, EXACTLY as
+        // the CPU deposit's bound walk sums them (below), so a GPU and a CPU deposit of the same pass take the
+        // same units (outside --ps-window, whose extraction skips the tets that miss the window)
+        std::vector<PSFixedBounds> gpuBoundPart( fxGpuWanted ? noTotalCells / 256 + 1 : 0 );
         // grid and canonical frame of the per-tet records (the CPU exact test's own definitions)
         double  recLo[3], recLen[3], recShift[3], recWrap[3];
         int32_t recN[3];
@@ -1204,6 +1622,7 @@ void interpolateGrid_phaseSpace(DT &dt,
             recShift[d] = exactFrame.periodic ? exactFrame.canonLd[d] : 0.;
             recWrap[d]  = exactFrame.periodic ? exactFrame.canonLd[d] : 0.;
         }
+        lap( PS_PH_SETUP );
         PS_FOREACH_FINITE_CELL
         {
             uint32_t const cellOrd = cellOrdCounter++;   // counts EVERY finite cell, like the CPU loop
@@ -1230,14 +1649,17 @@ void interpolateGrid_phaseSpace(DT &dt,
             if ( degreesLazy ) lazyDegrees(cell);   // --ps-window: this tet's vertices only
             float tm = psVertexMass ? float( psVertexShareMass(cell) )
                                     : float( double(userOptions.averageDensity)*absDetLag/factorial(NO_DIM) );
-            if (tm<=0.f) continue;
+            if ( fxGpuWanted ) fxTetBound( cell, geo, double( tm > 0.f ? tm : 0.f ), gpuBoundPart[cellOrd / 256] );
+            if (tm<=0.f) { if ( massAudit ) { audit.after += double(tm); ++audit.nAfter; } continue; }
             if ( psHaloRelease > 0. && absDetLag > psHaloRelease * geo.cellAbsDet )
             {
                 // identical classification to the CPU loop (double |det Lag| > D*|det Ax|);
                 // centroid cell + centroid-evaluated velocity mirror the CPU fallback exactly
                 Real centroid[NO_DIM];
                 size_t f = 0;
-                if ( !centroidCell(ep, centroid, f) ) { continue; }   // outside this grid/partition region: drop (as the CPU fallback does)
+                if ( !centroidCell(ep, centroid, f) )   // outside this grid/partition region: drop (as the CPU fallback does)
+                { if ( massAudit ) { audit.after += double(tm); ++audit.nAfter; } continue; }
+                if ( massAudit ) audit.released += double(tm);
                 ReleasedTet rt;
                 rt.flat = f;
                 rt.mass = Real(tm);
@@ -1325,6 +1747,7 @@ void interpolateGrid_phaseSpace(DT &dt,
 
         }
 
+        lap( PS_PH_EXTRACT );
         // Sort tetrahedra by grid-footprint cost before dispatch. A GPU chunk finishes when its
         // SLOWEST thread finishes: one stretched void tet (spanning thousands of grid cells) mixed
         // among cheap halo tets leaves most of the GPU idle until the chunk boundary -- measured as
@@ -1350,7 +1773,8 @@ void interpolateGrid_phaseSpace(DT &dt,
                         if (cc < lo) lo = cc;
                         if (cc > hi) hi = cc;
                     }
-                    cells *= (hi-lo) / float(dx[d]) + (nSub > 1 ? 3.f : 1.f);
+                    // the window spans extent + [1, 2) cells (no sample margin since 2026-10-11; it was +3)
+                    cells *= (hi-lo) / float(dx[d]) + 1.f;
                 }
                 // cells >= 1 (every factor is), so the key is >= 0; 30 doublings fill 61440 < 65536
                 costKey[t] = uint16_t( std::min( 65535.f, std::log2(cells) * 2048.f ) );
@@ -1411,13 +1835,56 @@ void interpolateGrid_phaseSpace(DT &dt,
         double bl[3]  = { double(boxCoordinates[0]), double(boxCoordinates[2]), double(boxCoordinates[4]) };
         double dxv[3] = { double(dx[0]), double(dx[1]), double(dx[2]) };
         size_t const nTetsDeposited = tetMasses.size();   // psGpuDepositFields consumes (frees) the arrays
+        if ( massAudit )
+        {
+            audit.gpuHanded = 0.;
+            for (float const m : tetMasses) audit.gpuHanded += double(m);
+        }
         PSGpuGrids gpuOut;
         std::vector<uint32_t> deferredTets;
         std::string metalErr;
-        if ( psGpuDepositFields(tetVerts, tetVels, tetMasses, tetDens, tetScal, bl, dxv,
+        // the released tets' mass: the host adds it into the GPU's fixed-point grid below, so the unit covers it
+        double releasedMass = 0.;
+        for (ReleasedTet const &rt : releasedTets) releasedMass += double(rt.mass);
+        // the moment grids' units (2026-10-14, fxg): one per grid the kernel deposits, from the bounds above, so the
+        // host's later integer adds (the deferred and released tets) stay within them too; dispw's unit only says
+        // "the mass grid is it" (the host then skips it when its mass grid is fixed). PS_METAL_FLOAT_MOMENTS=1: none.
+        PSFixedUnits fxUnits;
+        PSFixedBounds gpuBounds;
+        for (PSFixedBounds const &b : gpuBoundPart) gpuBounds.add( b );   // in block order (see gpuBoundPart)
+        std::vector<PSFixedBounds>().swap( gpuBoundPart );
+        if ( fxGpuWanted )
+        {
+            bool const dispOwn = psVolWeighted && fDisp;
+            bool const gpuSel[PS_FX_N] = { fVel, fDisp, fGrad, psVolWeighted, psExact, dispOwn, dispOwn, fScal, fSGrad };
+            for (int g = 0; g < PS_FX_N; ++g)
+                if ( gpuSel[g] ) fxUnits.scale[g] = g == PS_FX_DW ? 1.f : fxUnit( g, gpuBounds.B[g] );
+            fxUnits.sumW = true;
+        }
+        lap( PS_PH_SORT );
+        // (the GPU call's wall time includes any wait for the device: concurrent partitions queue on it)
+        bool gpuOk = psGpuDepositFields(tetVerts, tetVels, tetMasses, tetDens, tetScal, bl, dxv,
                                   nGrid, subOrigin, subDims, nSub,
                                   userOptions.periodic, fVel, fDisp, fGrad, psLinear,
-                                  psVolWeighted, psCaustics, psExact, fScal, fSGrad, windowMode, gpuOut, deferredTets, metalErr) )
+                                  psVolWeighted, psCaustics, psExact, fScal, fSGrad, windowMode, releasedMass, fxUnits,
+                                  gpuOut, deferredTets, metalErr);
+        // A host that chose the fixed-point unit hands back the words and leaves its float grid empty, so words
+        // of another size would send the decode below into that empty grid: a failed deposit instead (the CPU
+        // deposits the partition). Neither host produces it (2026-10-12 review); this keeps it from reading
+        // out of bounds if one ever does.
+        if ( gpuOk && gpuOut.massScale > 0.f && gpuOut.massFx.size() != totalGrid )
+        {
+            gpuOk = false;
+            metalErr = "the GPU returned a mass grid of the wrong size";
+        }
+        for (int g = 0; gpuOk && g < PS_FX_N; ++g)   // the same guard for the moment grids' words (2026-10-14)
+            if ( gpuOut.fxScale[g] > 0.f && gpuOut.fx[g].size() != totalGrid * fxComps(g) )
+            {
+                gpuOk = false;
+                metalErr = "the GPU returned a moment grid of the wrong size";
+            }
+        lap( PS_PH_GPU );
+        if ( gpuOk )
         {
             // the deferred tets' cells, ascending: the CPU loop below deposits exactly these
             deferredOrd.reserve( deferredTets.size() );
@@ -1429,35 +1896,101 @@ void interpolateGrid_phaseSpace(DT &dt,
                         << MESSAGE::cMagenta() << nTetsDeposited << MESSAGE::cReset() << " tetrahedra ("
                         << MESSAGE::cMagenta() << deferredOrd.size() << MESSAGE::cReset()
                         << " with a sample on a face, deposited by the CPU's exact test).\n" << MESSAGE::Flush;
+            // The mass grid (2026-10-12, see massFx): the GPU's fixed-point words become this pass's mass grid as
+            // they are -- the released and deferred tets are added into them below, and they are converted to the
+            // float density after the CPU loop. Otherwise (the double build, or the float A/B grid) the density
+            // is set here, from the words converted straight to Real or from the float grid.
+            bool const gpuFixed = gpuOut.massScale > 0.f && gpuOut.massFx.size() == totalGrid;
+            if ( field.density && massFxWanted && gpuFixed )
+            {
+                massFx.swap( gpuOut.massFx );
+                massFxScale = gpuOut.massScale;
+                massFxOn = true;
+            }
+            else if ( field.density )
+                quantities->density.assign( totalGrid, Real(0.) );   // (set from the GPU's grid just below)
+            std::vector<int64_t> const &gpuFx = massFxOn ? massFx : gpuOut.massFx;
+            auto gpuMass = [&](size_t const i) -> double   // the GPU's mass of cell i, whichever form it came in
+            {
+                return gpuFixed ? psMassFixedMass( gpuFx[i], gpuOut.massScale ) : double( gpuOut.mass[i] );
+            };
+            // The moment grids (2026-10-14, fxg): a grid the GPU returns as words becomes this pass's fixed-point grid
+            // as it is (the single build; the deferred and released tets are added into it, and it is converted after
+            // the CPU loop, like the mass); otherwise its Real grid is set here, cell by cell, from the GPU's floats,
+            // or (the double build) from its words converted to double. The moment normalizer MOMW is the GPU's
+            // volume-share grid under --ps-volume-weighted, else (no density selected) the mass words themselves;
+            // the dispersion's normalizer DW is the mass grid when the kernel skipped it (dispwIsMass) -- and once
+            // the mass grid is this pass's own exact words (massFxOn) DW is not accumulated at all: it becomes the
+            // density after the loop (see massFx). MOMW and DW never both take the mass words (DW needs
+            // --ps-volume-weighted, MOMW then the volume shares).
+            std::vector<float> const *const gpuFloat[PS_FX_N] = { &gpuOut.mom, &gpuOut.m2, &gpuOut.grad, &gpuOut.momw,
+                &gpuOut.streamvol, &gpuOut.dispvel, &gpuOut.dispw, &gpuOut.scal, &gpuOut.sgrad };
+            bool const momwIsMass = !psVolWeighted, dwIsMass = gpuOut.dispwIsMass;
+            bool fxFill[PS_FX_N] = {};    // grid g's Real grid is filled from the GPU in the cell loop below
+            for (int g = 0; g < PS_FX_N; ++g)
+            {
+                if ( !fxSel[g] ) continue;
+                if ( g == PS_FX_DW && massFxOn ) continue;            // (the density after the loop)
+                bool const fromMass = ( g == PS_FX_MOMW && momwIsMass ) || ( g == PS_FX_DW && dwIsMass );
+                if ( fxMomWanted && fromMass && gpuFixed && !massFxOn )
+                {   // (copied while the density below still reads them: PS_GPU_FLOAT_MASS=1 on a Metal build)
+                    fxg[g].scale = gpuOut.massScale;
+                    if ( field.density ) fxg[g].w = gpuOut.massFx;
+                    else fxg[g].w.swap( gpuOut.massFx );
+                }
+                else if ( fxMomWanted && !fromMass && gpuOut.fxScale[g] > 0.f )
+                {
+                    fxg[g].scale = gpuOut.fxScale[g];
+                    fxg[g].w.swap( gpuOut.fx[g] );
+                }
+                else
+                {
+                    fxEnsureReal( g );
+                    fxFill[g] = true;
+                }
+            }
+            // the released tets' multiplicity (sampled deposit + --ps-halo-release): the host's own sum, in the unit a
+            // CPU deposit of this pass would take (the same bounds), so the two write the same '.streams'
+            if ( fxMomWanted && fxSel[PS_FX_RM] )
+            {
+                float const scale = fxUnit( PS_FX_RM, gpuBounds.B[PS_FX_RM] );
+                if ( scale > 0.f ) fxStart( PS_FX_RM, scale );
+            }
+            // grid g's GPU value at component index 'at' (cell x components + component), whichever form it came in
+            auto gpuVal = [&](int const g, size_t const at) -> double
+            {
+                if ( ( g == PS_FX_MOMW && momwIsMass ) || ( g == PS_FX_DW && dwIsMass ) ) return gpuMass(at);
+                if ( gpuOut.fxScale[g] > 0.f ) return psMassFixedMass( gpuOut.fx[g][at], gpuOut.fxScale[g] );
+                return double( (*gpuFloat[g])[at] );
+            };
             for (size_t i = 0; i < totalGrid; ++i)
             {
-                if (field.density) quantities->density[i] = Real(gpuOut.mass[i]);
-                // moment normalizer: the volume-share sum under --ps-volume-weighted, else the mass
-                if (needWeight && !weightIsDensity)
-                    massWeight[i] = Real( psVolWeighted ? gpuOut.momw[i] : gpuOut.mass[i] );
-                if (haveVel)
+                if (field.density && !massFxOn) quantities->density[i] = Real( gpuMass(i) );
+                // moment normalizer: the volume-share sum under --ps-volume-weighted, else the mass (in the
+                // single build the same float the host's decode gave before 2026-10-12)
+                if (fxFill[PS_FX_MOMW]) massWeight[i] = Real( gpuVal(PS_FX_MOMW, i) );
+                if (fxFill[PS_FX_MOM])
                     for (size_t j = 0; j < noVelComp; ++j)
-                        quantities->velocity[i][j] = Real(gpuOut.mom[i*3+j]);
-                if (field.velocity_gradient)
+                        quantities->velocity[i][j] = Real( gpuVal(PS_FX_MOM, i*3+j) );
+                if (fxFill[PS_FX_GRAD])
                     for (size_t q = 0; q < noGradComp; ++q)
-                        quantities->velocity_gradient[i][q] = Real(gpuOut.grad[i*9+q]);
-                if (field.velocity_dispersion)
+                        quantities->velocity_gradient[i][q] = Real( gpuVal(PS_FX_GRAD, i*9+q) );
+                if (fxFill[PS_FX_M2])
                     for (size_t cc = 0; cc < noDispComp; ++cc)
-                        quantities->velocity_dispersion[i][cc] = Real(gpuOut.m2[i*6+cc]);
+                        quantities->velocity_dispersion[i][cc] = Real( gpuVal(PS_FX_M2, i*6+cc) );
 #ifdef SCALAR
-                if (fScal)  quantities->scalar[i][0] = Real(gpuOut.scal[i]);
-                if (fSGrad) for (int q = 0; q < NO_DIM; ++q) quantities->scalar_gradient[i][q] = Real(gpuOut.sgrad[i*3+q]);
+                if (fxFill[PS_FX_SCAL]) quantities->scalar[i][0] = Real( gpuVal(PS_FX_SCAL, i) );
+                if (fxFill[PS_FX_SG]) for (int q = 0; q < NO_DIM; ++q) quantities->scalar_gradient[i][q] = Real( gpuVal(PS_FX_SG, i*3+q) );
 #endif
-                if (dispNeedsOwnWeight)
-                {   // the dispersion's own mass-weighted mean/normalizer (kernel buffers 13/14)
-                    dispWeight[i] = Real(gpuOut.dispw[i]);
+                // the dispersion's own mass-weighted mean/normalizer (kernel buffers 13/14)
+                if (fxFill[PS_FX_DW]) dispWeight[i] = Real( gpuVal(PS_FX_DW, i) );
+                if (fxFill[PS_FX_DV])
                     for (size_t j = 0; j < noVelComp; ++j)
-                        dispVel[i][j] = Real(gpuOut.dispvel[i*3+j]);
-                }
+                        dispVel[i][j] = Real( gpuVal(PS_FX_DV, i*3+j) );
                 streamCount[i] = int(gpuOut.streams[i] & 0x7FFFFFFFu);   // bit 31 = the sub-sample mass flag ('.hidden_streams' bit 2)
                 if ( gpuOut.streams[i] >> 31 ) subSampleMassFlag[i] = 1;
-                if (psExact)
-                    exactMult[i] = Real(gpuOut.streamvol[i]);   // exact cell-mean multiplicity
+                if (fxFill[PS_FX_SV])
+                    exactMult[i] = Real( gpuVal(PS_FX_SV, i) );   // exact cell-mean multiplicity
                 // The kernel accumulates the two PARITY bits only, so a GPU deposit reproduces the
                 // fold flag EXACTLY (asserted by ps_caustic_class_check.sh) but not the
                 // stratification bits -- see the warning below.
@@ -1479,46 +2012,74 @@ void interpolateGrid_phaseSpace(DT &dt,
                            "('.causticClass') comes from the CPU deposit -- drop '--ps-gpu' for it.\n"
                         << MESSAGE::EndWarning;
             }
+            if ( massAudit )
+            {
+                audit.gpuDeferred = gpuOut.auditDeferredMass;
+                audit.gpuFixed = gpuOut.auditFixedTotal;
+                if ( field.density ) audit.gpuFloat = gridSum();
+            }
             // --ps-halo-release: host-side monolithic centroid deposits of the released tets
             // (same accumulation sites and moments as the CPU fallback's single sample)
+            // (each moment add: into the grid's fixed-point words when it has them, 2026-10-14, else its Real grid --
+            // the same float product either way; fxHost)
+            auto fxHost = [&](int const g, size_t const at, Real const v) -> bool
+            {
+                if ( fxg[g].w.empty() ) return false;
+                fxg[g].w[at] += psFixedShare( double(v), fxg[g].scale );
+                return true;
+            };
             for (ReleasedTet const &rt : releasedTets)
             {
-                if (field.density) quantities->density[rt.flat] += rt.mass;
-                if (needWeight && !weightIsDensity) massWeight[rt.flat] += rt.momw;
+                if (field.density)
+                {
+                    if ( massFxOn ) massFx[rt.flat] += psMassFixedShare( double(rt.mass), massFxScale );   // exact
+                    else quantities->density[rt.flat] += rt.mass;
+                }
+                if (needWeight && !weightIsDensity && !fxHost(PS_FX_MOMW, rt.flat, rt.momw)) massWeight[rt.flat] += rt.momw;
                 if (haveVel)
                     for (size_t j = 0; j < noVelComp; ++j)
-                        quantities->velocity[rt.flat][j] += rt.vel[j] * rt.momw;
+                        if ( !fxHost(PS_FX_MOM, rt.flat*noVelComp + j, rt.vel[j] * rt.momw) )
+                            quantities->velocity[rt.flat][j] += rt.vel[j] * rt.momw;
                 if (field.velocity_gradient)
                     for (size_t q = 0; q < noGradComp; ++q)
-                        quantities->velocity_gradient[rt.flat][q] += rt.grad[q] * rt.momw;
+                        if ( !fxHost(PS_FX_GRAD, rt.flat*noGradComp + q, rt.grad[q] * rt.momw) )
+                            quantities->velocity_gradient[rt.flat][q] += rt.grad[q] * rt.momw;
 #ifdef SCALAR
-                if (fScal)  quantities->scalar[rt.flat][0] += rt.scal * rt.momw;
-                if (fSGrad) for (int q = 0; q < NO_DIM; ++q) quantities->scalar_gradient[rt.flat][q] += rt.sgrad[q] * rt.momw;
+                if (fScal && !fxHost(PS_FX_SCAL, rt.flat, rt.scal * rt.momw)) quantities->scalar[rt.flat][0] += rt.scal * rt.momw;
+                if (fSGrad)
+                    for (int q = 0; q < NO_DIM; ++q)
+                        if ( !fxHost(PS_FX_SG, rt.flat*NO_DIM + size_t(q), rt.sgrad[q] * rt.momw) )
+                            quantities->scalar_gradient[rt.flat][q] += rt.sgrad[q] * rt.momw;
 #endif
                 if (field.velocity_dispersion)
                 {
                     size_t c = 0;
                     for (int a = 0; a < NO_DIM; ++a)
-                        for (int b = a; b < NO_DIM; ++b)
-                            quantities->velocity_dispersion[rt.flat][c++] += rt.mass * rt.vel[a] * rt.vel[b];
+                        for (int b = a; b < NO_DIM; ++b, ++c)
+                            if ( !fxHost(PS_FX_M2, rt.flat*noDispComp + c, rt.mass * rt.vel[a] * rt.vel[b]) )
+                                quantities->velocity_dispersion[rt.flat][c] += rt.mass * rt.vel[a] * rt.vel[b];
                     if ( dispNeedsOwnWeight )
                     {
-                        dispWeight[rt.flat] += rt.mass;
+                        if ( !massFxOn && !fxHost(PS_FX_DW, rt.flat, rt.mass) )   // (massFxOn: DW is the density)
+                            dispWeight[rt.flat] += rt.mass;
                         for (size_t j = 0; j < noVelComp; ++j)
-                            dispVel[rt.flat][j] += rt.vel[j] * rt.mass;
+                            if ( !fxHost(PS_FX_DV, rt.flat*noVelComp + j, rt.vel[j] * rt.mass) )
+                                dispVel[rt.flat][j] += rt.vel[j] * rt.mass;
                     }
                 }
                 subSampleMassFlag[rt.flat] = 1;            // mass from a never-sampled tet
                 if (psExact)
                 {
                     streamCount[rt.flat]++;             // raw tet-touch count ('.tetTouch')
-                    exactMult[rt.flat] += rt.volFrac;   // V_tet / V_cell, as the CPU fallback deposits
+                    if ( !fxHost(PS_FX_SV, rt.flat, rt.volFrac) )
+                        exactMult[rt.flat] += rt.volFrac;   // V_tet / V_cell, as the CPU fallback deposits
                 }
-                else
+                else if ( !fxHost(PS_FX_RM, rt.flat, rt.volFrac) )
                     releasedMult[rt.flat] += rt.volFrac;   // never sampled: its volume fraction
                 if (psCaustics)
                     orientBits[rt.flat] |= rt.orient;
             }
+            if ( massAudit && field.density && !releasedTets.empty() ) audit.releasedGain = gridSum() - audit.gpuFloat;
             metalDeposited = true;
         }
         else
@@ -1527,6 +2088,7 @@ void interpolateGrid_phaseSpace(DT &dt,
             warning << "PS-DTFE GPU deposit unavailable (" << metalErr << "); using the CPU deposit.\n" << MESSAGE::EndWarning;
             ++psGpuFallbacks;
             nReleased = 0;   // releasedTets are discarded; the CPU loop below recounts them
+            if ( massAudit ) { audit.after = audit.released = 0.; audit.nAfter = 0; audit.gpuHanded = -1.; }
         }
     }
 #endif // PS_GPU
@@ -1573,11 +2135,124 @@ void interpolateGrid_phaseSpace(DT &dt,
     }
 #endif // PS_GPU
 
+    // The CPU deposits the whole pass (no GPU, or the GPU declined or gave up): its mass accumulator is allocated
+    // here -- the density itself (the double build, or the float A/B grid), or the fixed-point mass grid starting
+    // from zero (2026-10-12, see massFx). Its unit must hold the pass's mass before the loop has seen a tet, so
+    // it comes from an upper bound found in one walk over the vertices (cheap next to the cells' walk): a kept tet's
+    // mass is its vertices' weight/degree shares under --ps-vertex-mass, and the degrees count every kept tet,
+    // so the kept tets hold at most the vertices' total weight; it is rho_bar V_lag otherwise, and the finite
+    // cells tile the Lagrangian hull of the vertices, so they hold at most rho_bar times its bounding box.
+    // The larger of the two: the bound is over by the padding (and the periodic copies), a factor of a few --
+    // a bit or two of the 2^61..2^62 units the total gets, where a cell of 2^-40 of it keeps 2^21. Deterministic
+    // (the vertex order is the triangulation's), so the grid is the same for every thread count.
+    if ( !metalDeposited && field.density && !massFxWanted )
+        quantities->density.assign( totalGrid, Real(0.) );   // the float (double build: double) accumulator
+    else if ( !metalDeposited && field.density )
+    {
+        double wSum = 0., lagLo[NO_DIM], lagHi[NO_DIM];
+        for (int d = 0; d < NO_DIM; ++d) { lagLo[d] = std::numeric_limits<double>::max(); lagHi[d] = -lagLo[d]; }
+        for (DT::Finite_vertices_iterator vit = dt.finite_vertices_begin(); vit != dt.finite_vertices_end(); ++vit)
+        {
+#ifdef TEST_PADDING
+            if ( vit->info().isDummy() ) continue;   // the filters drop every tet that touches one
+#endif
+            wSum += std::fabs( double(vit->info().weight()) );
+            for (int d = 0; d < NO_DIM; ++d)
+            {
+                double const p = double( vit->point()[d] );
+                lagLo[d] = std::min( lagLo[d], p );
+                lagHi[d] = std::max( lagHi[d], p );
+            }
+        }
+        double lagVolume = 1.;
+        for (int d = 0; d < NO_DIM; ++d) lagVolume *= std::max( 0., lagHi[d] - lagLo[d] );
+        double const bound = std::max( wSum, std::fabs( double(userOptions.averageDensity) ) * lagVolume );
+        float scale = 0.f;
+        if ( psMassFixedScale( bound, scale ) )
+        {
+            massFx.assign( totalGrid, 0 );
+            massFxScale = scale;
+            massFxOn = true;
+        }
+        else
+            quantities->density.assign( totalGrid, Real(0.) );   // (no vertices / no mass: the float grid)
+    }
+
+    // The CPU deposits the whole pass and the moment grids are to be fixed-point sums (2026-10-14, fxg): their units
+    // need bounds of what the loop will deposit, before it deposits. No cheap vertex walk bounds the gradients or the
+    // Eulerian volumes, so this is one extra walk over the cells with the deposit's own filter (psFilterCell, the
+    // inverse included) and its own tet mass, summing PSFixedBounds per tet (fxTetBound). The walk runs on the
+    // deposit's threads, each taking every nT-th block of 256 cells like the copy mode, and sums per BLOCK: the
+    // blocks are then added in their order, so the bounds -- and the units -- are the same at every thread count,
+    // and the same as a GPU deposit of the pass takes (its extraction sums the same blocks: gpuBoundPart). Under
+    // --ps-window every tet counts too, not only those that reach the window: the units are then the full run's,
+    // and a sampled window stays byte-identical to the same cells of the full run (tests/ps_window_check.sh) --
+    // at the price of the full run's resolution in the window's (small) cells, as for the mass. Cost: a filter
+    // pass (a fraction of the deposit, whose samples and exact tests dominate; a window's deposit also filters
+    // every tet). DW is not accumulated when the mass grid is this pass's own fixed-point words (it becomes the
+    // density after the loop).
+    if ( !metalDeposited && fxMomWanted )
+    {
+        bool any = false;
+        for (int g = 0; g < PS_FX_CPU_N; ++g) any = any || ( fxSel[g] && !( g == PS_FX_DW && massFxOn ) );
+        if ( any )
+        {
+            size_t const BLK = 256;
+            size_t const nBlocks = noTotalCells / BLK + 1;
+            std::vector<PSFixedBounds> part( nBlocks );
+            size_t const nT = size_t( std::max( 1, std::min( psDepositThreads(), int( std::min<size_t>( nBlocks, 1024 ) ) ) ) );
+            auto boundRun = [&](size_t const th)
+            {
+                size_t idx = 0;
+                for (auto it = PS_FINITE_CELLS_BEGIN; it != PS_FINITE_CELLS_END; ++it, ++idx)
+                {
+                    size_t const blk = idx / BLK;
+                    if ( blk % nT != th ) continue;
+                    Cell_handle cell = it;
+                    PSCellGeometry geo;
+                    if ( !psFilterCell(cell, userOptions, boxCoordinates, true, NULL, geo) ) continue;
+                    double tetMass;
+                    if ( psVertexMass ) tetMass = double( Real( psVertexShareMass(cell) ) );
+                    else
+                    {
+                        double Lag[NO_DIM][NO_DIM];
+                        for (int v = 0; v < NO_DIM; ++v)
+                            for (int i = 0; i < NO_DIM; ++i)
+                                Lag[v][i] = double(cell->vertex(v+1)->point()[i]) - double(cell->vertex(0)->point()[i]);
+                        tetMass = double( Real( double(userOptions.averageDensity) * std::fabs(determinant(Lag)) / factorial(NO_DIM) ) );
+                    }
+                    if ( !(tetMass > 0.) ) tetMass = 0.;   // (the deposit clamps a negative mass to 0)
+                    fxTetBound( cell, geo, tetMass, part[blk] );
+                }
+            };
+            {
+                std::vector<std::thread> pool;
+                for (size_t th = 1; th < nT; ++th) pool.emplace_back( boundRun, th );
+                boundRun( 0 );
+                for (std::thread &x : pool) x.join();
+            }
+            PSFixedBounds fb;
+            for (PSFixedBounds const &p : part) fb.add( p );   // in block order: thread-count independent
+            for (int g = 0; g < PS_FX_CPU_N; ++g)
+            {
+                if ( !fxSel[g] || ( g == PS_FX_DW && massFxOn ) ) continue;
+                float const scale = fxUnit( g, fb.B[g] );
+                if ( scale > 0.f ) fxStart( g, scale );
+                else fxEnsureReal( g );
+            }
+        }
+        else
+            for (int g = 0; g < PS_FX_CPU_N; ++g)
+                if ( !( g == PS_FX_DW && massFxOn ) ) fxEnsureReal( g );   // (nothing selected: a no-op)
+    }
+
     // The per-cell scatter. The CPU deposit runs on several threads (depositThreads, capped by the
     // memory its private accumulators may take): thread t takes every T-th block of 256 cells and
     // accumulates into its own copies, which are then summed in thread order -- deterministic for
     // a given thread count (DTFE_DEPOSIT_THREADS pins it). Thread 0 writes the real arrays. Serial
     // before: a small box on a fine grid (0.26M particles, 256^3) took 145 s where the GPU took 25.
+    // The single build's MASS grid is the exception (2026-10-12): one fixed-point grid for all threads
+    // (massFx), the same at every thread count.
     // GPU-deferred cells and --ps-caustic-cusps (CGAL's incident_cells marks visited cells, so it is
     // not re-entrant) stay on one thread. After a GPU deposit only the cells it deferred run here:
     // deferredOrd holds their finite-cell ordinals in the GPU extraction loop's order.
@@ -1589,6 +2264,8 @@ void interpolateGrid_phaseSpace(DT &dt,
         std::vector< Pvector<Real,noVelComp> > *dispVel = nullptr;
         std::vector<PSCausticClass::CausticMask> *orientBits = nullptr;
         std::vector<unsigned char> *subSampleMassFlag = nullptr, *flippedFlag = nullptr;
+        // the fixed-point mass grid (massFxOn; else null): ONE grid for every thread, never copied
+        int64_t *massFx = nullptr;
         // the private copies of threads > 0 (thread 0 points at the real arrays)
         Quantities ownQ;
         std::vector<int> ownStreamCount;
@@ -1601,8 +2278,12 @@ void interpolateGrid_phaseSpace(DT &dt,
         std::vector<Real>   insideRel, insideW;
         std::vector<double> exMom, exW;
         size_t nDegenerateInverse = 0, nReleased = 0;
+        // PS_MASS_AUDIT=1: the mass of the tets this thread deposits (once per tet) and of the shares it writes
+        double auditTets = 0., auditShares = 0.;
+        size_t auditNTets = 0;
     };
-    // bytes of one private copy of every accumulator this run uses
+    // bytes of one private copy of every accumulator this run uses (the density is EMPTY while the fixed-point
+    // mass grid stands in for it, and that one is shared, not copied)
     auto vecBytes = [](auto const &v) -> double { return double(v.size()) * double(sizeof(v[0])); };
     double accBytes = vecBytes(streamCount) + vecBytes(releasedMult) + vecBytes(exactMult) + vecBytes(dispWeight)
                     + vecBytes(massWeight)
@@ -1612,6 +2293,8 @@ void interpolateGrid_phaseSpace(DT &dt,
 #ifdef SCALAR
     accBytes += vecBytes(quantities->scalar) + vecBytes(quantities->scalar_gradient);
 #endif
+    // (the thread setup below -- slab binning, private copies -- is booked to the deposit it serves)
+    lap( metalDeposited ? PS_PH_COPY : PS_PH_SETUP );
     int nDepThreads = 1;
     // SLAB MODE. The private copies are what a fine grid cannot afford: on 1024^3 one copy of the
     // density+velocity accumulators is 24 GB, so the copy budget left ONE thread (245 s where four
@@ -1653,16 +2336,45 @@ void interpolateGrid_phaseSpace(DT &dt,
             nDepThreads = slabThreads;
         }
     }
+    // The GPU-DEFERRED tetrahedra (2026-10-11) run in slab mode too, on the deferred cells only. They were one
+    // thread walking every finite cell, and the new phase timers showed that thread outlasting the GPU deposit
+    // itself: 48 s against 27 s on 64^3 crossed waves at 256^3 (194154 deferred tets, each a large tet whose
+    // samples all take the exact double test). Slab mode writes the real arrays in the single-threaded loop's
+    // order, so the grids stay bit-identical to the one-thread loop (DTFE_DEPOSIT_SLABS=0 keeps that loop). A
+    // few hundred deferred tets are not worth the binning: below DEFERRED_SLAB_MIN the loop stays serial.
+    size_t const DEFERRED_SLAB_MIN = 2048;
+    if ( metalDeposited && deferredOrd.size() >= DEFERRED_SLAB_MIN && !userOptions.psCausticCusps
+         && subDims[0] >= 2 && noTotalCells < size_t(UINT32_MAX) )
+    {
+        char const *slabEnv = std::getenv("DTFE_DEPOSIT_SLABS");
+        int const slabThreads = std::max( 1, std::min( psDepositThreads(), int( deferredOrd.size() / 1024 ) + 1 ) );
+        if ( !( slabEnv && std::atoi(slabEnv) == 0 ) && slabThreads > 1 )
+        {
+            slabMode = true;
+            nDepThreads = slabThreads;
+        }
+    }
     if ( slabMode )
     {
         // binning: each tetrahedron's x range of global cells -- the bounding box of its Eulerian
         // vertices, minimum-image wrapped EXACTLY as psFilterCell wraps them (same Real operations, so the
-        // same positions), widened by two cells: a superset of every cell the deposit writes (its sample
-        // window adds one, the centroid fallback lies inside the box). No filter here: running it once
-        // more per tetrahedron cost a full extra pass (a third of the slab run on a clustered box, where
-        // a tet covers ~2 cells); the deposit filters, and counts a rejection in the tet's first slab.
-        slabTets.reserve( noTotalCells );
-        for (auto it = PS_FINITE_CELLS_BEGIN; it != PS_FINITE_CELLS_END; ++it) slabTets.push_back( it );
+        // same positions), widened by two cells: a superset of every cell the deposit writes (the sample
+        // window is the bounding box itself since 2026-10-11, the centroid fallback lies inside it). No
+        // filter here: running it once more per tetrahedron cost a full extra pass (a third of the slab
+        // run on a clustered box, where a tet covers ~2 cells); the deposit filters, and counts a
+        // rejection in the tet's first slab. After a GPU deposit: only the deferred cells, in loop order.
+        if ( metalDeposited )
+        {
+            slabTets.reserve( deferredOrd.size() );
+            size_t ord = 0, next = 0;
+            for (auto it = PS_FINITE_CELLS_BEGIN; it != PS_FINITE_CELLS_END && next < deferredOrd.size(); ++it, ++ord)
+                if ( size_t(deferredOrd[next]) == ord ) { slabTets.push_back( it ); ++next; }
+        }
+        else
+        {
+            slabTets.reserve( noTotalCells );
+            for (auto it = PS_FINITE_CELLS_BEGIN; it != PS_FINITE_CELLS_END; ++it) slabTets.push_back( it );
+        }
         size_t const nTets = slabTets.size();
         std::vector<int32_t> gLo( nTets ), gHi( nTets );         // its global x cells [gLo, gHi)
         std::vector<float> cost( nTets, 0.f );                    // its work: bbox cells + a per-tet overhead
@@ -1833,15 +2545,18 @@ void interpolateGrid_phaseSpace(DT &dt,
         size_t kept = 0;
         for (size_t i = 0; i < nTets; ++i) kept += mask[i] ? 1 : 0;
         if ( not userOptions.psSuppressGridStats or userOptions.verboseLevel >= 3 )   // (a partition's at 3)
-            message << MESSAGE::cBold() << "PS-DTFE:" << MESSAGE::cReset() << " CPU deposit in SLAB mode: "
-                    << nDepThreads << " threads over " << nSlabs << " slabs of the x axis (the accumulator copies "
-                    << "would not fit), " << ( kept ? double(entries) / double(kept) : 0. )
+            message << MESSAGE::cBold() << "PS-DTFE:" << MESSAGE::cReset()
+                    << ( metalDeposited ? " GPU-deferred tetrahedra on the CPU in SLAB mode: " : " CPU deposit in SLAB mode: " )
+                    << nDepThreads << " threads over " << nSlabs << " slabs of the x axis"
+                    << ( metalDeposited ? ", " : " (the accumulator copies would not fit), " )
+                    << ( kept ? double(entries) / double(kept) : 0. )
                     << " slabs per tetrahedron (mean extent " << meanExtent << " cells).\n" << MESSAGE::Flush;
     }
     std::vector<DepositThread> depT( static_cast<size_t>(nDepThreads) );
     for (int th = 0; th < nDepThreads; ++th)
     {
         DepositThread &D = depT[size_t(th)];
+        D.massFx = massFxOn ? massFx.data() : nullptr;   // shared by all (its own density copy stays EMPTY)
         if ( th == 0 or slabMode )      // slab mode: every thread writes its own cells of the real arrays
         {
             D.q = quantities; D.streamCount = &streamCount; D.releasedMult = &releasedMult;
@@ -1938,6 +2653,22 @@ void interpolateGrid_phaseSpace(DT &dt,
         bool const fDenL = field.density;
         bool const fVelL = field.velocity;
         bool const fScalL = field.scalar;
+        bool const auditL = massAudit;
+        // the fixed-point mass grid (null: the float density) and how this thread adds to it: atomically when
+        // the copy mode's threads share it, plainly when this thread owns its cells (one thread, or a slab)
+        int64_t *const massFxL = TH.massFx;
+        float const massFxScaleL = massFxScale;
+        bool const massFxAtomicL = nT > 1 && slab < 0;
+        // the moment grids' fixed-point words (2026-10-14, fxg; null: the grid's Real accumulator), ONE set for every
+        // thread, added exactly as the mass words are (the same atomic rule); each share is the float product the
+        // Real grid would have added. DW is not accumulated while the mass words are this pass's (massFxOn): it
+        // becomes the density after the loop.
+        int64_t *fxWL[PS_FX_CPU_N];
+        float fxSL[PS_FX_CPU_N];
+        for (int g = 0; g < PS_FX_CPU_N; ++g) { fxWL[g] = fxg[g].w.empty() ? nullptr : fxg[g].w.data(); fxSL[g] = fxg[g].scale; }
+        bool const dwOffL = massFxOn;
+        auto fxAddL = [&](int const g, size_t const at, Real const v)
+        { psAddMassFixed( fxWL[g], at, psFixedShare( double(v), fxSL[g] ), massFxAtomicL ); };
         // slab mode (slab >= 0): this slab's tetrahedra, in the loop's order, and the local x planes it
         // owns -- every write below skips the cells of other planes
         std::vector<uint32_t> const *slabList = slab >= 0 ? &slabTetLists[size_t(slab)] : nullptr;
@@ -2015,6 +2746,8 @@ void interpolateGrid_phaseSpace(DT &dt,
                 tetMass = psVertexMassL ? Real( psVertexShareMass(cell) )
                                        : Real( double(userOptions.averageDensity) * absDetLag / factorial(NO_DIM) );  // = rho_bar * V_lag
                 if (tetMass < Real(0.)) tetMass = Real(0.);
+                if ( auditL && ( !slabList || int(slabFirst[curOrd]) == slab ) )   // once per tet
+                { TH.auditTets += double(tetMass); ++TH.auditNTets; }
                 if ( psCausticsL )
                 {
                     PSCausticClass::TetDeformation const self = PSCausticClass::analyzeTet( geo.Ax, Lag );
@@ -2163,13 +2896,14 @@ void interpolateGrid_phaseSpace(DT &dt,
             {
                 iMin[d] = int(floor((eMin[d] - boxL[2*d]) / dxL[d]));
                 iMax[d] = int(floor((eMax[d] - boxL[2*d]) / dxL[d])) + 1;
-                // straddle is decided on the tet's own bbox, before the sample margin below: a tet whose
-                // bbox stays inside the grid has no sample beyond it (the margin alone flagged every tet
-                // within a cell of a region face, 14% of the TNG region's tets, all for nothing)
+                // straddle is decided on the tet's own bbox: a tet whose bbox stays inside the grid has
+                // no sample beyond it (a one-cell margin flagged every tet within a cell of a region
+                // face, 14% of the TNG region's tets, all for nothing)
                 if (!periodicL && (iMin[d] < 0 || iMax[d] > (int)nGridL[d])) straddle = true;
-                // sub-sample points can lie in edge cells; the exact deposit clips the bbox
-                // window directly (no sub-samples), so the expansion would only add empty clips
-                if (nSubL > 1 && !psExactL) { iMin[d] -= 1; iMax[d] += 1; }
+                // No one-cell sample margin (dropped 2026-10-11, as in the GPU kernels): a sub-sample
+                // sits at (k + 0.5)/nSub of its cell, >= 1/(2 nSub) inside it, so every sample in the
+                // bbox lies in a cell of this window and the ring's samples were all outside the tet
+                // (each one tested; 1.8-2.7x the window cells of real TNG50 z=0 tets).
                 iMinU[d] = iMin[d]; iMaxU[d] = iMax[d];
                 if (!periodicL)
                 {
@@ -2414,8 +3148,17 @@ void interpolateGrid_phaseSpace(DT &dt,
                         // moment weight: mass share, or the analytic intersection volume V_int
                         // (--ps-volume-weighted, the exact continuum volume share)
                         Real const momShare = psVolWeightedL ? Real( m[0] ) : massShare;
-                        if (fDenL) quantities->density[flatIdx] += massShare;
-                        if (needWeightL && !weightIsDensityL) massWeight[flatIdx] += momShare;
+                        if (fDenL)
+                        {
+                            if ( massFxL ) psAddMassFixed( massFxL, flatIdx, psMassFixedShare( double(massShare), massFxScaleL ), massFxAtomicL );
+                            else quantities->density[flatIdx] += massShare;
+                        }
+                        if (auditL) TH.auditShares += double(massShare);
+                        if (needWeightL && !weightIsDensityL)
+                        {
+                            if ( fxWL[PS_FX_MOMW] ) fxAddL( PS_FX_MOMW, flatIdx, momShare );
+                            else massWeight[flatIdx] += momShare;
+                        }
 
                         // exact mean of the linear velocity profile over this intersection
                         Pvector<Real,noVelComp> velBar;
@@ -2432,7 +3175,11 @@ void interpolateGrid_phaseSpace(DT &dt,
                                 velBar[j] = Real(vb);
                             }
                             if (haveVelL)
-                                quantities->velocity[flatIdx] += velBar * momShare;
+                            {
+                                if ( fxWL[PS_FX_MOM] )
+                                    for (size_t j = 0; j < noVelComp; ++j) fxAddL( PS_FX_MOM, flatIdx*noVelComp + j, velBar[j] * momShare );
+                                else quantities->velocity[flatIdx] += velBar * momShare;
+                            }
                         }
                         if (fVGradL)
                         {
@@ -2440,7 +3187,9 @@ void interpolateGrid_phaseSpace(DT &dt,
                             for (size_t j = 0; j < noVelComp; ++j)
                                 for (int i = 0; i < NO_DIM; ++i)
                                     grad[j*NO_DIM+i] = velGrad[i][j];
-                            quantities->velocity_gradient[flatIdx] += grad * momShare;
+                            if ( fxWL[PS_FX_GRAD] )
+                                for (size_t q = 0; q < noGradComp; ++q) fxAddL( PS_FX_GRAD, flatIdx*noGradComp + q, grad[q] * momShare );
+                            else quantities->velocity_gradient[flatIdx] += grad * momShare;
                         }
                         if (fVDispL)
                         {
@@ -2465,13 +3214,18 @@ void interpolateGrid_phaseSpace(DT &dt,
                                     for (int i = 0; i < NO_DIM; ++i)
                                         for (int k = 0; k < NO_DIM; ++k)
                                             gcg += double(velGrad[i][a]) * cov[i][k] * double(velGrad[k][b]);
-                                    quantities->velocity_dispersion[flatIdx][c2++] +=
-                                        massShare * ( velBar[a] * velBar[b] + Real(gcg) );
+                                    // (the Real grid's add keeps its one expression: a contracted multiply-add there)
+                                    if ( fxWL[PS_FX_M2] ) fxAddL( PS_FX_M2, flatIdx*noDispComp + c2, massShare * ( velBar[a] * velBar[b] + Real(gcg) ) );
+                                    else quantities->velocity_dispersion[flatIdx][c2] += massShare * ( velBar[a] * velBar[b] + Real(gcg) );
+                                    ++c2;
                                 }
                             if ( dispNeedsOwnWeightL )
                             {
-                                dispWeight[flatIdx] += massShare;
-                                dispVel[flatIdx]    += velBar * massShare;
+                                if ( fxWL[PS_FX_DW] ) fxAddL( PS_FX_DW, flatIdx, massShare );
+                                else if ( !dwOffL ) dispWeight[flatIdx] += massShare;
+                                if ( fxWL[PS_FX_DV] )
+                                    for (size_t j = 0; j < noVelComp; ++j) fxAddL( PS_FX_DV, flatIdx*noVelComp + j, velBar[j] * massShare );
+                                else dispVel[flatIdx] += velBar * massShare;
                             }
                         }
     #ifdef SCALAR
@@ -2489,7 +3243,9 @@ void interpolateGrid_phaseSpace(DT &dt,
                                     sb += double(sGrad[i][j]) * cen[i];
                                 scalarVal[j] = Real(sb);
                             }
-                            quantities->scalar[flatIdx] += scalarVal * momShare;
+                            if ( fxWL[PS_FX_SCAL] )
+                                for (size_t j = 0; j < noScalarComp; ++j) fxAddL( PS_FX_SCAL, flatIdx*noScalarComp + j, scalarVal[j] * momShare );
+                            else quantities->scalar[flatIdx] += scalarVal * momShare;
                         }
                         if (fSGradL)
                         {
@@ -2497,11 +3253,14 @@ void interpolateGrid_phaseSpace(DT &dt,
                             for (size_t j = 0; j < noScalarComp; ++j)
                                 for (int i = 0; i < NO_DIM; ++i)
                                     sgrad[j*NO_DIM+i] = sGrad[i][j];
-                            quantities->scalar_gradient[flatIdx] += sgrad * momShare;
+                            if ( fxWL[PS_FX_SG] )
+                                for (size_t q = 0; q < noScalarGradComp; ++q) fxAddL( PS_FX_SG, flatIdx*noScalarGradComp + q, sgrad[q] * momShare );
+                            else quantities->scalar_gradient[flatIdx] += sgrad * momShare;
                         }
     #endif
                         streamCount[flatIdx]++;   // raw tet-touch count -> '.tetTouch'
-                        exactMult[flatIdx] += Real( m[0] / double(cellVolumeL) );   // exact multiplicity share
+                        if ( fxWL[PS_FX_SV] ) fxAddL( PS_FX_SV, flatIdx, Real( m[0] / double(cellVolumeL) ) );
+                        else exactMult[flatIdx] += Real( m[0] / double(cellVolumeL) );   // exact multiplicity share
                         if ( psCausticsL )
                             orientBits[flatIdx] |= (PSCausticClass::CausticMask)((geo.cellDet > 0. ? 1 : 2) | tetCausticClass);
                     }
@@ -2734,9 +3493,19 @@ void interpolateGrid_phaseSpace(DT &dt,
                 // (--ps-volume-weighted, volume-average means); density always deposits MASS
                 Real const momShare = psVolWeightedL ? volumeShare : massShare;
 
-                // density accumulates MASS here; it is divided by the cell volume once at the end.
-                if (fDenL) quantities->density[flatIdx] += massShare;
-                if (needWeightL && !weightIsDensityL) massWeight[flatIdx] += momShare;
+                // density accumulates MASS here; it is divided by the cell volume once at the end. Single build:
+                // into the fixed-point grid (massFx), exact; converted to the float density once after the loop.
+                if (fDenL)
+                {
+                    if ( massFxL ) psAddMassFixed( massFxL, flatIdx, psMassFixedShare( double(massShare), massFxScaleL ), massFxAtomicL );
+                    else quantities->density[flatIdx] += massShare;
+                }
+                if (auditL) TH.auditShares += double(massShare);
+                if (needWeightL && !weightIsDensityL)
+                {
+                    if ( fxWL[PS_FX_MOMW] ) fxAddL( PS_FX_MOMW, flatIdx, momShare );
+                    else massWeight[flatIdx] += momShare;
+                }
 
                 // Weighted velocity moment sum(w_s v_s); also needed for the dispersion (uses <v>).
                 Pvector<Real,noVelComp> velVal;
@@ -2747,7 +3516,11 @@ void interpolateGrid_phaseSpace(DT &dt,
                         for (size_t j = 0; j < noVelComp; ++j)
                             velVal[j] += velGrad[i][j] * rel[i];
                     if (haveVelL)
-                        quantities->velocity[flatIdx] += velVal * momShare;
+                    {
+                        if ( fxWL[PS_FX_MOM] )
+                            for (size_t j = 0; j < noVelComp; ++j) fxAddL( PS_FX_MOM, flatIdx*noVelComp + j, velVal[j] * momShare );
+                        else quantities->velocity[flatIdx] += velVal * momShare;
+                    }
                 }
 
                 if (fVGradL)
@@ -2756,7 +3529,9 @@ void interpolateGrid_phaseSpace(DT &dt,
                     for (size_t j = 0; j < noVelComp; ++j)
                         for (int i = 0; i < NO_DIM; ++i)
                             grad[j*NO_DIM+i] = velGrad[i][j];
-                    quantities->velocity_gradient[flatIdx] += grad * momShare;
+                    if ( fxWL[PS_FX_GRAD] )
+                        for (size_t q = 0; q < noGradComp; ++q) fxAddL( PS_FX_GRAD, flatIdx*noGradComp + q, grad[q] * momShare );
+                    else quantities->velocity_gradient[flatIdx] += grad * momShare;
                 }
 
                 // velocity dispersion: weighted second moment sum(w_s v_i v_j) (upper triangle).
@@ -2765,12 +3540,18 @@ void interpolateGrid_phaseSpace(DT &dt,
                 {
                     size_t c = 0;
                     for (int i = 0; i < NO_DIM; ++i)
-                        for (int j = i; j < NO_DIM; ++j)
-                            quantities->velocity_dispersion[flatIdx][c++] += massShare * velVal[i] * velVal[j];
+                        for (int j = i; j < NO_DIM; ++j, ++c)
+                        {
+                            if ( fxWL[PS_FX_M2] ) fxAddL( PS_FX_M2, flatIdx*noDispComp + c, massShare * velVal[i] * velVal[j] );
+                            else quantities->velocity_dispersion[flatIdx][c] += massShare * velVal[i] * velVal[j];
+                        }
                     if ( dispNeedsOwnWeightL )
                     {
-                        dispWeight[flatIdx] += massShare;
-                        dispVel[flatIdx]    += velVal * massShare;
+                        if ( fxWL[PS_FX_DW] ) fxAddL( PS_FX_DW, flatIdx, massShare );
+                        else if ( !dwOffL ) dispWeight[flatIdx] += massShare;
+                        if ( fxWL[PS_FX_DV] )
+                            for (size_t j = 0; j < noVelComp; ++j) fxAddL( PS_FX_DV, flatIdx*noVelComp + j, velVal[j] * massShare );
+                        else dispVel[flatIdx] += velVal * massShare;
                     }
                 }
 
@@ -2781,7 +3562,9 @@ void interpolateGrid_phaseSpace(DT &dt,
                     for (int i = 0; i < NO_DIM; ++i)
                         for (size_t j = 0; j < noScalarComp; ++j)
                             scalarVal[j] += sGrad[i][j] * rel[i];
-                    quantities->scalar[flatIdx] += scalarVal * momShare;
+                    if ( fxWL[PS_FX_SCAL] )
+                        for (size_t j = 0; j < noScalarComp; ++j) fxAddL( PS_FX_SCAL, flatIdx*noScalarComp + j, scalarVal[j] * momShare );
+                    else quantities->scalar[flatIdx] += scalarVal * momShare;
                 }
                 if (fSGradL)
                 {
@@ -2789,7 +3572,9 @@ void interpolateGrid_phaseSpace(DT &dt,
                     for (size_t j = 0; j < noScalarComp; ++j)
                         for (int i = 0; i < NO_DIM; ++i)
                             sgrad[j*NO_DIM+i] = sGrad[i][j];
-                    quantities->scalar_gradient[flatIdx] += sgrad * momShare;
+                    if ( fxWL[PS_FX_SG] )
+                        for (size_t q = 0; q < noScalarGradComp; ++q) fxAddL( PS_FX_SG, flatIdx*noScalarGradComp + q, sgrad[q] * momShare );
+                    else quantities->scalar_gradient[flatIdx] += sgrad * momShare;
                 }
     #endif
 
@@ -2801,7 +3586,10 @@ void interpolateGrid_phaseSpace(DT &dt,
                 if ( psExactL )
                     streamCount[flatIdx]++;
                 else if ( released )
-                    releasedMult[flatIdx] += Real( geo.cellAbsDet / factorial(NO_DIM) / double(cellVolumeL) );
+                {
+                    if ( fxWL[PS_FX_RM] ) fxAddL( PS_FX_RM, flatIdx, Real( geo.cellAbsDet / factorial(NO_DIM) / double(cellVolumeL) ) );
+                    else releasedMult[flatIdx] += Real( geo.cellAbsDet / factorial(NO_DIM) / double(cellVolumeL) );
+                }
                 else if ( !useCentroid )
                     streamCount[flatIdx]++;
                 // --ps-exact-deposit fall-through (empty clip window, released or sub-resolution
@@ -2809,8 +3597,11 @@ void interpolateGrid_phaseSpace(DT &dt,
                 // carries V_tet/nInside -- for the monolithic centroid fallback (nInside==1) that
                 // is exactly V_tet/V_cell, the same volume fraction the exact path deposits.
                 if ( psExactL )
-                    exactMult[flatIdx] += Real( geo.cellAbsDet / factorial(NO_DIM) / double(cellVolumeL) )
-                                          / Real(nShare);
+                {
+                    if ( fxWL[PS_FX_SV] ) fxAddL( PS_FX_SV, flatIdx, Real( geo.cellAbsDet / factorial(NO_DIM) / double(cellVolumeL) ) / Real(nShare) );
+                    else exactMult[flatIdx] += Real( geo.cellAbsDet / factorial(NO_DIM) / double(cellVolumeL) )
+                                               / Real(nShare);
+                }
                 if ( psCausticsL )
                     // fold parity (sign of det(Ax)) plus this tetrahedron's stratification bits
                     orientBits[flatIdx] |= (PSCausticClass::CausticMask)((geo.cellDet > 0. ? 1 : 2) | tetCausticClass);
@@ -2819,10 +3610,11 @@ void interpolateGrid_phaseSpace(DT &dt,
         }   // end cell loop
     };
 
+    double const auditGridBefore = ( massAudit && field.density ) ? gridSum() : 0.;   // the CPU loop's starting grid
     auto const tCpuLoop0 = std::chrono::steady_clock::now();
-    if ( metalDeposited && !deferredOrd.empty() )
+    if ( metalDeposited && !deferredOrd.empty() && !slabMode )
         depositLoop( depT[0], 0, 1, true, -1 );
-    else if ( !metalDeposited )
+    else if ( !metalDeposited || slabMode )   // (after a GPU deposit, slab mode means its deferred cells)
     {
         size_t const nT = size_t(nDepThreads);
         std::vector<std::exception_ptr> errors( nT );
@@ -2887,7 +3679,10 @@ void interpolateGrid_phaseSpace(DT &dt,
     {
         nDegenerateInverse += D.nDegenerateInverse;
         nReleased += D.nReleased;
+        audit.cpuTets += D.auditTets; audit.cpuShares += D.auditShares; audit.nCpuTets += D.auditNTets;
     }
+    lap( metalDeposited ? PS_PH_DEFERRED : PS_PH_CPU );
+    if ( massAudit && field.density ) audit.cpuGain = gridSum() - auditGridBefore;
     std::vector<DepositThread>().swap( depT );   // the private copies
     std::vector<Cell_handle>().swap( slabTets );
     std::vector< std::vector<uint32_t> >().swap( slabTetLists );
@@ -2895,7 +3690,8 @@ void interpolateGrid_phaseSpace(DT &dt,
     if ( metalDeposited && !deferredOrd.empty() && not userOptions.psSuppressGridStats )
         message << MESSAGE::cBold() << "PS-DTFE:" << MESSAGE::cReset() << " deposited the "
                 << MESSAGE::cMagenta() << deferredOrd.size() << MESSAGE::cReset() << " GPU-deferred tetrahedra on the CPU in "
-                << std::chrono::duration<double>(std::chrono::steady_clock::now() - tCpuLoop0).count() << " s.\n" << MESSAGE::Flush;
+                << std::chrono::duration<double>(std::chrono::steady_clock::now() - tCpuLoop0).count() << " s ("
+                << nDepThreads << ( nDepThreads == 1 ? " thread" : " threads" ) << ").\n" << MESSAGE::Flush;
 
     // Whichever deposit ran (GPU success above skipped the CPU loop; a GPU FAILURE fell back
     // to the CPU loop, which needed the triangulation), its last read of dt is behind us.
@@ -2904,6 +3700,31 @@ void interpolateGrid_phaseSpace(DT &dt,
     // partition scope end. ~650 B/vertex, ~5 GB per concurrent partition at production scale.
     if ( mayClearDT )
         dt.clear();
+
+    // The fixed-point mass grid becomes the float density, once (2026-10-12, see massFx): every share is in it,
+    // and the normalizations below read the density (the moments' weight under weightIsDensity, then rho/rho_bar).
+    // Each cell is rounded once, to nearest -- the same float the GPU host's decode gave a cell the CPU never
+    // touched. Here, after the private copies, the slab lists and (on the final call) the triangulation are freed,
+    // the 4 B float grid and the 8 B words briefly coexist.
+    // The moment grids' words become their Real grids the same way, grid by grid (2026-10-14, fxg): each cell
+    // component rounded once, the words freed before the next grid is converted.
+    for (int g = 0; g < PS_FX_CPU_N; ++g) fxToReal( g );
+    if ( massFxOn )
+    {
+        quantities->density.assign( totalGrid, Real(0.) );
+        for (size_t i = 0; i < totalGrid; ++i)
+            quantities->density[i] = Real( psMassFixedMass( massFx[i], massFxScale ) );
+        std::vector<int64_t>().swap( massFx );
+        massFxOn = false;
+        // --ps-volume-weighted: the dispersion's own mass normalizer (dispWeight) sums the very shares this grid
+        // sums, at the same sites (the GPU's dispw likewise), so it takes the exact sums too. The default run's
+        // dispersion is normalized by this grid (weightIsDensity), and the volume-weighted one then stays the
+        // same mass-weighted arithmetic bit for bit (tests/ps_volume_weighted_check.sh B) -- with dispWeight's
+        // float sum the two parted at the last bit once the mass grid became exact.
+        // (2026-10-14: dispWeight is not even accumulated then -- it may be EMPTY here: dwOffL in the loop)
+        if ( dispNeedsOwnWeight )
+            dispWeight = quantities->density;
+    }
 
     if ( not userOptions.psSuppressGridStats )
     {
@@ -2996,19 +3817,49 @@ void interpolateGrid_phaseSpace(DT &dt,
     // by the grid-cell volume, then normalize by averageDensity so the written field is rho/rho_bar
     // (mean-normalized "density contrast + 1", the SAME convention as standard DTFE).
     // Mass conservation makes the box mean 1 for any nSub, up to the accumulators (2026-10-08: this
-    // said "exactly 1"; TNG50-3-Dark z=0 on the GPU gave 0.99941). The Metal deposit's mass grid is an
-    // exact fixed-point sum and the double build's sums are good to ~1e-15, but a FLOAT accumulator -- the
-    // CPU deposit of the single-precision build, PS_METAL_FLOAT_MASS=1 / PS_GPU_FLOAT_MASS=1 (the CUDA/HIP port has
-    // the fixed-point grid too since 2026-10-11) -- drops every
-    // share below half an ulp of a busy cell's running sum, always downward (~0.1% at 1e6 deposits into one
-    // cell, ~2% at 1e7). Tetrahedra the cell filters drop take their mass along in every build.
+    // said "exactly 1"; TNG50-3-Dark z=0 on the GPU gave 0.99941). The single build's mass grid is an exact
+    // fixed-point sum on the GPU and, since 2026-10-12, on the CPU too (the GPU-deferred tets, the released
+    // ones and a whole CPU deposit: massFx above), rounded once per cell to float; the double build's sums are
+    // good to ~1e-15. A FLOAT accumulator -- PS_METAL_FLOAT_MASS=1 / PS_GPU_FLOAT_MASS=1, kept for comparison --
+    // drops every share below half an ulp of a busy cell's running sum, always downward (~0.1% at 1e6
+    // deposits into one cell, ~2% at 1e7). Tetrahedra the cell filters drop take their mass along in every build.
     // Stream count is averaged over the nSub^NO_DIM sub-samples below.
+    double const auditGridPre = ( massAudit && field.density ) ? gridSum() : -1.;
     if ( field.density )
     {
         Real const invRhoBar = userOptions.averageDensity > Real(0.)
                              ? Real(1.) / userOptions.averageDensity : Real(1.);
         for (size_t i = 0; i < totalGrid; ++i)
             quantities->density[i] *= invRhoBar / cellVolume;
+    }
+    if ( massAudit )
+    {   // (g) the pass's grid in mass units, before and after the rho/rho_bar conversion; the line (ps_mass_audit.h)
+        double const gridPost = field.density ? gridSum() * double(cellVolume) * double(userOptions.averageDensity) : -1.;
+        auto rel = [](double x, double ref) { return ref != 0. ? x / ref - 1. : 0.; };
+        std::ostringstream s;
+        s << std::setprecision(12) << "PS mass audit: partition ";
+        if ( PSMassAudit::partition >= 0 ) s << PSMassAudit::partition; else s << "- (one domain)";
+        s << " (nSub " << nSub << (&field == &userOptions.aField ? ", averaged" : ", unaveraged") << " pass):"
+          << " (a) owned " << audit.owned << " [" << audit.nOwned << " vertices]"
+          << " (b) tets " << audit.tets << " [" << audit.nTets << "]"
+          << " (c) deg0 " << audit.deg0 << " [" << audit.nDeg0 << " vertices; kept tets touching one " << audit.nTetsDeg0 << "]"
+          << " (d) dropped " << audit.nDropped << " owned tets (rho_bar V_lag " << audit.dropped << "), after the filter "
+          << audit.after << " [" << audit.nAfter << "]";
+        if ( audit.gpuHanded >= 0. )
+            s << " (e) gpu handed " << audit.gpuHanded << " deferred " << audit.gpuDeferred << " fixed-point " << audit.gpuFixed
+              << " (handed-deferred-fixed " << ( audit.gpuHanded - audit.gpuDeferred - audit.gpuFixed ) << ")"
+              << " float grid " << audit.gpuFloat << " (rel " << rel(audit.gpuFloat, audit.gpuFixed) << ")"
+              << " released " << audit.released << " gained " << audit.releasedGain;
+        s << " (f) cpu tets " << audit.cpuTets << " [" << audit.nCpuTets << "] shares " << audit.cpuShares
+          << " gained " << audit.cpuGain << " (shares/tets-1 " << rel(audit.cpuShares, audit.cpuTets)
+          << ", gained/shares-1 " << rel(audit.cpuGain, audit.cpuShares) << ")"
+          << " (g) grid " << auditGridPre << " post " << gridPost << " (grid/tets-1 " << rel(auditGridPre, audit.tets)
+          << ", post/grid-1 " << rel(gridPost, auditGridPre) << ", grid/owned-1 " << rel(auditGridPre, audit.owned) << ")\n";
+        std::fprintf( stderr, "%s", s.str().c_str() );
+        std::lock_guard<std::mutex> lock( PSMassAudit::mutex );
+        PSMassAudit::Totals &T = PSMassAudit::totals[&field == &userOptions.aField ? 1 : 0];
+        T.owned += audit.owned; T.tets += audit.tets; T.deg0 += audit.deg0; T.dropped += audit.dropped;
+        T.gridPre += auditGridPre; T.gridPost += gridPost; ++T.passes;
     }
 
     // multi-stream / coverage statistics. Suppressed in the partition path (each partition covers
@@ -3088,11 +3939,32 @@ void interpolateGrid_phaseSpace(DT &dt,
 
     // Export the caustic orientation bits (0..3, exact in float); OR-merged across partitions
     // and binarized to the 0/1 fold flag once in DTFE() after the merge.
+    /* 2026-10-13 (audit finding 3): the parity bit 1 (det < 0) is the GEOMETRIC overlap flag.
+       orientBits gets its bits only where a tetrahedron DEPOSITS A SAMPLE, so a fold thinner than
+       the sub-sample spacing -- every young wall, and the edge of every older one -- set no
+       negative-parity bit in the cells it crosses: '.caustic' marked 21.0% of the cells of
+       TNG100-3-Dark z=1 where folded tetrahedra overlap 33.6% (about 2x low at z >= 3), and the
+       fraction depended on nSub, although the '--ps-caustics' help, ps_caustic_class.h and
+       dtfelib promise "a det < 0 tetrahedron OVERLAPS the cell". flippedFlag is exactly that
+       statement: the separating-axis tet-box test (TetBoxSAT; 2D: the triangle clip) of every
+       folded tetrahedron, marked in both deposit paths (the host loop marks the GPU's tets) and
+       still RAW here -- Quantities::finalizeHiddenStreams clears it in multi-stream cells only
+       after the merge, and only in '.hidden_streams'. OR-ing it in keeps the export partition-,
+       thread- and backend-invariant (OR of two OR-merged geometric masks).
+       Only bit 1 comes from the geometry. Bit 0 (det > 0) stays per sample: in a periodic box the
+       map has degree 1, so every point of the cell lies in a positive tetrahedron and any sample
+       of the cell sets it -- '(bits & 3) == 3' is therefore the geometric fold flag in every cell
+       a sample reached. The collapse and indicator bits 2..8 are per sample too, NOT geometric:
+       a fold cell whose samples all fell outside the folded tetrahedra carries the parity of the
+       fold but only the k of the streams its samples saw (typically k = 0) -- nSub-limited, as
+       the README notes. */
     if ( psCaustics )
     {
         quantities->caustic_bits.resize(totalGrid);
         for (size_t i = 0; i < totalGrid; ++i)
-            quantities->caustic_bits[i] = Real(orientBits[i]);
+            quantities->caustic_bits[i] = Real( orientBits[i]
+                | ( flippedFlag[i] ? (PSCausticClass::CausticMask)PSCausticClass::BIT_PARITY_NEG
+                                   : (PSCausticClass::CausticMask)0 ) );
     }
 
     // Record the sub-grid box so the caller (addFromSubgrid) can map results back into the full shared grid.
@@ -3100,6 +3972,34 @@ void interpolateGrid_phaseSpace(DT &dt,
     {
         quantities->ps_subOrigin[d] = subOrigin[d];
         quantities->ps_subDims[d]   = subDims[d];
+    }
+
+    // this pass's phase split and the run's totals so far (psPhaseTotalUs)
+    lap( PS_PH_NORM );
+    size_t const nDeferredHere = metalDeposited ? deferredOrd.size() : 0;
+    for (int k = 0; k < PS_PH_N; ++k) psPhaseTotalUs[k] += (long long)( phaseSec[k] * 1e6 );
+    psPhaseTotalDeferred += (long long)nDeferredHere;
+    int const nPasses = ++psPhasePasses;
+    {
+        std::ostringstream line, total;
+        line << std::fixed << std::setprecision(2);
+        total << std::fixed << std::setprecision(1);
+        bool first = true;
+        for (int k = 0; k < PS_PH_N; ++k)
+        {
+            double const tot = double( psPhaseTotalUs[k].load() ) * 1e-6;
+            if ( phaseSec[k] <= 0. && tot <= 0. ) continue;   // a phase this build/run never enters
+            line  << (first ? "" : ", ") << psPhaseName[k] << " " << phaseSec[k] << " s";
+            total << (first ? "" : ", ") << psPhaseName[k] << " " << tot << " s";
+            if ( k == PS_PH_DEFERRED )
+            {
+                line  << " (" << nDeferredHere << " tets)";
+                total << " (" << psPhaseTotalDeferred.load() << " tets)";
+            }
+            first = false;
+        }
+        message << MESSAGE::cGreen() << "  >>> field interpolation phases: " << line.str() << "\n"
+                << "  >>> ... run total over " << nPasses << " pass(es): " << total.str() << MESSAGE::cReset() << "\n" << MESSAGE::Flush;
     }
 }
 

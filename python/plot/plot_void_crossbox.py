@@ -57,8 +57,9 @@ from dtfelib.cli import DATA_ROOT
 from dtfelib import figures as style
 
 DEFAULT_SIMS = ("TNG50-3-Dark", "TNG100-3-Dark", "TNG300-3-Dark")
-DEFAULT_SIGMA_MPC = 2.1625            # 10.0002 cells of TNG100-3-Dark (110.7 Mpc / 512; production 10 cells = 2.16245
-                                      # Mpc): the 2026-10-07 comparison's, kept so its results stay comparable
+DEFAULT_SIGMA_MPC = config.CROSSBOX_SMOOTHING_MPC   # 2.1625 = 10.0002 cells of TNG100-3-Dark (110.7 Mpc / 512;
+                                      # production 10 cells = 2.16245 Mpc): the 2026-10-07 comparison's, kept so its
+                                      # results stay comparable; from config since 2026-10-11 (G2: one number everywhere)
 DEFAULT_Z = (0.0, 0.5, 1.0)
 DEFAULT_RV_RANGE = (2.5, 5.0)         # the common R_v range of the stacks, in smoothing lengths (profiles' upper bins)
 Z_TOLERANCE = 0.05                    # a box's snapshot counts as 'at z' within this

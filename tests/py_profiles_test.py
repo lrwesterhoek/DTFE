@@ -84,6 +84,35 @@ def t_interior_fraction():
     assert abs(f[1, 1] - (1 - 1 / 123.0)) < 1e-12, f[1, 1]       # 123 cell centres within 3 cells; (0,0,0) on the sphere
 
 
+def t_single_converted_once():
+    """2026-10-11: profile_grids converts the single-stream mask to float32 ONCE, not per radial bin (a 512 MB copy
+    of a 512^3 mask per bin), and its 'single' profile is the per-bin conversion's, bit for bit."""
+    from dtfelib import profiles
+    n = 32
+    rng = np.random.default_rng(8)
+    grids = {"density": rng.random((n, n, n)).astype(np.float32) + 0.1, "velocity": None,
+             "single": rng.random((n, n, n)) < 0.6}
+    centers, r_eff = rng.random((7, 3)), rng.uniform(1.5, 5.0, 7)
+    seen, real = [], profiles.shell_means
+    def spy(grid, *a, **k):
+        if k.get("mode") == "ngp":
+            seen.append(grid)
+        return real(grid, *a, **k)
+    profiles.shell_means = spy
+    try:
+        got = profiles.profile_grids(grids, centers, r_eff)
+    finally:
+        profiles.shell_means = real
+    nb = len(profiles.DEFAULT_BINS)
+    assert len(seen) == nb and all(g is seen[0] for g in seen) and seen[0].dtype == np.float32, \
+        f"{len({id(g) for g in seen})} single-stream copies for {nb} bins"
+    dirs = profiles.fibonacci_sphere(got["m"])
+    c, r = centers[got["index"]], r_eff[got["index"]]
+    want = np.stack([real(grids["single"].astype(np.float32), c, x * r, dirs, mode="ngp")
+                     for x in profiles.DEFAULT_BINS], axis=1)
+    assert np.array_equal(got["single"], want, equal_nan=True)
+
+
 def t_hsw_fit():
     """A known HSW profile with noise recovered within 4 sigma; too few shells is ok=False, never an exception."""
     from dtfelib import profiles
@@ -339,6 +368,7 @@ def main():
     print("=" * 60)
     print("synthetic:")
     check("interior_single_fraction: exact periodic count at 0.5 and 1 R, all-single = 1, NaN radius, a cell on the sphere", t_interior_fraction)
+    check("2026-10-11: profile_grids converts the single-stream mask once, not per bin; same profile bit for bit", t_single_converted_once)
     check("fit_hsw recovers a known HSW 2014 profile within 4 sigma; too few shells ok=False; stack_scatter = std/sqrt(n); fit_stack's min_count", t_hsw_fit)
     check("panel (b) units: linear_v_r(R = 1) / (a H) = -(1/3) f x Delta(<x) at z = 0, 1, 5", t_linear_normalised)
     check("r_v_by_definition: crossing, the fallback said once, the C3 key read when catalog has it", t_definition_fallback)

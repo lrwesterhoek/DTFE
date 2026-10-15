@@ -37,9 +37,22 @@
 #     the concurrency the run will use); DTFE_AUTO_PTS_N sizes a plane that does not exist yet.
 #  J) the machine's free memory over a plan: an explicit budget capped by it, the partition memory gate.
 #  M) the GPU deposit's host snapshot (ps_metal_host.cc GpuSnapshot) is in the prediction, ONCE (the deposits serialise).
+#  N) the '--sample-points' stream estimate is made on the points' own slab (2026-10-11): on a 1-D pancake
+#     (80^3, A k = 1.8; the 3-stream band covers ~16% of the box, box mean 1.33) a plane outside the band
+#     estimates ~1 stream/point and one through it ~3 (both measured exactly in '.pts_streams'), each within
+#     10%; the box-wide estimate (DTFE_AUTO_PTS_BOXMEAN=1, the old rule) gives ~1.3 for both. The TNG50-3-Dark
+#     z=0 z2048 plane budgeted 34.95 streams/point (19.3 GB) from the box mean 17.98 while its points averaged 5.38.
+#  O) '--parallel-triangulation' (TBB builds) is costed (2026-10-11): its insert copies (+203 B per vertex in flight,
+#     measured) raise the predicted peak; they were missing from the batch model. SKIP without TBB.
+#  P) the tessellation model pads a partition by the binary's DEFAULT Lagrangian padding (2026-10-12: '--ps-lag-padding
+#     8' spacings; before, the Eulerian '--padding' fraction floored at 0.3 of a partition): the default predicts what
+#     an explicit '--ps-lag-padding 8' does, and '--ps-lag-padding 0' (the old rule) predicts something else.
 #  K) partitions in flight never outnumber the threads (2026-10-08): a hand-set split with the
 #     concurrency left to the tuner, and '--max-concurrent 0' ("all threads"), each started every
 #     partition at once (64 threads for '--partition 4 4 4').
+#  R) STANDARD DTFE '--region' / '--regionMpc' (2026-10-13): the tuner plans the region's particles, not the whole
+#     snapshot's (the launcher's exact zoom of a 20^3-cell TNG50 region was split 3x3x3 with 10 threads: ~21 min
+#     instead of ~1). Uses the standard binary (built here too); SKIP when it is not built.
 #
 # The 2^32 GPU sub-grid guard (ps_interpolation.cc) is NOT exercised here: it needs a real
 # >4.29e9-cell partition sub-grid, i.e. >32 GB of buffers. It mirrors the validated guard in
@@ -73,6 +86,8 @@ if [ "${1:-}" != "--no-build" ] && ! precision_double; then
     echo ">> building PS-DTFE ..."
     BUILD_MODE="$(cat o_ps/.build_mode 2>/dev/null || true)"
     make PS-DTFE ${BUILD_MODE:+"$BUILD_MODE"} >/dev/null
+    echo ">> building DTFE (section R) ..."
+    make DTFE $(cat o/.build_mode 2>/dev/null || true) >/dev/null
 fi
 [ -x "${BIN}" ] || { echo "FAIL: ${BIN} not built"; exit 1; }
 
@@ -257,8 +272,10 @@ check "G the estimate stays physical: 0 < ${sg:-none} < 20 streams/point" \
 echo ">> H: time-aware split for small sets (speed, not memory)"
 GPU_H=0; grep -Eq "METAL=1|CUDA=1|HIP=1" o_ps/.build_mode 2>/dev/null && GPU_H=1   # (-E: GNU and BSD grep alike)
 COMMON_H=(--input 105 --MpcUnit 1 --verbose 2 --auto-tune-report)
-# H1: a slice of the 64^3 box (4.2M points, 16^3 grid) is triangulation-bound -> 2^3 partitions
-env DTFE_RAM_GB=64 DTFE_AUTO_PTS_N=4194304 "${BIN}" "${SNAP}" "${TMP}/at_h1" --grid 16 --field density --periodic \
+# H1: a slice of the 64^3 box (4.2M points, 16^3 grid) is triangulation-bound -> 2^3 partitions. The split pays
+# only with enough threads (on 4 it rightly stays one domain: CI's runner failed this, 2026-10-11), so the thread
+# count is pinned to a 10-core machine's: the report path only plans, it runs nothing
+env OMP_NUM_THREADS=10 DTFE_RAM_GB=64 DTFE_AUTO_PTS_N=4194304 "${BIN}" "${SNAP}" "${TMP}/at_h1" --grid 16 --field density --periodic \
     "${COMMON_H[@]}" > "${TMP}/at_h1.log" 2>&1
 agrep "H1 a triangulation-bound small run is split for speed" "^AUTO-TUNE-REPORT partition=[23] mc=[2-9]|^AUTO-TUNE-REPORT partition=[23] mc=[1-9][0-9]" "${TMP}/at_h1.log"
 # H2: a 256^3 sampled grid is deposit-bound -> one domain, and its predicted peak is sane
@@ -365,7 +382,7 @@ for f in ("a_den", "a_streams"):
     b = np.fromfile(f"{t}/at_j.{f}", real)
     assert a.size == b.size and a.size > 0, f
     worst = max(worst, float(np.max(np.abs(a - b) / np.maximum(np.abs(a), 1e-30))))
-print(f"   .... gated vs free: max rel {worst:.1e} (completion-order float sums)")
+print(f"   .... gated vs free: max rel {worst:.1e} (the merge's float sums; index order since 2026-10-14)")
 sys.exit(0 if worst < 1e-5 else 1)
 PYEOF
     then check "J6 ... and its grids equal the ungated run's to float rounding" 1
@@ -439,13 +456,116 @@ if grep -q "GPU (--ps-gpu)" "${TMP}/at_m2.log"; then
     gb() { sed -n "s/^AUTO-TUNE-REPORT .*$1=\([0-9.]*\) .*/\1/p" "$2" | head -1; }
     p2=$(gb predicted_gb "${TMP}/at_m2.log"); p3=$(gb predicted_gb "${TMP}/at_m3.log"); f2=$(gb fixed_gb "${TMP}/at_m2.log")
     # expected: (24 B of selected grids + 4 B of the 64-bit mass) x the (256/2 + 40)^3 sub-grid cells = 0.133 GB
+    # (+ the per-tet masses; measured 0.114 GB) -- and since 2026-10-14 the velocity moment and its weight (16 B)
+    # are 64-bit words, 16 B more: 0.209 GB (measured 0.190 GB). PS_METAL_FLOAT_MOMENTS=1 keeps the floats.
     sm=$(awk -v a="${p2:-0}" -v b="${p3:-0}" -v f="${f2:-0}" 'BEGIN{printf "%.3f", a - f - 2*(b - a)}')
-    check "M the GPU snapshot is counted once: ${sm} GB beyond 2 partitions (expected ~0.13 GB; predicted ${p2:-none} / ${p3:-none} GB at 2 / 3 in flight)" \
-          "$(awk -v s="${sm}" 'BEGIN{exit !(s >= 0.10 && s <= 0.17)}' && echo 1 || echo 0)"
+    if [ "${PS_METAL_FLOAT_MOMENTS:-0}" != "0" ] || [ "${PS_GPU_FLOAT_MOMENTS:-0}" != "0" ]; then lo=0.10; hi=0.17; ex=0.13
+    else lo=0.16; hi=0.25; ex=0.21; fi
+    check "M the GPU snapshot is counted once: ${sm} GB beyond 2 partitions (expected ~${ex} GB; predicted ${p2:-none} / ${p3:-none} GB at 2 / 3 in flight)" \
+          "$(awk -v s="${sm}" -v lo="${lo}" -v hi="${hi}" 'BEGIN{exit !(s >= lo && s <= hi)}' && echo 1 || echo 0)"
 else
     echo "   SKIP  M (this build has no GPU backend)"
 fi
 rm -f "${TMP}"/at_m*
+
+# ---------- (N) the stream estimate on the sample points' slab ----------
+echo ">> N: the sample-point stream estimate on the plane's own slab"
+SNAP_N="${TMP}/at_input_pancake80.hdf5"
+"${PY}" "${SCRIPT_DIR}/generate_ps_test_data.py" --out "${SNAP_N}" --n 80 --box "${BOX}" \
+    --amplitude-factor 1.8 --jitter-frac 0.02 --seed 7 >/dev/null
+"${PY}" - "${TMP}" "${BOX}" <<'PYEOF'
+import numpy as np, sys
+tmp, box = sys.argv[1], float(sys.argv[2])
+u = (np.arange(64) + 0.5) * box / 64
+Y, Z = np.meshgrid(u, u, indexing="ij")
+for name, x in (("far", 0.1 * box), ("fold", 0.5 * box)):    # outside / through the 3-stream band
+    np.stack([np.full(Y.size, x), Y.ravel(), Z.ravel()], 1).astype(np.float64).tofile(f"{tmp}/at_n_{name}.bin")
+PYEOF
+est_n() {  # $1 = plane, $2 = DTFE_AUTO_PTS_BOXMEAN
+    env DTFE_RAM_GB=64 DTFE_AUTO_PTS_BOXMEAN="$2" "${BIN}" "${SNAP_N}" "${TMP}/at_n" --grid 32 --periodic --input 105 \
+        --MpcUnit 1 --field density_a --sample-points "${TMP}/at_n_$1.bin" --auto-tune-report 2>/dev/null \
+        | sed -n 's/^AUTO-TUNE-REPORT .* streams_est=\([0-9.]*\) .*/\1/p'
+}
+nf=$(est_n far 0); nd=$(est_n fold 0); nb=$(est_n far 1)
+check "N a plane outside the fold estimates ${nf:-none} streams/point (true 1, within 10%)" \
+      "$(awk -v s="${nf:-0}" 'BEGIN{print (s > 0.9 && s < 1.1) ? 1 : 0}')"
+check "N a plane through the fold estimates ${nd:-none} streams/point (true 3, within 10%)" \
+      "$(awk -v s="${nd:-0}" 'BEGIN{print (s > 2.7 && s < 3.3) ? 1 : 0}')"
+check "N the box-wide estimate (the old rule) is the box mean, ${nb:-none} (true 1.33)" \
+      "$(awk -v s="${nb:-0}" 'BEGIN{print (s > 1.2 && s < 1.45) ? 1 : 0}')"
+rm -f "${TMP}"/at_n*
+
+# ---------- (O) the parallel insert's transient ----------
+echo ">> O: --parallel-triangulation is in the predicted peak"
+if "${BIN}" --help 2>&1 | grep -q -- "--parallel-triangulation"; then
+    pred_o() {
+        env DTFE_RAM_GB=64 "${BIN}" "${SNAP}" "${TMP}/at_o" --grid 32 --periodic --input 105 --MpcUnit 1 --field density \
+            --partition 2 2 2 --max-concurrent 2 --auto-tune-report "$@" 2>/dev/null \
+            | sed -n 's/^AUTO-TUNE-REPORT .*predicted_gb=\([0-9.]*\) .*/\1/p'
+    }
+    o0=$(pred_o); o1=$(pred_o --parallel-triangulation)
+    check "O the parallel insert raises the predicted peak (${o0:-none} -> ${o1:-none} GB)" \
+          "$(awk -v a="${o0:-0}" -v b="${o1:-0}" 'BEGIN{print (a > 0 && b > a) ? 1 : 0}')"
+else
+    echo "   SKIP  O (no TBB in this build)"
+fi
+
+# ---------- (P) the default Lagrangian padding is what the tuner models ----------
+# A hand-set 4^3 split of the 64^3 set (report path, runs nothing): k = 8 spacings pad each side by 0.5 of a
+# partition, the Eulerian rule by max(0.3, padding fraction x 4) ~ 0.31, so the two predictions differ.
+echo ">> P: the tuner models the default '--ps-lag-padding 8'"
+pred_p() {
+    env DTFE_RAM_GB=64 "${BIN}" "${SNAP}" "${TMP}/at_p" --grid 32 --periodic --input 105 --MpcUnit 1 --field density \
+        --partition 4 4 4 --max-concurrent 4 --auto-tune-report "$@" 2>/dev/null \
+        | sed -n 's/^AUTO-TUNE-REPORT .*predicted_gb=\([0-9.]*\) .*/\1/p'
+}
+pd=$(pred_p); p8=$(pred_p --ps-lag-padding 8); p0=$(pred_p --ps-lag-padding 0)
+check "P the default predicts like '--ps-lag-padding 8' (${pd:-none} = ${p8:-none} GB), not like 0 (${p0:-none} GB)" \
+      "$(awk -v d="${pd:-x}" -v e="${p8:-y}" -v z="${p0:-x}" 'BEGIN{print (d != "x" && d == e && d != z) ? 1 : 0}')"
+
+# ---------- (R) standard DTFE --region: the tuner plans the region, not the snapshot ----------
+# 2026-10-13 (audit finding 8). A '--region'/'--regionMpc' run triangulates only the region plus its padding, but the
+# standard binary's tuner was handed the whole snapshot's particle count and box: the launcher's exact zoom of a
+# 20^3-cell TNG50 region came out '--partition 3 3 3, 10 thread(s)' -- 27 x 10 sub-triangulations, each padded again
+# around its tiny sub-box. On a simulated 0.2 GB machine (the standard tuner has no small-N gate): the whole 64^3 box
+# needs a split (the control, so the machine is tight enough to show the bug); a 10 x 10 x 2 Mpc region of 264
+# particles keeps one domain with every thread (the tuner stays silent); a region that IS the box plans exactly like
+# the box; and a real region run left to the tuner is byte-identical to one with '--partition 1 1 1' -- the old
+# tuner, planning the snapshot, cut that one to ONE thread (with a bogus 'no split fits' warning) and split the other.
+echo ">> R: standard DTFE --region plans the region's particles (${DTFE_BIN})"
+if [ -x "${DTFE_BIN}" ]; then
+    std_r() {  # $1 = log, rest = extra args (report mode: nothing is written)
+        local log="$1"; shift
+        env DTFE_RAM_GB=0.2 "${DTFE_BIN}" "${SNAP}" "${TMP}/at_r" --grid 16 16 1 --periodic --input 105 --MpcUnit 1 \
+            --field density_a --auto-tune-report "$@" > "${log}" 2>&1 || true
+    }
+    std_r "${TMP}/at_r_box.log"
+    std_r "${TMP}/at_r_reg.log" --regionMpc 40 50 40 50 49 51
+    std_r "${TMP}/at_r_all.log" --region 0 1 0 1 0 1
+    agrep "R control: the whole box needs a split on this simulated machine" \
+          "AUTO-TUNE: .* -> --partition [2-6] [2-6] [2-6]" "${TMP}/at_r_box.log"
+    r_reg="$(grep -o 'AUTO-TUNE: .*' "${TMP}/at_r_reg.log" || true)"
+    check "R a 10x10x2 Mpc region keeps one domain and every thread (no AUTO-TUNE line; got: '${r_reg}')" \
+          "$([ -z "${r_reg}" ] && grep -q 'AUTO-TUNE-REPORT' "${TMP}/at_r_reg.log" && echo 1 || echo 0)"
+    r_box="$(grep -o 'AUTO-TUNE: .*' "${TMP}/at_r_box.log" || true)"
+    r_all="$(grep -o 'AUTO-TUNE: .*' "${TMP}/at_r_all.log" || true)"
+    check "R a region that is the whole box plans exactly like the box" \
+          "$([ -n "${r_box}" ] && [ "${r_box}" = "${r_all}" ] && echo 1 || echo 0)"
+    run_r() {  # $1 = output root, rest = extra args: a real (CPU) region run on the same simulated machine
+        local out="$1"; shift
+        env DTFE_RAM_GB=0.2 "${DTFE_BIN}" "${SNAP}" "${out}" --grid 32 32 4 --periodic --input 105 --MpcUnit 1 \
+            --field density_a velocity_a --regionMpc 30 60 30 60 45 50 "$@" > "${out}.log" 2>&1 || true
+    }
+    run_r "${TMP}/at_r_auto"
+    run_r "${TMP}/at_r_p1" --partition 1 1 1
+    check "R a real region run left to the tuner == the same run with '--partition 1 1 1', byte for byte" \
+          "$([ -s "${TMP}/at_r_auto.a_den" ] && cmp -s "${TMP}/at_r_auto.a_den" "${TMP}/at_r_p1.a_den" \
+             && cmp -s "${TMP}/at_r_auto.a_vel" "${TMP}/at_r_p1.a_vel" && ! grep -q 'AUTO-TUNE:' "${TMP}/at_r_p1.log" \
+             && echo 1 || echo 0)"
+    rm -f "${TMP}"/at_r*
+else
+    echo "   SKIP  R (${DTFE_BIN} is not built)"
+fi
 
 echo "------------------------------------------------------------"
 if [ "${FAILS}" -gt 0 ]; then

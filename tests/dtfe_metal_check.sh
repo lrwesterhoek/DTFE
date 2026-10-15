@@ -114,6 +114,50 @@ REL_TOL   = 5e-2    # per-cell ceiling (borderline tets flip a sample across a c
 FRAC_TOL  = 1e-3    # at most this fraction of cells may exceed 1e-3 relative
 MEAN_TOL  = 1e-5    # field means must agree this closely (relative to max|field|)
 REPEAT_TOL = 1e-4   # two GPU runs: atomic summation order only (a stray deposit would be ~1e-2)
+# the velocity GRADIENT is constant per tetrahedron and jumps across its faces, so one borderline sample that the
+# float GPU puts in the neighbouring tetrahedron moves a cell by a whole jump (7.7e-2 in 3.4e-5 of the values on
+# CI's x86-64 under CUDAEMU, 2026-10-11). Only that case is let past the peak ceiling: a SAMPLED pair ('s', 'p';
+# the exact average 'e' samples nothing, so nothing can flip there), a differing fraction 10x below FRAC_TOL and a
+# peak still bounded: a misplaced deposit in a few hundred cells exceeds that fraction. A gradient's signed mean is ~0
+# on a periodic box, blind to a corrupted or scaled gradient, so it is also held to its mean |value|
+# (tests/gpu_scalar_check.sh's rule; measured 3e-7 - 2e-6 on the Mac, CI's worst case bounded by 270 values x 7.7e-2
+# x max/mean|g| ~ 110 -> 3e-4; a pure permutation leaves it unchanged, the fraction catches that). 2026-10-11
+# (review): the exemption had dropped the peak check altogether, for every pair, so a misplaced velGrad deposit in a
+# few hundred cells passed.
+GRAD_FRAC_TOL = 1e-4
+GRAD_PEAK_TOL = 0.5
+GRAD_MEANABS_TOL = 1e-3
+
+def judge(pre, suf, c, g):
+    """(bad, line) of one CPU / GPU pair of grids."""
+    c = np.asarray(c, dtype=float); g = np.asarray(g, dtype=float)
+    scale = float(np.max(np.abs(c))) or 1.0
+    d = np.abs(c - g)
+    meandiff = abs(float(c.mean()) - float(g.mean())) / scale
+    frac = float((d > 1e-3 * scale).sum()) / c.size
+    peak = float(d.max()) / scale
+    line = f"{pre}.{suf:10s} mean-rel={meandiff:.2e} peak-rel={peak:.2e} frac>1e-3={frac:.2e}"
+    grad = suf == "a_velGrad"
+    flip = grad and pre in ("s", "p") and frac <= GRAD_FRAC_TOL and peak <= GRAD_PEAK_TOL
+    bad = meandiff > MEAN_TOL or (peak > REL_TOL and not flip) or frac > FRAC_TOL
+    if grad:
+        ma = float(np.abs(c).mean()) or 1.0
+        meanabs = abs(ma - float(np.abs(g).mean())) / ma
+        line += f" mean|abs|-rel={meanabs:.2e}"
+        bad = bad or meanabs > GRAD_MEANABS_TOL
+    return bad, line
+
+# the rule itself on synthetic grids (fails on the old rule, which let any velGrad peak pass below FRAC_TOL)
+_rng = np.random.default_rng(1)
+_c = _rng.normal(size=96 ** 3 * 9)
+_flip = _c.copy(); _flip[_rng.choice(_c.size, 270, replace=False)] += 0.077 * np.abs(_c).max()   # CI's case
+_moved = _c.copy(); _i = _rng.choice(_c.size, 3000, replace=False); _moved[_i] = _c[_rng.permutation(_i)]
+for _pre, _g, _want in (("s", _flip, False), ("p", _flip, False), ("e", _flip, True), ("s", _moved, True)):
+    _bad, _line = judge(_pre, "a_velGrad", _c, _g)
+    if _bad != _want:
+        print(f"FAIL rule self-test: {'passed' if _want else 'failed'} {_line}"); sys.exit(1)
+print("PASS rule self-test (a CI face flip passes in s / p only; 3000 misplaced velGrad values fail)")
+
 ok = True
 for pre in ("s", "p", "e"):
     for suf in ("a_den", "a_vel", "a_velGrad"):
@@ -122,12 +166,8 @@ for pre in ("s", "p", "e"):
         if c.shape != g.shape:
             print(f"FAIL {pre}.{suf}: shape {c.shape} vs {g.shape}"); ok = False; continue
         scale = float(np.max(np.abs(c))) or 1.0
-        d = np.abs(c - g)
-        meandiff = abs(float(c.mean()) - float(g.mean())) / scale
-        frac = float((d > 1e-3 * scale).sum()) / c.size
-        peak = float(d.max()) / scale
-        line = f"{pre}.{suf:10s} mean-rel={meandiff:.2e} peak-rel={peak:.2e} frac>1e-3={frac:.2e}"
-        if meandiff > MEAN_TOL or peak > REL_TOL or frac > FRAC_TOL:
+        bad, line = judge(pre, suf, c, g)
+        if bad:
             print("FAIL " + line); ok = False
         else:
             print("PASS " + line)

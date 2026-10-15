@@ -8,6 +8,9 @@
     (the smoothed field read, the Hessian not), then served silently;
   * DTFE_CACHE_DIR and DTFE_VOID_GATE (config at import; the gate applied to the served dict, never to the cache,
     and tagged through pipeline.smoothing_tag).
+  * config.CROSSBOX_SMOOTHING_MPC, the one cross-box smoothing (G2), and the R_v search cap of 24 sigma.
+  * (evening) the R_v search's half-box margin with the reach recorded (3c); the cache folder setting, 'analyze.py cache
+    --move' and the setup's offer to keep the caches out of iCloud Drive (3d).
 
 SYNTHETIC tests always run (CI: no T7); the DATA-BACKED one (TNG100-3-Dark z = 0 on the T7) is skipped when the
 snapshot is not on disk.
@@ -202,8 +205,8 @@ def t_r_v_cache_identity():
                 cat = P("099", 0.0, sim="SYN").voids()
             return cat, buf.getvalue(), len(saves) - mark, reads[rmark:]
         cat, said, wrote, rd = load()                            # built: radii and settings in the catalogue
-        assert wrote == 1 and pipeline.catalog_r_v_ok(cat), (wrote, said)
-        assert np.array_equal(cat["r_v_settings"], pipeline.r_v_settings())
+        assert wrote == 1 and pipeline.catalog_r_v_ok(cat, n=fx.n), (wrote, said)   # the reach is the 48^3 grid's
+        assert np.array_equal(cat["r_v_settings"], pipeline.r_v_record(1.0, fx.n))   # the five settings + the reach
         for k in ("r_v_cells", "r_v_delta08_cells", "r_v_ridge_cells"):
             assert cat[k].shape == (len(cat["coords"]),), k
         assert np.isfinite(cat["r_v_cells"]).any() and np.isfinite(cat["r_v_ridge_cells"]).any()
@@ -291,8 +294,13 @@ def t_void_gate_and_export():
         shutil.rmtree(root, ignore_errors=True)
 
 
+_NO_SETTING = tempfile.mkdtemp(prefix="void_core_xdg_")      # an empty config home: no cache setting (2026-10-11)
+atexit.register(shutil.rmtree, _NO_SETTING, True)
+
+
 def _config_in_child(env_extra, expr):
     env = {k: v for k, v in os.environ.items() if k not in ("DTFE_CACHE_DIR", "DTFE_VOID_GATE")}
+    env["XDG_CONFIG_HOME"] = _NO_SETTING        # never this machine's own ~/.config/dtfe/cache_dir: the default tested
     env.update(env_extra)
     return subprocess.run([sys.executable, "-c", f"import config; print({expr})"], cwd=str(_PY), env=env,
                           capture_output=True, text=True, timeout=120)
@@ -324,8 +332,8 @@ def t_env_overrides():
 
 def t_real_tng100_z0():
     """TNG100-3-Dark z = 0 (T7): the served catalogue carries today's R_v settings and all three radii; the crossing
-    median of the distinct voids is the 2026-10-11 rebuild's 6.94 Mpc. A fresh interpreter (DTFE_SIM decides config's
-    frame); the shared cache is read, or re-measured once if stale."""
+    median of the distinct voids is 7.42 Mpc (6.94 under the 15-sigma cap, before 2026-10-11's 24). A fresh
+    interpreter (DTFE_SIM decides config's frame); the shared cache is read, or re-measured once if stale."""
     from dtfelib.cli import sim_dir
     if not (sim_dir("TNG100-3-Dark") / "snapdir_099").is_dir():
         raise Skip("TNG100-3-Dark snapdir_099 not on disk")
@@ -342,8 +350,299 @@ def t_real_tng100_z0():
     r = subprocess.run([sys.executable, "-c", code], cwd=str(_PY), env=env, capture_output=True, text=True, timeout=600)
     assert r.returncode == 0, r.stderr[-600:]
     nd, cr, d08, ridge = r.stdout.strip().splitlines()[-1].split()
-    assert int(nd) == 77 and abs(float(cr) - 6.938) < 0.01, r.stdout
+    # 83 / 7.419 Mpc at the 24-sigma cap (2026-10-11; 77 / 6.938 at 15 sigma, where 88 minima had no crossing)
+    assert int(nd) == 83 and abs(float(cr) - 7.419) < 0.01, r.stdout
     assert float(d08) < float(cr) < float(ridge), r.stdout       # inner sphere < first crossing < compensation ridge
+
+
+def t_crossbox_constant():
+    """G2 (2026-10-11): config.CROSSBOX_SMOOTHING_MPC = 2.1625 is the ONE cross-box smoothing: plot_void_crossbox's
+    default and analyze.py's cache inventory import it (an assignment that names it, not an equal literal), and
+    scripts/thesis_runs.sh's literal (a recipe, kept on purpose) equals it."""
+    import re
+    import config
+    assert config.CROSSBOX_SMOOTHING_MPC == 2.1625, config.CROSSBOX_SMOOTHING_MPC
+    sys.path.insert(0, str(_PY / "plot"))
+    try:
+        import plot_void_crossbox
+        import analyze
+    finally:
+        sys.path.remove(str(_PY / "plot"))
+    assert plot_void_crossbox.DEFAULT_SIGMA_MPC == config.CROSSBOX_SMOOTHING_MPC, plot_void_crossbox.DEFAULT_SIGMA_MPC
+    assert analyze.CACHE_SMOOTHING_MPC == (config.CROSSBOX_SMOOTHING_MPC,), analyze.CACHE_SMOOTHING_MPC
+    for f, name in (("plot/plot_void_crossbox.py", "DEFAULT_SIGMA_MPC"), ("analyze.py", "CACHE_SMOOTHING_MPC")):
+        src = (_PY / f).read_text()
+        assert re.search(rf"^{name} = .*config\.CROSSBOX_SMOOTHING_MPC", src, re.M), f"{f}: {name} not from config"
+    sh = (_PY.parent / "scripts" / "thesis_runs.sh").read_text()
+    m = re.search(r"^CROSSBOX_SMOOTH_MPC=(\S+)$", sh, re.M)
+    assert m and float(m.group(1)) == config.CROSSBOX_SMOOTHING_MPC, m
+    assert "--smooth-mpc 2.1625" not in sh, "thesis_runs.sh: a bare literal left beside CROSSBOX_SMOOTH_MPC"
+
+
+def t_r_v_cap():
+    """The R_v search cap (2026-10-11): 24 sigma, raised from 15 (17-25% of the underdense minima had no crossing within
+    15 sigma), never above half the production box minus a sigma. A void negative out to 20 sigma (40 cells at sigma
+    = 2, in a 128^3 box whose L/2 = 64 cells is not what binds): its crossing is measured, ~40 cells; under the old
+    15-sigma cap (30 cells) it was NaN."""
+    import config
+    from dtfelib import pipeline
+    n, sig = 128, 2.0
+    assert 20.0 < pipeline.R_V_MAX_SIGMA
+    sig0 = config.PRODUCTION_SMOOTHING[0]                                         # not DTFE_SIGMA_MPC's
+    assert pipeline.R_V_MAX_SIGMA * sig0 <= 0.5 * config.FIELD_RESOLUTION - sig0
+    assert float(pipeline.r_v_settings()[1]) == pipeline.R_V_MAX_SIGMA           # in the cache identity
+    c = (60, 70, 3)                                                               # near a periodic face too
+    idx = np.indices((n, n, n), dtype=np.float32)
+    r2 = sum((((idx[k] + 0.5) - (c[k] + 0.5) + n / 2) % n - n / 2) ** 2 for k in range(3))
+    field = (0.3 * (r2 / 40.0 ** 2 - 1.0)).astype(np.float32)                     # 0 exactly at r = 40 cells
+    got = pipeline.void_radii_cells(field, np.array([c]), sig)
+    assert abs(got["r_v_cells"][0] - 40.0) < 0.1, got["r_v_cells"]
+
+
+def t_r_v_half_box_margin():
+    """3c (2026-10-11 evening): the R_v search's half-box clause has a sigma's margin, min(cap sigma, L/2 - sigma), and
+    the catalogue records the reach it searched (r_v_settings' sixth element) instead of a new algorithm number. A
+    catalogue recorded WITHOUT a reach (every cache before today's evening) is served as it is where the margin changes
+    nothing (cap sigma <= L/2 - sigma: the production 10 cells at 512^3) and re-measured, once, where it binds (a large
+    sigma). The fixture: 48^3, sigma = 1 cell; cap 24 reaches L/2 = 24 (old rule) but not L/2 - sigma = 23 (new); a
+    cap of 10 is short of both."""
+    import config
+    from dtfelib import pipeline
+    # the rule itself, on the real namespaces' numbers
+    assert pipeline.r_v_reach_cells(10.0, 512) == 240.0 == pipeline.r_v_reach_cells(10.0, 512, False)
+    assert pipeline.r_v_reach_cells(21.4043, 512, False) == 256.0
+    assert abs(pipeline.r_v_reach_cells(21.4043, 512) - (256.0 - 21.4043)) < 1e-9
+    assert pipeline.r_v_reach_cells(400.0, 512) == 0.0                         # never negative radii
+    # the search stops a sigma short of L/2: a void negative out to 30 cells on a 48^3 grid at sigma 1 has no
+    # crossing within 23 cells (it had one within 24 under the old clause only if it crossed in the last cell)
+    fx = _FieldFixture()
+    root = Path(tempfile.mkdtemp(prefix="void_core_margin_"))
+    old = (config.CACHE_DIR, config.SMOOTHING_SIGMA_CELLS, pipeline.R_V_MAX_SIGMA)
+    grid = root / "density.bin"
+    grid.write_bytes(b"x" * 64)
+    reads = []
+    P = _products_class(fx, reads, grid)
+    try:
+        config.CACHE_DIR = root / "cache"
+        config.SMOOTHING_SIGMA_CELLS = 1.0
+
+        def load():
+            buf, rmark = io.StringIO(), len(reads)
+            with redirect_stdout(buf):
+                cat = P("099", 0.0, sim="SYN").voids()
+            return cat, buf.getvalue(), reads[rmark:]
+
+        def legacy():
+            """The cached catalogue as the code before the margin wrote it: five settings, no reach."""
+            path = P("099", 0.0, sim="SYN")._cpath("voids")
+            with np.load(path) as z:
+                arrays = {k: z[k] for k in z.files}
+            assert arrays["r_v_settings"].shape == (6,), arrays["r_v_settings"]
+            arrays["r_v_settings"] = arrays["r_v_settings"][:5]
+            np.savez_compressed(path, **arrays)
+        # a 'production-like' reach: cap 10 sigma = 10 cells, short of L/2 - sigma = 23 -> the margin changes nothing
+        pipeline.R_V_MAX_SIGMA = 10.0
+        cat, said, rd = load()
+        assert float(cat["r_v_settings"][5]) == 10.0, cat["r_v_settings"]
+        legacy()
+        served, said, rd = load()
+        assert said == "" and rd == [], (said, rd)                                # served: no field read, nothing said
+        assert served["r_v_settings"].shape == (5,)
+        assert pipeline.catalog_r_v_ok(served, 1.0, fx.n) and pipeline.catalog_r_v_ok(served, 10.0, 512)
+        # the default cap 24: 24 cells under the old clause, 23 under the new -> a legacy record is re-measured once
+        pipeline.R_V_MAX_SIGMA = old[2]
+        cat, said, rd = load()                                                    # the settings changed (cap 10 -> 24)
+        assert "not today's" in said and float(cat["r_v_settings"][5]) == 23.0, (said, cat["r_v_settings"])
+        legacy()
+        assert not pipeline.catalog_r_v_ok({**cat, "r_v_settings": cat["r_v_settings"][:5]}, 1.0, fx.n)
+        got, said, rd = load()
+        assert "searched out to 24 cells, today's reach is 23" in said and said.count("\n") == 1, said
+        assert rd == ["field"] and float(got["r_v_settings"][5]) == 23.0, (rd, got["r_v_settings"])
+        _, said, rd = load()
+        assert said == "" and rd == [], (said, rd)                                # and then served
+    finally:
+        config.CACHE_DIR, config.SMOOTHING_SIGMA_CELLS, pipeline.R_V_MAX_SIGMA = old
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def _synthetic_cache(root):
+    """A cache of two namespaces and a loose file, each with distinct bytes; returns {relative path: bytes}."""
+    files = {"r512_s10_f11_trace_g0.1_v2/099_voids.npz": os.urandom(70_000),
+             "r512_s10_f11_trace_g0.1_v2/050_voids.npz": os.urandom(5_000),
+             "r512_s21.4291_f23_trace_g0.1_v2/TNG50-3-Dark_099_voids.npz": os.urandom(12_000),
+             ".DS_Store": b"x"}
+    for rel, data in files.items():
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_bytes(data)
+    return files
+
+
+def t_cache_move():
+    """3d (2026-10-11 evening): 'analyze.py cache --move DIR' on a synthetic cache: a dry run by default (nothing
+    moved, no setting); refused while a cache user runs, into a folder holding a namespace of the same name, or when a
+    copy does not verify (the old cache untouched, no partial copy left); with --yes every entry moved byte for byte,
+    the source removed, the setting recorded -- and a NEW interpreter's config.CACHE_DIR is the moved folder (the
+    check that fails on the old code), with DTFE_CACHE_DIR still first. cache_users: an analysis python counts, an
+    editor on analyze.py does not, nor this process and its ancestors; a DTFE binary does."""
+    import config
+    import analyze
+    root = Path(tempfile.mkdtemp(prefix="void_core_move_"))
+    src, dest, xdg = root / "repo" / "cache", root / "local caches" / "DTFE", root / "xdg"
+    setting = xdg / "dtfe" / "cache_dir"
+    saved = (config.CACHE_DIR, config.CACHE_DIR_SOURCE)
+    try:
+        files = _synthetic_cache(src)
+
+        def run(**kw):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                code = analyze.move_cache(dest, src=src, setting_file=setting, **kw)
+            return code, buf.getvalue()
+
+        def untouched():
+            return all((src / k).read_bytes() == v for k, v in files.items()) and not setting.exists()
+        code, said = run(users=[])
+        assert code == 0 and "DRY RUN" in said and untouched() and not dest.exists(), said
+        code, said = run(yes=True, users=[(4242, "python3 plot/plot_void_fate.py")])
+        assert code == 1 and "in use" in said and "4242" in said and untouched() and not dest.exists(), said
+        (dest / "r512_s10_f11_trace_g0.1_v2").mkdir(parents=True)
+        code, said = run(yes=True, users=[])
+        assert code == 1 and "already holds r512_s10_f11_trace_g0.1_v2" in said and untouched(), said
+        (dest / "r512_s10_f11_trace_g0.1_v2").rmdir()
+        stub = src / "r512_s10_f11_trace_g0.1_v2" / ".099_voids_b.npz.icloud"   # an evicted iCloud file's placeholder
+        stub.write_bytes(b"bplist")
+        code, said = run(yes=True, users=[])
+        assert code == 1 and "evicted to iCloud" in said and not list(dest.iterdir()), said
+        stub.unlink()
+        # current macOS evicts in place: the real name, SF_DATALESS in st_flags (no stub at all; 2026-10-11 review),
+        # and the download it forces lands on the source's disk: its bytes count in the room needed there
+        dataless = src / "r512_s10_f11_trace_g0.1_v2" / "099_voids.npz"
+        assert dataless.is_file()
+        flags, disk_usage = analyze._st_flags, shutil.disk_usage
+        total = sum(analyze._dir_size(p)[0] if p.is_dir() else p.stat().st_size for p in src.iterdir())
+        analyze._st_flags = lambda q: 0x40000000 if q == dataless else 0
+        shutil.disk_usage = lambda p: types.SimpleNamespace(free=int(total * 1.05 + 100e6) + 1)
+        try:
+            code, said = run(yes=True, users=[])
+        finally:
+            analyze._st_flags, shutil.disk_usage = flags, disk_usage
+        assert code == 1 and "evicted to iCloud (099_voids.npz" in said and not list(dest.iterdir()), said
+        assert "downloaded onto the same disk first" in said, said
+        assert untouched()
+        same = analyze._same_tree
+        analyze._same_tree = lambda a, b: False                       # a copy that does not verify
+        try:
+            code, said = run(yes=True, users=[])
+        finally:
+            analyze._same_tree = same
+        assert code == 1 and "copy failed" in said and untouched() and list(dest.iterdir()) == [], said
+        code, said = run(yes=True, users=[])
+        assert code == 0 and "Moved" in said, said
+        assert all((dest / k).read_bytes() == v for k, v in files.items()), "a moved file differs"
+        assert not src.exists() and not list(dest.glob(".*.partial")), list(dest.iterdir())
+        assert config.read_cache_setting(setting) == dest.resolve() and config.CACHE_DIR == dest.resolve()
+        env = {k: v for k, v in os.environ.items() if k != "DTFE_CACHE_DIR"}
+        env["XDG_CONFIG_HOME"] = str(xdg)
+        r = subprocess.run([sys.executable, "-c", "import config; print(config.CACHE_DIR); print(config.CACHE_DIR_SOURCE)"],
+                           cwd=str(_PY), env=env, capture_output=True, text=True, timeout=120)
+        out = r.stdout.strip().splitlines()
+        assert r.returncode == 0 and Path(out[0]) == dest.resolve() and str(setting) in out[1], (r.stdout, r.stderr[-300:])
+        r = subprocess.run([sys.executable, "-c", "import config; print(config.CACHE_DIR)"], cwd=str(_PY),
+                           env=dict(env, DTFE_CACHE_DIR=str(root / "env")), capture_output=True, text=True, timeout=120)
+        assert Path(r.stdout.strip()) == root / "env", r.stdout                    # the variable still wins
+        # the command line: a dry run by default; --yes only with --prune or --move
+        r = subprocess.run([sys.executable, "analyze.py", "cache", "--move", str(root / "elsewhere")], cwd=str(_PY),
+                           env=env, capture_output=True, text=True, timeout=120)
+        assert r.returncode == 0 and "DRY RUN" in r.stdout and not (root / "elsewhere").exists(), (r.stdout, r.stderr[-300:])
+        r = subprocess.run([sys.executable, "analyze.py", "cache", "--yes"], cwd=str(_PY), env=env,
+                           capture_output=True, text=True, timeout=120)
+        assert r.returncode != 0 and "--move" in r.stderr, r.stderr[-300:]
+        # who counts as a user of the cache
+        table = {1: (0, "/sbin/launchd"), 50: (1, "-zsh"), 60: (50, "/opt/py/bin/python3 analyze.py cache --move X"),
+                 70: (1, "/usr/bin/python3 /repo/python/plot/plot_void_fate.py --sim TNG100-3-Dark"),
+                 71: (1, "vim analyze.py"), 72: (1, "/x/Python /repo/python/gui/app.py"),
+                 73: (1, "python3 -m pytest tests/py_analyze_helpers.py"),
+                 # the launcher as scripts/gui.sh starts it on macOS (the host bundle), and a job run by its
+                 # interpreter (2026-10-11 review: both were missed, so --move went ahead with the launcher open)
+                 74: (1, "/Users/x/.venvs/dtfe-gui/DTFE Launcher.app/Contents/MacOS/DTFE Launcher "
+                         "/Users/x/Mobile Documents/DTFE/python/gui/app.py"),
+                 75: (74, "/Users/x/.venvs/dtfe-gui/DTFE Launcher.app/Contents/MacOS/DTFE Launcher "
+                          "/repo/python/void_cache.py --sim TNG100-3-Dark"),
+                 76: (1, "/usr/bin/python3 tests/py_gui_app2_test.py")}
+        got = [pid for pid, _ in analyze.cache_users(table, {80: "PS-DTFE", 50: "DTFE"}, me=60)]
+        assert got == [70, 72, 74, 75, 80], got
+    finally:
+        config.CACHE_DIR, config.CACHE_DIR_SOURCE = saved
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def t_setup_wizard_cache_offer():
+    """3d(iii) (2026-10-11 evening): the setup's first page offers to keep the caches outside iCloud Drive only while
+    the repository is synced AND the caches are inside it (config.icloud_cache_offer: ~/Library/Caches/DTFE on macOS,
+    ~/.cache/dtfe elsewhere), and its button runs analyze.py's own move (cache_move_command), here on a synthetic
+    cache: moved, the setting recorded, this process pointed at the new folder. Needs PySide6 (skipped without)."""
+    import config
+    try:
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        raise Skip("PySide6 not installed (the launcher's venv has it)")
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    repo_icloud = Path.home() / "Library" / "Mobile Documents" / "com~apple~CloudDocs" / "x" / "DTFE"
+    assert config.icloud_cache_offer(repo_icloud, repo_icloud / "python" / "cache") == config.local_cache_dir()
+    assert config.icloud_cache_offer(repo_icloud, Path("/tmp/elsewhere")) is None          # already moved
+    assert config.icloud_cache_offer(Path("/opt/DTFE"), Path("/opt/DTFE/python/cache")) is None
+    expect = ("Library/Caches/DTFE" if sys.platform == "darwin" else ".cache/dtfe")
+    assert str(config.local_cache_dir()).endswith(expect), config.local_cache_dir()
+    sys.path.insert(0, str(_PY / "gui"))
+    import setup_wizard as SW
+    app = QApplication.instance() or QApplication([])
+    root = Path(tempfile.mkdtemp(prefix="void_core_wizard_"))
+    saved_env = {k: os.environ.get(k) for k in ("DTFE_CACHE_DIR", "XDG_CONFIG_HOME")}
+    saved = (config.CACHE_DIR, config.CACHE_DIR_SOURCE, config.icloud_cache_offer)
+    try:
+        src, dest = root / "cache", root / "local" / "DTFE"
+        files = _synthetic_cache(src)
+        # the move runs in a child process: it finds the cache and the setting through its environment
+        os.environ["DTFE_CACHE_DIR"], os.environ["XDG_CONFIG_HOME"] = str(src), str(root / "xdg")
+        config.icloud_cache_offer = lambda *a: None
+        dlg = SW.SetupDialog(None, str(root))
+        assert dlg.cache_box.isHidden(), "offered with nothing to offer"
+        dlg.deleteLater()
+        config.icloud_cache_offer = lambda *a: dest
+        dlg = SW.SetupDialog(None, str(root))
+        assert not dlg.cache_box.isHidden() and dlg.cache_dir.text() == str(dest)
+        assert "--" not in dlg.cache_btn.text() and "--" not in dlg.cache_info.text()
+        cmd = SW.cache_move_command(dest)
+        assert cmd[2:] == ["cache", "--move", str(dest), "--yes"] and cmd[1].endswith("analyze.py"), cmd
+        # the same function, with the live process check replaced (whatever else runs on this machine meanwhile --
+        # another figure script -- would refuse the move, rightly): first a user present, then none
+        real_cmd = SW.cache_move_command
+
+        def run_move(users):
+            SW.cache_move_command = lambda folder: [
+                sys.executable, "-c", f"import sys, analyze; sys.exit(analyze.move_cache({str(folder)!r}, yes=True, "
+                                      f"users={users!r}))", str(folder)]
+            try:
+                dlg._move_cache()
+            finally:
+                SW.cache_move_command = real_cmd
+            assert dlg._cache_proc is not None and dlg._cache_proc.waitForFinished(120000)
+            app.processEvents()
+            assert dlg._cache_proc is None, "the finished move was not handled"
+        run_move([(4242, "python3 analyze.py voids")])
+        assert dlg.cache_info.text().startswith("not moved: refused") and "4242" in dlg.cache_info.text(), \
+            dlg.cache_info.text()
+        assert all((src / k).read_bytes() == v for k, v in files.items()) and dlg.cache_btn.isEnabled()
+        run_move([])
+        assert all((dest / k).read_bytes() == v for k, v in files.items()) and not src.exists(), dlg.cache_info.text()
+        assert dlg.cache_info.text().startswith("✔") and config.CACHE_DIR == dest.resolve(), dlg.cache_info.text()
+        assert config.read_cache_setting(root / "xdg" / "dtfe" / "cache_dir") == dest.resolve()
+        dlg.deleteLater()
+    finally:
+        config.CACHE_DIR, config.CACHE_DIR_SOURCE, config.icloud_cache_offer = saved
+        for k, v in saved_env.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def main():
@@ -360,6 +659,16 @@ def main():
           "export columns r_v_delta08_mpc / r_v_ridge_mpc and the R_v provenance", t_void_gate_and_export)
     check("2026-10-11: DTFE_CACHE_DIR (default kept, ~ expanded, the products follow) and DTFE_VOID_GATE at config "
           "import (an unknown value refused)", t_env_overrides)
+    check("2026-10-11 (G2): config.CROSSBOX_SMOOTHING_MPC = 2.1625 imported by plot_void_crossbox and analyze; "
+          "thesis_runs.sh's literal equals it", t_crossbox_constant)
+    check("2026-10-11: R_v search cap 24 sigma (a sigma short of L/2 at production): a 20-sigma void is measured, "
+          "not NaN", t_r_v_cap)
+    check("2026-10-11 (3d): analyze.py cache --move: dry run by default; refused while in use, on a clash or a failed "
+          "verify (nothing touched); moved byte for byte, the setting read by a new interpreter", t_cache_move)
+    check("2026-10-11 (3d): the setup offers the caches out of iCloud Drive only when the repository and the caches are "
+          "in it, and its button runs the same move", t_setup_wizard_cache_offer)
+    check("2026-10-11 (3c): the half-box clause has a sigma's margin; the reach is recorded, a legacy record served "
+          "where the margin changes nothing and re-measured where it binds", t_r_v_half_box_margin)
     print("data-backed:")
     check("2026-10-11: TNG100-3-Dark z = 0 served with today's R_v settings; distinct median radii in order", t_real_tng100_z0)
     print("=" * 60)

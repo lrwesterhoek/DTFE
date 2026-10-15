@@ -312,6 +312,8 @@ def process_snapshot(snapshot, redshift, args):
         with open(summary_file, 'w') as f:
             f.write(f"Critical Point Analysis Summary\n")
             f.write(f"Snapshot: {snapshot}, Redshift: {redshift:.2f}\n")
+            # what the numbers were made from: the folder is shared by every simulation and estimator
+            f.write(f"Simulation: {args.sim}, estimator: {p.fs.method}, grids: {p.fs.prefix.rstrip('.')}*\n")
             f.write(f"{'='*50}\n\n")
             f.write(f"Parameters:\n")
             f.write(f"  Box size: {box_size:g} Mpc\n")
@@ -347,53 +349,32 @@ def process_snapshot(snapshot, redshift, args):
                     f.write(f"  {cp_type.capitalize()}: A={params[0]:.4f}, μ={params[1]:.4f}, σ={params[2]:.4f}\n")
         
         print(f"  Found {total_count} critical points")
-        return True
+        # this snapshot's numbers for the evolution summary, at the precision its summary file carries (the
+        # summary was rebuilt from those files before 2026-10-11: the same figures for the same run)
+        frac = {k: float(f"{100.0 * c / total_count if total_count > 0 else 0.0:.1f}") for k, c in total_counts.items()}
+        return {"redshift": redshift, "total_density": float(f"{total_count / volume:.6e}"), **frac}
 
     except FileNotFoundError:
         method_label = 'ps/dtfe' if args.method == 'auto' else args.method
         print(f"  skipping snapshot {snapshot} (no {method_label} fields)")
-        return False
+        return None
     except Exception as e:
         print(f"  Error: {e}")
-        return False
+        return None
 
-def create_evolution_summary():
-    
+def create_evolution_summary(results):
+    """The redshift evolution from THIS run's snapshots (process_snapshot's numbers). 2026-10-11: it re-read every
+    snapshot_*/critical_point_analysis_summary_z*.txt of the config ladder in a folder shared by all simulations
+    and estimators, so another simulation's older run filled in points of another box."""
     print("\nCreating evolution summary")
-    
-    redshifts = []
-    total_densities = []
-    maxima_fractions = []
-    minima_fractions = []
-    saddle1_fractions = []
-    saddle2_fractions = []
-    
-    for snapshot, redshift in SNAPSHOT_TO_REDSHIFT.items():
-        summary_file = Path(OUTPUT_DIR) / f'snapshot_{snapshot}_z{redshift:.2f}' / f'critical_point_analysis_summary_z{redshift:.2f}.txt'
-        
-        if summary_file.exists():
-            try:
-                with open(summary_file, 'r') as f:
-                    content = f.read()
-                
-                import re
-                maxima_match = re.search(r'Maxima: \d+ \(([\d.]+)%,', content)
-                minima_match = re.search(r'Minima: \d+ \(([\d.]+)%,', content)
-                saddle1_match = re.search(r'1saddle: \d+ \(([\d.]+)%,', content)
-                saddle2_match = re.search(r'2saddle: \d+ \(([\d.]+)%,', content)
-                total_match = re.search(r'Total: \d+ \(([\de.-]+) Mpc', content)
-                
-                if all([maxima_match, minima_match, saddle1_match, saddle2_match, total_match]):
-                    redshifts.append(redshift)
-                    maxima_fractions.append(float(maxima_match.group(1)))
-                    minima_fractions.append(float(minima_match.group(1)))
-                    saddle1_fractions.append(float(saddle1_match.group(1)))
-                    saddle2_fractions.append(float(saddle2_match.group(1)))
-                    total_densities.append(float(total_match.group(1)))
-                    
-            except Exception:
-                continue
-    
+
+    redshifts = [r["redshift"] for r in results]
+    total_densities = [r["total_density"] for r in results]
+    maxima_fractions = [r["maxima"] for r in results]
+    minima_fractions = [r["minima"] for r in results]
+    saddle1_fractions = [r["1saddle"] for r in results]
+    saddle2_fractions = [r["2saddle"] for r in results]
+
     if len(redshifts) > 0:
         sorted_indices = np.argsort(redshifts)
         redshifts = np.array(redshifts)[sorted_indices]
@@ -452,18 +433,20 @@ def main():
 
     Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 
-    processed_snapshots = 0
+    results = []
     failed_snapshots = []
 
     for snapshot, redshift in SNAPSHOT_TO_REDSHIFT.items():
-        if process_snapshot(snapshot, redshift, args):
-            processed_snapshots += 1
+        r = process_snapshot(snapshot, redshift, args)
+        if r is not None:
+            results.append(r)
         else:
             failed_snapshots.append((snapshot, redshift))
-    
+    processed_snapshots = len(results)
+
     if processed_snapshots > 1:
         try:
-            create_evolution_summary()
+            create_evolution_summary(results)
         except Exception as e:
             print(f"\nError creating evolution summary: {e}")
     

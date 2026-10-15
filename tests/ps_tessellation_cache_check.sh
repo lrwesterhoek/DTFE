@@ -16,6 +16,11 @@
 #     next run, and demonstrably different tessellations. 'partNo' stays -1 for all of them, so the
 #     descriptor separates them by their unpadded Lagrangian region -- without that, partitions
 #     2..N would silently load the first partition's tessellation.
+#  E2) The partition padding is part of a partition's identity. Since 2026-10-12 the partitions are padded by
+#     '--ps-lag-padding 8' mean spacings BY DEFAULT (before: the Eulerian '--padding' fraction, floored at 0.3 of
+#     a partition), which selects other particles: a default partition records 'lagPadding=8', a default run
+#     MISSES the caches of the Eulerian padding (every partition cache written before 2026-10-12: what
+#     '--ps-lag-padding 0' writes), and '--ps-lag-padding 0' -- the way back -- hits them.
 #  F) A partitioned cache hit also reproduces the uncached run bit-for-bit.
 #  G) The standard binary caches its thread sub-domains too.
 #  H) New files carry the CHUNKED body; single-stream files still load; the converter rewrites them.
@@ -167,6 +172,20 @@ check "$([ "$(hits)" = "8" ] && echo 1 || echo 0)" "warm partitioned run hits al
 # the partitions must NOT all be the same tessellation
 ndistinct=$(echo "${RUN_OUT}" | grep -oE "Reused the cached tessellation \([0-9]+" | grep -oE "[0-9]+$" | sort -u | wc -l | tr -d ' ')
 check "$([ "${ndistinct}" -ge "2" ] && echo 1 || echo 0)" "partitions restored DIFFERENT tessellations (${ndistinct} distinct vertex counts)"
+# E2 (2026-10-12): the default padding is k = 8 spacings and its descriptor says so; an old Eulerian-padded cache
+# (no 'lagPadding' line: what '--ps-lag-padding 0' writes, and every partition cache written before 2026-10-12)
+# must MISS in a default run, and '--ps-lag-padding 0' must still find it
+ndesc=$( { grep -l -a "lagPadding=8" "${PCACHE}"/*.tess 2>/dev/null || true; } | wc -l | tr -d ' ')
+check "$([ "${ndesc}" = "8" ] && echo 1 || echo 0)" "E2 every default partition records 'lagPadding=8' in its descriptor (got ${ndesc} of 8)"
+LCACHE2="${CACHE}-lagpad"; rm -rf "${LCACHE2}"; mkdir -p "${LCACHE2}"
+run "${TMP}/ptc_lagpad0_cold" "${GRID}" --tessellation-cache "${LCACHE2}" --partition 2 2 2 --ps-lag-padding 0
+nold=$( { grep -L -a "lagPadding=" "${LCACHE2}"/*.tess 2>/dev/null || true; } | wc -l | tr -d ' ')   # grep -L exits 1 (pipefail)
+check "$([ "$(hits)" = "0" ] && [ "${nold}" = "8" ] && echo 1 || echo 0)" "E2 '--ps-lag-padding 0' writes 8 Eulerian-padded partitions with no 'lagPadding' line (got ${nold})"
+run "${TMP}/ptc_lagpad_dflt" "${GRID}" --tessellation-cache "${LCACHE2}" --partition 2 2 2
+check "$([ "$(hits)" = "0" ] && echo 1 || echo 0)" "E2 a default run misses the caches of the Eulerian padding (they rebuild once)"
+run "${TMP}/ptc_lagpad0_warm" "${GRID}" --tessellation-cache "${LCACHE2}" --partition 2 2 2 --ps-lag-padding 0
+check "$([ "$(hits)" = "8" ] && echo 1 || echo 0)" "E2 '--ps-lag-padding 0' (the way back) hits its 8 Eulerian partitions"
+rm -rf "${LCACHE2}"
 
 echo ""
 echo "(F) a partitioned cache hit reproduces the uncached run bit-for-bit"

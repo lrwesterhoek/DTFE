@@ -6,7 +6,6 @@ import zipfile
 import zlib
 import numpy as np
 from pathlib import Path
-from scipy.ndimage import minimum_filter, maximum_filter
 
 import config
 from .io import FieldSet
@@ -109,15 +108,17 @@ def hessian_slice(hessian, slice_dim, index=None):
 
 
 def find_critical_points(delta_s, hessian, grad_mag):
+    # the three box filters run slab-threaded (dtfe.box_filter, bit-identical to scipy's serial minimum_filter /
+    # maximum_filter; 2026-10-11): at 512^3 they were ~3 serial passes of several seconds each
     fp = config.FOOTPRINT_SIZE
-    minima_mask = (delta_s == minimum_filter(delta_s, size=fp, mode='wrap'))
-    maxima_mask = (delta_s == maximum_filter(delta_s, size=fp, mode='wrap'))
+    minima_mask = (delta_s == dtfe.box_filter(delta_s, fp, mode='wrap'))
+    maxima_mask = (delta_s == dtfe.box_filter(delta_s, fp, mode='wrap', maximum=True))
 
     gmax = float(np.max(grad_mag))
     gnorm = grad_mag / gmax if gmax > 0 else grad_mag
     cand = gnorm < config.GRADIENT_THRESHOLD
     inv = gmax - grad_mag
-    cand &= (inv == maximum_filter(inv, size=fp, mode='wrap'))
+    cand &= (inv == dtfe.box_filter(inv, fp, mode='wrap', maximum=True))
     cand &= ~minima_mask
     cand &= ~maxima_mask
 
@@ -141,7 +142,23 @@ def find_critical_points(delta_s, hessian, grad_mag):
 
 
 R_V_STEP_SIGMA = 0.2      # radial step of the R_v search, in smoothing lengths (the crossing is interpolated)
-R_V_MAX_SIGMA = 15.0      # how far out it looks (capped at half the box)
+R_V_MAX_SIGMA = 24.0      # how far out it looks (capped at half the box)
+# Why 24 (2026-10-11; was 15 = 32.4 Mpc on TNG100): at 15 sigma 17-25% of the underdense minima of TNG100-3-Dark and
+# TNG50-3-Dark (z = 0, 1, 3, 5; 10-cell smoothing) had NO crossing within reach (NaN, 88-104 per catalogue) or crossed
+# in its last sigma, 8-17% of the well-resolved ones -- the R_v tail was cut, not measured. Same count at 20 / 24 / 25
+# sigma / L/2: 5-8% / 1.1-2.6% / 0.6-1.8% / 0.4-1.2% (well-resolved 4-8% / 0-2.9% / 0-2% / 0-2%). Half the 512^3 box is
+# 25.6 sigma at 10 cells; 24 is the largest whole cap a sigma short of it (shells beyond L/2 meet the centre's periodic
+# images; within the last sigma the smoothed field already feels them). The distinct-void median crossing R_v
+# (Mpc, 15 -> 24 sigma) at z = 0 / 1 / 3 / 5: TNG100 6.94 -> 7.42 / 7.59 -> 7.85 / 6.82 -> 7.64 / 6.27 -> 6.79,
+# TNG50 2.82 -> 2.88 / 3.41 -> 3.98 / 3.68 -> 3.97 / 3.13 -> 3.73, and 6-13% more distinct voids (TNG100 z = 0: 77 ->
+# 83) as fewer deep voids lack a radius. It is in r_v_settings, so every catalogue is re-measured once (~15 s and
+# 2.4 GB per 512^3 snapshot: reading and smoothing the grid; the shells themselves 1-2 s). The half-box clause has a
+# sigma's margin of its own since the evening of 2026-10-11 (r_v_reach_cells: min(cap sigma, L/2 - sigma), was
+# min(cap sigma, L/2), which let a large-sigma search run right up to the centre's periodic images: TNG50 at 2.1625 Mpc
+# = 21.4 cells reached exactly 256 cells, now 234.6). It changes nothing while cap sigma <= L/2 - sigma, i.e. sigma <=
+# 10.24 cells at 512^3 (the production 10 included), so the catalogue records the reach it searched (r_v_settings'
+# sixth element) instead of a new algorithm number: a cache without one is served when today's reach equals the old
+# rule's and re-measured only where the margin binds (catalog_r_v_ok).
 R_V_DIRS = 128            # Fibonacci directions per shell
 R_V_DELTA08 = -0.8        # the enclosed contrast of the 'delta08' radius: shell crossing of the spherical model
                           # (nonlinear -0.8 <-> linear -2.71; Sheth & van de Weygaert 2004)
@@ -153,19 +170,66 @@ R_V_ALGORITHM = 2
 
 def r_v_settings():
     """What a catalogue's radii were measured with, as it records them ('r_v_settings'): [step in sigma, reach in
-    sigma, directions, algorithm, delta08 threshold]. Read at call time, so a changed module constant counts."""
+    sigma, directions, algorithm, delta08 threshold]. Read at call time, so a changed module constant counts. A
+    catalogue's record carries a sixth element since 2026-10-11 (evening), the reach in cells it searched
+    (r_v_record); these five stay the settings every other reader keys on (exports, the fate links)."""
     return np.array([R_V_STEP_SIGMA, R_V_MAX_SIGMA, R_V_DIRS, R_V_ALGORITHM, R_V_DELTA08], dtype=np.float64)
 
 
-def catalog_r_v_ok(cat):
-    """Whether a catalogue's radii were measured with today's settings (r_v_settings) and it holds all three
-    (catalog.R_V_DEFINITIONS). A cache from before 2026-10-11 has no record: not ok, re-measured once (the survey's
-    GAP: a changed R_V_MAX_SIGMA or algorithm used to leave every cache with the old radii and NaNs)."""
+def r_v_reach_cells(sigma_cells, n, half_box_margin=True):
+    """How far out the R_v search looks, in cells: min(R_V_MAX_SIGMA sigma, L/2 - sigma) on an n^3 grid (sigma
+    floored at a cell, as the step is), never below 0. half_box_margin=False is the rule before 2026-10-11 (evening),
+    min(R_V_MAX_SIGMA sigma, L/2): what a record without a reach was searched with (catalog_r_v_ok)."""
+    s = max(float(sigma_cells), 1.0)
+    return max(min(R_V_MAX_SIGMA * s, 0.5 * float(n) - (s if half_box_margin else 0.0)), 0.0)
+
+
+def r_v_record(sigma_cells, n):
+    """The record a catalogue measured TODAY carries: r_v_settings() plus the reach in cells it searched
+    (r_v_reach_cells for its smoothing and grid)."""
+    return np.append(r_v_settings(), r_v_reach_cells(sigma_cells, n))
+
+
+def catalog_r_v_ok(cat, sigma_cells=None, n=None):
+    """Whether a catalogue's radii were measured with today's settings (r_v_settings) out to today's reach
+    (r_v_reach_cells for sigma_cells / n: config's smoothing and grid by default, the namespace the catalogue lives
+    in) and it holds all three (catalog.R_V_DEFINITIONS). A cache from before 2026-10-11 has no record: not ok,
+    re-measured once (the survey's GAP: a changed R_V_MAX_SIGMA or algorithm used to leave every cache with the old
+    radii and NaNs). A record of the five settings alone (before the reach was recorded, 2026-10-11 evening) is ok
+    when the old half-box rule reached as far as today's does -- every sigma <= 10.24 cells at 512^3, the production
+    smoothing included -- so the margin re-measures only the catalogues it changes."""
     if 'r_v_settings' not in cat or any(k not in cat for k in ('r_v_cells', 'r_v_delta08_cells', 'r_v_ridge_cells')):
         return False
     have = np.asarray(cat['r_v_settings'], dtype=np.float64).reshape(-1)
     want = r_v_settings()
-    return have.shape == want.shape and np.array_equal(have, want)
+    if have.shape[0] not in (want.shape[0], want.shape[0] + 1) or not np.array_equal(have[:want.shape[0]], want):
+        return False
+    sigma_cells = config.SMOOTHING_SIGMA_CELLS if sigma_cells is None else sigma_cells
+    n = config.FIELD_RESOLUTION if n is None else n
+    reach = r_v_reach_cells(sigma_cells, n)
+    if have.shape[0] == want.shape[0]:
+        return r_v_reach_cells(sigma_cells, n, half_box_margin=False) == reach
+    return float(have[-1]) == reach
+
+
+def r_v_stale_reason(cat, sigma_cells=None, n=None):
+    """Why catalog_r_v_ok says no, in a few words for the log (None when it says yes)."""
+    if catalog_r_v_ok(cat, sigma_cells, n):
+        return None
+    if 'r_v_settings' not in cat:
+        return "has no record of its R_v settings"
+    have = np.asarray(cat['r_v_settings'], dtype=np.float64).reshape(-1)
+    want = r_v_settings()
+    if have.shape[0] in (want.shape[0], want.shape[0] + 1) and np.array_equal(have[:want.shape[0]], want) \
+            and all(k in cat for k in ('r_v_cells', 'r_v_delta08_cells', 'r_v_ridge_cells')):
+        sigma_cells = config.SMOOTHING_SIGMA_CELLS if sigma_cells is None else sigma_cells
+        n = config.FIELD_RESOLUTION if n is None else n
+        old = float(have[-1]) if have.shape[0] > want.shape[0] else r_v_reach_cells(sigma_cells, n, False)
+        return (f"was searched out to {old:.4g} cells, today's reach is {r_v_reach_cells(sigma_cells, n):.4g} "
+                f"(L/2 less a sigma)")
+    if have.shape[0] in (want.shape[0], want.shape[0] + 1) and np.array_equal(have[:want.shape[0]], want):
+        return "lacks one of the three radii"
+    return f"was measured with R_v settings {have[:want.shape[0]].tolist()}, not today's {want.tolist()}"
 
 
 def _enclosed_contrast(radii, shells):
@@ -187,7 +251,7 @@ def _enclosed_contrast(radii, shells):
 def void_radii_cells(delta_s, coords, sigma_cells):
     """The three measured radii per minimum, in cells, from ONE matrix of shell means of the SMOOTHED delta
     (trilinear, R_V_DIRS directions about the minimum's cell centre, every R_V_STEP_SIGMA sigma out to R_V_MAX_SIGMA
-    sigma or half the box; column 0 the minimum itself at r = 0) (2026-10-11, catalog.R_V_DEFINITIONS):
+    sigma or half the box less a sigma, r_v_reach_cells; column 0 the minimum itself at r = 0) (2026-10-11, catalog.R_V_DEFINITIONS):
       'r_v_cells'          the first up-crossing of 0 (the mean), linearly interpolated from the last negative shell
                            -- void_radius_cells, bit for bit;
       'r_v_delta08_cells'  where the enclosed contrast Delta(<R) (_enclosed_contrast) first reaches R_V_DELTA08 going
@@ -207,7 +271,7 @@ def void_radii_cells(delta_s, coords, sigma_cells):
         return out
     n = delta_s.shape[0]
     step = R_V_STEP_SIGMA * max(float(sigma_cells), 1.0)
-    radii = np.arange(1, int(min(R_V_MAX_SIGMA * max(float(sigma_cells), 1.0), 0.5 * n) / step) + 1) * step
+    radii = np.arange(1, int(r_v_reach_cells(sigma_cells, n) / step) + 1) * step   # L/2 less a sigma (2026-10-11)
     v0 = np.asarray(delta_s[coords[:, 0], coords[:, 1], coords[:, 2]], dtype=np.float64)
     todo = np.nonzero(v0 < 0)[0]                                # an overdense 'minimum' has no underdense region
     if not todo.size or not radii.size:
@@ -317,7 +381,7 @@ def build_void_catalog(delta_s, hessian):
     # the MEASURED radii (2026-10-07; delta08 and ridge 2026-10-11): in cells, frame-free like coords, so a refit
     # keeps them; with the settings they were measured with (catalog_r_v_ok)
     cat.update(void_radii_cells(delta_s, coords, config.SMOOTHING_SIGMA_CELLS))
-    cat['r_v_settings'] = r_v_settings()
+    cat['r_v_settings'] = r_v_record(config.SMOOTHING_SIGMA_CELLS, delta_s.shape[0])   # with the reach searched
     cat['cell_mpc'] = np.float64(config.CELL_SIZE)      # the FRAME the positions and semi-axes are in (2026-10-05)
     cat['cuts_mpc'] = _cuts_array()                     # the cuts (in Mpc) the well_resolved flag was taken with
     cat['deep_threshold'] = np.float64(config.DEEP_VOID_THRESHOLD)   # the threshold 'deep' was taken at
@@ -786,15 +850,16 @@ class SnapshotProducts:
             with np.load(p) as z:
                 cat = {k: z[k] for k in z.files}
             remeasured = False
-            if not catalog_r_v_ok(cat) and self._grid_path() is not None:
+            # the reach depends on the grid's n: the snapshot's own (snapshot_frame passed: its cell is config's)
+            n_grid = int(self.fs.grid_n)
+            if not catalog_r_v_ok(cat, n=n_grid) and self._grid_path() is not None:
                 # the radii need the smoothed field, which a refit does not have; the minima are this grid's (the
                 # stamp passed), so only the radii are re-measured: no Hessian (2026-10-11), saved once with the rest
-                why = ("has no record of its R_v settings" if 'r_v_settings' not in cat
-                       else f"was measured with R_v settings {np.asarray(cat['r_v_settings']).tolist()}, "
-                            f"not today's {r_v_settings().tolist()}")
+                why = r_v_stale_reason(cat, n=n_grid)
                 print(f"    [pipeline] cached void catalogue {p.name} {why}: re-measuring R_v (crossing, delta08, ridge)")
-                cat.update(void_radii_cells(self.delta_smoothed, cat['coords'], config.SMOOTHING_SIGMA_CELLS))
-                cat['r_v_settings'] = r_v_settings()
+                field = self.delta_smoothed
+                cat.update(void_radii_cells(field, cat['coords'], config.SMOOTHING_SIGMA_CELLS))
+                cat['r_v_settings'] = r_v_record(config.SMOOTHING_SIGMA_CELLS, field.shape[0])
                 remeasured = True
             frame_ok, cuts_ok = catalog_frame_ok(cat), catalog_cuts_ok(cat)
             if frame_ok and cuts_ok:
@@ -877,8 +942,7 @@ class SnapshotProducts:
         if self._cached('phimaxima') is not None:
             with np.load(p) as z:
                 return {k: z[k] for k in z.files}
-        mask = (self.phi == maximum_filter(self.phi, size=config.FOOTPRINT_SIZE,
-                                           mode='wrap'))
+        mask = (self.phi == dtfe.box_filter(self.phi, config.FOOTPRINT_SIZE, mode='wrap', maximum=True))
         coords = np.argwhere(mask)
         cat = {'coords': coords, 'values': self.phi[mask]}
         self._save(p, cat)

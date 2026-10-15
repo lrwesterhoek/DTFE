@@ -13,7 +13,8 @@
    The CPU deposit remains the double-precision reference; this backend carries the same
    parity contract as the Metal one (float rounding, atomic summation order). The MASS grid is,
    like Metal's since 2026-10-08, an exact 64-bit fixed-point sum (depositMass, 2026-10-11): it no
-   longer loses small shares in busy cells and is bit-identical run to run. It has been
+   longer loses small shares in busy cells and is bit-identical run to run -- and since 2026-10-14 so is every
+   moment grid (addMoment, DepositParams.fxMask: metal/ps_deposit.metal says why). It has been
    compiled and its CPU fallback exercised on Linux, but NOT yet validated on NVIDIA/AMD
    hardware -- see metal/README.md ("CUDA / HIP"). */
 
@@ -25,15 +26,20 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <mutex>
+#include <new>
 #include <string>
 #include <vector>
 extern std::atomic<int> psGpuRetries;   // ps_interpolation.cc (run_progress.h)
+extern std::atomic<int> psGpuRetriesByCause[4];   // ... by cause: innocent, timeout, oom, other (2026-10-11)
 #include <unistd.h>
 
 #include "gpu_host.h"
+#include "../message.h"       // ANSI colour helpers only (the retry warnings, 2026-10-11)
 #include "gpu_cuda_compat.h"
 #include "ps_deposit_params.h"
+#include "ps_mass_audit.h"      // PS_MASS_AUDIT=1: the fixed-point grid's exact total (as ps_metal_host.cc)
 
 namespace {
 
@@ -103,7 +109,40 @@ struct FieldGrids {
     unsigned* massFx;  // nCell*2   the mass as a 64-bit fixed-point sum [flat*2] low, [flat*2+1] high (massFixed; else dummy)
     float     massScale; // its unit: 1/massScale mass
     bool      massFixed;
+    // 2026-10-14: the moment grids as exact fixed-point sums (metal/ps_deposit.metal DepositParams.fxMask): bit g
+    // = grid g's buffer holds two unsigned words per component (the float pointer above, reinterpreted -- the
+    // Metal kernel takes the same buffer at a second index), in units of 1/fxScale[g]
+    unsigned  fxMask;
+    float     fxScale[PS_FX_N];
 };
+
+// One 64-bit two's-complement integer q into the two-word cell 'at' of x (metal/ps_deposit.metal addFixedQ): the
+// low word's carry is read off the value its atomic returns, the high words add modulo 2^32, so the words end at
+// the exact integer total whatever the interleaving.
+__device__ __forceinline__ void addFixedQ(unsigned* x, ull at, ull q)
+{
+    if (q == 0ull) return;                          // below half a unit: nothing to add
+    unsigned const lo = unsigned(q), hi = unsigned(q >> 32);
+    unsigned const old = atomicAdd(&x[at * 2ull], lo);
+    unsigned const up = hi + ((old + lo < old) ? 1u : 0u);
+    if (up != 0u)
+        atomicAdd(&x[at * 2ull + 1ull], up);
+}
+
+// One share v of moment grid g at component index 'at' (metal/ps_deposit.metal addMoment): rint(v * scale) into
+// the words when the grid is fixed-point, else the float atomic of before.
+__device__ __forceinline__ void addMoment(float* f, const FieldGrids& G, unsigned g, ull at, float v)
+{
+    if ((G.fxMask >> g) & 1u) addFixedQ(reinterpret_cast<unsigned*>(f), at, ull((long long)(rintf(v * G.fxScale[g]))));
+    else atomicAdd(&f[at], v);
+}
+
+// the FieldGrids' fixed-point fields from the parameters (both kernels)
+__device__ __forceinline__ void setFixed(FieldGrids& G, const DepositParams& P)
+{
+    G.fxMask = P.fxMask;
+    for (int g = 0; g < PS_FX_N; ++g) G.fxScale[g] = P.fxScale[g];
+}
 
 // A mass share into the mass grid (2026-10-11, metal/ps_deposit.metal depositMass; DepositParams.massFixed
 // there says why): the exact 64-bit fixed-point sum (massFixed), else a float atomic. The float atomics
@@ -121,14 +160,8 @@ __device__ __forceinline__ void depositMass(const FieldGrids& G, unsigned flat, 
         atomicAdd(&G.mass[flat], w);
         return;
     }
-    ull const q = ull((long long)(rintf(w * G.massScale)));
-    if (q == 0ull) return;                          // below half a unit: nothing to add
-    unsigned const lo = unsigned(q), hi = unsigned(q >> 32);
-    ull const at = ull(flat) * 2ull;                // 64-bit: a sub-grid may hold up to 2^32 cells
-    unsigned const old = atomicAdd(&G.massFx[at], lo);
-    unsigned const up = hi + ((old + lo < old) ? 1u : 0u);
-    if (up != 0u)
-        atomicAdd(&G.massFx[at + 1ull], up);
+    // (64-bit cell offsets inside addFixedQ: a sub-grid may hold up to 2^32 cells)
+    addFixedQ(G.massFx, ull(flat), ull((long long)(rintf(w * G.massScale))));
 }
 
 __device__ __forceinline__ void depositSample(const FieldGrids& G, unsigned flat,
@@ -148,38 +181,39 @@ __device__ __forceinline__ void depositSample(const FieldGrids& G, unsigned flat
             vv[j]=u0[j];
             for (int i=0;i<3;++i) vv[j]+=vG[i][j]*rel[i];
             if (fVel)
-                atomicAdd(&G.mom[base*3ull+ull(j)], vv[j]*wm);
+                addMoment(G.mom, G, PS_FX_MOM, base*3ull+ull(j), vv[j]*wm);
         }
         if (fDisp) {
             ull c=0;
             for (int i=0;i<3;++i)
                 for (int j=i;j<3;++j)
-                    atomicAdd(&G.m2[base*6ull + c++], w*vv[i]*vv[j]);
+                    addMoment(G.m2, G, PS_FX_M2, base*6ull + c++, w*vv[i]*vv[j]);
             if (fVolW) {
                 for (int j=0;j<3;++j)
-                    atomicAdd(&G.dispvel[base*3ull+ull(j)], vv[j]*w);
-                atomicAdd(&G.dispw[flat], w);
+                    addMoment(G.dispvel, G, PS_FX_DV, base*3ull+ull(j), vv[j]*w);
+                if (((G.fxMask >> PS_FX_DW) & 1u) == 0u)   // (else the mass grid is it)
+                    atomicAdd(&G.dispw[flat], w);
             }
         }
     }
     if (fGrad)
         for (int j=0;j<3;++j)
             for (int i=0;i<3;++i)
-                atomicAdd(&G.grad[base*9ull + ull(j*3+i)], vG[i][j]*wm);
+                addMoment(G.grad, G, PS_FX_GRAD, base*9ull + ull(j*3+i), vG[i][j]*wm);
     if (fScal) {   // the linear scalar profile at the sample, moment-weighted like the velocity
         float sv = s0;
         for (int i=0;i<3;++i) sv += sG[i]*rel[i];
-        atomicAdd(&G.scal[flat], sv*wm);
+        addMoment(G.scal, G, PS_FX_SCAL, base, sv*wm);
     }
     if (fSGrad)
         for (int i=0;i<3;++i)
-            atomicAdd(&G.sgrad[base*3ull + ull(i)], sG[i]*wm);
+            addMoment(G.sgrad, G, PS_FX_SG, base*3ull + ull(i), sG[i]*wm);
     if (fVolW)
-        atomicAdd(&G.momw[flat], wm);
+        addMoment(G.momw, G, PS_FX_MOMW, base, wm);
     if (fCaustic)
         atomicOr(&G.caustic[flat], obits);
     if (fExact)
-        atomicAdd(&G.sv[flat], svShare);
+        addMoment(G.sv, G, PS_FX_SV, base, svShare);
     if (countStream)
         atomicAdd(&G.streams[flat], 1u);
     if (unresolved)
@@ -238,6 +272,7 @@ struct ExactTet {
     float  invCellVol;
     bool   straddle;
     float  wFull;
+    float  wScale;           // the unit of its fixed-point sumW (PS_FX_SUMW_BIT; metal/ps_deposit.metal ExactTet)
 };
 
 __device__ __forceinline__ float exact_full_weight(float vol, bool fLinear, float d0, const float dG[3],
@@ -300,7 +335,7 @@ __device__ void exact_cell_deposit(const FieldGrids& G, unsigned flat, const flo
             vb[j] = E.u0[j];
             for (int i=0; i<3; ++i) vb[j] += E.vG[i][j]*cen[i];
             if (fVel)
-                atomicAdd(&G.mom[base*3ull+ull(j)], vb[j]*wmEx);
+                addMoment(G.mom, G, PS_FX_MOM, base*3ull+ull(j), vb[j]*wmEx);
         }
         if (fDisp) {
             float cov[3][3];
@@ -318,32 +353,33 @@ __device__ void exact_cell_deposit(const FieldGrids& G, unsigned flat, const flo
                     for (int i=0; i<3; ++i)
                         for (int k=0; k<3; ++k)
                             gcg += E.vG[i][a]*cov[i][k]*E.vG[k][b];
-                    atomicAdd(&G.m2[base*6ull + c2++], massShare*(vb[a]*vb[b] + gcg));
+                    addMoment(G.m2, G, PS_FX_M2, base*6ull + c2++, massShare*(vb[a]*vb[b] + gcg));
                 }
             if (fVolW) {
                 for (int j=0;j<3;++j)
-                    atomicAdd(&G.dispvel[base*3ull+ull(j)], vb[j]*massShare);
-                atomicAdd(&G.dispw[flat], massShare);
+                    addMoment(G.dispvel, G, PS_FX_DV, base*3ull+ull(j), vb[j]*massShare);
+                if (((G.fxMask >> PS_FX_DW) & 1u) == 0u)   // (else the mass grid is it)
+                    atomicAdd(&G.dispw[flat], massShare);
             }
         }
     }
     if (fGrad)
         for (int j=0; j<3; ++j)
             for (int i=0; i<3; ++i)
-                atomicAdd(&G.grad[base*9ull + ull(j*3+i)], E.vG[i][j]*wmEx);
+                addMoment(G.grad, G, PS_FX_GRAD, base*9ull + ull(j*3+i), E.vG[i][j]*wmEx);
     if (fScal) {   // exact mean of the linear scalar profile over the piece (the velocity's construction)
         float sb = E.s0;
         for (int i=0; i<3; ++i) sb += E.sG[i]*cen[i];
-        atomicAdd(&G.scal[flat], sb*wmEx);
+        addMoment(G.scal, G, PS_FX_SCAL, base, sb*wmEx);
     }
     if (fSGrad)
         for (int i=0; i<3; ++i)
-            atomicAdd(&G.sgrad[base*3ull + ull(i)], E.sG[i]*wmEx);
+            addMoment(G.sgrad, G, PS_FX_SG, base*3ull + ull(i), E.sG[i]*wmEx);
     if (fVolW)
-        atomicAdd(&G.momw[flat], wmEx);
+        addMoment(G.momw, G, PS_FX_MOMW, base, wmEx);
     if (fCaustic)
         atomicOr(&G.caustic[flat], E.obits);
-    atomicAdd(&G.sv[flat], mo[0]*E.invCellVol);
+    addMoment(G.sv, G, PS_FX_SV, base, mo[0]*E.invCellVol);
     atomicAdd(&G.streams[flat], 1u);
 }
 
@@ -560,6 +596,7 @@ depositFields(const float* __restrict__ verts, const float* __restrict__ vels, f
     G.momw = momwGrid; G.caustic = caustGrid; G.sv = svGrid; G.dispvel = dvGrid; G.dispw = dwGrid;
     G.scal = scalGrid; G.sgrad = sgGrid;
     G.massFx = massFxGrid; G.massScale = P.massScale; G.massFixed = P.massFixed != 0;
+    setFixed(G, P);
 
     bool const fVolW = P.fVolW != 0, fCaustic = P.fCaustic != 0, fExact = P.fExact != 0;
     float const mw = fVolW ? fabsf(d)/6.0f : m;
@@ -584,7 +621,8 @@ depositFields(const float* __restrict__ verts, const float* __restrict__ vels, f
         iMin[dd] = ic0[dd] + int(floorf(f0[dd] + lo / P.dx[dd]));
         iMax[dd] = ic0[dd] + int(floorf(f0[dd] + hi / P.dx[dd])) + 1;
         if (!P.periodic && (iMin[dd] < 0 || iMax[dd] > P.nGrid[dd])) straddle = true;
-        if (P.nSub>1 && !fExact) { iMin[dd]-=1; iMax[dd]+=1; }
+        // no one-cell sample margin (2026-10-11, as metal/ps_deposit.metal): every sub-sample lies
+        // >= 1/(2 nSub) inside its cell, so the ring's samples were all outside the tet
         iMinC[dd] = iMin[dd]; iMaxC[dd] = iMax[dd];
         if (!P.periodic) {
             if (iMinC[dd] < 0)           iMinC[dd] = 0;
@@ -831,6 +869,18 @@ __device__ bool exact_tet_setup(unsigned tet, const float* verts, const float* v
     E.faces = tet_planes(E.t1, E.t2, E.t3);
     E.hcell = v3(0.5f*P.dx[0], 0.5f*P.dx[1], 0.5f*P.dx[2]);
     E.wFull = exact_full_weight(fabsf(d)/6.0f, P.fLinear != 0, E.d0, E.dG, E.t1, E.t2, E.t3);
+    E.wScale = 1.0f;
+    if ((P.fxMask & PS_FX_SUMW_BIT) != 0u) {   // (metal/ps_deposit.metal exact_tet_setup)
+        float wb = fabsf(d)/6.0f;
+        if (P.fLinear != 0) {
+            float dMax = 0.0f;
+            for (int v=0; v<4; ++v) dMax = fmaxf(dMax, fabsf(dens[ull(tet)*4ull+ull(v)]));
+            wb *= dMax;
+        }
+        int e = 0;
+        (void)frexpf(wb, &e);                      // wb < 2^e
+        E.wScale = (wb > 0.0f && isfinite(wb)) ? ldexpf(1.0f, min(max(59 - e, -126), 126)) : 1.0f;
+    }
     return true;
 }
 
@@ -849,8 +899,9 @@ depositExactItems(const float* __restrict__ verts, const float* __restrict__ vel
     float const m = masses[tet];
     if (m <= 0.0f) return;
     bool const deposit = IP.phase == 1u;
+    bool const sumWFixed = (P.fxMask & PS_FX_SUMW_BIT) != 0u;
     float s = 0.0f;
-    if (deposit) {
+    if (deposit && !sumWFixed) {
         s = sumW[tet];               // written by phase 0's kernel, complete before this launch
         if (!(s > 0.0f)) return;
     }
@@ -858,6 +909,13 @@ depositExactItems(const float* __restrict__ verts, const float* __restrict__ vel
     ExactTet E;
     int iMin[3], iMax[3];
     if (!exact_tet_setup(tet, verts, vels, dens, scal, P, E, iMin, iMax)) return;
+    if (deposit && sumWFixed) {      // the exact total in the tet's own unit (two words), as the Metal kernel forms it
+        unsigned const* x = reinterpret_cast<unsigned const*>(sumW);
+        unsigned const lo = x[ull(tet)*2ull];
+        int const hi = int(x[ull(tet)*2ull+1ull]);
+        if (hi < 0 || (hi == 0 && lo == 0u)) return;
+        s = (float(hi) * 4294967296.0f + float(lo)) / E.wScale;
+    }
     float const shareFac = deposit ? m / ((E.straddle || P.windowMode != 0) ? fmaxf(s, E.wFull) : s) : 0.0f;
     ull const n1 = ull(max(iMax[1] - iMin[1], 0));
     ull const n2 = ull(max(iMax[2] - iMin[2], 0));
@@ -879,6 +937,7 @@ depositExactItems(const float* __restrict__ verts, const float* __restrict__ vel
     G.momw = momwGrid; G.caustic = caustGrid; G.sv = svGrid; G.dispvel = dvGrid; G.dispw = dwGrid;
     G.scal = scalGrid; G.sgrad = sgGrid;
     G.massFx = massFxGrid; G.massScale = P.massScale; G.massFixed = P.massFixed != 0;
+    setFixed(G, P);
     float acc = 0.0f;
     for (; w < wEnd; ++w) {
         int const raw[3] = { iMin[0] + a0, iMin[1] + a1, iMin[2] + a2 };
@@ -891,8 +950,10 @@ depositExactItems(const float* __restrict__ verts, const float* __restrict__ vel
         if (!deposit) acc += wt;
         else exact_cell_deposit(G, flat, mo, wt * shareFac, E, fVel, fDisp, fGrad, fVolW, fCaustic, fScal, fSGrad, cc);
     }
-    if (!deposit && acc > 0.0f)
-        atomicAdd(&sumW[tet], acc);
+    if (!deposit && acc > 0.0f) {
+        if (sumWFixed) addFixedQ(reinterpret_cast<unsigned*>(sumW), ull(tet), ull((long long)(rintf(acc * E.wScale))));
+        else atomicAdd(&sumW[tet], acc);
+    }
 }
 
 // gathers n records of 'stride' floats: dst[k] = src[idx[k]] (the compact leftovers)
@@ -955,6 +1016,27 @@ float* devUpload(const void* src, size_t bytes, const char* what, std::string& e
 
 inline unsigned blocksFor(size_t n, int tpb) { return unsigned((n + size_t(tpb) - 1) / size_t(tpb)); }
 
+
+// ---- chunk-level checkpoints and the cause-aware retry policy (2026-10-11, ported from ps_metal_host.cc) ----
+// A failed kernel used to redo the WHOLE partition deposit (three times, from re-zeroed grids). Now every
+// pass keeps a host-side snapshot of the device buffers its kernel writes (the accumulator grids, the exact
+// items' sumW, the per-tet masses the kernel negates when it defers a tet), taken at the pass's start and
+// every DTFE_GPU_CHECKPOINT_CHUNKS kernels; a failed kernel (which may have deposited part or all of its
+// atomics) restores the last snapshot and continues from its chunk. The snapshot is a device-to-host copy
+// (the Metal host memcpy's its unified memory), so each checkpoint costs a PCIe round of the grids. The
+// policy's pieces (GpuFault, the error codes, the pace, the fault hook, GpuSnapshot) live in gpu_cuda_retry.cuh
+// since 2026-10-13, shared with the standard-DTFE host (dtfe_gpu_cuda.cu); the pass loop is
+// psGpuDepositFields' runChunked below.
+#include "gpu_cuda_retry.cuh"
+
+// the run's retry counters (ps_interpolation.cc's), by gpuRetryCause's index
+void countGpuRetry(GpuFault f, gpuError_t code)
+{
+    int const k = gpuRetryCause(f, code);
+    ++psGpuRetries;
+    ++psGpuRetriesByCause[k];
+}
+
 } // namespace
 
 
@@ -978,6 +1060,7 @@ bool psGpuDepositFields(std::vector<float>& verts,
                         int nSub, bool periodic,
                         bool fVel, bool fDisp, bool fGrad, bool fLinear,
                         bool fVolW, bool fCaustic, bool fExact, bool fScal, bool fSGrad, bool windowMode,
+                        double massExtra, PSFixedUnits const& fxUnits,
                         PSGpuGrids& out, std::vector<uint32_t>& deferred, std::string& err)
 {
     std::lock_guard<std::mutex> lock(ctxMutex());   // serialize dispatches (one device)
@@ -985,31 +1068,74 @@ bool psGpuDepositFields(std::vector<float>& verts,
     if (!c.ready) { err = c.err; return false; }
 
     size_t const nCell = subDims[0] * subDims[1] * subDims[2];
-    size_t const momBytes  = fVel  ? nCell * 12 : 4;
-    size_t const m2Bytes   = fDisp ? nCell * 24 : 4;
-    size_t const gradBytes = fGrad ? nCell * 36 : 4;
-    size_t const momwBytes  = fVolW    ? nCell * 4 : 4;
-    size_t const caustBytes = fCaustic ? nCell * 4 : 4;
-    size_t const svBytes    = fExact   ? nCell * 4 : 4;
+    // a grid the caller gave a fixed-point unit (fxUnits, 2026-10-14; ps_metal_host.cc) is a 64-bit integer sum:
+    // 8 B per component in place of the float's 4
     bool   const fDispOwn   = fVolW && fDisp;
-    size_t const dvBytes    = fDispOwn ? nCell * 12 : 4;
-    size_t const dwBytes    = fDispOwn ? nCell * 4  : 4;
-    size_t const scalBytes  = fScal  ? nCell * 4  : 4;
-    size_t const sgBytes    = fSGrad ? nCell * 12 : 4;
-    out.mass.assign(nCell, 0.f);
-    out.mom.assign(fVel ? nCell * 3 : 0, 0.f);
-    out.m2.assign(fDisp ? nCell * 6 : 0, 0.f);
-    out.grad.assign(fGrad ? nCell * 9 : 0, 0.f);
+    bool const sel[PS_FX_N] = { fVel, fDisp, fGrad, fVolW, fExact, fDispOwn, false, fScal, fSGrad };
+    bool fxOn[PS_FX_N];
+    uint32_t fxMask = 0;
+    for (int g = 0; g < PS_FX_N; ++g)
+    {
+        fxOn[g] = sel[g] && fxUnits.scale[g] > 0.f;
+        if (fxOn[g]) fxMask |= 1u << g;
+    }
+    auto gridBytes4 = [&](int g, size_t comps) -> size_t { return sel[g] ? nCell * comps * (fxOn[g] ? 8 : 4) : 4; };
+    size_t const momBytes  = gridBytes4(PS_FX_MOM, 3);
+    size_t const m2Bytes   = gridBytes4(PS_FX_M2, 6);
+    size_t const gradBytes = gridBytes4(PS_FX_GRAD, 9);
+    size_t const momwBytes  = gridBytes4(PS_FX_MOMW, 1);
+    size_t const caustBytes = fCaustic ? nCell * 4 : 4;
+    size_t const svBytes    = gridBytes4(PS_FX_SV, 1);
+    size_t const dvBytes    = gridBytes4(PS_FX_DV, 3);
+    size_t const scalBytes  = gridBytes4(PS_FX_SCAL, 1);
+    size_t const sgBytes    = gridBytes4(PS_FX_SG, 3);
+    // the mass grid as an exact 64-bit fixed-point sum (2026-10-11, as ps_metal_host.cc since 2026-10-08;
+    // depositMass says why). PS_GPU_FLOAT_MASS=1 (or the Metal spelling PS_METAL_FLOAT_MASS=1) keeps the
+    // float atomics of before, for comparison. The unit covers the caller's own deposits too (massExtra,
+    // 2026-10-12): it adds the deferred and released tets into these words.
+    float massScale = 1.f;
+    bool massFixed = false;
+    {
+        double totalMass = massExtra > 0. ? massExtra : 0.;
+        for (float const mt : masses) totalMass += double(mt);
+        auto envOn = [](const char* n) { const char* e = getenv(n); return e && atoi(e) != 0; };
+        bool const floatMass = envOn("PS_GPU_FLOAT_MASS") || envOn("PS_METAL_FLOAT_MASS");
+        massFixed = !floatMass && psMassFixedScale(totalMass, massScale);
+    }
+    // dispw sums exactly the mass grid's shares: with both exact it is not deposited (ps_metal_host.cc)
+    bool const dispwIsMass = fDispOwn && massFixed && fxUnits.scale[PS_FX_DW] > 0.f;
+    if (dispwIsMass) fxMask |= 1u << PS_FX_DW;
+    size_t const dwBytes    = (fDispOwn && !dispwIsMass) ? nCell * 4 : 4;
+    bool const sumWFixed = fExact && fxUnits.sumW;
+    if (sumWFixed) fxMask |= PS_FX_SUMW_BIT;
+    size_t const sumWBytes = sumWFixed ? 8 : sizeof(float);   // per tet
+    out.dispwIsMass = dispwIsMass;
+    for (int g = 0; g < PS_FX_N; ++g) { out.fx[g].clear(); out.fxScale[g] = fxOn[g] ? fxUnits.scale[g] : 0.f; }
+    // fixed point: the words are handed over as they are (out.massFx, copied from the device grid at the end;
+    // 'mass' stays empty), else the float grid
+    out.mass.assign(massFixed ? 0 : nCell, 0.f);
+    out.massFx.clear();
+    out.massScale = massFixed ? massScale : 0.f;
+    // a fixed-point grid comes back as words (out.fx[g]) and leaves its float vector EMPTY
+    out.mom.assign(fVel && !fxOn[PS_FX_MOM] ? nCell * 3 : 0, 0.f);
+    out.m2.assign(fDisp && !fxOn[PS_FX_M2] ? nCell * 6 : 0, 0.f);
+    out.grad.assign(fGrad && !fxOn[PS_FX_GRAD] ? nCell * 9 : 0, 0.f);
     out.streams.assign(nCell, 0u);
-    out.momw.assign(fVolW ? nCell : 0, 0.f);
+    out.momw.assign(fVolW && !fxOn[PS_FX_MOMW] ? nCell : 0, 0.f);
     out.caustic.assign(fCaustic ? nCell : 0, 0u);
-    out.streamvol.assign(fExact ? nCell : 0, 0.f);
-    out.dispvel.assign(fDispOwn ? nCell * 3 : 0, 0.f);
-    out.dispw.assign(fDispOwn ? nCell : 0, 0.f);
-    out.scal.assign(fScal ? nCell : 0, 0.f);
-    out.sgrad.assign(fSGrad ? nCell * 3 : 0, 0.f);
+    out.streamvol.assign(fExact && !fxOn[PS_FX_SV] ? nCell : 0, 0.f);
+    out.dispvel.assign(fDispOwn && !fxOn[PS_FX_DV] ? nCell * 3 : 0, 0.f);
+    out.dispw.assign(fDispOwn && !dispwIsMass ? nCell : 0, 0.f);
+    out.scal.assign(fScal && !fxOn[PS_FX_SCAL] ? nCell : 0, 0.f);
+    out.sgrad.assign(fSGrad && !fxOn[PS_FX_SG] ? nCell * 3 : 0, 0.f);
+    static size_t const fxComps[PS_FX_N] = { 3, 6, 9, 1, 1, 3, 1, 1, 3 };
     deferred.clear();
-    if (masses.empty()) return true;
+    if (masses.empty())                 // nothing to deposit (the caller may still add released tets)
+    {
+        if (massFixed) out.massFx.assign(nCell, 0);
+        for (int g = 0; g < PS_FX_N; ++g) if (fxOn[g]) out.fx[g].assign(nCell * fxComps[g], 0);
+        return true;
+    }
     if (verts.size() != masses.size() * size_t(PS_TET_STRIDE))
     {
         err = "tet record size mismatch (verts must hold PS_TET_STRIDE floats per tet)";
@@ -1039,19 +1165,10 @@ bool psGpuDepositFields(std::vector<float>& verts,
     P.fScal    = (fScal  && !scal.empty()) ? 1 : 0;
     P.fSGrad   = (fSGrad && !scal.empty()) ? 1 : 0;
     P.windowMode = windowMode ? 1 : 0;
-    // the mass grid as an exact 64-bit fixed-point sum (2026-10-11, as ps_metal_host.cc since 2026-10-08;
-    // depositMass says why). PS_GPU_FLOAT_MASS=1 (or the Metal spelling PS_METAL_FLOAT_MASS=1) keeps the
-    // float atomics of before, for comparison.
-    {
-        double totalMass = 0.;
-        for (float const mt : masses) totalMass += double(mt);
-        float scale = 1.f;
-        auto envOn = [](const char* n) { const char* e = getenv(n); return e && atoi(e) != 0; };
-        bool const floatMass = envOn("PS_GPU_FLOAT_MASS") || envOn("PS_METAL_FLOAT_MASS");
-        P.massFixed = (!floatMass && psMassFixedScale(totalMass, scale)) ? 1 : 0;
-        P.massScale = scale;
-    }
-    bool const massFixed = P.massFixed != 0;
+    P.massFixed = massFixed ? 1 : 0;   // (the unit is chosen above)
+    P.massScale = massScale;
+    P.fxMask = fxMask;                 // the moment grids' fixed-point sums (the caller's units, above)
+    for (int g = 0; g < PS_FX_N; ++g) P.fxScale[g] = fxOn[g] ? fxUnits.scale[g] : 0.f;
     size_t const massBytes   = massFixed ? 4 : nCell * 4;   // the float grid, else a dummy
     size_t const massFxBytes = massFixed ? nCell * 8 : 4;   // the fixed-point grid, else a dummy
     size_t const nTetTotal = masses.size();
@@ -1150,7 +1267,7 @@ bool psGpuDepositFields(std::vector<float>& verts,
     if (dSG && useItems)
     {
         dItems = devUpload(items.data(), items.size() * sizeof(uint32_t), "upload exact items", err);
-        dSumW  = dItems ? devAlloc(std::max<size_t>(nTetTotal, 1) * sizeof(float), "per-tet weight totals", err) : nullptr;
+        dSumW  = dItems ? devAlloc(std::max<size_t>(nTetTotal, 1) * sumWBytes, "per-tet weight totals", err) : nullptr;
         if (!dItems || !dSumW)
         {   // too big for the device: the one-thread-per-tet kernel still works
             if (dItems) gpuFree(dItems);
@@ -1176,47 +1293,169 @@ bool psGpuDepositFields(std::vector<float>& verts,
     // Dispatch in CHUNKS, one short kernel each, serialized. The chunk controller is the one the
     // Metal host uses (ps_metal_host.cc): it bounds the kernel's duration -- a display-attached
     // Linux GPU kills kernels after a few seconds -- and adapts the chunk toward targetSec. A killed
-    // kernel may have PARTIALLY deposited its atomics, so a failed chunk is never retried alone:
-    // each retry re-zeros the grids and redoes the whole deposit with shorter kernels. (A kernel
-    // timeout is a STICKY error in CUDA: the retries then fail too and the caller's CPU fallback
-    // takes over for this and every later partition of the process.) The idle gap between
-    // kernels, which the Metal host needs for the window server, is zero here.
+    // kernel may have PARTIALLY deposited its atomics, so a failed chunk is never retried alone: the
+    // pass restores its last snapshot (the pass's start, or a periodic checkpoint) and continues from
+    // there (2026-10-11, the Metal host's policy; before, each retry re-zeroed the grids and redid the
+    // whole deposit). The retry depends on the cause (GpuFault above); the partition goes to the CPU
+    // deposit in the caller only when one chunk fails 3 times, on a sticky error (the context is lost:
+    // CUDA's launch timeout is one, so a real watchdog kill still ends there), or when no snapshot can
+    // be held. The idle gap between kernels, which the Metal host needs for the window server, is zero
+    // until a failure escalates the pace, and again once a clean stretch has eased it back (GpuPace).
     // PS_GPU_CHUNK=<n> (or PS_METAL_CHUNK) overrides the starting chunk size of the per-tet kernel.
     size_t const MIN_CHUNK = fExact ? 50 : 2000;
     size_t const MAX_CHUNK = 500000;
-    double targetSec = 0.25;
-    useconds_t gapUs = 0;
+    GpuPace& pace = gpuPace();
     size_t baseChunk = fExact ? 500 : 25000;
     if (const char* env = getenv("PS_GPU_CHUNK"))   { long v = atol(env); if (v > 0) baseChunk = size_t(v); }
     if (const char* env = getenv("PS_METAL_CHUNK")) { long v = atol(env); if (v > 0) baseChunk = size_t(v); }
+    // an escalated pace (an earlier partition's failures) opens with a proportionally smaller chunk
+    if (pace.targetSec < 0.25)
+        baseChunk = std::max(size_t(double(baseChunk) * pace.targetSec / 0.25), MIN_CHUNK);
     std::string lastErr;
     int const tpb = 256;
 
-    auto runChunked = [&](const char* name, size_t nThreads, size_t firstChunk, size_t minChunk, auto&& launch) -> bool
+    // DTFE_GPU_CHECKPOINT_CHUNKS=<n>: a checkpoint every n kernels (0 = only the pass-start snapshot).
+    // Unset: every ~10 s of GPU work (n = 10 s / the current kernel target). A checkpoint copies the
+    // accumulator grids (~24 B per cell for density + velocity) device-to-host into ONE spare host copy,
+    // allocated at the first checkpoint and held until the partition's deposit returns.
+    long ckChunks = -1;
+    if (const char* env = getenv("DTFE_GPU_CHECKPOINT_CHUNKS")) { ckChunks = atol(env); if (ckChunks < 0) ckChunks = 0; }
+    // DTFE_GPU_PACE_RECOVER_SEC=<s>: the clean GPU work after which an escalated pace steps back (GpuPace above)
+    double paceRecoverSec = 90.;
+    if (const char* env = getenv("DTFE_GPU_PACE_RECOVER_SEC")) { double v = atof(env); if (v >= 0.) paceRecoverSec = v; }
+    std::vector<DevBuf> const gridBufs = {
+        { dMass, massBytes }, { dMassFx, massFxBytes }, { dMom, momBytes }, { dM2, m2Bytes }, { dGrad, gradBytes },
+        { dStr, nCell * 4 }, { dMomW, momwBytes }, { dCaust, caustBytes }, { dSV, svBytes }, { dDV, dvBytes },
+        { dDW, dwBytes }, { dScal, scalBytes }, { dSG, sgBytes } };
+    GpuSnapshot snap;
+    int nFailed = 0, nResumedCk = 0;   // failed kernels of this deposit, and how many resumed from a periodic checkpoint
+    int const MAX_FAILS_SAME_CHUNK = 3, MAX_FAILS_TOTAL = 16;
+
+    // One paced, chunked run of a kernel over nThreads threads; launch(start, n) launches the chunk
+    // [start, start+n). 'extras' are the non-grid buffers the kernel WRITES (sumW, the per-tet masses
+    // it negates); gridsZero: the grids are all zero at the pass's start (snapshotted as such, without
+    // a copy); gridsKeepZero: the pass never writes them (the exact items' phase 0), so its periodic
+    // checkpoints skip them too. False (lastErr set) when the pass gave up (the caller falls back).
+    auto runChunked = [&](const char* name, size_t nThreads, size_t firstChunk, size_t minChunk,
+                          std::vector<DevBuf> const& extras, bool gridsZero, bool gridsKeepZero, auto&& launch) -> bool
     {
         size_t chunk = std::max(firstChunk, minChunk);
-        size_t start = 0, nBuf = 0;
+        size_t start = 0, nBuf = 0, sinceCk = 0;
         double busy = 0.;
         auto const tRun = std::chrono::steady_clock::now();
+        std::vector<DevBuf> ckBufs = gridBufs;
+        ckBufs.insert(ckBufs.end(), extras.begin(), extras.end());
+        std::vector<bool> zeroMask(ckBufs.size(), false);
+        if (gridsZero) std::fill(zeroMask.begin(), zeroMask.begin() + gridBufs.size(), true);
+        GpuSnapshot::Took const took = snap.take(ckBufs, zeroMask, 0, lastErr);
+        if (took == GpuSnapshot::DeviceError) return false;
+        bool ckOn = took == GpuSnapshot::Ok;
+        bool ckPeriodic = false;           // the held snapshot is a periodic checkpoint (not the pass start)
+        // failures of the 'same chunk': a failure that comes before the redo got past the previous failed
+        // kernel's end (chunk boundaries move with the timing controller, so a start offset is no identity)
+        int  failsHere = 0;
+        size_t failEnd = 0;
         while (start < nThreads)
         {
             uint32_t const n = uint32_t(std::min(chunk, nThreads - start));
             auto t0 = std::chrono::steady_clock::now();
             launch(start, n);
-            if (!gpuCheck(gpuGetLastError(), "kernel launch", lastErr) || !gpuCheck(gpuDeviceSynchronize(), name, lastErr))
-                return false;
+            gpuError_t code = gpuGetLastError();
+            if (code == gpuSuccess) code = gpuDeviceSynchronize();
             double const el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+
+            std::string desc;
+            GpuFault cause = GpuFault::Resource;
+            bool const realError = code != gpuSuccess;
+            bool failed = realError;
+            if (realError)
+            {
+                desc = gpuGetErrorString(code);
+                cause = code == kGpuErrTimeout ? GpuFault::Watchdog : GpuFault::Resource;
+            }
+            else failed = gpuFaultInjected(desc, cause, code);   // the test hook (the kernel DID deposit)
+
+            if (failed)
+            {
+                ++nFailed;
+                countGpuRetry(cause, code);   // the run's counters count every failed kernel (run_progress.h)
+                lastErr = std::string(GPU_BACKEND_STRING " kernel ") + name + " failed: " + desc + " [" + gpuFaultName(cause) + "]";
+                failsHere = (failsHere > 0 && start < failEnd) ? failsHere + 1 : 1;
+                failEnd = std::max(failEnd, start + n);
+                if (realError)
+                {   // a real error: a sticky one has lost the context, the probe returns it again
+                    (void)gpuGetLastError();
+                    if (gpuDeviceSynchronize() != gpuSuccess)
+                    {
+                        cause = GpuFault::Fatal;
+                        lastErr += " (sticky: the device context is lost)";
+                    }
+                }
+                if (cause == GpuFault::Fatal || !ckOn || failsHere >= MAX_FAILS_SAME_CHUNK || nFailed >= MAX_FAILS_TOTAL)
+                {
+                    if (!ckOn) lastErr += " (no checkpoint held)";
+                    else if (failsHere >= MAX_FAILS_SAME_CHUNK) lastErr += " (" + std::to_string(failsHere) + " failures of the same chunk)";
+                    else if (nFailed >= MAX_FAILS_TOTAL) lastErr += " (" + std::to_string(nFailed) + " failed kernels in this deposit)";
+                    return false;
+                }
+                if (cause != GpuFault::Victim)
+                {   // escalate (for the rest of the process): 4x shorter kernels, gaps of 8-50 ms, smaller chunk
+                    pace.targetSec = std::max(pace.targetSec / 4.0, 0.02);
+                    pace.gapUs     = std::min(std::max(pace.gapUs * 3, GPU_PACE_GAP_MIN), useconds_t(50000));
+                    pace.cleanSec  = 0.;
+                    chunk = std::max(chunk / 4, minChunk);
+                    baseChunk = std::max(baseChunk / 2, MIN_CHUNK);
+                }
+                std::string const why = lastErr;
+                if (!snap.restore(lastErr)) { lastErr = why + " -- " + lastErr; return false; }
+                if (ckPeriodic) ++nResumedCk;
+                fprintf(stderr, "%sPS-DTFE %s: %s -- resuming from the %s at thread %zu of %zu "
+                                "(redoing %zu; failure %d of this chunk, target %.0f ms kernels, %.0f ms gaps)%s\n",
+                        MESSAGE::cYellow(), GPU_BACKEND_STRING, lastErr.c_str(), ckPeriodic ? "checkpoint" : "pass start",
+                        snap.start, nThreads, start + n - snap.start, failsHere,
+                        pace.targetSec * 1e3, pace.gapUs / 1e3, MESSAGE::cReset());
+                start = snap.start;
+                sinceCk = 0;
+                // an innocent victim retries at once; our own kernels' failures let the device settle first
+                if (cause == GpuFault::Resource) sleep(2);
+                else if (cause == GpuFault::Watchdog) sleep(1);
+                continue;
+            }
+
             start += n;
             ++nBuf;
+            ++sinceCk;
             busy += el;
-            if (el > 1e-4)
+            if (el > 1e-4)   // retarget the next chunk toward targetSec (bounded rescale)
             {
-                double scale = targetSec / el;
+                double scale = pace.targetSec / el;
                 if (scale < 0.5) scale = 0.5;
                 if (scale > 4.0) scale = 4.0;
                 chunk = std::min(std::max(size_t(double(chunk) * scale), minChunk), MAX_CHUNK);
             }
-            if (gapUs) usleep(gapUs);
+            if (pace.targetSec < GPU_PACE_TARGET0 || pace.gapUs > GPU_PACE_GAP0)
+            {   // an escalated pace steps back after a clean stretch of GPU work (GpuPace above)
+                pace.cleanSec += el + pace.gapUs / 1e6;
+                if (pace.cleanSec >= paceRecoverSec)
+                {
+                    pace.targetSec = std::min(pace.targetSec * 4.0, GPU_PACE_TARGET0);
+                    pace.gapUs     = pace.gapUs / 3 < GPU_PACE_GAP_MIN ? GPU_PACE_GAP0 : pace.gapUs / 3;
+                    fprintf(stderr, "PS-DTFE %s: %.0f s of GPU work without a fault -- pace eased to %.0f ms "
+                                    "kernels, %.0f ms gaps%s\n", GPU_BACKEND_STRING, pace.cleanSec, pace.targetSec * 1e3,
+                            pace.gapUs / 1e3,
+                            pace.targetSec >= GPU_PACE_TARGET0 && pace.gapUs <= GPU_PACE_GAP0 ? " (the default)" : "");
+                    pace.cleanSec = 0.;
+                }
+            }
+            long const every = ckChunks >= 0 ? ckChunks : std::max(1L, long(std::lround(10.0 / pace.targetSec)));
+            if (ckOn && every > 0 && long(sinceCk) >= every && start < nThreads)
+            {   // synchronized above: the buffers hold exactly [0, start)
+                GpuSnapshot::Took const t = snap.take(ckBufs, gridsKeepZero ? zeroMask : std::vector<bool>(), start, lastErr);
+                if (t == GpuSnapshot::DeviceError) return false;
+                if (t == GpuSnapshot::Ok) { ++snap.taken; ckPeriodic = true; sinceCk = 0; }
+                // else: no host memory for the spare copy; the last snapshot stays valid
+            }
+            if (pace.gapUs) usleep(pace.gapUs);
         }
         if (timing)
             fprintf(stderr, "PS-DTFE %s: %-17s %10zu threads  %6zu kernels  %8.3f s busy  %8.3f s wall\n",
@@ -1225,10 +1464,14 @@ bool psGpuDepositFields(std::vector<float>& verts,
         return true;
     };
 
-    // depositFields over the tets [0,nT) of the given records (per-tet buffers at the chunk's offset)
-    auto runPerTet = [&](const float* vB, const float* uB, float* mB, const float* dB, const float* sB, size_t nT) -> bool
+    // depositFields over the tets [0,nT) of the given records (per-tet buffers at the chunk's offset).
+    // The kernel negates the masses of the tets it defers, so mB is part of the snapshot: a redo then
+    // runs exactly the same code path.
+    auto runPerTet = [&](const float* vB, const float* uB, float* mB, const float* dB, const float* sB, size_t nT,
+                         bool gridsZero) -> bool
     {
-        return runChunked("depositFields", nT, baseChunk, MIN_CHUNK, [&](size_t start, uint32_t n)
+        return runChunked("depositFields", nT, baseChunk, MIN_CHUNK, { { mB, nT * sizeof(float) } }, gridsZero, false,
+                          [&](size_t start, uint32_t n)
         {
             DepositParams Pc = P;
             Pc.nTet = n;
@@ -1243,7 +1486,11 @@ bool psGpuDepositFields(std::vector<float>& verts,
 
     auto runItems = [&](uint32_t phase) -> bool
     {
-        return runChunked("depositExactItems", nItems, 8192, 1024, [&](size_t start, uint32_t n)
+        // phase 0 writes only sumW (the grids are still zero), phase 1 only the grids (sumW is read)
+        std::vector<DevBuf> extras;
+        if (phase == 0) extras.push_back({ dSumW, nTetTotal * sumWBytes });
+        return runChunked("depositExactItems", nItems, 8192, 1024, extras, true, phase == 0,
+                          [&](size_t start, uint32_t n)
         {
             ExactItemParams const IP{ n, phase, blockCells, 0u };
             GPU_LAUNCH(depositExactItems, blocksFor(n, tpb), tpb, 0,
@@ -1258,12 +1505,19 @@ bool psGpuDepositFields(std::vector<float>& verts,
     // deferrals are written back into the masses (host mirror AND device copy).
     auto runLeftovers = [&]() -> bool
     {
-        std::vector<float> sw(nTetTotal);
-        if (!gpuCheck(gpuMemcpy(sw.data(), dSumW, nTetTotal * sizeof(float), gpuMemcpyDeviceToHost), "read weight totals", lastErr))
+        // the per-tet totals: floats, or (sumWFixed) the int64 words -- 8 B each, read through a double-sized float
+        // vector so the one buffer serves both
+        std::vector<float> sw(nTetTotal * (sumWFixed ? 2 : 1));
+        if (!gpuCheck(gpuMemcpy(sw.data(), dSumW, nTetTotal * sumWBytes, gpuMemcpyDeviceToHost), "read weight totals", lastErr))
             return false;
         std::vector<uint32_t> left;
         for (size_t t = 0; t < nTetTotal; ++t)
-            if (hostMass[t] > 0.f && !(sw[t] > 0.f)) left.push_back(uint32_t(t));
+        {
+            bool has = false;
+            if (sumWFixed) { int64_t q; std::memcpy(&q, &sw[2 * t], 8); has = q > 0; }
+            else has = sw[t] > 0.f;
+            if (hostMass[t] > 0.f && !has) left.push_back(uint32_t(t));
+        }
         if (left.empty()) return true;
         size_t const nL = left.size();
         bool const compact = nL <= nTetTotal / 16;
@@ -1295,7 +1549,7 @@ bool psGpuDepositFields(std::vector<float>& verts,
             ok = lM != nullptr;
         }
         if (!ok && lastErr.empty()) lastErr = GPU_BACKEND_STRING " allocation failed (exact-deposit leftovers)";
-        if (ok) ok = runPerTet(lV, lU, lM, lD, lS, compact ? nL : nTetTotal);
+        if (ok) ok = runPerTet(lV, lU, lM, lD, lS, compact ? nL : nTetTotal, false);
         if (ok)
         {
             std::vector<float> lm(compact ? nL : nTetTotal);
@@ -1316,47 +1570,24 @@ bool psGpuDepositFields(std::vector<float>& verts,
         return ok;
     };
 
-    int const maxAttempts = 3;
-    bool success = false;
-    for (int attempt = 0; attempt < maxAttempts && !success; ++attempt)
-    {
-        bool zeroed = gpuCheck(gpuMemset(dMass, 0, massBytes), "zero grids", lastErr)
-                   && gpuCheck(gpuMemset(dMassFx, 0, massFxBytes), "zero grids", lastErr)
-                   && gpuCheck(gpuMemset(dMom,  0, momBytes), "zero grids", lastErr)
-                   && gpuCheck(gpuMemset(dM2,   0, m2Bytes), "zero grids", lastErr)
-                   && gpuCheck(gpuMemset(dGrad, 0, gradBytes), "zero grids", lastErr)
-                   && gpuCheck(gpuMemset(dStr,  0, nCell * 4), "zero grids", lastErr)
-                   && gpuCheck(gpuMemset(dMomW, 0, momwBytes), "zero grids", lastErr)
-                   && gpuCheck(gpuMemset(dCaust, 0, caustBytes), "zero grids", lastErr)
-                   && gpuCheck(gpuMemset(dSV,   0, svBytes), "zero grids", lastErr)
-                   && gpuCheck(gpuMemset(dDV,   0, dvBytes), "zero grids", lastErr)
-                   && gpuCheck(gpuMemset(dDW,   0, dwBytes), "zero grids", lastErr)
-                   && gpuCheck(gpuMemset(dScal, 0, scalBytes), "zero grids", lastErr)
-                   && gpuCheck(gpuMemset(dSG,   0, sgBytes), "zero grids", lastErr);
-        if (!zeroed) break;
-
-        if (useItems)
-            success = gpuCheck(gpuMemset(dSumW, 0, nTetTotal * sizeof(float)), "zero weight totals", lastErr)
-                   && runItems(0) && runItems(1) && runLeftovers();
-        else
-            success = runPerTet(dV, dU, dM, dD, dSc, nTetTotal);
-
-        if (!success)
-        {
-            ++psGpuRetries;   // the run's progress sidecar counts every failed attempt (run_progress.h)
-            targetSec = std::max(targetSec / 4.0, 0.02);
-            gapUs     = std::min(std::max(gapUs * 3, useconds_t(8000)), useconds_t(50000));
-            baseChunk = std::max(baseChunk / 2, MIN_CHUNK);
-            if (attempt + 1 < maxAttempts)
-            {
-                fprintf(stderr, "PS-DTFE %s: %s -- retrying the partition deposit from scratch "
-                                "(attempt %d/%d, target %.0f ms kernels, %.0f ms gaps)\n",
-                        GPU_BACKEND_STRING, lastErr.c_str(), attempt + 2, maxAttempts,
-                        targetSec*1e3, gapUs/1e3);
-                sleep(2);
-            }
-        }
-    }
+    // one pass sequence on the zeroed grids (devAlloc); each pass heals its own failed kernels from its
+    // snapshots (runChunked), so a false here means the GPU gave up on this partition and the caller
+    // deposits it on the CPU
+    bool success;
+    if (useItems)
+        success = gpuCheck(gpuMemset(dSumW, 0, nTetTotal * sumWBytes), "zero weight totals", lastErr)
+               && runItems(0) && runItems(1) && runLeftovers();
+    else
+        success = runPerTet(dV, dU, dM, dD, dSc, nTetTotal, true);
+    if (nFailed > 0)
+        fprintf(stderr, "%sPS-DTFE %s: deposit %s after %d failed kernel(s) (%d resumed from a periodic checkpoint); "
+                        "%d checkpoint(s), %.0f MB held, %.3f s copying%s\n",
+                success ? MESSAGE::cYellow() : MESSAGE::cRed(), GPU_BACKEND_STRING,
+                success ? "recovered on the GPU" : "gave up",
+                nFailed, nResumedCk, snap.taken, snap.bytes / 1.e6, snap.sec, MESSAGE::cReset());
+    else if (timing)
+        fprintf(stderr, "PS-DTFE %s: checkpoints: %d, %.0f MB held, %.3f s copying\n",
+                GPU_BACKEND_STRING, snap.taken, snap.bytes / 1.e6, snap.sec);
     if (!success)
     {
         err = lastErr;
@@ -1367,36 +1598,47 @@ bool psGpuDepositFields(std::vector<float>& verts,
     // deferred tets: the kernel negated their masses (per-tet path: on the device; leftovers:
     // written back into both copies)
     bool ok = gpuCheck(gpuMemcpy(hostMass.data(), dM, nTetTotal * sizeof(float), gpuMemcpyDeviceToHost), "read masses back", err);
+    bool const massAudit = PSMassAudit::on();   // PS_MASS_AUDIT=1: the deferred mass and the fixed-point total, as the Metal host
+    double deferredMass = 0.;
     for (size_t t = 0; ok && t < nTetTotal; ++t)
-        if (hostMass[t] < 0.f) deferred.push_back(uint32_t(t));
+        if (hostMass[t] < 0.f) { deferred.push_back(uint32_t(t)); deferredMass -= double(hostMass[t]); }
+    if (massAudit) out.auditDeferredMass = deferredMass;
 
     if (ok && massFixed)
-    {   // decode the fixed-point words in blocks (the whole grid's 8 B per cell would be one more
-        // host copy of a GB at 512^3)
-        size_t const blk = size_t(1) << 20;
-        std::vector<uint32_t> fx(2 * std::min(blk, nCell));
-        for (size_t c0 = 0; ok && c0 < nCell; c0 += blk)
+    {   // the words themselves (2026-10-12; they were decoded to float here, in blocks): the caller adds the
+        // deferred and released tets into the same integers and converts once (ps_metal_host.cc says why).
+        // Low word first: on a little-endian host each pair is the int64 (ps_deposit_params.h).
+        out.massFx.resize(nCell);
+        ok = gpuCheck(gpuMemcpy(out.massFx.data(), dMassFx, nCell * 8, gpuMemcpyDeviceToHost),
+                      "copy fixed-point mass back", err);
+        if (ok && massAudit)
         {
-            size_t const n = std::min(blk, nCell - c0);
-            ok = gpuCheck(gpuMemcpy(fx.data(), reinterpret_cast<const uint32_t*>(dMassFx) + 2 * c0, n * 8,
-                                    gpuMemcpyDeviceToHost), "copy fixed-point mass back", err);
-            for (size_t i = 0; ok && i < n; ++i)
-                out.mass[c0 + i] = float(psMassFixedValue(fx[2*i], fx[2*i + 1], P.massScale));
+            int64_t q = 0;
+            for (size_t i = 0; i < nCell; ++i) q += out.massFx[i];
+            out.auditFixedTotal = psMassFixedMass(q, massScale);
         }
     }
     else if (ok)
         ok = gpuCheck(gpuMemcpy(out.mass.data(), dMass, nCell * 4, gpuMemcpyDeviceToHost), "copy mass back", err);
-    ok = ok && (!fVel  || gpuCheck(gpuMemcpy(out.mom.data(),  dMom,  nCell * 12, gpuMemcpyDeviceToHost), "copy mom back", err))
-            && (!fDisp || gpuCheck(gpuMemcpy(out.m2.data(),   dM2,   nCell * 24, gpuMemcpyDeviceToHost), "copy m2 back", err))
-            && (!fGrad || gpuCheck(gpuMemcpy(out.grad.data(), dGrad, nCell * 36, gpuMemcpyDeviceToHost), "copy grad back", err))
-            && gpuCheck(gpuMemcpy(out.streams.data(), dStr,  nCell * 4,  gpuMemcpyDeviceToHost), "copy streams back", err)
-            && (!fVolW    || gpuCheck(gpuMemcpy(out.momw.data(),    dMomW,  nCell * 4,  gpuMemcpyDeviceToHost), "copy momw back", err))
+    {   // each moment grid: its words (fixed point, 2026-10-14; little-endian pairs = the int64) or its floats
+        float* const fxDev[PS_FX_N] = { dMom, dM2, dGrad, dMomW, dSV, dDV, nullptr, dScal, dSG };
+        std::vector<float>* const flt[PS_FX_N] = { &out.mom, &out.m2, &out.grad, &out.momw, &out.streamvol, &out.dispvel,
+                                                   nullptr, &out.scal, &out.sgrad };
+        for (int g = 0; ok && g < PS_FX_N; ++g)
+        {
+            if (!sel[g] || !fxDev[g]) continue;
+            size_t const n = nCell * fxComps[g];
+            if (fxOn[g])
+            {
+                out.fx[g].resize(n);
+                ok = gpuCheck(gpuMemcpy(out.fx[g].data(), fxDev[g], n * 8, gpuMemcpyDeviceToHost), "copy fixed-point moments back", err);
+            }
+            else ok = gpuCheck(gpuMemcpy(flt[g]->data(), fxDev[g], n * 4, gpuMemcpyDeviceToHost), "copy moments back", err);
+        }
+    }
+    ok = ok && gpuCheck(gpuMemcpy(out.streams.data(), dStr,  nCell * 4,  gpuMemcpyDeviceToHost), "copy streams back", err)
             && (!fCaustic || gpuCheck(gpuMemcpy(out.caustic.data(), dCaust, nCell * 4,  gpuMemcpyDeviceToHost), "copy caustic back", err))
-            && (!fExact   || gpuCheck(gpuMemcpy(out.streamvol.data(), dSV,  nCell * 4,  gpuMemcpyDeviceToHost), "copy streamvol back", err))
-            && (!fDispOwn || gpuCheck(gpuMemcpy(out.dispvel.data(), dDV,  nCell * 12, gpuMemcpyDeviceToHost), "copy dispvel back", err))
-            && (!fDispOwn || gpuCheck(gpuMemcpy(out.dispw.data(),   dDW,  nCell * 4,  gpuMemcpyDeviceToHost), "copy dispw back", err))
-            && (!fScal    || gpuCheck(gpuMemcpy(out.scal.data(),    dScal, nCell * 4,  gpuMemcpyDeviceToHost), "copy scalar back", err))
-            && (!fSGrad   || gpuCheck(gpuMemcpy(out.sgrad.data(),   dSG,   nCell * 12, gpuMemcpyDeviceToHost), "copy scalar gradient back", err));
+            && (!fDispOwn || dispwIsMass || gpuCheck(gpuMemcpy(out.dispw.data(), dDW, nCell * 4, gpuMemcpyDeviceToHost), "copy dispw back", err));
     freeAll();
     return ok;
 }

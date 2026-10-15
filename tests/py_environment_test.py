@@ -166,7 +166,7 @@ def t_environment_script():
         frame = lambda p: (cell, cell * n, n, "header")
         pev.catalog = types.SimpleNamespace(frame_of=frame, r_v_mpc=catalog.r_v_mpc, R_V_DEFINITIONS=catalog.R_V_DEFINITIONS)
 
-        def classify_voids(prod, factor=2.0, distinct=True, definition="crossing"):
+        def classify_voids(prod, factor=2.0, distinct=True, definition="crossing", criterion="density_raw"):
             out = classify.classify_catalog(prod.voids(), prod.density_raw, cell, factor=factor, distinct=distinct,
                                             definition=definition)
             out.update(method="ps", prefix="ps_output.")
@@ -185,10 +185,12 @@ def t_environment_script():
         np.savez(tdir / "void0_track_dtfe.npz", snap=np.array([99]))          # another set: not read
         buf = _io.StringIO()
         with redirect_stdout(buf):
-            pev.main(["--sim", "SYN", "--data-root", str(root / "data"), "--tracking-dir", str(tdir)])
+            pev.main(["--sim", "SYN", "--data-root", str(root / "data"), "--tracking-dir", str(tdir),
+                      "--criterion", "density_raw"])
         text = buf.getvalue()
         out = Path(config.figures_path("void_environment")) / "SYN"
         names = sorted(q.name for q in out.iterdir())
+        # density_raw: the untagged names (2026-10-11: they keep what they held before the velocity default)
         want = ["environment_evolution.png", "environment_stats.npz", "environment_tracking.png",
                 "environment_z0.00.png", "environment_z1.00.png"]
         assert names == want, (names, text[-500:])
@@ -202,12 +204,14 @@ def t_environment_script():
         (out / "environment_tracking_x1.5.png").write_bytes(b"old")
         with redirect_stdout(_io.StringIO()):
             pev.main(["--sim", "SYN", "--data-root", str(root / "data"), "--tracking-dir", str(root / "none"),
-                      "--factor", "1.5"])
+                      "--factor", "1.5", "--criterion", "density_raw"])
         names = sorted(q.name for q in out.iterdir() if "_x1.5" in q.name)
-        assert names == ["environment_evolution_x1.5.png", "environment_stats_x1.5.npz", "environment_z0.00_x1.5.png",
-                         "environment_z1.00_x1.5.png"], names
-        assert pev.name_tag({99: "dtfe"}, {99: "output."}, True, 2.0, "delta08") == "_dtfe_overlaps_rvdelta08"
-        assert pev.name_tag({99: "ps"}, {99: "ps_caustic."}, False, 2.0) == "_ps_caustic"
+        assert names == ["environment_evolution_x1.5.png", "environment_stats_x1.5.npz",
+                         "environment_z0.00_x1.5.png", "environment_z1.00_x1.5.png"], names
+        assert pev.name_tag({99: "dtfe"}, {99: "output."}, True, 2.0, "delta08") == "_dtfe_overlaps_rvdelta08_velocity"
+        assert pev.name_tag({99: "dtfe"}, {99: "output."}, True, 2.0, "delta08", "density_raw") == "_dtfe_overlaps_rvdelta08"
+        assert pev.name_tag({99: "ps"}, {99: "ps_caustic."}, False, 2.0, criterion="density_raw") == "_ps_caustic"
+        assert pev.name_tag({99: "ps"}, {99: "ps_caustic."}, False, 2.0) == "_ps_caustic_velocity"
     finally:
         pev.pipeline, pev.catalog, pev.classify, pev.style.note_source, _root = saved
         cli.use_data_root(_root)                    # main()'s --data-root is process-wide

@@ -350,8 +350,13 @@ inline unsigned min(unsigned a, unsigned b) { return a < b ? a : b; }
 inline unsigned max(unsigned a, unsigned b) { return a > b ? a : b; }
 
 // ---- the runtime API (the gpu* names of gpu_cuda_compat.h)
-enum gpuError_t { gpuSuccess = 0, gpuErrorMemoryAllocation = 2 };
-inline const char* gpuGetErrorString(gpuError_t e) { return e == gpuSuccess ? "no error" : "out of memory"; }
+// the codes are CUDA's; nothing in the emulation raises a launch timeout, the PS host's retry policy only
+// needs the name (its test hook DTFE_GPU_FAULT_AT injects one, 2026-10-11)
+enum gpuError_t { gpuSuccess = 0, gpuErrorMemoryAllocation = 2, gpuErrorLaunchTimeout = 702 };
+inline const char* gpuGetErrorString(gpuError_t e)
+{
+    return e == gpuSuccess ? "no error" : e == gpuErrorLaunchTimeout ? "the launch timed out and was terminated" : "out of memory";
+}
 inline gpuError_t gpuGetLastError() { return gpuSuccess; }
 inline gpuError_t gpuMalloc(void** p, size_t n) { *p = std::malloc(n ? n : 4); return *p ? gpuSuccess : gpuErrorMemoryAllocation; }
 inline gpuError_t gpuFree(void* p) { std::free(p); return gpuSuccess; }

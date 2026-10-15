@@ -28,7 +28,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT / "python") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "python"))
 
-from dtfelib.io import FIELDS as _IO_FIELDS, LEGACY_SUFFIX, _VELOCITY_SCALE_EXP  # noqa: E402
+from dtfelib.io import FIELDS as _IO_FIELDS, LEGACY_SUFFIX, _VELOCITY_SCALE_EXP, caustic_is_fold  # noqa: E402
 
 # the launcher's field table: dtfelib's + the per-particle scalar a run with a scalar dataset writes ('.a_scalar',
 # '--field scalar_a'; dtfelib's analysis never reads it, the Explore map can)
@@ -50,7 +50,9 @@ FIELD_HELP = {
     "hidden_streams": "1 = the cell holds multi-stream volume its stream count misses (a fold "
                       "thinner than the sampling).\n2 = a tetrahedron too small to be sampled "
                       "left its mass here (usually of the same stream).\n3 = both.",
-    "caustic": "1 = a fold caustic crosses the cell.",
+    "caustic": "1 = a fold caustic crosses the cell: a folded tetrahedron overlaps it (stream count above 1, or "
+               "hidden-streams bit 1). Exact for every periodic phase-space run, also those made before "
+               "2026-10-13, whose stored caustic grid missed the folds thinner than the sampling.",
     "scalar": "The particles' own value (the run's scalar dataset, e.g. a potential), interpolated like the density.",
 }
 # vector fields that can be drawn as arrows (their in-plane components) over the colour map
@@ -360,6 +362,7 @@ class OutputSet:
             self.files = {}
         self.box = box                  # ((xlo, ylo[, zlo]), (xhi, yhi[, zhi])) in Mpc, or None
         self.redshift = redshift
+        self._fold_exact: bool | None = None
 
     def __bool__(self):
         return bool(self.files) and bool(self.n)
@@ -408,24 +411,47 @@ class OutputSet:
             return 1.0
         return (1.0 / (1.0 + self.redshift)) ** exp       # u-units -> peculiar km/s (FieldSet)
 
+    def _raw_plane(self, name: str, axis: int, index: int) -> np.ndarray:
+        """One plane of a field as stored (the file's precision, components last); a 2D grid: the whole grid."""
+        mm = self._memmap(name, int(axis), index)
+        if self.dim == 2:
+            return np.array(mm)             # the file's precision: only the component shown is up-cast (slice)
+        if mm.ndim == self.dim + (1 if self.files[name].ncomp > 1 else 0):     # the cached cube: cut the plane
+            sl = [slice(None)] * 3
+            sl[axis] = index
+            return np.array(mm[tuple(sl)])
+        return mm                           # already the plane (read from the file)
+
+    def fold_exact(self) -> bool:
+        """The 'caustic' map is the exact fold flag (2026-10-13): a phase-space output with a streams grid, in a
+        periodic box (every TNG run; a custom run's settings sidecar says). dtfelib.io.caustic_is_fold: streams > 1
+        or '.hidden_streams' bit 1 (OR the class mask's fold bits) -- what '.caustic' stores since the fix of
+        2026-10-13, while the grids made before then (every production PS grid of 2026-10-12/13) set it only where
+        a folded tetrahedron deposited a SAMPLE: 21.0% of the cells of TNG100-3-Dark z=1 against 33.6%. In a
+        non-periodic run the union over-flags (a sheet's edge overlaps without folding): the stored grid is shown."""
+        if self._fold_exact is None:
+            self._fold_exact = "streams" in self.files and bool((sidecar(self.root) or {}).get("periodic", True))
+        return self._fold_exact
+
+    def _fold_plane(self, axis: int, index: int) -> np.ndarray:
+        """The exact fold flag on one plane, 0/1 float64 (fold_exact): read plane by plane, no cube."""
+        def get(n):
+            return self._raw_plane(n, axis, index) if n in self.files else None
+        fold = caustic_is_fold(get("caustic_class"), streams=get("streams"), hidden=get("hidden_streams"))
+        return np.asarray(fold, dtype=np.float64)
+
     def slice(self, name: str, axis: int = 2, index: int | None = None, component: str = "norm") -> np.ndarray:
         """One plane of a field, (N, N) float64, rows = the first remaining axis (a 2D grid: the whole
         grid, rows = x; axis and index are ignored). Components of a vector/tensor field by name
         (components()); 'norm' = |v|, 'trace ...' = the trace. The vorticity is the curl of the
         velocity: the binary stores the antisymmetric part of the gradient, W_ab = (dv_a/dx_b -
         dv_b/dx_a)/2 for a < b (xy, xz, yz), which this turns into the curl's x, y, z (a 2D grid: its
-        z, a single number); measured on a rigid rotation (curl = 2 Omega), 2026-10-03."""
+        z, a single number); measured on a rigid rotation (curl = 2 Omega), 2026-10-03. The 'caustic'
+        map of a periodic phase-space run is the exact fold flag, not the stored grid (fold_exact, 2026-10-13)."""
         index = self.n // 2 if index is None else int(index)
-        mm = self._memmap(name, int(axis), index)
-        if self.dim == 2:
-            plane = np.array(mm)            # the file's precision: only the component shown is up-cast (below)
-        elif mm.ndim == self.dim + (1 if self.files[name].ncomp > 1 else 0):     # the cached cube: cut the plane
-            sl = [slice(None)] * 3
-            sl[axis] = index
-            plane = np.array(mm[tuple(sl)])
-        else:                               # already the plane (read from the file)
-            plane = mm
-        del mm
+        if name == "caustic" and self.fold_exact():
+            return self._fold_plane(int(axis), index)
+        plane = self._raw_plane(name, int(axis), index)
         ff = self.files[name]
         f64 = lambda a: np.asarray(a, dtype=np.float64)        # noqa: E731
         if name == "vorticity":         # [W_xy, W_xz, W_yz] = [-w_z, w_y, -w_x] / 2 -> the curl w
@@ -764,6 +790,38 @@ def _tng_box(snapdir: Path) -> tuple[tuple, float | None] | tuple[None, None]:
         return None, None
 
 
+def hubble(o) -> float | None:
+    """h of an output's box, for the saved figures' Mpc/h axes (2026-10-14), or None when it is not known: the
+    HubbleParam of the snapshot the box was read from, when that box is in h-free Mpc. A TNG-layout output: its
+    snapdir's combined file (merge_HDF5.py writes it h-free, the box Explore uses); a custom or opened run: its
+    sidecar's HDF5 input when that file carries the 'HFreeUnits' mark (else its box may already be in Mpc/h).
+    Read once per output (a header only) and cached on it."""
+    if hasattr(o, "_hubble"):
+        return o._hubble
+    h = None
+    if getattr(o, "box", None) is not None:
+        try:
+            import h5py
+            if getattr(o, "sim", ""):
+                files = sorted(Path(o.dir).glob("combined_[0-9][0-9][0-9].hdf5"))
+                src, need_mark = (files[0] if files else None), False
+            else:
+                src, need_mark = (sidecar(o.root) or {}).get("input_file"), True
+            if src:
+                with h5py.File(src, "r") as f:
+                    a = f["Header"].attrs
+                    if not need_mark or "HFreeUnits" in a:
+                        v = float(a["HubbleParam"]) if "HubbleParam" in a else float(a["HFreeUnits"])
+                        h = v if 0.1 < v < 2.0 else None
+        except Exception:
+            h = None
+    try:
+        o._hubble = h
+    except AttributeError:
+        pass
+    return h
+
+
 def sidecar(root) -> dict | None:
     """The settings a custom-snapshot job saved beside its outputs ('<prefix>.gui.json')."""
     p = Path(str(root) + ".gui.json")
@@ -835,6 +893,29 @@ def custom_box(settings: dict) -> tuple | None:
     return None
 
 
+def custom_redshift(settings: dict) -> float | None:
+    """The redshift of a custom-snapshot run's input, for the u-unit velocity scaling (sqrt(a), as FieldSet and the
+    TNG layout apply it): the sidecar's 'redshift' (the Custom tab records the Gadget header's since 2026-10-11), else
+    the header of its HDF5 input (input type 105) when it carries one; None = no scaling (no header, another input
+    type, no Redshift attribute: a non-cosmological snapshot has no defined a). 2026-10-11: custom outputs were
+    always None, so a z > 0 Gadget snapshot showed its velocities in u-units, 1/sqrt(a) too large (1.41x at z = 1)."""
+    if "redshift" in settings:          # recorded (None = the header has none): no need to open the snapshot
+        try:
+            return None if settings["redshift"] is None else float(settings["redshift"])
+        except (TypeError, ValueError):
+            return None
+    f = settings.get("input_file")
+    if not f or int(settings.get("input_type") or 105) != 105:
+        return None
+    try:
+        import h5py
+        with h5py.File(Path(f).expanduser(), "r") as h:
+            hd = h["Header"].attrs
+            return float(hd["Redshift"]) if "Redshift" in hd else None
+    except Exception:
+        return None
+
+
 def sim_sort_key(name: str) -> tuple:
     """Natural order for simulation names: TNG50 before TNG100 before TNG300 (text sorting puts
     TNG300 first, since '3' < '5')."""
@@ -870,7 +951,7 @@ def find_outputs(data_root, extra_dirs=()) -> list[tuple[str, OutputSet]]:
                 continue
             seen.add(key)
             s = sidecar(key) or {}
-            o = OutputSet(key, box=custom_box(s), redshift=None, title=f"custom · {prefix} ({key.parent.name})",
+            o = OutputSet(key, box=custom_box(s), redshift=custom_redshift(s), title=f"custom · {prefix} ({key.parent.name})",
                           dim=s.get("dim"))
             if o:
                 out.append((o.title, o))
@@ -899,7 +980,11 @@ def server_cost(snapshot, phase_space: bool = True, ram_bytes: int | None = None
     ram = ram_bytes or machine_ram_bytes()
     budget = 0.6 * ram
     per_vertex = (658 if phase_space else 640) + 160
-    single = n * (1.73 if phase_space else 1.2) * per_vertex + n * 64
+    # the standard server's periodic copies: its '--padding' (dtfelib.estimator.STANDARD_PADDING mean spacings since
+    # 2026-10-13, the binary's 5 before) on each face -- 1.18x the particles of TNG50-3, 1.37x of TNG50-4 (was a flat 1.2)
+    from dtfelib.estimator import STANDARD_PADDING
+    copies = 1.73 if phase_space else (1.0 + 2.0 * STANDARD_PADDING / max(n, 1) ** (1.0 / 3.0)) ** 3
+    single = n * copies * per_vertex + n * 64
     split = single > budget
     cache = n * 4.1 * 150 if split else n * 1.73 * 150
     return {"particles": n, "single_gb": single / 1e9, "budget_gb": budget / 1e9, "split": split,

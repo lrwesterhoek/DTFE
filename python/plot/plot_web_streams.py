@@ -15,6 +15,15 @@ replaced the TNG100 z = 0 T-web table, and a subset run would replace the full s
 
     python3 plot/plot_web_streams.py --sim TNG100-3-Dark --snaps 99 67 50 40
     python3 plot/plot_web_streams.py --sim TNG100-3-Dark --snap 99 --web tweb --raw
+
+THE V-WEB (2026-10-13) is the MEAN-FIELD one by default: classified from the FFT gradient of the PS velocity grid
+with the binary's normalisation and the run's lambda_th (FieldSet.load('vweb', mean_field=True)), the V-web standard
+DTFE stores and the literature means. The binary's own PS V-web classifies the stream average of each stream's
+gradient <grad v>, in which the inverted stream inside a fold has a POSITIVE divergence, so fold cells read as
+'void' (dtfelib/io.py, the note above FIELDS) -- the very cells this table counts as multi-stream. '--ps-gradient
+stored' tables it anyway, under the name tag '_stored' (web_streams_vweb_stored_z<z>.*, single_stream_vs_z_vweb_stored
+...), so the two never overwrite each other; the table's 'vweb_source' says which it holds. The T-web is the
+binary's either way.
 """
 
 import _bootstrap  # noqa: F401  (puts python/ on sys.path)
@@ -26,7 +35,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from dtfelib import make_parser, FieldSet, sim_dir
+from dtfelib import make_parser, FieldSet, sim_dir, add_ps_gradient_arg, mean_field_wanted
 from dtfelib import figures as style
 from dtfelib import webstreams as ws
 
@@ -92,10 +101,16 @@ def grid_tag(fs):
     return ("" if prefix == "ps_output" else f"_{prefix}") + ("" if fs.averaged else "_raw")
 
 
-def process(fs, sim, snap, webs, series, problems, out_dir):
+def web_tag(key, mean_field=True):
+    """'_stored' for the V-web of the stored PS gradient grids ('--ps-gradient stored'), else '' (2026-10-13)."""
+    return "_stored" if key == "vweb" and not mean_field else ""
+
+
+def process(fs, sim, snap, webs, series, problems, out_dir, mean_field=True):
     """The tables and figures of one snapshot: each web's table goes into series[web] AS SOON AS it is made
     (a later web's failure cannot lose it), a missing grid or a failure is noted in 'problems' as
-    (snapshot, web label, what); returns the number of tables written."""
+    (snapshot, web label, what); returns the number of tables written. mean_field: the V-web is the mean-field
+    one (module docstring); False = the stored PS grid."""
     z = fs.meta.redshift
     done = 0
     if not fs.has("streams"):
@@ -110,17 +125,22 @@ def process(fs, sim, snap, webs, series, problems, out_dir):
           f"caustic class {'yes' if caustic is not None else 'no'}")
     for key in webs:
         label, field = WEBS[key]
-        if not fs.has(field):
-            print(f"    {label}: no '{field}' grid; skipped")
+        mf = mean_field and key == "vweb"                    # the V-web of the mean flow, derived from the velocity grid
+        if not fs.has(field, mean_field=mf):
+            print(f"    {label}: no '{'velocity' if mf else field}' grid"
+                  f"{' to derive the mean-field V-web from' if mf else ''}; skipped")
             problems.append((snap, label, "no grid"))
             continue
         try:
-            web = fs.load(field, mode="memmap")
+            web = fs.load(field, mode="memmap", mean_field=mf)
             table = ws.environment_table(web, streams, hidden=hidden, density=density, caustic_class=caustic)
             table["sim"], table["snapshot"], table["redshift"], table["web"] = sim, int(snap), float(z), label
             table["prefix"], table["averaged"] = fs.prefix, fs.averaged
-            title = f"{sim}  z = {z:.2f}  {label}  ({'averaged' if fs.averaged else 'raw'} streams, prefix {fs.prefix.rstrip('.')})"
-            base = out_dir / f"web_streams_{key}{grid_tag(fs)}_z{z:.2f}"     # '.png' etc. APPENDED: with_suffix would eat '.50'
+            if key == "vweb":
+                table["vweb_source"] = "mean-field" if mf else "stored"
+            title = f"{sim}  z = {z:.2f}  {label}{' (stored PS gradient)' if web_tag(key, mean_field) else ''}  " \
+                    f"({'averaged' if fs.averaged else 'raw'} streams, prefix {fs.prefix.rstrip('.')})"
+            base = out_dir / f"web_streams_{key}{grid_tag(fs)}{web_tag(key, mean_field)}_z{z:.2f}"     # '.png' etc. APPENDED: with_suffix would eat '.50'
             ws.save_table(table, base, title)
             plot_table(table, title, Path(f"{base}.png"))
         except (OSError, ValueError, MemoryError) as e:      # a truncated or unreadable grid (OSError incl. missing): this web only
@@ -139,6 +159,7 @@ def main():
     parser.add_argument("--snaps", type=int, nargs="*", default=None, help="snapshots (default: --snap)")
     parser.add_argument("--web", choices=("both", "tweb", "vweb"), default="both")
     parser.add_argument("--out", default=None, help=f"output folder (default {OUTPUT_DIR}/<sim>)")
+    add_ps_gradient_arg(parser)
     args = parser.parse_args()
     style.apply()
     out_dir = Path(args.out).expanduser() if args.out else OUTPUT_DIR / args.sim
@@ -154,7 +175,7 @@ def main():
             fs = FieldSet(sim_dir(args.sim, args.data_root) / f"snapdir_{snap:03d}", method=method,
                           averaged=not args.raw, prefix=args.prefix)
             tag = grid_tag(fs) if tag is None else tag
-            n_done = process(fs, args.sim, snap, webs, series, problems, out_dir)
+            n_done = process(fs, args.sim, snap, webs, series, problems, out_dir, mean_field=mean_field_wanted(args))
         except (FileNotFoundError, ValueError, OSError) as e:    # OSError: h5py on an unreadable snapshot file
             print(f"  snapshot {snap:03d}: {e}")
             failed.append(snap)
@@ -169,7 +190,7 @@ def main():
     subset = "" if asked == ladder else "_snaps" + "-".join(str(s) for s in asked)
     for k, rows in series.items():
         if len(rows) > 1:
-            plot_vs_redshift(rows, WEBS[k][0], out_dir / f"single_stream_vs_z_{k}{tag or ''}{subset}.png")
+            plot_vs_redshift(rows, WEBS[k][0], out_dir / f"single_stream_vs_z_{k}{tag or ''}{web_tag(k, mean_field_wanted(args))}{subset}.png")
     done = sum(len(r) for r in series.values())
     notes = [f"{lab} {what} for {s:03d}" for s, lab, what in problems]
     print(f"\n{done} table(s) written under {out_dir}"

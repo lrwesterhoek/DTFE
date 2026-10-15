@@ -17,6 +17,7 @@ for runs with PTS_VEL_GRAD=1 -- velDiv, velShear, velVort (plus denGradMag with
     python3 plot/plot_pointeval.py --sims TNG300-3-Dark      # one simulation
     python3 plot/plot_pointeval.py --snaps 0,4,17,33         # selected snapshots
     python3 plot/plot_pointeval.py --fields density,velDiv --force
+    python3 plot/plot_pointeval.py --method dtfe             # the standard-DTFE slice (output.pts_*)
 """
 
 import _bootstrap  # noqa: F401  (puts python/ on sys.path)
@@ -58,6 +59,9 @@ def main() -> int:
                    help="comma-separated snapshot numbers (default: all present)")
     p.add_argument("--fields", default=None,
                    help=f"comma-separated subset of {','.join(pointeval.STYLES)} (default: all available)")
+    p.add_argument("--method", choices=("auto", "ps", "dtfe"), default="auto",
+                   help="whose slice to render: PS-DTFE (ps_output.pts_*), standard DTFE (output.pts_*, a "
+                        "run_dtfe.sh SAMPLE_POINTS run), or auto = the slice on disk, PS-DTFE first")
     p.add_argument("--prefix", default=None,
                    help="alternate on-disk grid prefix (run_ps_dtfe.sh OUTPUT_PREFIX, e.g. 'ps_mw')")
     p.add_argument("--plane", type=Path, default=None,
@@ -109,8 +113,14 @@ def main() -> int:
         print(f"\n== {sim}: snapshots {' '.join(map(str, snaps))}")
         for n in snaps:
             snapdir = simdir / f"snapdir_{n:03d}"
+            # 'auto' follows the SLICE on disk, PS-DTFE first (2026-10-11): FieldSet's own auto-detection follows
+            # the grids, so a standard-DTFE slice beside PS-DTFE grids was never found
+            method = args.method
+            if method == "auto" and args.prefix is None:
+                method = next((m for m, pre in (("ps", "ps_output"), ("dtfe", "output"))
+                               if (snapdir / f"{pre}.pts_den").is_file()), "auto")
             try:
-                fs = FieldSet(snapdir, prefix=args.prefix)
+                fs = FieldSet(snapdir, method=method, prefix=args.prefix)
             except (FileNotFoundError, ValueError) as e:
                 print(f"-- snap {n:03d}: {e}")
                 skipped += 1

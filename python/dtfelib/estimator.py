@@ -43,7 +43,17 @@ from pathlib import Path
 
 import numpy as np
 
-__all__ = ["Estimator", "PointFields", "find_binary"]
+__all__ = ["Estimator", "PointFields", "find_binary", "STANDARD_PADDING"]
+
+# The standard (Eulerian) server's '--padding', in mean particle spacings, when the caller gives none (2026-10-13).
+# The binary's own default of 5 is too thin near the box faces: on demo/z0_64 (z = 0) 0.5-0.9% of the points of a
+# plane 0.05 Mpc inside a face are off by up to ~4% against padding 30-40, computed from the wrong hull tetrahedra
+# (they still report coverage 1, so nothing flags them), while 10 to 40 agree to float rounding (1e-14;
+# tests/point_exact_serve_check.sh P2). 15 is scripts/run_dtfe.sh's default since 2026-10-12, complete (no
+# '*.badGridPoints*' file) on the z = 0 grids of TNG50/100/300-3-Dark, where 10 was not. The
+# phase-space server pads in Lagrangian space by its own rules and keeps the binary's default. The launcher's
+# standard exact zoom (gui/explore.py) passes the same value to its '--regionMpc' run.
+STANDARD_PADDING = 15.0
 
 _HELLO = b"DTFESRV2"
 _REPLY = b"DTFEPTS1"
@@ -168,6 +178,9 @@ class Estimator:
                        ('--max-concurrent').
     peculiar           convert velocities to peculiar km/s with the snapshot's scale factor
                        (FieldSet convention); False returns the binary's raw units.
+    padding            '--padding' in mean particle spacings. None (default): STANDARD_PADDING (15) for the
+                       standard estimator -- the binary's own 5 gives wrong values near the box faces --
+                       and the binary's default for PS-DTFE. A '--padding'/'--paddingMpc' in 'options' wins.
     options            extra command-line arguments, passed through verbatim.
     binary             explicit path to the executable (default: find_binary()).
     dim                2 for a 2D snapshot and build (PS-DTFE-2d / DTFE-2d): points are (N, 2), every
@@ -192,7 +205,8 @@ class Estimator:
                  scalars: bool = False, scalar_dataset: str | None = None,
                  lagrangian_positions: bool = False,
                  tessellation_cache=None, partition=None, resident: int | None = None,
-                 max_concurrent: int | None = None, peculiar: bool = True, options=(),
+                 max_concurrent: int | None = None, peculiar: bool = True, padding: float | None = None,
+                 options=(),
                  binary=None, precision: str = "single", dim: int = 3, verbose: int = 0, log_path=None,
                  progress: bool = False, _owned_dir=None, _shift=None, _on_spawn=None):
         self._owned_dir = Path(_owned_dir) if _owned_dir else None   # from_arrays' temporary snapshot
@@ -255,7 +269,12 @@ class Estimator:
             cmd += ["--max-concurrent", str(int(max_concurrent))]
         if progress:
             cmd.append("--serve-progress")
-        cmd += [str(o) for o in options]
+        options = [str(o) for o in options]
+        if padding is None and not self.phase_space:
+            padding = STANDARD_PADDING
+        if padding is not None and not any(o in ("--padding", "--paddingMpc") for o in options):
+            cmd += ["--padding", f"{float(padding):g}"]
+        cmd += options
         self.command = cmd
 
         self._log = None

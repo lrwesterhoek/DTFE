@@ -128,7 +128,9 @@ PARTITION="5 5 5" MAX_CONCURRENT=2 ./scripts/run_ps_dtfe.sh -s TNG300-3-Dark 99 
 THREADS=4 AVG_SUBSAMPLES=1 ./scripts/run_ps_dtfe.sh 99    # cap threads; cell-centre only (fast, no '_a')
 
 ./scripts/run_dtfe.sh -s TNG50-3-Dark -g 512 99           # standard DTFE
-./scripts/run_dtfe.sh -m 99                               # GPU '_a' interpolation
+./scripts/run_dtfe.sh -m 99                               # GPU '_a' interpolation (the default on a GPU build; DTFE_METAL=0 for the CPU)
+DTFE_EXACT_AVERAGE=0 ./scripts/run_dtfe.sh 99             # Monte-Carlo cell means (default since 2026-10-13: exact)
+OUTPUT_PREFIX=output_mc ./scripts/run_dtfe.sh 99          # a variant beside output.* (a ps_* prefix is refused)
 ```
 
 `run_ps_dtfe.sh` environment toggles (each maps to the flag in brackets):
@@ -136,17 +138,17 @@ THREADS=4 AVG_SUBSAMPLES=1 ./scripts/run_ps_dtfe.sh 99    # cap threads; cell-ce
 ```bash
 PS_VERTEX_MASS=1        # [--ps-vertex-mass]     DEFAULT 1: chart-independent tet masses.
                         #                        Set 0 only for true-lattice Lagrangian input.
-PS_VOLUME_WEIGHTED=1    # [--ps-volume-weighted] Eulerian-volume-weighted velocity moments
+PS_VOLUME_WEIGHTED=0    # [--ps-volume-weighted] DEFAULT 1 (2026-10-13): Eulerian-volume-weighted velocity moments
                         #                        (dispersion stays mass-weighted, bit-identical)
 PS_EXACT=1              # [--ps-exact-deposit]   exact r3d deposit; combine with -m (GPU)
-PS_METAL=1              # [--ps-gpu]             GPU deposit (same as -m)
+PS_METAL=0              # [--ps-gpu]             default auto: the GPU deposit on a GPU build (1 = -m); 0 = the CPU
 AVG_SUBSAMPLES=2        # [--avg-subsamples]     nSub for the '_a' pass (cost ~ nSub^3)
 SAMPLE_POINTS=plane.bin # [--sample-points]      also point-evaluate this point set
 PTS_VEL_GRAD=1          # [--pts-vel-grad]       + per-point velocity gradient (.pts_velGrad),
                         #                        which is what makes velDiv/shear/vort maps possible
 SCRATCH_DIR=/tmp/dtfe   # [--scratch-dir]        back the full-grid accumulators with mmap'ed
                         #                        files (out-of-core; must be LOCAL, non-synced)
-PS_CAUSTICS=1           # [--ps-caustics]        '.caustic' fold flag + (CPU) '.causticClass'
+PS_CAUSTICS=0           # [--ps-caustics]        DEFAULT 1 (2026-10-13): '.caustic' fold flag + '.causticClass'
 PS_CAUSTIC_CUSPS=1      # [--ps-caustic-cusps]   + bit7 A3 cusp AND bit8 A4 swallowtail
                         #                        indicators (needs PS_CAUSTICS=1; opt-in, bit7
                         #                        0.01% false positives, ~1.8x caustic cost)
@@ -156,7 +158,7 @@ LAMBDA_TH=0.3           # [--lambda_th]          T-web/V-web eigenvalue threshol
                         #                        (script default 0.3; the BINARY default is 0.0)
 LAGRANGIAN_INPUT=ics.h5 # [--lagrangianInput]    override the auto-detected combined_ics.hdf5
 OUTPUT_PREFIX=ps_mw     # writes <prefix>.* so an A/B grid set can sit beside the production one
-FIELDS="density_a ..."  # [--field]              override the production field list
+FIELDS="density_a ..."  # [--field]              override the production field list (default: all nine, tweb_a vweb_a included)
 PARTITION="4 4 4"       # [--partition]          explicit Lagrangian split (else auto-tuned; "1" = one triangulation)
 MAX_CONCURRENT=2        # [--max-concurrent]     cap simultaneous partition pipelines
 THREADS=4               # OMP_NUM_THREADS cap
@@ -185,7 +187,8 @@ GRID_SIZE=512 PTS_VEL_GRAD=1 ./scripts/run_ps_pipeline.sh
 # --periodic up to a quarter of a thread's cells lie outside the tessellation, with it ~1%.
 ./DTFE demo/z0_64.gadget out --grid 64 --field density --periodic --padding 12
 
-# standard DTFE, all main fields, GPU '_a' pass
+# standard DTFE, all main fields, GPU '_a' pass (run_dtfe.sh adds --exact-average --padding 15,
+# the production setting since 2026-10-13, and the T-web / V-web at --lambda_th 0.3)
 ./DTFE combined_099.hdf5 out --grid 512 --periodic --input 105 --MpcUnit 1000 \
     --field density_a velocity_a gradient_a --gpu
 
@@ -199,11 +202,13 @@ GRID_SIZE=512 PTS_VEL_GRAD=1 ./scripts/run_ps_pipeline.sh
     --field density_a velocity_a dispersion_a --lagrangianInput combined_ics.hdf5 \
     --ps-vertex-mass          `# chart-independent tet masses (removes the 1-D(z_ic)/D(z) bias)` \
     --ps-volume-weighted      `# volume-weighted velocity moments; dispersion stays mass-weighted` \
+    --ps-caustics             `# the caustic classes (.caustic, .causticClass); default since 2026-10-13` \
     --ps-gpu
 
 # point evaluation at arbitrary positions (text 'x y z' per line, or raw float64 Nx3);
 # the STANDARD binary supports the same flags/formats (streams = 0/1 coverage; no
-# --per-stream/--per-stream-ids, single triangulation so no --partition)
+# --per-stream/--per-stream-ids; with --partition, since 2026-10-13, each partition answers the
+# points in the tetrahedra it owns -- the single triangulation's values to float rounding)
 ./PS-DTFE snap.hdf5 out --grid 32 --periodic --input 105 --MpcUnit 1 \
     --sample-points points.txt \
     --per-stream               `# + ragged per-stream density/velocity records` \
@@ -379,9 +384,14 @@ thread count (default: all cores, or cores / concurrent partitions inside a part
                                                             #   density, NGP-assigned. Density
                                                             #   ONLY (other fields rejected);
                                                             #   '--field density_a' -> '.a_den'
-./DTFE snap.hdf5 out --grid 256 --periodic --CIC --interlace  # anti-aliasing (needs --periodic; 2D too; its
-                                                               # half-cell phase was wrong for half the modes
-                                                               # before 2026-10-02 night: older interlaced grids are off)
+./DTFE snap.hdf5 out --grid 256 --periodic --CIC --interlace  # anti-aliasing (2D and PS-DTFE too; without
+                                                               # --periodic it needs a --region half a cell inside
+                                                               # the box). Only the density is interlaced: the T-web
+                                                               # comes from the first, un-interlaced pass. Interlaced
+                                                               # grids are correct only from 2026-10-11: before, a
+                                                               # run without --region gridded the same cells twice
+                                                               # (and before 2026-10-02 night the half-cell phase was
+                                                               # also wrong for half the modes): regenerate older ones
 
 # approximate phase-space density f = rho * g: a SECOND Delaunay in velocity space.
 # Standard binary only; the result lands in the scalar output field. It ASSUMES the local
@@ -513,6 +523,9 @@ tests/point_exact_serve_check.sh --no-build   # exact point location (no double 
                                               #   per-stream q(x) + scalars; from_arrays; the
                                               #   tessellation cache keyed on --periodic
 tests/dtfe_metal_check.sh                     # CPU vs GPU parity, standard DTFE
+tests/dtfe_mc_average_check.sh --no-build    # standard Monte Carlo cell average: unbiased, the same for any
+                                              #   split (2026-10-13); its GPU part on GPU builds only
+tests/ps_periodic_seam_check.sh --no-build   # periodic PS seam: every tetrahedron deposited once (2026-10-13)
 tests/ps_auto_tune_check.sh                   # auto-tuner decisions (local only: macOS-isms)
 tests/ps_scratch_check.sh                     # --scratch-dir out-of-core (local only)
 tests/ps_tessellation_cache_check.sh --no-build  # --tessellation-cache: bit-identity + staleness

@@ -111,6 +111,79 @@ def t_match_catalog_void():
     assert j is None
 
 
+def t_threaded_filters():
+    """2026-10-11: smooth_field and find_local_minima run their separable 1-D passes slab-threaded on a big field: the
+    SAME bits as scipy's serial gaussian_filter / minimum_filter (float32 and float64, wrap and reflect, sigma below
+    and above a cell, the cross-box sigma, a 2-D plane, a NaN), and the threaded path is the one taken."""
+    from scipy import ndimage
+    from dtfelib import fields
+    rng = np.random.default_rng(4)
+    cases = [(np.float32, (132, 128, 128)), (np.float64, (128, 136, 130)), (np.float32, (1536, 1400))]
+    serial_g, serial_m = fields.gaussian_filter, fields.minimum_filter
+    def refused(*a, **k):
+        raise AssertionError("the serial scipy filter ran on a field above _THREAD_MIN")
+    for dt, shape in cases:
+        f = rng.standard_normal(shape).astype(dt)
+        f.flat[777] = np.nan
+        assert f.size >= getattr(fields, "_THREAD_MIN", 1 << 21)
+        want = {(sig, mode): ndimage.gaussian_filter(f, sigma=sig, mode=mode)
+                for sig in (0.7, 5.0, 21.4291) for mode in ("wrap", "reflect")}
+        want_min = {fp: f == ndimage.minimum_filter(f, size=fp, mode="wrap") for fp in (3, 11)}
+        fields.gaussian_filter = fields.minimum_filter = refused
+        try:
+            for (sig, mode), w in want.items():
+                got = fields.smooth_field(f, sig, mode=mode)
+                assert got.dtype == w.dtype and np.array_equal(got, w, equal_nan=True), (dt, shape, sig, mode)
+            for fp, w in want_min.items():
+                mask, coords = fields.find_local_minima(f, footprint_size=fp)
+                assert np.array_equal(mask, w) and np.array_equal(coords, np.argwhere(w)), (dt, shape, fp)
+        finally:
+            fields.gaussian_filter, fields.minimum_filter = serial_g, serial_m
+    small = rng.standard_normal((20, 20, 20)).astype(np.float32)          # below _THREAD_MIN: scipy's own call
+    assert np.array_equal(fields.smooth_field(small, 2.0), ndimage.gaussian_filter(small, 2.0, mode="wrap"))
+
+
+def t_threaded_critical_points():
+    """2026-10-11: pipeline.find_critical_points runs its three box filters (the minima, the maxima, the gradient
+    minima) slab-threaded through fields.box_filter: on a synthetic 256^3 field with plateaus (ties between neighbours
+    decide the masks) every output is array_equal to the same function on scipy's serial minimum_filter /
+    maximum_filter, box_filter's maximum is scipy's to the bit, and no serial filter runs above _THREAD_MIN."""
+    from scipy import ndimage
+    from dtfelib import fields, pipeline
+    import config
+    rng = np.random.default_rng(11)
+    f = fields.smooth_field(rng.standard_normal((256, 256, 256)).astype(np.float32), 2.0)
+    f = (np.round(f * 40) / 40).astype(np.float32)          # plateaus: equal neighbours decide the masks
+    g = (np.abs(np.roll(f, 1, 0) - f) + np.abs(np.roll(f, 1, 2) - f)).astype(np.float32)   # a |grad| stand-in
+    hess = {"hxx": f, "hyy": g, "hzz": -f, "hxy": g, "hxz": f, "hyz": -g}
+    fp = config.FOOTPRINT_SIZE
+    assert np.array_equal(fields.box_filter(f, fp, maximum=True), ndimage.maximum_filter(f, size=fp, mode="wrap"))
+    real = fields.box_filter
+    def serial(field, size, mode="wrap", maximum=False):    # the code of before: scipy's serial filters
+        return (ndimage.maximum_filter if maximum else ndimage.minimum_filter)(field, size=size, mode=mode)
+    fields.box_filter = serial
+    try:
+        want = pipeline.find_critical_points(f, hess, g)
+    finally:
+        fields.box_filter = real
+    def refused(*a, **k):
+        raise AssertionError("a serial scipy box filter ran on a field above _THREAD_MIN")
+    saved = {(m, n): getattr(m, n) for m in (fields, pipeline) for n in ("minimum_filter", "maximum_filter")
+             if hasattr(m, n)}
+    for (m, n) in saved:
+        setattr(m, n, refused)
+    try:
+        got = pipeline.find_critical_points(f, hess, g)
+    finally:
+        for (m, n), v in saved.items():
+            setattr(m, n, v)
+    assert sum(len(want[k]["coords"]) for k in ("minima", "maxima", "saddle1", "saddle2")) > 0
+    for k in ("minima", "maxima", "saddle1", "saddle2"):
+        for part in ("coords", "values", "eigenvalues"):
+            assert np.array_equal(got[k][part], want[k][part]), (k, part)
+    assert got["field_mean"] == want["field_mean"] and got["field_std"] == want["field_std"]
+
+
 def t_shape_estimators():
     """Vectorized BBKS/ellipsoid-fit estimators must reproduce the original per-void
     loops bit-for-bit: NaN rows (trace/lambda1 thresholds, sanity gate), the ellipsoid cuts
@@ -766,8 +839,16 @@ def t_webstreams():
     assert abs(c["node"]["mean_streams_mass"] - (d64[node] * streams[node]).sum() / d64[node].sum()) < 1e-9
     assert c["node"]["mean_streams_mass"] > c["node"]["mean_streams"]                   # the heavy cell has 9 streams
     # caustic class: the wall plane 2 holds one fold (k=1) and one k=0 cell; the node plane 6 one k=3 -- in both weightings
-    assert abs(c["wall"]["fold_fraction"]["volume"] - 1 / 128) < 1e-12 and c["void"]["fold_fraction"]["volume"] == 0.0
-    assert abs(c["wall"]["fold_fraction"]["mass"] - 3.0 / d64[wall].sum()) < 1e-12 and c["void"]["fold_fraction"]["mass"] == 0.0
+    # the fold is THE geometric one (io.caustic_is_fold with streams and hidden, 2026-10-13): the mask's fold bits OR
+    # streams > 1 + tol OR hidden bit 1 -- the wall's eight s = 1.5 cells (one of them the mask's fold cell, density 3)
+    # and the void's hidden-bit cell, which the mask's bits alone (1 wall cell, no void cell) undercounted
+    from dtfelib.io import caustic_is_fold
+    gfold = caustic_is_fold(cc, streams=streams, hidden=hidden)
+    void = wcls == 0
+    assert abs(c["wall"]["fold_fraction"]["volume"] - 8 / 128) < 1e-12 and abs(c["void"]["fold_fraction"]["volume"] - 1 / 127) < 1e-12
+    assert abs(c["wall"]["fold_fraction"]["mass"] - 10.0 / 130.0) < 1e-12 and abs(c["void"]["fold_fraction"]["mass"] - 1 / 127) < 1e-12
+    assert abs(c["wall"]["fold_fraction"]["mass"] - d64[wall & gfold].sum() / d64[wall].sum()) < 1e-12
+    assert abs(c["void"]["fold_fraction"]["mass"] - d64[void & gfold].sum() / d64[void].sum()) < 1e-12
     cb = c["wall"]["collapse"]
     assert abs(cb["k=1"]["volume"] - 1 / 128) < 1e-12 and abs(cb["k=0"]["volume"] - 1 / 128) < 1e-12 and abs(cb["none"]["volume"] - 126 / 128) < 1e-12
     assert abs(cb["k=1"]["mass"] - 3.0 / d64[wall].sum()) < 1e-12 and abs(cb["k=0"]["mass"] - 1.0 / d64[wall].sum()) < 1e-12
@@ -2216,10 +2297,14 @@ def t_caustic_skeleton():
     assert abs(sum(v["volume"] for v in fr["exclusive"].values()) - 1.0) < 1e-12 and abs(sum(v["mass"] for v in fr["exclusive"].values()) - 1.0) < 1e-12
     assert abs(fr["exclusive"]["none"]["volume"] - 1 / n ** 3) < 1e-15 and fr["cumulative"]["sheet"]["mass"] > fr["cumulative"]["sheet"]["volume"]
     # a parity-only grid (--ps-caustics --ps-linear-deposit --ps-gpu: the fold flag without collapse bits) is refused, alone
-    # or as one such cell -- either parity -- in a full deposit; a parity bit WITH a collapse bit is an ordinary deposit (review [24])
+    # or as one det>0-parity cell in a full deposit; a parity bit WITH a collapse bit is an ordinary deposit (review [24]).
+    # A lone det<0 bit is legitimate since 2026-10-13 (the geometric overlap, in a cell a folded tetrahedron overlaps but
+    # no sample reached): read, as class 'none' and not a fold
     one_pos, one_neg = cc.copy(), cc.copy()
     one_pos[20, 20, 20], one_neg[20, 20, 20] = CAUSTIC_PARITY_POS, CAUSTIC_PARITY_NEG
-    for bad in (np.full((4, 4, 4), fold, np.int32), one_pos, one_neg):
+    mn = sk.class_masks(one_neg)
+    assert mn["exclusive"]["none"][20, 20, 20] and not mn["indicator"]["fold"][20, 20, 20] and mn["exclusive"]["none"].sum() == 1
+    for bad in (np.full((4, 4, 4), fold, np.int32), np.full((4, 4, 4), CAUSTIC_PARITY_POS, np.int32), one_pos):
         try:
             sk.class_masks(bad)
         except ValueError as e:
@@ -2227,6 +2312,20 @@ def t_caustic_skeleton():
         else:
             raise AssertionError("a parity-only caustic_class grid was read as a stratification")
     assert sk.class_masks(np.full((4, 4, 4), fold | CAUSTIC_COLLAPSE[0], np.int32))["exclusive"]["k=0"].all()
+    # fold= replaces the mask's own fold bits (FieldSet.fold_mask(): the exact flag of a pre-2026-10-13 grid), and only
+    # them; fractions and skeleton_summary pass it on; a wrong shape is refused
+    exact = m["indicator"]["fold"].copy()
+    exact[0:3, 0:3, 8] = True                                         # folds the samples missed: k = 0 cells
+    mf = sk.class_masks(cc, fold=exact)
+    assert np.array_equal(mf["indicator"]["fold"], exact) and all(np.array_equal(mf["exclusive"][k], m["exclusive"][k]) for k in sk.CLASSES)
+    assert abs(sk.fractions(cc, fold=exact)["indicator"]["fold"]["volume"] - exact.mean()) < 1e-15
+    assert abs(sk.skeleton_summary(cc, fold=exact)["fractions"]["indicator"]["fold"]["volume"] - exact.mean()) < 1e-15
+    try:
+        sk.class_masks(cc, fold=exact[:-1])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a fold mask of another shape was accepted")
     # the periodic merge: without the wrap the two planes are two components, with it one
     assert ndimage.label(zplanes)[1] == 2 and sk.label_periodic(zplanes, 26)[1] == 1 and sk.label_periodic(zplanes, 6)[1] == 1
     # two cells across ONE box face each: one component under every connectivity (the planes and the tilted loop
@@ -2317,6 +2416,102 @@ def t_caustic_skeleton():
     assert np.allclose(dw, [np.sqrt(3.0), np.sqrt(6.0)], rtol=0, atol=1e-12) and not bw.any(), (dw, bw)
 
 
+def t_caustic_fold_exact():
+    """The geometric fold flag for grids of any date (audit finding 3, 2026-10-13): io.caustic_is_fold(mask, streams=,
+    hidden=) = streams > 1 + tol | hidden bit 1 | the mask's fold bits, the mask-only form unchanged, the tolerance edge,
+    the union with single_stream_mask's complement, the slab path (memmaps, several slabs) equal to one pass, the
+    argument checks; FieldSet.fold_mask() on synthetic snapshots: a pre-fix grid (fold bits only where a sample hit,
+    the hidden bit on the thin rest) gives the whole fold, the averaged pair by default, and the fallbacks without a
+    streams grid (the class mask, then the 0/1 'caustic' grid) and under method='dtfe'."""
+    import shutil, tempfile
+    from dtfelib import io as dio
+    from dtfelib.io import (CAUSTIC_COLLAPSE, CAUSTIC_PARITY_NEG, CAUSTIC_PARITY_POS, FieldSet, STREAM_TOL,
+                            caustic_is_fold, single_stream_mask)
+    pair = CAUSTIC_PARITY_POS | CAUSTIC_PARITY_NEG
+    # cell by cell: streams, hidden, mask -> fold (tolerance edges in float32, as single_stream_mask computes them)
+    st = np.array([1.0, 1.0 + 0.5 * STREAM_TOL, 1.0 + 2 * STREAM_TOL, 3.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.5], np.float32)
+    hi = np.array([0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 1.0, 0.0, 0.0], np.float32)
+    mk = np.array([CAUSTIC_PARITY_POS, 0, 0, pair, CAUSTIC_PARITY_POS, CAUSTIC_PARITY_POS, pair, CAUSTIC_PARITY_NEG, pair, pair])
+    assert list(caustic_is_fold(streams=st, hidden=hi)) == [False, False, True, True, True, False, True, True, False, True]
+    assert list(caustic_is_fold(mk, streams=st, hidden=hi)) == [False, False, True, True, True, False, True, True, True, True]
+    assert list(caustic_is_fold(mk)) == [False, False, False, True, False, False, True, False, True, True]    # unchanged
+    assert list(caustic_is_fold(streams=st)) == [False, False, True, True, False, False, False, False, False, True]
+    # every cell that is neither single-stream nor empty is a fold cell, and every fold cell is not single-stream
+    rng = np.random.default_rng(3)
+    n = 12
+    S = rng.choice(np.array([0.0, 1.0, 1.0, 1.0, 1.0004, 1.5, 3.0, 2.0 / 3.0], np.float32), size=(n, n, n))
+    H = rng.choice(np.array([0.0, 0.0, 0.0, 1.0, 2.0, 3.0], np.float32), size=(n, n, n))
+    C = rng.choice(np.array([0, CAUSTIC_PARITY_POS | CAUSTIC_COLLAPSE[0], pair | CAUSTIC_COLLAPSE[1]]), size=(n, n, n))
+    F = caustic_is_fold(streams=S, hidden=H)
+    notsingle = ~single_stream_mask(S, H)
+    assert np.array_equal(notsingle, F | (S < 1.0 - STREAM_TOL)) and not (F & single_stream_mask(S, H)).any()
+    # the slab path: memmaps, several slabs of an odd size, the same as one pass
+    d = Path(tempfile.mkdtemp(prefix="dtfelib_fold_"))
+    old_slab = dio._FOLD_SLAB_CELLS
+    try:
+        for name, arr in (("s", S), ("h", H), ("c", C.astype(np.float32))):
+            arr.astype(np.float32).tofile(d / name)
+        mm = {k: np.memmap(d / k, dtype=np.float32, mode="r", shape=(n, n, n)) for k in ("s", "h", "c")}
+        one = caustic_is_fold(C, streams=S, hidden=H)
+        dio._FOLD_SLAB_CELLS = 5 * n * n                              # 3 slabs of 5, 5, 2 planes
+        sl = caustic_is_fold(mm["c"], streams=mm["s"], hidden=mm["h"])
+        assert sl.dtype == bool and sl.shape == (n, n, n) and np.array_equal(sl, one)
+        assert np.array_equal(one, F | caustic_is_fold(C))
+        for bad in ((None, None, None), (None, None, H), (C[:-1], S, None), (None, S, H[:, :-1])):
+            try:
+                caustic_is_fold(bad[0], streams=bad[1], hidden=bad[2])
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"caustic_is_fold accepted {[None if b is None else np.shape(b) for b in bad]}")
+    finally:
+        dio._FOLD_SLAB_CELLS = old_slab
+        shutil.rmtree(d, ignore_errors=True)
+    # FieldSet.fold_mask on a PRE-FIX grid: a wall plane x = 3 that the samples saw (streams 3, fold bits) and a thin
+    # one x = 6 they missed (streams 1, hidden bit 1, the mask's det<0 bit absent): the fold is both planes
+    root = Path(tempfile.mkdtemp(prefix="dtfelib_foldfs_"))
+    try:
+        n = 8
+        X = np.indices((n, n, n))[0]
+        d50 = _synthetic_snapdir(root, "SYN", 50, 0.5, n=n, grids=("den",))
+        streams = np.where(X == 3, 3.0, 1.0).astype(np.float32)
+        hidden = np.where(X == 6, 1.0, 0.0).astype(np.float32)
+        cc = np.full((n, n, n), CAUSTIC_PARITY_POS | CAUSTIC_COLLAPSE[0], np.float32)
+        cc[X == 3] = pair | CAUSTIC_COLLAPSE[1]
+        old_flag = (X == 3).astype(np.float32)
+        np.ones((n, n, n), np.float32).tofile(str(d50 / "ps_output.den"))     # the raw set's grid size (averaged=False)
+        for pre in ("ps_output.a_", "ps_output."):                    # the averaged pair and the raw pair
+            streams.tofile(str(d50 / f"{pre}streams"))
+            hidden.tofile(str(d50 / f"{pre}hidden_streams"))
+        cc.tofile(str(d50 / "ps_output.causticClass"))
+        old_flag.tofile(str(d50 / "ps_output.caustic"))
+        fs = FieldSet(d50, method="ps")
+        want = (X == 3) | (X == 6)
+        assert np.array_equal(fs.fold_mask(), want) and np.array_equal(FieldSet(d50, method="ps", averaged=False).fold_mask(), want)
+        (d50 / "ps_output.a_hidden_streams").unlink()                 # no hidden grid: streams > 1 and the mask's bits only
+        assert np.array_equal(fs.fold_mask(), X == 3)
+        (d50 / "ps_output.a_streams").unlink()                        # no streams grid: the class mask's parity bits
+        assert np.array_equal(fs.fold_mask(), X == 3)
+        (d50 / "ps_output.causticClass").unlink()                     # nor a class mask: the 0/1 'caustic' grid
+        assert np.array_equal(fs.fold_mask(), X == 3)
+        (d50 / "ps_output.caustic").unlink()
+        try:
+            fs.fold_mask()
+        except FileNotFoundError:
+            pass
+        else:
+            raise AssertionError("fold_mask() with no streams, caustic_class or caustic grid did not raise")
+        np.ones((n, n, n), np.float32).tofile(str(d50 / "output.a_den"))
+        try:
+            FieldSet(d50, method="dtfe").fold_mask()
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("fold_mask() under method='dtfe' did not raise")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def t_caustic_crossed_waves():
     """The crossed-waves runs tests/ps_caustic_class_check.sh leaves under the suites' temp root ($DTFE_TEST_TMP,
     then ${TMPDIR:-/tmp}/dtfe-tests, then the old tests/tmp): on pcc_out (CPU, no --ps-caustic-cusps) the nested
@@ -2342,16 +2537,33 @@ def t_caustic_crossed_waves():
             if g and g ** 3 == a.size:
                 return a.reshape(g, g, g)
         raise AssertionError(f"{fx}{suffix}: {len(raw)} bytes is no cube of float32 or float64")
-    fx = find("pcc_out", (".causticClass", ".den", ".streams"))
+    fx = find("pcc_out", (".causticClass", ".den", ".streams", ".hidden_streams", ".caustic"))
     if fx is None:
         raise FileNotFoundError(f"no crossed-waves run pcc_out.{{causticClass,den,streams}} under {', '.join(map(str, roots))} "
                                 f"(tests/ps_caustic_class_check.sh writes it)")
     try:                                    # a missing summary key is a defect here, not missing data (KeyError would SKIP)
         rcc = np.rint(grid(fx, ".causticClass")).astype(np.int32)
-        rden, rstr = grid(fx, ".den"), grid(fx, ".streams")
+        rden, rstr, rhid = grid(fx, ".den"), grid(fx, ".streams"), grid(fx, ".hidden_streams")
         rm = sk.class_masks(rcc)
         assert (rm["cumulative"]["node"] <= rm["cumulative"]["line"]).all() and (rm["cumulative"]["line"] <= rm["cumulative"]["sheet"]).all()
-        assert (rm["indicator"]["fold"] <= rm["cumulative"]["sheet"]).all()               # a fold needs a collapsed axis
+        # a fold needs a collapsed axis -- but the collapse bits are per SAMPLE and the fold is geometric (2026-10-13):
+        # a fold cell with no k >= 1 bit is one whose samples all missed the folded tetrahedra, i.e. a hidden-bit cell
+        missed = rm["indicator"]["fold"] & ~rm["cumulative"]["sheet"]
+        assert (missed <= ((np.rint(rhid).astype(np.int32) & 1) != 0)).all(), int(missed.sum())
+        # the binary's '.caustic' IS dtfelib's fold, from the class mask alone or from the stream grids
+        from dtfelib.io import caustic_is_fold
+        rfold = grid(fx, ".caustic") == 1
+        assert np.array_equal(caustic_is_fold(rcc), rfold) and np.array_equal(caustic_is_fold(streams=rstr, hidden=rhid), rfold)
+        thin = find("pcj_crw_s", (".causticClass", ".streams", ".hidden_streams"))
+        if thin is not None:                # the young crossed waves of check (J): thin folds, k = 0 fold cells exist
+            tcc = np.rint(grid(thin, ".causticClass")).astype(np.int32)
+            tm, thid = sk.class_masks(tcc), (np.rint(grid(thin, ".hidden_streams")).astype(np.int32) & 1) != 0
+            tmiss = tm["indicator"]["fold"] & ~tm["cumulative"]["sheet"]
+            assert tmiss.sum() > 0 and (tmiss <= thid).all(), (int(tmiss.sum()), int((tmiss & ~thid).sum()))
+            assert np.array_equal(caustic_is_fold(streams=grid(thin, ".streams"), hidden=grid(thin, ".hidden_streams")),
+                                  tm["indicator"]["fold"])
+        else:
+            print("    (no pcj_crw_s run: the thin-fold part skipped)")
         rfr = sk.fractions(rcc, rden)
         assert abs(sum(v["volume"] for v in rfr["exclusive"].values()) - 1.0) < 1e-12 and rfr["cumulative"]["sheet"]["volume"] > 0
         means = [rstr[rm["exclusive"][c]].mean() for c in ("k=0", "k=1", "k=2") if rm["exclusive"][c].any()]
@@ -2627,7 +2839,9 @@ def t_webstreams_script():
     only when asked for by name; an unreadable combined file between two good snapshots (review 2 #31: h5py's
     OSError aborted the series) is a failed snapshot, the loop goes on to the next one and the series plot. Names
     (2026-10-08): a series over part of the snapdirs on disk is '_snaps<a>-<b>-...' (the whole ladder untagged, a
-    failed snapshot still counted as asked), another --prefix '_<prefix>', --raw '_raw', the default files untouched."""
+    failed snapshot still counted as asked), another --prefix '_<prefix>', --raw '_raw', the default files untouched.
+    2026-10-13: the V-web here is the STORED PS grid ('--ps-gradient stored', whose truncation and absence the test
+    stages), so its files carry the '_stored' tag; the default mean-field V-web is tests/py_meanfield_test.py's."""
     import io as _io, shutil, sys as _sys, tempfile
     from contextlib import redirect_stdout
     import json
@@ -2655,7 +2869,8 @@ def t_webstreams_script():
             def run(args):
                 out = root / "out"
                 buf = _io.StringIO()
-                _sys.argv = ["plot_web_streams.py", "--sim", "SYN", "--data-root", str(data), "--out", str(out)] + args
+                _sys.argv = ["plot_web_streams.py", "--sim", "SYN", "--data-root", str(data), "--out", str(out),
+                             "--ps-gradient", "stored"] + args
                 with redirect_stdout(buf):
                     try:
                         pws.main()
@@ -2669,10 +2884,11 @@ def t_webstreams_script():
             names = sorted(q.name for q in out.iterdir())
             assert code == 0, text[-600:]
             for z in ("0.00", "0.50"):
-                for w in ("tweb", "vweb"):
+                for w in ("tweb", "vweb_stored"):
                     assert f"web_streams_{w}_z{z}.json" in names and f"web_streams_{w}_z{z}.png" in names and f"web_streams_{w}_z{z}.txt" in names, names
+            assert json.loads((out / "web_streams_vweb_stored_z0.50.json").read_text())["vweb_source"] == "stored"
             # the series over 2 of the 4 snapdirs on disk is named by them (2026-10-08): it no longer replaces the full series
-            assert "single_stream_vs_z_tweb_snaps50-99.png" in names and "single_stream_vs_z_vweb_snaps50-99.png" in names \
+            assert "single_stream_vs_z_tweb_snaps50-99.png" in names and "single_stream_vs_z_vweb_stored_snaps50-99.png" in names \
                 and "4 table(s) written" in text and not any(q.startswith("single_stream_vs_z_tweb.") for q in names), (names, text[-300:])
             t = json.loads((out / "web_streams_tweb_z0.50.json").read_text())
             assert abs(sum(e["volume_fraction"] for e in t["classes"].values()) - 1.0) < 1e-12 and t["redshift"] == 0.5 and t["web"] == "T-web"
@@ -2682,7 +2898,7 @@ def t_webstreams_script():
             shutil.rmtree(out)
             code, text, out = run(["--snaps", "99", "98"])
             names = sorted(q.name for q in out.iterdir())
-            assert code == 1 and "web_streams_tweb_z0.01.json" in names and "web_streams_vweb_z0.01.json" not in names, (code, names)
+            assert code == 1 and "web_streams_tweb_z0.01.json" in names and "web_streams_vweb_stored_z0.01.json" not in names, (code, names)
             assert "V-web failed: " in text and "for 098" in text and "3 table(s) written" in text, text[-400:]
             shutil.rmtree(out)
             # the garbage header BETWEEN two good snapshots: 97 failed, 99 and 50 written, the series still drawn
@@ -2690,11 +2906,11 @@ def t_webstreams_script():
             names = sorted(q.name for q in out.iterdir()) if out.is_dir() else []
             assert code == 1, (code, text[-600:])
             for z in ("0.00", "0.50"):
-                for w in ("tweb", "vweb"):
+                for w in ("tweb", "vweb_stored"):
                     assert f"web_streams_{w}_z{z}.json" in names, (w, z, names)
             assert not any("z0.25" in q for q in names), names                  # nothing for the unreadable one
             # named by the snapshots ASKED for, sorted (the failed 97 too)
-            assert "single_stream_vs_z_tweb_snaps50-97-99.png" in names and "single_stream_vs_z_vweb_snaps50-97-99.png" in names, names
+            assert "single_stream_vs_z_tweb_snaps50-97-99.png" in names and "single_stream_vs_z_vweb_stored_snaps50-97-99.png" in names, names
             assert "4 table(s) written" in text and "no table for snapshot(s) [97]" in text, text[-400:]
             l097 = [l for l in text.splitlines() if l.startswith("  snapshot 097: ")]
             assert len(l097) == 1 and "signature" in l097[0], text[-600:]           # h5py's own reason, on 097's line
@@ -2702,7 +2918,7 @@ def t_webstreams_script():
             # the whole ladder on disk asked for (97 and 98's V-web failing): the untagged series
             code, text, out = run(["--snaps", "99", "98", "97", "50"])
             names = sorted(q.name for q in out.iterdir())
-            assert code == 1 and "single_stream_vs_z_tweb.png" in names and "single_stream_vs_z_vweb.png" in names \
+            assert code == 1 and "single_stream_vs_z_tweb.png" in names and "single_stream_vs_z_vweb_stored.png" in names \
                 and not any("_snaps" in q for q in names), (code, names)
             # another grid set at 99 (--prefix ps_caustic): its own names; the default set's z = 0 tables untouched
             _synthetic_snapdir(data, "SYN", 99, 0.0, prefix="ps_caustic")
@@ -2723,7 +2939,7 @@ def t_webstreams_script():
             assert {q.name: q.stat().st_mtime_ns for q in out.glob("web_streams_tweb_z0.00.*")} == kept
             shutil.rmtree(out)
             code, text, out = run(["--snaps", "99", "--web", "vweb"])
-            assert code == 0 and sorted(q.name for q in out.iterdir()) == ["web_streams_vweb_z0.00.json", "web_streams_vweb_z0.00.png", "web_streams_vweb_z0.00.txt"]
+            assert code == 0 and sorted(q.name for q in out.iterdir()) == ["web_streams_vweb_stored_z0.00.json", "web_streams_vweb_stored_z0.00.png", "web_streams_vweb_stored_z0.00.txt"]
             (data / "SYN" / "snapdir_099" / "ps_output.a_velVweb").unlink()
             shutil.rmtree(out)
             code, text, out = run(["--snaps", "99", "--web", "vweb"])
@@ -2881,7 +3097,8 @@ def t_slice_maps():
             style._save = spy
             for mod, argv in ((plot_DTFE, ["--sim", "SYN", "--data-root", str(data), "--snaps", "50"]),
                               (plot_PS_DTFE, ["--sim", "SYN", "--data-root", str(data), "--snap", "50"]),
-                              (plot_cosmic_web, ["--sim", "SYN", "--data-root", str(data), "--snap", "50"])):
+                              (plot_cosmic_web, ["--sim", "SYN", "--data-root", str(data), "--snap", "50",
+                                                 "--ps-gradient", "stored"])):   # the stored PS V-web pinned below (2026-10-13)
                 _sys.argv = [mod.__name__ + ".py"] + argv
                 buf = _io.StringIO()
                 with redirect_stdout(buf):
@@ -3125,6 +3342,187 @@ def t_pointeval_style():
             px = {name: mimg.imread(str(root / f"figures_{i}" / p)) for i, name in enumerate(got)}
             first = px["plot_pointeval"]
             assert all(a.shape == first.shape and np.array_equal(a, first) for a in px.values()), (p, {k: a.shape for k, a in px.items()})
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def _run_py(args, env_extra=None, cwd=None, timeout=300):
+    """A fresh interpreter (the plot scripts patch config / matplotlib at import): (returncode, stdout + stderr)."""
+    import os, subprocess, sys as _sys
+    env = dict(os.environ, MPLBACKEND="Agg", DTFE_NO_MIRROR="1", **(env_extra or {}))
+    res = subprocess.run([_sys.executable] + [str(a) for a in args], capture_output=True, text=True, env=env,
+                         cwd=cwd, timeout=timeout)
+    return res.returncode, res.stdout + res.stderr
+
+
+def t_pointeval_supersample_and_estimator():
+    """2026-10-11: plot_pointeval_panels.py reads a K > 1 plane (planes x nv*K x nu*K points; the density averaged
+    over each KxK block as PointPlane does, the stream count the block's largest) -- it died on every such plane --
+    and plot_pointeval.py renders a standard-DTFE slice (output.pts_*) beside PS-DTFE grids: '--method dtfe', and
+    'auto' following the slice on disk (it followed the grids, found no ps_output.pts_* and skipped the snapshot)."""
+    import json, shutil, tempfile
+    import matplotlib.image as mimg
+    root = Path(tempfile.mkdtemp(prefix="dtfe_ptsk_"))
+    plot = Path(__file__).resolve().parent.parent / "python" / "plot"
+    try:
+        data = root / "data"
+        d = _synthetic_snapdir(data, "SYN", 50, 0.5, grids=("den",))          # PS-DTFE grids only
+        nu, nv, k = 8, 4, 2
+        rng = np.random.default_rng(311)
+        den = rng.lognormal(0.0, 1.0, size=(1, nv * k, nu * k))
+        streams = rng.choice([1, 3, 5], size=(1, nv * k, nu * k)).astype(np.int32)
+        den.tofile(str(d / "ps_output.pts_den"))
+        streams.tofile(str(d / "ps_output.pts_streams"))
+        side = data / "SYN" / "plane_k2.json"
+        side.write_text(json.dumps({"axis": "z", "u_axis": "x", "v_axis": "y", "u0": 0.0, "u1": 100.0, "v0": 0.0,
+                                    "v1": 50.0, "nu": nu, "nv": nv, "planes": 1, "supersample": k, "center": 50.0,
+                                    "thickness": 2.0}))
+        _sys_path = list(__import__("sys").path)
+        __import__("sys").path.insert(0, str(plot))
+        try:
+            import plot_pointeval_panels as ppp
+            got_den, got_st = ppp.load_planes(d / "ps_output", json.loads(side.read_text()))
+        finally:
+            __import__("sys").path[:] = _sys_path
+        want_den = den.reshape(1, nv, k, nu, k).mean(axis=(2, 4))
+        want_st = streams.reshape(1, nv, k, nu, k).max(axis=(2, 4))
+        assert got_den.shape == (1, nv, nu) and np.allclose(got_den, want_den, rtol=0, atol=0) \
+            and np.array_equal(got_st, want_st), (got_den.shape, got_st.shape)
+        out = root / "panels.png"
+        rc, log = _run_py([plot / "plot_pointeval_panels.py", "--prefix", d / "ps_output", "--plane", side, "-o", out,
+                           "--image", "--panels", "density"])
+        assert rc == 0 and out.is_file(), (rc, log[-1500:])
+        assert mimg.imread(str(out)).shape[:2] == (nv, nu), mimg.imread(str(out)).shape   # one image pixel per PIXEL
+
+        # a standard-DTFE slice beside the PS-DTFE grids (the K = 1 plane of 16^2)
+        for f in ("ps_output.pts_den", "ps_output.pts_streams"):
+            (d / f).unlink()
+        rng.lognormal(0.0, 1.0, size=(1, 16, 16)).tofile(str(d / "output.pts_den"))
+        np.ones((1, 16, 16), np.int32).tofile(str(d / "output.pts_streams"))
+        (data / "SYN" / "pointeval_plane_16_z.json").write_text(json.dumps(
+            {"axis": "z", "u_axis": "x", "v_axis": "y", "u0": 0.0, "u1": 100.0, "v0": 0.0, "v1": 100.0,
+             "nu": 16, "nv": 16, "planes": 1, "supersample": 1}))
+        side.unlink()
+        rel = "fields/SYN/snap050/xy_plane/{}_density_pointeval_xy_plane_z0.50.png"
+        for method in ("auto", "dtfe", "ps"):
+            figs = root / f"figs_{method}"
+            rc, log = _run_py([plot / "plot_pointeval.py", "--data-root", data, "--sims", "SYN", "--snaps", "50",
+                               "--figures-root", figs, "--method", method, "--fields", "density"])
+            made = sorted(str(p.relative_to(figs)) for p in figs.rglob("*.png")) if figs.is_dir() else []
+            if method == "ps":
+                assert made == [] and "no point-evaluated fields" in log, (method, made, log[-800:])
+            else:
+                assert rc == 0 and made == [rel.format("dtfe")], (method, rc, made, log[-1500:])
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def t_halo_tracking_grid_set():
+    """2026-10-11: plot_halo_tracking.py samples the environment from the grid set asked for (--prefix, --raw), as
+    every other script does -- it read the default ps_output '_a' grids whatever the launcher had chosen -- and its
+    --data-root reaches the trees, catalogues and grids (it was parsed and ignored)."""
+    import shutil, tempfile
+    root = Path(tempfile.mkdtemp(prefix="dtfe_halotrack_"))
+    plot = Path(__file__).resolve().parent.parent / "python" / "plot"
+    try:
+        data = root / "data"
+        n = 8
+        d = _synthetic_snapdir(data, "SYN", 50, 0.5, n=n, grids=())
+        ix, iy, iz = np.indices((n, n, n)).astype(np.float32) + 1.0            # 1..8 along each axis, mean 4.5
+        ix.tofile(str(d / "ps_output.a_den"))                                   # each set a ramp along its own axis
+        iy.tofile(str(d / "ps_caustic.a_den"))
+        iz.tofile(str(d / "ps_caustic.den"))
+        drv = r"""
+import sys, json
+import numpy as np
+sys.path[:0] = [sys.argv[1], sys.argv[2]]
+from dtfelib import use_data_root
+use_data_root(sys.argv[3])
+import plot_halo_tracking as pht
+box = 100000.0 * 0.6774                                    # the synthetic header: h-free ckpc -> ckpc/h
+pos = np.array([[6.5, 1.5, 3.5]]) / 8 * box                # the centre of cell (6, 1, 3)
+out = {}
+for name, kw in (("default", {}), ("caustic", dict(prefix="ps_caustic")), ("raw", dict(prefix="ps_caustic", averaged=False))):
+    t = {0: {"snap": np.array([50]), "pos_ckpc_h": pos.copy()}}
+    pht.add_environment(t, "SYN", "auto", **kw)
+    out[name] = float(t[0]["env_density"][0])
+print("RESULT " + json.dumps(out))
+"""
+        rc, log = _run_py(["-c", drv, Path(plot).parent, plot, data])
+        line = [l for l in log.splitlines() if l.startswith("RESULT ")]
+        assert rc == 0 and line, log[-1500:]
+        import json
+        got = json.loads(line[0][7:])
+        want = {"default": 7 / 4.5, "caustic": 2 / 4.5, "raw": 4 / 4.5}
+        assert all(abs(got[k] - v) < 1e-6 for k, v in want.items()), got
+        other = root / "other root"
+        other.mkdir()
+        rc, log = _run_py([plot / "plot_halo_tracking.py", "--data-root", data, "--sim", "SYN", "--snap", "50"],
+                          env_extra={"DTFE_DATA_ROOT": str(other)})
+        assert rc != 0 and f"found under {data / 'SYN'}" in log and str(other) not in log, log[-800:]
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def t_evolution_summaries_this_run():
+    """2026-10-11: plot_velDiv_den.py's and plot_PDF_CDF.py's evolution summaries are built from THIS run's snapshots
+    (each summary file also names its simulation and estimator): they re-read every per-snapshot summary of the config
+    ladder in a folder shared by all simulations, so a snapshot this run skipped -- or another box's older run --
+    filled in points, and a skipped snapshot was counted as processed."""
+    import shutil, tempfile
+    root = Path(tempfile.mkdtemp(prefix="dtfe_evol_"))
+    plot = Path(__file__).resolve().parent.parent / "python" / "plot"
+    try:
+        data, figs = root / "data", root / "figs"
+        rng = np.random.default_rng(5)
+        for snap, z in ((99, 0.0), (50, 1.0)):
+            d = _synthetic_snapdir(data, "SYN", snap, z, n=8, grids=(), extra=(("velDiv", 1), ("vel", 3)))   # vel: the mean-field divergence (2026-10-13)
+            rng.lognormal(0.0, 0.5, size=(8, 8, 8)).astype(np.float32).tofile(str(d / "ps_output.a_den"))
+        stale = figs / "veldiv_density_analysis" / "snapshot_033_z2.00"     # another box's older run, same folder
+        stale.mkdir(parents=True)
+        (stale / "analysis_summary_z2.00.txt").write_text(
+            "Theoretical slope = -99.00 km/s/Mpc\nLinear regime slope = -77.00 km/s/Mpc\n"
+            "Difference from theory = -22.2%\nLinear-regime Pearson r = 0.5000\nResidual RMS (linear regime) = 1.00\n")
+        rc, log = _run_py([plot / "plot_velDiv_den.py", "--sim", "SYN", "--data-root", data],
+                          env_extra={"DTFE_FIGURES_ROOT": str(figs)}, timeout=600)
+        evo = figs / "veldiv_density_analysis" / "evolution_data.txt"
+        assert rc == 0 and evo.is_file(), (rc, log[-2000:])
+        rows = [l.split()[0] for l in evo.read_text().splitlines()[4:] if l.strip()]
+        assert rows == ["0.00", "1.00"], (rows, evo.read_text())
+        assert "Successfully processed: 2/" in log, log[-600:]
+        summ = (figs / "veldiv_density_analysis" / "snapshot_099_z0.00" / "analysis_summary_z0.00.txt").read_text()
+        assert "Simulation: SYN, estimator: ps, grids: ps_output*" in summ, summ[:400]
+        assert "Divergence: mean field div<v>" in summ, summ[:400]               # the PS default since 2026-10-13
+
+        # plot_PDF_CDF.py: the same rule (its per-snapshot work stubbed: the critical points need real grids)
+        stale2 = figs / "critical_point_analysis" / "snapshot_033_z2.00"
+        stale2.mkdir(parents=True)
+        (stale2 / "critical_point_analysis_summary_z2.00.txt").write_text(
+            "Maxima: 1 (25.0%,\nMinima: 1 (25.0%,\n1saddle: 1 (25.0%,\n2saddle: 1 (25.0%,\nTotal: 4 (1.0e-03 Mpc\n")
+        drv = r"""
+import sys, json
+sys.path[:0] = [sys.argv[1], sys.argv[2]]
+sys.argv = ["plot_PDF_CDF.py", "--sim", "SYN"]
+import plot_PDF_CDF as m
+seen = []
+def fake(snapshot, redshift, args):
+    if snapshot not in ("050", "099"):
+        return None
+    return {"redshift": redshift, "total_density": 1e-4, "maxima": 10.0, "minima": 20.0, "1saddle": 30.0, "2saddle": 40.0}
+def spy(fig, path, **kw):
+    seen.append([list(map(float, l.get_xdata())) for ax in fig.axes for l in ax.lines])
+m.process_snapshot, m.save_plot_to_multiple_paths = fake, spy
+m.main()
+print("RESULT " + json.dumps(seen))
+"""
+        rc, log = _run_py(["-c", drv, Path(plot).parent, plot], env_extra={"DTFE_FIGURES_ROOT": str(figs)})
+        line = [l for l in log.splitlines() if l.startswith("RESULT ")]
+        assert rc == 0 and line, log[-1500:]
+        import json
+        seen = json.loads(line[0][7:])
+        z50 = 1.0 + __import__("config").SNAPSHOT_TO_REDSHIFT["050"]
+        assert len(seen) == 2 and all(sorted(x) == sorted([1.0, z50]) for fig in seen for x in fig), seen
+        assert "Completed: 2/" in log, log[-600:]
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -3928,6 +4326,7 @@ def main():
     check("2026-10-11: analyze.py voids registers plot_void_convergence.py (K4) after the fate census, run with --sim (synthetic)", t_void_scripts_convergence)
     check("2026-10-11: analyze.py cache --prune lists the '_v1' and unreachable-smoothing namespaces, old fate links and dead temp files (dry run by default), --yes deletes exactly those, --keep-mpc (synthetic)", t_cache_prune)
     check("caustic skeleton: classes, periodic merge across a face/edge/corner, 6/18/26-connectivity, components, cusp vs swallowtail bits and 'not computed', the parity-only refusal, json_safe, per-void shells + the wall distance (synthetic)", t_caustic_skeleton)
+    check("the geometric fold flag (2026-10-13): caustic_is_fold with streams/hidden, its slabs and checks, FieldSet.fold_mask on a pre-fix grid and its fallbacks (synthetic)", t_caustic_fold_exact)
     check("plot_caustic_skeleton.py end to end: files per redshift, strict JSON, '--' cusp rows, --connectivity, no mirror under --out, no grid / parity-only / failed --voids exit 1, void_block with no or censored voids, the option name tags, the stale _voids.npz removed, the 'distinct' title (synthetic)", t_caustic_skeleton_script)
     check("plot_web_streams.py end to end: files per redshift, a truncated web, an unreadable snapshot file mid-series, the exit rule, the _snaps / _<prefix> / _raw name tags (synthetic)", t_webstreams_script)
     check("analyze.py compute: a missing snapdir and an unreadable snapshot file are counted failed, each with its own reason (synthetic)", t_compute_missing_data)
@@ -3935,11 +4334,18 @@ def main():
     check("slice maps: the house-style helpers' ranges and rules; the three map scripts write the same 53 files with the house norms, floors, panel labels, orientation and sizes; empty slices skipped (synthetic)", t_slice_maps)
     check("point-eval maps: one look and one path from plot_PS_DTFE (--pointeval-only and full) and plot_pointeval.py, fresh interpreters (synthetic)", t_pointeval_style)
     check("point-eval maps: slab / smooth / fixed-range renders get their own names, not 'up to date' against the plane render (synthetic)", t_pointeval_name_tags)
+    check("2026-10-11: plot_pointeval_panels.py reads a K > 1 plane (KxK blocks: density averaged, streams the largest); plot_pointeval.py renders a standard-DTFE slice beside PS-DTFE grids (--method dtfe, and auto following the slice) (synthetic)", t_pointeval_supersample_and_estimator)
+    check("2026-10-11: plot_halo_tracking.py samples the environment from --prefix / --raw's grids, and --data-root reaches the trees (synthetic)", t_halo_tracking_grid_set)
+    check("2026-10-11: plot_velDiv_den.py / plot_PDF_CDF.py evolution summaries from this run's snapshots only, each summary naming its simulation and estimator (synthetic)", t_evolution_summaries_this_run)
     check("sample_grid conventions", t_sample_grid)
     check("periodic helpers", t_periodic_helpers)
     check("track_center across box wrap", t_track_center_wrap)
     check("match_catalog_void (periodic)", t_match_catalog_void)
     check("shape estimators: vectorized == loop reference", t_shape_estimators)
+    check("2026-10-11: smooth_field / find_local_minima slab-threaded == scipy's serial filters bit for bit (synthetic)",
+          t_threaded_filters)
+    check("2026-10-11: find_critical_points' minimum/maximum box filters slab-threaded == scipy's serial filters bit "
+          "for bit at 256^3 (synthetic)", t_threaded_critical_points)
     check("FieldSet caustic loader (synthetic)", t_caustic_field_loader)
     check("velocity_single_stream float-streams + hidden-streams mask (synthetic)", t_velocity_single_stream_float_mask)
     check("FieldSet velocity_scale u-units conversion (synthetic)", t_velocity_scale)

@@ -580,6 +580,13 @@ inline std::string makeDescriptor(User_options const &userOptions)
         d << userOptions.lagrangianRegion.coords[i] << ',';
     d << " subgrid=" << (userOptions.psUseSubgrid?1:0)
       << " deferNorm=" << (userOptions.psDeferNormalization?1:0) << '\n';
+    // --ps-lag-padding (2026-10-11) sets the padded box instead of the Eulerian fraction recorded above. Written
+    // only when it is in force -- k > 0 on a Lagrangian-partitioned run (PSPartitionPlan; a single triangulation
+    // has no partition padding): since k = 8 became the default (2026-10-12) every partition cache written
+    // before then (no such line: the Eulerian padding) misses and rebuilds once, while '--ps-lag-padding 0'
+    // writes no line and so still finds them
+    if ( userOptions.psLagPadding > Real(0.) and userOptions.partitionOn and userOptions.partNo < 0 )
+        d << "lagPadding=" << userOptions.psLagPadding << '\n';
 #endif
     // anything that changes WHICH particles are triangulated, or their coordinates. The random
     // SEED belongs here only when '--randomSample' is on, because that is the one case where it

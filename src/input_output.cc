@@ -264,10 +264,13 @@ void readInputData(std::vector<Particle_data> *p,
                 snprintf(buf, sizeof(buf), "/PartType%d", type);
                 H5::Group grp = lagFile.openGroup(buf);
 
+                // the shapes, before reading into buffers sized N*NO_DIM / N (gadget_reader_HDF5.cc, 2026-10-11)
                 H5::DataSet coordDS = grp.openDataSet("Coordinates");
+                HDF5_checkParticleDataset(coordDS, buf, "Coordinates", chunkHeader.npart[type], NO_DIM, fn.c_str());
                 coordDS.read(&lagCoords[lagOffset * NO_DIM], H5::PredType::NATIVE_FLOAT);
 
                 H5::DataSet idDS = grp.openDataSet("ParticleIDs");
+                HDF5_checkParticleDataset(idDS, buf, "ParticleIDs", chunkHeader.npart[type], 0, fn.c_str());
                 idDS.read(&lagIDs[lagOffset], H5::PredType::NATIVE_UINT64);
 
                 lagOffset += chunkHeader.npart[type];

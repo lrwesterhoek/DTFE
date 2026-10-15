@@ -229,8 +229,9 @@ def track_voids_particles(vsnaps, n_voids, ztab, links=None):
         links = []
         tag = L.link_tag(vsnaps[-1].method, vsnaps[-1].prefix)    # the census's link files (plot_void_fate)
         for a, b in zip(vsnaps[:-1], vsnaps[1:]):
-            links.append(L.cached_link(a, b, tag))
-            a.drop_members()                                 # one snapshot's pool held at a time, as the census
+            # b's pool streamed, never held (2026-10-11); its followed members kept for b -> next, but not at the end
+            links.append(L.cached_link(a, b, tag, keep_prog=b is not vsnaps[-1]))
+            a.drop_members()
             b.drop_members(keep_prog=True)
         vsnaps[-1].drop_members()
     for lk, b in zip(links, vsnaps[1:]):

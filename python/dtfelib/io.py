@@ -17,6 +17,13 @@ analysis/plot script works with either method unchanged:
                        hardcoded BOX_SIZE / FIELD_RESOLUTION / REDSHIFT constants).
   * availability       PS-only fields (streams, dispersion, ...) raise a clear error under
                        method='dtfe'; use .has(name) to branch.
+  * same name, other   the velocity-GRADIENT family (gradient, divergence, shear, vorticity,
+    quantity           vweb) is the gradient of the mean velocity under DTFE but the stream
+                       average of each stream's own gradient <grad v> under PS-DTFE; the two agree
+                       only in single-stream cells (see the note above FIELDS). load(name,
+                       mean_field=True) gives the DTFE quantity for both (2026-10-13). The fold-caustic
+                       flag of grids written before 2026-10-13 is per sample and low: take it
+                       from FieldSet.fold_mask(), never from the raw 'caustic' grid.
   * memory             load() AUTO-TUNES against the machine: fields within the load budget
                        (DTFE_PY_LOAD_FRAC x available RAM; DTFE_PY_RAM_GB overrides) read
                        eagerly as before, bigger ones return a read-only memmap. Per-plane
@@ -28,6 +35,7 @@ Usage:
     rho   = fs.density(units="mean")            # rho/rho_bar for BOTH methods
     v     = fs.load("velocity")                 # (N,N,N,3) km/s
     v1    = fs.velocity_single_stream()         # velocity, NaN unless single-stream (PS only)
+    div   = fs.load("divergence", mean_field=True)  # div<v> for BOTH methods (PS: by FFT of 'velocity')
     if fs.has("streams"): s = fs.load("streams")
     print(fs)                                   # method, grid, box, z, rho_bar
 """
@@ -41,27 +49,63 @@ import numpy as np
 
 # canonical field name -> (file suffix, components, ps_only)
 # The 'a_' averaged prefix is inserted automatically (averaged=True default).
+#
+# THE VELOCITY-GRADIENT FAMILY UNDER PS-DTFE (audit finding 4, 2026-10-13): 'gradient', 'divergence',
+# 'shear', 'vorticity' and the V-web ('vweb', 'vweb_eigenvalues', classified from that gradient with
+# the Hoffman thresholds) hold, in a multi-stream cell, the STREAM AVERAGE OF EACH STREAM'S OWN
+# GRADIENT <grad v> = sum_s w_s grad(v_s) / sum_s w_s (w_s = the stream's Eulerian volume in the cell
+# under --ps-volume-weighted, the production convention, else its mass) -- NOT the gradient of the
+# mean velocity grad<v> that standard DTFE (one single-valued field) stores. The two agree in
+# single-stream cells only (deep void interiors agree to <1.5%); in folds they differ in sign and
+# size: the inverted stream inside a wall has a POSITIVE divergence (in 1-D dv/dx = Ddot psi'/(1 +
+# D psi') changes sign with the Jacobian, and diverges at the caustic) while the mean velocity
+# converges onto the wall. Consequences, measured on TNG100-3-Dark z=1 (audit 2026-10-13):
+#   * the box mean of 'divergence' is NOT 0 (DTFE's is, by Gauss on a periodic single-valued field):
+#     with volume weights the box mean of divergence * streams is the growth rate of the total
+#     stream volume, (1/V_box) d(sum_tets V_tet)/dt (the two agree to 4%: 159.7 vs 154.0 u-units);
+#   * the PS V-web finds almost no filaments or nodes (void/wall/filament/node 62.9/35.3/1.78/0.005%
+#     against DTFE's 54.2/39.0/6.62/0.20%) -- a different quantity, not a worse estimate;
+#   * a velocity-divergence--density relation from PS grids needs an intercept or the single-stream
+#     mask (velocity_single_stream / single_stream_mask): multi-stream cells add +12 to +56 km/s/Mpc.
+# Compare PS with DTFE stored gradients in single-stream cells only -- or compare the MEAN-FIELD quantity
+# (2026-10-13): FieldSet.load(name, mean_field=True) returns, for every name of MEAN_FIELD_NAMES, the derivatives
+# of the mean velocity grad<v> under BOTH methods: standard DTFE's stored grid as it is, and for PS-DTFE the
+# spectral (FFT) derivatives of its 'velocity' grid with the binary's components, units and V-web normalisation
+# (dtfelib/fields.py, mean_field_derivatives: applied to a standard run's own a_vel it reproduces the binary's
+# a_velDiv to correlation 0.995-0.998 and its V-web label in 96.5-98.4% of the cells, tests/py_meanfield_test.py;
+# on a PS run the divergence's box mean is 0 again and the V-web finds filaments where the stored one does not).
+# FieldSet.mean_field() computes it from the velocity grid for either method. The figure scripts that set PS
+# beside DTFE or theory use it for PS by default ('--ps-gradient stored' restores the stored grids; dtfelib/cli.py):
+# plot_velDiv_den, plot_cosmic_web, plot_web_streams, plot_shear_triaxial, plot_DTFE and plot_halo_tracking
+# (through environment.sample_fields_at). The raw-field viewers (plot_PS_DTFE, the launcher's Explore) still show
+# the stored PS grids.
 FIELDS = {
     "density":           ("den",           1, False),
     "velocity":          ("vel",           3, False),
     "streams":           ("streams",       1, True),
     "hidden_streams":    ("hidden_streams", 1, True),  # bitmask: bit 1 = multi-stream volume the stream count does not show (a folded tetrahedron overlaps the cell while '.streams' reads 1 -- a fold thinner than the sampling; exact in a periodic box), bit 2 = the cell holds mass from a tetrahedron none of whose sub-samples lies in it (a quadrature note, usually the SAME stream). Single-stream mask = streams==1 and not (hidden_streams & 1): velocity_single_stream does it. Written as '.unresolved' by the 2026-09-28/29 builds (0/1 = the old mass flag, read as bit 1: conservative; see LEGACY_SUFFIX); older outputs have neither and counted those tets in '.streams'
-    "caustic":         ("caustic",       1, True),   # 0/1 fold-caustic cell flag (--ps-caustics)
-    "caustic_class":     ("causticClass",  1, True),   # --ps-caustics (CPU or GPU; --ps-linear-deposit forces CPU): caustic stratification bitmask. bit0/1 = a det(J)>0 / det(J)<0 tetrahedron overlaps the cell (both = fold, i.e. '.caustic'), bits 2-5 = a tetrahedron with 0/1/2/3 collapsed axes overlaps it (1 = wall, 2 = filament, 3 = node), bit6 = two eigenvalues coincide AT ZERO (umbilic/D4 INDICATOR, not a D4 identification; both halves matter -- merely coincident eigenvalues occur throughout caustic-free volume), bit7 = the A3 CUSP indicator and bit8 = the A4 SWALLOWTAIL indicator, both present only under '--ps-caustic-cusps'. See src/CGAL_triangulation/ps_caustic_class.h; decode with caustic_collapse_max() / caustic_is_fold() / caustic_is_cusp() / caustic_is_swallowtail()
+    "caustic":         ("caustic",       1, True),   # 0/1 fold-caustic cell flag (--ps-caustics): tetrahedra of BOTH orientations overlap the cell. Geometric since 2026-10-13 (the det<0 half is the separating-axis overlap test, the raw '.hidden_streams' bit 1); grids written BEFORE that set it only where a folded tetrahedron deposited a sample and miss every fold thinner than the sampling (TNG100-3-Dark z=1: 21.0% of the cells against the exact 33.6%; ~2x low at z>=3). Read the fold with FieldSet.fold_mask() (= caustic_is_fold(mask, streams=, hidden=)), exact for old and new grids alike
+    "caustic_class":     ("causticClass",  1, True),   # --ps-caustics (CPU or GPU; --ps-linear-deposit forces CPU): caustic stratification bitmask. bit0/1 = a det(J)>0 / det(J)<0 tetrahedron overlaps the cell (both = fold, i.e. '.caustic'; bit1 is the geometric overlap since 2026-10-13, per sample before -- see 'caustic'), bits 2-5 = a tetrahedron with 0/1/2/3 collapsed axes deposited a sample here (1 = wall, 2 = filament, 3 = node; PER SAMPLE, so they depend on nSub and a fold thinner than the sampling shows only the k of the streams around it, typically k = 0 -- bit 0 and bits 6-8 are per sample too), bit6 = two eigenvalues coincide AT ZERO (umbilic/D4 INDICATOR, not a D4 identification; both halves matter -- merely coincident eigenvalues occur throughout caustic-free volume), bit7 = the A3 CUSP indicator and bit8 = the A4 SWALLOWTAIL indicator, both present only under '--ps-caustic-cusps'. See src/CGAL_triangulation/ps_caustic_class.h; decode with caustic_collapse_max() / caustic_is_fold() / caustic_is_cusp() / caustic_is_swallowtail()
     "tet_touch":         ("tetTouch",      1, True),   # --ps-exact-deposit: raw count of tetrahedra touching the cell (geometric multiplicity, runs to hundreds -- NOT a stream count; use 'streams' for that)
     "dispersion":        ("velDisp",       1, True),
     "dispersion_tensor": ("velDispTensor", 6, True),   # xx,xy,xz,yy,yz,zz
-    "divergence":        ("velDiv",        1, False),
-    "shear":             ("velShear",      5, False),
-    "vorticity":         ("velVort",       3, False),
-    "gradient":          ("velGrad",       9, False),
+    "divergence":        ("velDiv",        1, False),   # PS: the stream average <grad v> of each stream's own gradient, not grad<v> (note above FIELDS)
+    "shear":             ("velShear",      5, False),   # PS: the stream average <grad v> of each stream's own gradient, not grad<v> (note above FIELDS)
+    "vorticity":         ("velVort",       3, False),   # PS: the stream average <grad v> of each stream's own gradient, not grad<v> (note above FIELDS)
+    "gradient":          ("velGrad",       9, False),   # PS: the stream average <grad v> of each stream's own gradient, not grad<v> (note above FIELDS)
     "tweb":              ("tweb",          1, False),
     "tweb_eigenvalues":  ("twebEig",       3, False),
-    "vweb":              ("velVweb",       1, False),
-    "vweb_eigenvalues":  ("velVwebEig",    3, False),
+    "vweb":              ("velVweb",       1, False),   # PS: classified from <grad v>, not grad<v> (note above FIELDS): few filaments/nodes
+    "vweb_eigenvalues":  ("velVwebEig",    3, False),   # PS: classified from <grad v>, not grad<v> (note above FIELDS): few filaments/nodes
 }
 
 _PREFIX = {"ps": "ps_output.", "dtfe": "output."}
+
+# The velocity-gradient family load(..., mean_field=True) serves (fields.MEAN_FIELD_NAMES, kept here too so that
+# importing io never needs scipy), and the V-web threshold of a run whose log does not say it: the run scripts'
+# LAMBDA_TH default (run_dtfe.sh / run_ps_dtfe.sh pass --lambda_th 0.3; the binary's own default is 0).
+MEAN_FIELD_NAMES = ("gradient", "divergence", "shear", "vorticity", "vweb", "vweb_eigenvalues")
+DEFAULT_LAMBDA_TH = 0.3
 
 # Fields the binary writes ONCE, with no 'a_' (averaged) counterpart: the deposit produces a
 # single grid for them regardless of the u/a pass (see writeOutputData in src/input_output.cc).
@@ -121,15 +165,77 @@ def caustic_is_swallowtail(mask):
     return (np.asarray(mask).astype(np.int64) & CAUSTIC_SWALLOWTAIL) != 0
 
 
-def caustic_is_fold(mask):
-    """Boolean mask of the fold (A2) condition: BOTH map parities present in the cell/point.
+_FOLD_SLAB_CELLS = 16 << 20     # caustic_is_fold's slab size in cells (a module constant: the tests shrink it)
 
-    Identical to the 0/1 '.caustic' grid, recomputed from the mask so a single array can answer
-    every caustic question without loading a second file.
+
+def caustic_is_fold(mask=None, streams=None, hidden=None, tol: float | None = None):
+    """Boolean mask of the fold (A2) condition: tetrahedra of BOTH orientations overlap the cell/point.
+
+    mask only: BOTH parity bits set in a 'caustic_class' / '.pts_caustic' mask -- identical to the 0/1
+    '.caustic' grid of the same run. Exact for point masks and for grids written since 2026-10-13, whose
+    det<0 bit is the geometric overlap (audit finding 3). NOT for older grids: their bits were set only
+    where a folded tetrahedron deposited a SAMPLE, so every fold thinner than the sampling was missed
+    (TNG100-3-Dark z=1: 21.0% of the cells against 33.6%, about 2x low at z >= 3, and nSub-dependent).
+
+    streams (and hidden): THE fold definition for grids (2026-10-13), exact for old and new grids alike:
+
+        fold = (streams > 1 + tol)  |  (hidden_streams & 1)  [ | both parity bits of mask ]
+
+    In a periodic box the Lagrangian->Eulerian map has degree 1, so a point is multi-stream exactly where a
+    folded (det<0) tetrahedron covers it, and then positive ones cover it too: "a folded tetrahedron
+    overlaps the cell" IS the fold flag. '.hidden_streams' bit 1 holds exactly that overlap (the binary's
+    separating-axis test) wherever '.streams' reads single-stream, and '.streams' > 1 implies it everywhere
+    else, so the union is the geometric flag. The audit of 2026-10-13 checked it on the TNG100-3-Dark z=1
+    grids (no '.caustic' cell outside it; 33.6% of the cells), and tests/ps_caustic_class_check.sh (J) checks
+    that the fixed binary's '.caustic' equals it cell for cell. Either streams grid works ('.streams' with '.hidden_streams', or the
+    averaged 'a_' pair: both reduce to the same overlap). With 'mask' given its fold cells are OR-ed in, which
+    never changes the result (they lie inside the union) but keeps it whole if a grid is missing.
+
+    Caveats. Periodic runs only: a non-periodic sheet has an edge whose image can overlap without folding,
+    and there '.hidden_streams' bit 1 also carries the conservative mass flag, so the union over-flags. A
+    cell that '.streams' counts twice without a fold -- the Lagrangian periodic seam's double cover, a few
+    hundred cells per snapshot until the seam fix -- reads as fold here. Outputs of 2026-09-28/29 store the
+    old mass flag as '.unresolved' (read as bit 1: over-flags); outputs without either grid leave only
+    streams > 1 (per sample: under-flags, like the old '.caustic').
+
+    Inputs may be read-only memmaps of any size: the work runs in axis-0 slabs, so the only full-size array
+    is the boolean result (1 byte per cell). The streams test is single_stream_mask's own float32 arithmetic
+    (s - 1 > tol), so ~single_stream_mask(streams, hidden) == fold | (streams < 1 - tol): every cell that is
+    neither single-stream nor empty is a fold cell.
     """
     import numpy as np
-    m = np.asarray(mask).astype(np.int64)
-    return (m & (CAUSTIC_PARITY_POS | CAUSTIC_PARITY_NEG)) == (CAUSTIC_PARITY_POS | CAUSTIC_PARITY_NEG)
+    pair = CAUSTIC_PARITY_POS | CAUSTIC_PARITY_NEG
+    if streams is None:
+        if mask is None:
+            raise ValueError("caustic_is_fold needs a caustic_class mask, or the streams grid (with hidden_streams)")
+        if hidden is not None:
+            raise ValueError("caustic_is_fold: 'hidden' needs 'streams' too (the union is streams > 1 OR hidden bit 1)")
+        m = np.asarray(mask).astype(np.int64)
+        return (m & pair) == pair
+    tol = STREAM_TOL if tol is None else float(tol)
+    shape = np.shape(streams)
+    for name, other in (("mask", mask), ("hidden", hidden)):
+        if other is not None and np.shape(other) != shape:
+            raise ValueError(f"caustic_is_fold: {name} has shape {np.shape(other)}, streams {shape}")
+
+    def part(sl):
+        s = np.asarray(streams[sl], dtype=np.float32)
+        f = (s - 1.0) > tol                                   # = ~single_stream_mask(s) & not empty
+        if hidden is not None:
+            f |= (np.rint(np.asarray(hidden[sl], dtype=np.float32)).astype(np.int32) & 1) != 0
+        if mask is not None:
+            f |= (np.asarray(mask[sl]).astype(np.int64) & pair) == pair
+        return f
+
+    if len(shape) == 0:
+        return part(())
+    out = np.empty(shape, dtype=bool)
+    per = max(1, int(np.prod(shape[1:], dtype=np.int64)))
+    step = max(1, _FOLD_SLAB_CELLS // per)                    # ~16M cells per slab: ~200 MB of temporaries
+    for a in range(0, shape[0], step):
+        sl = slice(a, min(a + step, shape[0]))
+        out[sl] = part(sl)
+    return out
 
 
 def caustic_collapse_max(mask):
@@ -311,7 +417,12 @@ class FieldSet:
                 return old
         return path
 
-    def has(self, name: str) -> bool:
+    def has(self, name: str, mean_field: bool = False) -> bool:
+        """Is the grid on disk? mean_field=True asks whether load(name, mean_field=True) can serve it: under
+        PS-DTFE that needs the 'velocity' grid (the mean field is derived from it), under standard DTFE the stored
+        grid itself."""
+        if mean_field and self.method == "ps" and name in MEAN_FIELD_NAMES:
+            return self.has("velocity")
         try:
             return self._field_path(name).exists()
         except (KeyError, ValueError):
@@ -401,7 +512,7 @@ class FieldSet:
         shape = (n, n, n) if ncomp == 1 else (n, n, n, ncomp)
         return np.memmap(path, dtype=dtype, mode="r", shape=shape)
 
-    def load(self, name: str, scaled: bool = True, mode: str = "auto") -> np.ndarray:
+    def load(self, name: str, scaled: bool = True, mode: str = "auto", mean_field: bool = False) -> np.ndarray:
         """Field as stored on disk, shape (N,N,N) or (N,N,N,ncomp) -- with velocity-derived
         fields converted from Gadget u-units to peculiar km/s (see _VELOCITY_SCALE_EXP;
         a no-op at z=0). Pass scaled=False for the raw on-disk numbers.
@@ -418,9 +529,23 @@ class FieldSet:
         over-budget field that NEEDS scaling (velocity-derived, z>0) raises MemoryError
         naming the escape hatches: load_slice() for plot planes, iter_slabs() for
         streaming statistics, scaled=False for raw u-units, or mode='ram' to accept the
-        memory hit. At z=0 (every factor exactly 1) memmap serves ANY field."""
+        memory hit. At z=0 (every factor exactly 1) memmap serves ANY field.
+
+        mean_field=True (2026-10-13; names of MEAN_FIELD_NAMES only): the derivatives of the MEAN velocity grad<v>,
+        the quantity standard DTFE stores, whatever the method -- the stored grid under standard DTFE (exactly what
+        load(name) returns), under PS-DTFE mean_field(name) computed from the 'velocity' grid instead of the
+        stored stream average <grad v> (the note above FIELDS). Same units and layout as the stored grids; the
+        computed grid is always an in-memory array ('mode' does not apply to it)."""
         if mode not in ("auto", "ram", "memmap"):
             raise ValueError(f"mode must be 'auto', 'ram' or 'memmap', got {mode!r}")
+        if mean_field:
+            if name not in MEAN_FIELD_NAMES:
+                raise ValueError(f"mean_field=True serves the velocity-gradient family {', '.join(MEAN_FIELD_NAMES)}; "
+                                 f"not {name!r}")
+            if self.method == "ps":
+                return self.mean_field(name, scaled=scaled)
+            # standard DTFE: the stored grid IS the gradient of its one single-valued velocity field, measured by the
+            # estimator itself (cell averages of the interpolant's gradient) -- read it, never re-derive it
         factor = self._scale_factor32(name) if scaled else None
         if mode == "auto":
             mode = "ram" if self.field_nbytes(name) <= _load_budget_bytes() else "memmap"
@@ -445,6 +570,61 @@ class FieldSet:
         if factor is not None:
             data *= factor                    # in place: fromfile owns the buffer
         return data.reshape((n, n, n) if ncomp == 1 else (n, n, n, ncomp))
+
+    @property
+    def lambda_th(self) -> float:
+        """The web threshold this output was classified with: the '--lambda_th X' of its run log '<prefix>runlog'
+        (the binary's command line, which run_dtfe.sh / run_ps_dtfe.sh write on its 'RUNNING:' line), else the
+        binary's own T-web report '(lambda_th = X)' in that log, else DEFAULT_LAMBDA_TH (0.3, the run scripts'
+        default). mean_field() classifies its V-web with it, so a PS mean-field V-web uses its own run's threshold."""
+        import re
+        try:
+            text = (self.snapdir / f"{self.prefix}runlog").read_text(errors="replace")
+        except OSError:
+            return DEFAULT_LAMBDA_TH
+        found = re.findall(r"--lambda_th[ =]+([-+0-9.eE]+)", text) or re.findall(r"lambda_th = ([-+0-9.eE]+)", text)
+        try:
+            return float(found[-1]) if found else DEFAULT_LAMBDA_TH
+        except ValueError:
+            return DEFAULT_LAMBDA_TH
+
+    def mean_field(self, names, scaled: bool = True, lambda_th: float | None = None):
+        """The MEAN-FIELD velocity derivatives computed from this output's 'velocity' grid, for EITHER method
+        (load(name, mean_field=True) is the call that picks the stored grid for standard DTFE): the spectral
+        derivatives of the periodic velocity grid in the binary's layout (dtfelib/fields.py, mean_field_derivatives).
+
+        names: one name of MEAN_FIELD_NAMES (returns its grid) or a sequence of them (returns {name: grid}; asking
+        for several at once shares the FFTs, e.g. ('vweb', 'vweb_eigenvalues')). Units follow load(): the
+        gradient family scaled by sqrt(a) to peculiar km/s/Mpc (scaled=False: the binary's raw u-units/Mpc); the
+        V-web normalised as the binary does it, -sqrt(a)/(2 * 100 h) (g + g^T) with a = 1/(1+z) and h from the
+        snapshot header, classified with lambda_th (default: self.lambda_th, the run's own threshold).
+
+        The velocity grid is read through a memmap one component at a time and the work runs in float32 (float64 for
+        a DOUBLE=1 grid); fields.mean_field_peak_bytes() is the peak (512^3: divergence ~3.2 GB, V-web ~6.5 GB).
+        A grid whose estimate exceeds the available RAM (DTFE_PY_RAM_GB overrides the detection) raises
+        MemoryError rather than swapping. Periodic full-box grids only, as every FieldSet grid."""
+        from . import fields as _fields
+        single = isinstance(names, str)
+        wanted = (names,) if single else tuple(names)
+        for nm in wanted:
+            if nm not in MEAN_FIELD_NAMES:
+                raise ValueError(f"no mean-field derivative {nm!r}; known: {', '.join(MEAN_FIELD_NAMES)}")
+        vel = self.load("velocity", scaled=False, mode="memmap")          # raw u-units, never materialized whole
+        peak = _fields.mean_field_peak_bytes(self.grid_n, wanted, vel.dtype.itemsize)
+        if peak > _available_ram_bytes():
+            raise MemoryError(f"the mean-field {', '.join(wanted)} of a {self.grid_n}^3 grid needs ~{peak / 1e9:.1f} GB "
+                              f"(available {_available_ram_bytes() / 1e9:.1f} GB; DTFE_PY_RAM_GB overrides the detection)")
+        a = 1.0 / (1.0 + self.meta.redshift)
+        out = _fields.mean_field_derivatives(vel, self.meta.box_mpc, wanted, scale_factor=a,
+                                             hubble_h=self.meta.hubble_h,
+                                             lambda_th=self.lambda_th if lambda_th is None else float(lambda_th))
+        del vel
+        if scaled:
+            for nm in out:
+                factor = self._scale_factor32(nm)                         # vweb/vweb_eigenvalues: none (as stored)
+                if factor is not None:
+                    out[nm] *= factor
+        return out[wanted[0]] if single else {nm: out[nm] for nm in wanted}
 
     def load_slice(self, name: str, axis: int = 2, index: int | None = None,
                    scaled: bool = True) -> np.ndarray:
@@ -594,6 +774,30 @@ class FieldSet:
                                     self.load("hidden_streams") if self.has("hidden_streams") else None)
         vel[multi] = np.nan
         return vel
+
+    def fold_mask(self) -> np.ndarray:
+        """bool (N,N,N): the fold-caustic cells of this PS output -- a folded (det<0) tetrahedron overlaps the
+        cell, so it holds several streams -- EXACT for grids written before AND after the 2026-10-13 fix of
+        '.caustic' (see caustic_is_fold: streams > 1 + tol, or '.hidden_streams' bit 1, OR the class mask's
+        fold bits when the run wrote one). Use this, never the raw 'caustic' grid, wherever a fold fraction is
+        measured: the pre-fix '.caustic' was set per deposited sample and ~1.6x low at z=1, ~2x at z>=3.
+
+        Needs no '--ps-caustics' grid at all: every PS output since 2026-09-30 carries 'streams' and
+        'hidden_streams'. Which pair is read follows this FieldSet (averaged=True: 'a_streams' with
+        'a_hidden_streams'); both give the same overlap. An output without a streams grid falls back to the
+        class mask's parity bits or the 0/1 'caustic' grid, with that grid's own (pre-fix: per-sample) meaning.
+        Grids are opened as memmaps and reduced in slabs: the result is the only full-size array."""
+        if self.method != "ps":
+            raise ValueError("fold_mask() needs PS-DTFE outputs (method='ps'): standard DTFE has no streams")
+        mask = self.load("caustic_class", mode="memmap") if self.has("caustic_class") else None
+        if not self.has("streams"):
+            if mask is not None:
+                return caustic_is_fold(mask)
+            if self.has("caustic"):
+                return np.asarray(self.load("caustic", mode="memmap")) > 0.5
+            raise FileNotFoundError(f"no streams, caustic_class or caustic grid in {self.snapdir} (prefix {self.prefix})")
+        hidden = self.load("hidden_streams", mode="memmap") if self.has("hidden_streams") else None
+        return caustic_is_fold(mask, streams=self.load("streams", mode="memmap"), hidden=hidden)
 
     # ------------------------------------------------------------------ helpers
     def slice(self, field: np.ndarray, axis: int = 2, index: int | None = None) -> np.ndarray:

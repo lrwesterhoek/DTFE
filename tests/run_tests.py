@@ -790,6 +790,229 @@ def test_thin_region_threads(tmpdir):
         report(name, False, str(e))
 
 
+def _offset_lattice(nx, ny, nz, lx, ly, lz, frac=0.3):
+    """a uniform lattice of nx*ny*nz unit-weight particles, offset by 'frac' of a spacing from the cell edges"""
+    xs = [(i + frac) * lx / nx for i in range(nx)]
+    ys = [(j + frac) * ly / ny for j in range(ny)]
+    zs = [(k + frac) * lz / nz for k in range(nz)]
+    return [(x, y, z, 1.0) for x in xs for y in ys for z in zs]
+
+
+def test_mass_assignment_periodic_faces(tmpdir):
+    """Periodic CIC/TSC/PCS on a uniform (offset) lattice in a NON-CUBIC box (z twice as long, so its cells
+    are twice as tall): every cell is the mean density, at the box faces and at the auto-tuner's partition
+    seams too. Until 2026-10-11 PCS and CIC got no padding at all (no periodic images: PCS 0.27-0.94 at
+    faces and seams; CIC extrapolated instead, 1.4 / 0.8 in the face cells), and the derived TSC/NGP/DTFE
+    padding took the z faces' width from the x length and grid ([i%2] for the axis i/2), half the TSC
+    reach here."""
+    name = "mass_assignment_periodic_faces"
+    lx, lz = 100.0, 200.0
+    infile = os.path.join(tmpdir, f"{name}.txt")
+    write_text_input(infile, _offset_lattice(16, 16, 32, lx, lx, lz), (0, lx, 0, lx, 0, lz))
+    try:
+        for method in ("CIC", "TSC", "PCS"):
+            outfile = os.path.join(tmpdir, f"{name}_{method}")
+            ok, output = _run_raw(["-i", "111", "-o", "101", "-g", "16", "16", "16", "-f", "density",
+                                   "--MpcUnit", "1", "--periodic", f"--{method}"], infile, outfile)
+            if not ok:
+                raise AssertionError(f"DTFE --{method} failed")
+            den = _read_float32(outfile + ".a_den")
+            if len(den) != 16 ** 3:
+                raise AssertionError(f"{method}: {len(den)} cells, not {16 ** 3}")
+            worst = max(abs(v - 1.0) for v in den)
+            if worst > 1e-4:
+                raise AssertionError(f"{method}: a cell is {worst:.4f} off the mean density 1 "
+                                     f"(min {min(den):.4f}, max {max(den):.4f})")
+        report(name, True)
+    except AssertionError as e:
+        report(name, False, str(e))
+
+
+def test_mass_assignment_thin_partitions(tmpdir):
+    """'--partition 1 4 4' on an 8^3 grid gives partitions ONE cell thick: the clipped boundary stencil
+    must still give the mean density everywhere on a uniform lattice. Until 2026-10-11 TSC's edge case
+    for the first cell also wrote cell 1 of a one-cell grid (a heap overflow: 9% off here, rc 133/139 on
+    a thread's slab), CIC's extrapolated (1.74 off) and PCS had no padding (0.78 off)."""
+    name = "mass_assignment_thin_partitions"
+    infile = os.path.join(tmpdir, f"{name}.txt")
+    write_text_input(infile, _offset_lattice(8, 8, 8, 100.0, 100.0, 100.0), (0, 100, 0, 100, 0, 100))
+    env = dict(os.environ, OMP_NUM_THREADS="1")
+    try:
+        for method in ("CIC", "TSC", "PCS"):
+            outfile = os.path.join(tmpdir, f"{name}_{method}")
+            cmd = [DTFE_BIN, infile, outfile, "-i", "111", "-o", "101", "-g", "8", "-f", "density",
+                   "--MpcUnit", "1", "--periodic", f"--{method}", "--partition", "1", "4", "4"]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=env)
+            if result.returncode != 0:
+                raise AssertionError(f"--{method} on one-cell-thick partitions: exit {result.returncode}")
+            den = _read_float32(outfile + ".a_den")
+            worst = max(abs(v - 1.0) for v in den)
+            if len(den) != 512 or worst > 1e-4:
+                raise AssertionError(f"{method}: {len(den)} cells, a cell {worst:.4f} off the mean density 1")
+        report(name, True)
+    except AssertionError as e:
+        report(name, False, str(e))
+
+
+def test_partition_split_never_empty(tmpdir):
+    """More partitions along an axis than half its cells ('--partition 1 5 5' and '1 8 8' on an 8^3 grid), and a
+    cloud whose first slab holds every particle ('--partition 4 1 1', the 8^3 lattice squeezed into the first
+    x cell): the load-balancing split (subpartition.h optimalSplit) gave a partition no cells -- an '8*0*0' grid --
+    and TSC/CIC/PCS segfaulted (rc 139). Since 2026-10-11 every partition keeps at least one cell; a split that
+    already did is unchanged. Each run must equal the single-domain run of the same input to 1e-5."""
+    name = "partition_split_never_empty"
+    lat = os.path.join(tmpdir, f"{name}_lattice.txt")
+    write_text_input(lat, _offset_lattice(8, 8, 8, 100.0, 100.0, 100.0), (0, 100, 0, 100, 0, 100))
+    squeezed = os.path.join(tmpdir, f"{name}_slab.txt")
+    write_text_input(squeezed, [(x / 8.0, y, z, w) for x, y, z, w in _offset_lattice(8, 8, 8, 100.0, 100.0, 100.0)],
+                     (0, 100, 0, 100, 0, 100))
+    env = dict(os.environ, OMP_NUM_THREADS="1")
+    try:
+        for infile, label, splits in ((lat, "lattice", (["1", "5", "5"], ["1", "8", "8"])),
+                                      (squeezed, "first-slab cloud", (["4", "1", "1"],))):
+            for method in ("TSC", "CIC", "PCS"):
+                ref = None
+                for part in [None] + list(splits):
+                    tag = "single" if part is None else "_".join(part)
+                    outfile = os.path.join(tmpdir, f"{name}_{label[:5]}_{method}_{tag}")
+                    cmd = [DTFE_BIN, infile, outfile, "-i", "111", "-o", "101", "-g", "8", "-f", "density",
+                           "--MpcUnit", "1", "--periodic", f"--{method}"] + ([] if part is None else ["--partition"] + part)
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=env)
+                    if result.returncode != 0:
+                        raise AssertionError(f"{label}, --{method} --partition {' '.join(part or [])}: exit {result.returncode}")
+                    den = _read_float32(outfile + ".a_den")
+                    if len(den) != 512:
+                        raise AssertionError(f"{label}, --{method} {tag}: {len(den)} cells, not 512")
+                    if ref is None:
+                        ref = den
+                        continue
+                    peak = max(abs(v) for v in ref)
+                    worst = max(abs(a - b) for a, b in zip(den, ref)) / peak
+                    if worst > 1e-5:
+                        raise AssertionError(f"{label}, --{method} --partition {' '.join(part)}: {worst:.2e} of the "
+                                             f"peak off the single-domain grid")
+        report(name, True)
+    except AssertionError as e:
+        report(name, False, str(e))
+
+
+def test_mass_assignment_centroid(tmpdir):
+    """A mass-assignment kernel is symmetric about the particle: the centroid of one isolated particle's
+    deposit is its position (8 particles at random sub-cell offsets, one per 8^3-cell block). Until
+    2026-10-11 PCS took its 4 cells from the cell HOLDING the particle and the distance to that cell's
+    left edge, so every deposit sat half a cell too far along each axis (centroid +0.50 cells)."""
+    name = "mass_assignment_centroid"
+    import random
+    rnd = random.Random(1)
+    box, n = 64.0, 16
+    dx = box / n
+    parts = [(i * 32 + 16 + rnd.uniform(-2, 2), j * 32 + 16 + rnd.uniform(-2, 2), k * 32 + 16 + rnd.uniform(-2, 2), 1.0)
+             for i in (0, 1) for j in (0, 1) for k in (0, 1)]
+    infile = os.path.join(tmpdir, f"{name}.txt")
+    write_text_input(infile, parts, (0, box, 0, box, 0, box))
+    try:
+        for method in ("CIC", "TSC", "PCS"):
+            outfile = os.path.join(tmpdir, f"{name}_{method}")
+            ok, output = _run_raw(["-i", "111", "-o", "101", "-g", str(n), "-f", "density", "--MpcUnit", "1",
+                                   "--periodic", f"--{method}"], infile, outfile)
+            if not ok:
+                raise AssertionError(f"DTFE --{method} failed")
+            den = _read_float32(outfile + ".a_den")
+            for p in parts:
+                blk = [int(p[a] // 32) for a in range(3)]
+                tot, mom = 0.0, [0.0, 0.0, 0.0]
+                for i in range(8):
+                    for j in range(8):
+                        for k in range(8):
+                            c = (blk[0] * 8 + i, blk[1] * 8 + j, blk[2] * 8 + k)
+                            v = den[(c[0] * n + c[1]) * n + c[2]]
+                            tot += v
+                            for a in range(3):
+                                mom[a] += v * (c[a] + 0.5) * dx
+                off = max(abs(mom[a] / tot - p[a]) / dx for a in range(3))
+                if off > 0.01:
+                    raise AssertionError(f"{method}: a deposit's centroid is {off:.3f} cells off its particle")
+        report(name, True)
+    except AssertionError as e:
+        report(name, False, str(e))
+
+
+def test_fractional_region_noncubic(tmpdir):
+    """On a non-cubic box, '--region' (box fractions) is the same region as '--regionMpc' in Mpc, and
+    '--padding' (box fractions) the same padding as '--paddingMpc': byte-identical grids. Until
+    2026-10-11 the conversion read the box per entry [i%2] instead of per axis [i/2], so z took the x
+    length: '--region 0 1 0 1 0.5 1' on a 0-200 z axis gridded z = 50-100 instead of 100-200."""
+    name = "fractional_region_noncubic"
+    lx, lz = 100.0, 200.0
+    infile = os.path.join(tmpdir, f"{name}.txt")
+    parts = [(x, y, 2.0 * z, w) for (x, y, z, w) in make_seeded_random_particles(20000, lx, seed=7)]
+    write_text_input(infile, parts, (0, lx, 0, lx, 0, lz))
+    common = ["-i", "111", "-o", "101", "-g", "16", "-f", "density", "--MpcUnit", "1", "--TSC"]
+    pairs = (("region", ["--region", "0", "1", "0", "1", "0.5", "1"],
+              ["--regionMpc", "0", "100", "0", "100", "100", "200"]),
+             # the region in Mpc here, so only the padding conversion is under test: 5 Mpc in z (not 10) fell
+             # inside the 6.25 Mpc TSC reach and dropped particles
+             ("padding", ["--regionMpc", "25", "75", "25", "75", "50", "150",
+                          "--padding", "0.05", "0.05", "0.05", "0.05", "0.05", "0.05"],
+              ["--regionMpc", "25", "75", "25", "75", "50", "150",
+               "--paddingMpc", "5", "5", "5", "5", "10", "10"]))
+    try:
+        for what, frac_args, mpc_args in pairs:
+            grids = []
+            for tag, extra in (("frac", frac_args), ("mpc", mpc_args)):
+                outfile = os.path.join(tmpdir, f"{name}_{what}_{tag}")
+                ok, output = _run_raw(common + extra, infile, outfile)
+                if not ok:
+                    raise AssertionError(f"DTFE failed with {' '.join(extra)}")
+                with open(outfile + ".a_den", "rb") as f:
+                    grids.append(f.read())
+            if grids[0] != grids[1]:
+                raise AssertionError(f"the box-fraction {what} grids a different volume than the Mpc one")
+        report(name, True)
+    except AssertionError as e:
+        report(name, False, str(e))
+
+
+def test_hi_reader_species_guard(tmpdir):
+    """'--input 106' (HI mass from an HDF5 snapshot) is defined for gas only: gas plus stars must be refused.
+    The guard tested readParticleSpecies[1] five times until 2026-10-11, so gas + stars (species 0 and 4)
+    passed and the stars went in with their raw masses."""
+    name = "hi_reader_species_guard"
+    try:
+        import h5py
+        import numpy as np
+    except ImportError:
+        skip(name, "h5py/numpy not importable", required=False)
+        return
+    infile = os.path.join(tmpdir, f"{name}.hdf5")
+    n = 8
+    npart = np.array([n, 0, 0, 0, n, 0], dtype=np.int32)
+    with h5py.File(infile, "w") as f:
+        h = f.create_group("Header")
+        h.attrs.create("NumPart_ThisFile", npart)
+        h.attrs.create("NumPart_Total", npart.astype(np.uint32))
+        h.attrs.create("MassTable", np.array([1.0, 0, 0, 0, 1.0, 0]))
+        h.attrs.create("NumFilesPerSnapshot", np.int32(1))
+        h.attrs.create("BoxSize", np.float64(10.0))
+        for k, v in (("Time", 1.0), ("Redshift", 0.0), ("Omega0", 0.3), ("OmegaLambda", 0.7), ("HubbleParam", 0.7)):
+            h.attrs.create(k, np.float64(v))
+        for t in (0, 4):
+            f.create_group(f"PartType{t}").create_dataset("Coordinates", data=np.full((n, 3), 5.0, np.float32))
+    output_file = os.path.join(tmpdir, "outhi")
+    # blocks 3 = positions + masses; species 17 = gas (bit 0) + stars (bit 4)
+    ok, output = _run_raw(["-i", "106", "3", "17", "-g", "4", "-f", "density", "--MpcUnit", "1",
+                           "--options", os.path.join(tmpdir, "no_such_hi_file.hdf5")], infile, output_file)
+    try:
+        if ok:
+            raise AssertionError("gas + stars through the HI reader exited 0")
+        if "also asked for reading other particle species" not in output:
+            tail = output.strip().splitlines()[-1:] if output.strip() else []
+            raise AssertionError(f"not refused by the species guard: {tail}")
+        report(name, True)
+    except AssertionError as e:
+        report(name, False, str(e))
+
+
 def main():
     global VERBOSE, PASSED, FAILED
 
@@ -828,6 +1051,12 @@ def main():
         test_text_reader_zero_velocity(tmpdir)
         test_gadget_mass_block_skip(tmpdir)
         test_thin_region_threads(tmpdir)
+        test_mass_assignment_periodic_faces(tmpdir)
+        test_mass_assignment_thin_partitions(tmpdir)
+        test_partition_split_never_empty(tmpdir)
+        test_mass_assignment_centroid(tmpdir)
+        test_fractional_region_noncubic(tmpdir)
+        test_hi_reader_species_guard(tmpdir)
         test_exact_average_lattice(tmpdir)
         test_exact_average_convergence(tmpdir)
         test_regression(tmpdir, update_ref=args.update_ref)

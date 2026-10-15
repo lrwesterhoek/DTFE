@@ -5,7 +5,12 @@ A pure accumulation over the grids of one PS-DTFE output: for every class of the
 fractions of the box and, WITHIN the class, the distribution of the stream multiplicity in both
 weightings, the mean multiplicity, and -- when the run wrote a 'caustic_class' grid (--ps-caustics) --
 the fold fraction and the distribution of the collapse multiplicity k (0 uncollapsed, 1 wall, 2
-filament, 3 node; 'none' = no collapse bit at all, a cell never deposited into).
+filament, 3 node; 'none' = no collapse bit at all, a cell never deposited into). The fold is
+io.caustic_is_fold(caustic_class, streams=, hidden=) (2026-10-13): streams > 1 + tol, hidden-streams
+bit 1 or the mask's fold bits -- the geometric 'a folded tetrahedron overlaps the cell', exact for
+caustic_class grids written before that day too, whose own fold bits were set per deposited sample and
+low. So the fold fraction of a class is its 'hidden multi' share plus every bin above 1 (and the rare
+empty cell with the hidden bit); the collapse bins are still per sample.
 
 '.streams' is a FLOAT (dtfelib.STREAM_TOL): the averaged 'a_streams' grid is a sub-sample MEAN, so a
 partly multi-stream cell reads 1.5 and the bins are named by THRESHOLD, not by a stream count:
@@ -30,6 +35,10 @@ about ten times that, so a run of any size stays within a few GB.
                                  hidden=fs.load("hidden_streams", mode="memmap"),
                                  density=fs.load("density", mode="memmap"))
     print(ws.table_text(table, "TNG100-3-Dark z=0, T-web"))
+
+The web grid is the caller's choice: plot_web_streams.py passes the MEAN-FIELD V-web of a PS output by default
+(2026-10-13; fs.load("vweb", mean_field=True), the V-web standard DTFE stores), not the stored PS grid, whose
+<grad v> classes put the inverted fold streams in 'void' (dtfelib/io.py, the note above FIELDS).
 """
 
 from __future__ import annotations
@@ -109,7 +118,7 @@ class Accumulator:
             cb = collapse_bins(caustic_class).ravel()
             nc = self.c.shape[1]
             self.c += np.bincount(w.astype(np.int64) * nc + cb, minlength=nw * nc).reshape(nw, nc)
-            fold = caustic_is_fold(caustic_class).ravel()
+            fold = caustic_is_fold(caustic_class, streams=streams, hidden=hidden, tol=self.tol).ravel()
             self.fold += np.bincount(w, weights=fold, minlength=nw).astype(np.int64)
             if density is not None:
                 self.cm += np.bincount(w.astype(np.int64) * nc + cb, weights=d, minlength=nw * nc).reshape(nw, nc)

@@ -819,7 +819,7 @@ $(OBJ_DIR_PS)/ps_deposit_msl.h: metal/ps_deposit.metal metal/exact_clip.metal.in
 	{ printf 'static const char PS_DEPOSIT_MSL[] = R"MSL(\n'; cat metal/exact_clip.metal.inc metal/ps_deposit.metal; printf '\n)MSL";\n'; } > $@.tmp
 	mv $@.tmp $@
 
-$(OBJ_DIR_PS)/ps_metal_host$(OBJ_EXT): $(SRC)/CGAL_triangulation/ps_metal_host.cc $(SRC)/CGAL_triangulation/gpu_host.h $(SRC)/CGAL_triangulation/ps_deposit_params.h $(OBJ_DIR_PS)/ps_deposit_msl.h Makefile
+$(OBJ_DIR_PS)/ps_metal_host$(OBJ_EXT): $(SRC)/CGAL_triangulation/ps_metal_host.cc $(SRC)/CGAL_triangulation/gpu_host.h $(SRC)/CGAL_triangulation/gpu_metal_retry.h $(SRC)/CGAL_triangulation/ps_deposit_params.h $(OBJ_DIR_PS)/ps_deposit_msl.h Makefile
 	$(CC) $(COMPILE_FLAGS_PS) -I third_party/metal-cpp -I $(OBJ_DIR_PS) -o $@ -c $(SRC)/CGAL_triangulation/ps_metal_host.cc
 
 # Standard-DTFE Metal deposit host (METAL=1 only), same embedding scheme in $(OBJ_DIR).
@@ -828,20 +828,20 @@ $(OBJ_DIR)/dtfe_deposit_msl.h: metal/dtfe_deposit.metal metal/exact_clip.metal.i
 	{ printf 'static const char DTFE_DEPOSIT_MSL[] = R"MSL(\n'; cat metal/exact_clip.metal.inc metal/dtfe_deposit.metal; printf '\n)MSL";\n'; } > $@.tmp
 	mv $@.tmp $@
 
-$(OBJ_DIR)/dtfe_metal_host$(OBJ_EXT): $(SRC)/CGAL_triangulation/dtfe_metal_host.cc $(SRC)/CGAL_triangulation/gpu_host.h $(OBJ_DIR)/dtfe_deposit_msl.h Makefile
+$(OBJ_DIR)/dtfe_metal_host$(OBJ_EXT): $(SRC)/CGAL_triangulation/dtfe_metal_host.cc $(SRC)/CGAL_triangulation/gpu_host.h $(SRC)/CGAL_triangulation/gpu_metal_retry.h $(SRC)/CGAL_triangulation/dtfe_gpu_fixed.h $(SRC)/CGAL_triangulation/ps_deposit_params.h $(OBJ_DIR)/dtfe_deposit_msl.h Makefile
 	$(CC) $(COMPILE_FLAGS) -I third_party/metal-cpp -I $(OBJ_DIR) -o $@ -c $(SRC)/CGAL_triangulation/dtfe_metal_host.cc
 
-$(OBJ_DIR)/dtfe_metal_host_l$(OBJ_EXT): $(SRC)/CGAL_triangulation/dtfe_metal_host.cc $(SRC)/CGAL_triangulation/gpu_host.h $(OBJ_DIR)/dtfe_deposit_msl.h Makefile
+$(OBJ_DIR)/dtfe_metal_host_l$(OBJ_EXT): $(SRC)/CGAL_triangulation/dtfe_metal_host.cc $(SRC)/CGAL_triangulation/gpu_host.h $(SRC)/CGAL_triangulation/gpu_metal_retry.h $(SRC)/CGAL_triangulation/dtfe_gpu_fixed.h $(SRC)/CGAL_triangulation/ps_deposit_params.h $(OBJ_DIR)/dtfe_deposit_msl.h Makefile
 	$(CC) $(COMPILE_FLAGS) -fPIC -I third_party/metal-cpp -I $(OBJ_DIR) -o $@ -c $(SRC)/CGAL_triangulation/dtfe_metal_host.cc
 
 # CUDA/HIP GPU deposit hosts (CUDA=1 via nvcc, HIP=1 via hipcc): single-source .cu files, kernels
 # compiled ahead of time (no vendored SDK -- the CUDA toolkit / ROCm provide the headers). Ports of
 # the Metal kernels; keep them in step with metal/*.metal.
-$(OBJ_DIR_PS)/ps_gpu_cuda$(OBJ_EXT): $(SRC)/CGAL_triangulation/ps_gpu_cuda.cu $(SRC)/CGAL_triangulation/gpu_host.h $(SRC)/CGAL_triangulation/gpu_cuda_compat.h $(SRC)/CGAL_triangulation/gpu_cuda_emu.h $(SRC)/CGAL_triangulation/gpu_exact_clip.cuh $(SRC)/CGAL_triangulation/ps_deposit_params.h Makefile
+$(OBJ_DIR_PS)/ps_gpu_cuda$(OBJ_EXT): $(SRC)/CGAL_triangulation/ps_gpu_cuda.cu $(SRC)/CGAL_triangulation/gpu_host.h $(SRC)/CGAL_triangulation/gpu_cuda_compat.h $(SRC)/CGAL_triangulation/gpu_cuda_emu.h $(SRC)/CGAL_triangulation/gpu_exact_clip.cuh $(SRC)/CGAL_triangulation/gpu_cuda_retry.cuh $(SRC)/CGAL_triangulation/ps_deposit_params.h Makefile
 	@$(MKDIR_P) $(OBJ_DIR_PS)
 	$(GPUXX) $(GPUXX_FLAGS) -o $@ -c $(SRC)/CGAL_triangulation/ps_gpu_cuda.cu
 
-$(OBJ_DIR)/dtfe_gpu_cuda$(OBJ_EXT): $(SRC)/CGAL_triangulation/dtfe_gpu_cuda.cu $(SRC)/CGAL_triangulation/gpu_host.h $(SRC)/CGAL_triangulation/gpu_cuda_compat.h $(SRC)/CGAL_triangulation/gpu_cuda_emu.h $(SRC)/CGAL_triangulation/gpu_exact_clip.cuh Makefile
+$(OBJ_DIR)/dtfe_gpu_cuda$(OBJ_EXT): $(SRC)/CGAL_triangulation/dtfe_gpu_cuda.cu $(SRC)/CGAL_triangulation/gpu_host.h $(SRC)/CGAL_triangulation/gpu_cuda_compat.h $(SRC)/CGAL_triangulation/gpu_cuda_emu.h $(SRC)/CGAL_triangulation/gpu_exact_clip.cuh $(SRC)/CGAL_triangulation/gpu_cuda_retry.cuh $(SRC)/CGAL_triangulation/dtfe_gpu_fixed.h $(SRC)/CGAL_triangulation/ps_deposit_params.h Makefile
 	@$(MKDIR_P) $(OBJ_DIR)
 	$(GPUXX) $(GPUXX_FLAGS) -o $@ -c $(SRC)/CGAL_triangulation/dtfe_gpu_cuda.cu
 

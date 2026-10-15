@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # The Linux CI suite, ONE list shared by .github/workflows/ci.yml and the Dockerfile so the two cannot
-# drift. CPU-only: the GPU suites (dtfe_metal_check, gpu_scalar_check, gpu_mass_check, gpu_retry_check) need a GPU
+# drift. CPU-only: the GPU suites (dtfe_metal_check, gpu_scalar_check, gpu_mass_check, gpu_retry_check, and the
+# standard binary's dtfe_gpu_retry_check since 2026-10-13) need a GPU
 # build and stay local (the CUDA/HIP port runs them through its CPU emulation in the ci.yml job cudaemu:
 # tests/cudaemu_check.sh). ps_auto_tune_check and ps_scratch_check run here since 2026-10-11 (ported: the peak RSS from
 # getrusage instead of '/usr/bin/time -l', a temp folder instead of /private/tmp; their GPU parts SKIP).
@@ -45,6 +46,7 @@ stage_build() {
 # one here and compared nothing. The double pass compares the same reference (the double build sits 2.7e-5 from it).
 run_program_suites() {
     step "standard DTFE regression (stored reference)"; env -u DTFE_TEST_REFERENCE_DIR "$PY" tests/run_tests.py
+    step "standard DTFE Monte-Carlo average (unbiased, split-invariant)"; tests/dtfe_mc_average_check.sh --no-build
     step "PS-DTFE smoke test";                  tests/ps_smoke_test.sh --no-build
     step "PS-DTFE regression (analytic pancake)"; "$PY" tests/ps_regression_test.py --no-build
     step "3D crossed waves";                    "$PY" tests/ps_3d_test.py --no-build
@@ -55,10 +57,15 @@ run_program_suites() {
     step "vertex mass";                         tests/ps_vertex_mass_check.sh --no-build
     step "volume weighted";                     tests/ps_volume_weighted_check.sh --no-build
     step "parallel == serial";                  tests/ps_parallel_check.sh --no-build
+    step "partition / padding independence";     tests/ps_partition_padding_check.sh --no-build
+    step "periodic seam (exact periodic copies)"; tests/ps_periodic_seam_check.sh --no-build
     step "slab-mode deposit == serial";         tests/ps_slab_deposit_check.sh --no-build
+    step "exact mass grid (CPU fixed point)";   tests/ps_mass_exact_check.sh --no-build
+    step "exact moment grids (fixed point; thread-count independent)"; tests/ps_fixed_moments_check.sh --no-build
     step "caustic stratification";              tests/ps_caustic_class_check.sh --no-build
     step "tessellation cache";                  tests/ps_tessellation_cache_check.sh --no-build
     step "PS point evaluation";                 tests/ps_point_eval_check.sh --no-build
+    step "PS points in the grids' conventions"; tests/ps_point_conventions_check.sh --no-build
     step "standard point evaluation";           tests/dtfe_point_eval_check.sh --no-build
     step "exact point location + --serve";      tests/point_exact_serve_check.sh --no-build
     step "exact hidden-streams flag";           tests/ps_hidden_streams_check.sh --no-build
@@ -66,10 +73,15 @@ run_program_suites() {
     step "non-periodic suite";                  "$PY" tests/ps_nonperiodic_test.py --no-build
     step "batch drivers";                       tests/run_scripts_check.sh --no-build
     step "T-web (tidal tensor)";                tests/tweb_check.sh --no-build
+    # 2026-10-13: dtfelib's mean-field velocity derivatives (a PS grid given standard DTFE's grad<v> and V-web), checked
+    # against the standard binary's own a_velDiv / a_velGrad / V-web and a PS run; single and double pair alike
+    step "mean-field velocity derivatives + V-web"; MPLBACKEND=Agg "$PY" tests/py_meanfield_test.py
     step "interlacing (unit, 2D + 3D)";         tests/interlacing_check.sh
     step "composite server split";              tests/serve_split_check.sh --no-build
     step "ordered merge, look-ahead, crash-safe outputs, progress"; tests/ps_runtime_check.sh --no-build
     step "resume of a killed partitioned run";  tests/ps_resume_check.sh --no-build
+    step "resume of a killed partitioned standard run"; tests/dtfe_resume_check.sh --no-build
+    step "resume with --sample-points";         tests/ps_resume_points_check.sh --no-build
 }
 
 # The oldest supported Python (pyproject: >= 3.10) must PARSE every file: a PEP 701 f-string (3.12) is a
@@ -109,6 +121,12 @@ stage_core() {
     # against the single pair (the double stage does not repeat them): the memory model's predictions against a measured peak,
     # and the out-of-core accumulators bit-identical to in-RAM runs (2026-10-11, ported to Linux)
     step "auto-tune (memory model, budget, splits)"; tests/ps_auto_tune_check.sh --no-build
+    # 2026-10-14: the standard binary's tuner too (its report, the counted padded vertices of the run's own split, the
+    # user's thread count, the SUMMARY's memory model line). CPU-only here: its GPU half (E with --gpu --exact-average)
+    # skips on a build whose o/.build_mode names no GPU, H runs on the DTFE-2d the build stage makes; it pins
+    # OMP_NUM_THREADS=10 on purpose (the plans of a 10-core machine), so a 4-core runner only oversubscribes. The one
+    # timing-sensitive check is E's measured peak <= 1.35x the prediction (getrusage max RSS on Linux)
+    step "standard auto-tune (report, counted split, memory model)"; tests/dtfe_auto_tune_check.sh --no-build
     step "--scratch-dir (out-of-core accumulators)"; tests/ps_scratch_check.sh --no-build
     # AFTER the program suites: ps_caustic_class_check.sh leaves the crossed-waves run (pcc_out.*) under the
     # temp root, which the caustic-skeleton test's real-grid half reads (else it is a SKIP, not a pass)
@@ -123,6 +141,8 @@ stage_core() {
     step "void environment + caustic control";  MPLBACKEND=Agg "$PY" tests/py_environment_test.py
     step "void fate: particle links + census";  MPLBACKEND=Agg "$PY" tests/py_fate_test.py
     step "void convergence: grid, mass, estimator"; MPLBACKEND=Agg "$PY" tests/py_convergence_test.py
+    step "size function on the raw density";    MPLBACKEND=Agg "$PY" tests/py_size_function_test.py
+    step "void-in-cloud criteria";               MPLBACKEND=Agg "$PY" tests/py_vic_test.py
     # 2026-10-11: what the README tells a user to type exists in the code, and the drivers' knobs are documented
     step "docs drift (README / COMMANDS.md against the code)"; "$PY" tests/docs_drift_check.py
     # the python analysis stack end to end on a synthetic two-snapshot set (pins its own temp folders; its mirror

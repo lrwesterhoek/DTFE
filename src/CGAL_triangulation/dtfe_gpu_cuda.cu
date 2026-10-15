@@ -14,24 +14,35 @@
    The host mirrors dtfe_metal_host.cc: the same Batch / runBatch machinery, the chunked dispatch
    controller, the owner-box re-zero before a retry, and the shared full-grid accumulator (its
    result is copied to host vectors at Result, since the contract hands out pointers). Where
-   the Metal host reads unified memory in place, this one copies explicitly.
+   the Metal host reads unified memory in place, this one copies explicitly. Since 2026-10-13 also
+   its retry policy (chunk checkpoints, the cause of a failed kernel, the process-wide pace;
+   gpu_cuda_retry.cuh, ps_gpu_cuda.cu's) and its exact sums (64-bit fixed-point grids, the Metal
+   kernel's header; the item kernels' FX template parameter is Metal's FC_FIXED).
 
    Compiled and its CPU fallback exercised on Linux; NOT yet validated on NVIDIA/AMD hardware
    (metal/README.md, "CUDA / HIP"). */
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <mutex>
+#include <new>
 #include <string>
 #include <vector>
 #include <unistd.h>
+extern std::atomic<int> dtfeGpuRetries;            // averaged_interpolation_1.cc (run_progress.h), 2026-10-13
+extern std::atomic<int> dtfeGpuRetriesByCause[4];  // ... by cause: innocent, timeout, oom, other
 
 #include "gpu_host.h"
+#include "../message.h"         // ANSI colour helpers only (the retry warnings, 2026-10-13)
 #include "gpu_cuda_compat.h"
+#include "dtfe_gpu_fixed.h"     // batchFixedScales + psMassFixedMass: the exact sums' units (shared with the Metal host)
 
 #define ITEM_BLOCK_SHIFT 5      // log2 of the items per entry of the block table (kernel + host)
 
@@ -58,7 +69,31 @@ struct DepositParams
     uint32_t tableEntries;  // item kernel: shared-memory cell-table entries (power of two; 0 = none)
     int32_t  fScal;         // the scalar field (ONE component): runtime flags in both kernels here (Metal
     int32_t  fSGrad;        // specializes the item pipelines on them; 96 instantiations would be too many)
+    uint32_t fixedSum;      // the grids as exact 64-bit fixed-point sums (2026-10-13; batchFixedScales)
+    float    fxScale[5];    // their units 2^k: density, velocity, velocity gradient, scalar, scalar gradient
 };
+
+// ---- the exact sums (2026-10-13; metal/dtfe_deposit.metal's header says why and how). Under fixedSum a grid
+// buffer holds two unsigned words per component (low, high: the int64 on the little-endian hosts) instead of a
+// float: every share is the integer rint(v * scale) (the scale is 2^k, so the product is exact and rintf rounds
+// to nearest even, as Metal's rint), added word by word with the carry done by hand -- ps_gpu_cuda.cu's
+// depositMass -- so a cell's total does not depend on the order of the atomics.
+__device__ __forceinline__ ull fxq(float v, float scale) { return ull((long long)(rintf(v * scale))); }
+__device__ __forceinline__ void addWordsLH(unsigned* g, ull at, unsigned lo, unsigned hi)
+{
+    if (lo == 0u && hi == 0u) return;
+    unsigned const old = atomicAdd(&g[at * 2ull], lo);
+    unsigned const up = hi + ((old + lo < old) ? 1u : 0u);
+    if (up != 0u)
+        atomicAdd(&g[at * 2ull + 1ull], up);
+}
+__device__ __forceinline__ void addWords(unsigned* g, ull at, ull q) { addWordsLH(g, at, unsigned(q), unsigned(q >> 32)); }
+// one share of grid component 'at' (= flat * comps + component): the words when fx, else the float atomic
+__device__ __forceinline__ void gridAdd(float* g, bool fx, float scale, ull at, float v)
+{
+    if (fx) addWords(reinterpret_cast<unsigned*>(g), at, fxq(v, scale));
+    else atomicAdd(&g[at], v);
+}
 
 // ================================================================================================
 // kernels
@@ -100,19 +135,20 @@ __device__ __forceinline__ void depositCell(float* denGrid, float* velGrid, floa
                                             const float vel[3], const float gradFlat[9],
                                             float sc, const float sG[3], float w)
 {
+    bool const fx = P.fixedSum != 0u;
     if (P.fDen)
-        atomicAdd(&denGrid[flat], den*w);
+        gridAdd(denGrid, fx, P.fxScale[0], flat, den*w);
     if (P.fVel)
         for (int j=0;j<3;++j)
-            atomicAdd(&velGrid[flat*3ull+ull(j)], vel[j]*w);
+            gridAdd(velGrid, fx, P.fxScale[1], flat*3ull+ull(j), vel[j]*w);
     if (P.fGrad)
         for (int q=0;q<9;++q)
-            atomicAdd(&gradGrid[flat*9ull+ull(q)], gradFlat[q]*w);
+            gridAdd(gradGrid, fx, P.fxScale[2], flat*9ull+ull(q), gradFlat[q]*w);
     if (P.fScal)
-        atomicAdd(&scalGrid[flat], sc*w);
+        gridAdd(scalGrid, fx, P.fxScale[3], flat, sc*w);
     if (P.fSGrad)
         for (int i=0;i<3;++i)
-            atomicAdd(&sgGrid[flat*3ull+ull(i)], sG[i]*w);
+            gridAdd(sgGrid, fx, P.fxScale[4], flat*3ull+ull(i), sG[i]*w);
 }
 
 __global__ void __launch_bounds__(256)
@@ -229,7 +265,7 @@ struct CellCache {
     float cnt[K];
 };
 
-template <int K, bool FD, bool FV, bool FG>
+template <int K, bool FD, bool FV, bool FG, bool FX>
 __device__ __forceinline__ void flushSlot(float* denGrid, float* velGrid, float* gradGrid,
                                           float* scalGrid, float* sgGrid,
                                           const DepositParams& P, const CellCache<K>& C, int k,
@@ -247,26 +283,27 @@ __device__ __forceinline__ void flushSlot(float* denGrid, float* velGrid, float*
         sc   = m ? C.sc[j]   : sc;
         cnt  = m ? C.cnt[j]  : cnt;
     }
+    // (the same products as the table path's tableAdd: an eviction adds the same integers whichever takes it)
     ull const f = ull(flat);
     if (FD)
-        atomicAdd(&denGrid[f], den * factor);
+        gridAdd(denGrid, FX, P.fxScale[0], f, den * factor);
     if (FV) {
-        atomicAdd(&velGrid[f*3ull+0ull], vx * factor);
-        atomicAdd(&velGrid[f*3ull+1ull], vy * factor);
-        atomicAdd(&velGrid[f*3ull+2ull], vz * factor);
+        gridAdd(velGrid, FX, P.fxScale[1], f*3ull+0ull, vx * factor);
+        gridAdd(velGrid, FX, P.fxScale[1], f*3ull+1ull, vy * factor);
+        gridAdd(velGrid, FX, P.fxScale[1], f*3ull+2ull, vz * factor);
     }
     if (P.fScal)
-        atomicAdd(&scalGrid[f], sc * factor);
+        gridAdd(scalGrid, FX, P.fxScale[3], f, sc * factor);
     if (FG && P.debugNoAtomic < 3u) {
         float const w = cnt * factor;
         for (int j = 0; j < 3; ++j)
             for (int i = 0; i < 3; ++i)
-                atomicAdd(&gradGrid[f*9ull+ull(j*3+i)], vG[i][j] * w);
+                gridAdd(gradGrid, FX, P.fxScale[2], f*9ull+ull(j*3+i), vG[i][j] * w);
     }
     if (P.fSGrad && P.debugNoAtomic < 3u) {
         float const w = cnt * factor;
         for (int i = 0; i < 3; ++i)
-            atomicAdd(&sgGrid[f*3ull+ull(i)], sG[i] * w);
+            gridAdd(sgGrid, FX, P.fxScale[4], f*3ull+ull(i), sG[i] * w);
     }
 }
 
@@ -291,14 +328,15 @@ __device__ __forceinline__ Item itemOf(const unsigned* itemStart, const unsigned
 #define TABLE_EMPTY 0xffffffffu
 #define TABLE_PROBES 8u
 
-// floats per entry: den, vx, vy, vz, [scalar], [9 gradient], [3 scalar gradient] (== the Metal layout)
+// values per entry: den, vx, vy, vz, [scalar], [9 gradient], [3 scalar gradient] (== the Metal layout); floats,
+// or under FX (2026-10-13) two unsigned words each (tValsX: value v of an entry at words [2v], [2v+1])
 template <bool FG> __device__ __forceinline__ unsigned tableOffScal(const DepositParams&)    { return 4u; }
 template <bool FG> __device__ __forceinline__ unsigned tableOffGrad(const DepositParams& P)  { return 4u + (P.fScal ? 1u : 0u); }
 template <bool FG> __device__ __forceinline__ unsigned tableOffSGrad(const DepositParams& P) { return tableOffGrad<FG>(P) + (FG ? 9u : 0u); }
 template <bool FG> __device__ __forceinline__ unsigned tableStride(const DepositParams& P)   { return tableOffSGrad<FG>(P) + (P.fSGrad ? 3u : 0u); }
 
 // the per-block cell table (open addressing, linear probing, keys claimed by compare-exchange)
-template <bool FD, bool FV, bool FG>
+template <bool FD, bool FV, bool FG, bool FX>
 __device__ __forceinline__ bool tableAdd(unsigned* tKeys, float* tVals, unsigned E,
                                          unsigned key, float den, float vx, float vy, float vz, float sc, float w,
                                          const float vG[3][3], const float sG[3], const DepositParams& P)
@@ -313,6 +351,24 @@ __device__ __forceinline__ bool tableAdd(unsigned* tKeys, float* tVals, unsigned
         }
         if (k == key) {
             unsigned const base = h * tableStride<FG>(P);
+            if (FX) {   // the integers flushSlot would add (the same float products, converted here)
+                unsigned* tValsX = reinterpret_cast<unsigned*>(tVals);
+                if (FD) addWords(tValsX, base + 0u, fxq(den, P.fxScale[0]));
+                if (FV) {
+                    addWords(tValsX, base + 1u, fxq(vx, P.fxScale[1]));
+                    addWords(tValsX, base + 2u, fxq(vy, P.fxScale[1]));
+                    addWords(tValsX, base + 3u, fxq(vz, P.fxScale[1]));
+                }
+                if (P.fScal) addWords(tValsX, base + tableOffScal<FG>(P), fxq(sc, P.fxScale[3]));
+                if (FG)
+                    for (int j = 0; j < 3; ++j)
+                        for (int i = 0; i < 3; ++i)
+                            addWords(tValsX, base + tableOffGrad<FG>(P) + unsigned(j*3+i), fxq(vG[i][j] * w, P.fxScale[2]));
+                if (P.fSGrad)
+                    for (int i = 0; i < 3; ++i)
+                        addWords(tValsX, base + tableOffSGrad<FG>(P) + unsigned(i), fxq(sG[i] * w, P.fxScale[4]));
+                return true;
+            }
             if (FD) atomicAdd(&tVals[base + 0u], den);
             if (FV) {
                 atomicAdd(&tVals[base + 1u], vx);
@@ -336,7 +392,7 @@ __device__ __forceinline__ bool tableAdd(unsigned* tKeys, float* tVals, unsigned
 
 // The item body. 'valid' is false for a thread beyond the chunk (it still takes part in the warp
 // reduction, with nothing pending).
-template <int K, bool FD, bool FV, bool FG>
+template <int K, bool FD, bool FV, bool FG, bool FX>
 __device__ __forceinline__ void depositItem(
     const float* __restrict__ verts, const float* __restrict__ dens, const float* __restrict__ vels,
     const float* __restrict__ vols,  const unsigned* __restrict__ cnts, const unsigned* __restrict__ flats,
@@ -462,9 +518,9 @@ __device__ __forceinline__ void depositItem(
                     vVy = mm ? C.vy[j] : vVy; vVz = mm ? C.vz[j] : vVz; vSc = mm ? C.sc[j] : vSc; vCnt = mm ? C.cnt[j] : vCnt;
                 }
                 if (P.tableEntries == 0u ||
-                    !tableAdd<FD, FV, FG>(tKeys, tVals, P.tableEntries, vKey, vDen * factor, vVx * factor, vVy * factor,
-                                          vVz * factor, vSc * factor, vCnt * factor, vG, sG, P))
-                    flushSlot<K, FD, FV, FG>(denGrid, velGrid, gradGrid, scalGrid, sgGrid, P, C, hit, factor, vG, sG);
+                    !tableAdd<FD, FV, FG, FX>(tKeys, tVals, P.tableEntries, vKey, vDen * factor, vVx * factor, vVy * factor,
+                                              vVz * factor, vSc * factor, vCnt * factor, vG, sG, P))
+                    flushSlot<K, FD, FV, FG, FX>(denGrid, velGrid, gradGrid, scalGrid, sgGrid, P, C, hit, factor, vG, sG);
             }
             #pragma unroll
             for (int k = 0; k < K; ++k) {
@@ -496,7 +552,8 @@ __device__ __forceinline__ void depositItem(
     }   // valid
 
     // ---- flush with a warp reduction by cell (uniform control flow: every lane of the warp
-    // evaluates the warp-any conditions; lanes with nothing pending contribute zeros)
+    // evaluates the warp-any conditions; lanes with nothing pending contribute zeros). Under FX the leader
+    // converts its warp sums to integers (a warp is always the same items: the host aligns the chunks).
     #pragma unroll
     for (int k = 0; k < K; ++k) {
         bool  pend = k < used;
@@ -520,14 +577,14 @@ __device__ __forceinline__ void depositItem(
             if (lane == leader && !P.debugNoAtomic) {
                 ull const f = ull(leaderKey);
                 if (FD)
-                    atomicAdd(&denGrid[f], sd);
+                    gridAdd(denGrid, FX, P.fxScale[0], f, sd);
                 if (FV) {
-                    atomicAdd(&velGrid[f*3ull+0ull], sx);
-                    atomicAdd(&velGrid[f*3ull+1ull], sy);
-                    atomicAdd(&velGrid[f*3ull+2ull], sz);
+                    gridAdd(velGrid, FX, P.fxScale[1], f*3ull+0ull, sx);
+                    gridAdd(velGrid, FX, P.fxScale[1], f*3ull+1ull, sy);
+                    gridAdd(velGrid, FX, P.fxScale[1], f*3ull+2ull, sz);
                 }
                 if (fScal)
-                    atomicAdd(&scalGrid[f], ss);
+                    gridAdd(scalGrid, FX, P.fxScale[3], f, ss);
             }
             if ((FG || fSGrad) && P.debugNoAtomic < 2u) {
                 // the gradient is a per-tetrahedron constant times the cell weight: reduced per
@@ -543,10 +600,10 @@ __device__ __forceinline__ void depositItem(
                         if (FG)
                             for (int j = 0; j < 3; ++j)
                                 for (int i = 0; i < 3; ++i)
-                                    atomicAdd(&gradGrid[f*9ull+ull(j*3+i)], vG[i][j] * sw);
+                                    gridAdd(gradGrid, FX, P.fxScale[2], f*9ull+ull(j*3+i), vG[i][j] * sw);
                         if (fSGrad)
                             for (int i = 0; i < 3; ++i)
-                                atomicAdd(&sgGrid[f*3ull+ull(i)], sG[i] * sw);
+                                gridAdd(sgGrid, FX, P.fxScale[4], f*3ull+ull(i), sG[i] * sw);
                     }
                     mg = mg && !mt;
                 }
@@ -556,19 +613,41 @@ __device__ __forceinline__ void depositItem(
     }
 }
 
-// Flushes the block's cell table into the grids: one device atomic per field per used entry.
-template <bool FD, bool FV, bool FG>
+// Flushes the block's cell table into the grids: one device atomic per field per used entry (two words each,
+// integer to integer, under FX).
+template <bool FD, bool FV, bool FG, bool FX>
 __device__ __forceinline__ void tableFlush(const unsigned* tKeys, const float* tVals, unsigned E,
                                            unsigned ltid, unsigned tgSize,
                                            float* denGrid, float* velGrid, float* gradGrid,
                                            float* scalGrid, float* sgGrid, const DepositParams& P)
 {
+    const unsigned* tValsX = reinterpret_cast<const unsigned*>(tVals);
+    // value t of the integer table into device component 'at' of grid g
+    auto flushWords = [&](float* g, ull at, unsigned t) {
+        addWordsLH(reinterpret_cast<unsigned*>(g), at, tValsX[2u * t], tValsX[2u * t + 1u]);
+    };
     for (unsigned e = ltid; e < E; e += tgSize) {
         unsigned const key = tKeys[e];
         if (key == TABLE_EMPTY) continue;
         ull const f = ull(key);
         unsigned const base = e * tableStride<FG>(P);
         if (P.debugNoAtomic) continue;
+        if (FX) {
+            if (FD)
+                flushWords(denGrid, f, base + 0u);
+            if (FV)
+                for (unsigned c = 0u; c < 3u; ++c)
+                    flushWords(velGrid, f*3ull+ull(c), base + 1u + c);
+            if (P.fScal)
+                flushWords(scalGrid, f, base + tableOffScal<FG>(P));
+            if (FG)
+                for (unsigned q = 0u; q < 9u; ++q)
+                    flushWords(gradGrid, f*9ull+ull(q), base + tableOffGrad<FG>(P) + q);
+            if (P.fSGrad)
+                for (unsigned i = 0u; i < 3u; ++i)
+                    flushWords(sgGrid, f*3ull+ull(i), base + tableOffSGrad<FG>(P) + i);
+            continue;
+        }
         if (FD)
             atomicAdd(&denGrid[f], tVals[base + 0u]);
         if (FV)
@@ -589,7 +668,7 @@ __device__ __forceinline__ void tableFlush(const unsigned* tKeys, const float* t
 alignas(16) unsigned char dtfeSmem[65536];     // the emulator runs one block at a time: one shared buffer (aligned like the GPU's)
 #endif
 
-template <int K, bool FD, bool FV, bool FG>
+template <int K, bool FD, bool FV, bool FG, bool FX>
 __global__ void __launch_bounds__(256)
 depositItemsKernel(const float* __restrict__ verts, const float* __restrict__ dens, const float* __restrict__ vels,
                    const float* __restrict__ vols, const unsigned* __restrict__ cnts, const unsigned* __restrict__ flats,
@@ -606,17 +685,20 @@ depositItemsKernel(const float* __restrict__ verts, const float* __restrict__ de
     unsigned const ltid = threadIdx.x, tgSize = blockDim.x;
     for (unsigned e = ltid; e < E; e += tgSize) {
         tKeys[e] = TABLE_EMPTY;
-        for (unsigned c = 0u; c < stride; ++c) tVals[e * stride + c] = 0.0f;
+        if (FX)   // two words per value (the shared memory is sized for it)
+            for (unsigned c = 0u; c < 2u * stride; ++c) reinterpret_cast<unsigned*>(tVals)[e * 2u * stride + c] = 0u;
+        else
+            for (unsigned c = 0u; c < stride; ++c) tVals[e * stride + c] = 0.0f;
     }
     __syncthreads();
     unsigned const iid = blockIdx.x * blockDim.x + threadIdx.x;
     bool const valid = iid < P.nTet;
     Item it; it.tet = 0xffffffffu; it.sub = 0u; it.perTet = 1u;
     if (valid) it = itemOf(itemStart, blockTet, P.nTetTotal, P.itemBase + iid);
-    depositItem<K, FD, FV, FG>(verts, dens, vels, vols, cnts, flats, sobol, denGrid, velGrid, gradGrid,
-                               scal, scalGrid, sgGrid, P, it, valid, gpuLane(), tKeys, tVals);
+    depositItem<K, FD, FV, FG, FX>(verts, dens, vels, vols, cnts, flats, sobol, denGrid, velGrid, gradGrid,
+                                   scal, scalGrid, sgGrid, P, it, valid, gpuLane(), tKeys, tVals);
     __syncthreads();
-    tableFlush<FD, FV, FG>(tKeys, tVals, E, ltid, tgSize, denGrid, velGrid, gradGrid, scalGrid, sgGrid, P);
+    tableFlush<FD, FV, FG, FX>(tKeys, tVals, E, ltid, tgSize, denGrid, velGrid, gradGrid, scalGrid, sgGrid, P);
 }
 
 
@@ -807,42 +889,49 @@ Ctx& ctx()
     return c;
 }
 
-// the item kernel for a cache size and field set (all 24 instantiations are compiled ahead of time)
+// the item kernel for a cache size, field set and sum mode (all 48 instantiations are compiled ahead of time;
+// FX, the exact sums, since 2026-10-13 -- Metal's FC_FIXED)
 typedef void (*ItemLaunch)(unsigned blocks, size_t smem,
                            const float*, const float*, const float*, const float*, const unsigned*, const unsigned*,
                            const float4*, float*, float*, float*, const DepositParams&, const unsigned*, const unsigned*,
                            const float*, float*, float*);
 
-template <int K, bool FD, bool FV, bool FG>
+template <int K, bool FD, bool FV, bool FG, bool FX>
 void launchItemsT(unsigned blocks, size_t smem,
                   const float* v, const float* d, const float* u, const float* vol, const unsigned* cnt, const unsigned* flt,
                   const float4* s, float* den, float* vel, float* grad, const DepositParams& P,
                   const unsigned* g, const unsigned* b, const float* sc, float* scal, float* sgrad)
 {
-    auto const kfn = depositItemsKernel<K, FD, FV, FG>;
+    auto const kfn = depositItemsKernel<K, FD, FV, FG, FX>;
     GPU_LAUNCH(kfn, blocks, 256, smem, v, d, u, vol, cnt, flt, s, den, vel, grad, P, g, b, sc, scal, sgrad);
 }
 
-template <int K>
-ItemLaunch itemLaunchK(int mask)
+template <int K, bool FX>
+ItemLaunch itemLaunchKX(int mask)
 {
     switch (mask & 7)
     {
-        case 0: return launchItemsT<K, false, false, false>;
-        case 1: return launchItemsT<K, true,  false, false>;
-        case 2: return launchItemsT<K, false, true,  false>;
-        case 3: return launchItemsT<K, true,  true,  false>;
-        case 4: return launchItemsT<K, false, false, true >;
-        case 5: return launchItemsT<K, true,  false, true >;
-        case 6: return launchItemsT<K, false, true,  true >;
-        default: return launchItemsT<K, true,  true,  true >;
+        case 0: return launchItemsT<K, false, false, false, FX>;
+        case 1: return launchItemsT<K, true,  false, false, FX>;
+        case 2: return launchItemsT<K, false, true,  false, FX>;
+        case 3: return launchItemsT<K, true,  true,  false, FX>;
+        case 4: return launchItemsT<K, false, false, true,  FX>;
+        case 5: return launchItemsT<K, true,  false, true,  FX>;
+        case 6: return launchItemsT<K, false, true,  true,  FX>;
+        default: return launchItemsT<K, true,  true,  true,  FX>;
     }
 }
 
-ItemLaunch itemLaunch(int cacheK, bool fDen, bool fVel, bool fGrad)
+template <int K>
+ItemLaunch itemLaunchK(int mask, bool fFixed)
+{
+    return fFixed ? itemLaunchKX<K, true>(mask) : itemLaunchKX<K, false>(mask);
+}
+
+ItemLaunch itemLaunch(int cacheK, bool fDen, bool fVel, bool fGrad, bool fFixed)
 {
     int const mask = (fDen ? 1 : 0) | (fVel ? 2 : 0) | (fGrad ? 4 : 0);
-    return cacheK == 2 ? itemLaunchK<2>(mask) : cacheK == 8 ? itemLaunchK<8>(mask) : itemLaunchK<4>(mask);
+    return cacheK == 2 ? itemLaunchK<2>(mask, fFixed) : cacheK == 8 ? itemLaunchK<8>(mask, fFixed) : itemLaunchK<4>(mask, fFixed);
 }
 
 // a zeroed device allocation; null (and 'err' set) on failure
@@ -865,6 +954,27 @@ float* devUpload(const void* src, size_t bytes, const char* what, std::string& e
 inline unsigned blocksFor(size_t n, int tpb) { return unsigned((n + size_t(tpb) - 1) / size_t(tpb)); }
 
 
+// The checkpoints and the cause-aware retry policy of the GPU deposit (2026-10-13, ps_gpu_cuda.cu's, see
+// gpu_cuda_retry.cuh): GpuFault, the error codes, gpuRetryCause, the process-wide GpuPace, the DTFE_GPU_FAULT_AT
+// test hook and GpuSnapshot (device-to-host copies). The pass loop is runBatch below.
+#include "gpu_cuda_retry.cuh"
+
+// the run's retry counters (the progress sidecar's and DTFE.cpp's closing line), by gpuRetryCause's index;
+// averaged_interpolation_1.cc defines them
+void countGpuRetry(GpuFault f, gpuError_t code)
+{
+    int const k = gpuRetryCause(f, code);
+    ++dtfeGpuRetries;
+    ++dtfeGpuRetriesByCause[k];
+}
+
+// Chunks start at multiples of this many work items (2026-10-13, dtfe_metal_host.cc's rule): with the 256-thread
+// blocks also starting there, a warp (32 lanes on NVIDIA, 64 on CDNA) is always the same items, so its float warp
+// sum -- the item kernel's flush, which the exact sums convert only after -- does not depend on the chunking.
+size_t const CHUNK_ALIGN = 256;
+size_t alignChunkUp(size_t n) { return (n + CHUNK_ALIGN - 1) / CHUNK_ALIGN * CHUNK_ALIGN; }
+
+
 // ---------------------------------------------------------------- knobs (see dtfe_metal_host.cc)
 struct Knobs
 {
@@ -872,6 +982,7 @@ struct Knobs
     uint32_t itemSamples = 48;
     int      cacheK      = 2;
     bool     noWrite     = false;   // DTFE_GPU_DEBUG_NOWRITE: timing experiment, all the work, no atomics
+    bool     floatGrids  = false;   // DTFE_GPU_FLOAT_GRIDS=1 / DTFE_METAL_FLOAT_GRIDS=1: the float atomics of before (A/B)
 };
 
 Knobs knobs()
@@ -882,6 +993,8 @@ Knobs knobs()
     { long v = atol(env); if (v >= 4 && v <= 100000) k.itemSamples = uint32_t(v); }
     if (const char* env = getenv("DTFE_GPU_CACHE_K")) { int v = atoi(env); k.cacheK = (v == 4 || v == 8) ? v : 2; }
     k.noWrite = getenv("DTFE_GPU_DEBUG_NOWRITE") != nullptr;
+    auto envOn = [](const char* n) { const char* e = getenv(n); return e && atoi(e) != 0; };
+    k.floatGrids = envOn("DTFE_GPU_FLOAT_GRIDS") || envOn("DTFE_METAL_FLOAT_GRIDS");
     return k;
 }
 
@@ -889,24 +1002,34 @@ Knobs knobs()
 // ---------------------------------------------------------------- the accumulated grids
 struct Grids
 {
-    float* den  = nullptr;   // nCell floats (or a 4-byte dummy)
+    float* den  = nullptr;   // nCell components (or a 4-byte dummy)
     float* vel  = nullptr;   // nCell*3
     float* grad = nullptr;   // nCell*9
     float* scal = nullptr;   // nCell     the scalar
     float* sgrad = nullptr;  // nCell*3   its gradient
     size_t full[3] = {0, 0, 0};
     bool fDen = false, fVel = false, fGrad = false, fScal = false, fSGrad = false;
+    bool fixed = false;      // the components are two-word fixed-point sums (8 B, 2026-10-13), else floats
 
     size_t nCell() const { return full[0] * full[1] * full[2]; }
-    bool alloc(const size_t fullGrid[3], bool d, bool v, bool g, bool s, bool sg, std::string& err)
+    size_t compBytes() const { return fixed ? 8 : 4; }
+    size_t bytes(bool on, size_t comps) const { return on ? nCell() * comps * compBytes() : 4; }
+    // the buffers the kernels write, for the checkpoints (GpuSnapshot)
+    std::vector<DevBuf> buffers() const
+    {
+        return { { den, bytes(fDen, 1) }, { vel, bytes(fVel, 3) }, { grad, bytes(fGrad, 9) },
+                 { scal, bytes(fScal, 1) }, { sgrad, bytes(fSGrad, 3) } };
+    }
+    bool alloc(const size_t fullGrid[3], bool d, bool v, bool g, bool s, bool sg, std::string& err, bool fx = false)
     {
         for (int i = 0; i < 3; ++i) full[i] = fullGrid[i];
         fDen = d; fVel = v; fGrad = g; fScal = s; fSGrad = sg;
-        den  = devAlloc(fDen  ? nCell() * 4  : 4, "density grid", err);
-        vel  = den  ? devAlloc(fVel  ? nCell() * 12 : 4, "velocity grid", err) : nullptr;
-        grad = vel  ? devAlloc(fGrad ? nCell() * 36 : 4, "gradient grid", err) : nullptr;
-        scal = grad ? devAlloc(fScal ? nCell() * 4  : 4, "scalar grid", err) : nullptr;
-        sgrad = scal ? devAlloc(fSGrad ? nCell() * 12 : 4, "scalar-gradient grid", err) : nullptr;
+        fixed = fx;
+        den  = devAlloc(bytes(fDen, 1), "density grid", err);
+        vel  = den  ? devAlloc(bytes(fVel, 3), "velocity grid", err) : nullptr;
+        grad = vel  ? devAlloc(bytes(fGrad, 9), "gradient grid", err) : nullptr;
+        scal = grad ? devAlloc(bytes(fScal, 1), "scalar grid", err) : nullptr;
+        sgrad = scal ? devAlloc(bytes(fSGrad, 3), "scalar-gradient grid", err) : nullptr;
         return den && vel && grad && scal && sgrad;
     }
     void release()
@@ -924,7 +1047,9 @@ struct Grids
                        dims[0], dims[1], dims[2], comps);
             return gpuCheck(gpuGetLastError(), "zero box launch", err) && gpuCheck(gpuDeviceSynchronize(), "zero box", err);
         };
-        return zero(den, fDen, 1) && zero(vel, fVel, 3) && zero(grad, fGrad, 9) && zero(scal, fScal, 1) && zero(sgrad, fSGrad, 3);
+        unsigned const w = fixed ? 2u : 1u;   // floats per component
+        return zero(den, fDen, 1 * w) && zero(vel, fVel, 3 * w) && zero(grad, fGrad, 9 * w) && zero(scal, fScal, 1 * w)
+            && zero(sgrad, fSGrad, 3 * w);
     }
 };
 
@@ -951,7 +1076,7 @@ bool uploadBatch(std::vector<float>& verts, std::vector<float>& dens, std::vecto
                  std::vector<float>& vols, std::vector<uint32_t>& cnts, std::vector<uint32_t>& flats,
                  const std::vector<float>& sobol, const double dx[3], const size_t nGrid[3],
                  const size_t subOff[3], const size_t fullGrid[3], bool fDen, bool fVel, bool fGrad,
-                 bool fScal, bool fSGrad, bool exact, Batch& b, std::string& err)
+                 bool fScal, bool fSGrad, bool exact, bool allowFixed, Batch& b, std::string& err)
 {
     b.k = knobs();
     b.exact = exact;
@@ -975,6 +1100,12 @@ bool uploadBatch(std::vector<float>& verts, std::vector<float>& dens, std::vecto
     P.fScal = fScal ? 1 : 0;
     P.fSGrad = fSGrad ? 1 : 0;
     if (b.k.noWrite) P.fDen = P.fVel = P.fGrad = P.fScal = P.fSGrad = 0;
+    // the exact sums (2026-10-13): their units from this batch's values, before the upload consumes them; the
+    // shared full grid (allowFixed false) and DTFE_GPU_FLOAT_GRIDS=1 keep the float atomics
+    P.fixedSum = 0;
+    for (int g = 0; g < 5; ++g) P.fxScale[g] = 1.f;
+    if (allowFixed && !b.k.floatGrids && !b.k.noWrite)
+        P.fixedSum = batchFixedScales(verts, dens, vels, scal, vols, fDen, fVel, fGrad, fScal, fSGrad, P.fxScale) ? 1u : 0u;
     P.debugNoAtomic = getenv("DTFE_GPU_DEBUG_NOATOMIC") ? uint32_t(std::max(1, atoi(getenv("DTFE_GPU_DEBUG_NOATOMIC")))) : 0u;
     P.itemSamples = b.k.itemSamples;
     uint32_t exactCells = 16;          // the exact kernel's item = a block of cells (DTFE_GPU_EXACT_CELLS)
@@ -1072,130 +1203,237 @@ bool uploadBatch(std::vector<float>& verts, std::vector<float>& dens, std::vecto
     return true;
 }
 
-// The chunk controller's state; one per accumulated grid so it stays warm across batches.
+// The chunk controller's chunk, carried from one batch to the next on the shared grid (a per-call batch starts
+// afresh). The pace -- the kernels' target length and the gaps -- is the process-wide GpuPace since 2026-10-13
+// (gpu_cuda_retry.cuh), as in dtfe_metal_host.cc.
 struct ChunkState
 {
-    double     targetSec = 0.25;
-    useconds_t gapUs     = 0;       // no window server to yield to (the Metal host idles 8 ms)
     size_t     chunk     = 0;       // 0 = not started: use the kernel's first chunk
 };
 
 struct Stats { int chunks = 0, retries = 0; };
 
-// Runs one batch into the grids (CALLER HOLDS ctxMutex). Chunked, serialized launches: the chunk
-// controller bounds each kernel's duration (a display-attached Linux GPU kills kernels after a
-// few seconds); a failed chunk is never retried alone -- the batch's OWNER BOX is re-zeroed and
-// the whole batch redone with shorter kernels. (A CUDA kernel timeout is a sticky error: the
-// retries then fail as well and the caller deposits this sub-domain on the CPU.)
-bool runBatch(Batch& b, Grids& g, ChunkState& cs, Stats& st, std::string& err)
+// Runs one batch into the grids (CALLER HOLDS ctxMutex). Chunked, serialized launches: the chunk controller
+// bounds each kernel's duration (a display-attached Linux GPU kills kernels after a few seconds). Since
+// 2026-10-13 the retry policy of ps_gpu_cuda.cu's runChunked (dtfe_metal_host.cc runBatch has the rationale):
+// a failed kernel restores the batch's last snapshot -- its start (the per-call grids are zero there; the shared
+// grid's owner box is re-zeroed) or a checkpoint every ~10 s of GPU work (DTFE_GPU_CHECKPOINT_CHUNKS=<n>
+// kernels; per-call only: a device-to-host copy of the batch's grids) -- and continues, at a pace that depends
+// on the cause; a STICKY error (the context is lost: CUDA's launch timeout is one), 3 failures of the same chunk
+// or 16 in the batch hand the sub-domain to the CPU. Every failed kernel counts into the run's retry counters.
+// Before, each retry re-zeroed the owner box and redid the whole batch with shorter kernels, three times.
+bool runBatch(Batch& b, Grids& g, ChunkState& cs, Stats& st, bool sharedBox, std::string& err)
 {
     bool const exact = b.exact;
     bool useItems = b.k.useItems;
-    size_t const MIN_CHUNK = exact ? 1024 : useItems ? 4096 : 2000;
-    size_t const MAX_CHUNK = exact ? 500000 : useItems ? 4000000 : 500000;
-    size_t firstChunk = exact ? 8192 : useItems ? 65536 : 25000;
+    size_t const MIN_CHUNK = exact ? 1024 : useItems ? 4096 : 2048;
+    size_t const MAX_CHUNK = exact ? 499968 : useItems ? 4000000 : 499968;   // (multiples of CHUNK_ALIGN)
+    size_t firstChunk = exact ? 8192 : useItems ? 65536 : 25088;
     if (const char* env = getenv("DTFE_GPU_CHUNK"))   { long v = atol(env); if (v > 0) firstChunk = size_t(v); }
     if (const char* env = getenv("DTFE_METAL_CHUNK")) { long v = atol(env); if (v > 0) firstChunk = size_t(v); }
+    GpuPace& pace = gpuPace();        // targetSec 0.25 s, no gap until escalated
+    // an escalated pace (an earlier batch's failures) opens with a proportionally smaller chunk
+    if (pace.targetSec < GPU_PACE_TARGET0)
+        firstChunk = std::max(size_t(double(firstChunk) * pace.targetSec / GPU_PACE_TARGET0), MIN_CHUNK);
     if (cs.chunk == 0) cs.chunk = firstChunk;
 
     size_t const nThreads = useItems ? b.nItems : b.nTet;
     if (nThreads == 0) return true;
     int const tpb = 256;
+    bool const fixedSum = b.P.fixedSum != 0;
     // the per-block cell table: as many power-of-two entries as fit 32 KB of shared memory (keys
-    // 4 B + 4 or 13 floats per entry), like the Metal kernel's threadgroup memory; DTFE_GPU_TABLE=0
-    // turns it off (evictions go straight to the device)
+    // 4 B + 4 or 13 values per entry: floats, or the exact sums' two-word integers), like the Metal kernel's
+    // threadgroup memory; DTFE_GPU_TABLE=0 turns it off (evictions go straight to the device)
     uint32_t tableEntries = 0;
     size_t smemBytes = 0;
     ItemLaunch launch = nullptr;
     if (useItems && !exact)
     {   // == the kernel's tableStride(): den, vel, [scalar], [gradient], [scalar gradient]
         size_t const stride = 4 + (b.P.fScal ? 1 : 0) + (b.P.fGrad ? 9 : 0) + (b.P.fSGrad ? 3 : 0);
+        size_t const valueBytes = fixedSum ? 8 : 4;
         size_t const budget = 32768;
         uint32_t e = 1;
-        while (size_t(e * 2) * (4 + stride * 4) <= budget) e *= 2;
-        if (size_t(e) * (4 + stride * 4) > budget) e = 0;
+        while (size_t(e * 2) * (4 + stride * valueBytes) <= budget) e *= 2;
+        if (size_t(e) * (4 + stride * valueBytes) > budget) e = 0;
         if (const char* env = getenv("DTFE_GPU_TABLE")) { if (atoi(env) == 0) e = 0; }
         tableEntries = e >= 64 ? e : 0;
-        smemBytes = tableEntries ? size_t(tableEntries) * (4 + stride * 4) : 0;
-        launch = itemLaunch(b.k.cacheK, b.P.fDen != 0, b.P.fVel != 0, b.P.fGrad != 0);
+        smemBytes = tableEntries ? size_t(tableEntries) * (4 + stride * valueBytes) : 0;
+        launch = itemLaunch(b.k.cacheK, b.P.fDen != 0, b.P.fVel != 0, b.P.fGrad != 0, fixedSum);
     }
     b.P.tableEntries = tableEntries;
 
-    int const maxAttempts = 3;
-    bool success = false;
+    // DTFE_GPU_CHECKPOINT_CHUNKS=<n>: a checkpoint every n kernels (0 = only the batch-start snapshot). Unset:
+    // every ~10 s of GPU work (n = 10 s / the current kernel target), as the PS deposit's.
+    long ckChunks = -1;
+    if (const char* env = getenv("DTFE_GPU_CHECKPOINT_CHUNKS")) { ckChunks = atol(env); if (ckChunks < 0) ckChunks = 0; }
+    // DTFE_GPU_PACE_RECOVER_SEC=<s>: the clean GPU work after which an escalated pace steps back (GpuPace)
+    double paceRecoverSec = 90.;
+    if (const char* env = getenv("DTFE_GPU_PACE_RECOVER_SEC")) { double v = atof(env); if (v >= 0.) paceRecoverSec = v; }
+    std::vector<DevBuf> const gridBufs = g.buffers();
+    GpuSnapshot snap;
     std::string lastErr;
-    for (int attempt = 0; attempt < maxAttempts && !success; ++attempt)
+    // the batch's start: its grids are zero (per call: freshly zeroed; shared: its owner box), recorded as such
+    bool ckOn = sharedBox;
+    if (!sharedBox)
     {
-        if (attempt > 0)
-        {   // everything launched before has completed (each chunk synchronizes): re-zero the owner box
-            if (!g.zeroBox(b.P.subOff, b.P.nGrid, lastErr)) break;
-            ++st.retries;
-        }
-        success = true;
-        size_t chunk = std::min(std::max(cs.chunk, MIN_CHUNK), MAX_CHUNK);
-        size_t start = 0;
-        while (start < nThreads)
-        {
-            uint32_t const n = uint32_t(std::min(chunk, nThreads - start));
-            b.P.nTet = n;
-            b.P.itemBase = uint32_t(start);
+        GpuSnapshot::Took const took = snap.take(gridBufs, std::vector<bool>(gridBufs.size(), true), 0, lastErr);
+        if (took == GpuSnapshot::DeviceError) { err = lastErr; return false; }
+        ckOn = took == GpuSnapshot::Ok;
+    }
+    bool ckPeriodic = false;           // the held snapshot is a periodic checkpoint (not the batch's start)
+    int nFailed = 0, nResumedCk = 0;   // failed kernels of this batch, and how many resumed from a periodic checkpoint
+    int const MAX_FAILS_SAME_CHUNK = 3, MAX_FAILS_TOTAL = 16;
+    // failures of the 'same chunk': a failure that comes before the redo got past the previous failed kernel's
+    // end (chunk boundaries move with the timing controller, so a start offset is no identity)
+    int  failsHere = 0;
+    size_t failEnd = 0;
 
-            auto t0 = std::chrono::steady_clock::now();
-            if (exact)
-                GPU_LAUNCH(depositExactAverage, blocksFor(n, tpb), tpb, 0, b.bV, b.bD, b.bU, b.bVol,
-                           reinterpret_cast<const unsigned*>(b.bCnt), reinterpret_cast<const unsigned*>(b.bFlt),
-                           g.den, g.vel, g.grad, b.P,
-                           reinterpret_cast<const unsigned*>(b.bG), reinterpret_cast<const unsigned*>(b.bB),
-                           b.bSc, g.scal, g.sgrad);
-            else if (useItems)
-                launch(blocksFor(n, tpb), smemBytes, b.bV, b.bD, b.bU, b.bVol,
+    bool success = true;
+    size_t chunk = alignChunkUp(std::min(std::max(cs.chunk, MIN_CHUNK), MAX_CHUNK));
+    size_t start = 0, sinceCk = 0;
+    char const* const kname = exact ? "exact-average" : useItems ? "item" : "per-tetrahedron";
+    while (start < nThreads)
+    {
+        uint32_t const n = uint32_t(std::min(chunk, nThreads - start));
+        b.P.nTet = n;
+        b.P.itemBase = uint32_t(start);
+
+        auto t0 = std::chrono::steady_clock::now();
+        if (exact)
+            GPU_LAUNCH(depositExactAverage, blocksFor(n, tpb), tpb, 0, b.bV, b.bD, b.bU, b.bVol,
                        reinterpret_cast<const unsigned*>(b.bCnt), reinterpret_cast<const unsigned*>(b.bFlt),
-                       reinterpret_cast<const float4*>(b.bS), g.den, g.vel, g.grad, b.P,
+                       g.den, g.vel, g.grad, b.P,
                        reinterpret_cast<const unsigned*>(b.bG), reinterpret_cast<const unsigned*>(b.bB),
                        b.bSc, g.scal, g.sgrad);
-            else
-                GPU_LAUNCH(depositAveraged1, blocksFor(n, tpb), tpb, 0,
-                    b.bV + start * 12, b.bD + start * 4, b.needVel ? b.bU + start * 12 : b.bU, b.bVol + start,
-                    reinterpret_cast<const unsigned*>(b.bCnt) + start, reinterpret_cast<const unsigned*>(b.bFlt) + start,
-                    reinterpret_cast<const float4*>(b.bS), g.den, g.vel, g.grad, b.P,
-                    b.needScal ? b.bSc + start * 4 : b.bSc, g.scal, g.sgrad);
-            bool const ok = gpuCheck(gpuGetLastError(), "kernel launch", lastErr)
-                         && gpuCheck(gpuDeviceSynchronize(), exact ? "exact-average kernel" : useItems ? "item kernel" : "per-tetrahedron kernel", lastErr);
-            ++st.chunks;
-            double const el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-            if (!ok) { success = false; break; }     // restart the WHOLE batch (owner box re-zeroed above)
+        else if (useItems)
+            launch(blocksFor(n, tpb), smemBytes, b.bV, b.bD, b.bU, b.bVol,
+                   reinterpret_cast<const unsigned*>(b.bCnt), reinterpret_cast<const unsigned*>(b.bFlt),
+                   reinterpret_cast<const float4*>(b.bS), g.den, g.vel, g.grad, b.P,
+                   reinterpret_cast<const unsigned*>(b.bG), reinterpret_cast<const unsigned*>(b.bB),
+                   b.bSc, g.scal, g.sgrad);
+        else
+            GPU_LAUNCH(depositAveraged1, blocksFor(n, tpb), tpb, 0,
+                b.bV + start * 12, b.bD + start * 4, b.needVel ? b.bU + start * 12 : b.bU, b.bVol + start,
+                reinterpret_cast<const unsigned*>(b.bCnt) + start, reinterpret_cast<const unsigned*>(b.bFlt) + start,
+                reinterpret_cast<const float4*>(b.bS), g.den, g.vel, g.grad, b.P,
+                b.needScal ? b.bSc + start * 4 : b.bSc, g.scal, g.sgrad);
+        gpuError_t code = gpuGetLastError();
+        if (code == gpuSuccess) code = gpuDeviceSynchronize();
+        ++st.chunks;
+        double const el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 
-            start += n;
-            if (el > 1e-4)
-            {
-                double scale = cs.targetSec / el;
-                if (scale < 0.5) scale = 0.5;
-                if (scale > 4.0) scale = 4.0;
-                chunk = std::min(std::max(size_t(double(chunk) * scale), MIN_CHUNK), MAX_CHUNK);
-            }
-            if (cs.gapUs) usleep(cs.gapUs);
-        }
-        cs.chunk = chunk;
-
-        if (!success)
+        std::string desc;
+        GpuFault cause = GpuFault::Resource;
+        bool const realError = code != gpuSuccess;
+        bool failed = realError;
+        if (realError)
         {
-            cs.targetSec = std::max(cs.targetSec / 4.0, 0.02);
-            cs.gapUs     = std::min(std::max(cs.gapUs * 3, useconds_t(8000)), useconds_t(50000));
-            cs.chunk     = std::max(cs.chunk / 2, MIN_CHUNK);
-            if (attempt + 1 < maxAttempts)
+            desc = gpuGetErrorString(code);
+            cause = code == kGpuErrTimeout ? GpuFault::Watchdog : GpuFault::Resource;
+        }
+        else failed = gpuFaultInjected(desc, cause, code);   // the test hook (the kernel DID deposit)
+
+        if (failed)
+        {
+            ++nFailed;
+            ++st.retries;
+            countGpuRetry(cause, code);   // the run's counters count every failed kernel (run_progress.h)
+            lastErr = std::string(GPU_BACKEND_STRING " ") + kname + " kernel failed: " + desc + " [" + gpuFaultName(cause) + "]";
+            failsHere = (failsHere > 0 && start < failEnd) ? failsHere + 1 : 1;
+            failEnd = std::max(failEnd, start + n);
+            if (realError)
+            {   // a real error: a sticky one has lost the context, the probe returns it again
+                (void)gpuGetLastError();
+                if (gpuDeviceSynchronize() != gpuSuccess)
+                {
+                    cause = GpuFault::Fatal;
+                    lastErr += " (sticky: the device context is lost)";
+                }
+            }
+            if (cause == GpuFault::Fatal || !ckOn || failsHere >= MAX_FAILS_SAME_CHUNK || nFailed >= MAX_FAILS_TOTAL)
             {
-                fprintf(stderr, "DTFE %s: %s -- retrying the deposit from scratch "
-                                "(attempt %d/%d, target %.0f ms kernels, %.0f ms gaps)\n",
-                        GPU_BACKEND_STRING, lastErr.c_str(), attempt + 2, maxAttempts,
-                        cs.targetSec*1e3, cs.gapUs/1e3);
-                sleep(2);
+                if (!ckOn) lastErr += " (no checkpoint held)";
+                else if (failsHere >= MAX_FAILS_SAME_CHUNK) lastErr += " (" + std::to_string(failsHere) + " failures of the same chunk)";
+                else if (nFailed >= MAX_FAILS_TOTAL) lastErr += " (" + std::to_string(nFailed) + " failed kernels in this batch)";
+                success = false;
+                break;
+            }
+            if (cause != GpuFault::Victim)
+            {   // escalate (for the rest of the process): 4x shorter kernels, gaps of 8-50 ms, smaller chunk
+                pace.targetSec = std::max(pace.targetSec / 4.0, 0.02);
+                pace.gapUs     = std::min(std::max(pace.gapUs * 3, GPU_PACE_GAP_MIN), useconds_t(50000));
+                pace.cleanSec  = 0.;
+                chunk = alignChunkUp(std::max(chunk / 4, MIN_CHUNK));
+            }
+            std::string const why = lastErr;
+            size_t resumeAt = 0;
+            if (sharedBox)
+            {   // everything launched before has completed (each chunk synchronizes): re-zero the owner box
+                if (!g.zeroBox(b.P.subOff, b.P.nGrid, lastErr)) { lastErr = why + " -- " + lastErr; success = false; break; }
+            }
+            else
+            {
+                if (!snap.restore(lastErr)) { lastErr = why + " -- " + lastErr; success = false; break; }
+                resumeAt = snap.start;
+            }
+            if (ckPeriodic) ++nResumedCk;
+            fprintf(stderr, "%sDTFE %s: %s -- resuming from the %s at thread %zu of %zu "
+                            "(redoing %zu; failure %d of this chunk, target %.0f ms kernels, %.0f ms gaps)%s\n",
+                    MESSAGE::cYellow(), GPU_BACKEND_STRING, lastErr.c_str(), ckPeriodic ? "checkpoint" : "pass start",
+                    resumeAt, nThreads, start + n - resumeAt, failsHere,
+                    pace.targetSec * 1e3, pace.gapUs / 1e3, MESSAGE::cReset());
+            start = resumeAt;
+            sinceCk = 0;
+            // an innocent victim retries at once; our own kernels' failures let the device settle first
+            if (cause == GpuFault::Resource) sleep(2);
+            else if (cause == GpuFault::Watchdog) sleep(1);
+            continue;
+        }
+
+        start += n;
+        ++sinceCk;
+        if (el > 1e-4)
+        {
+            double scale = pace.targetSec / el;
+            if (scale < 0.5) scale = 0.5;
+            if (scale > 4.0) scale = 4.0;
+            chunk = alignChunkUp(std::min(std::max(size_t(double(chunk) * scale), MIN_CHUNK), MAX_CHUNK));
+        }
+        if (pace.targetSec < GPU_PACE_TARGET0 || pace.gapUs > GPU_PACE_GAP0)
+        {   // an escalated pace steps back after a clean stretch of GPU work (GpuPace)
+            pace.cleanSec += el + pace.gapUs / 1e6;
+            if (pace.cleanSec >= paceRecoverSec)
+            {
+                pace.targetSec = std::min(pace.targetSec * 4.0, GPU_PACE_TARGET0);
+                pace.gapUs     = pace.gapUs / 3 < GPU_PACE_GAP_MIN ? GPU_PACE_GAP0 : pace.gapUs / 3;
+                fprintf(stderr, "DTFE %s: %.0f s of GPU work without a fault -- pace eased to %.0f ms "
+                                "kernels, %.0f ms gaps%s\n", GPU_BACKEND_STRING, pace.cleanSec, pace.targetSec * 1e3,
+                        pace.gapUs / 1e3,
+                        pace.targetSec >= GPU_PACE_TARGET0 && pace.gapUs <= GPU_PACE_GAP0 ? " (the default)" : "");
+                pace.cleanSec = 0.;
             }
         }
+        long const every = ckChunks >= 0 ? ckChunks : std::max(1L, long(std::lround(10.0 / pace.targetSec)));
+        if (!sharedBox && ckOn && every > 0 && long(sinceCk) >= every && start < nThreads)
+        {   // synchronized above: the buffers hold exactly [0, start)
+            GpuSnapshot::Took const t = snap.take(gridBufs, std::vector<bool>(), start, lastErr);
+            if (t == GpuSnapshot::DeviceError) { success = false; break; }
+            if (t == GpuSnapshot::Ok) { ++snap.taken; ckPeriodic = true; sinceCk = 0; }
+            // else: no host memory for the spare copy; the last snapshot stays valid
+        }
+        if (pace.gapUs) usleep(pace.gapUs);
     }
+    cs.chunk = chunk;
+    if (nFailed > 0)
+        fprintf(stderr, "%sDTFE %s: deposit %s after %d failed kernel(s) (%d resumed from a periodic checkpoint); "
+                        "%d checkpoint(s), %.0f MB held, %.3f s copying%s\n",
+                success ? MESSAGE::cYellow() : MESSAGE::cRed(), GPU_BACKEND_STRING,
+                success ? "recovered on the GPU" : "gave up",
+                nFailed, nResumedCk, snap.taken, snap.bytes / 1.e6, snap.sec, MESSAGE::cReset());
     if (!success)
     {   // leave the owner box clean for whoever deposits this sub-domain instead
         std::string ignored;
-        g.zeroBox(b.P.subOff, b.P.nGrid, ignored);
+        if (sharedBox) g.zeroBox(b.P.subOff, b.P.nGrid, ignored);
         err = lastErr;
     }
     return success;
@@ -1204,11 +1442,11 @@ bool runBatch(Batch& b, Grids& g, ChunkState& cs, Stats& st, std::string& err)
 void logBatch(const Batch& b, const Stats& st, double waitSec, double runSec, double sinceBegin)
 {
     fprintf(stderr, "DTFE %s timing: %s kernel, %zu tetrahedra (%zu single-cell), %zu items of <= %u %s, "
-                    "%zu samples, table %u, %d chunks, %d retries, %.2f s (%.0f M samples/s)%s",
+                    "%zu samples, table %u, %s sums, %d chunks, %d retries, %.2f s (%.0f M samples/s)%s",
             GPU_BACKEND_STRING,
             b.exact ? "exact" : b.k.useItems ? (b.k.cacheK == 8 ? "item/K8" : b.k.cacheK == 2 ? "item/K2" : "item/K4") : "per-tet",
             b.nTet, b.nSingle, b.k.useItems ? b.nItems : size_t(0), b.P.itemSamples, b.exact ? "cells" : "samples", b.nSamples, b.P.tableEntries,
-            st.chunks, st.retries, runSec, runSec > 0 ? b.nSamples / runSec / 1e6 : 0.0,
+            b.P.fixedSum ? "fixed-point" : "float", st.chunks, st.retries, runSec, runSec > 0 ? b.nSamples / runSec / 1e6 : 0.0,
             sinceBegin >= 0 ? "" : "\n");
     if (sinceBegin >= 0)
         fprintf(stderr, "; shared grid: batch ready %.2f s after begin, waited %.2f s for the device\n",
@@ -1269,27 +1507,46 @@ bool dtfeGpuDepositAveraged1(std::vector<float>& verts,
     size_t const zero[3] = {0, 0, 0};
     Batch b;      // uploaded WITHOUT the mutex: the sub-domains' host work overlaps the queue
     if (!uploadBatch(verts, dens, vels, scal, vols, cnts, flats, sobol, dx, nGrid, zero, nGrid, fDen, fVel, fGrad,
-                     fScal, fSGrad, exact, b, err))
+                     fScal, fSGrad, exact, true, b, err))
         return false;
     Grids g;
-    if (!g.alloc(nGrid, fDen, fVel, fGrad, fScal, fSGrad, err))
-    {
-        if (err.empty()) err = GPU_BACKEND_STRING " allocation failed (out of device memory?)";
-        b.release(); g.release();
-        return false;
-    }
     ChunkState cs;
     Stats st;
     bool ok;
-    double el;
+    double el = 0.;
     {
         std::lock_guard<std::mutex> lock(ctxMutex());   // serialize dispatches
-        auto const t0 = std::chrono::steady_clock::now();
-        ok = runBatch(b, g, cs, st, err);
-        el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        // the grids are allocated under the device mutex since 2026-10-13 (dtfe_metal_host.cc says why: one
+        // batch's at a time, not every waiting sub-domain's; the exact sums' words are 8 B per component)
+        if (!g.alloc(nGrid, fDen, fVel, fGrad, fScal, fSGrad, err, b.P.fixedSum != 0))
+        {
+            if (err.empty()) err = GPU_BACKEND_STRING " allocation failed (out of device memory?)";
+            ok = false;
+        }
+        else
+        {
+            auto const t0 = std::chrono::steady_clock::now();
+            ok = runBatch(b, g, cs, st, false, err);
+            el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        }
     }
-    if (timingOn()) logBatch(b, st, 0., el, -1.);
-    if (ok)
+    if (timingOn() && g.den) logBatch(b, st, 0., el, -1.);
+    if (ok && g.fixed)
+    {   // the exact sums: each grid's words back to the host, every cell rounded once to the float of the contract
+        // (psMassFixedMass: q / scale in double), one grid at a time outside the device mutex
+        auto toFloat = [&](std::vector<float>& dst, const float* src, float scale, const char* what) -> bool {
+            std::vector<int64_t> q(dst.size());
+            if (!gpuCheck(gpuMemcpy(q.data(), src, q.size() * 8, gpuMemcpyDeviceToHost), what, err)) return false;
+            for (size_t i = 0; i < dst.size(); ++i) dst[i] = float(psMassFixedMass(q[i], scale));
+            return true;
+        };
+        ok = (!fDen   || toFloat(out.density,     g.den,   b.P.fxScale[0], "copy density back"))
+          && (!fVel   || toFloat(out.velocity,    g.vel,   b.P.fxScale[1], "copy velocity back"))
+          && (!fGrad  || toFloat(out.grad,        g.grad,  b.P.fxScale[2], "copy gradient back"))
+          && (!fScal  || toFloat(out.scalar,      g.scal,  b.P.fxScale[3], "copy scalar back"))
+          && (!fSGrad || toFloat(out.scalar_grad, g.sgrad, b.P.fxScale[4], "copy scalar gradient back"));
+    }
+    else if (ok)
         ok = (!fDen  || gpuCheck(gpuMemcpy(out.density.data(),  g.den,  nCell * 4,  gpuMemcpyDeviceToHost), "copy density back", err))
           && (!fVel  || gpuCheck(gpuMemcpy(out.velocity.data(), g.vel,  nCell * 12, gpuMemcpyDeviceToHost), "copy velocity back", err))
           && (!fGrad || gpuCheck(gpuMemcpy(out.grad.data(),     g.grad, nCell * 36, gpuMemcpyDeviceToHost), "copy gradient back", err))
@@ -1364,9 +1621,10 @@ bool dtfeGpuSharedDeposit(std::vector<float>& verts, std::vector<float>& dens, s
     if (cnts.empty()) return true;
 
     auto const tReady = std::chrono::steady_clock::now();
-    Batch b;      // uploaded WITHOUT the mutex
+    Batch b;      // uploaded WITHOUT the mutex (the float atomics: the shared grid's one unit would have to fit
+                  // every batch, which no batch's bound sets -- the exact sums are the per-call path's, 2026-10-13)
     if (!uploadBatch(verts, dens, vels, scal, vols, cnts, flats, sobol, dx, nGrid, subOff, s.grids.full,
-                     s.grids.fDen, s.grids.fVel, s.grids.fGrad, s.grids.fScal, s.grids.fSGrad, false, b, err))
+                     s.grids.fDen, s.grids.fVel, s.grids.fGrad, s.grids.fScal, s.grids.fSGrad, false, false, b, err))
         return false;
 
     bool ok;
@@ -1376,7 +1634,7 @@ bool dtfeGpuSharedDeposit(std::vector<float>& verts, std::vector<float>& dens, s
         auto const tGot = std::chrono::steady_clock::now();
         waitSec = std::chrono::duration<double>(tGot - tReady).count();
         Stats st;
-        ok = runBatch(b, s.grids, s.cs, st, err);
+        ok = runBatch(b, s.grids, s.cs, st, true, err);
         runSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - tGot).count();
         s.busy += runSec;
         ++s.batches;

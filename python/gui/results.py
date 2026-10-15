@@ -51,6 +51,9 @@ _NSUB = re.compile(r"--avg-subsamples (\d+)")
 _FIELDS = re.compile(r"--field ((?:(?!--)\S+\s*)+)")
 # the GPU deposit restarted after a watchdog kill: DTFE says 'the deposit', PS-DTFE 'the partition deposit'
 _GPU_RETRY = re.compile(r"retrying the (?:partition )?deposit from scratch")
+# the run log's closing tally (contract G1, 2026-10-11), printed when N > 0
+_GPU_RETRIES = re.compile(r"^GPU deposit retries: (\d+) \(innocent (\d+), timeout (\d+), oom (\d+), other (\d+)\)", re.M)
+GPU_RETRY_CAUSES = ("innocent", "timeout", "oom", "other")
 # the run-log contract's three names: the log of record, the last failed attempt, a run going or killed
 LOG_SUFFIXES = (".runlog", ".runlog.failed", ".runlog.partial")
 # the run-directory files of a run going (contract C1, 2026-10-11): the binary's JSON progress sidecar, the run
@@ -168,10 +171,27 @@ def progress_text(d: dict | None) -> str:
         pass
     try:
         if int(d.get("gpu_retries") or 0):
-            bits.append(f"{int(d['gpu_retries'])} GPU retries")
+            bits.append(retries_text(int(d["gpu_retries"]), d.get("gpu_retries_by_cause")))
     except (TypeError, ValueError):
         pass
     return ", ".join(bits)
+
+
+def retries_text(total: int, by_cause: dict | None = None) -> str:
+    """'3 GPU retries (timeout 2, oom 1)': the nonzero causes of the sidecar's or the log's tally (G1); '' for none.
+    innocent = Metal's 'Innocent Victim' (another process hung the GPU, ours was collateral), timeout = the GPU
+    watchdog killed our own buffer, oom = out of GPU memory, other = any other GPU error."""
+    if not total:
+        return ""
+    causes = []
+    if isinstance(by_cause, dict):
+        for c in GPU_RETRY_CAUSES:
+            try:
+                if int(by_cause.get(c) or 0):
+                    causes.append(f"{c} {int(by_cause[c])}")
+            except (TypeError, ValueError):
+                pass
+    return f"{int(total)} GPU retries" + (f" ({', '.join(causes)})" if causes else "")
 
 
 def log_prefix(name: str) -> str:
@@ -211,6 +231,8 @@ class RunRecord:
     build_time: _dt.datetime | None = None
     finished: _dt.datetime | None = None   # the log's modification time = when the run ended
     gpu_retried: bool = False       # the GPU deposit was restarted after a watchdog kill (the log says so)
+    gpu_retries: int = 0            # the log's 'GPU deposit retries: N (...)' line (G1, 2026-10-11): N, and per cause
+    gpu_retries_by_cause: dict = field(default_factory=dict)
     wall_seconds: float | None = None
     peak_rss_gb: float | None = None
     footprint_gb: float | None = None
@@ -330,6 +352,10 @@ class RunRecord:
                 bits.append("caustics")
             if self.has("--ordered-merge"):
                 bits.append("ordered merge")
+            elif self.has("--completion-order-merge"):   # the old merge, asked for since 2026-10-14
+                bits.append("completion-order merge")
+        elif self.has("--exact-average"):       # standard DTFE: the exact cell average tells the production grids
+            bits.append("exact average")        # of 2026-10-13 on from the Monte-Carlo ones
         if self.gpu:
             bits.append("GPU")
         if self.precision == "double":
@@ -355,7 +381,10 @@ class RunRecord:
                      volume_weighted=self.has("--ps-volume-weighted"),
                      caustics=self.has("--ps-caustics"), caustic_cusps=self.has("--ps-caustic-cusps"),
                      parallel_triangulation=self.has("--parallel-triangulation"),
-                     ordered_merge=self.has("--ordered-merge"),       # K1: off too, as linear_deposit (2026-10-11)
+                     # K1 (2026-10-11); since 2026-10-14 the default is ON (the staged merge in index order), so only
+                     # a run made with '--completion-order-merge' turns it off -- an older run without either flag
+                     # merged in completion order then, but loading its settings starts today's default
+                     ordered_merge=not self.has("--completion-order-merge"),
                      output_prefix=self.prefix or "ps_output")
             m = re.search(r"(?:^|\s)--ps-alpha-shape\s+([0-9.]+)", self.command)
             if m:
@@ -364,6 +393,8 @@ class RunRecord:
                 d["nsub"] = self.nsub
             if self.fields:
                 d["fields"] = self.fields
+        elif self.estimator == "dtfe":      # its cell average, both ways (2026-10-13: the Grids tab's choice was kept)
+            d["deposit"] = "exact" if self.has("--exact-average") else "sampled"
         return d
 
 
@@ -418,8 +449,8 @@ def run_inputs(rec: RunRecord) -> set[Path]:
 # the text-derived fields of every run log read, by path, with the (size, mtime_ns) they were read at
 # (2026-10-11): the launcher rescans every 30 s on its GUI thread, and a TNG50 z=0 log is large and on the
 # external disk; an unchanged log is not read again
-_LOG_FIELDS = ("binary", "build_rev", "build_time", "command", "gpu_retried", "wall_seconds", "peak_rss_gb",
-               "footprint_gb", "ok")
+_LOG_FIELDS = ("binary", "build_rev", "build_time", "command", "gpu_retried", "gpu_retries", "gpu_retries_by_cause",
+               "wall_seconds", "peak_rss_gb", "footprint_gb", "ok")
 _LOG_CACHE: dict[str, tuple[int, int, dict]] = {}
 
 
@@ -443,6 +474,12 @@ def _parse_text(rec: RunRecord, text: str):
                     rec.binary = name
                     break
     rec.gpu_retried = _GPU_RETRY.search(text) is not None
+    tallies = _GPU_RETRIES.findall(text)
+    if tallies:                     # the last: a resumed run's log holds each attempt's
+        n = [int(x) for x in tallies[-1]]
+        # display only: gpu_retried stays the from-scratch restart message (the dtfe-gpu-retry Fix keys on it;
+        # a chunk restore the tally also counts is byte-identical)
+        rec.gpu_retries, rec.gpu_retries_by_cause = n[0], dict(zip(GPU_RETRY_CAUSES, n[1:]))
     m = _WALL.search(text)
     rec.wall_seconds = parse_duration(m.group(1)) if m else None
     m = _RSS.search(text)
@@ -602,11 +639,12 @@ def scan_runs(root, extra_dirs=()) -> list[RunRecord]:
         elif live is not None:
             r.attempt = "running" if str(r.path.parent / r.prefix) in live else "killed"
     # K2: no process continues it, but the next run can -- when it is a Grids or Pipeline job (run_ps_dtfe.sh passes
-    # '--resume' by itself; it writes under the data root's snapdir_*, so the record has a sim; a Custom run never
-    # resumes and starts over), and not when the attempt failed BECAUSE the resume was refused (other settings, no
-    # manifest): the same job then fails the same way every time (2026-10-11), and only 'Start over' runs it
+    # '--resume' by itself, and run_dtfe.sh since 2026-10-13; they write under the data root's snapdir_*, so the record
+    # has a sim; a Custom run never resumes and starts over), and not when the attempt failed BECAUSE the resume was
+    # refused (other settings, no manifest): the same job then fails the same way every time (2026-10-11), and only
+    # 'Start over' runs it
     for r in out:
-        if (r.attempt in ("failed", "killed") and r.checkpoint_dir().is_dir() and r.sim and r.estimator == "ps"
+        if (r.attempt in ("failed", "killed") and r.checkpoint_dir().is_dir() and r.sim and r.estimator in ("ps", "dtfe")
                 and not r.attempt_resume_refused):
             r.attempt = "resumable"
     return sorted(out, key=lambda r: r.finished or _dt.datetime.min, reverse=True)
@@ -664,6 +702,23 @@ def _any_output(rec: RunRecord, *suffixes) -> bool:
     return any(s in names for s in suffixes)
 
 
+_NUMBER = r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?"
+
+
+def _box_axes_differ(rec: RunRecord, origin: bool = True) -> bool:
+    """The run's '--box' (min, max per axis) has axes of different lengths, or (origin) different minima: the
+    boxes on which the [i%2] axis indexing of the fractional region and padding mattered (2026-10-11). No
+    '--box': the snapshot's own box, cubic from the origin for every input the pipeline writes."""
+    m = re.search(rf"(?:^|\s)--box((?:\s+{_NUMBER}(?=\s|$))+)", rec.command)
+    if not m:
+        return False
+    v = [float(x) for x in m.group(1).split()]
+    lo, hi = v[0::2], v[1::2]
+    lengths = [b - a for a, b in zip(lo, hi)]
+    close = lambda xs: max(xs) - min(xs) <= 1e-6 * max(1.0, max(abs(x) for x in xs))   # noqa: E731
+    return len(lengths) >= 2 and (not close(lengths) or (origin and not close(lo)))
+
+
 KNOWN_FIXES: tuple[Fix, ...] = (
     Fix("gpu-partition-wrap", "2026-09-29T03:00", "error",
         "periodic runs split into partitions on the GPU skipped the wrapped part of every "
@@ -707,11 +762,45 @@ KNOWN_FIXES: tuple[Fix, ...] = (
         "negative along exactly one axis was shifted the wrong way (a band-limited field came back 31% "
         "off; fixed 2026-10-02): regenerate",
         lambda r: r.has("--interlace")),
+    # the cpp-bug fixes of 2026-10-11 (src/main.cpp, user_options.cc, grid_deposit_engine.h); 23:00 local is
+    # after their build, so a grid built before it predates them
+    Fix("interlace-pass2", "2026-10-11T23:00", "error",
+        "an interlaced grid without a region: the second pass gridded the same cells, so the output was the "
+        "first pass low-passed and moved half a cell, not de-aliased (fixed 2026-10-11): regenerate",
+        lambda r: r.has("--interlace") and not (r.has("--region") or r.has("--regionMpc"))),
+    Fix("pcs-deposit", "2026-10-11T23:00", "error",
+        "a PCS grid: no padding (mass lost at the box faces and partition seams) and the deposit moved half a "
+        "cell (fixed 2026-10-11): regenerate",
+        lambda r: r.has("--PCS")),
+    Fix("cic-faces", "2026-10-11T23:00", "warning",
+        "a CIC grid: the cells at the box faces and partition seams extrapolated their weights (up to 28% off "
+        "at 32^3; fixed 2026-10-11): regenerate",
+        lambda r: r.has("--CIC")),
+    Fix("region-axes", "2026-10-11T23:00", "error",
+        "a fractional region on a box whose axes differ in length or origin: each region entry took the box "
+        "of the wrong axis (the x and y lengths for y and z), so the grid covers another region than asked "
+        "(fixed 2026-10-11): regenerate",
+        lambda r: r.has("--region") and _box_axes_differ(r)),
+    Fix("padding-axes", "2026-10-11T23:00", "warning",
+        "a fractional padding on a box whose axes differ in length: the y and z padding took the x and y "
+        "lengths, so a face could get less padding than asked (fixed 2026-10-11): regenerate",
+        lambda r: r.has("--padding") and _box_axes_differ(r, origin=False)),
+    # the parity batch of 2026-10-13 (par-pspoint): a phase-space image plane takes the grids' vertex masses and
+    # volume weighting ('--pts-conventions grid', the default). 20:00 local lies between the last build of the old
+    # sources (15:21) and any build of the merged ones; '--pts-conventions legacy' keeps the old estimators on purpose
+    Fix("pts-grid-conventions", "2026-10-13T20:00", "warning",
+        "an image plane made before the plane followed the grids' vertex masses and volume weighting (2026-10-13): "
+        "its density misses part of the contrast the grids gained from the evolved initial positions (about 0.82 of "
+        "the grid's at z = 20) and its multi-stream velocities are density-weighted means: regenerate it to compare "
+        "it with the grids",
+        lambda r: r.estimator == "ps" and r.has("--sample-points")
+                  and (r.has("--ps-vertex-mass") or r.has("--ps-volume-weighted"))
+                  and re.search(r"(^|\s)--pts-conventions\s+legacy(\s|$)", r.command) is None),
 )
 
 
 # the launcher's start-over control, as the notes name it (no '--': launcher text; 2026-10-11)
-START_OVER_HINT = "'Start over' on the Grids or Pipeline tab (PS_RESUME=0)"
+START_OVER_HINT = "'Start over' on the Grids or Pipeline tab (PS_RESUME=0; standard DTFE: DTFE_RESUME=0)"
 
 
 def attempt_note(rec: RunRecord) -> tuple[str, str] | None:
@@ -786,9 +875,12 @@ def time_estimate(records, *, sim: str, grid: int, estimator: str, gpu: bool,
                   sliced: bool, precision: str = "single", dim: int = 3) -> tuple[float, int] | None:
     """(median seconds per snapshot, number of runs) of successful earlier runs with the same
     simulation, grid, estimator, GPU use, slice/no slice, precision and dimension; None without any
-    (a double-precision run takes about twice as long: it must not predict a single one)."""
+    (a double-precision run takes about twice as long: it must not predict a single one).
+    A run under a second is one: the binary's SUMMARY prints its wall time in whole seconds ('0s', 0.0 here), and
+    a truthiness test dropped such runs as if they had no time (2026-10-12: with the Lagrangian padding default
+    the launcher test's 32^3 run went from 11.6 s to 0.5 s and lost its estimate)."""
     times = [r.wall_seconds for r in records
-             if r.ok and r.wall_seconds and r.sim == sim and r.grid == grid
+             if r.ok and r.wall_seconds is not None and r.sim == sim and r.grid == grid
              and r.estimator == estimator and r.gpu == gpu and r.sliced == sliced
              and r.precision == precision and r.dim == dim]
     return (statistics.median(times), len(times)) if times else None
@@ -844,7 +936,8 @@ def diagnose(log: str, exit_codes=()) -> list[Diagnosis]:
         out.append(Diagnosis("Resume refused",
                              "A killed run's checkpoint is there, but it cannot be continued (written with other "
                              "settings, or incomplete). Tick 'Start over' on the Grids or Pipeline tab "
-                             "(PS_RESUME=0) to run the job from the beginning; it replaces the checkpoint.",
+                             "(PS_RESUME=0; standard DTFE: DTFE_RESUME=0) to run the job from the beginning; it "
+                             "replaces the checkpoint.",
                              "start_over"))
     if re.search(r"OVER BUDGET|over the memory budget|exceed the memory budget", tail) and not out:
         out.append(Diagnosis("Over the memory budget",

@@ -13,6 +13,9 @@
 #  D) The mean stream count increases strictly with k: uncollapsed < wall < filament < node.
 #  E) The GPU deposit reproduces BOTH '.caustic' and '.causticClass' byte-for-byte; only the
 #     --ps-linear-deposit combination falls back to the parity-only fold flag, and says so.
+#  J) (2026-10-13) The fold flag is the GEOMETRIC overlap of a folded tetrahedron, not a per-sample
+#     hit: on thin young folds it equals dtfelib's (streams > 1 + tol) | (hidden_streams & 1) cell for
+#     cell, is the same for nSub 1, nSub 3 and the exact deposit, and is split- and GPU-invariant.
 #
 # Usage: tests/ps_caustic_class_check.sh [--no-build]
 
@@ -329,20 +332,131 @@ sys.exit(1 if fails else 0)
 PYEOF
 
 echo ""
-echo "(E) GPU behaviour: BOTH the fold flag and the full stratification must match the CPU exactly."
+echo "(J) The fold flag is GEOMETRIC (2026-10-13, audit finding 3): '.caustic' = a folded tetrahedron"
+echo "    overlaps the cell, not 'a folded tetrahedron deposited a sample here'. Two geometries just past"
+echo "    shell crossing, whose young walls are thinner than the sampling: the pancake (amplitude 1.05) and"
+echo "    the crossed waves (1.3), 27 particles per axis on 48^3 so no lattice lines up. Before the fix the"
+echo "    flag marked 4364 of 4608 and 15844 of 25408 fold cells there. Asserted, cell for cell:"
+echo "    J1 '.caustic' == dtfelib's fold, (streams > 1 + tol) | (hidden_streams & 1), from either pair;"
+echo "    J2 folds the samples missed ARE flagged (non-vacuous), and are exactly the hidden-bit cells;"
+echo "    J3 the flag does not depend on the deposit (nSub 1 == nSub 3 == the exact deposit) and is exactly the"
+echo "       cells the exact deposit gives more than one stream (r3d volumes: shares no code with the flag);"
+echo "    J4 bit 0 (per sample) is present in every fold cell, so '(bits & 3) == 3' loses none;"
+echo "    J5 '--partition 2 2 2' and the GPU deposit give byte-identical '.caustic'."
+GPUJ=0
+[ -d o_ps ] && [ ! -f o_ps/.gpu_mode_off ] && grep -q "METAL=1\|CUDA=1\|HIP=1" o_ps/.build_mode 2>/dev/null && GPUJ=1
+for geo in pan crw; do
+    if [ "${geo}" = pan ]; then gen=(--amplitude-factor 1.05); else gen=(--amplitude-factor 1.3 --crossed-waves); fi
+    "${PY}" "${SCRIPT_DIR}/generate_ps_test_data.py" --out "${TMP}/pcj_input_${geo}.hdf5" --n 27 --box "${BOX}" \
+            "${gen[@]}" >/dev/null
+    J=( "${TMP}/pcj_input_${geo}.hdf5" )
+    JO=( --grid 48 --periodic --MpcUnit 1 --ps-caustics )
+    rm -f "${TMP}/pcj_${geo}"_*.*
+    "${BIN}" "${J[@]}" "${TMP}/pcj_${geo}_s"   "${JO[@]}" --max-concurrent 1 --field density density_a --avg-subsamples 3 >/dev/null
+    "${BIN}" "${J[@]}" "${TMP}/pcj_${geo}_a3"  "${JO[@]}" --max-concurrent 1 --field density_a --avg-subsamples 3 >/dev/null
+    "${BIN}" "${J[@]}" "${TMP}/pcj_${geo}_ex"  "${JO[@]}" --max-concurrent 1 --field density --ps-exact-deposit >/dev/null
+    "${BIN}" "${J[@]}" "${TMP}/pcj_${geo}_par" "${JO[@]}" --field density density_a --avg-subsamples 3 --partition 2 2 2 >/dev/null
+    if [ "${GPUJ}" = 1 ]; then
+        "${BIN}" "${J[@]}" "${TMP}/pcj_${geo}_gpu" "${JO[@]}" --max-concurrent 1 --field density density_a \
+                 --avg-subsamples 3 --ps-gpu >/dev/null
+    fi
+done
+"${PY}" - "${TMP}" "${ROOT}/python" "${GPUJ}" <<'PYEOF' || py_rc=1
+import filecmp
+import sys
+import numpy as np
+import os as _os; REAL = np.dtype(_os.environ.get("DTFE_TEST_REAL", "float32"))   # tests/precision.sh
+
+tmp, pydir, gpu = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
+sys.path.insert(0, pydir)
+from dtfelib.io import STREAM_TOL, caustic_is_fold, single_stream_mask
+
+fails = 0
+def check(ok, msg):
+    global fails
+    print(f"   {'PASS' if ok else 'FAIL'}  {msg}")
+    if not ok:
+        fails += 1
+
+def L(root, ext):
+    return np.fromfile(f"{tmp}/{root}{ext}", dtype=REAL)
+
+for geo, title in (("pan", "pancake"), ("crw", "crossed waves")):
+    print(f"   {title}:")
+    s = f"pcj_{geo}_s"
+    fold = L(s, ".caustic") == 1
+    cc = np.rint(L(s, ".causticClass")).astype(np.int64)
+    st, hid = L(s, ".streams"), L(s, ".hidden_streams")
+    rec_u = caustic_is_fold(streams=st, hidden=hid)
+    rec_a = caustic_is_fold(streams=L(s, ".a_streams"), hidden=L(s, ".a_hidden_streams"))
+    n_u, n_a = int((fold ^ rec_u).sum()), int((fold ^ rec_a).sum())
+    check(n_u == 0 and n_a == 0 and fold.sum() > 0,
+          f"J1 '.caustic' == (streams > 1 + tol) | (hidden & 1): {int(fold.sum())} fold cells, "
+          f"{n_u} differ (raw pair), {n_a} differ (averaged pair)")
+    check(np.array_equal(caustic_is_fold(cc, streams=st, hidden=hid), fold) and np.array_equal(caustic_is_fold(cc), fold),
+          "J1 caustic_is_fold(mask) and caustic_is_fold(mask, streams, hidden) both reproduce it")
+    near = np.abs(st - 1.0) <= STREAM_TOL
+    thin = fold & near                                       # a fold cell whose one sample saw one stream
+    hbit = (np.rint(hid).astype(np.int32) & 1) != 0
+    check(int(thin.sum()) > 0 and np.array_equal(thin, hbit & near),
+          f"J2 {int(thin.sum())} fold cells whose samples missed the fold are flagged, exactly the hidden-bit cells")
+    check(np.array_equal(~single_stream_mask(st, hid) & (st >= 1.0 - STREAM_TOL), fold),
+          "J2 fold == not single-stream (outside empty cells): the flag and the single-stream mask partition the grid")
+    a3, ex = L(f"pcj_{geo}_a3", ".caustic") == 1, L(f"pcj_{geo}_ex", ".caustic") == 1
+    check(np.array_equal(a3, fold) and np.array_equal(ex, fold),
+          f"J3 nSub 1 == nSub 3 == exact deposit ({int((a3 ^ fold).sum())} / {int((ex ^ fold).sum())} cells differ)")
+    # J3 against a reference sharing no code with the flag: the exact deposit's '.streams' is the analytic cell-mean
+    # multiplicity (r3d clipping, not the separating-axis test), > 1 exactly where folded volume sits in the cell
+    exm = L(f"pcj_{geo}_ex", ".streams").astype(np.float64) - 1.0
+    nbad = int(((exm > 2e-5) ^ fold).sum())
+    check(nbad == 0 and float(exm[fold].min()) > 0.01,
+          f"J3 fold == exact-deposit multiplicity > 1 + 2e-5 ({nbad} cells differ; least excess on a fold cell "
+          f"{float(exm[fold].min()):.3f} streams)")
+    neg_only = int((((cc & 3) == 2)).sum())
+    check(neg_only == 0 and bool((cc[fold] & 1).all()), f"J4 bit 0 set in every fold cell ({neg_only} det<0-only cells)")
+    check(filecmp.cmp(f"{tmp}/{s}.caustic", f"{tmp}/pcj_{geo}_par.caustic", shallow=False),
+          "J5 '--partition 2 2 2' '.caustic' byte-identical")
+    if gpu:
+        check(filecmp.cmp(f"{tmp}/{s}.caustic", f"{tmp}/pcj_{geo}_gpu.caustic", shallow=False),
+              "J5 GPU '.caustic' byte-identical (the host marks the GPU's folded tetrahedra)")
+    else:
+        print("   SKIP  J5 GPU (CPU-only build)")
+sys.exit(1 if fails else 0)
+PYEOF
+
+echo ""
+echo "(E) GPU behaviour: BOTH the fold flag and the full stratification must match the CPU exactly"
+echo "    (the double build, whose GPU works on float copies, to 1e-4 of the cells)."
 echo "    The per-tet mask reaches the kernel through the otherwise-unused 'dens' buffer, so only the"
 echo "    --ps-linear-deposit combination (which needs that buffer) falls back to parity."
+# GPU grid == CPU grid ($1 = extension): byte for byte in the single build. The double build hands the GPU
+# float copies of its double tetrahedra (ps_double_check D5), so a sample on a face may count differently there:
+# up to 1e-4 of the cells may differ (2026-10-13 -- the 2026-10-12 double binary already counted 2 streams
+# instead of 1 in one cell of this snapshot on the GPU, unseen because only these two grids are compared; the
+# periodic-seam fix changes CGAL's vertex labelling and that cell's fold class then differs too)
+gpu_matches() {
+    cmp -s "${OUT}.$1" "${OUT}_gpu.$1" && return 0
+    precision_double || return 1
+    "${PY}" - "${OUT}.$1" "${OUT}_gpu.$1" <<'EOF2'
+import sys
+import numpy as np
+a, b = (np.fromfile(f, dtype=np.float64) for f in sys.argv[1:3])
+fr = float(np.mean(a != b)) if a.size == b.size and a.size else 1.0
+print(f"         (double build: {fr:.1e} of the cells differ -- the GPU's float copies of the tetrahedra; <= 1e-4 passes)")
+sys.exit(0 if fr <= 1e-4 else 1)
+EOF2
+}
 if [ -d o_ps ] && [ ! -f o_ps/.gpu_mode_off ]; then   # any GPU backend stamp (metal / cuda / hip)
     msg="$("${BIN}" "${SNAP}" "${OUT}_gpu" --grid "${GRID}" --periodic --field density --MpcUnit 1 \
             --max-concurrent 1 --ps-caustics --ps-gpu 2>&1 || true)"
-    if cmp -s "${OUT}.caustic" "${OUT}_gpu.caustic"; then
-        echo "   PASS  GPU '.caustic' is byte-identical to the CPU"
+    if gpu_matches caustic; then
+        echo "   PASS  GPU '.caustic' matches the CPU (byte for byte; the double build to 1e-4 of the cells)"
     else
         echo "   FAIL  GPU '.caustic' differs from the CPU"
         py_rc=1
     fi
-    if cmp -s "${OUT}.causticClass" "${OUT}_gpu.causticClass"; then
-        echo "   PASS  GPU '.causticClass' is byte-identical to the CPU (mask rides in the dens buffer)"
+    if gpu_matches causticClass; then
+        echo "   PASS  GPU '.causticClass' matches the CPU (mask rides in the dens buffer; byte for byte, the double build to 1e-4 of the cells)"
     else
         echo "   FAIL  GPU '.causticClass' differs from the CPU"
         py_rc=1

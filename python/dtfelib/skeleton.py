@@ -10,8 +10,9 @@ THE CLASSES. io.caustic_collapse_max gives every cell its highest collapse multi
 no tetrahedron ever deposited into it, 0: single-stream / uncollapsed only, 1: a wall (one axis
 collapsed and inverted), 2: a filament, 3: a node). The FRACTIONS are over these EXCLUSIVE classes
 ('none', 'k=0', 'k=1', 'k=2', 'k=3' = webstreams.COLLAPSE_BINS, so the two modules' tables agree and the
-fractions sum to 1), plus the fold (io.caustic_is_fold: both map parities in the cell), the A3 cusp and
-A4 swallowtail indicators (bits 7, 8, only under --ps-caustic-cusps) and the umbilic bit 6, each as a
+fractions sum to 1), plus the fold (both map parities overlap the cell: pass fold=FieldSet.fold_mask(), the
+exact flag for grids of any date -- the mask's own parity bits, the default, are exact only for grids written
+since 2026-10-13, see io.caustic_is_fold), the A3 cusp and A4 swallowtail indicators (bits 7, 8, only under --ps-caustic-cusps) and the umbilic bit 6, each as a
 fraction alone (never labelled: they are proximity indicators). The COMPONENTS are built from the
 CUMULATIVE masks -- 'sheet' = k >= 1 (every collapsed cell: the walls with the filaments and nodes
 running through them), 'line' = k >= 2, 'node' = k = 3 -- because a wall is the connected sheet, not the
@@ -31,7 +32,7 @@ the void's centre to the nearest sheet cell, from the Euclidean distance transfo
 of 'cutout_cells' half-width around the centre (np.take with wrap); no sheet in the cut-out -> NaN with
 the cut-out's half-width as the lower bound.
 
-THE CONTROL (2026-10-11; the per-void numbers alone -- fold shell 0.285 against a box fold fraction of 0.249, the
+THE CONTROL (2026-10-11; the per-void numbers alone -- per-sample fold shell 0.285 against a box fold fraction of 0.249, the
 wall at 0.105 R_v -- could not be interpreted): random_sphere_null draws the same metrics in random spheres with the
 voids' own radii, null_zscores gives the voids' median against the null's mean +- std as a z-score, and
 filter_components keeps only the sheet components above a size (cells) or mass threshold before the shells and the
@@ -53,20 +54,31 @@ INDICATORS = ("fold", "cusp", "swallowtail", "umbilic")        # fractions only
 CUMULATIVE = ("sheet", "line", "node")                         # k >= 1, k >= 2, k = 3: the components
 
 
-def class_masks(caustic_class) -> dict:
+def class_masks(caustic_class, fold=None) -> dict:
     """{'exclusive': {name: bool mask} over CLASSES, 'indicator': over INDICATORS, 'cumulative': over
-    CUMULATIVE} of a caustic_class grid (any integer-valued array)."""
+    CUMULATIVE} of a caustic_class grid (any integer-valued array). 'fold' (bool, the grid's shape) replaces
+    the mask's own fold bits as the 'fold' indicator: FieldSet.fold_mask() / io.caustic_is_fold(cc,
+    streams=, hidden=), the geometric flag for grids of any date (2026-10-13; the default is exact only for
+    grids written since then)."""
     cc = np.rint(np.asarray(caustic_class)).astype(np.int64)
     kmax = caustic_collapse_max(cc)
-    # every deposited tetrahedron sets a parity bit TOGETHER with one collapse bit; a cell with a parity bit and no
-    # collapse bit comes from a parity-only grid (--ps-caustics with --ps-linear-deposit --ps-gpu writes the fold
-    # flag alone), which would read as 99.96% 'none' (review 2026-10-05)
-    if np.any(((cc & (CAUSTIC_PARITY_POS | CAUSTIC_PARITY_NEG)) != 0) & (kmax == -1)):
+    # every deposited SAMPLE sets a parity bit TOGETHER with one collapse bit; a cell with the det>0 parity bit and
+    # no collapse bit comes from a parity-only grid (--ps-caustics with --ps-linear-deposit --ps-gpu writes the fold
+    # flag alone), which would read as 99.96% 'none' (review 2026-10-05). Bit 0 only (2026-10-13): the det<0 bit is
+    # the geometric overlap since then, legitimately alone in a cell a folded tetrahedron overlaps but no sample
+    # reached (a coverage hole); a parity-only grid carries bit 0 in every deposited cell, so it is still refused.
+    if np.any(((cc & CAUSTIC_PARITY_POS) != 0) & (kmax == -1)):
         raise ValueError("parity-only caustic_class grid (fold bits without collapse bits: a --ps-caustics "
                          "--ps-linear-deposit --ps-gpu run); the stratification needs the CPU or the GPU's full deposit")
+    if fold is None:
+        fold = caustic_is_fold(cc)
+    else:
+        fold = np.asarray(fold, dtype=bool)
+        if fold.shape != cc.shape:
+            raise ValueError(f"fold mask of shape {fold.shape} for a caustic_class grid of shape {cc.shape}")
     return {
         "exclusive": {"none": kmax == -1, "k=0": kmax == 0, "k=1": kmax == 1, "k=2": kmax == 2, "k=3": kmax == 3},
-        "indicator": {"fold": caustic_is_fold(cc), "cusp": caustic_is_cusp(cc), "swallowtail": caustic_is_swallowtail(cc),
+        "indicator": {"fold": fold, "cusp": caustic_is_cusp(cc), "swallowtail": caustic_is_swallowtail(cc),
                       "umbilic": (cc & CAUSTIC_DEGENERATE) != 0},
         "cumulative": {"sheet": kmax >= 1, "line": kmax >= 2, "node": kmax == 3},
     }
@@ -82,10 +94,10 @@ def _fraction(mask, density=None) -> dict:
     return {"volume": vol, "mass": float(d[mask].sum()) / tot if tot > 0 else None}
 
 
-def fractions(caustic_class, density=None) -> dict:
+def fractions(caustic_class, density=None, fold=None) -> dict:
     """Volume (and mass, with a density grid) fractions: {'exclusive': {class: {'volume', 'mass'}},
-    'indicator': {...}, 'cumulative': {...}}; the exclusive volumes sum to 1."""
-    m = class_masks(caustic_class)
+    'indicator': {...}, 'cumulative': {...}}; the exclusive volumes sum to 1. 'fold': see class_masks."""
+    m = class_masks(caustic_class, fold)
     return {group: {name: _fraction(mask, density) for name, mask in masks.items()} for group, masks in m.items()}
 
 
@@ -145,11 +157,12 @@ def components(mask, density=None, cell_mpc: float = 1.0, connectivity: int = 26
     return out
 
 
-def skeleton_summary(caustic_class, density=None, cell_mpc: float = 1.0, connectivity: int = 26, top: int = 10) -> dict:
+def skeleton_summary(caustic_class, density=None, cell_mpc: float = 1.0, connectivity: int = 26, top: int = 10,
+                     fold=None) -> dict:
     """fractions() plus, per CUMULATIVE class, its components' count, largest share and top sizes
-    (cells and Mpc^3), as a JSON-able dict (no label grids)."""
-    m = class_masks(caustic_class)
-    out = {"fractions": fractions(caustic_class, density), "cell_mpc": float(cell_mpc),
+    (cells and Mpc^3), as a JSON-able dict (no label grids). 'fold': see class_masks."""
+    m = class_masks(caustic_class, fold)
+    out = {"fractions": fractions(caustic_class, density, fold=fold), "cell_mpc": float(cell_mpc),
            "connectivity": int(connectivity), "components": {},
            # bits 7 and 8 exist only under --ps-caustic-cusps on the CPU deposit: 0% there means 'not computed'
            "cusp_bits_present": bool(m["indicator"]["cusp"].any() or m["indicator"]["swallowtail"].any())}
@@ -166,7 +179,9 @@ def void_shell_fractions(caustic_class, centers_frac, r_eff_cells, shells=(1.0, 
     """Per void: the fold and sheet fractions of its shells x R_eff (nearest cell, profiles.shell_means),
     averaged over the shells: {'fold': (n,), 'sheet': (n,), 'shells': x, 'per_shell': {name: (n, len(x))}}.
     'masks' {'fold': bool grid, 'sheet': bool grid} replaces the class masks of 'caustic_class' (which may then be
-    None): a sheet filtered by filter_components, or masks computed once for many calls (the random-sphere null)."""
+    None): a sheet filtered by filter_components, or masks computed once for many calls (the random-sphere null).
+    Without 'masks' the fold is the mask's own parity bits, exact only for grids written since 2026-10-13: pass
+    masks={'fold': FieldSet.fold_mask(), ...} for older ones (plot_caustic_skeleton does)."""
     from .profiles import fibonacci_sphere, shell_means
     if masks is None:
         cm = class_masks(caustic_class)

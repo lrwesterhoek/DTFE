@@ -11,7 +11,7 @@
 #       The same --max-concurrent and thread count as the killed run: the deposit inside a partition splits its
 #       sums by the threads a partition gets, so another count differs at float rounding (C6 covers that case)
 #   C5  '--resume' with nothing to resume refuses
-#   C6  a run killed while merging in COMPLETION order (no --ordered-merge) resumes too: mass conserved
+#   C6  a run killed while merging in COMPLETION order ('--completion-order-merge': no flag before 2026-10-14) resumes too: mass conserved
 #   C7  '--scratch-dir': the checkpoint goes to the scratch folder under the name scripts/config.sh
 #       ps_checkpoint_dir computes (the basename + a hash of the whole output path)
 #   C9  too little room for a checkpoint (DTFE_TEST_CHECKPOINT_FREE_BYTES): the run warns, writes none, and finishes
@@ -102,8 +102,10 @@ check "C5 refused: nothing to resume" $?
 
 echo ">> C6: killed while merging in completion order, then resumed"
 OMP_NUM_THREADS=4 DTFE_TEST_EXIT_AFTER_PARTITIONS=25 "$BIN" "$SNAP" "$TMP/u" "${C[@]}" --verbose 2 --max-concurrent 4 \
-    > "$TMP/u.log" 2>&1; rc1=$?
-OMP_NUM_THREADS=4 "$BIN" "$SNAP" "$TMP/u" "${C[@]}" --verbose 2 --max-concurrent 4 --resume > "$TMP/u2.log" 2>&1; rc2=$?
+    --completion-order-merge > "$TMP/u.log" 2>&1; rc1=$?
+# (the resume keeps the flag, as run_ps_dtfe.sh ORDERED_MERGE=0 would: --resume merges in index order over it)
+OMP_NUM_THREADS=4 "$BIN" "$SNAP" "$TMP/u" "${C[@]}" --verbose 2 --max-concurrent 4 --completion-order-merge --resume \
+    > "$TMP/u2.log" 2>&1; rc2=$?
 [ "$rc1" = 137 ] && [ "$rc2" = 0 ] && [ ! -e "$TMP/u.runlog.checkpoint" ]
 check "C6 killed (137), resumed (0), checkpoint removed" $?
 "$PY" - "$TMP/ref" "$TMP/u" <<'PYEOF'

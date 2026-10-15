@@ -6,6 +6,12 @@ metadata come from dtfelib.FieldSet.
     python3 plot/plot_cosmic_web.py                       # TNG50-4-Dark snap 99, auto method
     python3 plot/plot_cosmic_web.py --method dtfe
     python3 plot/plot_cosmic_web.py --sim TNG50-3-Dark --snap 50
+
+PS-DTFE grids (2026-10-13): the V-web is the MEAN-FIELD one by default -- classified from the FFT gradient of the
+PS velocity grid with the binary's normalisation and the run's lambda_th (FieldSet.mean_field), the V-web standard
+DTFE stores. The binary's PS V-web classifies the stream average of each stream's gradient <grad v> and finds
+almost no filaments or nodes (TNG100-3-Dark z=1: 1.8% filaments against standard DTFE's 6.6%; dtfelib/io.py, the
+note above FIELDS); '--ps-gradient stored' plots it instead. The T-web is the binary's for both methods.
 """
 
 import _bootstrap  # noqa: F401  (puts python/ on sys.path)
@@ -15,7 +21,7 @@ from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
 
-from dtfelib import make_parser, snapdir, FieldSet
+from dtfelib import make_parser, snapdir, FieldSet, add_ps_gradient_arg, mean_field_wanted
 from dtfelib import figures as style
 
 style.apply()                                   # the house style (serif, SHOW_TITLES, DPI): survey item 11, 2026-10-05
@@ -105,7 +111,32 @@ def plot_tweb_vweb_residual(tweb_class, vweb_class, slice_dim, box_size,
                     suptitle=_title("T-web vs V-web Comparison", redshift),
                     footnote=f"Agreement: {agree_frac:.1f}%   |  Mean |residual|: {mean_abs:.2f}")
 
-def process_snapshot(fs, snapshot):
+def _plot_web(web_type, short, class_field, eig_field, snapshot, redshift, box_size):
+    """One web's figures: the eigenvalue histogram (when there are eigenvalues) and, per plane, the class map and
+    the eigenvalue triptych."""
+    output_base = Path(OUTPUT_DIR) / f"snapshot_{snapshot}_z{redshift:.2f}"
+
+    if eig_field is not None:
+        save_path = output_base / f"{short}_eigenvalue_hist_z{redshift:.2f}.png"
+        print(f"  Creating {web_type} eigenvalue histogram...")
+        plot_eigenvalue_histogram(eig_field, web_type, redshift, save_path)
+
+    for slice_dim in SLICE_PLANES_TO_PLOT:
+        plane_name = SLICE_PLANES[slice_dim]['name']
+        plane_dir = output_base / plane_name
+
+        print(f"  Creating {web_type} {plane_name} visualizations...")
+
+        save_path = plane_dir / f"{short}_classification_{plane_name}_z{redshift:.2f}.png"
+        plot_classification(class_field, slice_dim, box_size, web_type, redshift, save_path)
+
+        if eig_field is not None:
+            save_path = plane_dir / f"{short}_eigenvalues_{plane_name}_z{redshift:.2f}.png"
+            plot_eigenvalues(eig_field, slice_dim, box_size, web_type, redshift, save_path)
+
+
+def process_snapshot(fs, snapshot, mean_field=True):
+    """mean_field: a PS-DTFE output's V-web is the mean-field one (module docstring); False = the stored grids."""
     redshift = fs.meta.redshift
     box_size = fs.meta.box_mpc
 
@@ -132,6 +163,25 @@ def process_snapshot(fs, snapshot):
 
         short = web_type.replace('-', '').lower()
 
+        if web_type == 'V-web' and mean_field and fs.method == 'ps':
+            # the classes and the eigenvalues of ONE mean-field computation (sharing its FFTs)
+            if not fs.has('vweb', mean_field=True):
+                print(f"  Warning: V-web: no velocity grid to derive the mean-field V-web from (method 'ps'; "
+                      f"--ps-gradient stored plots the stored PS V-web)")
+                continue
+            try:
+                mf = fs.mean_field(('vweb', 'vweb_eigenvalues'))
+            except (OSError, ValueError, MemoryError) as e:
+                print(f"  Error computing the mean-field V-web: {e}")
+                continue
+            class_field, eig_field = mf['vweb'], mf['vweb_eigenvalues']
+            del mf
+            print(f"  Computed V-web classification + eigenvalues: mean field, from the velocity grid "
+                  f"(lambda_th = {fs.lambda_th:g})")
+            loaded[web_type] = class_field
+            _plot_web(web_type, short, class_field, eig_field, snapshot, redshift, box_size)
+            continue
+
         try:
             if not fs.has(cfg['class_field']):
                 print(f"  Warning: {web_type} classification field not found: "
@@ -156,25 +206,7 @@ def process_snapshot(fs, snapshot):
             print(f"  Error loading {web_type} eigenvalues: {e}")
             eig_field = None
 
-        output_base = Path(OUTPUT_DIR) / f"snapshot_{snapshot}_z{redshift:.2f}"
-
-        if eig_field is not None:
-            save_path = output_base / f"{short}_eigenvalue_hist_z{redshift:.2f}.png"
-            print(f"  Creating {web_type} eigenvalue histogram...")
-            plot_eigenvalue_histogram(eig_field, web_type, redshift, save_path)
-
-        for slice_dim in SLICE_PLANES_TO_PLOT:
-            plane_name = SLICE_PLANES[slice_dim]['name']
-            plane_dir = output_base / plane_name
-
-            print(f"  Creating {web_type} {plane_name} visualizations...")
-
-            save_path = plane_dir / f"{short}_classification_{plane_name}_z{redshift:.2f}.png"
-            plot_classification(class_field, slice_dim, box_size, web_type, redshift, save_path)
-
-            if eig_field is not None:
-                save_path = plane_dir / f"{short}_eigenvalues_{plane_name}_z{redshift:.2f}.png"
-                plot_eigenvalues(eig_field, slice_dim, box_size, web_type, redshift, save_path)
+        _plot_web(web_type, short, class_field, eig_field, snapshot, redshift, box_size)
 
     if 'T-web' in loaded and 'V-web' in loaded:
         output_base = Path(OUTPUT_DIR) / f"snapshot_{snapshot}_z{redshift:.2f}"
@@ -192,6 +224,7 @@ def process_snapshot(fs, snapshot):
 
 def main():
     parser = make_parser("Cosmic-web classification and eigenvalue plots (T-web/V-web).")
+    add_ps_gradient_arg(parser)
     args = parser.parse_args()
 
     snapshot = f"{args.snap:03d}"
@@ -215,8 +248,10 @@ def main():
     print(f"Output directory: {OUTPUT_DIR}")
     print(f"Averaged: {fs.averaged}")
     print(f"Fields: {', '.join(fields)}")
+    if fs.method == 'ps' and PROCESS_VWEB:
+        print(f"V-web: {'mean field (from the velocity grid)' if mean_field_wanted(args) else 'stored PS grids'}")
 
-    if process_snapshot(fs, snapshot):
+    if process_snapshot(fs, snapshot, mean_field=mean_field_wanted(args)):
         print(f"\nCompleted: snapshot {snapshot} processed")
     else:
         print(f"\nFailed snapshot: {snapshot} (z={fs.meta.redshift:.2f})")
