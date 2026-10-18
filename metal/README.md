@@ -16,8 +16,9 @@ gradient grid. The old density-only prototype kernel is gone.)
 **Which samples a tetrahedron contains is decided exactly as on the CPU**
 (`src/CGAL_triangulation/ps_exact_inside.h`). Metal has no double, so the kernel classifies each
 sample in float with a rigorous error bound, from a per-tet record the host builds in the exact
-test's canonical frame (vertex 0 as a cell index plus an in-cell fraction, the edges as exact
-differences; `psFillTetRecord` in `ps_deposit_params.h`). Outside the bound the float decision
+test's canonical frame (vertex 0 as a cell index plus an in-cell fraction, the edges as
+differences of the canonical positions, from the double build's own doubles since 2026-10-18;
+`psFillTetRecord` in `ps_deposit_params.h`). Outside the bound the float decision
 provably equals the exact one. A tet with a sample inside it (within float rounding of a face;
 2291 of 14.7M at nSub=1, 57k at nSub=3) is **deferred**: the kernel negates its mass and deposits
 nothing, and the host deposits it with the CPU's exact test. Stream counts and the sub-sample mass flag
@@ -60,7 +61,8 @@ tet is: on the fine virtual grid of a zoom a void tet's bounding box holds milli
 outside a one-slice window, and clipping them for the normalization would cost more than the whole full
 run. A tet whose window pieces are all empty then means "no volume inside the window", not "degenerate":
 `depositFields` returns without the sampled fallback under windowMode. The CPU loop does the same
-(`tests/ps_window_check.sh`: the sampled CPU window identical bytes, the exact one to 1e-5 relative in
+(`tests/ps_window_check.sh`: the sampled CPU window's counts and masks identical bytes and its sums to the last
+fixed-point unit, a window pass taking its own units since 2026-10-15, the exact one to 1e-5 relative in
 the moments and identical in the counts and masks, the GPU in its parity class; a 256x256x16 grid
 windowed to one slice: 7 s full vs 0 s window, exact deposit).
 On a non-periodic grid a tetrahedron cut by the grid face keeps only its inside share: the exact path

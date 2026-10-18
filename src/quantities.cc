@@ -290,32 +290,8 @@ void Quantities::normalizePhaseSpace(Field const &field, Real const weightFromDe
 }
 
 
-// Like addField, but 'src' is a sub-grid (dims m, global origin o) of the full grid 'full';
-// each cell is mapped to its global row-major index. o, m, full are in grid-cell units.
-// The destination may itself be a WINDOW of the full grid (--ps-window: mainOrigin/mainDims given):
-// a source cell is then mapped to its window-local index and skipped when it lies outside.
-inline bool subgridTarget(size_t const *c, size_t const *o, size_t const *full,
-                          size_t const *mainOrigin, size_t const *mainDims, size_t &g)
-{
-    g = 0;
-    for (int d = 0; d < NO_DIM; ++d)
-    {
-        // '% full[d]': the sub-box may WRAP a periodic axis (o[d]+m[d] > full[d]), which is the
-        // normal case for a partition straddling the box seam. No-op for an unwrapped box.
-        size_t gl = (c[d] + o[d]) % full[d];              // global index
-        if (mainOrigin)
-        {
-            long ml = long(gl) - long(mainOrigin[d]);
-            if (ml < 0) ml += long(full[d]);              // the window may wrap too
-            if (ml < 0 || ml >= long(mainDims[d])) return false;
-            g = g * mainDims[d] + size_t(ml);
-        }
-        else
-            g = g * full[d] + gl;                         // global row-major flat
-    }
-    return true;
-}
-
+// Like addField, but 'src' is a sub-grid (dims m, global origin o) of the full grid 'full'; each cell is mapped by
+// subgridTarget (quantities.h since 2026-10-15: the fixed-point merge, src/ps_fixed_merge.h, maps cells by it too).
 template <typename T>
 void addFieldSubgrid(std::vector<T> const &src, std::vector<T> *dst,
                      size_t const *o, size_t const *m, size_t const *full,

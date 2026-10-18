@@ -39,7 +39,8 @@
 #  N) the Makefile stamps BUILD_MODE, ARCH_FLAGS and EXTRA_FLAGS in the object dirs (a dry run, builds nothing).
 #  O) the drivers' single-instance lock (<prefix>.runlog.lock: a second driver refused, stale locks removed, a stop
 #     releases it) and their preflight (data disk mounted, output folder writable with room for the grids).
-#  P) run_ps_pipeline.sh's freshness test compares the run settings with the snapshot's run log, not only file times.
+#  P) run_ps_pipeline.sh's freshness test compares the run settings with the snapshot's run log, not only file times
+#     (2026-10-15: the plane's conventions too, PTS_CONVENTIONS, which it hands to run_ps_dtfe.sh).
 #  Q) scripts/thesis_runs.sh (the thesis run recipe): DRY_RUN=1 prints the exact settings of each stage, runs nothing;
 #     the voids stage hands each figure its box, gate and flags (the size function at fixed R and the convergence
 #     check ungated, per box), in order, draws each box's environment again after its tracking, and goes on after a
@@ -58,8 +59,10 @@
 #     snapshot is skipped only when output_plane.runlog shows that plane run; a real run moves old output_plane.* files
 #     to _backup/output_plane_<date>/... and never touches the output.* grids beside them.
 #  R) run_ps_dtfe.sh ORDERED_MERGE=1 (the default since 2026-10-14) passes --ordered-merge, ORDERED_MERGE=0
-#     --completion-order-merge; a killed run's checkpoint (<prefix>.runlog.checkpoint, or
-#     config.sh ps_checkpoint_dir's name under SCRATCH_DIR) makes the next run pass --resume and say so; PS_RESUME=0,
+#     --completion-order-merge, FIXED_POINT_MERGE=1 --fixed-point-merge instead of either (2026-10-15);
+#     PTS_CONVENTIONS=legacy with SAMPLE_POINTS passes '--pts-conventions legacy', grid (the default) and a run without
+#     points pass nothing, another value is refused (2026-10-15); a killed run's checkpoint (<prefix>.runlog.checkpoint,
+#     or config.sh ps_checkpoint_dir's name under SCRATCH_DIR) makes the next run pass --resume and say so; PS_RESUME=0,
 #     an auto-tune report and a checkpoint folder with no 'checkpoint' file in it do not.
 #  S) the production defaults and the rerun hygiene of 2026-10-13 (audit finding 7), against the stand-in binaries:
 #     the GPU when the Makefile's stamp says the binary has one (metal/cuda/hip; not off or cudaemu; DTFE_METAL /
@@ -936,6 +939,11 @@ rc=$(mdrive run_ps_dtfe.sh "${TMP}/r_compl.log" FAKE_MODE=ok ORDERED_MERGE=0)
 check "$([ "$(has "${TMP}/r_compl.log" '^RUNNING: .*--completion-order-merge')" = 0 ] \
          && [ "$(lacks "${TMP}/r_compl.log" '^RUNNING: .*--ordered-merge')" = 0 ] && echo 0 || echo 1)" \
       "ORDERED_MERGE=0 passes --completion-order-merge, the merge as partitions finish (${rc})"
+# 2026-10-15: FIXED_POINT_MERGE=1 passes the opt-in order-free merge in place of the merge-order flag
+rc=$(mdrive run_ps_dtfe.sh "${TMP}/r_fixed.log" FAKE_MODE=ok FIXED_POINT_MERGE=1)
+check "$([ "$(has "${TMP}/r_fixed.log" '^RUNNING: .*--fixed-point-merge')" = 0 ] \
+         && [ "$(lacks "${TMP}/r_fixed.log" '^RUNNING: .*--(ordered-merge|completion-order-merge)')" = 0 ] && echo 0 || echo 1)" \
+      "FIXED_POINT_MERGE=1 passes --fixed-point-merge and no merge-order flag (${rc})"
 mkdir -p "${RCK}"; : > "${RCK}/checkpoint"
 rc=$(mdrive run_ps_dtfe.sh "${TMP}/r_resume.log" FAKE_MODE=ok)
 check "$([ "${rc}" = "0" ] && grep -aqE -e '^RUNNING: .*--resume' "${TMP}/r_resume.log" && echo 0 || echo 1)" "a checkpoint folder beside the outputs: --resume is passed (${rc})"
@@ -961,6 +969,19 @@ mkdir -p "${SCK}"; : > "${SCK}/checkpoint"
 rc=$(mdrive run_ps_dtfe.sh "${TMP}/r_scr1.log" FAKE_MODE=ok SCRATCH_DIR="${RSCR}")
 check "$(has "${TMP}/r_scr1.log" '^RUNNING: .*--resume')" "... the checkpoint in the scratch folder: --resume is passed (${rc})"
 rm -rf "${SCK}"
+# the plane's conventions (2026-10-15): legacy only on request and only with points; the binary's default otherwise
+: > "${TMP}/r_points.txt"
+rc=$(mdrive run_ps_dtfe.sh "${TMP}/r_pc_def.log" FAKE_MODE=ok SAMPLE_POINTS="${TMP}/r_points.txt")
+rc2=$(mdrive run_ps_dtfe.sh "${TMP}/r_pc_leg.log" FAKE_MODE=ok SAMPLE_POINTS="${TMP}/r_points.txt" PTS_CONVENTIONS=legacy)
+check "$([ "$(lacks "${TMP}/r_pc_def.log" '^RUNNING: .*--pts-conventions')" = 0 ] \
+         && [ "$(has "${TMP}/r_pc_leg.log" '^RUNNING: .*--sample-points .*r_points\.txt.* --pts-conventions legacy')" = 0 ] && echo 0 || echo 1)" \
+      "PTS_CONVENTIONS: the grids' (the default) passes nothing, legacy passes --pts-conventions legacy with the points (${rc} ${rc2})"
+rc=$(mdrive run_ps_dtfe.sh "${TMP}/r_pc_nopts.log" FAKE_MODE=ok PTS_CONVENTIONS=legacy)
+check "$(lacks "${TMP}/r_pc_nopts.log" '^RUNNING: .*--pts-conventions')" "... and nothing without points (${rc})"
+rc=$(mdrive run_ps_dtfe.sh "${TMP}/r_pc_bad.log" FAKE_MODE=ok PTS_CONVENTIONS=old)
+check "$([ "${rc}" = "2" ] && [ "$(has "${TMP}/r_pc_bad.log" "PTS_CONVENTIONS must be 'grid' or 'legacy'")" = 0 ] \
+         && [ "$(lacks "${TMP}/r_pc_bad.log" '^RUNNING: ')" = 0 ] && echo 0 || echo 1)" \
+      "... another value is refused before anything runs (exit ${rc})"
 
 echo ""
 echo "(P) run_ps_pipeline.sh's 'up to date' compares the run settings, not only the file times (2026-10-11)."
@@ -1009,6 +1030,14 @@ rc=$(pdrive "${TMP}/p_more.log" FIELDS="density_a velocity_a tweb_a" DRY_RUN=1)
 check "$(has "${TMP}/p_more.log" 'settings differ')" "... a field the grids lack: recomputed"
 rc=$(pdrive "${TMP}/p_gpu.log" PS_GPU=1 DRY_RUN=1)
 check "$(has "${TMP}/p_gpu.log" 'up to date \(same settings\)')" "the GPU/CPU choice alone does not make grids stale"
+# 2026-10-15: the plane's conventions are a setting of the slice; the pipeline hands them to run_ps_dtfe.sh
+rc=$(pdrive "${TMP}/p_pc.log" PTS_CONVENTIONS=legacy DRY_RUN=1)
+check "$([ "$(has "${TMP}/p_pc.log" 'snap 99: settings differ from its ps_output.runlog, recomputing')" = 0 ] \
+         && grep -aq 'now: --pts-conventions legacy$' "${TMP}/p_pc.log" \
+         && [ "$(has "${TMP}/p_pc.log" '^\+ env .*PTS_CONVENTIONS=legacy .*run_ps_dtfe\.sh -s SIM')" = 0 ] && echo 0 || echo 1)" \
+      "PTS_CONVENTIONS=legacy: a slice in the grids' conventions is recomputed, the difference shown, the knob passed on (${rc})"
+rc=$(pdrive "${TMP}/p_pcg.log" PTS_CONVENTIONS=grid DRY_RUN=1)
+check "$(has "${TMP}/p_pcg.log" 'up to date \(same settings\)')" "... PTS_CONVENTIONS=grid (the default, said or not): up to date (${rc})"
 mv "${SD}/ps_output.runlog" "${SD}/ps_output.runlog.keep"
 rc=$(pdrive "${TMP}/p_nolog.log" GRID_SIZE=24 DRY_RUN=1)
 check "$(has "${TMP}/p_nolog.log" 'up to date by file times \(no ps_output.runlog to compare the settings with\)')" \
@@ -1315,7 +1344,7 @@ q_seed
 QO=(env -u DTFE_NO_MIRROR THESIS_FIGURES="${TMP}/q_thesis" PS_LAG_PADDING=8 PS_PARALLEL_TRI=1 PS_VOLUME_WEIGHTED=1
     PS_EXACT=1 AVG_SUBSAMPLES=1 PADDING=40 FIELDS="density_a vweb_a" SAMPLE_POINTS=/no/such/plane.bin
     DTFE_EXACT_AVERAGE=0 PARTITION="2 2 2" LAMBDA_TH=0.7 OUTPUT_PREFIX=leaky LAGRANGIAN_INPUT= DTFE_METAL=0 PS_METAL=0
-    PS_CAUSTICS=0 MAX_CONCURRENT=3 TESS_CACHE=/no/such/cache AUTO_TUNE_REPORT=1)
+    PS_CAUSTICS=0 MAX_CONCURRENT=3 TESS_CACHE=/no/such/cache AUTO_TUNE_REPORT=1 PTS_CONVENTIONS=legacy)
 rm -rf "${TMP}/q_scratch"           # the voids run above made it; a dry run must not
 rc=0; qv "${QO[@]}" DRY_RUN=1 Q_PY_LOG="${TMP}/q_py_on.log" "${MREPO}/scripts/thesis_runs.sh" overnight >"${TMP}/q_on.log" 2>&1 || rc=$?
 check "$([ "${rc}" = "0" ] && [ ! -e "${TMP}/q_py_on.log" ] && [ ! -e "${TMP}/q_scratch" ] && [ ! -e "${QFIG}/old_untagged" ] \
@@ -1481,7 +1510,7 @@ check "$([ "$(q27 DTFE | grep -cE -e "TNG50-3-Dark/snapdir_[0-9]{3}/$(printf "${
          && [ "$(q27 DTFE | grep -cE -e "TNG100-3-Dark/snapdir_[0-9]{3}/$(printf "${QDT}" '3 +3 +3' 10)")" = "9" ] \
          && [ "$(q27 DTFE | grep -oE 'TNG[0-9]+-3-Dark/snapdir_[0-9]{3}/output' | tr '\n' ' ')" = "$(for b in TNG50 TNG300 TNG100; do for s in 000 004 017 025 033 040 050 067 099; do printf '%s-3-Dark/snapdir_%s/output ' "${b}" "${s}"; done; done)" ] \
          && echo 0 || echo 1)" "dtfe27: 27 standard-DTFE runs (TNG50 4x4x4 x4, TNG300 5x5x5 x10, TNG100 3x3x3 x10), the 2026-10-12 command with padding 15 and --exact-average, no scratch dir"
-check "$([ "$(lacks "${TMP}/q_27.log" 'leaky|--partition +2 +2 +2|/no/such|--padding +40|--lambda_th +0\.7|--max-concurrent +3 |ps-lag-padding|parallel-triangulation|ps-exact-deposit|auto-tune-report')" = 0 ] \
+check "$([ "$(lacks "${TMP}/q_27.log" 'leaky|--partition +2 +2 +2|/no/such|--padding +40|--lambda_th +0\.7|--max-concurrent +3 |ps-lag-padding|parallel-triangulation|ps-exact-deposit|auto-tune-report|pts-conventions')" = 0 ] \
          && [ "$(q27 'PS-DTFE|DTFE' | grep -c -e '--avg-subsamples +1 ')" = "0" ] && echo 0 || echo 1)" "... the caller's knobs (prefix, split, padding, fields, plane, threshold, deposit, report) reach neither"
 # the skip rule: ps27 skips a snapshot only when its run log shows the caustics AND the 4096^2 plane; SIMS limits the boxes
 T3="${TROOT}/TNG300/TNG300-3-Dark/snapdir_099"

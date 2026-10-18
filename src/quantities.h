@@ -47,6 +47,33 @@
 // dtfelib.STREAM_TOL on the Python side -- keep the two in sync. The plateau is sharp (every
 // single-stream cell measures inside 1e-5 of 1.0), so 1e-3 admits noise but no real structure.
 Real const PS_STREAM_TOL = Real(1.e-3);
+
+// A partition sub-grid cell (local coords c; sub-grid dims m, global origin o) -> its index in the full grid 'full'
+// (2026-10-15: moved here unchanged from quantities.cc, whose addFieldSubgrid/orFieldSubgrid use it, for the
+// fixed-point merge, src/ps_fixed_merge.h). Each cell maps to its global row-major index; o, m, full are in grid cells.
+// The destination may itself be a WINDOW of the full grid (--ps-window: mainOrigin/mainDims given):
+// a source cell is then mapped to its window-local index and skipped when it lies outside.
+inline bool subgridTarget(size_t const *c, size_t const *o, size_t const *full,
+                          size_t const *mainOrigin, size_t const *mainDims, size_t &g)
+{
+    g = 0;
+    for (int d = 0; d < NO_DIM; ++d)
+    {
+        // '% full[d]': the sub-box may WRAP a periodic axis (o[d]+m[d] > full[d]), which is the
+        // normal case for a partition straddling the box seam. No-op for an unwrapped box.
+        size_t gl = (c[d] + o[d]) % full[d];              // global index
+        if (mainOrigin)
+        {
+            long ml = long(gl) - long(mainOrigin[d]);
+            if (ml < 0) ml += long(full[d]);              // the window may wrap too
+            if (ml < 0 || ml >= long(mainDims[d])) return false;
+            g = g * mainDims[d] + size_t(ml);
+        }
+        else
+            g = g * full[d] + gl;                         // global row-major flat
+    }
+    return true;
+}
 #endif
 
 

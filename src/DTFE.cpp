@@ -32,6 +32,7 @@
 #include <exception>
 #include <memory>
 #include <map>       // the staged ordered merge's parked sub-grids (2026-10-14)
+#include <functional>   // the standard look-ahead's memory estimate (2026-10-15)
 #ifdef OPEN_MP
     #include <omp.h>
 #endif
@@ -59,8 +60,11 @@
 #include "partition_checkpoint.h"   // checkpoint + '--resume' of a partitioned run (PS 2026-10-11, standard 2026-10-13)
 #ifdef PHASE_SPACE
 #include "CGAL_triangulation/ps_mass_audit.h"   // PS_MASS_AUDIT=1: the run's mass closure after the merge
+#include "ps_merge_spill.h"   // the staged ordered merge's spill of parked sub-grids to disk (2026-10-15)
+#include "ps_fixed_merge.h"   // '--fixed-point-merge': the order-free merge into exact integer grids (2026-10-15)
 #endif
 #include "io/io.h"         // readInputData: the late read of a --ps-window run that started without its particles
+#include "CGAL_triangulation/ps_deposit_params.h"   // fixedShareDrops: the non-finite guard's counts (2026-10-15)
 
 
 using namespace std;
@@ -90,7 +94,29 @@ void DTFE_parallel(vector<Particle_data> *allParticles,
 std::shared_ptr<void> psPrebuildTessellation(vector<Particle_data> *p, User_options &userOptions);
 void psInterpolatePrebuilt(std::shared_ptr<void> &tessellation, vector<Sample_point> &samples,
                            User_options &userOptions, Quantities *uQuantities, Quantities *aQuantities);
+#else
+// the standard partition loop's look-ahead (2026-10-15; triangulation.cpp): one thread sub-domain's tessellation +
+// vertex densities built ahead (an opaque handle), and its interpolation later
+std::shared_ptr<void> dtfePrebuildTessellation(vector<Particle_data> *p, User_options &userOptions);
+void dtfeInterpolatePrebuilt(std::shared_ptr<void> &tessellation, vector<Sample_point> &samples,
+                             User_options &userOptions, Quantities *uQuantities, Quantities *aQuantities);
 #endif
+// One standard partition's sub-domains as the look-ahead prepared them (2026-10-15): DTFE_parallel's thread split of
+// the partition (or its single tessellation) and every sub-domain's tessellation, built; DTFE_parallelImpl then only
+// interpolates them. (Declared in both builds, used by the standard partition loop only.)
+struct DTFEPrepared
+{
+    bool single = true;                                // DTFE_parallel's single-tessellation branch
+    std::vector<size_t> pGrid;                         // else its thread grid, its split and the sub-domains' tessellations
+    std::vector< std::vector<size_t> > subgridList;
+    std::vector< Box > subgridCoords;
+    std::vector< std::shared_ptr<void> > tessellation; // [thread number]: the sub-domain DTFE_parallel's thread i takes
+    std::vector<size_t> nParticles;                    // [thread number]: its padded particles (the thread statistics)
+    size_t noTotalParticles = 0;
+};
+static void DTFE_parallelImpl(vector<Particle_data> *allParticles, vector<Sample_point> &samples,
+                              User_options &userOptions, Quantities *uQuantities, Quantities *aQuantities,
+                              DTFEPrepared *prepared);
 
 // Derives velocity divergence, shear and vorticity from the stored velocity gradient.
 void computeDivergenceShearVorticity(Field &fields,
@@ -593,8 +619,17 @@ DTFE_State DTFE_setup(vector<Particle_data> *allParticles,
             userOptions.partition      = tuneOptions.partition;
             userOptions.partitionOn    = tuneOptions.partitionOn;
             userOptions.maxConcurrent  = tuneOptions.maxConcurrent;
+#ifndef PHASE_SPACE
+            userOptions.stdLookAheadOffBudget = tuneOptions.stdLookAheadOffBudget;   // (2026-10-15)
+            userOptions.stdLookAheadCounted   = tuneOptions.stdLookAheadCounted;
+#endif
         }
         if ( report.valid ) runProgressSetPredicted( report.predicted );   // the SUMMARY's predicted-vs-measured line
+#ifndef PHASE_SPACE
+        // what the budget leaves for the partition loop's look-ahead beside the busiest partition (2026-10-15, as PS's)
+        if ( report.valid )
+            userOptions.stdLookAheadRoom = report.budget - report.fixed - report.gpuSnapshot - report.perPartition;
+#endif
 #ifdef PHASE_SPACE
         if ( report.valid )
         {
@@ -605,7 +640,14 @@ DTFE_State DTFE_setup(vector<Particle_data> *allParticles,
             // what the budget leaves for the look-ahead beside one partition (2026-10-11: it used to check the
             // free memory only, so a budget set low on purpose was passed by one tessellation)
             userOptions.psLookAheadRoom = report.budget - report.fixed - report.gpuSnapshot - report.perPartition;
+            // what the budget leaves beside the predicted peak for partitions parked by the staged ordered merge
+            // (2026-10-15): the prediction never counted them, and on macOS the free-memory reading alone did not
+            // stop them -- TNG100 z=0 parked 74 GB in RAM (footprint 122 GB on 64 GB) and spilled nothing, because the
+            // compressor and swap kept 'free' above the spill threshold. DTFE_TEST_PARK_ROOM_GB sets it (tests).
+            userOptions.psParkRoom = report.budget - report.predicted;
         }
+        if ( char const *room = std::getenv( "DTFE_TEST_PARK_ROOM_GB" ) )
+            if ( room[0] != '\0' ) userOptions.psParkRoom = std::max( 0., std::atof( room ) ) * 1.e9;
 #endif
         if ( userOptions.autoTuneReport )   // the memory check: the decision and prediction, nothing else
         {
@@ -747,6 +789,116 @@ static void standardPartitionOwnBox(std::vector<size_t> const &range, std::vecto
 }
 
 
+/* DTFE_parallel's thread split, in pieces the standard partition loop's look-ahead shares (2026-10-15): it prepares a
+   partition's sub-domains EXACTLY as DTFE_parallel would (the same threads, the same split, the same per-thread
+   options and particles), so these are the one definition of each. */
+// the threads DTFE_parallel may split one call over: every OpenMP thread, at most '--max-concurrent'
+static int dtfeParallelThreads(User_options const &userOptions)
+{
+#ifdef OPEN_MP
+    int n = omp_get_max_threads();
+    if ( userOptions.maxConcurrent > 0 and userOptions.maxConcurrent < n )
+        n = userOptions.maxConcurrent;
+    return n;
+#else
+    (void)userOptions;
+    return 1;
+#endif
+}
+// ... and whether it runs ONE tessellation instead: 1 thread, user sampling, redshift cone, --sample-points point
+// evaluation (the standard worker evaluates ONE Eulerian tessellation; overlapping padded sub-triangulations would
+// double-count boundary tets), or PS-DTFE (which partitions in Lagrangian space)
+static bool dtfeParallelSingle(User_options const &userOptions, vector<Sample_point> const &samples, int const threads)
+{
+#ifdef PHASE_SPACE
+    (void)userOptions; (void)samples; (void)threads;
+    return true;   // PS-DTFE: bypass spatial partitioning, use single triangulation
+#else
+    return threads==1 or not samples.empty() or userOptions.redshiftConeOn or psPointEvalActive();
+#endif
+}
+// one thread's sub-domain of the split: its options (sub-grid, region, padded box), 'userOptions' being the call's
+static User_options dtfeSubdomainOptions(User_options const &userOptions, int const threadNo, int const noProcessors,
+                                         std::vector<size_t> const &pGrid,
+                                         std::vector< std::vector<size_t> > &subgridList, std::vector< Box > &subgridCoords)
+{
+    User_options tempOptions = userOptions;
+    tempOptions.noProcessors = noProcessors;
+    tempOptions.threadId = threadNo;
+    tempOptions.verboseLevel = (userOptions.verboseLevel>0) ? 1 : userOptions.verboseLevel;   // slaves show only errors/warnings; master shows all
+
+    if ( threadNo==0 )
+        tempOptions.verboseLevel = userOptions.verboseLevel;
+    tempOptions.partNo = threadNo;
+    tempOptions.partition.clear();
+    for (int i=0; i<NO_DIM; ++i)
+        tempOptions.partition.push_back( pGrid[i] );
+    // the call's region becomes the sub-domain's full box: for a partition's sub-domain that is the PARTITION's region,
+    // which so names the partition in the tessellation-cache key (its 'box=' line, tessellation_cache.h makeDescriptor)
+    Box parentRegion = userOptions.region;   // (updateFullBox takes a non-const box)
+    tempOptions.updateFullBox( parentRegion );
+
+
+    // region allocated to this thread: writes subgrid size to tempOptions.gridSize and box to tempOptions.region
+    copySubgridInformation( &tempOptions, subgridList, subgridCoords );
+    tempOptions.paddedBox = tempOptions.region;
+    tempOptions.paddedBox.addPadding( tempOptions.paddingLength );
+    return tempOptions;
+}
+
+#ifndef PHASE_SPACE
+/* The standard look-ahead's PREPARE stage (2026-10-15): partition k+1's sub-domains, on the look-ahead thread while
+   partition k deposits. The thread count is the CALLER's (dtfeParallelThreads on the loop's thread: a fresh thread's
+   OpenMP defaults need not be the loop's), the rest is DTFE_parallel's own code above: the single-tessellation choice,
+   parallelGrid, optimalPartitionSplit on the partition's particles, each sub-domain's options and particles, and
+   buildTessellation (dtfePrebuildTessellation) -- with the cache when '--tessellation-cache' is on. The sub-domains are
+   built on a team of their own (an OpenMP team started from this thread), as many at once as DTFE_parallel runs, and
+   every one silently ('verbose 0': the log's progress line reports the look-ahead). Frees the partition's particles. */
+static void dtfePrepareSubdomains(vector<Particle_data> *partParticles, vector<Sample_point> &samples,
+                                  User_options const &partOptions, int const threads, DTFEPrepared &P)
+{
+    User_options quiet = partOptions;
+    quiet.verboseLevel = 0;
+    P.noTotalParticles = partParticles->size();
+    P.single = dtfeParallelSingle( quiet, samples, threads );
+    if ( P.single )
+    {
+        P.nParticles.assign( 1, partParticles->size() );
+        P.tessellation.assign( 1, std::shared_ptr<void>() );
+        P.tessellation[0] = dtfePrebuildTessellation( partParticles, quiet );   // frees the particles
+        return;
+    }
+    P.pGrid.assign( NO_DIM, 0 );
+    parallelGrid( threads, quiet, &(P.pGrid[0]) );
+    int noProcessors = 1;
+    for (int d=0; d<NO_DIM; ++d) noProcessors *= int( P.pGrid[d] );
+    optimalPartitionSplit( *partParticles, quiet, P.pGrid, &P.subgridList, &P.subgridCoords );
+    P.tessellation.assign( size_t(noProcessors), std::shared_ptr<void>() );
+    P.nParticles.assign( size_t(noProcessors), 0 );
+    std::vector<std::exception_ptr> errors( static_cast<size_t>( noProcessors ), std::exception_ptr() );
+    // over the sub-domain numbers, not the thread numbers: each is built whatever team the runtime gives
+#ifdef OPEN_MP
+    #pragma omp parallel for schedule(dynamic, 1) num_threads(noProcessors)
+#endif
+    for (int t=0; t<noProcessors; ++t)
+    {
+        try
+        {
+            User_options o = dtfeSubdomainOptions( quiet, t, noProcessors, P.pGrid, P.subgridList, P.subgridCoords );
+            vector<Particle_data> particles;
+            findParticlesInBox( *partParticles, &particles, o );
+            P.nParticles[size_t(t)] = particles.size();
+            P.tessellation[size_t(t)] = dtfePrebuildTessellation( &particles, o );
+        }
+        catch ( ... ) { errors[size_t(t)] = std::current_exception(); }
+    }
+    vector<Particle_data>().swap( *partParticles );
+    for (std::exception_ptr const &e : errors)
+        if ( e ) std::rethrow_exception( e );
+}
+#endif
+
+
 #ifdef PHASE_SPACE
 // PS-DTFE, periodic: unwrap the Eulerian positions so each displacement s = pos - lagPos lies in
 // [-L/2, L/2]; otherwise boundary particles get displacements near L and huge spurious simplices.
@@ -766,6 +918,42 @@ static void psUnwrapEulerian(std::vector<Particle_data> &particles, User_options
         }
 }
 #endif
+
+// The host's reaction to shares the non-finite guard of the exact fixed-point sums dropped (2026-10-15;
+// ps_deposit_params.h psFixedShareOk: a NaN, an infinity or a product beyond 2^63 adds nothing and is counted, on
+// the CPU and in every GPU kernel). THE one place that decides what such a run does: now a warning that names each
+// grid and its count, once per DTFE() call (the counts are taken and reset here), and the run goes on -- the grids
+// are written, without those shares (a float sum would have turned their cells NaN). To fail the run instead,
+// throw here (throwError). Nothing is printed when nothing was dropped.
+static void fixedShareDropsReact(User_options const &userOptions)
+{
+#ifdef PHASE_SPACE
+    // the slots: PSFxGrid, then FX_DROP_MASS / FX_DROP_SUMW (ps_deposit_params.h)
+    static char const *const names[FX_DROP_SLOTS] = {
+        "velocity moment", "dispersion second moment", "velocity-gradient moment", "moment weight",
+        "exact multiplicity", "dispersion mean", "dispersion weight", "scalar moment", "scalar-gradient moment",
+        "released multiplicity", "mass (density)", "exact-deposit weight totals", "", "", "", "" };
+#else
+    // the standard GPU deposit's grids (dtfe_gpu_fixed.h batchFixedScales)
+    static char const *const names[FX_DROP_SLOTS] = {
+        "density", "velocity", "velocity gradient", "scalar", "scalar gradient", "", "", "", "", "", "", "", "", "", "", "" };
+#endif
+    unsigned long long total = 0;
+    std::string what;
+    for (int k = 0; k < FX_DROP_SLOTS; ++k)
+    {
+        unsigned long long const n = fixedShareDrops[k].exchange( 0, std::memory_order_relaxed );
+        if ( n == 0 ) continue;
+        total += n;
+        what += ( what.empty() ? "" : ", " ) + std::string( names[k][0] ? names[k] : "slot " + std::to_string( k ) )
+              + " grid " + std::to_string( n );
+    }
+    if ( total == 0 ) return;
+    MESSAGE::Warning warning( userOptions.verboseLevel );
+    warning << total << " share(s) of the exact fixed-point sums were not finite or beyond the 64-bit range and were "
+            << "left out (" << what << "). The grids are written without them; a non-finite input value (a NaN or an "
+            << "infinite position, velocity or mass) is the usual cause.\n" << MESSAGE::EndWarning;
+}
 
 // Top-level DTFE interpolation onto a grid; dispatches to the standard, partitioned, or PS-DTFE path. Clears allParticles.
 void DTFE(vector<Particle_data> *allParticles,
@@ -1031,10 +1219,15 @@ void DTFE(vector<Particle_data> *allParticles,
             userOptions.psWindowLo[d]   = state.options.psWindowLo[d];
             userOptions.psWindowDims[d] = state.options.psWindowDims[d];
         }
+        // NO_DIM entries (2026-10-15): the 2D build read past the end of both 2-entry arrays here
+        std::string dims, lo;
+        for (int d = 0; d < NO_DIM; ++d)
+        {
+            dims += ( d ? "x" : "" ) + std::to_string( state.options.psWindowDims[d] );
+            lo   += ( d ? ", " : "" ) + std::to_string( state.options.psWindowLo[d] );
+        }
         MESSAGE::Message message( userOptions.verboseLevel );
-        message << "--ps-window: the output grid is the window of "
-                << state.options.psWindowDims[0] << "x" << state.options.psWindowDims[1] << "x" << state.options.psWindowDims[2]
-                << " cells at (" << state.options.psWindowLo[0] << ", " << state.options.psWindowLo[1] << ", " << state.options.psWindowLo[2]
+        message << "--ps-window: the output grid is the window of " << dims << " cells at (" << lo
                 << ") of the " << MESSAGE::printElements( state.options.gridSize, "x" ) << " grid.\n" << MESSAGE::Flush;
     }
 #endif
@@ -1245,9 +1438,28 @@ void DTFE(vector<Particle_data> *allParticles,
         // like a --ps-window skip: no particles, no tessellation, but still a turn in the ordered merge.
         // (2026-10-13: the set-up, the write after each merge and the closing line moved into partition_checkpoint.h
         // unchanged -- beginLoop / afterMerge / reportWrites -- so the standard loop below runs the same code.)
+        // '--fixed-point-merge' (2026-10-15, opt-in; ps_fixed_merge.h): the summed accumulators become exact integer
+        // grids for the loop -- the pre-sized Real ones are replaced here by their integer arrays (allocated now, so the
+        // memory gate sees them before it admits a partition; the moment weights, which the default too grows at their
+        // first values, come with a partition's first values) -- in units fixed NOW from global quantities (one pass
+        // over the particles for their largest velocity),
+        // before any partition finishes. A finished partition is then added at once (no index order, no parking, no
+        // spill), and the grids go back to Real once, after the loop. Its words go into the checkpoint as blobs.
+        bool const fixedMerge = state.options.psFixedPointMerge;
+        PSFixedMerge::Merge fxMerge;
+        PartitionCheckpoint::state().blobs.clear();
+        if ( fixedMerge )
+        {
+            if ( state.options.psParticlesDeferred )   // --ps-window is refused with the flag (user_options.cc)
+                throwError( "internal: '--fixed-point-merge' needs the particles for its units, and they were not read." );
+            fxMerge.setup( *uQuantities, *aQuantities, state.options, state.particles );
+            PartitionCheckpoint::state().blobs = fxMerge.blobs();
+        }
         PartitionCheckpoint::Checkpointer &checkpoint = PartitionCheckpoint::state();
         PartitionCheckpoint::beginLoop( state.options, totalPartitions, *uQuantities, *aQuantities, psPointEvalActive(),
                                         userOptions.verboseLevel );
+        if ( fixedMerge and checkpoint.resumed )
+            fxMerge.restore();   // the saved units must be this run's; the overflow bound comes back
         if ( checkpoint.resumed )
             for (int pi=0; pi<totalPartitions; ++pi)
                 if ( checkpoint.merged[size_t(pi)] and not skipPartition[size_t(pi)] ) { skipPartition[size_t(pi)] = 1; ++nSkipped; }
@@ -1298,7 +1510,41 @@ void DTFE(vector<Particle_data> *allParticles,
         // in index order, and the gate waits only behind lower-numbered partitions in flight. An exact (int64)
         // per-partition grid would merge in any order to the same bits; the staging holds whatever the partition
         // hands back, so it needs nothing from such a change, and stays useful until every field is exact.
-        bool const orderedMerge = state.options.psOrderedMerge;
+        // (2026-10-15: that alternative exists now as the OPT-IN '--fixed-point-merge', ps_fixed_merge.h: exact integer
+        // FULL grids, every partition added as it finishes, no staging and no spill; this staged merge stays the
+        // default. Under it 'orderedMerge' below is false, so nothing here runs.)
+        //
+        // THE SPILL (2026-10-15). Parked in RAM the sub-grids reached 16 GB on TNG100, and TNG50 z=0 swapped 5.7 GB:
+        // under the memory gate a partition was ALWAYS parked in RAM, and the gate lets a partition start with no
+        // lower-numbered one in flight whatever the free memory says (it must, or it could deadlock), so parked
+        // sub-grids plus that partition went past the machine. Now a partition that must park goes, in this order:
+        //   1. to RAM, while the free memory less 4 GB of headroom -- and, under the gate, less the one partition the
+        //      gate must still be able to admit (psPartitionBytes) -- holds it (DTFE_MERGE_STAGE_GB=X: while the
+        //      parked RAM stays under X GB instead). The reading already contains the sub-grids (they exist), so
+        //      asking it to hold them once more is a margin of one sub-grid, kept on purpose as in the 2026-10-14
+        //      rule: the partition still holds its particle copy at this point, and spilling a little early costs
+        //      only a few seconds of sequential I/O;
+        //   2. else to DISK (ps_merge_spill.h): its accumulators are written to one unlinked file in --scratch-dir
+        //      (SCRATCH_DIR), else in the system temporary folder ($TMPDIR, else /tmp), and freed; at its turn they
+        //      are read back into the same Quantities and merged by the same mergeOne, so the merged grids, the
+        //      checkpoints and the resume sequence are byte-identical to an in-RAM park (and to '--max-concurrent 1').
+        //      Only while the folder's volume keeps 2 GB free beside it (scratch_alloc.cc's margin), the spills still
+        //      being written and, in --scratch-dir, the scratch mappings' full size (sparse files). The write runs
+        //      outside the merge lock (seconds per GB-sized partition, beside deposits of minutes); a partition whose
+        //      turn came during its write merges from RAM and drops the file. A default folder rather than none: the
+        //      alternatives are a thread waiting for its turn (the 35% loss the staging removed) or, under the gate,
+        //      RAM that macOS then swaps to the same internal disk page by page;
+        //   3. else as before the spill: under the gate (with no DTFE_MERGE_STAGE_GB cap) to RAM anyway -- holding the
+        //      sub-grids costs the same memory as waiting with them, only the freed thread differs, and the gate
+        //      admits it only by the free memory -- otherwise it waits for its turn holding its thread.
+        // DTFE_MERGE_SPILL=0 switches the spill off (exactly the 2026-10-14 staging; the gate then parks in RAM
+        // always), DTFE_MERGE_SPILL=1 spills EVERY parked partition with sub-grids (the test suite's hook), and
+        // DTFE_MERGE_STAGE_GB=0 still means no parking at all, RAM or disk. The 'ordered merge:' line counts the
+        // spills (how many, at most how many at once, the GB written). The gate and the auto-tuner need nothing new:
+        // a spilled partition has left the gate like a parked one, and its freed memory shows in the free-memory
+        // reading the gate admits by; the tuner's model never counted parked sub-grids (the gate keeps them honest).
+        // (2026-10-15: not under '--fixed-point-merge', whose integer adds need no order; --resume's flag included)
+        bool const orderedMerge = state.options.psOrderedMerge and not fixedMerge;
         std::mutex mergeMutex;
         std::condition_variable mergeCv;
         int nextMerge = 0;
@@ -1306,12 +1552,13 @@ void DTFE(vector<Particle_data> *allParticles,
         {
             Quantities u, a;
             bool emptyPartition = true, skipped = false;
-            double bytes = 0.;
+            double bytes = 0.;          // the RAM it holds (0 when spilled)
+            PSMergeSpill::File spill;   // spilled (2026-10-15): u and a are in this file, their vectors empty
         };
         std::map<int, StagedPartition> staged;      // finished partitions waiting for their turn (under mergeMutex)
         double stagedBytes = 0., stagedPeakBytes = 0.;
-        size_t stagedPeakCount = 0;
-        int nStaged = 0, nWaitedTurn = 0;
+        size_t stagedPeakCount = 0, stagedRamCount = 0;   // parked in RAM: at most / now
+        int nStaged = 0, nWaitedTurn = 0;                  // parked (RAM or disk); waited for their turn instead
         double stageCapBytes = -1.;                 // DTFE_MERGE_STAGE_GB: a fixed cap; < 0 = the free-memory rule
         if ( char const *cap = std::getenv( "DTFE_MERGE_STAGE_GB" ) )
             if ( cap[0] != '\0' ) stageCapBytes = std::max( 0., std::atof( cap ) ) * 1.e9;
@@ -1327,13 +1574,48 @@ void DTFE(vector<Particle_data> *allParticles,
         // estimate and the partitions are gated (the omp loop below: not the speed split, unless asked for)
         bool const gateGuards = psConcurrency > 1 and state.options.psPartitionBytes > 0.
                                 and ( not state.options.psSpeedSplit or state.options.psOrderedMergeFlag );
-        auto stageFits = [&](double const bytes)
+        // the spill (2026-10-15, the comment above): DTFE_MERGE_SPILL=0 off, =1 every parked partition, else the rule
+        int spillMode = 0;
+        if ( char const *sp = std::getenv( "DTFE_MERGE_SPILL" ) )
+            spillMode = sp[0] == '0' ? -1 : sp[0] == '1' ? 1 : 0;
+        std::string spillWhy;
+        std::string const spillDir = PSMergeSpill::folder( state.options.scratchDir, spillWhy );
+        bool spillUsable = staging and spillMode >= 0 and spillWhy.empty();
+        if ( spillMode < 0 ) spillWhy = "DTFE_MERGE_SPILL=0";
+        int nSpilled = 0, nSpillTurn = 0;
+        size_t spilledCount = 0, spilledPeakCount = 0;
+        double spilledBytes = 0., spilledPeakBytes = 0., spillWritten = 0.;
+        // the spills being written now (outside the lock): their bytes are not on the disk yet, so the room each new
+        // one is checked against must leave them out (review, 2026-10-15: k writers passed one reading together)
+        double spillPendingBytes = 0.;
+        // where a partition of 'bytes' parks now (under mergeMutex): 1 RAM, 2 disk, 0 nowhere (it waits its turn)
+        enum { PARK_WAIT = 0, PARK_RAM = 1, PARK_DISK = 2 };
+        auto parkWhere = [&](double const bytes) -> int
         {
-            if ( stageCapBytes > 0. ) return stagedBytes + bytes <= stageCapBytes;
-            if ( gateGuards ) return true;
-            double const freeNow = autoTuneSystemFree();
-            if ( freeNow < 0. ) return stagedBytes + bytes <= 2.e9;   // free memory unknown: a small fixed room
-            return freeNow - 4.e9 >= bytes;
+            if ( not staging ) return PARK_WAIT;
+            // spoken-for room on the spill disk: the writes in progress, and with '--scratch-dir' (the spill folder
+            // then) every scratch mapping in full -- a sparse file whose unwritten pages statvfs reports free
+            // (over-counting the pages already written only spills less: the fallback is the park or the wait)
+            double const reserved = spillPendingBytes
+                                    + ( state.options.scratchDir.empty() ? 0. : double( ScratchAlloc::scratchLiveBytes() ) );
+            bool const disk = spillUsable and bytes > 0. and PSMergeSpill::room( spillDir, bytes, reserved,
+                                                                                    PSMergeSpill::margin( state.options.scratchDir ) );
+            if ( spillMode > 0 and disk ) return PARK_DISK;   // the test hook
+            bool ram;
+            if ( stageCapBytes > 0. ) ram = stagedBytes + bytes <= stageCapBytes;
+            else
+            {
+                double const freeNow = autoTuneSystemFree();
+                if ( freeNow < 0. ) ram = stagedBytes + bytes <= 2.e9;   // free memory unknown: a small fixed room
+                else ram = freeNow - 4.e9 - ( gateGuards ? state.options.psPartitionBytes : 0. ) >= bytes;
+                // and within what the memory budget leaves beside the plan's predicted peak (2026-10-15; psParkRoom
+                // says why: the free memory alone let TNG100 z=0 park 74 GB). stagedBytes counts RAM-parked ones only
+                if ( ram and std::isfinite( state.options.psParkRoom ) )
+                    ram = stagedBytes + bytes <= std::max( 0., state.options.psParkRoom );
+            }
+            if ( ram ) return PARK_RAM;
+            if ( disk ) return PARK_DISK;
+            return ( gateGuards and stageCapBytes < 0. ) ? PARK_RAM : PARK_WAIT;
         };
         // test hook: DTFE_TEST_DELAY_PARTITION=i:s holds partition i for s seconds before its merge, so the partitions
         // after it finish first and the staging is certain to happen (tests/ps_runtime_check.sh R7)
@@ -1341,6 +1623,14 @@ void DTFE(vector<Particle_data> *allParticles,
         double delaySeconds = 0.;
         if ( char const *hook = std::getenv( "DTFE_TEST_DELAY_PARTITION" ) )
             if ( std::sscanf( hook, "%d:%lf", &delayPartition, &delaySeconds ) != 2 ) delayPartition = -1;
+        std::string parkRoomText;   // the RAM parking's budget room (psParkRoom), when one is known
+        if ( std::isfinite( state.options.psParkRoom ) )
+        {
+            char rb[96];
+            std::snprintf( rb, sizeof(rb), ", in RAM up to the %.1f GB the memory budget leaves beside the plan",
+                           std::max( 0., state.options.psParkRoom ) / 1.e9 );
+            parkRoomText = rb;
+        }
         if ( orderedMerge and psConcurrency > 1 )
             message << MESSAGE::cBold() << "PS-DTFE:" << MESSAGE::cReset() << " partitions merge in index order "
                     << "(bit-reproducible sums); "
@@ -1349,16 +1639,30 @@ void DTFE(vector<Particle_data> *allParticles,
                                      "(DTFE_MERGE_STAGE_GB), while its thread goes on"
                                      : gateGuards ? std::string( "one finished before its turn waits in memory and its "
                                      "thread goes on (the memory gate admits the next partition)" )
+                                       + parkRoomText
                                      : std::string( "one finished before its turn waits in memory, while the free memory "
                                      "allows, and its thread goes on" ) )
                                  : std::string( "one finished before its turn waits for it (DTFE_MERGE_STAGE_GB=0)" ) )
+                    << ( not staging ? std::string()
+                         : spillUsable ? std::string( spillMode > 0 ? "; every one with sub-grids is spilled to disk"
+                                                                    : "; when the memory cannot hold it, spilled to disk" )
+                                         + " in '" + spillDir + "'" + ( spillMode > 0 ? " (DTFE_MERGE_SPILL=1)" : "" )
+                         : "; no spill to disk (" + spillWhy + ")" )
                     << ( state.options.psCompletionOrderMergeFlag ? "; --resume overrides --completion-order-merge" : "" )
                     << ".\n" << MESSAGE::Flush;
+        if ( fixedMerge )
+            message << MESSAGE::cBold() << "PS-DTFE:" << MESSAGE::cReset() << " --fixed-point-merge: each partition is "
+                    << "added as it finishes into exact integer grids (9 B per summed component and cell; the same bytes "
+                    << "at any concurrency and completion order; nothing parks or spills). Units from the "
+                    << fxMerge.unitsText() << ".\n" << MESSAGE::Flush;
 
         ConcurrentTriangulationPlan triangulationPlan( psConcurrency, totalPartitions );
         psGpuFallbacksTaken( true );   // counted from here; reported once after the loop
         // a partition starts only when the machine has the memory for it (or nothing else is in flight);
         // under the ordered merge it waits only behind lower-numbered partitions (auto_tune.h)
+        // (2026-10-15: under '--fixed-point-merge' orderedMerge is false -- no partition waits for its turn, so the gate
+        // needs no ordered mode: it waits while any partition is in flight, which the dynamic schedule makes the same
+        // set, every one in flight being lower-numbered)
         PartitionMemoryGate memoryGate( psConcurrency > 1 ? state.options.psPartitionBytes : 0., orderedMerge );
 
         // One partition's work, in two stages: PREPARE (select its particles; with 'build', also its
@@ -1434,17 +1738,76 @@ void DTFE(vector<Particle_data> *allParticles,
                 {   // with --ps-window every partition's sub-grid IS the window: the merge is window-local
                     size_t const *wo = state.options.psWindowOn ? state.options.psWindowLo   : nullptr;
                     size_t const *wd = state.options.psWindowOn ? state.options.psWindowDims : nullptr;
-                    uQuantities->addFromSubgrid( tu, &(state.options.gridSize[0]), wo, wd );
-                    aQuantities->addFromSubgrid( ta, &(state.options.gridSize[0]), wo, wd );
+                    if ( fixedMerge )   // the integer grids (2026-10-15); the masks still OR into the Real ones
+                        fxMerge.add( pj, tu, ta, *uQuantities, *aQuantities, &(state.options.gridSize[0]), wo, wd );
+                    else
+                    {
+                        uQuantities->addFromSubgrid( tu, &(state.options.gridSize[0]), wo, wd );
+                        aQuantities->addFromSubgrid( ta, &(state.options.gridSize[0]), wo, wd );
+                    }
                 }
                 PartitionCheckpoint::afterMerge( pj, skipped, *uQuantities, *aQuantities, userOptions.verboseLevel );
             };
             bool stagedHere = false;
             if ( orderedMerge and nextMerge != pi )
             {
-                // not its turn: park its sub-grids (when the memory allows) and free the thread, else wait as before
+                // not its turn: park its sub-grids -- in RAM, or spilled to disk (2026-10-15) -- and free the thread,
+                // else wait as before (parkWhere above)
                 double const bytes = P.emptyPartition ? 0. : subgridBytes( temp_uQuantities ) + subgridBytes( temp_aQuantities );
-                if ( staging and stageFits( bytes ) )
+                int where = parkWhere( bytes );
+                if ( where == PARK_DISK )
+                {
+                    // the write runs outside the merge lock (the merges of the others go on); the sub-grids stay in
+                    // memory until the file is complete, so a failed write loses nothing
+                    PSMergeSpill::File file;
+                    std::string why;
+                    spillPendingBytes += bytes;   // counted against the room of the spills that start meanwhile
+                    lock.unlock();
+                    bool const wrote = PSMergeSpill::write( temp_uQuantities, temp_aQuantities, spillDir, file, why );
+                    lock.lock();
+                    spillPendingBytes -= bytes;
+                    if ( nextMerge == pi )
+                    {   // its turn came during the write: the drain before it found nothing parked here and stopped,
+                        // so it merges now, from memory, and the file goes (a late park would never be merged)
+                        ++nSpillTurn;
+                        where = -1;
+                    }
+                    else if ( wrote )
+                    {
+                        PSMergeSpill::release( temp_uQuantities );
+                        PSMergeSpill::release( temp_aQuantities );
+                        StagedPartition &S = staged[pi];
+                        S.u = std::move( temp_uQuantities );   // empty vectors; the sub-grid placement stays with them
+                        S.a = std::move( temp_aQuantities );
+                        S.emptyPartition = P.emptyPartition;
+                        S.skipped = P.skipped;
+                        S.bytes = 0.;
+                        ++nStaged;
+                        ++nSpilled;
+                        ++spilledCount;
+                        spilledBytes += file.bytes;
+                        spillWritten += file.bytes;
+                        spilledPeakCount = std::max( spilledPeakCount, spilledCount );
+                        spilledPeakBytes = std::max( spilledPeakBytes, spilledBytes );
+                        S.spill = std::move( file );
+                        stagedHere = true;
+                    }
+                    else
+                    {   // the disk refused (full, unwritable): no more spills this run; parked in RAM or waiting, as
+                        // without the spill
+                        if ( spillUsable )
+                        {
+                            MESSAGE::Warning warning( userOptions.verboseLevel );
+                            warning << "the staged ordered merge cannot spill to disk (" << why << "); from now on a "
+                                    << "partition that finishes before its turn waits in memory or for its turn.\n"
+                                    << MESSAGE::EndWarning;
+                            spillUsable = false;
+                            spillWhy = why;
+                        }
+                        where = parkWhere( bytes );
+                    }
+                }
+                if ( where == PARK_RAM )
                 {
                     StagedPartition &S = staged[pi];
                     S.u = std::move( temp_uQuantities );
@@ -1454,11 +1817,12 @@ void DTFE(vector<Particle_data> *allParticles,
                     S.bytes = bytes;
                     stagedBytes += bytes;
                     ++nStaged;
+                    ++stagedRamCount;
                     stagedPeakBytes = std::max( stagedPeakBytes, stagedBytes );
-                    stagedPeakCount = std::max( stagedPeakCount, staged.size() );
+                    stagedPeakCount = std::max( stagedPeakCount, stagedRamCount );
                     stagedHere = true;
                 }
-                else
+                else if ( where == PARK_WAIT )
                 {
                     if ( not P.skipped ) ++nWaitedTurn;
                     mergeCv.wait( lock, [&]{ return nextMerge == pi; } );
@@ -1470,12 +1834,26 @@ void DTFE(vector<Particle_data> *allParticles,
                 if ( orderedMerge )
                 {
                     nextMerge = pi + 1;
-                    // the staged partitions whose turn has now come, in index order
+                    // the staged partitions whose turn has now come, in index order; a spilled one is read back first
+                    // (under the lock, beside its merge: one partition's sub-grids at a time)
                     for ( auto it = staged.find( nextMerge ); it != staged.end(); it = staged.find( nextMerge ) )
                     {
                         StagedPartition S = std::move( it->second );
                         staged.erase( it );
-                        stagedBytes -= S.bytes;
+                        if ( S.spill.fd >= 0 )
+                        {
+                            spilledBytes -= S.spill.bytes;
+                            --spilledCount;
+                            std::string why;
+                            if ( not PSMergeSpill::read( S.spill, S.u, S.a, why ) )
+                                throwError( "the staged ordered merge: partition ", nextMerge, " was spilled to '" + spillDir
+                                            + "' and cannot be merged: " + why );
+                        }
+                        else
+                        {
+                            stagedBytes -= S.bytes;
+                            --stagedRamCount;
+                        }
                         mergeOne( nextMerge, S.emptyPartition, S.skipped, S.u, S.a );
                         ++nextMerge;
                     }
@@ -1652,15 +2030,31 @@ void DTFE(vector<Particle_data> *allParticles,
 
         PartitionCheckpoint::reportWrites( std::chrono::duration<double>( std::chrono::steady_clock::now() - psLoopStart ).count(),
                                            userOptions.verboseLevel );
+        // '--fixed-point-merge': every integer grid to its Real grid, once (ps_fixed_merge.h), before anything reads
+        // them; then what it held and how much room its units left
+        if ( fixedMerge )
+        {
+            PartitionCheckpoint::state().blobs.clear();   // they point into fxMerge, and nothing is checkpointed now
+            fxMerge.finish( *uQuantities, *aQuantities );
+            message << MESSAGE::cDim() << "  " << fxMerge.reportText() << "\n" << MESSAGE::cReset() << MESSAGE::Flush;
+        }
         // what the staged ordered merge did (2026-10-14): how many partitions finished before their turn and waited in
         // memory, at most how many / how much at once, and how many waited for their turn holding their thread
         if ( orderedMerge and psConcurrency > 1 )
         {
             if ( not staged.empty() )   // cannot happen: every partition merges once, the last drains the rest
                 throwError( "internal: ", staged.size(), " staged partition(s) were never merged" );
-            message << MESSAGE::cDim() << "  ordered merge: " << nStaged << " partition(s) finished before their turn "
-                    << "and waited in memory (at most " << stagedPeakCount << " at once, "
-                    << std::round( stagedPeakBytes / 1.e7 ) / 100. << " GB); " << nWaitedTurn << " waited for their turn "
+            // (2026-10-15: of those, how many were spilled to disk, at most how many at once, and the GB written)
+            auto gbText = [](double const b) { char t[32]; std::snprintf( t, sizeof(t), "%.2f", b / 1.e9 ); return std::string( t ); };
+            message << MESSAGE::cDim() << "  ordered merge: " << nStaged << " partition(s) finished before their turn: "
+                    << ( nStaged - nSpilled ) << " waited in memory (at most " << stagedPeakCount << " at once, "
+                    << std::round( stagedPeakBytes / 1.e7 ) / 100. << " GB), " << nSpilled << " spilled to disk"
+                    << ( nSpilled > 0 ? " (at most " + std::to_string( spilledPeakCount ) + " at once, "
+                                        + gbText( spillWritten ) + " GB written)"
+                                      : spillUsable or not staging ? std::string() : " (" + spillWhy + ")" )
+                    << ( nSpillTurn > 0 ? " (+" + std::to_string( nSpillTurn ) + " whose turn came while writing: merged "
+                                          "from memory)" : "" )
+                    << "; " << nWaitedTurn << " waited for their turn "
                     << "holding their thread" << ( staging and nWaitedTurn > 0 ? " (no room to stage)" : "" ) << "\n"
                     << MESSAGE::cReset() << MESSAGE::Flush;
         }
@@ -1834,21 +2228,48 @@ void DTFE(vector<Particle_data> *allParticles,
                     << "tetrahedra whose centroid lies in its sub-box.\n" << MESSAGE::Flush;
 
         auto const partLoopStart = std::chrono::steady_clock::now();
-        for (int i=0; i<totalPartitions; ++i)
+
+        // One partition's work in two stages (2026-10-15, as the PS loop's): PREPARE selects its particles (its padded
+        // box, periodic images included) and, for the look-ahead, splits it into DTFE_parallel's thread sub-domains and
+        // builds their tessellations; DEPOSIT interpolates (building the tessellations in place when nothing was
+        // prepared), copies the partition's sub-grid into the full grids, checkpoints and reports. Without the
+        // look-ahead each partition runs prepare + deposit in turn, the loop it always was.
+        struct StdPrepared
         {
-            if ( checkpoint.merged[size_t(i)] ) continue;   // restored: its sub-grid is in the loaded grids already
+            User_options opt;              // the partition's options (its sub-grid, region and padded box)
+            vector<Particle_data> part;    // its particles (none once the look-ahead has built from them)
+            bool built = false;            // the look-ahead built its sub-domains (sub)
+            DTFEPrepared sub;
+            double seconds = 0.;           // the look-ahead's time for it
+        };
+        int const parallelThreads = dtfeParallelThreads( state.options );   // DTFE_parallel's, read on THIS thread
+        auto prepare = [&](int const i, bool const build, StdPrepared &P)
+        {
+            auto const t0 = std::chrono::steady_clock::now();
+            P.opt = state.options;
+            P.opt.partNo = i;
+            copySubgridInformation( &P.opt, subgridList, subgridCoords );
+
+            P.opt.paddedBox = P.opt.region;
+            P.opt.paddedBox.addPadding( P.opt.paddingLength );
+
+            findParticlesInBox( state.particles, &P.part, P.opt );
+            P.opt.periodic = false;
+#ifndef PHASE_SPACE
+            if ( build )
+            {
+                dtfePrepareSubdomains( &P.part, samples, P.opt, parallelThreads, P.sub );
+                P.built = true;
+            }
+#else
+            (void)build;
+#endif
+            P.seconds = std::chrono::duration<double>( std::chrono::steady_clock::now() - t0 ).count();
+        };
+        auto deposit = [&](int const i, StdPrepared &P)
+        {
             message << MESSAGE::cBold() << "\n<<< Interpolating the fields for partition " << i+1 << "/" << totalPartitions << " ...\n" << MESSAGE::cReset();
-
-            User_options tempOpt = state.options;
-            tempOpt.partNo = i;
-            copySubgridInformation( &tempOpt, subgridList, subgridCoords );
-
-            tempOpt.paddedBox = tempOpt.region;
-            tempOpt.paddedBox.addPadding( tempOpt.paddingLength );
-
-            vector<Particle_data> tempPart;
-            findParticlesInBox( state.particles, &tempPart, tempOpt );
-            tempOpt.periodic = false;
+            User_options &tempOpt = P.opt;
 
             if ( psPointEvalActive() )   // this partition's ownership (above); the loop is serial
             {
@@ -1861,9 +2282,10 @@ void DTFE(vector<Particle_data> *allParticles,
             // saves them per partition ('points.<i>', partition_checkpoint.h) and '--resume' reads them back. The tag is
             // thread-local; under point evaluation DTFE_parallel triangulates the partition once ON THIS THREAD (its
             // single-triangulation branch), and the point walk copies the tag into its sinks before it starts its own
-            // threads (ps_point_eval.cc forEachCellParallel). A no-op without '--sample-points'.
+            // threads (ps_point_eval.cc forEachCellParallel). A no-op without '--sample-points'. (The look-ahead only
+            // BUILDS on its own thread; the interpolation, and so the walk, stays on this one.)
             psPointEvalSetPartition( i );
-            DTFE_parallel( &tempPart, samples, tempOpt, &temp_uQuantities, &temp_aQuantities );
+            DTFE_parallelImpl( &P.part, samples, tempOpt, &temp_uQuantities, &temp_aQuantities, P.built ? &P.sub : nullptr );
             psPointEvalSetPartition( -1 );
 
             // map this partition's sub-grid results back into the full output grids
@@ -1885,7 +2307,156 @@ void DTFE(vector<Particle_data> *allParticles,
                     << MESSAGE::cDim() << "  elapsed " << MESSAGE::formatDuration(elapsed)
                     << ( done<totalPartitions ? ", ETA ~" + MESSAGE::formatDuration(eta) : ", done" )
                     << MESSAGE::cReset() << "\n" << MESSAGE::Flush;
+        };
+
+        // the partitions this process computes, in index order (a resumed run's restored ones are in the grids already)
+        std::vector<int> toCompute;
+        for (int i=0; i<totalPartitions; ++i)
+            if ( not checkpoint.merged[size_t(i)] ) toCompute.push_back( i );
+
+        /* The LOOK-AHEAD (2026-10-15; the PS loop's of 2026-10-11, DTFE.cpp above, for the standard loop). With '--gpu'
+           every partition's volume-averaged pass waits for the partition's particle selection and the Delaunay
+           triangulations + vertex densities of all its thread sub-boxes, while the GPU idles. Now partition k+1 is
+           prepared -- selected, split into DTFE_parallel's sub-domains and triangulated (or loaded from
+           '--tessellation-cache'), on a team of CPU threads of its own -- while partition k is interpolated, at most
+           one ahead. Every sub-domain is built from the same particles with the same options as without the
+           look-ahead (dtfePrepareSubdomains: DTFE_parallel's own split and options, the sequential insert), the
+           interpolation is unchanged, and each partition still ASSIGNS its own part of the grids in index order, so
+           every output is byte-identical (tests/dtfe_resume_check.sh D14). It holds the next partition's particle copy
+           and tessellations; before each look-ahead the free memory, less 4 GB of headroom, is checked against that
+           (auto_tune.h stdLookAheadBytes, the uniform count of one partition, or the auto-tuner's count when larger),
+           and the partition is prepared in turn when it does not fit; the auto-tuner counts it in its prediction and
+           switches it off for a run whose budget cannot hold it (stdLookAheadOffBudget). '--no-overlap' switches it off; DTFE_OVERLAP=1 forces it on
+           a CPU run too (the tests' byte-identity check on any build), DTFE_OVERLAP=0 switches it off. A '--resume'
+           looks ahead to the next partition it computes, not to the next index. */
+        bool gpuDeposit = false;
+#if defined(DTFE_GPU) && NO_DIM==3 && !defined(PHASE_SPACE)
+        gpuDeposit = state.options.useMetal and state.options.method==1 and state.options.aField.selected()
+                     and not state.options.redshiftConeOn and not state.options.userDefinedSampling;
+#endif
+        bool overlap = false;
+        double aheadBytesMax = 0.;
+        std::function<double(int)> aheadBytes = [](int) { return 0.; };
+#ifndef PHASE_SPACE
+        {
+            char const *overlapEnv = std::getenv( "DTFE_OVERLAP" );
+            bool const overlapForced = overlapEnv and overlapEnv[0] == '1';
+            bool const overlapBanned = overlapEnv and overlapEnv[0] == '0';
+            overlap = toCompute.size() > 1 and state.options.DTFE and not state.options.stdNoOverlap
+                      and not state.options.stdLookAheadOffBudget and not overlapBanned and ( gpuDeposit or overlapForced );
         }
+        // what one partition's look-ahead holds: its padded particle copy + the tessellations of its sub-domains
+        // (auto_tune.h, the model's bytes per padded vertex); the partitions hold about the same particles (the split
+        // balances them), so the uniform count of the partition's geometry -- or the auto-tuner's count from the
+        // particles, of the partition that needs the most, when it is larger (on clustered data the padding shells
+        // of a dense partition hold more than the uniform count: auto_tune.h StdTuneDensity)
+        aheadBytes = [&](int const i) -> double
+        {
+            User_options o = state.options;
+            o.partNo = i;
+            copySubgridInformation( &o, subgridList, subgridCoords );
+            o.verboseLevel = 0;
+            size_t tGrid[NO_DIM];
+            for (int d=0; d<NO_DIM; ++d) tGrid[d] = 1;
+            if ( not dtfeParallelSingle( o, samples, parallelThreads ) )
+                parallelGrid( parallelThreads, o, tGrid );
+            double len[NO_DIM], pad[NO_DIM];
+            for (int d=0; d<NO_DIM; ++d)
+            {
+                len[d] = double( o.region[2*d+1] - o.region[2*d] );
+                pad[d] = double( o.paddingLength[2*d] + o.paddingLength[2*d+1] ) / 2.;
+            }
+            return std::max( state.options.stdLookAheadCounted,
+                             stdLookAheadBytes( state.options, double( state.particles.size() ) / double( totalPartitions ),
+                                                len, pad, tGrid ) );
+        };
+        if ( overlap )
+        {
+            for (int i : toCompute) aheadBytesMax = std::max( aheadBytesMax, aheadBytes( i ) );
+            // the memory budget too, not only the free memory: what it leaves beside the grids, the particles and one
+            // partition must hold the look-ahead, or the run has none (the same for every partition, decided once)
+            if ( aheadBytesMax > state.options.stdLookAheadRoom )
+            {
+                overlap = false;
+                message << MESSAGE::cBold() << "DTFE:" << MESSAGE::cReset() << " look-ahead off: the ~"
+                        << std::round( aheadBytesMax/1.e7 )/100. << " GB it holds is more than the ~"
+                        << std::round( std::max( 0., state.options.stdLookAheadRoom )/1.e7 )/100. << " GB the memory "
+                        << "budget leaves beside one partition; partitions are prepared in turn.\n" << MESSAGE::Flush;
+            }
+        }
+#endif
+        if ( overlap )
+        {
+            message << MESSAGE::cBold() << "DTFE:" << MESSAGE::cReset() << " look-ahead on: partition k+1 is "
+                    << "triangulated on CPU threads while partition k is interpolated"
+                    << ( gpuDeposit ? " on the GPU" : " (DTFE_OVERLAP=1)" ) << " (~" << std::round( aheadBytesMax/1.e7 )/100.
+                    << " GB more in memory; '--no-overlap' switches it off).\n" << MESSAGE::Flush;
+
+            StdPrepared cur;
+            prepare( toCompute[0], false, cur );
+            bool saidNoRoom = false;
+            for (size_t k=0; k<toCompute.size(); ++k)
+            {
+                int const i = toCompute[k];
+                StdPrepared next;
+                std::thread ahead;
+                std::exception_ptr aheadError;
+                bool aheadRan = false;
+                if ( k + 1 < toCompute.size() )
+                {
+                    int const nextI = toCompute[k+1];
+                    double const need = aheadBytes( nextI );
+                    double const freeNow = autoTuneSystemFree();
+                    bool const room = freeNow < 0. or freeNow - 4.e9 >= need;
+                    if ( room )
+                    {
+                        aheadRan = true;
+                        ahead = std::thread( [&, nextI]()
+                        {
+                            try { prepare( nextI, true, next ); }
+                            catch ( ... ) { aheadError = std::current_exception(); }
+                        } );
+                    }
+                    else if ( not saidNoRoom )
+                    {
+                        saidNoRoom = true;
+                        MESSAGE::Message m( userOptions.verboseLevel );
+                        m << MESSAGE::cDim() << "  look-ahead paused: " << freeNow/1.e9 << " GB free, minus 4 GB headroom, "
+                          << "is below the ~" << need/1.e9 << " GB it holds; partitions are prepared in turn "
+                          << "until memory frees up\n" << MESSAGE::cReset() << MESSAGE::Flush;
+                    }
+                }
+                try
+                {
+                    deposit( i, cur );
+                }
+                catch ( ... )
+                {
+                    if ( ahead.joinable() ) ahead.join();
+                    throw;
+                }
+                if ( ahead.joinable() ) ahead.join();
+                if ( aheadError ) std::rethrow_exception( aheadError );
+                if ( aheadRan and userOptions.verboseLevel > 0 )
+                {
+                    MESSAGE::Message m( userOptions.verboseLevel );
+                    m << MESSAGE::cDim() << "  look-ahead: partition " << toCompute[k+1] + 1 << " prepared in "
+                      << MESSAGE::formatDuration( next.seconds ) << " during this one\n" << MESSAGE::cReset() << MESSAGE::Flush;
+                }
+                if ( k + 1 < toCompute.size() )
+                {
+                    if ( not aheadRan ) prepare( toCompute[k+1], false, next );
+                    cur = std::move( next );
+                }
+            }
+        }
+        else
+            for (int i : toCompute)
+            {
+                StdPrepared P;
+                prepare( i, false, P );
+                deposit( i, P );
+            }
         PartitionCheckpoint::reportWrites( std::chrono::duration<double>( std::chrono::steady_clock::now() - partLoopStart ).count(),
                                            userOptions.verboseLevel );
 
@@ -1949,6 +2520,9 @@ void DTFE(vector<Particle_data> *allParticles,
                 << runProgressGpuRetries( 1 ) << ", oom " << runProgressGpuRetries( 2 ) << ", other "
                 << runProgressGpuRetries( 3 ) << ")\n" << MESSAGE::Flush;
     }
+
+    // the shares the non-finite guard of the exact sums dropped in this DTFE() call, by grid (2026-10-15)
+    fixedShareDropsReact( userOptions );
 }
 
 
@@ -1993,34 +2567,52 @@ void DTFE_parallel(vector<Particle_data> *allParticles,
                    Quantities *uQuantities,
                    Quantities *aQuantities)
 {
+    DTFE_parallelImpl( allParticles, samples, userOptions, uQuantities, aQuantities, nullptr );
+}
+
+// ... the body; 'prepared' (the standard partition loop's look-ahead, 2026-10-15) holds the split and the sub-domains'
+// tessellations already built from these options (dtfePrepareSubdomains), so only their interpolation is left
+static void DTFE_parallelImpl(vector<Particle_data> *allParticles,
+                              vector<Sample_point> &samples,
+                              User_options & userOptions,
+                              Quantities *uQuantities,
+                              Quantities *aQuantities,
+                              DTFEPrepared *prepared)
+{
+#ifndef PHASE_SPACE
+    // a prepared single tessellation (as the branches below, which interpolate() it)
+    auto interpolatePrepared = [&](size_t const sub, User_options &o, Quantities *u, Quantities *a)
+    {
+        if ( not userOptions.DTFE )
+            throwError( "internal: a look-ahead tessellation reached a non-DTFE interpolation." );
+        dtfeInterpolatePrebuilt( prepared->tessellation[sub], samples, o, u, a );
+    };
+#else
+    if ( prepared ) throwError( "internal: the standard look-ahead reached PS-DTFE's DTFE_parallel." );
+    auto interpolatePrepared = [&](size_t, User_options &, Quantities *, Quantities *) {};
+#endif
 #ifndef OPEN_MP
-    interpolate( allParticles, samples, userOptions, uQuantities, aQuantities );  // deletes allParticles
+    if ( prepared ) interpolatePrepared( 0, userOptions, uQuantities, aQuantities );
+    else interpolate( allParticles, samples, userOptions, uQuantities, aQuantities );  // deletes allParticles
     return;
 #else
-    int noAvailableProcessors = omp_get_max_threads();
     // cap concurrent sub-triangulations to bound peak memory (--max-concurrent); 0 = all threads
-    if ( userOptions.maxConcurrent > 0 and userOptions.maxConcurrent < noAvailableProcessors )
-        noAvailableProcessors = userOptions.maxConcurrent;
+    int const noAvailableProcessors = dtfeParallelThreads( userOptions );
 
-    // fall back to a single triangulation when spatial partitioning does not apply:
-    // 1 thread, user sampling, redshift cone, --sample-points point evaluation (the standard
-    // worker evaluates ONE Eulerian tessellation; overlapping padded sub-triangulations
-    // would double-count boundary tets), or PS-DTFE (which partitions in Lagrangian space)
-    if ( noAvailableProcessors==1 or not samples.empty() or userOptions.redshiftConeOn
-         or psPointEvalActive()
-#ifdef PHASE_SPACE
-         or true  // PS-DTFE: bypass spatial partitioning, use single triangulation
-#endif
-       )
+    // fall back to a single triangulation when spatial partitioning does not apply (dtfeParallelSingle: 1 thread,
+    // user sampling, redshift cone, --sample-points point evaluation, PS-DTFE); a prepared partition decided it
+    if ( prepared ? prepared->single : dtfeParallelSingle( userOptions, samples, noAvailableProcessors ) )
     {
-        interpolate( allParticles, samples, userOptions, uQuantities, aQuantities );
+        if ( prepared ) interpolatePrepared( 0, userOptions, uQuantities, aQuantities );
+        else interpolate( allParticles, samples, userOptions, uQuantities, aQuantities );
         return;
     }
 
 
     // more than 1 thread: split the data into spatial partitions, one per thread
     std::vector<size_t> pGrid(NO_DIM,0); // the parallel grid
-    parallelGrid( noAvailableProcessors, userOptions, &(pGrid[0]) );
+    if ( prepared ) pGrid = prepared->pGrid;
+    else parallelGrid( noAvailableProcessors, userOptions, &(pGrid[0]) );
     int noProcessors = 1;
     for (int d=0; d<NO_DIM; ++d) noProcessors *= pGrid[d];    //number of processors actually used (may differ from 'noAvailableProcessors')
 
@@ -2030,13 +2622,19 @@ void DTFE_parallel(vector<Particle_data> *allParticles,
     message << "From now on only the master thread will show messages on how the computation is going. Not all threads take the same execution time, so there may be a discrepancy between the messages displayed to the user and the computations across all threads.\n\n" << MESSAGE::Flush;
     std::vector<size_t> processorParticles(noProcessors);    // number of particles associated to each processor
     std::vector<Real> processorTime(noProcessors);           // the actual runtime of each thread
-    size_t const noTotalParticles = allParticles->size();
+    size_t const noTotalParticles = prepared ? prepared->noTotalParticles : allParticles->size();
     
 
     // choose the partition geometry that balances the particle load across threads
     std::vector< std::vector<size_t> > subgridList;
     std::vector< Box > subgridCoords;
-    optimalPartitionSplit( *allParticles, userOptions, pGrid, &subgridList, &subgridCoords );
+    if ( prepared )
+    {
+        subgridList = prepared->subgridList;
+        subgridCoords = prepared->subgridCoords;
+    }
+    else
+        optimalPartitionSplit( *allParticles, userOptions, pGrid, &subgridList, &subgridCoords );
 
     // --gpu: the sub-domains deposit into ONE full grid on the device (dtfeGpuShared*, see
     // gpu_host.h) instead of each into a sub-grid of its own -- one accumulator, one read-back,
@@ -2068,33 +2666,23 @@ void DTFE_parallel(vector<Particle_data> *allParticles,
 #pragma omp parallel num_threads( noProcessors )
     {
         int const threadNo = omp_get_thread_num();
-        User_options tempOptions = userOptions;
-        tempOptions.noProcessors = noProcessors;
-        tempOptions.threadId = threadNo;
-        tempOptions.verboseLevel = (userOptions.verboseLevel>0) ? 1 : userOptions.verboseLevel;   // slaves show only errors/warnings; master shows all
-
-        if ( threadNo==0 )
-            tempOptions.verboseLevel = userOptions.verboseLevel;
-        tempOptions.partNo = threadNo;
-        tempOptions.partition.clear();
-        for (int i=0; i<NO_DIM; ++i)
-            tempOptions.partition.push_back( pGrid[i] );
-        tempOptions.updateFullBox( userOptions.region );
-
-
-        // region allocated to this thread: writes subgrid size to tempOptions.gridSize and box to tempOptions.region
-        copySubgridInformation( &tempOptions, subgridList, subgridCoords );
-        tempOptions.paddedBox = tempOptions.region;
-        tempOptions.paddedBox.addPadding( tempOptions.paddingLength );
-
-
-        vector<Particle_data> particles;
-        findParticlesInBox( *allParticles, &particles, tempOptions );
-        processorParticles[ threadNo ] = particles.size();
+        // region allocated to this thread (dtfeSubdomainOptions: its sub-grid, box and padded box)
+        User_options tempOptions = dtfeSubdomainOptions( userOptions, threadNo, noProcessors, pGrid, subgridList, subgridCoords );
 
 
         Quantities temp_uQuantities, temp_aQuantities;
-        interpolate( &particles, samples, tempOptions, &temp_uQuantities, &temp_aQuantities ); //this function deletes the vector 'particles'
+        if ( prepared )   // the look-ahead built this sub-domain's tessellation from the same options and particles
+        {
+            processorParticles[ threadNo ] = prepared->nParticles[ size_t(threadNo) ];
+            interpolatePrepared( size_t(threadNo), tempOptions, &temp_uQuantities, &temp_aQuantities );
+        }
+        else
+        {
+            vector<Particle_data> particles;
+            findParticlesInBox( *allParticles, &particles, tempOptions );
+            processorParticles[ threadNo ] = particles.size();
+            interpolate( &particles, samples, tempOptions, &temp_uQuantities, &temp_aQuantities ); //this function deletes the vector 'particles'
+        }
         processorTime[ threadNo ] = tempOptions.totalTime;
 
 
@@ -2613,6 +3201,7 @@ void DTFE(vector<Particle_data> *allParticles,
     }
 
     postProcessWebFields( userOptions, uQuantities, aQuantities );
+    fixedShareDropsReact( userOptions );   // the non-finite guard's dropped shares, as at the end of DTFE() above (2026-10-15)
 }
 #endif
 

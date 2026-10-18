@@ -37,6 +37,10 @@
 #   PTS_VEL_GRAD  1 (default) = also evaluate the velocity gradient at every sample point
 #                 (.pts_velGrad), which is what makes the velDiv/velShear/velVort maps
 #                 possible. A snapshot lacking it counts as STALE, so a rerun recomputes it.
+#   PTS_CONVENTIONS  grid (default) | legacy: the image plane's estimators (run_ps_dtfe.sh's knob, the binary's
+#                 --pts-conventions; 2026-10-15): 'grid' = the grids' vertex masses and volume weighting at the points,
+#                 'legacy' = the conventions before 2026-10-13, which reproduce a plane made before then. A snapshot
+#                 whose run log shows the other one is recomputed.
 #   PLANES, THICKNESS, SUPERSAMPLE, WINDOW
 #                 the plane's geometry, forwarded to make_image_plane.py: PLANES sampling planes
 #                 (default 1 = one crisp cross-section; a handful ghosts, use >= 16 with
@@ -81,6 +85,7 @@ AXIS="${AXIS:-z}"
 CENTER="${CENTER:-}"
 GRID_SIZE="${USER_GRID:-512}"       # 512^3 analysis grids by default (figures don't depend on it)
 PTS_VEL_GRAD="${PTS_VEL_GRAD:-1}"
+PTS_CONVENTIONS="${PTS_CONVENTIONS:-grid}"
 PLANES="${PLANES:-1}"
 THICKNESS="${THICKNESS:-2}"
 SUPERSAMPLE="${SUPERSAMPLE:-1}"
@@ -131,7 +136,8 @@ run_settings() {
     printf '%s\n' "$1" | awk '
         BEGIN { split("--grid --padding --avg-subsamples --field --lambda_th", v); for (i in v) val[v[i]] = 1
                 split("--periodic --ps-vertex-mass --ps-volume-weighted --ps-exact-deposit --ps-linear-deposit " \
-                      "--ps-caustics --ps-caustic-cusps --pts-vel-grad", b); for (i in b) flag[b[i]] = 1 }
+                      "--ps-caustics --ps-caustic-cusps --pts-vel-grad", b); for (i in b) flag[b[i]] = 1
+                split("--pts-conventions", c); for (i in c) val[c[i]] = 1 }
         { i = 1; if ($1 == "RUNNING:") i = 2
           bin = $i; sub(/.*\//, "", bin); print "binary " bin
           cur = ""; line = ""
@@ -234,7 +240,7 @@ print(int(s.get("planes", 1)) * int(s["nv"]) * int(s["nu"]) * int(s.get("supersa
     # ---- grids + point evaluation, one triangulation per snapshot ------------------------
     # PS_METAL follows PS_GPU too: -m only switches the GPU ON, an exported PS_METAL=1 would otherwise leak in
     env_args=(SAMPLE_POINTS="${plane}.bin" PS_VOLUME_WEIGHTED="${PS_VOLUME_WEIGHTED}" PTS_VEL_GRAD="${PTS_VEL_GRAD}"
-              PS_METAL="${PS_GPU}")
+              PTS_CONVENTIONS="${PTS_CONVENTIONS}" PS_METAL="${PS_GPU}")
     [ -n "${FIELDS:-}" ] && env_args+=(FIELDS="${FIELDS}")
     # The settings this batch would run each snapshot with, asked from run_ps_dtfe.sh itself (DRY_RUN=1: reads,
     # runs and writes nothing), so the comparison below cannot drift from what it runs (2026-10-11: the check

@@ -77,8 +77,9 @@ import numpy as np
 # FieldSet.mean_field() computes it from the velocity grid for either method. The figure scripts that set PS
 # beside DTFE or theory use it for PS by default ('--ps-gradient stored' restores the stored grids; dtfelib/cli.py):
 # plot_velDiv_den, plot_cosmic_web, plot_web_streams, plot_shear_triaxial, plot_DTFE and plot_halo_tracking
-# (through environment.sample_fields_at). The raw-field viewers (plot_PS_DTFE, the launcher's Explore) still show
-# the stored PS grids.
+# (through environment.sample_fields_at), and since 2026-10-15 the launcher's Explore (its 'PS velocity derivatives'
+# choice, the mean field by default: fields.mean_field_plane, one slice at a time). The raw-field viewer
+# plot_PS_DTFE still shows the stored PS grids.
 FIELDS = {
     "density":           ("den",           1, False),
     "velocity":          ("vel",           3, False),
@@ -332,6 +333,23 @@ def _load_budget_bytes() -> int:
     return int(frac * _available_ram_bytes())
 
 
+def run_lambda_th(runlog) -> float:
+    """The web threshold of the run whose log is 'runlog' (FieldSet.lambda_th; the launcher's Explore reads its
+    outputs' logs with it, 2026-10-15): the last '--lambda_th X' in it (the binary's command line on the 'RUNNING:'
+    line run_dtfe.sh / run_ps_dtfe.sh write), else the binary's own T-web report '(lambda_th = X)', else
+    DEFAULT_LAMBDA_TH (0.3, the run scripts' default; also for a log that cannot be read)."""
+    import re
+    try:
+        text = Path(runlog).read_text(errors="replace")
+    except OSError:
+        return DEFAULT_LAMBDA_TH
+    found = re.findall(r"--lambda_th[ =]+([-+0-9.eE]+)", text) or re.findall(r"lambda_th = ([-+0-9.eE]+)", text)
+    try:
+        return float(found[-1]) if found else DEFAULT_LAMBDA_TH
+    except ValueError:
+        return DEFAULT_LAMBDA_TH
+
+
 def _grid_shape_of(path: Path, ncomp: int) -> tuple[int, np.dtype]:
     """(N, dtype) of a raw N^3 x ncomp grid file, from its size alone: float32 (the default
     build) or float64 (a DOUBLE=1 build). The two never collide -- N^3 = 2 M^3 has no integer
@@ -577,16 +595,7 @@ class FieldSet:
         (the binary's command line, which run_dtfe.sh / run_ps_dtfe.sh write on its 'RUNNING:' line), else the
         binary's own T-web report '(lambda_th = X)' in that log, else DEFAULT_LAMBDA_TH (0.3, the run scripts'
         default). mean_field() classifies its V-web with it, so a PS mean-field V-web uses its own run's threshold."""
-        import re
-        try:
-            text = (self.snapdir / f"{self.prefix}runlog").read_text(errors="replace")
-        except OSError:
-            return DEFAULT_LAMBDA_TH
-        found = re.findall(r"--lambda_th[ =]+([-+0-9.eE]+)", text) or re.findall(r"lambda_th = ([-+0-9.eE]+)", text)
-        try:
-            return float(found[-1]) if found else DEFAULT_LAMBDA_TH
-        except ValueError:
-            return DEFAULT_LAMBDA_TH
+        return run_lambda_th(self.snapdir / f"{self.prefix}runlog")
 
     def mean_field(self, names, scaled: bool = True, lambda_th: float | None = None):
         """The MEAN-FIELD velocity derivatives computed from this output's 'velocity' grid, for EITHER method

@@ -51,6 +51,18 @@ VOID_TIP = ("Outline the voids on the map: a circle where each distinct, well-re
 # a heavy action beside a running DTFE job starts without a question only when it fits in the free memory less
 # this (void_outlines.HEADROOM_BYTES, the catalogue build's own margin)
 HEAVY_HEADROOM_GB = 4.0
+# the choice of a phase-space output's velocity derivatives (2026-10-15; grids.py, GRADIENT_FIELDS): its items and tip
+PS_GRADIENT_ITEMS = (("mean field ∇⟨v⟩: from the mean velocity, as standard DTFE", "mean-field"),
+                     ("stream average ⟨∇v⟩: the stored grids", "stored"))
+PS_GRADIENT_TIP = ("How a phase-space output's velocity divergence, shear, vorticity, gradient and V-web are shown. Mean "
+                   "field (the default, as in the figure scripts): the derivatives of its mean velocity grid, ∇⟨v⟩, the "
+                   "quantity standard DTFE stores, computed slice by slice from the velocity grid (under a "
+                   "second per slice at 512³; the V-web at the run's own threshold). Stream average: the grids the "
+                   "program stored, the average of each stream's own gradient ⟨∇v⟩, which differs in multi-stream "
+                   "cells (its divergence does not average to zero over the box, its V-web finds few filaments). "
+                   "A standard-DTFE output is always shown as stored: its grids are the mean field. The hi-res slices "
+                   "and the zooms are point evaluations: the stream average. Every title, colour bar and figure-grid "
+                   "panel of a phase-space output says which it shows.")
 VOID_REFF_TIP = ("Also draw each void's R_eff = (a b c)^⅓ of its fitted ellipsoid, dashed, around the same centre: "
                  "R_eff is about 1.6 R_v, the open question of which radius describes the void")
 VOID_SIGMA_TIP = ("The smoothing the voids are found at. 'production' = the analysis scripts' own (10 cells: a "
@@ -193,12 +205,14 @@ class SliceWorker(QObject):
             if req.get("pts"):                      # the point-evaluated hi-res slice in place of the grid's
                 plane, pts_side, pts_factor = pts_plane(out, req["pts"], req["field"], req["component"])
                 plane = _smoothed(plane, req.get("smooth", 0))
-            else:
-                plane = _smoothed(out.slice(req["field"], req["axis"], req["index"], req["component"]),
+            else:                                   # (a phase-space output's velocity derivatives: the family
+                grad = req.get("ps_gradient", "stored")     # asked for, grids.OutputSet.slice; 2026-10-15)
+                plane = _smoothed(out.slice(req["field"], req["axis"], req["index"], req["component"], grad),
                                   req.get("smooth", 0))
             planes = None
             if req.get("compare") is not None:      # B read and smoothed the same way; the map is A - B or log10 A/B
-                b = _smoothed(req["compare"].slice(req["field"], req["axis"], req["index"], req["component"]),
+                b = _smoothed(req["compare"].slice(req["field"], req["axis"], req["index"], req["component"],
+                                                   req.get("ps_gradient", "stored")),
                               req.get("smooth", 0))
                 planes = (plane, b)
                 plane = compare_planes(plane, b, req["compare_mode"])
@@ -208,7 +222,8 @@ class SliceWorker(QObject):
                                      symmetric=req["symmetric"], vrange=req.get("vrange"))
             if planes is not None:
                 rgb[~np.isfinite(img)] = NAN_GREY   # colorize paints NaN as vmin: on RdBu_r that would read 'A >> B'
-            arrows = out.arrow_field(req["field"], req["axis"], req["index"], smooth=req.get("smooth", 0)) \
+            arrows = out.arrow_field(req["field"], req["axis"], req["index"], smooth=req.get("smooth", 0),
+                                     gradient=req.get("ps_gradient", "stored")) \
                 if req.get("arrows") and not req.get("pts") else None
             self.done.emit({"rgb": np.ascontiguousarray(rgb), "plane": plane, "vrange": vrange, "request": req,
                             "arrows": arrows, "planes": planes, "pts_side": pts_side, "pts_factor": pts_factor})
@@ -508,8 +523,12 @@ def load_exact_planes(root, grid, redshift=None):
 def grid_items(req: dict) -> list:
     """Per panel of the request: its plane on the slice and the colour range it gets (None for an empty
     panel). The range is colorize()'s (log10 where the panel is log, centred on 0 for a diverging field);
-    with 'shared' or 'merged', panels of one (field, component) take the union of their ranges."""
+    with 'shared' or 'merged', panels of one (field, component) take the union of their ranges -- and of one family
+    of velocity derivatives (2026-10-15): a phase-space panel's stored stream average never shares a range, a colour
+    bar or a name with a mean-field panel (grids.OutputSet.gradient_family); with a phase-space panel in the grid every
+    velocity-derivative panel says its family ('qualify', grids.field_label)."""
     axis, rel, clip, smooth = req["axis"], req["rel"], req["clip"], req["smooth"]
+    grad = req.get("ps_gradient", "stored")
     items = []
     for p in req["panels"]:
         if p is None:
@@ -517,7 +536,7 @@ def grid_items(req: dict) -> list:
             continue
         o, name, comp = p["output"], p["field"], p["component"]
         idx = 0 if o.dim == 2 else int(round(rel * (o.n - 1)))
-        plane = o.slice(name, axis, idx, comp)
+        plane = o.slice(name, axis, idx, comp, grad)
         if smooth > 0:
             try:
                 from scipy.ndimage import gaussian_filter
@@ -533,12 +552,16 @@ def grid_items(req: dict) -> list:
         ext = [o.lo[rest[0]], o.lo[rest[0]] + o.length[rest[0]], o.lo[rest[1]], o.lo[rest[1]] + o.length[rest[1]]]
         items.append({"output": o, "field": name, "component": comp, "plane": plane, "img": img, "lo": lo, "hi": hi,
                       "log": log, "cmap": cmap, "symmetric": symmetric, "ext": ext, "rest": rest, "idx": idx,
-                      "finite": finite, "voids": p.get("voids")})
+                      "finite": finite, "voids": p.get("voids"), "family": o.gradient_family(name, grad)})
+    qualify = any(it["family"] and G.estimator_label(it["output"]) == "PS-DTFE" for it in items if it is not None)
+    for it in items:
+        if it is not None:
+            it["qualify"] = qualify
     if req["shared"] or req["merged"]:
         groups: dict = {}
         for it in items:
             if it is not None:
-                groups.setdefault((it["field"], it["component"]), []).append(it)
+                groups.setdefault(quantity(it), []).append(it)
         for its in groups.values():
             full = [i for i in its if i["finite"]] or its        # an all-empty panel takes the others' range
             lo, hi = min(i["lo"] for i in full), max(i["hi"] for i in full)
@@ -550,10 +573,17 @@ def grid_items(req: dict) -> list:
     return items
 
 
+def quantity(it: dict) -> tuple:
+    """What a grid panel shows, for its colour range, colour bar and name: (field, component, family of velocity
+    derivatives: '' / 'mean' / 'stream', 2026-10-15)."""
+    return it["field"], it["component"], it.get("family", "")
+
+
 def panel_names(it: dict) -> tuple[str, str, str, str]:
-    """(field label, component text, who, when) of a panel."""
+    """(field label, component text, who, when) of a panel; the label says the velocity derivatives' family
+    (grids.field_label, the item's 'qualify')."""
     o, name, comp = it["output"], it["field"], it["component"]
-    label = G.FIELD_LABELS.get(name, name)
+    label = G.field_label(o, name, it.get("family", ""), it.get("qualify"))
     ctext = "" if comp in ("value", "") else f" [{comp}]"
     who = o.sim or o.dir.name
     when = f"z = {o.redshift:.2f}" if o.redshift is not None else (o.title.split(" · ")[1] if " · " in o.title else "")
@@ -578,7 +608,7 @@ def grid_differences(items: list) -> dict:
     moments = {panel_names(it)[2:] for it in live}
     types = {type_tag(it["output"]) for it in live}
     return {"outs": outs, "sims": {panel_names(it)[2] for it in live},
-            "quantities": {(it["field"], it["component"]) for it in live},
+            "quantities": {quantity(it) for it in live},
             "by_prefix": len(outs) > len(moments) or len(types) > 1}
 
 
@@ -687,12 +717,22 @@ def grid_tiles(req: dict, items: list, max_tile: int = 1024) -> tuple[np.ndarray
     return out, labels, bar
 
 
-def grid_suptitle(req: dict, items: list) -> str:
+def grid_unit(items: list, unit: str) -> tuple[str, str]:
+    """(the figure grid's axes unit, a note when it is not the one asked for): Mpc/h only when the h of EVERY panel's
+    box is known, else Mpc in every panel, said (2026-10-15: a panel without a known h fell back to Mpc alone,
+    unsaid, beside panels in Mpc/h; the remembered choice stays Mpc/h for the outputs that know h)."""
+    if unit != "mpc_h" or all(G.hubble(it["output"]) for it in items if it is not None):
+        return unit, ""
+    return "mpc", "the h of a panel's box is not known: the axes are in Mpc"
+
+
+def grid_suptitle(req: dict, items: list, position: str | None = None) -> str:
     """The figure grid's own title, what Save figure… writes above the panels: merged, what every panel shares (the
-    quantity, the simulation) and the slice; else the slice alone ('' for 2D panels)."""
+    quantity, the simulation) and the slice; else the slice alone ('' for 2D panels). 'position' in place of the
+    request's (the map's 'z = 32.50 Mpc'): a saved figure's in its axes' unit (2026-10-15)."""
     diff = grid_differences(items)
     pdim = next((it["output"].dim for it in items if it), 3)
-    where = f" ({req['position']})" if req.get("position") else ""
+    where = f" ({req['position'] if position is None else position})" if req.get("position") else ""
     slice_text = f"slice normal to {AXES[req['axis']]} at {100 * req['rel']:.0f}% of the box{where}" if pdim == 3 else ""
     if not req["merged"]:
         return slice_text
@@ -719,6 +759,7 @@ def grid_figure(req: dict, items: list, dpi: float = 200.0, opts: dict | None = 
     from matplotlib.figure import Figure
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     o_ = FS.options(opts)
+    o_["unit"], _note = grid_unit(items, o_["unit"])    # one unit in every panel (2026-10-15)
     rows, cols, merged, axis = req["rows"], req["cols"], req["merged"], req["axis"]
     fs = float(o_["font_scale"])
     bare = o_["margins"] == "none"          # the panels fill the figure: no title, axes or colour bars
@@ -775,7 +816,7 @@ def grid_figure(req: dict, items: list, dpi: float = 200.0, opts: dict | None = 
         tag = f" · {type_tag(o)}" if diff["by_prefix"] and type_tag(o) else ""
         if tile:
             if merged and bars_on:
-                bars.setdefault((it["field"], it["component"]), (im, it))
+                bars.setdefault(quantity(it), (im, it))
             if o_["panel_titles"]:
                 ax.text(0.03, 0.97, panel_label(it, diff), transform=ax.transAxes, va="top", ha="left",
                         fontsize=8 * fs, color="white", bbox=dict(facecolor="black", alpha=0.45, edgecolor="none",
@@ -788,7 +829,13 @@ def grid_figure(req: dict, items: list, dpi: float = 200.0, opts: dict | None = 
                 if o_["colorbar_label"]:
                     cb.set_label(("log₁₀ " if it["log"] else "") + label + ctext, fontsize=8 * fs)
                 cb.ax.tick_params(labelsize=7 * fs)
-    auto = grid_suptitle(req, items)
+    auto = shown = grid_suptitle(req, items)
+    first = next((it["output"] for it in items if it is not None), None)
+    if o_["unit"] != "mpc" and req.get("position_at") and first is not None:
+        # the slice position in the axes' unit (2026-10-15), converted with the first panel's box (its h, its cells)
+        a, v = req["position_at"]
+        val, name = FS.position(first, a, v, o_["unit"], G.hubble(first) if o_["unit"] == "mpc_h" else None)
+        shown = grid_suptitle(req, items, f"{AXES[a]} = {val:.2f} {name}")
     if bare:
         pass                                # nothing around the panels
     elif merged:
@@ -822,9 +869,9 @@ def grid_figure(req: dict, items: list, dpi: float = 200.0, opts: dict | None = 
                 cb.set_label(text, fontsize=size)
             cb.ax.tick_params(labelsize=min(7 * fs, size))
         if o_["title"]:
-            fig.suptitle(FS.title_text(o_, auto), fontsize=9 * fs, y=1.0 - 0.17 / H)
+            fig.suptitle(FS.title_text(o_, auto, shown), fontsize=9 * fs, y=1.0 - 0.17 / H)
     else:
-        title = FS.title_text(o_, auto) if o_["title"] else ""
+        title = FS.title_text(o_, auto, shown) if o_["title"] else ""
         if title:
             fig.suptitle(title, fontsize=9 * fs, y=0.995)
         fig.tight_layout()
@@ -834,11 +881,14 @@ def grid_figure(req: dict, items: list, dpi: float = 200.0, opts: dict | None = 
 
 def grid_dpi(fig, req: dict, items: list, opts: dict) -> float:
     """The dpi to save the grid figure at: the options', or with 'match the data' the one at which the widest
-    panel holds its plane pixel for pixel (figsave.match_dpi). The panels are the figure's first rows x cols axes."""
+    panel holds its plane pixel for pixel (figsave.match_dpi: panels too small for 72 dpi shrink the figure, the
+    separate panels' tight_layout re-run). The panels are the figure's first rows x cols axes."""
     if not opts["match_data"]:
         return float(opts["dpi"])
     panels = fig.axes[:req["rows"] * req["cols"]]
-    return FS.match_dpi(fig, [(ax, it["img"].shape[1]) for ax, it in zip(panels, items) if it is not None])
+    tile = req["merged"] or opts["margins"] == "none"       # grid_figure's fixed margins: no tight_layout there
+    return FS.match_dpi(fig, [(ax, it["img"].shape[1]) for ax, it in zip(panels, items) if it is not None],
+                        relayout=None if tile else fig.tight_layout)
 
 
 def grid_full_pixels(req: dict, items: list, opts: dict):
@@ -1264,6 +1314,10 @@ class ExploreControls(QWidget):
         self._settings = settings
         self.save_options = FS.loads(settings.value(self.SAVE_KEY, "")) if settings is not None else FS.options()
         self._grid_title = ""                   # the figure grid's own title (its worker sends it)
+        # the single map's title as a function of the unit of its positions: units = None (the screen's: Mpc, or
+        # cells without a box) or ((axis, position) -> (value, unit name)), a saved figure's (2026-10-15); None
+        # while the figure grid is shown
+        self._title_make = None
         self._save_note = ""                    # why a saved figure's axes are not in the unit asked for
         self._data_root = data_root_fn          # () -> current data root
         self._extra_dirs = extra_dirs_fn        # () -> the custom-snapshot output directories
@@ -1353,6 +1407,19 @@ class ExploreControls(QWidget):
         self.voids.toggled.connect(self._voids_toggled)
         crow.addWidget(self.voids)
         f.addRow("Component", crow)
+        # a phase-space output's velocity derivatives: the mean field (computed) or the stored stream average (2026-10-15)
+        self.ps_gradient = QComboBox()
+        for text, mode in PS_GRADIENT_ITEMS:
+            self.ps_gradient.addItem(text, mode)
+        self.ps_gradient.setCurrentIndex(self.ps_gradient.findData(G.PS_GRADIENT_DEFAULT))
+        self.ps_gradient.setToolTip(PS_GRADIENT_TIP)
+        self.ps_gradient.currentIndexChanged.connect(self._ps_gradient_changed)
+        f.addRow("PS derivatives", self.ps_gradient)
+        self.ps_gradient_note = QLabel("")
+        self.ps_gradient_note.setWordWrap(True)
+        self.ps_gradient_note.setStyleSheet("color: gray")
+        f.addRow("", self.ps_gradient_note)
+        f.setRowVisible(self.ps_gradient_note, False)
         # the void inspector and its options (2026-10-11): R_eff outlines too (dashed), the smoothing the voids are
         # found at, the void last clicked and a jump to the slice through its centre
         vrow = QHBoxLayout()
@@ -2122,7 +2189,8 @@ class ExploreControls(QWidget):
                "component": self.component.currentText(), "cmap": self.cmap.currentText(),
                "log": self.log.isChecked(), "clip": self.clip.value(), "smooth": self.smooth.value(),
                "symmetric": name in G.DIVERGING and not self.log.isChecked(),
-               "arrows": self.vectors.isEnabled() and self.vectors.isChecked()}
+               "arrows": self.vectors.isEnabled() and self.vectors.isChecked(),
+               "ps_gradient": self.ps_gradient.currentData() or G.PS_GRADIENT_DEFAULT}
         if self.pts_combo.currentData():
             req.update(pts=self.pts_combo.currentData(), arrows=False)
             if name in ("shear", "vorticity"):  # the hi-res slice holds their magnitudes (>= 0): no component, no
@@ -2239,13 +2307,16 @@ class ExploreControls(QWidget):
                 "fixed": self.fixed.isChecked(), "vmin": self.vmin_edit.text(), "vmax": self.vmax_edit.text(),
                 "snapshots": dict(self._snapshots), "resident": self.resident.value(),
                 "voids": self.voids.isChecked(), "void_reff": self.void_reff.isChecked(),
-                "void_sigma": self.void_sigma.value()}
+                "void_sigma": self.void_sigma.value(), "ps_gradient": self.ps_gradient.currentData()}
 
     def restore_state(self, d: dict) -> bool:
         """Back to a remembered state when its output is still listed (selected first by refresh_outputs)."""
         if isinstance(d, dict):                 # the hand-chosen snapshots and the server's residency: for every output
             self._snapshots.update({k: v for k, v in (d.get("snapshots") or {}).items() if Path(v).is_file()})
             self.resident.setValue(int(d.get("resident", 0) or 0))
+            j = self.ps_gradient.findData(d.get("ps_gradient"))       # for every output too (2026-10-15)
+            if j >= 0 and j != self.ps_gradient.currentIndex():
+                self.ps_gradient.setCurrentIndex(j)
             self._refresh_server_button()       # refresh_outputs ran first: it judged the server with no snapshots
         if not d or self.current is None or str(self.current.root) != d.get("root"):
             return False
@@ -2632,11 +2703,48 @@ class ExploreControls(QWidget):
         self._compare_sync()
         self.render()
 
+    def _ps_gradient_changed(self, *_):
+        """The velocity-derivative family chosen (2026-10-15): the map, its comparison and the figure grid again."""
+        self.render()
+
+    def _gradient_label(self, req: dict) -> str:
+        """The field's name on the map for request 'req' (grids.field_label): a phase-space output's velocity
+        derivatives say their family -- the mean field, the stored stream average, or (a hi-res slice: a point
+        evaluation) the stream average; with a comparison both outputs' families, A's and B's when they differ. The
+        note under the choice says when a phase-space map is not what the choice asks, and why."""
+        o, name, grad = req["output"], req["field"], req.get("ps_gradient", "stored")
+        ps = G.estimator_label(o) == "PS-DTFE"
+        fam = o.gradient_family(name, grad)
+        note = ""
+        if fam and ps and req.get("pts"):
+            fam, note = "stream", "a hi-res slice is a point evaluation: the stream average"
+        elif fam == "stream" and grad == "mean-field":
+            note = f"this output shows the stored stream average: {o.mean_field_reason()}"
+        b = req.get("compare")
+        fam_b = b.gradient_family(name, grad) if b is not None else fam
+        if fam_b == "stream" and grad == "mean-field" and b is not None and not note:
+            note = f"B shows the stored stream average: {b.mean_field_reason()}"
+        self.ps_gradient_note.setText(note)
+        self._out_form_map.setRowVisible(self.ps_gradient_note, bool(note))
+        qualify = bool(fam) and (ps or (b is not None and G.estimator_label(b) == "PS-DTFE"))
+        if fam and fam_b and fam != fam_b:
+            return (f"{G.FIELD_LABELS.get(name, name)} (A {G.GRADIENT_QUALIFIER[fam]}, "
+                    f"B {G.GRADIENT_QUALIFIER[fam_b]})")
+        return G.field_label(o, name, fam, qualify)
+
     def _set_position(self, req: dict):
-        o = req["output"]
-        pos = o.lo[req["axis"]] + (req["index"] + 0.5) * o.length[req["axis"]] / o.n
-        unit = "Mpc" if o.box is not None else "cells"
-        self.position.setText("2D: the whole plane" if o.dim == 2 else f"{AXES[req['axis']]} = {pos:.2f} {unit}")
+        self.position.setText(self._position_text(req))
+
+    @staticmethod
+    def _position_text(req: dict, units=None) -> str:
+        """Where the slice of request 'req' lies, 'z = 32.50 Mpc': in Mpc (cells without a box), or with 'units'
+        ((axis, position) -> (value, unit name); figsave.position) in a saved figure's unit (2026-10-15)."""
+        o, axis = req["output"], req["axis"]
+        if o.dim == 2:
+            return "2D: the whole plane"
+        pos = o.lo[axis] + (req["index"] + 0.5) * o.length[axis] / o.n
+        v, unit = units(axis, pos) if units is not None else (pos, "Mpc" if o.box is not None else "cells")
+        return f"{AXES[axis]} = {v:.2f} {unit}"
 
     def _rendered(self, res: dict):
         self._busy = False
@@ -2661,22 +2769,32 @@ class ExploreControls(QWidget):
         self.view.canvas.dashed = self._void_circles("_r_eff")
         self.view.canvas.axes = self._canvas_axes()      # BEFORE the image: its first drawing has the margins
         self.view.canvas.set_rgb(res["rgb"])
-        label = G.FIELD_LABELS.get(req["field"], req["field"])
+        label = self._gradient_label(req)       # the velocity derivatives' family said (2026-10-15)
         comp = "" if req["component"] in ("value", "") else f" [{req['component']}]"
         o = req["output"]
+        # the title as a function of the positions' unit (2026-10-15: a figure saved in Mpc/h or cells said Mpc)
         if req.get("compare") is not None:
             mode = dict((m, t) for t, m in COMPARE_MODES)[req["compare_mode"]]
             self.view.colorbar.set(req["cmap"], res["vrange"], f"{mode}: {label}{comp}")
-            self.view.title.setText(f"<b>{mode}: {label}{comp}</b> — A = {o.title}, B = {req['compare'].title} — "
-                                    f"{self.position.text()}")
+            head = f"<b>{mode}: {label}{comp}</b> — A = {o.title}, B = {req['compare'].title} — "
+
+            def where(units=None):
+                return self._position_text(req, units)
         else:
             self.view.colorbar.set(req["cmap"], res["vrange"], ("log₁₀ " if req["log"] else "") + label + comp, req["log"])
-            where = self.position.text()
-            if req.get("pts") and self._pts_side is not None:
-                sd, fct = self._pts_side, res.get("pts_factor") or 1
-                where = (f"hi-res slice: {sd.get('axis')} = {float(sd.get('center', 0)):.2f} Mpc, {sd['nu']}×{sd['nv']} "
-                         f"points" + (f" (shown {fct}×{fct}-averaged)" if fct > 1 else "") + ", point evaluation")
-            self.view.title.setText(f"<b>{label}{comp}</b> — {o.title} — {where}")
+            head = f"<b>{label}{comp}</b> — {o.title} — "
+            sd, fct = self._pts_side, res.get("pts_factor") or 1
+
+            def where(units=None):
+                if not (req.get("pts") and sd is not None):
+                    return self._position_text(req, units)
+                c, unit = float(sd.get("center", 0)), "Mpc"            # the plane's own place, in Mpc
+                if units is not None and sd.get("axis") in AXES:
+                    c, unit = units(AXES.index(sd["axis"]), c)
+                return (f"hi-res slice: {sd.get('axis')} = {c:.2f} {unit}, {sd['nu']}×{sd['nv']} points"
+                        + (f" (shown {fct}×{fct}-averaged)" if fct > 1 else "") + ", point evaluation")
+        self._title_make = lambda units=None: head + where(units)
+        self.view.title.setText(self._title_make())
         self.changed.emit()
 
     def render_request(self, req):
@@ -2788,9 +2906,12 @@ class ExploreControls(QWidget):
         self.view.save_btn.setToolTip(f"Save the map ({d}; Save options… to change), or its values as .npy or .csv")
         self.grid_save_btn.setToolTip(f"Write the composed figure ({d}; Options… to change)")
 
-    def _map_title(self) -> str:
-        """The single map's own title, as the window shows it (the saved figure's title unless one was typed)."""
-        return self.view.title.text().replace("<b>", "").replace("</b>", "")
+    def _map_title(self, units=None) -> str:
+        """The single map's own title, as the window shows it (the saved figure's title unless one was typed); with
+        'units' ((axis, position) -> (value, unit name)) the same title with its slice position and zoom window in
+        that unit, a saved figure's axes' (2026-10-15)."""
+        html = self.view.title.text() if units is None or self._title_make is None else self._title_make(units)
+        return html.replace("<b>", "").replace("</b>", "")
 
     def save_context(self) -> dict:
         """What the Save options dialog needs to know of the picture on screen: the grid or a map, arrows and outlines
@@ -2891,14 +3012,15 @@ class ExploreControls(QWidget):
     def save_png(self, f, options: dict | None = None) -> list[str]:
         """The map as a file, as the Save options say ('options', else the ones chosen; until the dialog is used,
         the figure always written: a matplotlib PNG at 200 dpi with title, axes, colour bar, arrows and the void
-        outlines as on screen), in the format of the file's suffix (.png, .pdf, .svg, .tif). At full resolution:
-        the map's own pixels (_write_full_map). With outlines drawn, '<name>_voids.csv' beside it: the table of
-        those voids (2026-10-11). The paths."""
+        outlines as on screen), in the format of the file's suffix (.png, .pdf, .svg, .tif). At full resolution,
+        and with no margins and 'match the data' (figsave.writes_pixels, 2026-10-15): the map's own pixels
+        (_write_full_map). With outlines drawn, '<name>_voids.csv' beside it: the table of those voids (2026-10-11).
+        The paths."""
         opts = FS.options(self.save_options if options is None else options)
         fmt = FS.format_of(f, opts["format"])
         written = [str(f)]
         self._save_note = ""
-        if opts["kind"] == "full":
+        if FS.writes_pixels(opts):
             self._write_full_map(f, fmt, opts)
         else:
             import matplotlib
@@ -2908,7 +3030,7 @@ class ExploreControls(QWidget):
                 fig, dpi = self.map_figure(opts)
                 try:
                     FS.check_pixels(*fig.get_size_inches(), dpi)     # before Agg allocates it (2026-10-14, review)
-                    fig.savefig(f, **FS.save_kwargs(opts, dpi))
+                    fig.savefig(f, **FS.save_kwargs(opts, dpi, fmt))
                 finally:
                     plt.close(fig)
         if opts["voids"] and self.voids_shown():
@@ -2930,7 +3052,8 @@ class ExploreControls(QWidget):
         if req["log"]:
             data = np.log10(np.where(data > 0, data, np.nan))
         _, _, rest, glo, ghi, _, _ = self._geometry()    # a hi-res slice's axes are its file's, not the menu's
-        um, self._save_note = FS.unit_map(o, rest, opts["unit"], G.hubble(o) if opts["unit"] == "mpc_h" else None)
+        h = G.hubble(o) if opts["unit"] == "mpc_h" else None
+        um, self._save_note = FS.unit_map(o, rest, opts["unit"], h)
         ext = um.ext([glo[0], ghi[0], glo[1], ghi[1]])
         s = float(opts["font_scale"])
         bare = opts["margins"] == "none"
@@ -2949,10 +3072,15 @@ class ExploreControls(QWidget):
         if not bare:
             FS.style_axes(ax, opts, (AXES[rest[0]], AXES[rest[1]]), um.name)
             if opts["title"]:
-                t = ax.set_title(FS.title_text(opts, self._map_title()), fontsize=8 * s)
-                if opts["width"] > 0 or s != 1.0:
+                # the slice position (and a zoom's window) in the axes' unit (2026-10-15); in Mpc the screen's title
+                auto = self._map_title()
+                shown = auto if opts["unit"] == "mpc" else \
+                    self._map_title(lambda a, v: FS.position(o, a, v, opts["unit"], h))
+                t = ax.set_title(FS.title_text(opts, auto, shown), fontsize=8 * s)
+                if opts["width"] > 0 or s != 1.0 or opts["match_data"]:
                     # a long title wraps rather than widening a figure of a set width or, in larger fonts (Slide),
-                    # running over the colour bar's top tick label (2026-10-14, review)
+                    # running over the colour bar's top tick label (2026-10-14, review); the figure 'match the data'
+                    # shrinks for a small map too (2026-10-15)
                     t.set_wrap(True)
             if opts["colorbar"]:
                 if opts["colorbar_label"]:
@@ -3437,16 +3565,21 @@ class ExploreControls(QWidget):
             return None
         cur = self.current
         rows, cols = self.grid_dims()
+        axis, index = self.axis.currentIndex(), self.index.value()
         return {"panels": [None if p is None else {"output": p[0], "field": p[1], "component": p[2],
                                                     "cmap": self._grid_cmap(p[1]), "log": self._grid_log(p[1]),
                                                     "voids": self._panel_voids(p[0])}
                            for p in panels],
-                "rows": rows, "cols": cols, "axis": self.axis.currentIndex(),
-                "rel": 0.5 if cur.n <= 1 or cur.dim == 2 else self.index.value() / (cur.n - 1),
-                "index": self.index.value(), "clip": self.clip.value(), "smooth": self.smooth.value(),
+                "rows": rows, "cols": cols, "axis": axis,
+                "ps_gradient": self.ps_gradient.currentData() or G.PS_GRADIENT_DEFAULT,     # (2026-10-15)
+                "rel": 0.5 if cur.n <= 1 or cur.dim == 2 else index / (cur.n - 1),
+                "index": index, "clip": self.clip.value(), "smooth": self.smooth.value(),
                 "shared": self.grid_shared.isChecked(),
                 "merged": self.grid_merge.isChecked() and self._grid_merge_applicable(),
-                "position": self.position.text() if cur.dim == 3 else ""}
+                "position": self.position.text() if cur.dim == 3 else "",
+                # the same place as a number (Mpc, cells without a box): a saved title's in its unit (2026-10-15)
+                "position_at": (axis, float(cur.lo[axis] + (index + 0.5) * cur.length[axis] / cur.n))
+                if cur.dim == 3 else None}
 
     def _panel_voids(self, o) -> dict | None:
         """A grid panel's outlines: its output's own catalogue (shown rows: centres, R_v, R_eff when ticked) when
@@ -3537,6 +3670,7 @@ class ExploreControls(QWidget):
         self._grid_index = req["index"]
         n, rows, cols = res["shown"], req["rows"], req["cols"]
         pos = req["position"]
+        self._title_make = None                     # the map's title function: not this title's
         self.view.title.setText(f"<b>Figure grid</b> {rows} × {cols} — {n} panel{'s' if n != 1 else ''}"
                                 + (f" — {pos}" if pos else ""))
         self.grid_state.setText(f"{n} panel{'s' if n != 1 else ''}" + (f" at {pos}" if pos else "")
@@ -3581,25 +3715,29 @@ class ExploreControls(QWidget):
 
     def save_grid(self, path, options: dict | None = None) -> str:
         """Write the figure of the current panels as the Save options say ('options', else the ones chosen): PNG,
-        PDF, SVG or TIFF by the file's suffix, the decorated figure or the panels at full resolution; the path
-        written."""
+        PDF, SVG or TIFF by the file's suffix, the decorated figure or the panels at full resolution (no margins with
+        'match the data' too: the panels' own pixels, touching as in that figure; 2026-10-15); the path written. The
+        status line says when the axes are not in the unit asked for (grid_unit)."""
         opts = FS.options(self.save_options if options is None else options)
         fmt = FS.format_of(path, opts["format"])
         req = self.grid_request()
         if req is None:
             raise ValueError("no panel has an output (use a Fill button, or choose outputs in the table)")
         items = grid_items(req)
-        if opts["kind"] == "full":
-            rgb, overlay = grid_full_pixels(req, items, opts)
+        note = ""
+        if FS.writes_pixels(opts):
+            # the borderless figure's panels touch: its full-resolution twin has no gaps (merged tiles)
+            rgb, overlay = grid_full_pixels(req if opts["kind"] == "full" else dict(req, merged=True), items, opts)
             FS.write_pixels(path, rgb, fmt, overlay)
         else:
             import matplotlib
+            _unit, note = grid_unit(items, opts["unit"])
             with matplotlib.rc_context(FS.rc(opts, fmt)):    # the font size and the text kept as text
                 fig, _n = grid_figure(req, items, opts=opts)
                 dpi = grid_dpi(fig, req, items, opts)
                 FS.check_pixels(*fig.get_size_inches(), dpi)     # before Agg allocates it (2026-10-14, review)
-                fig.savefig(str(path), **FS.save_kwargs(opts, dpi))
-        self.status.emit(f"saved {path}")
+                fig.savefig(str(path), **FS.save_kwargs(opts, dpi, fmt))
+        self.status.emit(f"saved {path}" + (f"; {note}" if note else ""))
         return str(path)
 
     def _save_grid_dialog(self):
@@ -4357,14 +4495,30 @@ class ExploreControls(QWidget):
         self._compare_sync()
         if self.compare.currentData() is not None:
             note += " · the comparison applies to the slice map: the zoom shows A"
-        label = G.FIELD_LABELS.get(req["field"], req["field"])
+        # a zoom is a point evaluation (or an exact run on the region): a phase-space output's velocity derivatives are
+        # there the stream average, whatever the choice; standard DTFE's the containing tetrahedron's (2026-10-15)
+        o = req["output"]
+        ps = G.estimator_label(o) == "PS-DTFE"
+        fam = "" if req["field"] not in G.GRADIENT_FIELDS else "stream" if ps else "mean"
+        label = G.field_label(o, req["field"], fam)
+        self.ps_gradient_note.setText("")
+        self._out_form_map.setRowVisible(self.ps_gradient_note, False)
+        if fam == "stream" and req.get("ps_gradient") == "mean-field":
+            note += " · its velocity derivatives are the stream average (a point evaluation has no mean field)"
         comp = "" if req["component"] in ("value", "") else f" [{req['component']}]"
         self.view.colorbar.set(req["cmap"], vrange, ("log₁₀ " if req["log"] else "") + label + comp, req["log"])
-        o, rest = req["output"], z["rest"]
-        unit = "Mpc" if o.box is not None else "cells"
-        where = (f"{AXES[rest[0]]} {z['a0'][0]:.2f}–{z['a0'][1]:.2f}, {AXES[rest[1]]} {z['a1'][0]:.2f}–{z['a1'][1]:.2f} {unit}")
+        rest = z["rest"]
         kind = "exact zoom" if z.get("exact") else "zoom"
-        self.view.title.setText(f"<b>{label}{comp}</b> — {o.title} — {kind} {z['res']}² on {where} — {self.position.text()}")
+
+        def where(units=None):                  # the window and the slice, in Mpc or a saved figure's unit (2026-10-15)
+            (u0, u1), (v0, v1), unit = z["a0"], z["a1"], "Mpc" if o.box is not None else "cells"
+            if units is not None:
+                (u0, unit), (u1, _u), (v0, _v), (v1, _w) = (units(rest[0], u0), units(rest[0], u1),
+                                                            units(rest[1], v0), units(rest[1], v1))
+            return (f"{AXES[rest[0]]} {u0:.2f}–{u1:.2f}, {AXES[rest[1]]} {v0:.2f}–{v1:.2f} {unit} — "
+                    + self._position_text(req, units))
+        self._title_make = lambda units=None: f"<b>{label}{comp}</b> — {o.title} — {kind} {z['res']}² on {where(units)}"
+        self.view.title.setText(self._title_make())
         how = "cells (exact deposit, one slice cell thick)" if z.get("exact") else "points"
         took = ""
         if z.get("memo"):
@@ -4376,7 +4530,7 @@ class ExploreControls(QWidget):
                 took += (f" ({sm['partitions']} of {sm['total']} partitions"
                          + (f", {sm['loaded']} loaded from disk in {sm['load_s']:.1f} s" if sm["loaded"] else ", all in memory")
                          + ")")
-        self.zoom_state.setText(f"{kind} level {z['depth']}: {z['res']} × {z['res']} {how} on {where}{took}; "
+        self.zoom_state.setText(f"{kind} level {z['depth']}: {z['res']} × {z['res']} {how} on {where()}{took}; "
                                 f"drag again to go deeper" + note)
         self.zoom_out_btn.setEnabled(True)
         self.zoom_back_btn.setEnabled(True)

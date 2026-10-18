@@ -23,6 +23,11 @@
 #     '--ps-lag-padding 0' writes), and '--ps-lag-padding 0' -- the way back -- hits them.
 #  F) A partitioned cache hit also reproduces the uncached run bit-for-bit.
 #  G) The standard binary caches its thread sub-domains too.
+#  G2) (2026-10-15) ... and a PARTITIONED standard run every partition's: one file per thread sub-box of each
+#     partition, whose descriptor names its partition's region (its 'box=' line: DTFE_parallel makes the partition's
+#     region the sub-domain's full box), a warm run that loads them all (the folder left untouched) and outputs
+#     byte-identical to the uncached run; under '--sample-points' one file per partition (keyed by the partition's own
+#     'region='), byte-identical too.
 #  H) New files carry the CHUNKED body; single-stream files still load; the converter rewrites them.
 #  I) The block-wise triangulation reader builds exactly CGAL's triangulation (structure hashes),
 #     and the block-wise writer writes exactly CGAL's bytes.
@@ -221,6 +226,55 @@ if [ -x "${DTFE_BIN}" ]; then
         check 0 "standard '.den' is bit-identical across the cache"
     fi
     rm -rf "${SCACHE}"
+else
+    echo "   SKIP  (${DTFE_BIN} not built)"
+fi
+
+echo ""
+echo "(G2) a PARTITIONED standard run caches every partition's sub-domains (2026-10-15)"
+# A standard partition is split into thread sub-boxes, each its own tessellation (DTFE_parallel), so a 2x2x2 split at
+# 2 threads writes 16 files; a sub-box's particles are selected from its partition's padded copy, so its descriptor
+# names the partition's region too (as its 'box=': 8 distinct ones over the 16 files). Under '--sample-points' a
+# partition is ONE tessellation: one file each, keyed by the partition's own region as before (the composite '--serve'
+# of the same split shares them).
+PSCACHE="${CACHE}-stdpart"; rm -rf "${PSCACHE}"; mkdir -p "${PSCACHE}"
+if [ -x "${DTFE_BIN}" ]; then
+    SP=(--grid "${GRID}" --periodic --MpcUnit 1 --padding 5 --field density density_a velocity_a --seed 5 --partition 2 2 2
+        --max-concurrent 2)
+    srun() { env OMP_NUM_THREADS=2 "${DTFE_BIN}" "${SNAP}" "$@" >/dev/null 2>&1 || true; }
+    sameout() {  # every output of $1 byte-identical in $2 (the padding test's per-thread files are not outputs)
+        local n=0 f
+        for f in "$1".*; do
+            case "$f" in *badGridPoints*|*.runlog*) continue ;; esac
+            cmp -s "$f" "$2${f#"$1"}" || return 1
+            n=$((n+1))
+        done
+        [ "$n" -gt 0 ]
+    }
+    srun "${TMP}/ptc_sp_ref" "${SP[@]}"
+    srun "${TMP}/ptc_sp_cold" "${SP[@]}" --tessellation-cache "${PSCACHE}"
+    n_cold=$(ls -1 "${PSCACHE}"/*.tess 2>/dev/null | wc -l | tr -d ' ')
+    n_named=$(for f in "${PSCACHE}"/*.tess; do grep -a -m1 '^box=' "$f"; done 2>/dev/null | sort -u | wc -l | tr -d ' ')
+    check "$([ "${n_cold}" = "16" ] && [ "${n_named}" = "8" ] && echo 1 || echo 0)" \
+          "G2 2x2x2 partitions x 2 threads: 16 sub-domain files (${n_cold}), naming the 8 partitions' regions (${n_named})"
+    before="$(ls -li "${PSCACHE}")"
+    srun "${TMP}/ptc_sp_warm" "${SP[@]}" --tessellation-cache "${PSCACHE}"
+    check "$([ "${before}" = "$(ls -li "${PSCACHE}")" ] && echo 1 || echo 0)" "G2 the warm run loaded every sub-domain (no file rewritten)"
+    check "$(sameout "${TMP}/ptc_sp_ref" "${TMP}/ptc_sp_cold" && sameout "${TMP}/ptc_sp_ref" "${TMP}/ptc_sp_warm" && echo 1 || echo 0)" \
+          "G2 the cold and the warm cached run: every output byte-identical to the uncached run"
+    rm -rf "${PSCACHE}"; mkdir -p "${PSCACHE}"
+    SPP=("${SP[@]}" --sample-points "${POINTS}")
+    srun "${TMP}/ptc_spp_ref" "${SPP[@]}"
+    srun "${TMP}/ptc_spp_cold" "${SPP[@]}" --tessellation-cache "${PSCACHE}"
+    n_cold=$(ls -1 "${PSCACHE}"/*.tess 2>/dev/null | wc -l | tr -d ' ')
+    n_named=$(for f in "${PSCACHE}"/*.tess; do grep -a -m1 '^region=' "$f"; done 2>/dev/null | sort -u | wc -l | tr -d ' ')
+    before="$(ls -li "${PSCACHE}")"
+    srun "${TMP}/ptc_spp_warm" "${SPP[@]}" --tessellation-cache "${PSCACHE}"
+    check "$([ "${n_cold}" = "8" ] && [ "${n_named}" = "8" ] && [ "${before}" = "$(ls -li "${PSCACHE}")" ] && echo 1 || echo 0)" \
+          "G2 --sample-points: one file per partition (${n_cold} of 8, keyed by its own region), all loaded by the warm run"
+    check "$(sameout "${TMP}/ptc_spp_ref" "${TMP}/ptc_spp_warm" && [ -s "${TMP}/ptc_spp_warm.pts_den" ] && echo 1 || echo 0)" \
+          "G2 --sample-points: the warm cached run's outputs (.pts_* and grids) byte-identical to the uncached run"
+    rm -rf "${PSCACHE}" "${TMP}"/ptc_sp_* "${TMP}"/ptc_spp_*
 else
     echo "   SKIP  (${DTFE_BIN} not built)"
 fi

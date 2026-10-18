@@ -107,6 +107,7 @@ OPTION_TEXT = {
     "per_stream_ids":  ("... with each stream's tetrahedron particle IDs", "--per-stream-ids"),
     "slice_vel_grad":  ("Velocity gradient at each slice point (divergence, shear, vorticity maps)",
                         "--pts-vel-grad"),
+    "pts_conventions": ("Plane conventions", "--pts-conventions"),     # (2026-10-15) the image plane's estimators
     "exact":           ("Exact: analytic tetrahedron-cell clipping (noise-free; best on the GPU)", "--ps-exact-deposit"),
     "parallel_triangulation": ("Parallel triangulation (faster; repeats differ at float rounding)",
                                "--parallel-triangulation"),

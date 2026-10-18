@@ -28,6 +28,12 @@
 #  G) on a simulated small machine the tuner picks a split its counted model says fits (over_budget=0) and names the
 #     busiest partition's vertex count in its AUTO-TUNE line.
 #  H) the 2D build (DTFE-2d, when built): a valid report from the counted model, counts within 15% of the run's.
+#  I) (2026-10-15) the terms the plan lacked, each a field of the report line: I1 a '--sample-points' plane's records
+#     (pts_gb: 326 B per point with --pts-vel-grad, one record per point, in fixed_gb too; DTFE_AUTO_PTS_N sizes a plane
+#     that is not on disk); on GPU builds I2 the GPU deposit's host snapshot of its grids (snapshot_gb: 8-B words, half
+#     under DTFE_METAL_FLOAT_GRIDS=1, none on the CPU), I3 the partition loop's look-ahead (lookahead_gb, in
+#     predicted_gb; none with --no-overlap or on one domain) and I4 a budget that holds the plan but not its
+#     look-ahead: the look-ahead is switched off for the run (said, lookahead_gb=0, over_budget=0).
 #
 # Usage: tests/dtfe_auto_tune_check.sh [--no-build]     (DTFE_TEST_TMP, DTFE_TEST_PRECISION=double as the others)
 
@@ -216,6 +222,50 @@ PYEOF
 else
     echo "   SKIP  H (${BIN2D} is not built)"
 fi
+
+# ---------- (I) the plane records, the GPU snapshot and the look-ahead in the report ----------
+echo ">> I: the plane records, the GPU snapshot and the look-ahead in the report line"
+field() { sed -n "s/^AUTO-TUNE-REPORT .* $1=\([0-9.]*\) .*/\1/p; s/^AUTO-TUNE-REPORT .* $1=\([0-9.]*\)$/\1/p" "$2" | head -1; }
+"${PY}" - "${TMP}/da_i_plane.bin" "${BOX}" <<'PYEOF'
+import sys, numpy as np
+c = (np.arange(16) + 0.5) * float(sys.argv[2]) / 16
+X, Y = np.meshgrid(c, c, indexing="ij")
+np.stack([X.ravel(), Y.ravel(), np.full(X.size, 0.5 * float(sys.argv[2]))], 1).astype(np.float64).tofile(sys.argv[1])
+PYEOF
+IR=("${SNAP}" "${TMP}/da_i" --grid 192 "${COMMON[@]}" --field density_a velocity_a gradient_a --partition 2 2 2
+    --auto-tune-report)
+env DTFE_RAM_GB=64 "${BIN}" "${IR[@]}" --max-concurrent 1 > "${TMP}/da_i0.txt" 2>&1 || true
+env DTFE_RAM_GB=64 DTFE_AUTO_PTS_N=4194304 DTFE_AUTO_PTS_VELGRAD=1 "${BIN}" "${IR[@]}" --max-concurrent 1 \
+    --sample-points "${TMP}/da_i_plane.bin" > "${TMP}/da_i1.txt" 2>&1 || true
+p1="$(field pts_gb "${TMP}/da_i1.txt")"; f0="$(field fixed_gb "${TMP}/da_i0.txt")"; f1="$(field fixed_gb "${TMP}/da_i1.txt")"
+ok="$(awk -v p="${p1:-0}" -v a="${f0:-0}" -v b="${f1:-0}" 'BEGIN{print (p > 1.362 && p < 1.372 && b - a > p - 0.02 && b - a < p + 0.02) ? 1 : 0}')"
+grep -q 'streams_budget=1.000 ' "${TMP}/da_i1.txt" || ok=0
+check "I1 a 2048^2 plane with --pts-vel-grad: pts_gb ${p1:-?} (4194304 x 326 B = 1.367), in fixed_gb (${f0:-?} -> ${f1:-?}), one record per point" "${ok}"
+s0="$(field snapshot_gb "${TMP}/da_i0.txt")"; l0="$(field lookahead_gb "${TMP}/da_i0.txt")"
+check "I2/I3 a CPU run counts no GPU snapshot and no look-ahead (${s0:-?}, ${l0:-?})" \
+      "$([ "${s0}" = "0.000" ] && [ "${l0}" = "0.000" ] && echo 1 || echo 0)"
+if [ "${GPU}" = 1 ]; then
+    env DTFE_RAM_GB=64 "${BIN}" "${IR[@]}" --max-concurrent 2 --gpu > "${TMP}/da_i2.txt" 2>&1 || true
+    env DTFE_RAM_GB=64 DTFE_METAL_FLOAT_GRIDS=1 DTFE_GPU_FLOAT_GRIDS=1 "${BIN}" "${IR[@]}" --max-concurrent 2 --gpu \
+        > "${TMP}/da_i3.txt" 2>&1 || true
+    env DTFE_RAM_GB=64 "${BIN}" "${IR[@]}" --max-concurrent 2 --gpu --no-overlap > "${TMP}/da_i4.txt" 2>&1 || true
+    s2="$(field snapshot_gb "${TMP}/da_i2.txt")"; s3="$(field snapshot_gb "${TMP}/da_i3.txt")"
+    check "I2 --gpu: the snapshot of the largest thread sub-grid (${s2:-?} GB), half under the float grids (${s3:-?} GB)" \
+          "$(awk -v a="${s2:-0}" -v b="${s3:-0}" 'BEGIN{print (a > 0.02 && b > 0. && a / b > 1.95 && a / b < 2.05) ? 1 : 0}')"
+    l2="$(field lookahead_gb "${TMP}/da_i2.txt")"; l4="$(field lookahead_gb "${TMP}/da_i4.txt")"
+    q2="$(field predicted_gb "${TMP}/da_i2.txt")"; q4="$(field predicted_gb "${TMP}/da_i4.txt")"
+    check "I3 --gpu over 8 partitions: the look-ahead (${l2:-?} GB) is in predicted_gb (${q4:-?} -> ${q2:-?}); none with --no-overlap (${l4:-?})" \
+          "$(awk -v l="${l2:-0}" -v m="${l4:-1}" -v a="${q4:-0}" -v b="${q2:-0}" 'BEGIN{d = b - a - l; print (l > 0.01 && m == 0 && d > -0.011 && d < 0.011) ? 1 : 0}')"
+    # a budget between the plan without the look-ahead and the plan with it (the budget is 60% of DTFE_RAM_GB)
+    ram="$(awk -v a="${q4:-0}" -v l="${l2:-0}" 'BEGIN{printf "%.4f", (a + l / 2.) / 0.6}')"
+    env DTFE_RAM_GB="${ram}" "${BIN}" "${IR[@]}" --max-concurrent 2 --gpu > "${TMP}/da_i5.txt" 2>&1 || true
+    check "I4 a budget that holds the plan (${q4:-?} GB) but not its look-ahead: switched off, said, over_budget=0" \
+          "$(grep -q 'look-ahead off for this run' "${TMP}/da_i5.txt" && grep -Eq 'lookahead_gb=0.000 over_budget=0$' "${TMP}/da_i5.txt" \
+             && echo 1 || echo 0)"
+else
+    echo "   SKIP  I2-I4 (this build has no GPU backend)"
+fi
+rm -f "${TMP}"/da_i.* "${TMP}"/da_i*badGridPoints*
 
 echo "------------------------------------------------------------"
 if [ "${FAILS}" -gt 0 ]; then

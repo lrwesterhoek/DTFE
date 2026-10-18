@@ -26,7 +26,8 @@
 #   C13 a checkpoint of another binary ('binary=' key line: the revision AND link time) is refused, naming PS_RESUME=0
 #   C14 a commit whose renames failed (exit 3, the outputs left as '.part.<pid>') keeps the checkpoint
 #   C8  GPU builds only: a killed '--ps-gpu' run resumes to the exactly summed grids of an uninterrupted one
-#       (byte-identical .den/.a_den/.streams), the float-atomic velocity within 1e-5 of its peak; SKIP otherwise
+#       byte for byte in EVERY grid, the velocity and dispersion included (exact fixed-point sums since 2026-10-14;
+#       the velocity was a float-atomic sum checked to 1e-5 of its peak until 2026-10-15); SKIP otherwise
 # Usage: tests/ps_resume_check.sh [--no-build]   (--no-build is accepted and ignored: the binaries are used as built)
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -238,19 +239,13 @@ else
         && ! grep -q "ran on the CPU instead" "$TMP/gref.log" "$TMP/g1.log" "$TMP/g2.log"
     check "C8 killed after 12 GPU partitions, resumed the other 52 (no CPU fallback)" $?
     ok=0
-    for e in den a_den streams a_streams hidden_streams a_hidden_streams; do
+    # every grid, the velocity included: since 2026-10-14 every PS grid of a GPU deposit is an exact fixed-point sum
+    # (the moments too, ps_deposit_params.h PSFxGrid) and the partitions merge in index order, so the resumed run
+    # is byte-identical in all of them (the velocity used to be a float-atomic sum, checked to 1e-5 of its peak)
+    for e in den a_den streams a_streams hidden_streams a_hidden_streams vel a_vel a_velDisp; do
         cmp -s "$TMP/gref.$e" "$TMP/g.$e" || { echo "    differs: .$e"; ok=1; }
     done
-    check "C8 the exactly summed grids byte-identical to the uninterrupted GPU run" $ok
-    "$PY" - "$TMP/gref.a_vel" "$TMP/g.a_vel" <<'PYEOF'
-import numpy as np, os, sys
-REAL = np.dtype(os.environ.get("DTFE_TEST_REAL", "float32"))
-a, b = (np.fromfile(p, dtype=REAL).astype(np.float64) for p in sys.argv[1:3])
-peak = float(np.abs(a - b).max() / max(np.abs(a).max(), 1e-300)) if a.size == b.size and a.size else 1.
-print(f"    .a_vel peak-relative difference {peak:.1e}")
-sys.exit(0 if peak < 1e-5 else 1)
-PYEOF
-    check "C8 velocity within 1e-5 of its peak (float atomics)" $?
+    check "C8 every grid (velocity and dispersion included: exact fixed-point sums) byte-identical to the uninterrupted GPU run" $ok
 fi
 
 echo "RESULT: $PASS passed, $FAILS failed"

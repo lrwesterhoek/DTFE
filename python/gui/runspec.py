@@ -119,7 +119,8 @@ class RunSpec:
     grid: int = 512
     nsub: int = 3
     fields: list[str] = field(default_factory=lambda: list(PS_DEFAULT_FIELDS))
-    gpu: bool = True
+    gpu: bool | None = None          # None (not given) = the build's: on when the pair was built with a GPU backend,
+                                     # gpu_build_default() (2026-10-15: it was always on, a CPU-only build too)
     vertex_mass: bool = True         # --ps-vertex-mass (script default on; needed for TNG IC inputs)
     volume_weighted: bool = True     # --ps-volume-weighted (the production convention)
     caustics: bool = True            # --ps-caustics: on since 2026-10-13, as run_ps_dtfe.sh's default and every
@@ -129,6 +130,9 @@ class RunSpec:
     precision: str = "single"        # "single" (./PS-DTFE, ./DTFE) | "double" (the -double pair: float64 end to end, ~2x memory)
     slice_plane: str = ""            # a --sample-points file (hi-res slice); "" = none
     slice_vel_grad: bool = True
+    pts_conventions: str = "grid"    # PTS_CONVENTIONS (PS-DTFE with a slice, 2026-10-15): the plane's estimators, the
+                                     # grids' ('grid', the binary's default since 2026-10-13) or the ones before then
+                                     # ('legacy': reproduces a plane made before; PTS_CONVENTIONS_TEXT)
     partition: int = 0               # 0 = auto-tuned
     max_concurrent: int = 0          # 0 = auto-tuned (NOT the binary's "0 = all cores")
     scratch_dir: str = ""
@@ -139,8 +143,9 @@ class RunSpec:
     linear_deposit: bool = False     # PS_LINEAR_DEPOSIT: --ps-linear-deposit (density-weighted inside each tet)
     ordered_merge: bool = True       # ORDERED_MERGE: --ordered-merge (partitions merged in index order: bit-identical
                                      # repeats). ON by default since 2026-10-14, as in run_ps_dtfe.sh and the binary
-                                     # (the staged merge: a partition finished early waits in memory, its thread goes
-                                     # on); off = ORDERED_MERGE=0, --completion-order-merge (the old default)
+                                     # (the staged merge: a partition finished early waits in memory, or since
+                                     # 2026-10-15 spilled to disk when memory is short, and its thread goes on);
+                                     # off = ORDERED_MERGE=0, --completion-order-merge (the old default)
     start_over: bool = False         # PS_RESUME=0: a killed run's checkpoint is NOT resumed, the run starts from the
                                      # beginning and replaces it (2026-10-11: the launcher had no way to, and a
                                      # refused resume -- other settings, an incomplete checkpoint -- failed every time;
@@ -149,6 +154,8 @@ class RunSpec:
     def __post_init__(self):
         if not self.deposit:            # 2026-10-13: a standard-DTFE job starts at the exact cell average
             self.deposit = production_deposit(self.estimator)
+        if self.gpu is None:            # 2026-10-15: a fresh job's GPU tick is the build's (a saved one is kept)
+            self.gpu = gpu_build_default(self.estimator, self.precision)
 
     # ------------------------------------------------------------------ data
     def sim_path(self) -> Path:
@@ -185,6 +192,7 @@ class RunSpec:
             out += _ps_option_problems(self, dm_particles(self.sim))
             if self.slice_plane and not Path(self.slice_plane).is_file():
                 out.append(("error", f"slice file not found: {self.slice_plane}"))
+            out += _pts_conventions_problems(self, bool(self.slice_plane))
             if self.output_prefix.strip() == "" or re.search(r"[\s/]", self.output_prefix):
                 out.append(("error", "output prefix must be a single word (no spaces or '/')"))
         else:
@@ -270,6 +278,7 @@ class RunSpec:
         if self.slice_plane:
             env["SAMPLE_POINTS"] = str(self.slice_plane)
             env["PTS_VEL_GRAD"] = "1" if self.slice_vel_grad else "0"
+            env["PTS_CONVENTIONS"] = self.pts_conventions     # spelled out: a stray export cannot leak in (2026-10-15)
         return argv + snaps, env
 
     def shell_line(self) -> str:
@@ -277,7 +286,7 @@ class RunSpec:
         return shell(*self.command())
 
     def memory_key(self) -> str:
-        return _memory_key(self, ("snapshots", "lambda_th", "tess_cache", "start_over"))
+        return _memory_key(self, ("snapshots", "lambda_th", "tess_cache", "start_over", "pts_conventions"))
 
     def check_step(self) -> "Step":
         """The same run_ps_dtfe.sh / run_dtfe.sh call in report mode: the binary's own memory prediction per
@@ -519,6 +528,33 @@ PIPELINE_ONLY_KEYS = ("SIMS", "SNAPS", "NU", "AXIS", "CENTER", "PLANES", "THICKN
                       "GRID_SIZE", "PS_GPU", "FORCE", "DRY_RUN", "PY")
 
 
+# The phase-space image plane's conventions (PS-DTFE --pts-conventions; run_ps_dtfe.sh / run_ps_pipeline.sh
+# PTS_CONVENTIONS; 2026-10-15): 'grid', the binary's default since 2026-10-13, puts the grids' vertex masses and volume
+# weighting at the points too; 'legacy' keeps the estimators before that date and so reproduces a plane made before
+# it -- the planes the Runs tab marks with a warning (results.KNOWN_FIXES 'pts-grid-conventions'), whose density
+# reaches about 0.82 of the grid's contrast at z = 20. The launcher's choice, its menu texts.
+PTS_CONVENTIONS = ("grid", "legacy")
+PTS_CONVENTIONS_TEXT = {"grid": "the grids' conventions (the default)",
+                        "legacy": "legacy: as before 13 October 2026 (reproduces an older plane)"}
+
+
+def _pts_conventions_problems(spec, points: bool) -> list[tuple[str, str]]:
+    """The plane conventions' checks (Grids, Pipeline and Custom jobs with points, PS-DTFE): an unknown value is an
+    error; 'legacy' is said, it is the old estimators on purpose (and changes nothing without the vertex masses and
+    the volume weighting)."""
+    conv = getattr(spec, "pts_conventions", "grid")
+    if conv not in PTS_CONVENTIONS:
+        return [("error", f"unknown plane conventions '{conv}' (grid or legacy)")]
+    if conv != "legacy" or not points:
+        return []
+    if not (getattr(spec, "vertex_mass", False) or getattr(spec, "volume_weighted", False)):
+        return [("info", "legacy plane conventions: without the vertex masses and the volume weighting they are the "
+                         "grids' conventions anyway")]
+    return [("info", "legacy plane conventions: the image plane keeps the estimators before 13 October 2026, as a "
+                     "plane made then (about 0.82 of the grid's density contrast at z = 20, density-weighted stream "
+                     "means); compare it with the grids knowing that")]
+
+
 def _ps_option_problems(spec, n_particles) -> list[tuple[str, str]]:
     """The phase-space run options' checks, shared by the Grids and Pipeline jobs (duck-typed on the
     option names both carry: fields, deposit, nsub, gpu, caustics, caustic_cusps, parallel_triangulation,
@@ -592,7 +628,7 @@ class PipelineSpec:
     fields: list[str] = field(default_factory=lambda: list(PS_DEFAULT_FIELDS))
     deposit: str = "sampled"        # "sampled" (nsub^3 samples per cell) | "exact" (r3d clipping): PS_EXACT
     nsub: int = 3                   # AVG_SUBSAMPLES
-    gpu: bool = True                # PS_GPU: the script's -m
+    gpu: bool | None = None         # PS_GPU: the script's -m; None = the build's (gpu_build_default, 2026-10-15)
     vertex_mass: bool = True        # PS_VERTEX_MASS (needed for TNG IC inputs)
     volume_weighted: bool = True    # PS_VOLUME_WEIGHTED (the production convention)
     caustics: bool = True           # PS_CAUSTICS (on since 2026-10-13: run_ps_dtfe.sh's default, the production runs')
@@ -604,6 +640,7 @@ class PipelineSpec:
     linear_deposit: bool = False    # PS_LINEAR_DEPOSIT, see RunSpec
     ordered_merge: bool = True      # ORDERED_MERGE (run_ps_pipeline.sh's run_ps_dtfe.sh inherits it), see RunSpec
     start_over: bool = False        # PS_RESUME=0 (inherited the same way), see RunSpec
+    pts_conventions: str = "grid"   # PTS_CONVENTIONS: the image plane's estimators, see RunSpec (2026-10-15)
     output_prefix: str = "ps_output"
     precision: str = "single"       # "double" = the PS-DTFE-double binary (DTFE_PRECISION), see RunSpec
     partition: int = 0
@@ -624,6 +661,10 @@ class PipelineSpec:
     adaptive: bool = False
     plan: dict = field(default_factory=dict)
     plan_key: str = ""              # memory_key() the plan was checked for (settings changed -> stale)
+
+    def __post_init__(self):
+        if self.gpu is None:            # 2026-10-15: a fresh pipeline's GPU tick is the PS build's (a saved one is kept)
+            self.gpu = gpu_build_default("ps", self.precision)
 
     def plane_json(self, sim: str, nu: int | None = None) -> Path:
         return sim_dir(sim, self.data_root) / f"hires_plane_{self.axis}{nu or self.nu}.json"
@@ -676,7 +717,7 @@ class PipelineSpec:
     # ------------------------------------------------------------------ memory check
     def memory_key(self) -> str:
         return _memory_key(self, ("sims", "nu", "force", "plan_only", "adaptive", "plan", "plan_key",
-                                  "figures_root", "center", "thickness", "lambda_th", "start_over")
+                                  "figures_root", "center", "thickness", "lambda_th", "start_over", "pts_conventions")
                            + PIPELINE_RENDER_KEYS)
 
     def check_step(self, sim: str, snaps: list[int], nu: int) -> Step:
@@ -765,6 +806,7 @@ class PipelineSpec:
             out.append(("warning", f"GPU requested, but the binary was built without GPU support ({GPU_BUILD_HINT}): "
                                    "the deposit will run on the CPU"))
         out += _ps_option_problems(self, max((dm_particles(s) or 0 for s in self.sims), default=0) or None)
+        out += _pts_conventions_problems(self, True)
         if self.output_prefix.strip() == "" or re.search(r"[\s/]", self.output_prefix):
             out.append(("error", "output prefix must be a single word (no spaces or '/')"))
         if self.render:
@@ -816,7 +858,8 @@ class PipelineSpec:
                "PS_PARALLEL_TRI": "1" if self.parallel_triangulation else "0",
                "PS_LINEAR_DEPOSIT": "1" if self.linear_deposit else "0",
                "ORDERED_MERGE": "1" if self.ordered_merge else "0",
-               "PS_RESUME": "0" if self.start_over else "1"}
+               "PS_RESUME": "0" if self.start_over else "1",
+               "PTS_CONVENTIONS": self.pts_conventions}
         if self.planes > 1:
             env["THICKNESS"] = _num(self.thickness)
         try:
@@ -1950,6 +1993,8 @@ class CustomSpec:
     ordered_merge: bool = True      # --ordered-merge (PS only; off: --completion-order-merge), see RunSpec
     sample_points: str = ""         # --sample-points <file>: the fields at these points too ('.pts_*'); "" = none
     pts_vel_grad: bool = True       # ... with the velocity gradient at each point (--pts-vel-grad)
+    pts_conventions: str = "grid"   # ... PS-DTFE: their estimators, '--pts-conventions legacy' when not the grids'
+                                    # (the binary's default), see RunSpec (2026-10-15)
     window: list[float] = field(default_factory=list)   # --ps-window x0 x1 y0 y1 [z0 z1] in Mpc: only these cells
     halo_release: float = 0.0       # --ps-halo-release D: tetrahedra denser than D x rho_bar deposited at their centroid
     stream_density: str = "dtfe"    # --ps-stream-density for the sample points: 'dtfe' (interpolated) | 'geometric'
@@ -2053,10 +2098,13 @@ class CustomSpec:
                 a.append("--per-stream")
             if ps and self.per_stream_ids:
                 a.append("--per-stream-ids")
+            if ps and self.pts_conventions == "legacy":     # 'grid' is the binary's default: the run log as before
+                a += ["--pts-conventions", "legacy"]
         return a
 
     def memory_key(self) -> str:
-        return _memory_key(self, ("output_dir", "output_name", "demo_n", "demo_file", "lambda_th", "tess_cache"))
+        return _memory_key(self, ("output_dir", "output_name", "demo_n", "demo_file", "lambda_th", "tess_cache",
+                                  "pts_conventions"))
 
     def demo_pending(self) -> bool:
         """The demo snapshot is to be generated first: the demo's own input path, not on disk yet."""
@@ -2212,6 +2260,8 @@ class CustomSpec:
                 out.append(("error", "the T-web / V-web classes need the whole periodic grid: not with a window"))
             elif self.linear_deposit:
                 out.append(("error", "the window cannot be combined with the linear deposit (the binary refuses it)"))
+        if ps:
+            out += _pts_conventions_problems(self, bool(self.sample_points))
         if (self.per_stream or self.per_stream_ids or self.stream_density != "dtfe") and not self.sample_points:
             out.append(("warning", "the per-stream outputs and the stream density apply to sample points: choose a "
                                    "points file (or they do nothing)"))
@@ -2410,9 +2460,14 @@ def snapshots(sim_path: Path, prefix: str = "ps_output", estimator: str = "ps", 
 
 
 def has_outputs(snapdir: Path, prefix: str, estimator: str) -> bool:
+    """A density grid of the run: PS-DTFE '<prefix>.a_den' (or the unaveraged '.den'); standard DTFE 'output.*',
+    what run_dtfe.sh writes for a Grids job (it passes no prefix) and dtfelib's FieldSet reads (2026-10-15: the
+    pattern was 'output*.a_den', which matched every 'output_<variant>' beside it too -- 'output_plane.a_den',
+    thesis_runs.sh dtfe27planes' plane run with its one-field grid, marked a snapshot without the grids done)."""
     if estimator == "ps":
         return (snapdir / f"{prefix}.a_den").exists() or (snapdir / f"{prefix}.den").exists()
-    return any(snapdir.glob("output*.a_den")) or any((snapdir / "output").glob("*.a_den"))
+    return ((snapdir / "output.a_den").exists() or (snapdir / "output.den").exists()
+            or any((snapdir / "output").glob("*.a_den")))
 
 
 def has_grids(snapdir: Path, method: str, prefix: str) -> bool:
@@ -2510,6 +2565,17 @@ def gpu_backend(estimator: str, precision: str = "single", dim: int = 3) -> str:
         if (objdir / f".gpu_mode_{stamp}").exists():
             return name
     return ""
+
+
+def gpu_build_default(estimator: str = "ps", precision: str = "single", dim: int = 3) -> bool:
+    """The GPU tick a fresh job starts with (2026-10-15: RunSpec and PipelineSpec started with it on, a CPU-only
+    build too, so every fresh job warned that the deposit would run on the CPU): on when the pair was built with a
+    GPU backend -- scripts/config.sh gpu_build_default's rule, the drivers' default for DTFE_METAL / PS_METAL: the
+    Makefile's '.gpu_mode_metal', '_cuda' or '_hip' stamp in the pair's object folder (gpu_backend). Not gpu_built's
+    'any stamp but off': the CI's 'cudaemu' build emulates the kernels on the CPU, far slower than the CPU path.
+    The binary itself cannot say ('--help' lists --gpu in every build, '--version' names no backend). A job, preset
+    or saved setting that carries a tick keeps it."""
+    return bool(gpu_backend(estimator, precision, dim))
 
 
 def gpu_compiler() -> str:

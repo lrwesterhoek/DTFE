@@ -442,7 +442,8 @@ def main():
         have = pm.check_step("TNG100-3-Dark", [99, 4], 64)                 # hires_plane_z64.bin exists
         need = pm.check_step("TNG100-3-Dark", [99], 32)                    # hires_plane_z32 does not
         check("a pipeline check passes the pipeline's settings, the plane file when it exists ...",
-              have.argv[1:] == ["-s", "TNG100-3-Dark", "-g", "128", "-m", "4", "99"]
+              have.argv[1:] == ["-s", "TNG100-3-Dark", "-g", "128"] + (["-m"] if rs.gpu_build_default("ps") else [])
+              + ["4", "99"]
               and have.env["SAMPLE_POINTS"].endswith("hires_plane_z64.bin") and have.env["AUTO_TUNE_REPORT"] == "1"
               and have.env["PS_VOLUME_WEIGHTED"] == "1" and have.env["SCRATCH_DIR"] == str(tmp.parent), str(have.env))
         check("... and only its point count when it does not exist yet",
@@ -505,6 +506,7 @@ def main():
         launcher_2026_10_11()
         cpp_fix_flags_2026_10_11()
         pts_conventions_flag_2026_10_13()
+        pts_conventions_choice_2026_10_15()
         estimator_per_snapshot(tmp)
     finally:
         shutil.rmtree(tmp.parent)
@@ -562,6 +564,18 @@ def estimator_per_snapshot(tmp: Path):
     (sd / "ps_output.pts_den").write_bytes(b"\0" * 8 * 16 * 16)
     check("... auto with both slices: PS-DTFE first, as before",
           pts() == ("auto", str(sd / "ps_output"), False), str(pts()))
+    # 2026-10-15: standard DTFE's grids are 'output.*' exactly; 'output*.a_den' matched the plane run's one-field
+    # grid 'output_plane.a_den' (thesis_runs.sh dtfe27planes) and any other 'output_<variant>' beside them
+    pl = sp / "snapdir_050"
+    pl.mkdir()
+    (pl / "output_plane.a_den").touch()
+    (pl / "output_mc.a_den").touch()
+    before = (rs.has_outputs(pl, "", "dtfe"), rs.has_grids(pl, "dtfe", ""), rs.has_grids(pl, "auto", ""))
+    (pl / "output.a_den").touch()
+    check("standard DTFE's grids are 'output.*' only: a snapdir with 'output_plane.a_den' and 'output_mc.a_den' has "
+          "none (Grids marks, figure checks), one with 'output.a_den' has them",
+          before == (False, False, False) and rs.has_outputs(pl, "", "dtfe") and rs.has_grids(pl, "dtfe", ""),
+          str(before))
 
 
 def gpu_branches(tmp: Path, snap: Path):
@@ -582,7 +596,23 @@ def gpu_branches(tmp: Path, snap: Path):
             check(f"the faked stamp is what the build checks read ({built})",
                   rs.gpu_built("ps") is built and rs.gpu_built("dtfe") is built
                   and rs.gpu_backend("ps") == ("Metal" if built else ""))
+            # 2026-10-15: a fresh job's GPU tick is the build's (it was on for a CPU-only build too); a saved one stays
+            check(f"a fresh job's GPU tick is the build's ({built}): the Grids job (both estimators, double too), the "
+                  "pipeline; a saved tick is kept either way",
+                  rs.RunSpec().gpu is built and rs.RunSpec(estimator="dtfe").gpu is built
+                  and rs.RunSpec(precision="double").gpu is built and rs.PipelineSpec().gpu is built
+                  and rs.RunSpec.from_dict({"gpu": not built}).gpu is (not built)
+                  and rs.PipelineSpec.from_dict({"gpu": not built}).gpu is (not built)
+                  and rs.RunSpec(gpu=True).gpu is True,
+                  f"{rs.RunSpec().gpu} {rs.PipelineSpec().gpu}")
             _gpu_advice_checks(tmp, snap)
+        for d in (rs._objdir(e, p) for e in ("ps", "dtfe") for p in ("single", "double")):
+            (d / ".gpu_mode_off").unlink(missing_ok=True)
+            (d / ".gpu_mode_cudaemu").touch()
+        check("the CI's emulated CUDA build (its kernels on the CPU): built for gpu_built, but a fresh job starts "
+              "without the GPU, as scripts/config.sh gpu_build_default says",
+              rs.gpu_built("ps") and not rs.gpu_build_default("ps") and rs.RunSpec().gpu is False
+              and rs.PipelineSpec().gpu is False)
     finally:
         rs._objdir = real
         shutil.rmtree(fake, ignore_errors=True)
@@ -1968,9 +1998,11 @@ def pipeline_options(tmp: Path, sim: Path):
     run_keys = ("PS_EXACT", "AVG_SUBSAMPLES", "PS_GPU", "PS_VERTEX_MASS", "PS_VOLUME_WEIGHTED", "PS_CAUSTICS",
                 "PS_CAUSTIC_CUSPS", "PS_PARALLEL_TRI", "PLANES", "SUPERSAMPLE")
     env = rs.PipelineSpec(**base).command()[1]
-    # 2026-10-13: the caustic classes are on by default (run_ps_dtfe.sh's default and the production runs')
+    # 2026-10-13: the caustic classes are on by default (run_ps_dtfe.sh's default and the production runs'); the GPU
+    # since 2026-10-15 when the PS pair was built with one (rs.gpu_build_default, scripts/config.sh's rule)
+    gpu = "1" if rs.gpu_build_default("ps") else "0"
     check("defaults: every run option is spelled out for run_ps_dtfe.sh (a stray PS_* in the login shell cannot leak in)",
-          [env[k] for k in run_keys] == ["0", "3", "1", "1", "1", "1", "0", "0", "1", "1"]
+          [env[k] for k in run_keys] == ["0", "3", gpu, "1", "1", "1", "0", "0", "1", "1"]
           and "THICKNESS" not in env and "WINDOW" not in env, str(env))
     q = rs.PipelineSpec(**base, deposit="exact", nsub=1, gpu=False, vertex_mass=False, volume_weighted=False,
                         caustics=True, caustic_cusps=True, parallel_triangulation=True, planes=16, thickness=3.5,
@@ -2055,7 +2087,7 @@ def pipeline_options(tmp: Path, sim: Path):
           and fine.plane_matches("TNG100-3-Dark") is True, f"{env['WINDOW']} {env['THICKNESS']}")
     side.write_text(good)
     check("the GPU knob is pinned in the environment too (PS_METAL / DTFE_METAL), not only by -m",
-          rs.PipelineSpec(**base).command()[1]["PS_METAL"] == "1"
+          rs.PipelineSpec(**base, gpu=True).command()[1]["PS_METAL"] == "1"
           and rs.PipelineSpec(**base, gpu=False).command()[1]["PS_METAL"] == "0"
           and rs.RunSpec(data_root=str(tmp), sim="TNG100-3-Dark", snapshots=[99], gpu=False).command()[1]["PS_METAL"] == "0"
           and rs.RunSpec(data_root=str(tmp), sim="TNG100-3-Dark", snapshots=[99], estimator="dtfe",
@@ -2093,7 +2125,8 @@ def pipeline_options(tmp: Path, sim: Path):
           rs.POINTEVAL_FIELDS == tuple(pointeval.STYLES) and rs.POINTEVAL_DERIVATIVE_SMOOTH == pointeval.DERIVATIVE_SMOOTH)
     old = rs.PipelineSpec.from_dict({"sims": ["TNG50-4"], "nu": 4096, "render": False})
     check("settings saved before these options load with the scripts' defaults",
-          old.deposit == "sampled" and old.gpu and old.planes == 1 and old.render_project == "plane" and not old.render)
+          old.deposit == "sampled" and old.gpu is rs.gpu_build_default("ps") and old.planes == 1
+          and old.render_project == "plane" and not old.render)
 
 
 def bug_fixes_2026_10_05(tmp: Path, sim: Path):
@@ -2783,6 +2816,81 @@ def pts_conventions_flag_2026_10_13():
         check("KNOWN_FIXES pts-grid-conventions: a PS plane with the grids' vertex masses or volume weighting built "
               "before 2026-10-13T20:00 is flagged, the same built after it, a legacy or option-less plane, a PS run "
               "without a plane and a standard plane are not", not bad, " || ".join(bad))
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def pts_conventions_choice_2026_10_15():
+    """The plane conventions' choice (PS-DTFE '--pts-conventions grid|legacy', 2026-10-15) where the launcher makes a
+    phase-space image plane: a Grids job with a slice and a Pipeline job set PTS_CONVENTIONS for run_ps_dtfe.sh /
+    run_ps_pipeline.sh, spelled out both ways; a Custom run passes '--pts-conventions legacy' to the binary only for
+    legacy (grid is its default, the run log as before); standard DTFE and a run without points get nothing. Legacy
+    is said (info, no '--'), an unknown value refused; the memory check ignores it; 'Load settings' of a run reads it
+    back from the run log, the Runs tab names it, and a saved job without it opens at the grids' conventions."""
+    import results as R
+    print("the plane conventions' choice (2026-10-15):")
+    work = Path(tempfile.mkdtemp(prefix="gui_ptschoice_"))
+    try:
+        plane = work / "hires_plane_z64.bin"
+        plane.write_bytes(b"\0" * 24 * 64)
+        snap = work / "snap.hdf5"
+        snap.write_bytes(b"")
+        g = lambda **kw: rs.RunSpec(sim="TNG50-4", snapshots=[99], **kw).command()[1]        # noqa: E731
+        c = lambda **kw: rs.CustomSpec(input_file=str(snap), **kw).command()                # noqa: E731
+        check("Grids: PTS_CONVENTIONS with a PS slice (grid by default, legacy when chosen); none without a slice or "
+              "for standard DTFE; Pipeline: always (its plane), both ways",
+              g(slice_plane=str(plane)).get("PTS_CONVENTIONS") == "grid"
+              and g(slice_plane=str(plane), pts_conventions="legacy").get("PTS_CONVENTIONS") == "legacy"
+              and "PTS_CONVENTIONS" not in g() and "PTS_CONVENTIONS" not in g(estimator="dtfe", slice_plane=str(plane))
+              and rs.PipelineSpec(sims=["TNG50-4"]).command()[1].get("PTS_CONVENTIONS") == "grid"
+              and rs.PipelineSpec(sims=["TNG50-4"], pts_conventions="legacy").command()[1].get("PTS_CONVENTIONS") == "legacy"
+              and rs.PipelineSpec(sims=["TNG50-4"], pts_conventions="legacy").check_step("TNG50-4", [99], 1024).env.get(
+                  "PTS_CONVENTIONS") == "legacy")
+        leg = c(sample_points=str(plane), pts_conventions="legacy")
+        check("Custom: '--pts-conventions legacy' with points for legacy only (grid = the binary's default, nothing "
+              "added); not without points nor for standard DTFE",
+              "--pts-conventions" in leg and leg[leg.index("--pts-conventions") + 1] == "legacy"
+              and "--pts-conventions" not in c(sample_points=str(plane))
+              and "--pts-conventions" not in c(pts_conventions="legacy")
+              and "--pts-conventions" not in c(sample_points=str(plane), pts_conventions="legacy", estimator="dtfe"))
+        msgs = lambda spec: [(lv, m) for lv, m in spec.problems() if "conventions" in m]     # noqa: E731
+        rl = msgs(rs.RunSpec(sim="TNG50-4", snapshots=[99], slice_plane=str(plane), pts_conventions="legacy"))
+        pl = msgs(rs.PipelineSpec(sims=["TNG50-4"], pts_conventions="legacy"))
+        cl = msgs(rs.CustomSpec(input_file=str(snap), sample_points=str(plane), pts_conventions="legacy"))
+        bad = msgs(rs.CustomSpec(input_file=str(snap), sample_points=str(plane), pts_conventions="old"))
+        plain = msgs(rs.RunSpec(sim="TNG50-4", snapshots=[99], slice_plane=str(plane)))
+        check("legacy is said on every tab (info: the estimators before 13 October 2026), an unknown value is refused, "
+              "the grids' conventions say nothing; no '--' in the messages",
+              [lv for lv, _ in rl + pl + cl] == ["info"] * 3 and all("13 October 2026" in m for _, m in rl + pl + cl)
+              and [lv for lv, _ in bad] == ["error"] and not plain and not any("--" in m for _, m in rl + pl + cl + bad),
+              str(rl + pl + cl + bad))
+        same = (rs.RunSpec(slice_plane=str(plane)).memory_key() == rs.RunSpec(slice_plane=str(plane),
+                                                                             pts_conventions="legacy").memory_key()
+                and rs.PipelineSpec().memory_key() == rs.PipelineSpec(pts_conventions="legacy").memory_key()
+                and rs.CustomSpec().memory_key() == rs.CustomSpec(pts_conventions="legacy").memory_key())
+        old = {k: v for k, v in rs.RunSpec().to_dict().items() if k != "pts_conventions"}
+        check("the memory check ignores it; a job saved before the choice opens at the grids' conventions",
+              same and rs.RunSpec.from_dict(old).pts_conventions == "grid"
+              and rs.PipelineSpec.from_dict({}).pts_conventions == "grid")
+        log = work / "ps_output.runlog"
+        recs = {}
+        for name, extra in (("legacy", " --pts-conventions legacy"), ("grid", ""), ("noplane", None)):
+            args = "--grid 64 --ps-vertex-mass --ps-volume-weighted" + (
+                "" if extra is None else f" --sample-points {plane} --pts-vel-grad{extra}")
+            _write_log(log, f"RUNNING: /x/PS-DTFE in.hdf5 {work}/ps_output {args}\n")
+            recs[name] = R.parse_runlog(log)
+        st = {k: r.settings().get("pts_conventions") for k, r in recs.items()}
+        check("Load settings: a run's plane conventions from its run log (legacy only when it says so; none without a "
+              "plane), and the Runs tab names a legacy plane",
+              st == {"legacy": "legacy", "grid": "grid", "noplane": None}
+              and rs.RunSpec.from_dict(dict(rs.RunSpec().to_dict(), **recs["legacy"].settings())).pts_conventions == "legacy"
+              and "legacy conventions" in recs["legacy"].options_text() and "legacy" not in recs["grid"].options_text()
+              and "--" not in recs["legacy"].options_text(), f"{st} {recs['legacy'].options_text()}")
+        import presets as P
+        check("the menu's label and texts (the binary's own help behind the tooltip): no '--'",
+              P.label("pts_conventions") and P.OPTION_TEXT["pts_conventions"][1] == "--pts-conventions"
+              and set(rs.PTS_CONVENTIONS_TEXT) == set(rs.PTS_CONVENTIONS) == {"grid", "legacy"}
+              and not any("--" in t for t in list(rs.PTS_CONVENTIONS_TEXT.values()) + [P.label("pts_conventions")]))
     finally:
         shutil.rmtree(work, ignore_errors=True)
 

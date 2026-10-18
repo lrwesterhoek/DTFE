@@ -183,6 +183,24 @@ def _dir_row(edit: QLineEdit, on_browse) -> QHBoxLayout:
     return row
 
 
+# what the plane conventions' menu adds to the binary's own help (2026-10-15): the Runs tab's warning about older planes
+PTS_CONVENTIONS_TIP = ("\n\nThe Runs tab warns about a phase-space plane made before 13 October 2026 with the vertex "
+                       "masses or the volume weighting: it has the old estimators. Legacy reproduces such a plane on "
+                       "purpose (its run log says so, and it is not warned about); the grids' conventions are the ones "
+                       "to compare a plane with the grids.")
+
+
+def _pts_conventions_combo(changed) -> QComboBox:
+    """The phase-space image plane's conventions (PS-DTFE '--pts-conventions', the scripts' PTS_CONVENTIONS;
+    runspec.PTS_CONVENTIONS, 2026-10-15): the grids' (the default) or legacy."""
+    c = QComboBox()
+    for key in rs.PTS_CONVENTIONS:
+        c.addItem(rs.PTS_CONVENTIONS_TEXT[key], key)
+    c.setToolTip(P.tooltip("pts_conventions") + PTS_CONVENTIONS_TIP)
+    c.currentIndexChanged.connect(changed)
+    return c
+
+
 def _exclusive(a: QCheckBox, b: QCheckBox):
     """Two options the binary refuses together: ticking one unticks the other."""
     a.toggled.connect(lambda on: on and b.setChecked(False))
@@ -385,7 +403,9 @@ class MainWindow(QMainWindow):
         self.data = data or self._restore("data", rs.DataSpec)
         self.custom = custom or self._restore("custom", rs.CustomSpec)
         if custom is None and not self._restore_json("custom", None):
-            self.custom.gpu = rs.gpu_built("ps")            # a fresh custom-snapshot job uses the GPU when built
+            # a fresh custom-snapshot job uses the GPU when built with one (the Grids and Pipeline tabs' rule,
+            # rs.gpu_build_default, 2026-10-15: not an emulated one)
+            self.custom.gpu = rs.gpu_build_default("ps")
         # 2026-10-13: standard DTFE's production cell average is the exact one (rs.production_deposit). A state saved
         # before then holds the launcher's old start, 'sampled', for a standard-DTFE Grids or Custom job (the
         # Monte-Carlo average, never really chosen: it was the only start): moved to 'exact' ONCE; the Monte-Carlo
@@ -417,6 +437,9 @@ class MainWindow(QMainWindow):
         self.proc: QProcess | None = None
         self._loading = False
         self._own_last_file = ""        # the custom file whose particle count last set the GPU box
+        # the deposit choice per estimator, per tab ('grids', 'own'): {estimator: 'sampled' | 'exact'}, what an
+        # estimator switch brings back (_estimator_switched, 2026-10-15; this session only)
+        self._deposit_kept: dict[str, dict[str, str]] = {}
         self._steps: list[rs.Step] = []
         self._step_i, self._results = -1, []
         self._job_tab, self._job_start = GRIDS, None
@@ -904,6 +927,8 @@ class MainWindow(QMainWindow):
         self.vg_check.setToolTip(P.tooltip("slice_vel_grad"))
         self.vg_check.toggled.connect(self._changed)
         f.addRow("", self.vg_check)
+        self.pc_combo = _pts_conventions_combo(self._changed)       # PS-DTFE: the plane's conventions (2026-10-15)
+        f.addRow(P.label("pts_conventions"), self.pc_combo)
         col.addWidget(self.slice_group)
 
         g, (self.part_spin, self.conc_spin, self.scratch_edit, self.prefix_edit,
@@ -931,18 +956,31 @@ class MainWindow(QMainWindow):
         (rs.production_deposit, 2026-10-13): PS-DTFE the sampled deposit, standard DTFE the exact cell average,
         run_dtfe.sh's default; the launcher kept 'sampled', so a standard job ran the biased Monte-Carlo average
         unless it was changed by hand. (With two choices, 'a choice at the old estimator's production setting
-        follows to the new one's' is the same rule.) The other choice stays selectable afterwards."""
+        follows to the new one's' is the same rule.) The other choice stays selectable afterwards. A choice made
+        for an estimator comes back with it (2026-10-15, per tab, this session): PS-DTFE's exact deposit was lost on
+        the way PS -> standard -> PS, the switch back always gave the sampled one."""
         if self._loading:
             return
-        want = rs.production_deposit("ps" if ps_now else "dtfe")
+        new, old = ("ps", "dtfe") if ps_now else ("dtfe", "ps")
+        kept = self._deposit_kept.setdefault("grids" if combo is self.deposit_combo else "own", {})
+        if combo.currentData():
+            kept[old] = combo.currentData()          # the estimator left: its choice, for the way back
+        want = kept.get(new) or rs.production_deposit(new)
         if combo.currentData() != want:
             gpu = self.gpu_check if combo is self.deposit_combo else self.o_gpu
             was = gpu.isChecked()
             combo.setCurrentIndex(max(combo.findData(want), 0))      # its signal: the GPU tick, _changed
             on_gpu = ", on the GPU (6.6x faster than the CPU)" if gpu.isChecked() and not was else ""
-            self.status_message(f"standard DTFE: the exact cell average, its production setting{on_gpu}; the "
-                                "Monte-Carlo average stays selectable" if not ps_now else
-                                "PS-DTFE: the sampled deposit, its production setting")
+            if want != rs.production_deposit(new) and ps_now:            # the user's own choice back
+                self.status_message("PS-DTFE: the exact deposit again, as chosen for it before"
+                                    + (", on the GPU (2x faster than the CPU)" if gpu.isChecked() and not was else ""))
+            elif want != rs.production_deposit(new):
+                self.status_message("standard DTFE: the Monte-Carlo average again, as chosen for it before; the "
+                                    "exact cell average stays selectable")
+            else:
+                self.status_message(f"standard DTFE: the exact cell average, its production setting{on_gpu}; the "
+                                    "Monte-Carlo average stays selectable" if not ps_now else
+                                    "PS-DTFE: the sampled deposit, its production setting")
 
     @staticmethod
     def _deposit_texts(combo: QComboBox, ps: bool):
@@ -1191,6 +1229,8 @@ class MainWindow(QMainWindow):
         self.o_pvg.setToolTip(P.tooltip("slice_vel_grad"))
         self.o_pvg.toggled.connect(self._changed)
         f.addRow("", self.o_pvg)
+        self.o_pc = _pts_conventions_combo(self._changed)           # PS-DTFE: the points' conventions (2026-10-15)
+        f.addRow(P.label("pts_conventions"), self.o_pc)
         self.o_window = QLineEdit(placeholderText="none: the whole grid")
         self.o_window.setToolTip(P.tooltip("window") + "\n\nGive x0 x1 y0 y1 z0 z1 in Mpc (2D: four numbers).")
         self.o_window.editingFinished.connect(self._changed)
@@ -1323,6 +1363,8 @@ class MainWindow(QMainWindow):
                              "vorticity maps (PTS_VEL_GRAD)")
         self.p_vg.toggled.connect(self._changed)
         f.addRow("", self.p_vg)
+        self.p_pc = _pts_conventions_combo(self._changed)           # the image plane's conventions (2026-10-15)
+        f.addRow(P.label("pts_conventions"), self.p_pc)
         slab = QHBoxLayout()
         self.p_planes = QSpinBox(minimum=1, maximum=256)
         self.p_planes.setToolTip("Sampling planes spread across a slab, which the figures' 'slab' projection averages "
@@ -1881,6 +1923,7 @@ class MainWindow(QMainWindow):
         self.cu_check.setChecked(s.caustic_cusps)
         self.ld_check.setChecked(s.linear_deposit)
         self.vg_check.setChecked(s.slice_vel_grad)
+        self.pc_combo.setCurrentIndex(max(self.pc_combo.findData(s.pts_conventions), 0))
         self.part_spin.setValue(s.partition)
         self.conc_spin.setValue(s.max_concurrent)
         self.scratch_edit.setText(s.scratch_dir)
@@ -1898,6 +1941,7 @@ class MainWindow(QMainWindow):
         self.p_axis.setCurrentText(p.axis)
         self.p_center.setText(p.center)
         self.p_vg.setChecked(p.vel_grad)
+        self.p_pc.setCurrentIndex(max(self.p_pc.findData(p.pts_conventions), 0))
         self.p_planes.setValue(p.planes)
         self.p_thick.setValue(p.thickness)
         self.p_super.setValue(p.supersample)
@@ -1958,6 +2002,7 @@ class MainWindow(QMainWindow):
         self.o_ld.setChecked(c.linear_deposit)
         self.o_points.setText(c.sample_points)
         self.o_pvg.setChecked(c.pts_vel_grad)
+        self.o_pc.setCurrentIndex(max(self.o_pc.findData(c.pts_conventions), 0))
         self.o_window.setText(" ".join(f"{v:g}" for v in c.window))
         self.o_sdens.setCurrentIndex(max(self.o_sdens.findData(c.stream_density), 0))
         self.o_pstream.setChecked(c.per_stream)
@@ -2021,6 +2066,7 @@ class MainWindow(QMainWindow):
         s.linear_deposit = self.ld_check.isChecked()
         s.slice_plane = self.plane_combo.currentData() or ""
         s.slice_vel_grad = self.vg_check.isChecked()
+        s.pts_conventions = self.pc_combo.currentData() or "grid"
         s.partition = self.part_spin.value()
         s.max_concurrent = self.conc_spin.value()
         s.scratch_dir = self.scratch_edit.text().strip()
@@ -2039,6 +2085,7 @@ class MainWindow(QMainWindow):
         p.axis = self.p_axis.currentText()
         p.center = self.p_center.text().strip()
         p.vel_grad = self.p_vg.isChecked()
+        p.pts_conventions = self.p_pc.currentData() or "grid"
         p.planes = self.p_planes.value()
         p.thickness = self.p_thick.value()
         p.supersample = self.p_super.value()
@@ -2101,6 +2148,7 @@ class MainWindow(QMainWindow):
         c.linear_deposit = self.o_ld.isChecked()
         c.sample_points = self.o_points.text().strip()
         c.pts_vel_grad = self.o_pvg.isChecked()
+        c.pts_conventions = self.o_pc.currentData() or "grid"
         c.stream_density = self.o_sdens.currentData() or "dtfe"
         c.per_stream = self.o_pstream.isChecked()
         c.per_stream_ids = self.o_pids.isChecked()
@@ -2332,6 +2380,7 @@ class MainWindow(QMainWindow):
         self.fields_box.sync_lambda()
         self.cu_check.setEnabled(ps and s.caustics)
         self.vg_check.setEnabled(bool(s.slice_plane))
+        self.pc_combo.setEnabled(ps and bool(s.slice_plane))       # a phase-space option (standard DTFE has one way)
         self.nsub_spin.setEnabled(ps and s.deposit == "sampled")
         gpu_ok = rs.gpu_built(s.estimator, s.precision)
         self.gpu_check.setText(P.label("gpu" if ps else "gpu_dtfe") + ("" if gpu_ok else " (this build has no GPU support)"))
@@ -2351,7 +2400,7 @@ class MainWindow(QMainWindow):
         flat = c.dim == 2                   # the 2D programs: CPU only, sequential insertion
         for w in (self.o_lag_box, self.o_vm, self.o_vw, self.o_ca, self.o_pt, self.o_ld, self.o_window, self.o_halo):
             w.setEnabled(cps)
-        for w in (self.o_sdens, self.o_pstream, self.o_pids):      # the sample points' phase-space options
+        for w in (self.o_sdens, self.o_pstream, self.o_pids, self.o_pc):      # the sample points' phase-space options
             w.setEnabled(cps and bool(c.sample_points))
         self.o_cu.setEnabled(cps and c.caustics)
         self.o_pvg.setEnabled(bool(c.sample_points))

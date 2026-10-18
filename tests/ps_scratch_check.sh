@@ -9,10 +9,13 @@
 #     the deterministic merge order -- mc>1 float merges are order-nondeterministic even
 #     WITHOUT scratch) and the unpartitioned deposit paths. It is the same memory semantics,
 #     so anything but equality is a bug.
-#  B) GPU parity path (GPU builds): scratch + --ps-gpu also bit-identical to plain --ps-gpu.
+#  B) GPU parity path (GPU builds): scratch + --ps-gpu also bit-identical to plain --ps-gpu (exact
+#     fixed-point GPU sums since 2026-10-14; a float tolerance until 2026-10-15).
 #  C) NO LEFTOVER FILES: scratch files are unlinked at creation, so the directory must be
 #     empty after every run -- even though GBs flowed through it.
 #  D) GUARDS: an iCloud path and a nonexistent directory are both rejected up front.
+#  S) the staged ordered merge's SPILL (2026-10-15) into the scratch folder, with the sub-grids themselves in
+#     scratch mappings: bit-identical to A's --max-concurrent 1 run, and C covers its files too.
 #
 # Portable (2026-10-11): runs on Linux too (tests/ci_suite.sh core); B is GPU-only and SKIPs on a CPU build.
 #
@@ -86,38 +89,39 @@ compare_outputs "${TMP}/scr_u_ref" "${TMP}/scr_u_mm" "A unpartitioned"
 if grep -q "SCRATCH:" "${TMP}/scr_p_mm.log"; then check "A arming banner printed" 1; else check "A arming banner printed" 0; fi
 
 # ---------- (B) GPU parity path ----------
-# GPU float atomics accumulate in nondeterministic threadgroup order, so two identical plain
-# --ps-gpu runs already differ bit-wise (verified) -- like every other GPU check in the suite,
-# this compares to a float tolerance rather than bit-equality. Streams stay integer -> exact.
+# Since 2026-10-14 every grid of a GPU deposit is an exact 64-bit fixed-point sum (the mass since 2026-10-08,
+# the moments since 2026-10-14; ps_deposit_params.h PSFxGrid), and --max-concurrent 1 merges the partitions in
+# index order, so the scratch run equals the plain --ps-gpu run byte for byte, as the CPU runs of A do. (Until
+# 2026-10-15 this compared to a float tolerance: the float atomics of before landed in a different order per run.)
 if [ "${GPU_BUILT}" -eq 1 ]; then
-    echo ">> B: GPU deposit path (float tolerance; GPU atomics are order-nondeterministic)"
+    echo ">> B: GPU deposit path (exact fixed-point sums: bit-identity)"
     "${BIN}" "${SNAP}" "${TMP}/scr_g_ref" "${BASEARGS[@]}" --ps-gpu --partition 2 2 2 \
         --max-concurrent 1 > "${TMP}/scr_g_ref.log" 2>&1
     DTFE_SCRATCH_MIN_GB=0.0001 "${BIN}" "${SNAP}" "${TMP}/scr_g_mm" "${BASEARGS[@]}" --ps-gpu \
         --partition 2 2 2 --max-concurrent 1 --scratch-dir "${SC}" > "${TMP}/scr_g_mm.log" 2>&1
-    if "${PY}" - "${TMP}" <<'PYEOF'
-import sys
-import numpy as np
-tmp = sys.argv[1]
-ok = True
-for ext, exact in ((".a_den", False), (".a_streams", True), (".a_vel", False), (".a_velDisp", False)):
-    a = np.fromfile(f"{tmp}/scr_g_ref{ext}", dtype=np.float32).astype(np.float64)
-    b = np.fromfile(f"{tmp}/scr_g_mm{ext}",  dtype=np.float32).astype(np.float64)
-    if exact:
-        good = np.mean(a == b) > 0.999
-        print(f"        {ext}: {100*np.mean(a==b):.4f}% equal {'ok' if good else '<<<<'}")
-    else:
-        mrel = np.abs(a - b).mean() / (np.abs(a).max() + 1e-30)
-        good = mrel < 1e-6
-        print(f"        {ext}: mean rel = {mrel:.3e} {'ok' if good else '<<<<'}")
-    ok &= good
-sys.exit(0 if ok else 1)
-PYEOF
-    then check "B GPU scratch run matches plain GPU run (float tolerance)" 1
-    else check "B GPU scratch run matches plain GPU run (float tolerance)" 0; fi
+    # a CPU fallback in one run of the pair (GPU contention) breaks the identity for another reason: say so
+    if grep -q "using the CPU deposit\|deposit unavailable\|ran on the CPU instead" "${TMP}/scr_g_ref.log" "${TMP}/scr_g_mm.log"; then
+        echo "        (a GPU run fell back to the CPU: see ${TMP}/scr_g_ref.log / scr_g_mm.log)"
+        check "B GPU runs stayed on the GPU" 0
+    else
+        compare_outputs "${TMP}/scr_g_ref" "${TMP}/scr_g_mm" "B GPU scratch run:"
+    fi
 else
     echo "   SKIP  B (this build has no GPU backend)"
 fi
+
+# ---------- (S) the staged ordered merge's spill into the scratch folder (2026-10-15) ----------
+# four partitions in flight, partition 0 held back so the others park, every parked one SPILLED (DTFE_MERGE_SPILL=1)
+# to --scratch-dir while the tiny threshold puts their sub-grids themselves in scratch mappings: freed mappings and
+# sub-grids read back into new ones, through the replaced operator new/delete. Byte-identical to A's mc=1 run, and
+# section C below then checks the folder is empty (the spill files are unlinked at creation too).
+echo ">> S: the ordered merge's spill to the scratch folder (4 in flight, mmap'ed sub-grids)"
+DTFE_MERGE_SPILL=1 DTFE_TEST_DELAY_PARTITION=0:2 DTFE_SCRATCH_MIN_GB=0.0001 OMP_NUM_THREADS=4 "${BIN}" "${SNAP}" \
+    "${TMP}/scr_s_mm" "${BASEARGS[@]}" --partition 2 2 2 --max-concurrent 4 --scratch-dir "${SC}" \
+    > "${TMP}/scr_s_mm.log" 2>&1 && check "S spilling scratch run exits 0" 1 || check "S spilling scratch run exits 0" 0
+NSP="$(sed -n 's/.*ordered merge: .* \([0-9]*\) spilled to disk.*/\1/p' "${TMP}/scr_s_mm.log")"
+check "S ${NSP:-no} partition(s) spilled to the scratch folder" $([ "${NSP:-0}" -gt 0 ] && echo 1 || echo 0)
+compare_outputs "${TMP}/scr_p_ref" "${TMP}/scr_s_mm" "S spilled"
 
 # ---------- (C) nothing left behind ----------
 NLEFT=$(ls "${SC}" 2>/dev/null | wc -l | tr -d ' ')

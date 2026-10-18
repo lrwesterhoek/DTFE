@@ -32,8 +32,9 @@
 #      server (--serve, 2D since 2026-10-03): dtfelib's Estimator(dim=2) answers byte-identical to
 #      --sample-points, a composite (partition 2 2) server equals the same split's point run, and
 #      Estimator.from_arrays builds a 2D estimator from (N, 2) arrays
-#   W  --ps-window (2D since 2026-10-02): the window run's cells are the full run's, bit for bit with the
-#      sampled deposit, to float rounding with the exact one; the stream counts identical
+#   W  --ps-window (2D since 2026-10-02): the window run's cells are the full run's -- the stream counts and the
+#      hidden-stream masks bit for bit, the sums within 1e-8 of the peak with the sampled deposit (a window pass takes
+#      its own fixed-point units since 2026-10-15, ps_interpolation.cc fxBoundWalk), to float rounding with the exact one
 #   CU --ps-caustic-cusps (2D since 2026-10-02) on a pancake modulated along y, psi_x = A sin(kq_x)
 #      (1 + eps cos(kq_y)), whose fold lens closes in two analytic cusps: both are flagged, every flag
 #      lies on the ridge k q_x = pi where the null-direction derivative of lambda_c vanishes (the
@@ -341,14 +342,17 @@ check("PE6 standard DTFE-2d points", sd2.size == G*G and np.isfinite(sd2).all() 
 xs, ys = slice(25, 61), slice(38, 116)
 def win(name, ext):
     return np.fromfile(tmp / f"{name}.{ext}", np.float32).astype(np.float64).reshape(36, 78)
-same_den = np.array_equal(grid("w_full", "den")[xs, ys], win("w_win", "den"))
+# the 'window' class (tests/ps_window_check.sh): counts and masks bit for bit, sums within 1e-8 of the grid's peak
+def close(a, b):
+    return a.shape == b.shape and float(np.abs(a - b).max()) <= 1e-8 * max(float(np.abs(a).max()), 1e-300)
+same_den = close(grid("w_full", "den")[xs, ys], win("w_win", "den"))
 same_str = np.array_equal(grid("w_full", "streams")[xs, ys], win("w_win", "streams"))
 # '.hidden_streams' is what the window port changed (markFlipped walks the window's hull only)
 same_hid = np.array_equal(grid("w_full", "hidden_streams")[xs, ys], win("w_win", "hidden_streams"))
 fv = grid("w_full", "vel", ncomp=2)[xs, ys]
 wv = np.fromfile(tmp / "w_win.vel", np.float32).astype(np.float64).reshape(36, 78, 2)
-check("W sampled window == full run", same_den and same_str and same_hid and np.array_equal(fv, wv),
-      f"density {same_den}, streams {same_str}, hidden streams {same_hid}, velocity {np.array_equal(fv, wv)} (36 x 78 cells)")
+check("W sampled window == full run", same_den and same_str and same_hid and close(fv, wv),
+      f"density {same_den}, streams {same_str}, hidden streams {same_hid}, velocity {close(fv, wv)} (36 x 78 cells)")
 fx, wx = grid("w_xfull", "den")[xs, ys], win("w_xwin", "den")
 rel = float(np.abs(fx - wx).max() / fx.max())
 hid_x = np.array_equal(grid("w_xfull", "hidden_streams")[xs, ys], win("w_xwin", "hidden_streams"))
@@ -361,9 +365,9 @@ log2 = (tmp / "w_pc2.log").read_text(errors="replace")
 xs3 = slice(6, 26)
 w2 = np.fromfile(tmp / "w_pc2.den", np.float32).astype(np.float64)
 full3 = grid("w_pfull", "den")[xs3, xs3]
-same3 = w2.size == full3.size and np.array_equal(full3.reshape(-1), w2)
+same3 = w2.size == full3.size and close(full3.reshape(-1), w2)
 check("W3 partitioned window over the cache", same3 and "never reach the window" in log2,
-      f"density == the full run's window cells: {same3}; partitions skipped by their occupancy maps: "
+      f"density == the full run's window cells (within 1e-8 of the peak): {same3}; partitions skipped by their occupancy maps: "
       f"{'yes' if 'never reach the window' in log2 else 'no'}")
 
 # CU: cusps of the modulated pancake (A k = 1.2, eps = 0.3): at k q_x = pi (Eulerian x = 50, where

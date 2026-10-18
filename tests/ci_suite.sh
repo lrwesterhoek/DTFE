@@ -80,6 +80,7 @@ run_program_suites() {
     step "composite server split";              tests/serve_split_check.sh --no-build
     step "ordered merge, look-ahead, crash-safe outputs, progress"; tests/ps_runtime_check.sh --no-build
     step "resume of a killed partitioned run";  tests/ps_resume_check.sh --no-build
+    step "--fixed-point-merge (order-free integer merge)"; tests/ps_fixed_merge_check.sh --no-build
     step "resume of a killed partitioned standard run"; tests/dtfe_resume_check.sh --no-build
     step "resume with --sample-points";         tests/ps_resume_points_check.sh --no-build
 }

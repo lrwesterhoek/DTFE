@@ -88,8 +88,9 @@ SAMPLE_POINTS="${SAMPLE_POINTS:-}"  # a --sample-points file: the standard DTFE 
                                  # one resumes (DTFE_RESUME) since 2026-10-14, its finished partitions' points kept
 PTS_VEL_GRAD="${PTS_VEL_GRAD:-0}"   # 1 = with SAMPLE_POINTS, also the velocity gradient at each point
 TESS_CACHE="${TESS_CACHE:-}"     # a LOCAL folder: reuse the Delaunay tessellation of an identical earlier run
-                                 # (--tessellation-cache; created if missing; a partitioned standard run does not
-                                 # cache, the binary says so) -- the same knob as run_ps_dtfe.sh
+                                 # (--tessellation-cache; created if missing; a partitioned run caches one file per
+                                 # thread sub-box of each partition, one per partition with SAMPLE_POINTS) -- the
+                                 # same knob as run_ps_dtfe.sh
 LAMBDA_TH="${LAMBDA_TH:-0.3}"    # eigenvalue threshold of the T-web / V-web classes (--lambda_th), the SAME default as
                                  # run_ps_dtfe.sh (the binary's own default is 0.0: a run without this flag classifies
                                  # differently from a scripted one)

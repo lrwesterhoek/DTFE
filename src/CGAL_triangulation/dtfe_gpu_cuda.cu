@@ -71,6 +71,10 @@ struct DepositParams
     int32_t  fSGrad;        // specializes the item pipelines on them; 96 instantiations would be too many)
     uint32_t fixedSum;      // the grids as exact 64-bit fixed-point sums (2026-10-13; batchFixedScales)
     float    fxScale[5];    // their units 2^k: density, velocity, velocity gradient, scalar, scalar gradient
+    // 2026-10-15, the one field the Metal struct has not: the non-finite guard's counters (one word per grid; fxq),
+    // which Metal binds as a buffer of its own (21). Here they travel in the by-value parameters, which every
+    // device function that converts a share already takes.
+    unsigned* bad;
 };
 
 // ---- the exact sums (2026-10-13; metal/dtfe_deposit.metal's header says why and how). Under fixedSum a grid
@@ -78,7 +82,16 @@ struct DepositParams
 // float: every share is the integer rint(v * scale) (the scale is 2^k, so the product is exact and rintf rounds
 // to nearest even, as Metal's rint), added word by word with the carry done by hand -- ps_gpu_cuda.cu's
 // depositMass -- so a cell's total does not depend on the order of the atomics.
-__device__ __forceinline__ ull fxq(float v, float scale) { return ull((long long)(rintf(v * scale))); }
+// The non-finite guard (2026-10-15; metal/dtfe_deposit.metal fxq has the same test, ps_deposit_params.h
+// psFixedShareOk says why): a product not below 2^63 in magnitude -- NaN, inf, overflow -- has no int64; it gives 0
+// (every add skips it) and is counted in grid g's word of P.bad. The float's bits are tested, as in Metal.
+__device__ __forceinline__ ull fxq(float v, const DepositParams& P, int g)
+{
+    float const p = v * P.fxScale[g];
+    if ((__float_as_uint(p) & 0x7fffffffu) < 0x5f000000u) return ull((long long)(rintf(p)));
+    atomicAdd(&P.bad[g], 1u);
+    return 0ull;
+}
 __device__ __forceinline__ void addWordsLH(unsigned* g, ull at, unsigned lo, unsigned hi)
 {
     if (lo == 0u && hi == 0u) return;
@@ -89,9 +102,9 @@ __device__ __forceinline__ void addWordsLH(unsigned* g, ull at, unsigned lo, uns
 }
 __device__ __forceinline__ void addWords(unsigned* g, ull at, ull q) { addWordsLH(g, at, unsigned(q), unsigned(q >> 32)); }
 // one share of grid component 'at' (= flat * comps + component): the words when fx, else the float atomic
-__device__ __forceinline__ void gridAdd(float* g, bool fx, float scale, ull at, float v)
+__device__ __forceinline__ void gridAdd(float* g, bool fx, const DepositParams& P, int slot, ull at, float v)
 {
-    if (fx) addWords(reinterpret_cast<unsigned*>(g), at, fxq(v, scale));
+    if (fx) addWords(reinterpret_cast<unsigned*>(g), at, fxq(v, P, slot));
     else atomicAdd(&g[at], v);
 }
 
@@ -137,18 +150,18 @@ __device__ __forceinline__ void depositCell(float* denGrid, float* velGrid, floa
 {
     bool const fx = P.fixedSum != 0u;
     if (P.fDen)
-        gridAdd(denGrid, fx, P.fxScale[0], flat, den*w);
+        gridAdd(denGrid, fx, P, 0, flat, den*w);
     if (P.fVel)
         for (int j=0;j<3;++j)
-            gridAdd(velGrid, fx, P.fxScale[1], flat*3ull+ull(j), vel[j]*w);
+            gridAdd(velGrid, fx, P, 1, flat*3ull+ull(j), vel[j]*w);
     if (P.fGrad)
         for (int q=0;q<9;++q)
-            gridAdd(gradGrid, fx, P.fxScale[2], flat*9ull+ull(q), gradFlat[q]*w);
+            gridAdd(gradGrid, fx, P, 2, flat*9ull+ull(q), gradFlat[q]*w);
     if (P.fScal)
-        gridAdd(scalGrid, fx, P.fxScale[3], flat, sc*w);
+        gridAdd(scalGrid, fx, P, 3, flat, sc*w);
     if (P.fSGrad)
         for (int i=0;i<3;++i)
-            gridAdd(sgGrid, fx, P.fxScale[4], flat*3ull+ull(i), sG[i]*w);
+            gridAdd(sgGrid, fx, P, 4, flat*3ull+ull(i), sG[i]*w);
 }
 
 __global__ void __launch_bounds__(256)
@@ -286,24 +299,24 @@ __device__ __forceinline__ void flushSlot(float* denGrid, float* velGrid, float*
     // (the same products as the table path's tableAdd: an eviction adds the same integers whichever takes it)
     ull const f = ull(flat);
     if (FD)
-        gridAdd(denGrid, FX, P.fxScale[0], f, den * factor);
+        gridAdd(denGrid, FX, P, 0, f, den * factor);
     if (FV) {
-        gridAdd(velGrid, FX, P.fxScale[1], f*3ull+0ull, vx * factor);
-        gridAdd(velGrid, FX, P.fxScale[1], f*3ull+1ull, vy * factor);
-        gridAdd(velGrid, FX, P.fxScale[1], f*3ull+2ull, vz * factor);
+        gridAdd(velGrid, FX, P, 1, f*3ull+0ull, vx * factor);
+        gridAdd(velGrid, FX, P, 1, f*3ull+1ull, vy * factor);
+        gridAdd(velGrid, FX, P, 1, f*3ull+2ull, vz * factor);
     }
     if (P.fScal)
-        gridAdd(scalGrid, FX, P.fxScale[3], f, sc * factor);
+        gridAdd(scalGrid, FX, P, 3, f, sc * factor);
     if (FG && P.debugNoAtomic < 3u) {
         float const w = cnt * factor;
         for (int j = 0; j < 3; ++j)
             for (int i = 0; i < 3; ++i)
-                gridAdd(gradGrid, FX, P.fxScale[2], f*9ull+ull(j*3+i), vG[i][j] * w);
+                gridAdd(gradGrid, FX, P, 2, f*9ull+ull(j*3+i), vG[i][j] * w);
     }
     if (P.fSGrad && P.debugNoAtomic < 3u) {
         float const w = cnt * factor;
         for (int i = 0; i < 3; ++i)
-            gridAdd(sgGrid, FX, P.fxScale[4], f*3ull+ull(i), sG[i] * w);
+            gridAdd(sgGrid, FX, P, 4, f*3ull+ull(i), sG[i] * w);
     }
 }
 
@@ -353,20 +366,20 @@ __device__ __forceinline__ bool tableAdd(unsigned* tKeys, float* tVals, unsigned
             unsigned const base = h * tableStride<FG>(P);
             if (FX) {   // the integers flushSlot would add (the same float products, converted here)
                 unsigned* tValsX = reinterpret_cast<unsigned*>(tVals);
-                if (FD) addWords(tValsX, base + 0u, fxq(den, P.fxScale[0]));
+                if (FD) addWords(tValsX, base + 0u, fxq(den, P, 0));
                 if (FV) {
-                    addWords(tValsX, base + 1u, fxq(vx, P.fxScale[1]));
-                    addWords(tValsX, base + 2u, fxq(vy, P.fxScale[1]));
-                    addWords(tValsX, base + 3u, fxq(vz, P.fxScale[1]));
+                    addWords(tValsX, base + 1u, fxq(vx, P, 1));
+                    addWords(tValsX, base + 2u, fxq(vy, P, 1));
+                    addWords(tValsX, base + 3u, fxq(vz, P, 1));
                 }
-                if (P.fScal) addWords(tValsX, base + tableOffScal<FG>(P), fxq(sc, P.fxScale[3]));
+                if (P.fScal) addWords(tValsX, base + tableOffScal<FG>(P), fxq(sc, P, 3));
                 if (FG)
                     for (int j = 0; j < 3; ++j)
                         for (int i = 0; i < 3; ++i)
-                            addWords(tValsX, base + tableOffGrad<FG>(P) + unsigned(j*3+i), fxq(vG[i][j] * w, P.fxScale[2]));
+                            addWords(tValsX, base + tableOffGrad<FG>(P) + unsigned(j*3+i), fxq(vG[i][j] * w, P, 2));
                 if (P.fSGrad)
                     for (int i = 0; i < 3; ++i)
-                        addWords(tValsX, base + tableOffSGrad<FG>(P) + unsigned(i), fxq(sG[i] * w, P.fxScale[4]));
+                        addWords(tValsX, base + tableOffSGrad<FG>(P) + unsigned(i), fxq(sG[i] * w, P, 4));
                 return true;
             }
             if (FD) atomicAdd(&tVals[base + 0u], den);
@@ -577,14 +590,14 @@ __device__ __forceinline__ void depositItem(
             if (lane == leader && !P.debugNoAtomic) {
                 ull const f = ull(leaderKey);
                 if (FD)
-                    gridAdd(denGrid, FX, P.fxScale[0], f, sd);
+                    gridAdd(denGrid, FX, P, 0, f, sd);
                 if (FV) {
-                    gridAdd(velGrid, FX, P.fxScale[1], f*3ull+0ull, sx);
-                    gridAdd(velGrid, FX, P.fxScale[1], f*3ull+1ull, sy);
-                    gridAdd(velGrid, FX, P.fxScale[1], f*3ull+2ull, sz);
+                    gridAdd(velGrid, FX, P, 1, f*3ull+0ull, sx);
+                    gridAdd(velGrid, FX, P, 1, f*3ull+1ull, sy);
+                    gridAdd(velGrid, FX, P, 1, f*3ull+2ull, sz);
                 }
                 if (fScal)
-                    gridAdd(scalGrid, FX, P.fxScale[3], f, ss);
+                    gridAdd(scalGrid, FX, P, 3, f, ss);
             }
             if ((FG || fSGrad) && P.debugNoAtomic < 2u) {
                 // the gradient is a per-tetrahedron constant times the cell weight: reduced per
@@ -600,10 +613,10 @@ __device__ __forceinline__ void depositItem(
                         if (FG)
                             for (int j = 0; j < 3; ++j)
                                 for (int i = 0; i < 3; ++i)
-                                    gridAdd(gradGrid, FX, P.fxScale[2], f*9ull+ull(j*3+i), vG[i][j] * sw);
+                                    gridAdd(gradGrid, FX, P, 2, f*9ull+ull(j*3+i), vG[i][j] * sw);
                         if (fSGrad)
                             for (int i = 0; i < 3; ++i)
-                                gridAdd(sgGrid, FX, P.fxScale[4], f*3ull+ull(i), sG[i] * sw);
+                                gridAdd(sgGrid, FX, P, 4, f*3ull+ull(i), sG[i] * sw);
                     }
                     mg = mg && !mt;
                 }
@@ -1272,6 +1285,15 @@ bool runBatch(Batch& b, Grids& g, ChunkState& cs, Stats& st, bool sharedBox, std
     std::vector<DevBuf> const gridBufs = g.buffers();
     GpuSnapshot snap;
     std::string lastErr;
+    // The non-finite guard's counters (2026-10-15; fxq), one word per grid (P.bad): zeroed before each kernel and
+    // added into badRun after one that succeeded; a restore rolls badRun back to the held snapshot's (badCk), so a
+    // failed kernel and the redone ones count once (dtfe_metal_host.cc runBatch). Handed to the run's counters
+    // only when the batch succeeds.
+    unsigned* dBad = reinterpret_cast<unsigned*>(devAlloc(FX_DROP_SLOTS * 4, "guard counters", err));
+    if (!dBad) return false;
+    b.P.bad = dBad;
+    unsigned long long badRun[FX_DROP_SLOTS] = {}, badCk[FX_DROP_SLOTS] = {};
+    struct FreeBad { unsigned* p; ~FreeBad() { gpuFree(p); } } const freeBad{ dBad };   // every return below
     // the batch's start: its grids are zero (per call: freshly zeroed; shared: its owner box), recorded as such
     bool ckOn = sharedBox;
     if (!sharedBox)
@@ -1298,6 +1320,7 @@ bool runBatch(Batch& b, Grids& g, ChunkState& cs, Stats& st, bool sharedBox, std
         b.P.nTet = n;
         b.P.itemBase = uint32_t(start);
 
+        if (!gpuCheck(gpuMemset(dBad, 0, FX_DROP_SLOTS * 4), "zero the guard counters", lastErr)) { success = false; break; }
         auto t0 = std::chrono::steady_clock::now();
         if (exact)
             GPU_LAUNCH(depositExactAverage, blocksFor(n, tpb), tpb, 0, b.bV, b.bD, b.bU, b.bVol,
@@ -1376,6 +1399,7 @@ bool runBatch(Batch& b, Grids& g, ChunkState& cs, Stats& st, bool sharedBox, std
                 if (!snap.restore(lastErr)) { lastErr = why + " -- " + lastErr; success = false; break; }
                 resumeAt = snap.start;
             }
+            std::memcpy(badRun, badCk, sizeof badRun);   // (sharedBox: the batch's start, all zero)
             if (ckPeriodic) ++nResumedCk;
             fprintf(stderr, "%sDTFE %s: %s -- resuming from the %s at thread %zu of %zu "
                             "(redoing %zu; failure %d of this chunk, target %.0f ms kernels, %.0f ms gaps)%s\n",
@@ -1392,6 +1416,12 @@ bool runBatch(Batch& b, Grids& g, ChunkState& cs, Stats& st, bool sharedBox, std
 
         start += n;
         ++sinceCk;
+        {
+            unsigned words[FX_DROP_SLOTS];
+            if (!gpuCheck(gpuMemcpy(words, dBad, sizeof words, gpuMemcpyDeviceToHost), "read the guard counters", lastErr))
+            { success = false; break; }
+            for (int k = 0; k < FX_DROP_SLOTS; ++k) badRun[k] += words[k];
+        }
         if (el > 1e-4)
         {
             double scale = pace.targetSec / el;
@@ -1418,7 +1448,7 @@ bool runBatch(Batch& b, Grids& g, ChunkState& cs, Stats& st, bool sharedBox, std
         {   // synchronized above: the buffers hold exactly [0, start)
             GpuSnapshot::Took const t = snap.take(gridBufs, std::vector<bool>(), start, lastErr);
             if (t == GpuSnapshot::DeviceError) { success = false; break; }
-            if (t == GpuSnapshot::Ok) { ++snap.taken; ckPeriodic = true; sinceCk = 0; }
+            if (t == GpuSnapshot::Ok) { ++snap.taken; ckPeriodic = true; sinceCk = 0; std::memcpy(badCk, badRun, sizeof badCk); }
             // else: no host memory for the spare copy; the last snapshot stays valid
         }
         if (pace.gapUs) usleep(pace.gapUs);
@@ -1436,6 +1466,9 @@ bool runBatch(Batch& b, Grids& g, ChunkState& cs, Stats& st, bool sharedBox, std
         if (sharedBox) g.zeroBox(b.P.subOff, b.P.nGrid, ignored);
         err = lastErr;
     }
+    else   // the batch is kept: its dropped shares join the run's counts (reported once at the end, DTFE.cpp)
+        for (int k = 0; k < FX_DROP_SLOTS; ++k)
+            if (badRun[k]) fixedShareDropped(k, badRun[k]);
     return success;
 }
 

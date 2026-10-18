@@ -112,13 +112,21 @@ struct DGrids {
     device atomic_float* scal; device atomic_float* sg;
     device atomic_uint*  denX; device atomic_uint*  velX; device atomic_uint*  gradX;
     device atomic_uint*  scalX; device atomic_uint* sgX;
+    device atomic_uint*  bad;   // 2026-10-15: the non-finite guard's counters, one word per grid (buffer 21, fxq)
 };
 
 // A share in fixed-point units: rint(v * scale). scale is 2^k, so the float product is exact (barring
 // overflow, which the host's bound rules out) and rint rounds to nearest even -- the integer the host
-// would compute (ps_deposit_params.h psMassFixedShare).
-static inline ulong fxq(float v, float scale) {
-    return as_type<ulong>(long(rint(v * scale)));
+// would compute (ps_deposit_params.h psMassFixedShare). The non-finite guard (2026-10-15; ps_deposit_params.h
+// psFixedShareOk says why, metal/ps_deposit.metal fixedShareOk is the same test): a product not below 2^63 in
+// magnitude -- NaN, inf, an overflow -- has no int64 (the conversion is unspecified there); it gives 0, which every
+// add below skips, and is counted in its grid's word of 'bad'. The float's bits are tested (fast math cannot fold
+// an integer compare away): one compare, and a finite in-range share keeps its integer, bit for bit.
+static inline ulong fxq(float v, float scale, device atomic_uint* bad, uint slot) {
+    float const p = v * scale;
+    if ((as_type<uint>(p) & 0x7fffffffu) < 0x5f000000u) return as_type<ulong>(long(rint(p)));
+    atomic_fetch_add_explicit(&bad[slot], 1u, memory_order_relaxed);
+    return 0ul;
 }
 
 // Adds a two's-complement 64-bit integer, given as its (low, high) words, to the two-word cell at index 'at'
@@ -151,23 +159,23 @@ static inline void addWordsTg(threadgroup atomic_uint* g, uint at, ulong q) {
 // else the float atomic.
 // at = flat * comps + component.
 static inline void addDen(thread const DGrids& G, constant DepositParams& P, bool fx, ulong at, float v) {
-    if (fx) addWords(G.denX, at, fxq(v, P.fxScale[0]));
+    if (fx) addWords(G.denX, at, fxq(v, P.fxScale[0], G.bad, 0u));
     else atomic_fetch_add_explicit(&G.den[at], v, memory_order_relaxed);
 }
 static inline void addVel(thread const DGrids& G, constant DepositParams& P, bool fx, ulong at, float v) {
-    if (fx) addWords(G.velX, at, fxq(v, P.fxScale[1]));
+    if (fx) addWords(G.velX, at, fxq(v, P.fxScale[1], G.bad, 1u));
     else atomic_fetch_add_explicit(&G.vel[at], v, memory_order_relaxed);
 }
 static inline void addGrad(thread const DGrids& G, constant DepositParams& P, bool fx, ulong at, float v) {
-    if (fx) addWords(G.gradX, at, fxq(v, P.fxScale[2]));
+    if (fx) addWords(G.gradX, at, fxq(v, P.fxScale[2], G.bad, 2u));
     else atomic_fetch_add_explicit(&G.grad[at], v, memory_order_relaxed);
 }
 static inline void addScal(thread const DGrids& G, constant DepositParams& P, bool fx, ulong at, float v) {
-    if (fx) addWords(G.scalX, at, fxq(v, P.fxScale[3]));
+    if (fx) addWords(G.scalX, at, fxq(v, P.fxScale[3], G.bad, 3u));
     else atomic_fetch_add_explicit(&G.scal[at], v, memory_order_relaxed);
 }
 static inline void addSG(thread const DGrids& G, constant DepositParams& P, bool fx, ulong at, float v) {
-    if (fx) addWords(G.sgX, at, fxq(v, P.fxScale[4]));
+    if (fx) addWords(G.sgX, at, fxq(v, P.fxScale[4], G.bad, 4u));
     else atomic_fetch_add_explicit(&G.sg[at], v, memory_order_relaxed);
 }
 
@@ -252,10 +260,11 @@ kernel void depositAveraged1(
     device atomic_uint*     gradX    [[buffer(18)]],
     device atomic_uint*     scalX    [[buffer(19)]],
     device atomic_uint*     sgX      [[buffer(20)]],
+    device atomic_uint*     badX     [[buffer(21)]],   // 2026-10-15: the non-finite guard's counters (DGrids.bad)
     uint tid [[thread_position_in_grid]])
 {
     if (tid >= P.nTet) return;
-    DGrids const G = { denGrid, velGrid, gradGrid, scalGrid, sgGrid, denX, velX, gradX, scalX, sgX };
+    DGrids const G = { denGrid, velGrid, gradGrid, scalGrid, sgGrid, denX, velX, gradX, scalX, sgX, badX };
 
     float base[3] = { verts[tid*12+0], verts[tid*12+1], verts[tid*12+2] };
     float Ax[3][3];   // vertex-difference matrix, rows = vertex k+1 - vertex 0
@@ -461,7 +470,7 @@ static inline uint tableOffSGrad() { return tableOffGrad() + (FC_GRAD ? 9u : 0u)
 static inline uint tableStride()   { return tableOffSGrad() + (FC_SGRAD ? 3u : 0u); }
 
 static inline bool tableAdd(threadgroup atomic_uint* tKeys, threadgroup atomic_float* tVals,
-                            threadgroup atomic_uint* tValsX, uint E, constant DepositParams& P,
+                            threadgroup atomic_uint* tValsX, uint E, constant DepositParams& P, device atomic_uint* bad,
                             uint key, float den, float vx, float vy, float vz, float sc, float w,
                             thread const float vG[3][3], thread const float sG[3])
 {
@@ -479,20 +488,20 @@ static inline bool tableAdd(threadgroup atomic_uint* tKeys, threadgroup atomic_f
         if (k == key) {
             uint const base = h * tableStride();
             if (FC_FIXED) {   // the integers flushSlot would add (the same float products, converted here)
-                if (FC_DEN) addWordsTg(tValsX, base + 0u, fxq(den, P.fxScale[0]));
+                if (FC_DEN) addWordsTg(tValsX, base + 0u, fxq(den, P.fxScale[0], bad, 0u));
                 if (FC_VEL) {
-                    addWordsTg(tValsX, base + 1u, fxq(vx, P.fxScale[1]));
-                    addWordsTg(tValsX, base + 2u, fxq(vy, P.fxScale[1]));
-                    addWordsTg(tValsX, base + 3u, fxq(vz, P.fxScale[1]));
+                    addWordsTg(tValsX, base + 1u, fxq(vx, P.fxScale[1], bad, 1u));
+                    addWordsTg(tValsX, base + 2u, fxq(vy, P.fxScale[1], bad, 1u));
+                    addWordsTg(tValsX, base + 3u, fxq(vz, P.fxScale[1], bad, 1u));
                 }
-                if (FC_SCAL) addWordsTg(tValsX, base + tableOffScal(), fxq(sc, P.fxScale[3]));
+                if (FC_SCAL) addWordsTg(tValsX, base + tableOffScal(), fxq(sc, P.fxScale[3], bad, 3u));
                 if (FC_GRAD)
                     for (int j = 0; j < 3; ++j)
                         for (int i = 0; i < 3; ++i)
-                            addWordsTg(tValsX, base + tableOffGrad() + uint(j*3+i), fxq(vG[i][j] * w, P.fxScale[2]));
+                            addWordsTg(tValsX, base + tableOffGrad() + uint(j*3+i), fxq(vG[i][j] * w, P.fxScale[2], bad, 2u));
                 if (FC_SGRAD)
                     for (int i = 0; i < 3; ++i)
-                        addWordsTg(tValsX, base + tableOffSGrad() + uint(i), fxq(sG[i] * w, P.fxScale[4]));
+                        addWordsTg(tValsX, base + tableOffSGrad() + uint(i), fxq(sG[i] * w, P.fxScale[4], bad, 4u));
                 return true;
             }
             if (FC_DEN) atomic_fetch_add_explicit(&tVals[base + 0u], den, memory_order_relaxed);
@@ -643,7 +652,7 @@ static inline void depositItem(
                     vVy = mm ? C.vy[j] : vVy; vVz = mm ? C.vz[j] : vVz; vSc = mm ? C.sc[j] : vSc; vCnt = mm ? C.cnt[j] : vCnt;
                 }
                 if (P.tableEntries == 0u ||
-                    !tableAdd(tKeys, tVals, tValsX, P.tableEntries, P, vKey, vDen * factor, vVx * factor, vVy * factor,
+                    !tableAdd(tKeys, tVals, tValsX, P.tableEntries, P, G.bad, vKey, vDen * factor, vVx * factor, vVy * factor,
                               vVz * factor, vSc * factor, vCnt * factor, vG, sG))
                     flushSlot<K>(G, P, C, hit, factor, vG, sG);
             }
@@ -815,6 +824,7 @@ kernel void NAME(                                                               
     device atomic_uint*     gradX    [[buffer(18)]],                                        \
     device atomic_uint*     scalX    [[buffer(19)]],                                        \
     device atomic_uint*     sgX      [[buffer(20)]],                                        \
+    device atomic_uint*     badX     [[buffer(21)]],  /* the non-finite guard's counters */ \
     threadgroup atomic_uint*  tKeys  [[threadgroup(0)]],  /* cell table keys   (host-sized) */ \
     threadgroup atomic_float* tVals  [[threadgroup(1)]],  /* cell table values (host-sized) */ \
     threadgroup atomic_uint*  tValsX [[threadgroup(2)]],  /* ... as two-word integers (FC_FIXED) */ \
@@ -824,7 +834,7 @@ kernel void NAME(                                                               
     uint tgSize [[threads_per_threadgroup]])                                                \
 {                                                                                           \
     uint const E = P.tableEntries;                                                          \
-    DGrids const G = { denGrid, velGrid, gradGrid, scalGrid, sgGrid, denX, velX, gradX, scalX, sgX }; \
+    DGrids const G = { denGrid, velGrid, gradGrid, scalGrid, sgGrid, denX, velX, gradX, scalX, sgX, badX }; \
     for (uint e = ltid; e < E; e += tgSize) {                                               \
         atomic_store_explicit(&tKeys[e], TABLE_EMPTY, memory_order_relaxed);                \
         if (FC_FIXED)                                                                       \
@@ -883,10 +893,11 @@ kernel void depositExactAverage(
     device atomic_uint*     gradX    [[buffer(18)]],
     device atomic_uint*     scalX    [[buffer(19)]],
     device atomic_uint*     sgX      [[buffer(20)]],
+    device atomic_uint*     badX     [[buffer(21)]],
     uint iid [[thread_position_in_grid]])
 {
     if (iid >= P.nTet) return;
-    DGrids const G = { denGrid, velGrid, gradGrid, scalGrid, sgGrid, denX, velX, gradX, scalX, sgX };
+    DGrids const G = { denGrid, velGrid, gradGrid, scalGrid, sgGrid, denX, velX, gradX, scalX, sgX, badX };
     uint3 const it = itemOf(itemStart, blockTet, P.nTetTotal, P.itemBase + iid);
     uint const tid = it.x, sub = it.y;
 

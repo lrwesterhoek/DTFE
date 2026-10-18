@@ -24,7 +24,7 @@
 
     SAFE: the manifest carries the run's SETTINGS KEY: the build configuration and the binary (its revision and
     link time: a rebuilt binary does not resume), the command line minus the
-    options that cannot change a grid value (--resume, --ordered-merge, --completion-order-merge, --ps-no-overlap, --verbose,
+    options that cannot change a grid value (--resume, --ordered-merge, --completion-order-merge, --ps-no-overlap, --no-overlap, --verbose,
     --max-concurrent, --scratch-dir, --tessellation-cache), the input files' size+mtime, the resolved
     partition split and the grid. '--resume' refuses, naming the lines that differ, when the key differs.
     It over-refuses rather than under-refuses (a reordered command line is a different key).
@@ -101,6 +101,7 @@
 #include <cstring>
 #include <dirent.h>
 #include <fstream>
+#include <functional>
 #include <signal.h>
 #include <sstream>
 #include <string>
@@ -203,7 +204,10 @@ inline std::string commandKeyLines(std::vector<std::string> const &tokens)
 {
     // '--completion-order-merge' (2026-10-14) like '--ordered-merge': the merge order moves the grids at float rounding
     // only, and a run killed under one order must resume under the other (--resume merges in index order)
-    static char const *const dropFlag[]  = { "--resume", "--ordered-merge", "--completion-order-merge", "--ps-no-overlap" };
+    // '--fixed-point-merge' (2026-10-15) is dropped here because the key's own 'merge=fixed-point' line carries it
+    static char const *const dropFlag[]  = { "--resume", "--ordered-merge", "--completion-order-merge", "--ps-no-overlap",
+                                             "--no-overlap",   // (the standard look-ahead switch, 2026-10-15)
+                                             "--fixed-point-merge" };
     static char const *const dropValue[] = { "--verbose", "-v", "--max-concurrent", "--scratch-dir", "--tessellation-cache" };
     auto isOption = [](std::string const &t)
     {   // '--name' or '-x'; a negative number ('-0.1') is a value
@@ -253,6 +257,12 @@ inline std::string settingsKey(User_options const &u)
     // command line -- a plane rewritten in place would otherwise pass. Runs without points keep their old key.
     if ( not u.psSamplePointsFile.empty() )
         k << cacheFileLine( "sample-points", u.psSamplePointsFile ) << '\n';
+#ifdef PHASE_SPACE
+    // the merge mode (2026-10-15): a '--fixed-point-merge' checkpoint holds integer words instead of the summed Real
+    // grids, so neither mode can resume the other's (beginLoop refuses it by name)
+    if ( u.psFixedPointMerge )
+        k << "merge=fixed-point\n";
+#endif
     k << "partition=";
     for ( size_t p : u.partition ) k << p << ',';
     k << "\ngrid=";
@@ -371,6 +381,18 @@ inline void removeStaleTemps(std::string const &dir)
     for ( auto const &s : stale ) std::remove( s.c_str() );
 }
 
+// A raw array kept beside the grids (2026-10-15): the fixed-point merge's integer words, carries and state
+// (ps_fixed_merge.h), whose Real grids do not exist during its loop. Listed as 'field x.<name> <elemSize> <count>'
+// after the u and a fields (none with count 0); a load calls 'resize' for the listed ones and reads into its bytes.
+struct Blob
+{
+    std::string name;
+    size_t elemSize = 0;
+    std::function<size_t()> count;                 // the elements to write now
+    std::function<void const *()> data;            // their bytes
+    std::function<void *(size_t)> resize;          // load: room for n elements, their bytes
+};
+
 // The run's checkpoint state (one per process: a partition loop runs once -- PS-DTFE's, or standard DTFE's)
 struct Checkpointer
 {
@@ -390,6 +412,7 @@ struct Checkpointer
     bool points = false;              // this run evaluates points: save their records with every checkpoint
     std::vector<char> pointsSaved;    // per partition: its 'points.<i>' is this run's (written, or read on resume)
     bool pointsCleaned = false;       // an earlier run's unlisted 'points.<i>' files removed (after the first write)
+    std::vector<Blob> blobs;          // '--fixed-point-merge' (2026-10-15): its integer grids, beside the Real ones
 };
 
 inline Checkpointer &state()
@@ -447,6 +470,8 @@ inline bool write(Quantities &u, Quantities &a, std::string &why)
     };
     listFields( "u", u );
     listFields( "a", a );
+    for ( Blob const &b : c.blobs )
+        if ( b.count() > 0 ) h << "field x." << b.name << ' ' << b.elemSize << ' ' << b.count() << '\n';
     h << "key-begin\n" << c.key << "key-end\nheader-end\n";
     std::string const header = h.str();
     // room: the new file beside the old one, and the outputs still to come (about the grids' size again: beside
@@ -458,6 +483,7 @@ inline bool write(Quantities &u, Quantities &a, std::string &why)
     };
     addBytes( u );
     addBytes( a );
+    for ( Blob const &b : c.blobs ) bytes += double( b.count() ) * double( b.elemSize );
     // '--sample-points': the records of the partitions merged since the last write (each partition's once)
     if ( c.points )
         bytes += psPointEvalUnsavedBytes( c.merged, c.pointsSaved );
@@ -507,6 +533,9 @@ inline bool write(Quantities &u, Quantities &a, std::string &why)
     };
     writeFields( u );
     writeFields( a );
+    for ( Blob const &b : c.blobs )
+        if ( ok and b.count() > 0 )
+            ok = std::fwrite( b.data(), b.elemSize, b.count(), f ) == b.count();
     ok = ok and std::fflush( f ) == 0 and ::fsync( ::fileno( f ) ) == 0;
     int const err = errno;
     ok = ( std::fclose( f ) == 0 ) and ok;
@@ -561,6 +590,14 @@ inline bool load(std::string const &dir, Manifest const &m, Quantities &u, Quant
         };
         check( "u", u );
         check( "a", a );
+        for ( Blob const &b : state().blobs )
+            if ( fe.name == "x." + b.name )
+            {
+                found = true;
+                if ( fe.elemSize != b.elemSize )
+                    why = "field '" + fe.name + "' has " + std::to_string( fe.elemSize ) + "-byte elements, this build "
+                          + std::to_string( b.elemSize );
+            }
         if ( not found ) why = "the checkpoint holds a field this build does not know: '" + fe.name + "'";
         if ( not why.empty() ) return false;
     }
@@ -587,6 +624,9 @@ inline bool load(std::string const &dir, Manifest const &m, Quantities &u, Quant
         };
         fill( "u", u );
         fill( "a", a );
+        for ( Blob const &b : state().blobs )
+            if ( ok and fe.name == "x." + b.name )
+                ok = std::fread( b.resize( fe.count ), b.elemSize, fe.count, f ) == fe.count;
     }
     std::fclose( f );
     if ( not ok ) why = "reading the grids of '" + path + "' failed";
@@ -643,6 +683,17 @@ inline int beginLoop(User_options const &options, int const totalPartitions, Qua
         std::string why;
         if ( not readManifest( dir, m, why ) )
             throwError( "'--resume': nothing to resume -- ", why, ". Run without '--resume' to start the run." );
+#ifdef PHASE_SPACE
+        // the merge mode first (2026-10-15): the other mode's grids are not this mode's (Real sums / integer words)
+        bool const savedFx = m.key.find( "\nmerge=fixed-point\n" ) != std::string::npos;
+        if ( savedFx != options.psFixedPointMerge )
+            throwError( "'--resume' refused: the checkpoint '", dir, std::string( "' was written by a run " )
+                        + ( savedFx ? "with '--fixed-point-merge' (its grids are integer words); this run merges into "
+                                      "the float grids (the default merge)"
+                                    : "with the default merge (its grids are float sums); this run has '--fixed-point-merge'" )
+                        + ". Resume with the killed run's merge mode, or run without '--resume' to start over (" + START_OVER
+                        + ").", "" );
+#endif
         if ( m.key != key )
             throwError( "'--resume' refused: the checkpoint '", dir, "' was written by a run with other settings. "
                         "The lines that differ:", keyDifference( m.key, key ),
@@ -665,7 +716,9 @@ inline int beginLoop(User_options const &options, int const totalPartitions, Qua
                 << nDone << " of " << totalPartitions << MESSAGE::cReset() << " partitions are already in the "
                 << "checkpoint '" << dir << "'; computing the other " << ( totalPartitions - nDone )
 #ifdef PHASE_SPACE
-                << " (merged in partition order: --resume always merges in index order).\n" << MESSAGE::Flush;
+                << ( options.psFixedPointMerge ? " (each added as it finishes: --fixed-point-merge).\n"
+                                               : " (merged in partition order: --resume always merges in index order).\n" )
+                << MESSAGE::Flush;
 #else
                 << ".\n" << MESSAGE::Flush;
 #endif

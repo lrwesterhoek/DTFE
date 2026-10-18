@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """The launcher's 2026-10-11 additions (python/gui): run-directory files of a run going (contract C1) in the Runs
 browser, the memory status strip, the 'Running now' panel, the void-catalogue status and its build job, keep-awake,
-the new Plots sets, the memory check's log; (2026-10-14) the Explore menu's Save Options….
+the new Plots sets, the memory check's log; (2026-10-14) the Explore menu's Save Options…; (2026-10-15) the plane
+conventions' menu on the Grids, Custom and Pipeline tabs.
 
 Three tiers:
   * HEADLESS (always run; Ubuntu CI, numpy 1.26): results.py / runspec.py / void_cache.py on synthetic run folders
@@ -511,6 +512,7 @@ def t_qt(tmp: Path):
               "ticks it, no '--' in its text, 'Load settings' leaves it", ok,
               (getattr(w.spec, "start_over", None), getattr(w.pipe, "start_over", None)))
         t_qt_void_options(w)
+        t_qt_pts_conventions(w, tmp)
         t_qt_gpu_retries(tmp)
     finally:
         w._machine_timer.stop()
@@ -538,6 +540,43 @@ def t_qt_save_options(w):
           k > 0 and acts[k - 1] is w.save_image_action and w.save_options_action.text() == "Save Options…"
           and w.save_options_action.isEnabled() and opened == [A.EXPLORE] and w.explore._settings is None
           and "--" not in w.save_options_action.text(), (k, opened, w.save_options_action.isEnabled()))
+
+
+def t_qt_pts_conventions(w, tmp: Path):
+    """The plane conventions' menu (2026-10-15): on the Grids tab (PS-DTFE with a hi-res slice), the Custom tab (a
+    phase-space run with sample points) and the Pipeline tab, starting at the grids' conventions; what it says reaches
+    the job (PTS_CONVENTIONS for the scripts, '--pts-conventions legacy' for the binary) and comes back on loading."""
+    pts = tmp / "pc_points.txt"
+    pts.write_text("1 1 1\n")
+    s0, c0, p0 = rs.RunSpec.from_dict(w.spec.to_dict()), rs.CustomSpec.from_dict(w.custom.to_dict()), \
+        rs.PipelineSpec.from_dict(w.pipe.to_dict())
+    try:
+        w.spec.estimator, w.spec.slice_plane = "ps", ""
+        w.custom.estimator, w.custom.sample_points = "ps", str(pts)
+        w._load_into_widgets()
+        w.refresh()
+        start = (w.pc_combo.currentData(), w.o_pc.currentData(), w.p_pc.currentData())
+        grids_off, custom_on = not w.pc_combo.isEnabled(), w.o_pc.isEnabled()
+        for combo in (w.o_pc, w.p_pc):
+            combo.setCurrentIndex(combo.findData("legacy"))
+        w._read_widgets()
+        cmd, env = w.custom.command(), w.pipe.command()[1]
+        w.custom.estimator = "dtfe"
+        w._load_into_widgets()
+        w.refresh()
+        custom_dtfe_off = not w.o_pc.isEnabled()
+        check("the plane conventions' menu: the grids' conventions at first on the Grids, Custom and Pipeline tabs; the "
+              "Grids one greyed without a slice, the Custom one live with points for PS-DTFE (greyed for standard "
+              "DTFE); legacy reaches the binary ('--pts-conventions legacy') and the pipeline (PTS_CONVENTIONS) and "
+              "loads back; no '--' in its texts",
+              start == ("grid", "grid", "grid") and grids_off and custom_on and custom_dtfe_off
+              and "--pts-conventions" in cmd and cmd[cmd.index("--pts-conventions") + 1] == "legacy"
+              and env.get("PTS_CONVENTIONS") == "legacy" and w.o_pc.currentData() == "legacy"
+              and not any("--" in w.p_pc.itemText(i) for i in range(w.p_pc.count())),
+              (start, grids_off, custom_on, custom_dtfe_off, env.get("PTS_CONVENTIONS")))
+    finally:
+        w.spec, w.custom, w.pipe = s0, c0, p0
+        w._load_into_widgets()
 
 
 def t_qt_void_options(w):

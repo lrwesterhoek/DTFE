@@ -10,6 +10,9 @@
   server_settings(out)     how to start a dtfelib.Estimator on the snapshot behind an output (the
                            Explore tab's click-to-query), from the TNG layout or the custom-snapshot
                            job's settings sidecar ('<prefix>.gui.json')
+  field_label(o, name, ..) a map's name for a field, the velocity derivatives' family said (2026-10-15: a phase-space
+                           output's divergence, shear, vorticity, gradient and V-web as the mean field grad<v>,
+                           computed slice by slice from its velocity grid, or as its stored stream average <grad v>)
 """
 
 from __future__ import annotations
@@ -28,7 +31,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT / "python") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "python"))
 
-from dtfelib.io import FIELDS as _IO_FIELDS, LEGACY_SUFFIX, _VELOCITY_SCALE_EXP, caustic_is_fold  # noqa: E402
+from dtfelib.cli import PS_GRADIENT_CHOICES  # noqa: E402,F401  (the figure scripts' '--ps-gradient' choices)
+from dtfelib.io import (FIELDS as _IO_FIELDS, LEGACY_SUFFIX, MEAN_FIELD_NAMES, _VELOCITY_SCALE_EXP,  # noqa: E402
+                        caustic_is_fold, run_lambda_th)
 
 # the launcher's field table: dtfelib's + the per-particle scalar a run with a scalar dataset writes ('.a_scalar',
 # '--field scalar_a'; dtfelib's analysis never reads it, the Explore map can)
@@ -55,6 +60,17 @@ FIELD_HELP = {
                "2026-10-13, whose stored caustic grid missed the folds thinner than the sampling.",
     "scalar": "The particles' own value (the run's scalar dataset, e.g. a potential), interpolated like the density.",
 }
+# The velocity derivatives (dtfelib.io.MEAN_FIELD_NAMES; 2026-10-15). Standard DTFE stores them as the derivatives of
+# its one velocity field, the mean field grad<v>; PS-DTFE stores, in a multi-stream cell, the stream average of each
+# stream's own gradient <grad v> (dtfelib/io.py, the note above FIELDS: a divergence whose box mean is not 0, a V-web
+# with almost no filaments) -- so a map of a PS divergence beside a standard one compared two quantities. Explore
+# shows a phase-space output's as either ('PS velocity derivatives'): 'mean-field', computed from its velocity grid
+# one slice at a time (dtfelib.fields.mean_field_gradient_plane, the figure scripts' spectral derivative and their
+# default, '--ps-gradient' of dtfelib.cli), or 'stored'. Every map, title, colour bar and figure-grid panel says
+# which (field_label).
+GRADIENT_FIELDS = frozenset(MEAN_FIELD_NAMES)
+PS_GRADIENT_DEFAULT = "mean-field"
+GRADIENT_QUALIFIER = {"mean": "mean field ∇⟨v⟩", "stream": "stream average ⟨∇v⟩"}
 # vector fields that can be drawn as arrows (their in-plane components) over the colour map
 VECTOR_FIELDS = {"velocity", "vorticity"}
 # which component menu a field offers; 'norm' = the vector's length
@@ -232,6 +248,8 @@ def cap_cubes(on: bool) -> None:
         budget = _cube_budget()
         while _CUBES and sum(a.nbytes for a in _CUBES.values()) > budget:
             _CUBES.pop(next(iter(_CUBES)))
+        while _MF_PLANES and sum(a.nbytes for a in _MF_PLANES.values()) > _mf_budget():
+            _MF_PLANES.pop(next(iter(_MF_PLANES)))
 
 
 def _cube_budget() -> int:
@@ -246,11 +264,12 @@ def _cube_key(path: Path, dtype, shape) -> tuple | None:
     return (path.resolve(), st.st_mtime_ns, st.st_size, np.dtype(dtype).str, tuple(int(v) for v in shape))
 
 
-def _cached_cube(path: Path, dtype, shape, axis: int | None = None) -> np.ndarray | None:
+def _cached_cube(path: Path, dtype, shape, axis: int | None = None, read: bool = True) -> np.ndarray | None:
     """The whole array of a grid file, cached, or None when the caller should memmap it instead: it is
     larger than the cache, or larger than CUBE_EAGER_BYTES and not cached yet while 'axis' (the plane
     axis the caller slices next, 0 or 1 of a 3D grid) is one a memmap reads cheaply. axis None = the
-    caller reads the whole array (a 2D grid) or slices along the last axis."""
+    caller reads the whole array (a 2D grid) or slices along the last axis. read False = only a cube cached
+    already, never a new read (the fold map's planes, 2026-10-15)."""
     nbytes = int(np.prod(shape)) * np.dtype(dtype).itemsize
     budget = _cube_budget()
     if nbytes > budget:
@@ -263,6 +282,8 @@ def _cached_cube(path: Path, dtype, shape, axis: int | None = None) -> np.ndarra
         if cube is not None:
             _CUBES[key] = _CUBES.pop(key)     # most recently used last
             return cube
+    if not read:
+        return None
     if nbytes > min(CUBE_EAGER_BYTES, budget) and axis is not None and axis < 2:
         return None
     cube = np.fromfile(path, dtype=dtype).reshape(shape)         # outside the lock: nobody waits on the disk
@@ -314,13 +335,46 @@ def _read_plane(path: Path, dtype, n: int, ncomp: int, axis: int, index: int) ->
 
 
 def drop_cubes() -> int:
-    """Forget every cached cube (the bytes they held). The launcher calls it when a job or a memory check
-    starts: the cache is anonymous memory of the GUI process, and the binary's auto-tuner budgets from
+    """Forget every cached cube and mean-field plane (the bytes they held). The launcher calls it when a job or a
+    memory check starts: the cache is anonymous memory of the GUI process, and the binary's auto-tuner budgets from
     the memory that is free at that moment."""
     with _CUBES_LOCK:
-        n = sum(a.nbytes for a in _CUBES.values())
+        n = sum(a.nbytes for a in _CUBES.values()) + sum(a.nbytes for a in _MF_PLANES.values())
         _CUBES.clear()
+        _MF_PLANES.clear()
     return n
+
+
+# The mean-field velocity gradient of the planes shown lately (2026-10-15): (velocity file's _cube_key, axis, index,
+# box) -> float64 (N, N, 3, 3), least recently used first, under _CUBES_LOCK. A plane costs one pass over the velocity
+# grid (0.3-0.6 s at 512^3 from the cube cache, a read of its 1.6 GB file otherwise); every derivative of it (the
+# divergence, shear, vorticity, gradient, V-web) and every colour or range change then comes from here. At most a
+# quarter of the cube cache's budget, 256 MB (13 planes of 512^2, 3 of 1024^2): the grid's panels fit.
+_MF_PLANES: dict[tuple, np.ndarray] = {}
+MF_PLANE_BYTES = int(256e6)
+
+
+def _mf_budget() -> int:
+    return min(MF_PLANE_BYTES, _cube_budget() // 4)
+
+
+class _SlabFile:
+    """An (n, ...) grid file read in slabs along its first axis by plain reads (no memmap, OutputSet._memmap's rule):
+    what dtfelib.fields.mean_field_gradient_plane takes, .shape, .dtype and [s:e]. A short file raises ValueError, a
+    drive gone OSError (the slice worker reports either)."""
+
+    def __init__(self, path: Path, dtype, shape):
+        self.path, self.dtype, self.shape = Path(path), np.dtype(dtype), tuple(int(v) for v in shape)
+
+    def __getitem__(self, sl: slice) -> np.ndarray:
+        s, e, _step = sl.indices(self.shape[0])
+        per = int(np.prod(self.shape[1:]))
+        with open(self.path, "rb") as f:
+            f.seek(s * per * self.dtype.itemsize)
+            a = np.fromfile(f, dtype=self.dtype, count=(e - s) * per)
+        if a.size != (e - s) * per:
+            raise ValueError(f"{self.path.name} is shorter than its grid (an interrupted write?)")
+        return a.reshape((e - s,) + self.shape[1:])
 
 
 class OutputSet:
@@ -363,6 +417,7 @@ class OutputSet:
         self.box = box                  # ((xlo, ylo[, zlo]), (xhi, yhi[, zhi])) in Mpc, or None
         self.redshift = redshift
         self._fold_exact: bool | None = None
+        self._mf_reason: str | None = None      # mean_field_reason(), once known
 
     def __bool__(self):
         return bool(self.files) and bool(self.n)
@@ -391,19 +446,24 @@ class OutputSet:
             out[2] = 0.0
         return out
 
-    def _memmap(self, name: str, axis: int | None = None, index: int = 0) -> np.ndarray:
+    def _memmap(self, name: str, axis: int | None = None, index: int = 0, cache: bool = True) -> np.ndarray:
         """The field's array -- the cached cube when _cached_cube() keeps one -- or, for a 3D grid, just the
         plane 'index' along 'axis', read from the file. NEVER a memmap: a mapped page of a drive unplugged
         meanwhile (the T7) kills the whole launcher with SIGBUS, which Python cannot catch; a read fails with
-        an OSError the slice worker reports (2026-10-06). A 2D grid is read whole."""
+        an OSError the slice worker reports (2026-10-06). A 2D grid is read whole. cache False: a cube cached
+        already, else the plane; no new cube read (2026-10-15)."""
         ff = self.files[name]
         shape = (self.n,) * self.dim + ((ff.ncomp,) if ff.ncomp > 1 else ())
-        cube = _cached_cube(ff.path, self.dtype, shape, axis if self.dim == 3 else None)
+        cube = _cached_cube(ff.path, self.dtype, shape, axis if self.dim == 3 else None, read=cache)
         if cube is not None:
             return cube
         if self.dim == 2 or axis is None:
             return np.fromfile(ff.path, dtype=self.dtype).reshape(shape)
         return _read_plane(ff.path, self.dtype, self.n, ff.ncomp, int(axis), int(index))
+
+    def _nbytes(self, name: str) -> int:
+        """The bytes of a field's whole grid file."""
+        return self.n ** self.dim * self.files[name].ncomp * self.dtype.itemsize
 
     def _velocity_factor(self, name: str) -> float:
         exp = _VELOCITY_SCALE_EXP.get(name)
@@ -411,9 +471,10 @@ class OutputSet:
             return 1.0
         return (1.0 / (1.0 + self.redshift)) ** exp       # u-units -> peculiar km/s (FieldSet)
 
-    def _raw_plane(self, name: str, axis: int, index: int) -> np.ndarray:
-        """One plane of a field as stored (the file's precision, components last); a 2D grid: the whole grid."""
-        mm = self._memmap(name, int(axis), index)
+    def _raw_plane(self, name: str, axis: int, index: int, cache: bool = True) -> np.ndarray:
+        """One plane of a field as stored (the file's precision, components last); a 2D grid: the whole grid.
+        cache False: no new cube read into the cache (_memmap)."""
+        mm = self._memmap(name, int(axis), index, cache)
         if self.dim == 2:
             return np.array(mm)             # the file's precision: only the component shown is up-cast (slice)
         if mm.ndim == self.dim + (1 if self.files[name].ncomp > 1 else 0):     # the cached cube: cut the plane
@@ -434,24 +495,79 @@ class OutputSet:
         return self._fold_exact
 
     def _fold_plane(self, axis: int, index: int) -> np.ndarray:
-        """The exact fold flag on one plane, 0/1 float64 (fold_exact): read plane by plane, no cube."""
+        """The exact fold flag on one plane, 0/1 float64 (fold_exact), from up to three fields (the class mask, the
+        streams, the hidden streams). When the three cubes together do not fit in the cube cache -- while a job runs
+        it keeps 1 GB, and three 512³ cubes are 1.5 GB -- only their planes are read (a cube cached already is still
+        used): until 2026-10-15 each was read whole, 0.5 GB, and they evicted each other, so every step of the slice
+        read 1.5 GB into memory beside the run the cap is there for."""
+        names = [n for n in ("caustic_class", "streams", "hidden_streams") if n in self.files]
+        cache = sum(self._nbytes(n) for n in names) <= _cube_budget()
+
         def get(n):
-            return self._raw_plane(n, axis, index) if n in self.files else None
+            return self._raw_plane(n, axis, index, cache) if n in self.files else None
         fold = caustic_is_fold(get("caustic_class"), streams=get("streams"), hidden=get("hidden_streams"))
         return np.asarray(fold, dtype=np.float64)
 
-    def slice(self, name: str, axis: int = 2, index: int | None = None, component: str = "norm") -> np.ndarray:
+    def mean_field_reason(self) -> str:
+        """'' when this output's velocity derivatives can be shown as the mean field grad<v> (2026-10-15), else why
+        not, in plain words: a standard-DTFE output stores the mean field itself; a phase-space one needs its velocity
+        grid, a 3D grid of a known cubic box, and a periodic one -- the spectral derivative wraps around the box, so
+        not a non-periodic run nor a window of the grid (a custom run's settings sidecar says). Cached on the object
+        (a refresh of the outputs makes new ones)."""
+        if self._mf_reason is None:
+            side = sidecar(self.root) or {}
+            self._mf_reason = (
+                "standard DTFE stores the mean field" if estimator_label(self) != "PS-DTFE" else
+                "a 2D grid: the mean field is computed for 3D grids only" if self.dim != 3 else
+                "no velocity grid to compute it from" if "velocity" not in self.files else
+                "not a periodic box" if not side.get("periodic", True) else
+                "a window of the grid, not the whole periodic box" if side.get("window") else
+                "the box is not known" if self.box is None else
+                "the box is not a cube" if float(np.ptp(self.length)) > 1e-9 * float(np.max(self.length)) else "")
+        return self._mf_reason
+
+    def gradient_family(self, name: str, gradient: str = "stored") -> str:
+        """Which velocity derivative a map of 'name' shows (2026-10-15): '' none (another field); 'mean' the mean field
+        grad<v> (a standard-DTFE output's stored grid, or with gradient 'mean-field' a phase-space output's computed
+        from its velocity where mean_field_reason allows); 'stream' a phase-space output's stored stream average."""
+        if name not in GRADIENT_FIELDS:
+            return ""
+        if estimator_label(self) != "PS-DTFE":
+            return "mean"
+        return "mean" if gradient == "mean-field" and not self.mean_field_reason() else "stream"
+
+    def _mean_field_plane(self, name: str, axis: int, index: int) -> np.ndarray:
+        """The mean-field 'name' on one plane in the stored grid's layout and units (raw u-units per Mpc, the
+        binary's component order; slice() scales and picks components as for the stored grid): dtfelib.fields'
+        mean_field_from_gradient of the plane's spectral gradient (_mf_gradient_plane), the V-web at the snapshot's
+        a and h and the run log's lambda_th, as FieldSet.mean_field classifies it."""
+        from dtfelib import fields as F
+        web = name in ("vweb", "vweb_eigenvalues")
+        a = None if self.redshift is None else 1.0 / (1.0 + float(self.redshift))
+        out = F.mean_field_from_gradient(_mf_gradient_plane(self, axis, index), name, real=self.dtype,
+                                         scale_factor=a, hubble_h=header_hubble(self) if web else None,
+                                         lambda_th=run_lambda_th(str(self.root) + ".runlog") if web else 0.3)
+        return out[name]
+
+    def slice(self, name: str, axis: int = 2, index: int | None = None, component: str = "norm",
+              gradient: str = "stored") -> np.ndarray:
         """One plane of a field, (N, N) float64, rows = the first remaining axis (a 2D grid: the whole
         grid, rows = x; axis and index are ignored). Components of a vector/tensor field by name
         (components()); 'norm' = |v|, 'trace ...' = the trace. The vorticity is the curl of the
         velocity: the binary stores the antisymmetric part of the gradient, W_ab = (dv_a/dx_b -
         dv_b/dx_a)/2 for a < b (xy, xz, yz), which this turns into the curl's x, y, z (a 2D grid: its
         z, a single number); measured on a rigid rotation (curl = 2 Omega), 2026-10-03. The 'caustic'
-        map of a periodic phase-space run is the exact fold flag, not the stored grid (fold_exact, 2026-10-13)."""
+        map of a periodic phase-space run is the exact fold flag, not the stored grid (fold_exact, 2026-10-13).
+        gradient 'mean-field' (2026-10-15): a phase-space output's velocity derivatives as the mean field, computed
+        from its velocity grid (gradient_family 'mean'); 'stored' (the default) or any other field: the file's grid."""
         index = self.n // 2 if index is None else int(index)
         if name == "caustic" and self.fold_exact():
             return self._fold_plane(int(axis), index)
-        plane = self._raw_plane(name, int(axis), index)
+        if gradient == "mean-field" and self.gradient_family(name, gradient) == "mean" \
+                and estimator_label(self) == "PS-DTFE":
+            plane = self._mean_field_plane(name, int(axis), index)
+        else:
+            plane = self._raw_plane(name, int(axis), index)
         ff = self.files[name]
         f64 = lambda a: np.asarray(a, dtype=np.float64)        # noqa: E731
         if name == "vorticity":         # [W_xy, W_xz, W_yz] = [-w_z, w_y, -w_x] / 2 -> the curl w
@@ -476,18 +592,19 @@ class OutputSet:
         return f64(plane) * self._velocity_factor(name)
 
     def arrow_field(self, name: str, axis: int = 2, index: int | None = None, per_side: int = 32,
-                    smooth: float = 0.0) -> dict | None:
+                    smooth: float = 0.0, gradient: str = "stored") -> dict | None:
         """Arrows for a vector field on one slice, in IMAGE coordinates (the Explore image is
         plane.T[::-1]: x = the first in-plane axis rightward, y = the second, drawn upward, in
         cell units from the image's top-left corner). The two in-plane components are
         block-averaged to about 'per_side' arrows along each side; dx, dy are scaled so the
-        longest arrow is 1 (times 'spacing' cells when drawn). None for a non-vector field."""
+        longest arrow is 1 (times 'spacing' cells when drawn). None for a non-vector field. 'gradient': slice()'s
+        (the vorticity's arrows of the family its colours show)."""
         ff = self.files.get(name)
         if ff is None or ff.ncomp != self.dim:          # a vector: one component per axis
             return None
         rest = [0, 1] if self.dim == 2 else [a for a in range(3) if a != axis]
-        u = self.slice(name, axis, index, "xyz"[rest[0]])      # rows = rest[0], columns = rest[1]
-        v = self.slice(name, axis, index, "xyz"[rest[1]])
+        u = self.slice(name, axis, index, "xyz"[rest[0]], gradient)      # rows = rest[0], columns = rest[1]
+        v = self.slice(name, axis, index, "xyz"[rest[1]], gradient)
         if smooth > 0:
             try:
                 from scipy.ndimage import gaussian_filter
@@ -511,13 +628,13 @@ class OutputSet:
                 "u": ub, "v": vb, "c0": c0, "c1": c1,           # plane frame, for a matplotlib quiver
                 "spacing": float(step), "vmax": vmax, "axes": (rest[0], rest[1])}
 
-    def value(self, name: str, ijk, component: str = "norm") -> float:
-        """The value of one cell (same component convention as slice); a 2D grid's cell is (i, j)."""
+    def value(self, name: str, ijk, component: str = "norm", gradient: str = "stored") -> float:
+        """The value of one cell (same component and 'gradient' convention as slice); a 2D grid's cell is (i, j)."""
         if self.dim == 2:
             i, j = (int(v) for v in list(ijk)[:2])
-            return float(self.slice(name, 2, 0, component)[i, j])
+            return float(self.slice(name, 2, 0, component, gradient)[i, j])
         i, j, k = (int(v) for v in ijk)
-        return float(self.slice(name, 0, i, component)[j, k])
+        return float(self.slice(name, 0, i, component, gradient)[j, k])
 
     # -- coordinates
     def cell_center(self, ijk) -> np.ndarray:
@@ -531,6 +648,80 @@ class OutputSet:
         ijk = [0, 0, 0]
         ijk[axis], ijk[rest[0]], ijk[rest[1]] = index, row, col
         return np.asarray(ijk)
+
+
+def _mf_gradient_plane(o: OutputSet, axis: int, index: int) -> np.ndarray:
+    """The mean-field velocity gradient g[..., a, b] = dv_a/dx_b on one plane of a phase-space output (raw u-units per
+    Mpc), from _MF_PLANES or computed (dtfelib.fields.mean_field_gradient_plane: one pass over the velocity grid).
+    The velocity grid as the cube cache's rules give it -- the cached cube, or read whole when it fits the cache and
+    CUBE_EAGER_BYTES (1.6 GB at 512^3: stepping then costs no read), else in 16 MB slabs from the file, never more:
+    while a job runs (the 1 GB cap) a 512^3 plane takes about 100 MB, not the 3-7.5 GB of the whole-cube FFTs."""
+    from dtfelib import fields as F
+    ff = o.files["velocity"]
+    shape = (o.n, o.n, o.n, 3)
+    key = _cube_key(ff.path, o.dtype, shape)
+    if key is None:
+        raise OSError(f"{ff.path} cannot be read")
+    k = ("mean-field",) + key + (int(axis), int(index), float(o.length[0]))
+    with _CUBES_LOCK:
+        g = _MF_PLANES.get(k)
+        if g is not None:
+            _MF_PLANES[k] = _MF_PLANES.pop(k)               # most recently used last
+            return g
+    vel = _cached_cube(ff.path, o.dtype, shape, axis=0)     # axis 0: a cube above CUBE_EAGER_BYTES is not read whole
+    g = F.mean_field_gradient_plane(vel if vel is not None else _SlabFile(ff.path, o.dtype, shape),
+                                    float(o.length[0]), int(axis), int(index))
+    del vel
+    with _CUBES_LOCK:
+        for stale in [s for s in _MF_PLANES if s[1] == k[1] and s[:6] != k[:6]]:     # the file rewritten: drop
+            _MF_PLANES.pop(stale)
+        if g.nbytes <= _mf_budget():
+            while _MF_PLANES and sum(a.nbytes for a in _MF_PLANES.values()) + g.nbytes > _mf_budget():
+                _MF_PLANES.pop(next(iter(_MF_PLANES)))
+            _MF_PLANES[k] = g
+    return g
+
+
+def header_hubble(o) -> float | None:
+    """HubbleParam of the snapshot an output was computed from, whatever unit its box is in (hubble() asks an h-free
+    box): the h the binary's V-web takes from the Gadget header (H0 = 100 h), for the mean-field V-web (2026-10-15).
+    The TNG layout's combined file, or a custom run's HDF5 input; None = not known (the binary's fallback, 1). Read once
+    per output (a header only) and cached on it."""
+    if hasattr(o, "_header_h"):
+        return o._header_h
+    h = None
+    try:
+        import h5py
+        if getattr(o, "sim", ""):
+            files = sorted(Path(o.dir).glob("combined_[0-9][0-9][0-9].hdf5"))
+            src = files[0] if files else None
+        else:
+            src = (sidecar(o.root) or {}).get("input_file")
+        if src:
+            with h5py.File(src, "r") as f:
+                a = f["Header"].attrs
+                if "HubbleParam" in a and float(a["HubbleParam"]) > 0:
+                    h = float(a["HubbleParam"])
+    except Exception:
+        h = None
+    try:
+        o._header_h = h
+    except AttributeError:
+        pass
+    return h
+
+
+def field_label(o, name: str, family: str = "", qualify: bool | None = None) -> str:
+    """A map's name for a field (FIELD_LABELS'), with the velocity derivatives' family said (2026-10-15): 'velocity
+    divergence (mean field ∇⟨v⟩)' or '(stream average ⟨∇v⟩)' (family: OutputSet.gradient_family) for a phase-space
+    output -- or, with 'qualify', for every output: a comparison or a figure grid with a phase-space panel names the
+    standard-DTFE panel's family too (its stored grid is the mean field). A standard-DTFE map alone keeps its name."""
+    base = FIELD_LABELS.get(name, name)
+    if not family:
+        return base
+    if qualify is None:
+        qualify = estimator_label(o) == "PS-DTFE"
+    return f"{base} ({GRADIENT_QUALIFIER[family]})" if qualify else base
 
 
 # ---------------------------------------------------------------------- colour

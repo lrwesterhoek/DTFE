@@ -4,8 +4,8 @@
 #   R2  the partition look-ahead (forced on the CPU deposit with DTFE_PS_OVERLAP=1): every output byte-identical
 #       to '--ps-no-overlap', and the log says it ran
 #   R3  GPU builds only: the look-ahead of a '--ps-gpu' run at --max-concurrent 1 (on by default) against
-#       '--ps-no-overlap': the exactly summed grids (.den, .a_den, .streams, ...) byte-identical, the float-atomic
-#       velocity within 1e-5 of its peak (two GPU runs differ there anyway); SKIP on a CPU build
+#       '--ps-no-overlap': every grid byte-identical (.den, .a_den, .streams, ... and since 2026-10-15 the velocity,
+#       an exact fixed-point sum like the rest since 2026-10-14); SKIP on a CPU build
 #   R4  crash-safe outputs: a finished run leaves no '<file>.part.<pid>' and no progress sidecar; a stale
 #       '.part.<pid>' of a dead pid is removed at the start, one of a live pid is kept, and one whose final file
 #       is missing is kept with its mv (it may be the only copy, 2026-10-11); a run whose output
@@ -26,7 +26,13 @@
 #       together are refused; a default run killed after 10 merges (DTFE_TEST_EXIT_AFTER_PARTITIONS=10) while
 #       partitions are staged has checkpointed exactly partitions 0-9 (the merge order is the index order) and
 #       resumes to R1's grids byte for byte; with the concurrency left to the auto-tuner (the memory gate guards
-#       every partition start) a partition is always staged, and the grids equal DTFE_MERGE_STAGE_GB=0's byte for byte
+#       every partition start) a partition is always staged, and the grids equal DTFE_MERGE_STAGE_GB=0's byte for byte.
+#       THE SPILL (2026-10-15): with no free memory a parked partition is spilled to disk (--scratch-dir, which is
+#       empty afterwards: the files are unlinked) instead of waiting -- the 'ordered merge:' line counts the spills,
+#       none waited -- and DTFE_MERGE_SPILL=1 spills every parked one (the system temp folder, with DTFE_SPILL_MIN_GB=2:
+#       a CI runner has less than its 16 GB margin free; and under the memory gate): every output byte-identical to a
+#       '--max-concurrent 1' run and to R1; a spilling run killed after 10 merges checkpointed partitions 0-9 and
+#       resumes byte-identical; DTFE_MERGE_SPILL=0 brings back the wait
 # Usage: tests/ps_runtime_check.sh [--no-build]   (--no-build is accepted and ignored: the binaries are used as built)
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -76,11 +82,35 @@ grep -q "partition merge order  : partition index" "$TMP/st.log" && grep -q "PS-
 check "R7 no merge flag: index order, ${nst:-?} partition(s) staged, ${nwt:-?} waited" $?
 same "$TMP/o1" "$TMP/st"; check "R7 ... every output byte-identical to the --ordered-merge run (R1)" $?
 DTFE_MERGE_STAGE_GB=0 "${R7[@]}" "$TMP/st0" "${C[@]}" "${P3[@]}" > "$TMP/st0.log" 2>&1 || { echo "FAIL: st0 (see $TMP/st0.log)"; exit 1; }
-DTFE_FREE_GB=0.001 "${R7[@]}" "$TMP/stf" "${C[@]}" "${P3[@]}" > "$TMP/stf.log" 2>&1 || { echo "FAIL: stf (see $TMP/stf.log)"; exit 1; }
+# no free memory and no spill (2026-10-15: with the spill on, such a partition goes to disk; below)
+DTFE_MERGE_SPILL=0 DTFE_FREE_GB=0.001 "${R7[@]}" "$TMP/stf" "${C[@]}" "${P3[@]}" > "$TMP/stf.log" 2>&1 || { echo "FAIL: stf (see $TMP/stf.log)"; exit 1; }
 grep -q "ordered merge: 0 partition(s) finished before their turn" "$TMP/st0.log" && ! grep -q " 0 waited for their turn" "$TMP/st0.log" \
     && grep -q "ordered merge: 0 partition(s) finished before their turn" "$TMP/stf.log" && grep -q "(no room to stage)" "$TMP/stf.log" \
     && same "$TMP/o1" "$TMP/st0" && same "$TMP/o1" "$TMP/stf"
-check "R7 DTFE_MERGE_STAGE_GB=0 and no free memory: nothing staged, partitions wait their turn, byte-identical" $?
+check "R7 DTFE_MERGE_STAGE_GB=0 and no free memory (DTFE_MERGE_SPILL=0): nothing staged, partitions wait their turn, byte-identical" $?
+# THE SPILL (2026-10-15): the reference is the same split at --max-concurrent 1 (no parking at all), on ONE thread:
+# four partitions on four threads deposit each on one, and the double build's CPU sums are equal between thread
+# counts only to rounding (README: run-to-run identical grids)
+OMP_NUM_THREADS=1 "$BIN" "$SNAP" "$TMP/m1" "${C[@]}" --partition 3 3 3 --max-concurrent 1 --ps-no-overlap > "$TMP/m1.log" 2>&1 \
+    || { echo "FAIL: m1 (see $TMP/m1.log)"; exit 1; }
+nspill() { sed -n 's/.*ordered merge: .* \([0-9]*\) spilled to disk.*/\1/p' "$1"; }
+SPD="$TMP/spill"; mkdir -p "$SPD"
+DTFE_FREE_GB=0.001 "${R7[@]}" "$TMP/sp" "${C[@]}" "${P3[@]}" --scratch-dir "$SPD" > "$TMP/sp.log" 2>&1 || { echo "FAIL: sp (see $TMP/sp.log)"; exit 1; }
+nsp="$(nspill "$TMP/sp.log")"
+grep -q "when the memory cannot hold it, spilled to disk in '$SPD'" "$TMP/sp.log" && [ "${nsp:-0}" -gt 0 ] \
+    && grep -q " 0 waited for their turn" "$TMP/sp.log" && [ -z "$(ls -A "$SPD")" ] && same "$TMP/m1" "$TMP/sp" && same "$TMP/o1" "$TMP/sp"
+check "R7 no free memory: ${nsp:-?} partition(s) spilled to --scratch-dir (left empty), none waited; byte-identical to --max-concurrent 1 and R1" $?
+DTFE_MERGE_SPILL=1 DTFE_SPILL_MIN_GB=2 "${R7[@]}" "$TMP/sf" "${C[@]}" "${P3[@]}" > "$TMP/sf.log" 2>&1 || { echo "FAIL: sf (see $TMP/sf.log)"; exit 1; }
+nsf="$(nspill "$TMP/sf.log")"
+nst2="$(sed -n 's/.*ordered merge: \([0-9]*\) partition(s) finished before their turn.*/\1/p' "$TMP/sf.log")"
+grep -q "every one with sub-grids is spilled to disk" "$TMP/sf.log" && [ "${nsf:-0}" -gt 0 ] && [ "$nsf" = "$nst2" ] \
+    && same "$TMP/m1" "$TMP/sf"
+check "R7 DTFE_MERGE_SPILL=1 (the system temp folder): all ${nsf:-?} parked partition(s) spilled, byte-identical to --max-concurrent 1" $?
+DTFE_MERGE_SPILL=1 DTFE_SPILL_MIN_GB=2 DTFE_TEST_EXIT_AFTER_PARTITIONS=10 "${R7[@]}" "$TMP/sk3" "${C[@]}" "${P3[@]}" > "$TMP/sk3.log" 2>&1; rc1=$?
+bits="$(grep -a -m1 '^merged ' "$TMP/sk3.runlog.checkpoint/checkpoint" 2>/dev/null | awk '{print $2}')"
+DTFE_MERGE_SPILL=1 DTFE_SPILL_MIN_GB=2 OMP_NUM_THREADS=4 "$BIN" "$SNAP" "$TMP/sk3" "${C[@]}" "${P3[@]}" --resume > "$TMP/sk4.log" 2>&1; rc2=$?
+[ "$rc1" = 137 ] && [ "$bits" = "111111111100000000000000000" ] && [ "$rc2" = 0 ] && same "$TMP/m1" "$TMP/sk3"
+check "R7 spilling run killed after 10 merges (exit $rc1): partitions 0-9 checkpointed (${bits:-none}), resumed byte-identical (exit $rc2)" $?
 "${R7[@]}" "$TMP/co" "${C[@]}" "${P3[@]}" --completion-order-merge > "$TMP/co.log" 2>&1 || { echo "FAIL: co (see $TMP/co.log)"; exit 1; }
 grep -q "partition merge order  : completion order" "$TMP/co.log" && ! grep -q "ordered merge:" "$TMP/co.log" \
     && "$PY" - "$TMP/o1" "$TMP/co" <<'PYEOF'
@@ -106,6 +136,18 @@ DTFE_MERGE_STAGE_GB=0 "${GA[@]}" "$TMP/sg0" "${C[@]}" --partition 3 3 3 > "$TMP/
 nsg="$(sed -n 's/.*ordered merge: \([0-9]*\) partition(s) finished before their turn.*/\1/p' "$TMP/sg.log")"
 grep -q "the memory gate admits the next partition" "$TMP/sg.log" && [ "${nsg:-0}" -gt 0 ] && same "$TMP/sg0" "$TMP/sg"
 check "R7 auto-tuned concurrency (the memory gate guards the starts): ${nsg:-?} staged, byte-identical to DTFE_MERGE_STAGE_GB=0" $?
+DTFE_MERGE_SPILL=1 DTFE_SPILL_MIN_GB=2 "${GA[@]}" "$TMP/sgs" "${C[@]}" --partition 3 3 3 > "$TMP/sgs.log" 2>&1 || { echo "FAIL: sgs (see $TMP/sgs.log)"; exit 1; }
+nsgs="$(nspill "$TMP/sgs.log")"
+grep -q "the memory gate admits the next partition" "$TMP/sgs.log" && [ "${nsgs:-0}" -gt 0 ] && same "$TMP/sg0" "$TMP/sgs"
+check "R7 ... and spilling under the memory gate (DTFE_MERGE_SPILL=1): ${nsgs:-?} spilled, byte-identical" $?
+# the budget room (2026-10-15): the free memory plentiful (DTFE_FREE_GB=1000), but no room in the budget beside the
+# plan's predicted peak -- every parked partition must spill (TNG100 z=0 parked 74 GB on the free-memory rule alone)
+DTFE_TEST_PARK_ROOM_GB=0 DTFE_SPILL_MIN_GB=2 "${GA[@]}" "$TMP/sgr" "${C[@]}" --partition 3 3 3 > "$TMP/sgr.log" 2>&1 || { echo "FAIL: sgr (see $TMP/sgr.log)"; exit 1; }
+nsgr="$(nspill "$TMP/sgr.log")"
+nstr="$(sed -n 's/.*ordered merge: \([0-9]*\) partition(s) finished before their turn.*/\1/p' "$TMP/sgr.log")"
+grep -q "the memory budget leaves beside the plan" "$TMP/sgr.log" && [ "${nsgr:-0}" -gt 0 ] && [ "$nsgr" = "$nstr" ] \
+    && same "$TMP/sg0" "$TMP/sgr"
+check "R7 ... and no room in the memory budget (DTFE_TEST_PARK_ROOM_GB=0): all ${nsgr:-?} parked partition(s) spilled, byte-identical" $?
 
 echo ">> R2: the look-ahead on the CPU deposit (DTFE_PS_OVERLAP=1) against --ps-no-overlap"
 "$BIN" "$SNAP" "$TMP/n1" "${C[@]}" --partition 3 3 3 --max-concurrent 1 --ps-no-overlap > "$TMP/n1.log" 2>&1 \
@@ -140,19 +182,12 @@ else
         && ! grep -q "using the CPU deposit\|deposit unavailable\|ran on the CPU instead" "$TMP/gl.log" "$TMP/gn.log"
     check "R3 a --ps-gpu run at --max-concurrent 1 looks ahead by default (and neither run fell back to the CPU)" $?
     ok=0
-    for e in den a_den streams a_streams hidden_streams a_hidden_streams; do
+    # the velocity too: every PS grid of a GPU deposit is an exact fixed-point sum since 2026-10-14 (it was a
+    # float-atomic sum, checked to 1e-5 of its peak until 2026-10-15)
+    for e in den a_den streams a_streams hidden_streams a_hidden_streams vel; do
         cmp -s "$TMP/gn.$e" "$TMP/gl.$e" || { echo "    differs: .$e"; ok=1; }
     done
-    check "R3 GPU look-ahead vs --ps-no-overlap: the exactly summed grids byte-identical" $ok
-    "$PY" - "$TMP/gn.vel" "$TMP/gl.vel" <<'PYEOF'
-import numpy as np, os, sys
-REAL = np.dtype(os.environ.get("DTFE_TEST_REAL", "float32"))
-a, b = (np.fromfile(p, dtype=REAL).astype(np.float64) for p in sys.argv[1:3])
-peak = float(np.abs(a - b).max() / max(np.abs(a).max(), 1e-300)) if a.size == b.size and a.size else 1.
-print(f"    .vel peak-relative difference {peak:.1e}")
-sys.exit(0 if peak < 1e-5 else 1)
-PYEOF
-    check "R3 GPU look-ahead vs --ps-no-overlap: velocity within 1e-5 of its peak (float atomics)" $?
+    check "R3 GPU look-ahead vs --ps-no-overlap: every grid (the velocity included) byte-identical" $ok
 fi
 
 echo ">> R4: crash-safe outputs"

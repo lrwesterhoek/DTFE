@@ -19,6 +19,11 @@
 #       difference below 1e-5 per grid, GPU and CPU (a sum of the same float shares, in another order)
 #   F4  --partition 2 2 2 --max-concurrent 1 (partitions merge in index order): two GPU runs byte-identical, and
 #       1 vs 6 CPU threads byte-identical (single build) -- the whole run, not only one partition's sub-grid
+#   F5  the non-finite guard (2026-10-15, ps_deposit_params.h psFixedShareOk): DTFE_TEST_NAN_SHARE=50 gives about one
+#       tetrahedron in 50 a NaN mass, on the CPU and (GPU builds) in the kernel; each run says once how many shares
+#       it left out, by grid (the mass grid among them), its '.a_den' has no NaN or infinity, and a run without
+#       the hook says nothing of the kind. Single build only (the double build's CPU sums are doubles, no words).
+#       The binaries of before 2026-10-15 fail it (no count, no warning).
 # 2D (PS-DTFE-2d, when built): F2's thread independence for the sampled deposit.
 # ~1-2 min (M-series Mac, 10 cores). The binaries of before 2026-10-14 fail F1 (GPU) and F2.
 # Usage: tests/ps_fixed_moments_check.sh [--no-build]   (--no-build is accepted and ignored)
@@ -82,6 +87,15 @@ if ! precision_double; then
     run "$TMP/pc1" env DTFE_DEPOSIT_THREADS=1 "${PS_BIN}" "$SNAP" "$TMP/pc1" "${C[@]}" "${P[@]}" --ps-volume-weighted
     run "$TMP/pc6" env DTFE_DEPOSIT_THREADS=6 DTFE_DEPOSIT_SLABS=0 "${PS_BIN}" "$SNAP" "$TMP/pc6" "${C[@]}" "${P[@]}" --ps-volume-weighted
 fi
+N5=0
+if ! precision_double; then
+    N5=1
+    echo ">> F5: the non-finite guard (DTFE_TEST_NAN_SHARE=50: about one tetrahedron in 50 with a NaN mass)"
+    run "$TMP/n_cpu" env DTFE_TEST_NAN_SHARE=50 "${PS_BIN}" "$SNAP" "$TMP/n_cpu" "${C[@]}"
+    if [ "$GPU" = 1 ]; then
+        GPUOK=1 run "$TMP/n_gpu" env DTFE_TEST_NAN_SHARE=50 "${PS_BIN}" "$SNAP" "$TMP/n_gpu" "${C[@]}" --ps-gpu
+    fi
+fi
 D2=0
 if ! precision_double && [ -x ./PS-DTFE-2d ]; then
     D2=1
@@ -96,8 +110,8 @@ if ! precision_double && [ -x ./PS-DTFE-2d ]; then
     fi
 fi
 
-GPU="$GPU" D2="$D2" VARIANTS="$VARIANTS" "$PY" - "$TMP" <<'PYEOF'
-import numpy as np, os, sys
+GPU="$GPU" D2="$D2" N5="$N5" VARIANTS="$VARIANTS" "$PY" - "$TMP" <<'PYEOF'
+import numpy as np, os, re, sys
 from pathlib import Path
 tmp = Path(sys.argv[1]); fails = 0
 REAL = np.dtype(os.environ.get("DTFE_TEST_REAL", "float32"))   # tests/precision.sh
@@ -140,6 +154,19 @@ if not double:
     same("pc1", "pc6", "--partition 2 2 2, volume-weighted: CPU 1 thread vs 6", "F4")
 if os.environ.get("D2") == "1":
     same("d2_1", "d2_6", "2D: CPU 1 thread vs 6 (copy mode)", "F2")
+DROP = re.compile(r"(\d+) share\(s\) of the exact fixed-point sums were not finite.*?\((.*?)\)\.")
+if os.environ.get("N5") == "1":
+    for run in ["n_cpu"] + (["n_gpu"] if gpu else []):
+        log = (tmp / f"{run}.log").read_text(errors="replace")
+        m = DROP.findall(log)
+        mass = re.search(r"mass \(density\) grid (\d+)", m[-1][1]) if m else None
+        check("F5", len(m) == 1 and int(m[0][0]) > 0 and mass is not None and int(mass.group(1)) > 0,
+              f"{run}: the run reports its dropped shares once, by grid: "
+              + (f"{m[0][0]} ({m[0][1]})" if m else "NO such warning"))
+        den = np.fromfile(tmp / f"{run}.a_den", dtype=REAL)
+        check("F5", den.size > 0 and bool(np.isfinite(den).all()), f"{run}: '.a_den' finite everywhere ({den.size} cells)")
+    clean = [r for r in (["c1_samp"] + (["g1_samp"] if gpu else [])) if DROP.search((tmp / f"{r}.log").read_text(errors="replace"))]
+    check("F5", not clean, "runs without the hook report no dropped share" + (f" -- they do: {clean}" if clean else ""))
 print("RESULT:", "PASS  (every grid of a pass is an exact sum: run- and thread-count independent)"
       if not fails else f"FAIL ({fails} check(s))")
 sys.exit(1 if fails else 0)

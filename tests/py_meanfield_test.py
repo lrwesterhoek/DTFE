@@ -16,7 +16,10 @@ a PS output the standard quantity, from its velocity grid, in the binary's conve
     for the V-web, three for the shear) and memmap input; FieldSet: PS mean_field == the analytic grid times sqrt(a),
     standard DTFE's mean_field=True byte-identical to its stored grid, has() needs the velocity grid for PS, the
     run log's --lambda_th, the refusals (a non-gradient name, the memory gate); the figure scripts' default
-    (plot_web_streams' table source and names, plot_cosmic_web and plot_shear_triaxial's report).
+    (plot_web_streams' table source and names, plot_cosmic_web and plot_shear_triaxial's report). (2026-10-15) the
+    one-plane entry point the launcher's Explore uses, mean_field_plane: np.take of the cube's result to float
+    rounding for all six names, every axis, planes at the box faces and on a slab boundary, random (not band-limited)
+    float32 and float64 grids of even and odd size, read through a minimal slab reader (no array, no memmap).
   * BINARY (the acceptance test; skipped when the binaries are not built -- a FAILURE under DTFE_TEST_REQUIRED=1):
     a Zel'dovich field plus a rotational flow, 32^3 particles, through the standard binary with --exact-average at
     32^3 and 64^3: the mean field of its OWN a_vel reproduces its a_velDiv (correlation >= 0.99), every gradient,
@@ -196,6 +199,57 @@ def t_plan_and_memmap():
         try:
             fields.mean_field_derivatives(bad, 1.0)
             raise AssertionError(f"shape {bad.shape} accepted")
+        except ValueError:
+            pass
+
+
+class _Slabs:
+    """The minimal velocity input mean_field_gradient_plane takes (the launcher's file reader): .shape, .dtype and
+    [s:e] along axis 0 -- every slab asked for is recorded."""
+
+    def __init__(self, a):
+        self._a, self.shape, self.dtype, self.asked = a, a.shape, a.dtype, []
+
+    def __getitem__(self, sl):
+        self.asked.append((sl.start, sl.stop))
+        return np.array(self._a[sl])
+
+
+def t_plane():
+    """mean_field_plane (2026-10-15): the plane 'index' normal to 'axis' of mean_field_derivatives' result, from one
+    pass in slabs -- the normal derivative as the periodic kernel irfft(i k) summed along the line, the in-plane ones
+    as 1-D FFTs of the plane."""
+    from dtfelib import fields
+    rng = np.random.default_rng(11)
+    names, lam = fields.MEAN_FIELD_NAMES, 0.3
+    for n, dtype, tol in ((24, np.float32, 2e-6), (15, np.float64, 1e-11)):
+        v = (300.0 * rng.normal(size=(n, n, n, 3))).astype(dtype)            # every mode up to Nyquist (n even)
+        cube = fields.mean_field_derivatives(v, 40.0, names, scale_factor=0.5, hubble_h=0.7, lambda_th=lam)
+        slab = 4 * n * n * 3 * np.dtype(dtype).itemsize                       # 4 layers a slab: several slabs
+        for axis in range(3):
+            for index in (0, 4, 7, n - 1):                                    # the faces, a slab's first and last layer
+                src = _Slabs(v)
+                got = fields.mean_field_plane(src, 40.0, names, axis, index, scale_factor=0.5, hubble_h=0.7,
+                                              lambda_th=lam, slab_bytes=slab)
+                assert src.asked[0] == (0, 4) and src.asked[-1][1] == n and len(src.asked) == -(-n // 4), src.asked
+                for nm in names:
+                    want = np.take(cube[nm], index, axis=axis)
+                    assert got[nm].dtype == want.dtype and got[nm].shape == want.shape, (nm, got[nm].dtype, want.shape)
+                    if nm == "vweb":                  # the labels: equal wherever no eigenvalue sits at the threshold
+                        ev = np.take(cube["vweb_eigenvalues"], index, axis=axis)
+                        clear = (np.abs(ev - lam) > 1e-4 * np.abs(ev).max()).all(axis=-1)
+                        assert clear.mean() > 0.9 and np.array_equal(got[nm][clear], want[clear]), (n, axis, index)
+                        continue
+                    err = float(np.abs(got[nm].astype(np.float64) - want).max() / np.abs(want).max())
+                    assert err < tol, (n, np.dtype(dtype).name, axis, index, nm, err)
+    g = fields.mean_field_gradient_plane(v, 40.0, 1, 3)
+    assert g.shape == (15, 15, 3, 3) and g.dtype == np.float64
+    assert np.array_equal(fields.mean_field_from_gradient(g, "divergence", real=np.float64)["divergence"],
+                          np.trace(g, axis1=-2, axis2=-1)), "the divergence is the trace"
+    for bad in ((np.zeros((4, 4, 4)), 0, 0), (np.zeros((4, 4, 4, 3)), 3, 0), (np.zeros((4, 4, 4, 3)), 0, 4)):
+        try:
+            fields.mean_field_gradient_plane(bad[0], 1.0, bad[1], bad[2])
+            raise AssertionError(f"accepted {bad[0].shape} axis {bad[1]} index {bad[2]}")
         except ValueError:
             pass
 
@@ -475,6 +529,8 @@ def main():
     check("V-web: eigenvalues of -sqrt(a)/(2*100h)(g + g^T), descending, labels above lambda_th, the a/h fallbacks", t_vweb_normalisation)
     check("symmetric_eigenvalues3 (the binary's Cardano) against numpy: random, isotropic, the pancake; classify_web", t_cardano)
     check("the spectra plan, the peak estimate, a memmap input, the shape refusals", t_plan_and_memmap)
+    check("mean_field_plane (Explore, 2026-10-15): one plane in slabs == the cube's result cut there, six names, every "
+          "axis, faces and slab boundaries, float32 / float64, even / odd size, a minimal slab reader", t_plane)
     check("FieldSet: PS mean field == analytic x sqrt(a), standard DTFE's stored grid kept, has(), the run log's lambda_th, refusals, the memory gate", t_fieldset_api)
     check("figure scripts: plot_web_streams / plot_cosmic_web / plot_shear_triaxial read PS's mean field by default, '--ps-gradient stored' the grids", t_scripts_default)
     print("binary (acceptance)")

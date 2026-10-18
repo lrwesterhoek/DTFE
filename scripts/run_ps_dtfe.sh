@@ -22,10 +22,10 @@
 #   Run logs, beside the outputs: <prefix>.runlog belongs to the grids on disk, <prefix>.runlog.failed
 #   to the last failed or stopped attempt, <prefix>.runlog.partial to a run still going (or killed outright).
 #   Knobs (environment; each is explained where the script sets it): PARTITION MAX_CONCURRENT AVG_SUBSAMPLES THREADS
-#   SCRATCH_DIR SAMPLE_POINTS PTS_VEL_GRAD PS_METAL PS_EXACT PS_VERTEX_MASS PS_VOLUME_WEIGHTED PS_LINEAR_DEPOSIT
+#   SCRATCH_DIR SAMPLE_POINTS PTS_VEL_GRAD PTS_CONVENTIONS PS_METAL PS_EXACT PS_VERTEX_MASS PS_VOLUME_WEIGHTED PS_LINEAR_DEPOSIT
 #   PS_CAUSTICS PS_CAUSTIC_CUSPS PS_PARALLEL_TRI PS_LAG_PADDING TESS_CACHE OUTPUT_PREFIX FIELDS LAMBDA_TH LAGRANGIAN_INPUT
 #   DTFE_PRECISION AUTO_TUNE_REPORT (1 = only the auto-tuner's memory report per snapshot, nothing computed)
-#   ORDERED_MERGE PS_RESUME. A partitioned run killed part-way resumes: when the snapshot's checkpoint
+#   ORDERED_MERGE FIXED_POINT_MERGE PS_RESUME. A partitioned run killed part-way resumes: when the snapshot's checkpoint
 #   (<prefix>.runlog.checkpoint, or in SCRATCH_DIR) exists, the next run passes --resume (PS_RESUME=0 starts over).
 #   While a snapshot runs, <prefix>.runlog.lock (a folder holding the driver's pid) refuses a second driver on
 #   it; a lock left by a killed driver is removed with a note. Before anything runs: the data disk must be
@@ -66,6 +66,13 @@ PTS_VEL_GRAD="${PTS_VEL_GRAD:-0}"   # 1 = with SAMPLE_POINTS, also write '.pts_v
                            # sample point (float64 x9). dtfelib.PointPlane derives the
                            # divergence / shear / vorticity maps from it, so this is what makes
                            # the velocity-derivative fields available to the hi-res figures.
+PTS_CONVENTIONS="${PTS_CONVENTIONS:-grid}"  # with SAMPLE_POINTS (2026-10-15): the points' conventions, the binary's
+                           # --pts-conventions. 'grid' (default; the binary's own since 2026-10-13) = the grids' vertex
+                           # masses (PS_VERTEX_MASS) and volume weighting (PS_VOLUME_WEIGHTED) at the points too;
+                           # 'legacy' = the estimators before that date (rho_bar*V_lag masses, density-weighted stream
+                           # means), which reproduces a plane made before it -- about 0.82 of the grid's density
+                           # contrast at z = 20 (the launcher's Runs tab warns about such planes). Only 'legacy' is
+                           # passed: a 'grid' run's command line is the one it was before the knob existed.
 PS_METAL="${PS_METAL:-auto}"  # 1 = the deposit on the GPU (--ps-gpu), 0 = the CPU; 'auto' (default, 2026-10-13; it
                            # was 0) = 1 when the binary is a GPU build (config.sh gpu_build_default), resolved
                            # below once DTFE_PRECISION has chosen the binary
@@ -77,6 +84,13 @@ ORDERED_MERGE="${ORDERED_MERGE:-1}"  # 1 (default since 2026-10-14; it was 0) = 
                            # the time it did (35% on a TNG region's GPU run, 2026-10-11). Passed explicitly, so the run
                            # log says it. 0 = --completion-order-merge, the old default: added as they finish, the
                            # grids then differ run to run in the last bits.
+FIXED_POINT_MERGE="${FIXED_POINT_MERGE:-0}"  # 1 = --fixed-point-merge (2026-10-15, OPT-IN, to compare against the default): each
+                           # partition is added AS IT FINISHES into exact integer full grids (9 B per summed component and
+                           # cell during the loop instead of 4), so the grids are the same bytes at any concurrency and
+                           # completion order and nothing parks or spills; they differ from the ordered merge at ~1e-7.
+                           # It replaces the merge flag (ORDERED_MERGE is then not used). Not with the double build
+                           # (DTFE_PRECISION=double): the binary refuses it. A checkpoint of one mode is not resumed by
+                           # the other (the binary refuses; PS_RESUME=0 starts over). 0 (default) = the ordered merge.
 PS_RESUME="${PS_RESUME:-1}"  # 1 (default) = resume a killed partitioned run: when the snapshot's checkpoint file
                            # exists (<prefix>.runlog.checkpoint/checkpoint beside the outputs, or under SCRATCH_DIR; config.sh
                            # ps_checkpoint_dir), --resume is passed and only the partitions it lacks are computed.
@@ -193,6 +207,10 @@ for _k in "${!SNAPSHOTS[@]}"; do
     fi
     SNAPSHOTS[$_k]=$((10#${_s}))
 done
+case "${PTS_CONVENTIONS}" in
+    grid|legacy) ;;
+    *) echo "Error: PTS_CONVENTIONS must be 'grid' or 'legacy' (got '${PTS_CONVENTIONS}')." >&2; exit 2 ;;
+esac
 
 [ -z "${DATA_DIR}" ] && DATA_DIR="$(sim_dir "${SIMULATION}")"
 # preflight (2026-10-11): with the data disk unmounted every snapshot used to print 'Input file not found'
@@ -406,6 +424,7 @@ for i in "${SNAPSHOTS[@]}"; do
     sp_args=()
     [ -n "${SAMPLE_POINTS}" ] && sp_args=(--sample-points "${SAMPLE_POINTS}")
     [ -n "${SAMPLE_POINTS}" ] && [ "${PTS_VEL_GRAD}" = "1" ] && sp_args+=(--pts-vel-grad)
+    [ -n "${SAMPLE_POINTS}" ] && [ "${PTS_CONVENTIONS}" = "legacy" ] && sp_args+=(--pts-conventions legacy)
 
     # Lagrangian positions: the separate IC file when it exists, else the snapshot's own
     # 'InitialCoordinates'. Skip only when NEITHER is available.
@@ -454,7 +473,9 @@ for i in "${SNAPSHOTS[@]}"; do
     [ -n "${MAX_CONCURRENT}" ] && part_args+=(--max-concurrent "${MAX_CONCURRENT}")
     [ -n "${SCRATCH_DIR}" ] && part_args+=(--scratch-dir "${SCRATCH_DIR}")
     # 2026-10-14: the merge order said either way (the run log names it; results.py reads the flag back)
-    if [ "${ORDERED_MERGE}" = "0" ]; then part_args+=(--completion-order-merge); else part_args+=(--ordered-merge); fi
+    # (2026-10-15: FIXED_POINT_MERGE=1 passes --fixed-point-merge instead, the opt-in order-free merge)
+    if [ "${FIXED_POINT_MERGE}" = "1" ]; then part_args+=(--fixed-point-merge)
+    elif [ "${ORDERED_MERGE}" = "0" ]; then part_args+=(--completion-order-merge); else part_args+=(--ordered-merge); fi
     # a killed partitioned run left its checkpoint (the binary removes it once the outputs are in place): resume it.
     # The FILE, not the folder (2026-10-11): a folder with no 'checkpoint' in it (a kill during the first write) holds
     # nothing to resume, the binary refuses '--resume' there, and every rerun of the snapshot failed the same way

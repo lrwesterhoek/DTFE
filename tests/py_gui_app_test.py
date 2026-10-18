@@ -285,7 +285,8 @@ def main():
         # cusps box is enabled (unticked) from the start
         check("the run options show the scripts' defaults; cusps wait for caustics, the slab and projection for planes",
               w.p_deposit.currentData() == "sampled" and w.p_nsub.value() == 3 and w.p_nsub.isEnabled()
-              and w.p_gpu.isChecked() and w.p_vm.isChecked() and w.p_vw.isChecked() and w.p_ca.isChecked()
+              and w.p_gpu.isChecked() == rs.gpu_build_default("ps") and w.p_vm.isChecked() and w.p_vw.isChecked()
+              and w.p_ca.isChecked()
               and w.p_cu.isEnabled() and not w.p_cu.isChecked() and not w.p_pt.isHidden() and w.p_planes.value() == 1
               and not w.p_thick.isEnabled() and w.p_super.value() == 1 and not w.p_rproject.isEnabled()
               and w.p_render_box.isEnabled() and w.p_rsmoothd.value() == rs.POINTEVAL_DERIVATIVE_SMOOTH)
@@ -1005,6 +1006,27 @@ def new_user_features(qa, w, tmp, data, sim):
           "(the sampled deposit, sub-samples editable)",
           w.deposit_combo.itemText(w.deposit_combo.findData("exact")) == P.label("exact") and w.spec.estimator == "ps"
           and w.spec.deposit == "sampled" and w.deposit_combo.currentData() == "sampled" and w.nsub_spin.isEnabled())
+    # 2026-10-15: a choice made for an estimator comes back with it: PS-DTFE's exact deposit after PS -> standard ->
+    # PS (it became the sampled deposit), standard DTFE's Monte-Carlo average after standard -> PS -> standard
+    w.deposit_combo.setCurrentIndex(w.deposit_combo.findData("exact"))
+    w.dtfe_radio.setChecked(True)
+    qa.processEvents()
+    on_dtfe = w.spec.deposit                                    # the exact average: the same either way
+    w.deposit_combo.setCurrentIndex(w.deposit_combo.findData("sampled"))     # the Monte-Carlo average, by hand
+    w.ps_radio.setChecked(True)
+    qa.processEvents()
+    back_ps = (w.spec.deposit, w.deposit_combo.currentData(), w.gpu_check.isChecked())
+    w.dtfe_radio.setChecked(True)
+    qa.processEvents()
+    back_dtfe = (w.spec.deposit, "DTFE_EXACT_AVERAGE=0" in w.cmd_view.toPlainText())
+    w.ps_radio.setChecked(True)
+    qa.processEvents()
+    check("the deposit choice per estimator: PS-DTFE's exact deposit comes back after a switch to standard DTFE and "
+          "back (the GPU ticked, when built), standard DTFE's Monte-Carlo average too",
+          on_dtfe == "exact" and back_ps == ("exact", "exact", rs.gpu_built("ps"))
+          and back_dtfe == ("sampled", True) and w.spec.deposit == "exact", f"{on_dtfe} {back_ps} {back_dtfe}")
+    w.deposit_combo.setCurrentIndex(w.deposit_combo.findData("sampled"))
+    qa.processEvents()
     w.gpu_check.setChecked(False)
     qa.processEvents()
     w.user_presets["mine"] = P.capture(w.spec)
@@ -1058,6 +1080,15 @@ def new_user_features(qa, w, tmp, data, sim):
     check("... back on PS-DTFE: the sampled deposit again, no '--padding'",
           w.custom.estimator == "ps" and w.custom.deposit == "sampled" and "--padding" not in w.cmd_view.toPlainText()
           and "--avg-subsamples" in w.cmd_view.toPlainText(), w.cmd_view.toPlainText())
+    w.o_deposit.setCurrentIndex(w.o_deposit.findData("exact"))      # 2026-10-15: the choice per estimator, here too
+    w.o_dtfe.setChecked(True)
+    w.o_ps.setChecked(True)
+    qa.processEvents()
+    check("Custom tab: PS-DTFE's exact deposit comes back after a switch to standard DTFE and back",
+          w.custom.estimator == "ps" and w.custom.deposit == "exact" and "--ps-exact-deposit" in w.cmd_view.toPlainText(),
+          w.cmd_view.toPlainText())
+    w.o_deposit.setCurrentIndex(w.o_deposit.findData("sampled"))
+    qa.processEvents()
     check("a periodic box: no alpha-shape row", not w.o_snap_form.isRowVisible(w.o_alpha)
           and "ps-alpha-shape" not in w.cmd_view.toPlainText())
     w.o_periodic.setChecked(False)

@@ -953,7 +953,10 @@ endif
 	@echo "Include flags: $(INCLUDES)"
 	@echo "Libraries: $(DTFE_LIB)"
 
+# the folders are made here too (2026-10-15): under 'make -j' this rule can run before set_directories_2, and on a
+# fresh checkout (CI) './DTFE_include' did not exist yet -- 'make library' failed with 'cp: target ... No such file'
 copy_headers:
+	@$(MKDIR_P) $(INC_DIR)/CGAL_triangulation
 	cp $(addprefix $(SRC)/, $(HEADERS_1)) $(INC_DIR)
 	cp $(addprefix $(SRC)/, $(HEADERS_2)) $(INC_DIR)/CGAL_triangulation
 

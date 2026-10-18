@@ -566,6 +566,14 @@ bool runBatch(Ctx& c, Batch& b, Grids& g, ChunkState& cs, Stats& st, bool shared
     b.P.tableEntries = tableEntries;
     MTL::Buffer* bP = c.dev->newBuffer(sizeof(DepositParams), MTL::ResourceStorageModeShared);
     if (!bP) { err = "Metal buffer allocation failed (params)"; return false; }
+    // The non-finite guard's counters (2026-10-15; metal/dtfe_deposit.metal fxq), one word per grid at buffer 21:
+    // zeroed before each command buffer and added into badRun after one that succeeded; a restore rolls badRun
+    // back to the held snapshot's (badCk), so a failed buffer and the redone ones count once. Handed to the run's
+    // counters (ps_deposit_params.h fixedShareDrops) only when the batch succeeds.
+    MTL::Buffer* bBad = c.dev->newBuffer(FX_DROP_SLOTS * 4, MTL::ResourceStorageModeShared);
+    if (!bBad) { bP->release(); err = "Metal buffer allocation failed (guard counters)"; return false; }
+    uint32_t* const badW = static_cast<uint32_t*>(bBad->contents());
+    unsigned long long badRun[FX_DROP_SLOTS] = {}, badCk[FX_DROP_SLOTS] = {};
 
     // DTFE_GPU_CHECKPOINT_CHUNKS=<n>: a checkpoint every n command buffers (0 = only the batch-start snapshot).
     // Unset: every ~10 s of GPU work (n = 10 s / the current buffer target), as the PS deposit's.
@@ -606,6 +614,7 @@ bool runBatch(Ctx& c, Batch& b, Grids& g, ChunkState& cs, Stats& st, bool shared
         b.P.itemBase = uint32_t(start);
         std::memcpy(bP->contents(), &b.P, sizeof(DepositParams));   // safe: previous chunk completed
 
+        std::memset(badW, 0, FX_DROP_SLOTS * 4);                     // (likewise)
         auto t0 = std::chrono::steady_clock::now();
         MTL::CommandBuffer* cb = c.q->commandBuffer();
         MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
@@ -644,6 +653,7 @@ bool runBatch(Ctx& c, Batch& b, Grids& g, ChunkState& cs, Stats& st, bool shared
         enc->setBuffer(g.grad, 0, 18);
         enc->setBuffer(g.scal, 0, 19);
         enc->setBuffer(g.sgrad, 0, 20);
+        enc->setBuffer(bBad,   0, 21);
         if (useItems && !exact)
         {
             enc->setThreadgroupMemoryLength(keyBytes, 0);
@@ -697,6 +707,7 @@ bool runBatch(Ctx& c, Batch& b, Grids& g, ChunkState& cs, Stats& st, bool shared
             size_t resumeAt = 0;
             if (sharedBox) g.zeroBox(b.P.subOff, b.P.nGrid);
             else { snap.restore(); resumeAt = snap.start; }
+            std::memcpy(badRun, badCk, sizeof badRun);   // (sharedBox: the batch's start, all zero)
             if (ckPeriodic) ++nResumedCk;
             fprintf(stderr, "%sDTFE Metal: %s -- resuming from the %s at thread %zu of %zu "
                             "(redoing %zu; failure %d of this chunk, target %.0f ms buffers, %.0f ms gaps)%s\n",
@@ -713,6 +724,7 @@ bool runBatch(Ctx& c, Batch& b, Grids& g, ChunkState& cs, Stats& st, bool shared
 
         start += n;
         ++sinceCk;
+        for (int k = 0; k < FX_DROP_SLOTS; ++k) badRun[k] += badW[k];
         if (el > 1e-4)   // retarget the next chunk toward targetSec (bounded rescale)
         {
             double scale = pace.targetSec / el;
@@ -736,7 +748,8 @@ bool runBatch(Ctx& c, Batch& b, Grids& g, ChunkState& cs, Stats& st, bool shared
         long const every = ckChunks >= 0 ? ckChunks : std::max(1L, long(std::lround(10.0 / pace.targetSec)));
         if (!sharedBox && ckOn && every > 0 && long(sinceCk) >= every && start < nThreads)
         {   // the queue is drained (waitUntilCompleted above): the buffers hold exactly [0, start)
-            if (snap.take(gridBufs, std::vector<bool>(), start)) { ++snap.taken; ckPeriodic = true; sinceCk = 0; }
+            if (snap.take(gridBufs, std::vector<bool>(), start))
+            { ++snap.taken; ckPeriodic = true; sinceCk = 0; std::memcpy(badCk, badRun, sizeof badCk); }
             // else: no host memory for the spare copy; the last snapshot stays valid
         }
         usleep(pace.gapUs);   // deliberate idle gap: lets WindowServer take the GPU
@@ -748,12 +761,16 @@ bool runBatch(Ctx& c, Batch& b, Grids& g, ChunkState& cs, Stats& st, bool shared
                 success ? MESSAGE::cYellow() : MESSAGE::cRed(), success ? "recovered on the GPU" : "gave up",
                 nFailed, nResumedCk, snap.taken, snap.bytes / 1.e6, snap.sec, MESSAGE::cReset());
     bP->release();
+    bBad->release();
     if (!success)
     {   // leave the owner box clean for whoever deposits this sub-domain instead
         drainQueue();
         if (sharedBox) g.zeroBox(b.P.subOff, b.P.nGrid);
         err = lastErr;
     }
+    else   // the batch is kept: its dropped shares join the run's counts (reported once at the end, DTFE.cpp)
+        for (int k = 0; k < FX_DROP_SLOTS; ++k)
+            if (badRun[k]) fixedShareDropped(k, badRun[k]);
     return success;
 }
 

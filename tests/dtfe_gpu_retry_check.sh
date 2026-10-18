@@ -33,6 +33,14 @@
 #   S1  the opt-in shared full grid (DTFE_GPU_SHARED=1; float sums, no periodic checkpoints): an innocent fault
 #       re-zeroes the batch's owner box and resumes from its start; the grids agree with a fault-free shared run
 #       to 1e-5 of the peak
+#   R8  (2026-10-15) the image-plane shape of the recipe's dtfe27planes stage: '--sample-points' with
+#       '--exact-average' under --partition 2 2 2 (one triangulation per partition, DTFE_parallel's single-
+#       triangulation branch) and a 'persist' fault, so every partition's grid falls back to the CPU: the fallback
+#       runs the THREADED exact average (DTFE_DEPOSIT_THREADS=4: the log says so once per partition; it ran on one
+#       thread before), and its '.a_*' grids and '.pts_*' answers are byte-identical to a one-thread CPU run
+#   N1  (2026-10-15) the non-finite guard of the exact sums (ps_deposit_params.h psFixedShareOk): DTFE_TEST_NAN_SHARE=50
+#       makes about one tetrahedron in 50 hand the kernel NaN vertex densities; the run reports once how many density
+#       shares it left out, and its '.a_den' has no NaN or infinity
 # GPU builds only: Metal, or the CUDA/HIP port (CUDAEMU=1 runs it on the CPU emulation, tests/cudaemu_check.sh);
 # skipped (exit 0) otherwise, a local GPU suite like tests/gpu_retry_check.sh (not in tests/ci_suite.sh). ~30 s on
 # Metal (M1 Max), a few minutes under the emulation. DTFE_TEST_PRECISION=double runs ./DTFE-double.
@@ -97,6 +105,20 @@ ALLOW_CPU=1 run "$TMP/y1" env DTFE_GPU_FAULT_AT=3:persist "${DTFE_BIN}" "$SNAP" 
 echo ">> S1: the shared full grid (DTFE_GPU_SHARED=1), without and with an innocent fault at buffer 5"
 run "$TMP/s0" env DTFE_GPU_SHARED=1 "${DTFE_BIN}" "$SNAP" "$TMP/s0" "${C[@]}" --gpu
 run "$TMP/s1" env DTFE_GPU_SHARED=1 DTFE_GPU_FAULT_AT=5 "${DTFE_BIN}" "$SNAP" "$TMP/s1" "${C[@]}" --gpu
+echo ">> R8: a --sample-points plane with --exact-average, a persistent fault: every partition on the threaded CPU average"
+"$PY" - "$TMP/plane.bin" <<'PYEOF' || { echo "FAIL: R8 points"; exit 1; }
+import sys, numpy as np
+c = (np.arange(48) + 0.5) * 100. / 48           # a 48^2 plane across the 100 Mpc box, off the grid planes
+X, Y = np.meshgrid(c, c, indexing="ij")
+np.stack([X.ravel(), Y.ravel(), np.full(X.size, 50.3)], 1).astype(np.float64).tofile(sys.argv[1])
+PYEOF
+PL=(--grid 32 --periodic --input 105 --MpcUnit 1 --verbose 2 --padding 15 --field density_a velocity_a gradient_a
+    --exact-average --partition 2 2 2 --max-concurrent 1 --sample-points "$TMP/plane.bin" --pts-vel-grad)
+ALLOW_CPU=1 run "$TMP/v1" env DTFE_GPU_FAULT_AT=3:persist DTFE_DEPOSIT_THREADS=4 "${DTFE_BIN}" "$SNAP" "$TMP/v1" "${PL[@]}" --gpu
+env DTFE_DEPOSIT_THREADS=1 "${DTFE_BIN}" "$SNAP" "$TMP/v0" "${PL[@]}" > "$TMP/v0.log" 2>&1 \
+    || { echo "FAIL: the one-thread CPU plane run (see $TMP/v0.log)"; exit 1; }
+echo ">> N1: the non-finite guard (DTFE_TEST_NAN_SHARE=50: NaN vertex densities in about one tetrahedron in 50)"
+run "$TMP/n1" env DTFE_TEST_NAN_SHARE=50 "${DTFE_BIN}" "$SNAP" "$TMP/n1" "${C[@]}" "${ONE[@]}" --gpu
 GPU_STAMP="$gpu_stamp" "$PY" - "$TMP" <<'PYEOF'
 import numpy as np, re, sys
 import os as _os; REAL = np.dtype(_os.environ.get("DTFE_TEST_REAL", "float32"))   # tests/precision.sh
@@ -192,6 +214,23 @@ check("S1", re.search(r"\[innocent victim\] -- resuming from the pass start at t
       "shared grid: the fault re-zeroes the batch's owner box and resumes from its start")
 worst = max(peak("s0", "s1", ext) for ext in GRIDS)
 check("S1", worst < 1e-5, f"shared grid: the grids agree with a fault-free shared run to {worst:.1e} of the peak (< 1e-5)")
+L = log("v1")
+nfall, nthr = L.count("using the CPU interpolation"), len(re.findall(r"exact average on 4 CPU threads", L))
+check("R8", nfall == 8 and nthr == 8 and "exact average on" not in log("v0"),
+      f"planes + exact average, persistent fault: {nfall} of 8 partitions fell back, {nthr} of them on the threaded "
+      "CPU exact average (4 threads); the one-thread run says nothing of the kind")
+outs = sorted(p.name[3:] for p in tmp.glob("v0.*") if p.name[3:] not in ("log", "runlog") and not p.name.endswith((".json", ".txt")))
+diff = [e for e in outs if not (tmp / f"v1.{e}").is_file() or (tmp / f"v0.{e}").read_bytes() != (tmp / f"v1.{e}").read_bytes()]
+check("R8", len(outs) >= 6 and any(e.startswith("pts_") for e in outs) and not diff,
+      f"the fallback's grids and point answers byte-identical to a one-thread CPU run ({len(outs)} outputs"
+      + (f"; DIFFER: {diff})" if diff else ")"))
+m = re.findall(r"(\d+) share\(s\) of the exact fixed-point sums were not finite.*?density grid (\d+)", log("n1"))
+check("N1", len(m) == 1 and int(m[0][1]) > 0,
+      "NaN vertex densities: the run reports its dropped density shares once"
+      + (f" ({m[0][1]})" if m else " -- NO such warning"))
+den = rd("n1", "a_den")
+check("N1", den.size > 0 and bool(np.isfinite(den).all()), f"NaN vertex densities: '.a_den' finite everywhere ({den.size} cells)")
+check("N1", not re.search(r"share\(s\) of the exact fixed-point sums", log("a1")), "a run without the hook reports no dropped share")
 print("RESULT:", "PASS  (two GPU runs write the same grids, and a failed GPU buffer resumes from its checkpoint with "
       "exact grids, by cause; only a persistent failure reaches the CPU)" if not fails else f"FAIL ({fails} check(s))")
 sys.exit(1 if fails else 0)

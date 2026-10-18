@@ -31,7 +31,9 @@ on:
 jobs:
   build-and-test:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    # 60 until 2026-10-15: the single-precision battery alone outgrew it on the 4-core runner (cancelled at 1 h in
+    # 'Test battery (single precision)'; locally it is 18 min on 10 cores), the double and 2D passes come after it
+    timeout-minutes: 150
     env:
       CCACHE_MAXSIZE: 500M
     steps:

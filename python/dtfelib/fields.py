@@ -1,5 +1,6 @@
 """Generic grid-field utilities (smoothing, slices, minima, shape parameters, cosmology, and since 2026-10-13 the
-mean-field velocity derivatives: mean_field_derivatives, the V-web of the mean flow for PS-DTFE grids).
+mean-field velocity derivatives: mean_field_derivatives, the V-web of the mean flow for PS-DTFE grids; since
+2026-10-15 the same on one plane in a single pass over the grid, mean_field_plane, for the launcher's Explore).
 
 Plain numpy/scipy only -- no config or I/O; callers pass everything in. Import as
 `from dtfelib import fields as dtfe` (the historical alias used by the plot scripts).
@@ -305,6 +306,13 @@ def symmetric_eigenvalues3(a00, a01, a02, a11, a12, a22) -> np.ndarray:
     return -np.sort(-ev, axis=-1)                           # descending (the binary's three swaps)
 
 
+def _vweb_norm(scale_factor, hubble_h) -> float:
+    """The V-web's -sqrt(a)/(2 H0), H0 = 100 h, with the binary's fallbacks (a or h None or <= 0: 1)."""
+    sqrt_a = float(np.sqrt(scale_factor)) if scale_factor is not None and scale_factor > 0 else 1.0
+    h0 = 100.0 * float(hubble_h) if hubble_h is not None and hubble_h > 0 else 1.0
+    return -sqrt_a / (2.0 * h0)
+
+
 def classify_web(eigenvalues, lambda_th: float) -> np.ndarray:
     """The web label of DTFE.cpp classifyWeb: how many eigenvalues (last axis) exceed lambda_th -- 0 void, 1 wall,
     2 filament, 3 node -- as float32, the binary's on-disk type of the '.velVweb' / '.tweb' grids."""
@@ -425,9 +433,7 @@ def mean_field_derivatives(velocity, box_mpc: float, names=("divergence",), *, s
     del acc, tmp, spec
 
     if want_web:
-        sqrt_a = float(np.sqrt(scale_factor)) if scale_factor is not None and scale_factor > 0 else 1.0
-        h0 = 100.0 * float(hubble_h) if hubble_h is not None and hubble_h > 0 else 1.0
-        norm = -sqrt_a / (2.0 * h0)                         # Sigma = norm (g + g^T): tensor holds g + g^T already
+        norm = _vweb_norm(scale_factor, hubble_h)          # Sigma = norm (g + g^T): tensor holds g + g^T already
         eig = np.empty((n, n, n, 3), dtype=real) if "vweb_eigenvalues" in names else None
         lab = np.empty((n, n, n), dtype=np.float32) if "vweb" in names else None
         step = max(1, _EIG_SLAB_CELLS // (n * n))
@@ -444,3 +450,104 @@ def mean_field_derivatives(velocity, box_mpc: float, names=("divergence",), *, s
         if lab is not None:
             out["vweb"] = lab
     return out
+
+
+# ---------------------------------------------------------------- the same derivatives on ONE plane (2026-10-15)
+# The launcher's Explore shows a PS output's divergence / shear / vorticity / gradient / V-web as the mean field
+# (the figure scripts' default) one slice at a time, beside a running job whose memory budget it must leave alone:
+# mean_field_derivatives' whole-cube FFTs peak at 3.2-7.5 GB on a 512^3 grid. The spectral derivative is separable:
+# d/dx_b of the 3D transform multiplies by i k_b alone, so it is the 1-D spectral derivative along axis b of every
+# line of the grid -- a periodic convolution with the fixed kernel K = irfft(i k) (the 1-D wavenumbers with the
+# Nyquist mode zeroed, _wavenumbers), (D v)_i = sum_j K[(i - j) mod n] v_j. On the plane 'index' normal to 'axis'
+# the in-plane derivatives are then 1-D FFTs of the plane itself, and the normal one the kernel's weighted sum over
+# the line through each pixel: one pass over the grid in slabs along axis 0, holding one slab (16 MB by default) and
+# a few planes -- about 100 MB in all at 512^3 (the slab, its float64 copy in the contraction; 64 MB slabs: 350 MB,
+# no faster). The same linear operator as the cube's, so the same numbers to float rounding (measured 2e-7 of the
+# largest value on random, not band-limited, float32 grids of even and odd n, every axis; tests/
+# py_meanfield_test.py repeats it for the six names). Cost: one read of the velocity grid per plane (0.3-0.6 s at
+# 512^3 from memory, 0.6-1.0 s from a file in the page cache; measured on a loaded machine).
+def mean_field_gradient_plane(velocity, box_mpc: float, axis: int, index: int, *, slab_bytes: int = 16 << 20):
+    """g[..., a, b] = dv_a/dx_b, float64 (N, N, 3, 3), on the plane 'index' normal to 'axis' of the periodic
+    (N,N,N,3) 'velocity' grid of a box_mpc box: exactly mean_field_derivatives' spectral gradient there (its
+    'gradient' cut as np.take(cube, index, axis), reshaped to 3 x 3), from one pass over the grid (the section
+    comment above). 'velocity': anything with .shape, .dtype and [s:e] slabs along axis 0 -- an array, a memmap,
+    or a reader that does plain reads (the launcher never maps a file: a page of an unplugged drive is a SIGBUS);
+    slabs of about slab_bytes (16 MB: ~100 MB in all at 512^3). Units: the velocity's per Mpc."""
+    shape = tuple(int(v) for v in np.shape(velocity))
+    if len(shape) != 4 or shape[3] != 3 or not (shape[0] == shape[1] == shape[2]):
+        raise ValueError(f"mean_field_gradient_plane needs an (N,N,N,3) velocity grid, got {shape}")
+    n, axis, index = shape[0], int(axis), int(index)
+    if axis not in (0, 1, 2) or not 0 <= index < n:
+        raise ValueError(f"plane {index} along axis {axis} is outside an {n}^3 grid")
+    rest = [a for a in range(3) if a != axis]
+    k = _wavenumbers(n, box_mpc, True)
+    w = np.fft.irfft(1j * k, n)[(index - np.arange(n)) % n]         # K[(index - j) mod n], j = 0 .. n-1
+    item = np.dtype(getattr(velocity, "dtype", np.float32)).itemsize
+    step = max(1, int(slab_bytes) // (n * n * 3 * item))
+    plane = np.empty((n, n, 3))
+    normal = np.zeros((n, n, 3))
+    for s in range(0, n, step):
+        e = min(n, s + step)
+        slab = np.asarray(velocity[s:e])
+        if axis == 0:
+            normal += np.tensordot(w[s:e], slab, axes=(0, 0))
+            if s <= index < e:
+                plane[...] = slab[index - s]
+        elif axis == 1:
+            normal[s:e] = np.tensordot(slab, w, axes=(1, 0))
+            plane[s:e] = slab[:, index]
+        else:
+            normal[s:e] = np.tensordot(slab, w, axes=(2, 0))
+            plane[s:e] = slab[:, :, index]
+        del slab
+    g = np.empty((n, n, 3, 3))
+    g[..., axis] = normal
+    for pa, b in enumerate(rest):                          # the plane's axis pa is the grid's axis b
+        ik = (1j * k).reshape((-1, 1, 1) if pa == 0 else (1, -1, 1))
+        g[..., b] = np.fft.irfft(np.fft.rfft(plane, axis=pa) * ik, n, axis=pa)
+    return g
+
+
+def mean_field_from_gradient(g, names=("divergence",), *, real=np.float32, scale_factor: float | None = 1.0,
+                             hubble_h: float | None = None, lambda_th: float = 0.3) -> dict:
+    """{name: array} of mean_field_derivatives' results from a velocity gradient g[..., a, b] = dv_a/dx_b (any
+    leading shape; mean_field_gradient_plane's plane): the same combinations of the components (_velgrad_terms), each
+    rounded to 'real' as the cube's inverse FFTs are (float32 for a float32 grid), the V-web's tensor likewise
+    before its eigenvalues (the same normalisation, Cardano and labels). Shapes: g's leading shape, with the
+    components last where there are several."""
+    names = (names,) if isinstance(names, str) else tuple(names)
+    for nm in names:
+        if nm not in MEAN_FIELD_NAMES:
+            raise KeyError(f"no mean-field derivative {nm!r}; known: {', '.join(MEAN_FIELD_NAMES)}")
+    g = np.asarray(g, dtype=np.float64)
+    real = np.float64 if np.dtype(real) == np.float64 else np.float32
+
+    def combine(terms):
+        return sum(coef * g[..., a, b] for a, b, coef in terms).astype(real)
+
+    out = {}
+    for nm in names:
+        if nm in ("vweb", "vweb_eigenvalues") or nm in out:
+            continue
+        comps = [combine(t) for t in _velgrad_terms(nm)]
+        out[nm] = comps[0] if len(comps) == 1 else np.stack(comps, axis=-1)
+    if any(nm in ("vweb", "vweb_eigenvalues") for nm in names):
+        norm = _vweb_norm(scale_factor, hubble_h)
+        tensor = [combine(t) for t in _velgrad_terms("vweb_tensor")]
+        ev = symmetric_eigenvalues3(*(norm * c.astype(np.float64) for c in tensor))
+        if "vweb_eigenvalues" in names:
+            out["vweb_eigenvalues"] = ev.astype(real)
+        if "vweb" in names:
+            out["vweb"] = classify_web(ev.astype(real), lambda_th)
+    return {nm: out[nm] for nm in names}
+
+
+def mean_field_plane(velocity, box_mpc: float, names, axis: int, index: int, *, scale_factor: float | None = 1.0,
+                     hubble_h: float | None = None, lambda_th: float = 0.3, slab_bytes: int = 16 << 20) -> dict:
+    """{name: plane} of mean_field_derivatives(velocity, box_mpc, names, ...) on the one plane 'index' normal to
+    'axis' -- np.take(result, index, axis) to rounding, the same dtype and component order -- in one pass over the
+    grid (mean_field_gradient_plane: one slab in memory, never the cube's FFTs)."""
+    real = np.float64 if np.dtype(getattr(velocity, "dtype", np.float32)) == np.float64 else np.float32
+    g = mean_field_gradient_plane(velocity, box_mpc, axis, index, slab_bytes=slab_bytes)
+    return mean_field_from_gradient(g, names, real=real, scale_factor=scale_factor, hubble_h=hubble_h,
+                                    lambda_th=lambda_th)

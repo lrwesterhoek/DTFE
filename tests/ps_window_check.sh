@@ -6,12 +6,19 @@
 # triangulation by summation order). Then the launcher's zoom shape: an anisotropic 256x256x16 grid
 # windowed to one coarse slice, exact deposit, with the wall times of both runs.
 # Contracts: the SAMPLED deposit counts a straddling tet's samples over its whole bounding box, so
-# the CPU window is identical bytes (every field, masks and counts included). The EXACT deposit
-# clips only the window's cells and normalizes each tet by its whole weight, so its moments agree
-# to float rounding (the counts, masks and multiplicity are still identical bytes); the GPU takes
-# the usual parity class. With '--tessellation-cache', a window run skips the partitions whose occupancy
+# the CPU window has the full run's values: its counts and masks identical bytes, its summed grids identical to
+# the rounding of the fixed-point units -- a window pass takes ITS OWN units since 2026-10-15 (from the tets that
+# reach the window, the same on the GPU and the CPU: ps_interpolation.cc fxBoundWalk), so a share below ~2^-38 of
+# the bound can round to another last unit than in the full run (peak-relative < 1e-8; measured 1e-10, in the
+# velocity gradient only, on these waves; until 2026-10-15 identical bytes, the CPU taking the full run's units
+# and the GPU its window's). The EXACT deposit clips only the window's cells and normalizes each tet by its
+# whole weight, so its moments agree to float rounding (the counts, masks and multiplicity are still identical
+# bytes); the GPU takes the usual parity class. GPU builds: a GPU window and the CPU window of the same pass
+# (--partition 2 2 2, --verbose 3) take the same fixed-point units -- their 'fixed-point units' lines, one per
+# pass, are equal -- and their grids agree to the GPU parity class (the kernels form their shares in float). With '--tessellation-cache', a window run skips the partitions whose occupancy
 # maps (written by a composite server or by an earlier batch run) never reach the window: identical
-# bytes to the uncached run, the skip count reported. --no-build is accepted and ignored.
+# bytes to the uncached run, the skip count reported. The units comparison runs in the single build only (the double
+# build's CPU sums are doubles). --no-build is accepted and ignored.
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(dirname "$SCRIPT_DIR")"
@@ -71,6 +78,27 @@ run "$TMP/zoom_full" "$PS_BIN" "$SNAP" "$TMP/zoom_full" --grid 256 256 16 "${BAS
 run "$TMP/zoom_win"  "$PS_BIN" "$SNAP" "$TMP/zoom_win"  --grid 256 256 16 "${BASE[@]}" --ps-exact-deposit --ps-window 25 75 25 75 50 56.25
 if [ $GPU = 1 ]; then
     run "$TMP/zoom_wingpu" "$PS_BIN" "$SNAP" "$TMP/zoom_wingpu" --grid 256 256 16 "${BASE[@]}" --ps-exact-deposit --ps-window 25 75 25 75 50 56.25 --ps-gpu
+    # the units of a GPU and a CPU window pass (2026-10-15): before, the CPU walk bounded every tet of the partition
+    # and the GPU extraction only the window's, so the two took different units (and different last bits). Single
+    # build only: the double build's CPU deposit keeps double sums (no units to compare)
+    precision_double && echo ">> GPU vs CPU window units: SKIP (the double build's CPU sums are doubles)"
+    precision_double || echo ">> GPU vs CPU window: the same fixed-point units per pass (--partition 2 2 2, --verbose 3)"
+    precision_double || for v in "sampled:--avg-subsamples 2" "exact:--ps-exact-deposit --ps-vertex-mass --ps-volume-weighted" "hr:--ps-halo-release 2"; do
+        tag="${v%%:*}"; read -r -a O <<< "${v#*:}"
+        for dev in cpu gpu; do
+            D=(); [ $dev = gpu ] && D=(--ps-gpu)
+            run "$TMP/units_${tag}_$dev" "$PS_BIN" "$SNAP" "$TMP/units_${tag}_$dev" --grid $G "${BASE[@]}" "${O[@]}" \
+                --partition 2 2 2 --verbose 3 "${WA[@]}" ${D[@]+"${D[@]}"}
+            sed -n 's/^PS-DTFE fixed-point units ([CG]PU): //p' "$TMP/units_${tag}_$dev.log" > "$TMP/units_${tag}_$dev.txt"
+        done
+        grep -q "using the CPU deposit\|deposit unavailable" "$TMP/units_${tag}_gpu.log" && { echo "FAIL: the GPU units run fell back to the CPU"; exit 1; }
+        n=$(wc -l < "$TMP/units_${tag}_cpu.txt" | tr -d ' ')
+        if [ "$n" = 8 ] && cmp -s "$TMP/units_${tag}_cpu.txt" "$TMP/units_${tag}_gpu.txt" && grep -q "mass 2^" "$TMP/units_${tag}_cpu.txt"; then
+            echo "  PASS $tag: the GPU and the CPU window take the same units in all $n passes ($(grep -m1 'mass 2^' "$TMP/units_${tag}_cpu.txt"))"
+        else
+            echo "  FAIL $tag: the window passes' units differ ($n CPU lines; diff below)"; diff "$TMP/units_${tag}_cpu.txt" "$TMP/units_${tag}_gpu.txt" | head -8; exit 1
+        fi
+    done
 fi
 echo ">> the tessellation cache + occupancy maps: a window run skips the partitions that never reach the window"
 # the cache must live on a local, non-synced volume (the option refuses iCloud Drive, where the repo is)
@@ -212,7 +240,8 @@ def window_of(full, lo, dims):
     idx = [np.arange(lo[d], lo[d] + dims[d]) % full.shape[d] for d in range(3)]
     return full[np.ix_(*idx)]
 def compare(tag, fullp, winp, lo, dims, shape, cls):
-    """cls: 'bytes' (identical), 'tight' (exact CPU: moments to float rounding), 'gpu' (the parity class)"""
+    """cls: 'bytes' (identical), 'window' (sampled CPU: counts and masks identical, summed grids to the fixed-point
+    units' rounding), 'tight' (exact CPU: moments to float rounding), 'gpu' (the parity class)"""
     global fails
     fields = FIELDS + ((("tetTouch", 1),) if "exact" in tag or "zoom" in tag else ())
     for name, nc in fields:
@@ -229,8 +258,8 @@ def compare(tag, fullp, winp, lo, dims, shape, cls):
         else:
             sc = max(float(np.abs(a).max()), 1e-30); d = np.abs(a - b)
             p = d.max() / sc; fr = float(np.mean(d > 1e-3 * sc))
-            if cls == "tight":
-                tol = 1e-3 if name in ("velDisp", "velDispTensor") else 1e-5   # the dispersion cancels E[v^2]-E[v]^2
+            if cls in ("tight", "window"):
+                tol = 1e-8 if cls == "window" else 1e-3 if name in ("velDisp", "velDispTensor") else 1e-5   # the dispersion cancels E[v^2]-E[v]^2
                 ok = p < tol
                 print(f"  {'PASS' if ok else 'FAIL'} {tag} {name:15s} peak-rel={p:.2e} (< {tol:g})")
             else:
@@ -239,7 +268,7 @@ def compare(tag, fullp, winp, lo, dims, shape, cls):
         fails += not ok
 LO, DIMS, SHAPE = (8, 40, 30), (16, 12, 1), (G, G, G)
 SEAM = (56, 40, 30)
-for mode, cls in (("sampled", "bytes"), ("exact", "tight")):
+for mode, cls in (("sampled", "window"), ("exact", "tight")):
     compare(f"{mode} window == full",                        f"{mode}_full",     f"{mode}_win",   LO,   DIMS, SHAPE, cls)
     compare(f"{mode} seam window == full (wrapped cells)",   f"{mode}_full",     f"{mode}_seam",  SEAM, DIMS, SHAPE, cls)
     compare(f"{mode} window, partition 2 2 2 == full, partition 2 2 2", f"{mode}_fullpart", f"{mode}_part", LO, DIMS, SHAPE, cls)
@@ -249,6 +278,9 @@ for mode, cls in (("sampled", "bytes"), ("exact", "tight")):
         compare(f"{mode} GPU window ~ CPU full",             f"{mode}_full",     f"{mode}_wingpu",  LO,   DIMS, SHAPE, "gpu")
         compare(f"{mode} GPU seam window ~ CPU full",        f"{mode}_full",     f"{mode}_seamgpu", SEAM, DIMS, SHAPE, "gpu")
         compare(f"{mode} GPU halo-release window ~ CPU full", f"{mode}_fullhr",  f"{mode}_winhrgpu", LO, DIMS, SHAPE, "gpu")
+        # the GPU window against the CPU window of the same pass (2026-10-15: the same units, checked above)
+        compare(f"{mode} GPU window ~ CPU window",           f"{mode}_win",      f"{mode}_wingpu",  (0, 0, 0), DIMS, DIMS, "gpu")
+        compare(f"{mode} GPU seam window ~ CPU seam window", f"{mode}_seam",     f"{mode}_seamgpu", (0, 0, 0), DIMS, DIMS, "gpu")
 ZLO, ZDIMS, ZSHAPE = (64, 64, 8), (128, 128, 1), (256, 256, 16)
 compare("zoom-shaped exact window == full", "zoom_full", "zoom_win", ZLO, ZDIMS, ZSHAPE, "tight")
 if gpu:

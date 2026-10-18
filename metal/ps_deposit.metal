@@ -153,11 +153,12 @@ static inline float linearWeight(thread const float rel[3], float d0, thread con
 
 // ---- the per-tetrahedron record (host: ps_interpolation.cc, harness: validate_deposit.cpp) ----
 // TET_STRIDE floats per tet in the 'verts' buffer, in the CANONICAL frame of the exact inside
-// test (ps_exact_inside.h: every periodic image of a particle mapped to one float position):
+// test (ps_exact_inside.h: every periodic image of a particle mapped to one position, a float in
+// the single build and a double in the double build):
 //   [0..2]  ic0 -- vertex 0's grid-cell index in the canonical index frame (int bits)
 //   [3..5]  f0  -- vertex 0's offset inside that cell, in cell units, in [0,1)
-//   [6..14] E   -- the edges vertex_k - vertex_0 (k = 1..3, one row each), Mpc; exact
-//                  differences of the canonical floats, rounded once to float
+//   [6..14] E   -- the edges vertex_k - vertex_0 (k = 1..3, one row each), Mpc; differences of
+//                  the canonical positions (exact for floats), rounded once to float
 //   [15]    the centroid-fallback cell as a flat sub-grid index, computed by the host exactly as
 //           the CPU fallback does (uint bits; 0xFFFFFFFF = outside this partition: dropped)
 // Positions relative to vertex 0 are then formed from SMALL numbers -- sample offset in cells
@@ -252,7 +253,19 @@ struct FieldGrids {
     device atomic_uint*  sgX;
     uint  fxMask;
     constant float* fxScale;      // DepositParams.fxScale
+    // 2026-10-15: the non-finite guard's counters, one word per slot (FX_DROP_*): depositFields' own buffer 30,
+    // the exact items' tail of the sumW buffer (ExactItemParams.badAt); the host zeroes them before each command
+    // buffer and adds them up after one that succeeded
+    device atomic_uint*  bad;
 };
+
+// The non-finite guard of a fixed-point share (2026-10-15; ps_deposit_params.h psFixedShareOk is the host's twin and
+// says why): a product p = share * 2^k that is not below 2^63 in magnitude -- a NaN, an infinity, an overflow -- has
+// no int64 (the float->long conversion is unspecified there) and adds NOTHING; it is counted in its slot instead.
+// The test reads the float's bits (|p| < 2^63 <=> (bits & 0x7fffffff) < 0x5f000000, NaN and inf above it), so the
+// default fast math cannot fold it away. One compare; a finite in-range share adds the integer it always did.
+constant uint FX_DROP_MASS = 10u, FX_DROP_SUMW = 11u;   // ps_deposit_params.h FixedShareSlot (keep in step)
+static inline bool fixedShareOk(float p) { return (as_type<uint>(p) & 0x7fffffffu) < 0x5f000000u; }
 
 // One 64-bit two's-complement integer q into the two-word cell 'at' of x: the low word's carry is read off the
 // value its atomic returns (the add wrapped iff the result is below it), and the high words add modulo 2^32, so
@@ -273,7 +286,11 @@ static inline void addFixedQ(device atomic_uint* x, ulong at, ulong q)
 static inline void addMoment(device atomic_float* f, device atomic_uint* x, thread const FieldGrids& G, uint g,
                              ulong at, float v)
 {
-    if ((G.fxMask >> g) & 1u) addFixedQ(x, at, as_type<ulong>(long(rint(v * G.fxScale[g]))));
+    if ((G.fxMask >> g) & 1u) {
+        float const p = v * G.fxScale[g];
+        if (fixedShareOk(p)) addFixedQ(x, at, as_type<ulong>(long(rint(p))));
+        else atomic_fetch_add_explicit(&G.bad[g], 1u, memory_order_relaxed);   // (the guard above)
+    }
     else atomic_fetch_add_explicit(&f[at], v, memory_order_relaxed);
 }
 
@@ -289,7 +306,9 @@ static inline void depositMass(thread const FieldGrids& G, uint flat, float w)
         return;
     }
     // (64-bit cell offsets inside addFixedQ: a sub-grid may hold up to 2^32 cells)
-    addFixedQ(G.massFx, ulong(flat), as_type<ulong>(long(rint(w * G.massScale))));
+    float const p = w * G.massScale;
+    if (fixedShareOk(p)) addFixedQ(G.massFx, ulong(flat), as_type<ulong>(long(rint(p))));
+    else atomic_fetch_add_explicit(&G.bad[FX_DROP_MASS], 1u, memory_order_relaxed);   // (the non-finite guard)
 }
 
 // w = mass share (mass grid), wm = moment weight (== w by default; the V_eul share under
@@ -758,6 +777,7 @@ kernel void depositFields(
     device atomic_uint*        dvX      [[buffer(27)]],
     device atomic_uint*        scalX    [[buffer(28)]],
     device atomic_uint*        sgX      [[buffer(29)]],
+    device atomic_uint*        bad      [[buffer(30)]], // 2026-10-15: the non-finite guard's counters (FieldGrids.bad)
     uint tid [[thread_position_in_grid]])
 {
     if (tid >= P.nTet) return;
@@ -815,7 +835,7 @@ kernel void depositFields(
 
     FieldGrids G { massGrid, momGrid, m2Grid, gradGrid, strGrid, momwGrid, caustGrid, svGrid, dvGrid, dwGrid, scalGrid, sgGrid,
                    massFx, P.massScale, P.massFixed != 0, momX, m2X, gradX, momwX, svX, dvX, scalX, sgX,
-                   P.fxMask, P.fxScale };
+                   P.fxMask, P.fxScale, bad };
 
     // --ps-volume-weighted: the tet's total moment weight is its Eulerian volume |det|/6
     // (matching the CPU volumeShare); default: the moment weight equals the mass share.
@@ -1198,7 +1218,9 @@ kernel void depositFields(
 // Under --ps-window the items cover only the window's cells and the share is m / wFull (the whole
 // weight): a tet with no volume in the window stays at sumW 0 and depositFields drops it.
 // ------------------------------------------------------------------------------------------------
-struct ExactItemParams { uint nItems; uint phase; uint blockCells; uint pad; };
+// badAt (2026-10-15): the word of the sumW buffer (bound at 16 and 30) where the non-finite guard's counters start,
+// past the per-tet totals -- every one of the 31 buffer slots is taken here, so they ride in that buffer's tail
+struct ExactItemParams { uint nItems; uint phase; uint blockCells; uint badAt; };
 
 // The per-tet numbers depositFields derives in its preamble, for the exact path (keep in sync).
 // False when the float recheck calls the tet degenerate.
@@ -1333,6 +1355,7 @@ kernel void depositExactItems(
     uint iid [[thread_position_in_grid]])
 {
     if (iid >= IP.nItems) return;
+    device atomic_uint* const bad = sumWX + ulong(IP.badAt);   // the guard's counters (ExactItemParams.badAt)
     uint2 const it = items[iid];
     uint  const tet = it.x;
     float const m = masses[tet];
@@ -1377,7 +1400,7 @@ kernel void depositExactItems(
     bool const fScal = P.fScal != 0, fSGrad = P.fSGrad != 0;
     FieldGrids G { massGrid, momGrid, m2Grid, gradGrid, strGrid, momwGrid, caustGrid, svGrid, dvGrid, dwGrid, scalGrid, sgGrid,
                    massFx, P.massScale, P.massFixed != 0, momX, m2X, gradX, momwX, svX, dvX, scalX, sgX,
-                   P.fxMask, P.fxScale };
+                   P.fxMask, P.fxScale, bad };
     float acc = 0.0f;
     for (; w < wEnd; ++w) {
         int const raw[3] = { iMin[0] + a0, iMin[1] + a1, iMin[2] + a2 };
@@ -1391,7 +1414,11 @@ kernel void depositExactItems(
         else exact_cell_deposit(G, flat, mo, wt * shareFac, E, fVel, fDisp, fGrad, fVolW, fCaustic, fScal, fSGrad, cc);
     }
     if (!deposit && acc > 0.0f) {
-        if (sumWFixed) addFixedQ(sumWX, ulong(tet), as_type<ulong>(long(rint(acc * E.wScale))));
+        if (sumWFixed) {
+            float const p = acc * E.wScale;
+            if (fixedShareOk(p)) addFixedQ(sumWX, ulong(tet), as_type<ulong>(long(rint(p))));
+            else atomic_fetch_add_explicit(&bad[FX_DROP_SUMW], 1u, memory_order_relaxed);   // (the non-finite guard)
+        }
         else atomic_fetch_add_explicit(&sumW[tet], acc, memory_order_relaxed);
     }
 }

@@ -171,6 +171,8 @@ void DTFE_interpolation(vector<Particle_data> *p,
     Timer t;
 #ifdef PHASE_SPACE
     if ( not userOptions.psTessellationPrebuilt )   // the partition look-ahead built it already (below)
+#else
+    if ( not userOptions.stdTessellationPrebuilt )  // the standard loop's look-ahead built it already (2026-10-15, below)
 #endif
     buildTessellation( p, userOptions, dt );
 #ifdef PHASE_SPACE
@@ -395,6 +397,30 @@ void psInterpolatePrebuilt(std::shared_ptr<void> &tessellation, vector<Sample_po
     userOptions.psTessellationPrebuilt = true;
     DTFE_interpolation( &none, samples, userOptions, uQuantities, aQuantities, dt );
     userOptions.psTessellationPrebuilt = false;
+    tessellation.reset();
+}
+#endif
+#ifndef PHASE_SPACE
+// The standard partition loop's look-ahead (DTFE.cpp, 2026-10-15): the same pair for one THREAD SUB-DOMAIN of the
+// next partition (a standard partition is split into the threads' sub-boxes, each its own tessellation; under
+// '--sample-points' or on one thread it is one). buildTessellation is the very call DTFE_interpolation makes, cache
+// included, so the tessellation and its vertex densities are the ones it would have built.
+std::shared_ptr<void> dtfePrebuildTessellation(vector<Particle_data> *p, User_options &userOptions)
+{
+    std::shared_ptr<DT> dt = std::make_shared<DT>();
+    buildTessellation( p, userOptions, *dt );
+    return dt;
+}
+
+// ... and its interpolation, exactly as the owning DTFE_interpolation overload runs it; frees the tessellation
+void dtfeInterpolatePrebuilt(std::shared_ptr<void> &tessellation, vector<Sample_point> &samples,
+                             User_options &userOptions, Quantities *uQuantities, Quantities *aQuantities)
+{
+    DT &dt = *static_cast<DT*>( tessellation.get() );
+    vector<Particle_data> none;
+    userOptions.stdTessellationPrebuilt = true;
+    DTFE_interpolation( &none, samples, userOptions, uQuantities, aQuantities, dt );
+    userOptions.stdTessellationPrebuilt = false;
     tessellation.reset();
 }
 #endif

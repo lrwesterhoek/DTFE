@@ -1,8 +1,10 @@
 #ifndef PS_DEPOSIT_PARAMS_H
 #define PS_DEPOSIT_PARAMS_H
 
+#include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 
 // Per-tetrahedron record of the GPU deposit: PS_TET_STRIDE floats per tet in the 'verts'
@@ -10,15 +12,24 @@
 constexpr int PS_TET_STRIDE = 16;
 
 // Fills one record. cv = the tet's four vertices in the CANONICAL frame of the exact inside
-// test (ps_exact_inside.h canonicalCoord: every periodic image of a particle at one float
-// position); gridLo/gridLen/nGrid = the deposit grid, as the CPU test forms its sample positions
+// test (ps_exact_inside.h canonicalCoord: every periodic image of a particle at one position),
+// in the build's own Real -- the very coordinates that test compares in; gridLo/gridLen/nGrid =
+// the deposit grid, as the CPU test forms its sample positions
 // lo + ((g + frac) * len) / n; canonShift = how far the canonical frame sits above the grid (the
 // box length when periodic, else 0); wrapL = the box length for the minimum-image edge wrap
 // (0 = no wrap); centroidFlat = the flat sub-grid index of the centroid-fallback cell as the
 // CPU deposit computes it (0xFFFFFFFF = outside this partition, dropped).
-// Vertex 0 is stored as a cell index plus an in-cell fraction and the edges as exact double
-// differences rounded once, so the kernel forms every sample offset from small numbers.
-inline void psFillTetRecord(float *rec, float const cv[4][3], double const gridLo[3],
+// Vertex 0 is stored as a cell index plus an in-cell fraction and the edges as double
+// differences rounded once to float, so the kernel forms every sample offset from small numbers.
+// The double build passes its DOUBLE vertices (2026-10-18). It rounded them to float first, which
+// moves a vertex by up to half a float ulp of its canonical coordinate (~8e-6 Mpc in a 100 Mpc
+// box): the kernel's error bound covers the record's own roundings, not that shift, so a
+// sub-sample that close to a face could be counted on the wrong side of the double CPU test
+// (tests/ps_double_check.sh D5: 0-2 cells of 48^3 had other stream counts than the double CPU
+// run). A double edge difference rounds by 2^-53 of the edge before its float rounding, far
+// inside the bound's safety factor of two; for float vertices nothing changes (same bytes).
+template <typename V>
+inline void psFillTetRecord(float *rec, V const cv[4][3], double const gridLo[3],
                             double const gridLen[3], int32_t const nGrid[3],
                             double const canonShift[3], double const wrapL[3],
                             uint32_t const centroidFlat)
@@ -34,7 +45,7 @@ inline void psFillTetRecord(float *rec, float const cv[4][3], double const gridL
     for (int e = 0; e < 3; ++e)
         for (int d = 0; d < 3; ++d)
         {
-            double r = double(cv[e+1][d]) - double(cv[0][d]);   // exact: a difference of floats
+            double r = double(cv[e+1][d]) - double(cv[0][d]);   // exact for float vertices
             if (wrapL[d] > 0.)
             {
                 if (r >  0.5 * wrapL[d]) r -= wrapL[d];
@@ -128,14 +139,82 @@ struct PSFixedUnits
 {
     float scale[PS_FX_N] = {};
     bool  sumW = false;
+    // the total the mass grid's unit is taken from (psMassFixedScale) when > 0 (2026-10-15: a --ps-window pass, so
+    // that the GPU and the CPU window deposits take the same unit -- ps_interpolation.cc fxBoundWalk); 0 = the host's
+    // own sum of the masses it is handed plus massExtra, as before
+    double massTotal = 0.;
 };
+
+// The non-finite guard of the fixed-point shares (2026-10-15). rint(share * scale) -> int64 is UNSPECIFIED for a
+// NaN, an infinity or a product beyond the signed 64-bit range (C++ llrint / the GPU's float->long conversion:
+// arm64 gives 0 for a NaN and saturates the rest, x86-64 gives 0x8000000000000000 for all of them), so one such
+// share silently corrupted an exact sum where the float sum of before would have shown a NaN. The policy, the same
+// on the CPU, in Metal and in CUDA/HIP (and its emulation): a share whose product is not below 2^63 in magnitude
+// -- NaN, +-inf and an overflow alike -- adds NOTHING and is COUNTED, per grid slot (below); the host reports the
+// run's counts once (fixedShareDropsReact, DTFE.cpp). Hot path: one compare. The kernels test the float product's
+// bits, (bits & 0x7fffffff) < 0x5f000000 (= 2^63), as fast math cannot fold an integer compare away; the CPU
+// tests the double product, which is the same float times the same 2^k, exactly. A finite in-range share takes
+// the very integer it took before, so normal data stays bit-identical.
+// The count slots: PS-DTFE g = PSFxGrid (0 .. PS_FX_CPU_N-1), the mass grid, the exact items' per-tet weight totals;
+// standard DTFE 0..4 = its grids (dtfe_gpu_fixed.h: density, velocity, velocity gradient, scalar, its gradient).
+enum FixedShareSlot { FX_DROP_MASS = 10, FX_DROP_SUMW = 11, FX_DROP_SLOTS = 16 };
+static_assert( int(PS_FX_CPU_N) <= int(FX_DROP_MASS), "a moment grid's slot would be the mass grid's" );
+// The run's dropped shares by slot: every pass (CPU, or a GPU host after a deposit it kept) adds its counts here
+inline std::atomic<unsigned long long> fixedShareDrops[FX_DROP_SLOTS] = {};
+// Counts n dropped shares of a slot (the cold path of the guard; also the GPU hosts' per-pass totals)
+inline void fixedShareDropped(int const slot, unsigned long long const n = 1)
+{
+    fixedShareDrops[slot].fetch_add( n, std::memory_order_relaxed );
+}
+// The guard itself: the share's integer in q, or false (q = 0, counted in 'slot') for a product that has none
+inline bool psFixedShareOk(double const product, int const slot, int64_t &q)
+{
+    if ( !( std::fabs( product ) < 9223372036854775808.0 ) )   // 2^63; false for a NaN too
+    {
+        fixedShareDropped( slot );
+        q = 0;
+        return false;
+    }
+    q = int64_t( std::llrint( product ) );
+    return true;
+}
+
+// The guard's test hook (2026-10-15): DTFE_TEST_NAN_SHARE=<k> makes the deposit's input NaN for about one
+// tetrahedron in k -- PS-DTFE its mass (the GPU extraction and the CPU loop alike, so every share of it is NaN), the
+// standard GPU deposit its vertex densities -- picked by a hash of its first vertex's coordinates (fixedShareTestNan),
+// which every path sees the same way. The units and bounds leave those values out (a NaN is no maximum, and the GPU
+// hosts' mass total skips it), so the rest of the grid stays exact and the guard drops and counts the NaN shares.
+// 0 / unset: off (tests/ps_fixed_moments_check.sh, tests/dtfe_gpu_retry_check.sh use it).
+inline unsigned long fixedShareTestNanEvery()
+{
+    static unsigned long const k = [] { char const *e = std::getenv( "DTFE_TEST_NAN_SHARE" ); long const v = e ? std::atol( e ) : 0;
+                                        return v > 0 ? (unsigned long)v : 0ul; }();
+    return k;
+}
+inline bool fixedShareTestNan(double const x, double const y, double const z)
+{
+    unsigned long const k = fixedShareTestNanEvery();
+    if ( k == 0 ) return false;
+    uint64_t h = 0x9e3779b97f4a7c15ull;
+    for (double const c : { x, y, z })
+    {
+        uint64_t b;
+        std::memcpy( &b, &c, sizeof b );
+        h = ( h ^ b ) * 0xbf58476d1ce4e5b9ull;
+        h ^= h >> 31;
+    }
+    return h % k == 0;
+}
 
 // One share of a moment grid in fixed-point units: the float product v*w the deposit formed (the float the old
 // float sum added), times the 2^k unit -- exact in double -- rounded to nearest even: the integer rint(v*w *
-// scale) the kernels add (metal/ps_deposit.metal addFixed). psMassFixedShare's rule, for any grid.
-inline int64_t psFixedShare(double share, float scale)
+// scale) the kernels add (metal/ps_deposit.metal addFixed). psMassFixedShare's rule, for any grid. 'slot' = the
+// grid's PSFxGrid index: a share without an integer (the guard above) adds 0 and is counted there.
+inline int64_t psFixedShare(double share, float scale, int slot)
 {
-    return int64_t( std::llrint( share * double(scale) ) );
+    int64_t q;
+    psFixedShareOk( share * double(scale), slot, q );
+    return q;
 }
 
 // Host-side parameter block of the PS-DTFE GPU deposit, shared by the Metal host
@@ -217,7 +296,9 @@ inline double psMassFixedValue(uint32_t lo, uint32_t hi, float scale)
 // integer sum, independent of the order and the thread count, and is converted to float once.
 inline int64_t psMassFixedShare(double share, float scale)
 {
-    return int64_t( std::llrint( share * double(scale) ) );
+    int64_t q;
+    psFixedShareOk( share * double(scale), FX_DROP_MASS, q );   // (the non-finite guard above, 2026-10-15)
+    return q;
 }
 
 // The GPU hosts hand the kernels' (low, high) uint32 word pairs over as int64_t by copying the bytes

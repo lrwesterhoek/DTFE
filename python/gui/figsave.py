@@ -5,10 +5,14 @@ with or without borders, titles, axes, axes names and units, full resolution, et
                       figure… wrote before (a test compares the pixels), so nothing changes for whoever never opens
                       the dialog; PRESETS fill several in one go (Publication, Bare image, Slide)
   unit_map            the axes' unit: Mpc as stored (h-free), Mpc/h when the box's h is known, or cells
+  position            a position along any axis in that unit (the slice position in a saved title, 2026-10-15)
   style_axes          frame, ticks, tick labels and axis names of one matplotlib Axes as the options say
   rc / save_kwargs    the matplotlib settings (font size, text kept as text in PDF and SVG) and savefig() arguments
+                      (a TIFF compressed losslessly, LZW, 2026-10-15)
   fit_width           the figure scaled so the saved file has the width asked for
-  match_dpi           the dpi that puts one data pixel on one image pixel inside the map's axes
+  match_dpi           the dpi that puts one data pixel on one image pixel inside the map's axes (a plane too small
+                      for 72 dpi shrinks the figure instead, 2026-10-15)
+  writes_pixels       the options that save the data's own pixels: full resolution, or no margins + match the data
   write_pixels        the full-resolution file: one image pixel per data pixel, the screen's colours, overlays optional
   SaveOptionsDialog   the one dialog behind Save image…, Save figure… and Explore > Save Options…
 
@@ -36,6 +40,10 @@ FULL_DPI = 100.0                # the full-resolution file's nominal dpi: the ou
 # stop before that; 16384 a side is 1 GB for the canvas alone (the image resampled into it takes more: a 1200 dpi map
 # of 7 in peaks at about 2 GB)
 MAX_SIDE_PX = 16384
+# a TIFF's compression (2026-10-15; it was written uncompressed): LZW, lossless (the same pixels, a test reads them
+# back) and read by every TIFF reader (the 'TIFF with LZW' journals ask for); Pillow's libtiff writes it, for the
+# full-resolution file directly and for a matplotlib figure through savefig's pil_kwargs
+TIFF_COMPRESSION = "tiff_lzw"
 
 DEFAULTS = {
     "kind": "figure",           # "figure": title, axes and colour bar at a dpi; "full": the map alone at its own pixels
@@ -150,16 +158,27 @@ def describe(opts: dict) -> str:
     o = options(opts)
     name = PRESET_SHORT.get(which_preset(o) or "", "your options")
     fmt = o["format"].upper()
-    if o["kind"] == "full":
+    if writes_pixels(o):
         return f"{name}: {fmt} at the data's own resolution"
     res = "dpi matched to the data" if o["match_data"] else f"{o['dpi']} dpi"
     return f"{name}: {fmt}, {res}" if fmt not in ("PDF", "SVG") else f"{name}: {fmt} (vector), {res} for the map"
 
 
-def title_text(opts: dict, auto: str) -> str:
-    """The title drawn: the typed one when it was typed for this map (its own title then was 'auto'), else 'auto'."""
+def title_text(opts: dict, auto: str, shown: str | None = None) -> str:
+    """The title drawn: the typed one when it was typed for this map (its own title then was 'auto'), else the map's
+    own title: 'shown' when given (2026-10-15: 'auto' with its positions in the axes' unit, Mpc/h or cells; 'auto'
+    stays the key a typed title is tied to, so changing the unit never detaches it), else 'auto'."""
     t = (opts.get("title_text") or "").strip()
-    return t if t and opts.get("title_for", auto) == auto else auto
+    return t if t and opts.get("title_for", auto) == auto else (auto if shown is None else shown)
+
+
+def writes_pixels(opts: dict) -> bool:
+    """The save writes the data's own pixels (write_pixels: one image pixel per data pixel, the screen's colours, no
+    resampling): full resolution, or no margins with 'match the data' and no width asked (2026-10-15: that borderless
+    figure was matplotlib's picture of the map at the matched dpi, 72 at least, so a plane under ~390 points across
+    was resampled; it is now the same file as full resolution)."""
+    o = options(opts)
+    return o["kind"] == "full" or (o["margins"] == "none" and o["match_data"] and not o["width"] > 0)
 
 
 # ---------------------------------------------------------------------- formats and file names
@@ -224,6 +243,14 @@ def unit_map(o, rest, unit: str, hubble: float | None = None) -> tuple[UnitMap, 
     return UnitMap("Mpc"), ""
 
 
+def position(o, axis: int, v: float, unit: str, hubble: float | None = None) -> tuple[float, str]:
+    """(value, unit name) of position 'v' along axis 'axis' of output 'o', as Explore keeps it (h-free Mpc, cells for
+    an output without a box), in the unit the axes get from unit_map (Mpc/h without a known h: Mpc). A saved title's
+    slice position and zoom window (2026-10-15: the axes were in Mpc/h or cells while the title said Mpc)."""
+    um, _note = unit_map(o, [axis, axis], unit, hubble)
+    return float(um.x(v)), um.name
+
+
 # ---------------------------------------------------------------------- axes, fonts, saving
 def axis_label(name: str, unit: str, opts: dict) -> str:
     if not opts["axis_names"]:
@@ -263,8 +290,9 @@ def rc(opts: dict, fmt: str = "png") -> dict:
     return d
 
 
-def save_kwargs(opts: dict, dpi: float) -> dict:
-    """savefig()'s arguments: the dpi, the margins (the default: bbox_inches='tight', as before), transparency."""
+def save_kwargs(opts: dict, dpi: float, fmt: str = "png") -> dict:
+    """savefig()'s arguments: the dpi, the margins (the default: bbox_inches='tight', as before), transparency; a
+    TIFF compressed losslessly (TIFF_COMPRESSION, 2026-10-15; matplotlib hands a TIFF to Pillow with pil_kwargs)."""
     kw = {"dpi": dpi}
     if opts["margins"] == "tight":
         kw["bbox_inches"] = "tight"
@@ -272,6 +300,8 @@ def save_kwargs(opts: dict, dpi: float) -> dict:
         kw.update(bbox_inches="tight", pad_inches=float(opts["pad"]))
     if opts["transparent"]:
         kw["transparent"] = True
+    if fmt == "tiff":
+        kw["pil_kwargs"] = {"compression": TIFF_COMPRESSION}
     return kw
 
 
@@ -333,28 +363,73 @@ def fit_width(fig, opts: dict, dpi: float, relayout=None) -> None:
         fig.set_dpi(own)
 
 
-def match_dpi(fig, axes_px) -> float:
+def match_dpi(fig, axes_px, relayout=None) -> float:
     """The dpi at which the widest data plane fills its axes pixel for pixel: max over (axes, data pixels across) of
-    pixels / the axes' drawn width in inches, within DPI_MIN and DPI_MAX."""
-    W = fig.get_size_inches()[0]
-    best = 0.0
-    for ax, px in axes_px:
-        ax.apply_aspect()
-        w_in = ax.get_position().width * W
-        if w_in > 0:
-            best = max(best, float(px) / w_in)
-    return float(min(max(best or DPI_MIN, DPI_MIN), DPI_MAX))
+    pixels / the axes' drawn width in inches, at most DPI_MAX. A plane too small for DPI_MIN (fewer than 72 points per
+    inch of its axes: every plane under ~390 points across in the 7 in map, a 256³ grid's slice too) SHRINKS THE
+    FIGURE instead (2026-10-15): at DPI_MIN its axes then hold the plane pixel for pixel, so the saved map has the
+    data's pixel count (the dpi stopped at 72 before and a 64-cell map came out resampled to 389 pixels), while the
+    text keeps its size in points, readable at 72 dpi (a dpi below it drew 8 pt text one to three pixels high).
+    The shrink is uniform with the layout's fractions kept, which is exact in one step (the aspect of every axes box
+    is kept, so its width scales with the figure); 'relayout' (the separate panels' tight_layout) is re-run between
+    such steps while it still fits the text, and a last step makes the size exact whatever it did. A tiny plane
+    (64 cells) leaves little room for the text: legible, tightly packed. The caller's check_pixels guard stays (a
+    shrunk figure only gets smaller)."""
+    import warnings
+
+    def need():                                     # (dpi wanted, data pixels of that axes)
+        W = fig.get_size_inches()[0]
+        best = (0.0, 0.0)
+        for ax, px in axes_px:
+            ax.apply_aspect()
+            w_in = ax.get_position().width * W
+            if w_in > 0 and float(px) / w_in > best[0]:
+                best = (float(px) / w_in, float(px))
+        return best
+
+    def exact(b, p):                                # the widest-needing axes within 0.02 pixel of its plane
+        return b > 0 and abs(p * (1.0 - DPI_MIN / b)) < 0.02
+    best, px = need()
+    if best >= DPI_MIN or best <= 0:
+        return float(min(max(best or DPI_MIN, DPI_MIN), DPI_MAX))
+    own = fig.dpi
+    fig.set_dpi(DPI_MIN)                            # the text's extent at the dpi it is saved at (as fit_width)
+    try:
+        for _ in range(8):
+            W, H = fig.get_size_inches()
+            f = best / DPI_MIN
+            fig.set_size_inches(W * f, H * f)       # the fractions kept: exact
+            best, px = need()
+            if relayout is None:
+                break
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")     # 'tight layout not applied' (too small for the text): no output
+                relayout()
+            best, px = need()
+            if caught or exact(best, px):
+                break
+        if not exact(best, px):                     # the last tight_layout moved the axes: one more uniform step
+            W, H = fig.get_size_inches()
+            f = best / DPI_MIN
+            fig.set_size_inches(W * f, H * f)
+        W, H = fig.get_size_inches()
+        eps = 1e-3 / DPI_MIN                        # int(w dpi) must not round a whole pixel down (a borderless map)
+        fig.set_size_inches(W + eps, H + eps)
+    finally:
+        fig.set_dpi(own)
+    return float(DPI_MIN)
 
 
 def write_pixels(path, rgb: np.ndarray, fmt: str, overlay=None, transparent: bool = False) -> None:
     """The full-resolution file: 'rgb' (rows from the top, uint8) one image pixel per element. 'overlay(ax)' draws
     on an invisible Axes spanning the image exactly (it sets its own limits: arrows, outlines); None writes the array
-    as it is (PNG and TIFF straight through Pillow). A PDF or SVG embeds the pixels unresampled on a page of
-    width / 100 inches."""
+    as it is (PNG and TIFF straight through Pillow; a TIFF LZW-compressed, TIFF_COMPRESSION). A PDF or SVG embeds the
+    pixels unresampled on a page of width / 100 inches."""
     rgb = np.ascontiguousarray(rgb)
     if overlay is None and fmt in ("png", "tiff"):
         from PIL import Image                       # matplotlib's own dependency: the RGB as it is
-        Image.fromarray(rgb).save(str(path), format=fmt.upper(), dpi=(FULL_DPI, FULL_DPI))
+        extra = {"compression": TIFF_COMPRESSION} if fmt == "tiff" else {}
+        Image.fromarray(rgb).save(str(path), format=fmt.upper(), dpi=(FULL_DPI, FULL_DPI), **extra)
         return
     if overlay is None:
         import matplotlib.image as mimage
@@ -371,7 +446,8 @@ def write_pixels(path, rgb: np.ndarray, fmt: str, overlay=None, transparent: boo
     ax.set_axis_off()
     ax.set_zorder(1)                                # over the figure image
     overlay(ax)
-    fig.savefig(str(path), dpi=FULL_DPI, format=fmt, transparent=transparent)
+    extra = {"pil_kwargs": {"compression": TIFF_COMPRESSION}} if fmt == "tiff" else {}
+    fig.savefig(str(path), dpi=FULL_DPI, format=fmt, transparent=transparent, **extra)
 
 
 def draw_pixel_circles(ax, shape, circles, dashed=(), clips=()) -> int:
@@ -479,7 +555,9 @@ def _dialog_class():
             drow.addWidget(self.dpi)
             self.match = q["QCheckBox"]("match the data")
             self.match.setToolTip("The dpi at which the map's axes hold one image pixel per data pixel (at most "
-                                  f"{DPI_MAX} dpi): the full resolution with the axes and colour bar around it")
+                                  f"{DPI_MAX} dpi; a map too small for {DPI_MIN} dpi gets a smaller figure at "
+                                  f"{DPI_MIN} dpi instead): the full resolution with the axes and colour bar around "
+                                  "it. With no margins: the map's own pixels, unresampled")
             drow.addWidget(self.match)
             drow.addStretch(1)
             form.addRow("Resolution", drow)
@@ -727,8 +805,18 @@ def _dialog_class():
                 notes.append("Full resolution: " + ("the panels" if grid else "the map") + " alone"
                              + (f", {px[0]} × {px[1]} pixels" if px else "") + "; the title, axes and colour bar are "
                              "not drawn.")
+            elif borderless and self.match.isChecked() and not self.width.value() > 0:
+                notes.append("No margins with 'match the data': the file is the map's own pixels, unresampled "
+                             "(as Full resolution).")
             elif borderless:
-                notes.append("No margins: the map fills the file, without title, axes or colour bar.")
+                notes.append("No margins: the map fills the file, without title, axes or colour bar. Tick 'match the "
+                             "data' (no width) for the map's own pixels, unresampled.")
+            # a remembered Mpc/h where this output's h is not known (2026-10-15): the axes fall back, the choice stays
+            if deco and self.unit.currentData() != "cells" and self.opened["unit"] == "mpc_h" \
+                    and not self.ctx.get("hubble"):
+                notes.append(("No box is known for this output: its axes are in cells." if not self.ctx.get("box", True)
+                              else "This output's h is not known: its axes are in Mpc.")
+                             + " Mpc/h stays your choice for the outputs that know their h.")
             if grid:
                 notes.append("The figure grid draws no arrows.")
             elif not self.ctx.get("arrows"):

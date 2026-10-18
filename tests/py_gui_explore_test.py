@@ -25,6 +25,19 @@
      or not shown with the reason in the zoom and status lines); another simulation, a custom run or opened file in
      a box of another size start at the middle with the whole box, as the first open does; a 2D output on the way
      leaves the slice and the window to the next 3D output.
+  8. (2026-10-15) the Save options' fixes: the title's slice position in the axes' unit (map and grid); TIFF
+     LZW-compressed, pixel-identical; 'match the data' below 72 dpi shrinks the figure (the map keeps the data's
+     pixel count), and with no margins writes the map's own pixels; Mpc/h where h is not known falls back to Mpc,
+     said in the status line and the dialog, the choice kept (the grid: every panel); the fold map reads only its
+     planes while a job caps the cube cache.
+  9. (2026-10-15) a phase-space output's velocity derivatives as the mean field grad<v> (the default, as the figure
+     scripts') or the stored stream average <grad v>: the mean-field planes equal dtfelib's FieldSet.load(name,
+     mean_field=True) cut there (the six names, every axis, through slice()'s components and units); standard DTFE
+     unchanged; 2D, non-periodic and window outputs keep the stored grid and say why; while a job caps the cube cache
+     the velocity is read in slabs, never cached whole, the same numbers; a rewritten velocity grid is not served
+     from the plane cache. In the window: the map, its title, colour bar and saved figure say the family, the choice
+     reaches Compare with (A's and B's families) and the figure grid (a stored PS panel never shares a colour bar
+     with a mean-field one), it is remembered, a zoom says the stream average (and its zoom line is text).
 
 The pure parts (grids.void_at, void_circles_mpc, void_info, void_outlines.write_csv) run without Qt; the rest needs
 PySide6 and reports SKIP (exit 0) without it. Usage: ~/.venvs/dtfe-gui/bin/python tests/py_gui_explore_test.py
@@ -246,12 +259,40 @@ def save_options_pure():
           and um_c.name == "cells" and np.allclose(um_c.ext([10, 42, 20, 52]), [0, 64, 0, 64])
           and um_u.name == "Mpc" and "h" in note_u and um_n.name == "cells"
           and FS.unit_map(boxed, [0, 1], "mpc")[0].identity and FS.unit_map(boxed, [0, 1], "mpc")[0].x(1.25) == 1.25)
+    # (2026-10-15) the slice position of a saved title in the axes' unit
+    pos_h, pos_c, pos_u, pos_m = (FS.position(boxed, 2, 16.25, "mpc_h", 0.7), FS.position(boxed, 2, 16.25, "cells"),
+                                  FS.position(boxed, 2, 16.25, "mpc_h", None), FS.position(boxed, 2, 16.25, "mpc"))
+    check("position: along any axis as the axes convert it (Mpc/h = Mpc x h; cells from the box's low corner, the "
+          "centre of cell 32 of 64 = 32.5; Mpc/h without h = Mpc; Mpc untouched)",
+          pos_h[1] == "Mpc/h" and abs(pos_h[0] - 11.375) < 1e-12 and pos_c == (32.5, "cells")
+          and pos_u == (16.25, "Mpc") and pos_m == (16.25, "Mpc"), str((pos_h, pos_c, pos_u, pos_m)))
+    check("title_text with the title in the axes' unit: drawn unless a title was typed for this map ('auto' stays its "
+          "key, so a unit change keeps a typed title)",
+          FS.title_text({}, "z = 1 Mpc", "z = 0.7 Mpc/h") == "z = 0.7 Mpc/h"
+          and FS.title_text({"title_text": "Mine", "title_for": "z = 1 Mpc"}, "z = 1 Mpc", "z = 0.7 Mpc/h") == "Mine")
+    tw = FS.save_kwargs(FS.options(), 200, "tiff")
+    check("save_kwargs: a TIFF is LZW-compressed through Pillow (pil_kwargs); a PNG's arguments unchanged",
+          tw.get("pil_kwargs") == {"compression": "tiff_lzw"} and "pil_kwargs" not in FS.save_kwargs(FS.options(), 200)
+          and "pil_kwargs" not in FS.save_kwargs(FS.options(), 200, "pdf"), str(tw))
+    check("writes_pixels: full resolution, or no margins with 'match the data' and no width (the map's own pixels); "
+          "not a borderless figure at a dpi or a width",
+          FS.writes_pixels(FS.preset("bare")) and FS.writes_pixels({"margins": "none", "match_data": True})
+          and not FS.writes_pixels({"margins": "none"}) and not FS.writes_pixels({"match_data": True})
+          and not FS.writes_pixels({"margins": "none", "match_data": True, "width": 640, "width_unit": "px"})
+          and "own resolution" in FS.describe({"margins": "none", "match_data": True}))
     from matplotlib.figure import Figure
     fig = Figure(figsize=(7, 6))
     ax = fig.add_axes([0.1, 0.1, 0.5, 0.5])
-    check("match_dpi: the dpi at which an axes 3.5 in wide holds 700 data pixels is 200; clipped to 72 to 1200",
-          abs(FS.match_dpi(fig, [(ax, 700)]) - 200.0) < 1e-6 and FS.match_dpi(fig, [(ax, 10)]) == FS.DPI_MIN
-          and FS.match_dpi(fig, [(ax, 10 ** 6)]) == FS.DPI_MAX)
+    small = Figure(figsize=(7, 6))
+    sax = small.add_axes([0.1, 0.1, 0.5, 0.5])
+    d_small = FS.match_dpi(small, [(sax, 64)])
+    held = sax.get_position().width * small.get_size_inches()[0] * d_small      # the axes' pixels at that dpi
+    check("match_dpi: the dpi at which an axes 3.5 in wide holds 700 data pixels is 200, 1200 at most; a 64 pixel "
+          "plane (18 dpi wanted) gets 72 dpi and a figure shrunk until its axes hold 64 pixels (2026-10-15: the "
+          "dpi stopped at 72, 252 pixels)",
+          abs(FS.match_dpi(fig, [(ax, 700)]) - 200.0) < 1e-6 and FS.match_dpi(fig, [(ax, 10 ** 6)]) == FS.DPI_MAX
+          and d_small == FS.DPI_MIN and abs(held - 64) < 0.05 and small.get_size_inches()[0] < 2.0
+          and tuple(fig.get_size_inches()) == (7.0, 6.0), f"{d_small} {held} {small.get_size_inches()}")
     # the box's h: a custom run's HDF5 input with the h-free mark gives it, one without the mark does not
     d = TMP / "hubble"
     d.mkdir()
@@ -339,6 +380,7 @@ def saving_map(qa, x, view):
     font size."""
     import matplotlib
     import matplotlib.pyplot as plt
+    from PIL import Image
     import figsave as FS
     print("Save options: the map")
     d = TMP / "save map"
@@ -420,6 +462,22 @@ def saving_map(qa, x, view):
           got["mpc{}"][0] == f"{xn} [Mpc]" and got["mpc_h{}"][0] == f"{xn} [Mpc/h]" and abs(h - 0.6774) < 1e-12
           and np.allclose(got["mpc_h{}"][1], (glo[0] * h, ghi[0] * h)) and got["cells{}"][0] == f"{xn} [cells]"
           and np.allclose(got["cells{}"][1], (0, n0)) and got["mpc{'units': False}"][0] == xn, str(got))
+    # (2026-10-15) the title's slice position in the axes' unit: it said Mpc whatever the axes said
+    req = x._req
+    an, pos = "xyz"[req["axis"]], float(x._slice_position())
+    tt = {}
+    for unit in ("mpc", "mpc_h", "cells"):
+        fig, _ = x.map_figure(FS.options({"unit": unit}))
+        tt[unit] = fig.axes[0].get_title()
+        plt.close(fig)
+    fig, _ = x.map_figure(FS.options({"unit": "cells", "title_text": "Typed", "title_for": auto}))
+    typed = fig.axes[0].get_title()
+    plt.close(fig)
+    check("the title's slice position in the axes' unit: Mpc as on screen, Mpc/h (times h), cells (the cell's "
+          "centre); a title typed for this map stays under another unit",
+          tt["mpc"] == auto and f"{an} = {pos * h:.2f} Mpc/h" in tt["mpc_h"] and f"{an} = {pos:.2f} Mpc" in auto
+          and f"{an} = {pos:.2f} Mpc" not in tt["mpc_h"] and f"{an} = {req['index'] + 0.5:.2f} cells" in tt["cells"]
+          and typed == "Typed", str(tt))
     fig, _ = x.map_figure(FS.options({"voids": False}))
     check("void outlines off: no circles (the default draws them)", base_circles > 0 and _n_circles(fig) == 0,
           f"{base_circles} {_n_circles(fig)}")
@@ -441,8 +499,22 @@ def saving_map(qa, x, view):
           "2 px); dpi 100 = half the default's width", abs(w5 - 500) <= 2 and abs(w900 - 900) <= 2
           and abs(d100 - new.shape[1] / 2) <= 3, f"{w5} {w900} {d100} {new.shape}")
     fig, dpi = x.map_figure(FS.options({"match_data": True}))
+    fig.set_dpi(dpi)
+    ext = fig.axes[0].get_window_extent(fig.canvas.get_renderer())
     plt.close(fig)
-    check("match the data: a 64 px map needs less than 72 dpi, so 72", dpi == FS.DPI_MIN, str(dpi))
+    x.save_png(d / "match.png", FS.options({"match_data": True, "voids": False}))
+    mw = _png(d / "match.png").shape[1]
+    check("match the data: a 64 px map needs less than 72 dpi: 72 dpi and a smaller figure, the map's axes 64 x 64 "
+          "pixels as the data (2026-10-15: 389, resampled), the text around it",
+          dpi == FS.DPI_MIN and abs(ext.width - n0) < 0.6 and abs(ext.height - n1) < 0.6 and n0 + 40 < mw < 389,
+          f"{dpi} {ext.width} x {ext.height} {mw}")
+    # (2026-10-15) no margins with 'match the data': the map's own pixels, unresampled (as full resolution)
+    bm = FS.options({"margins": "none", "match_data": True, "voids": False, "arrows": False})
+    w_bm = x.save_png(d / "borderless_match.png", bm)
+    blm = _png(d / "borderless_match.png")
+    check("no margins with 'match the data': the file is the map's own pixels (the data's shape, the screen's very "
+          "pixels, as Full resolution)", blm.shape == (n1, n0, 3) and np.array_equal(blm, view.canvas._buf)
+          and w_bm == [str(d / "borderless_match.png")], f"{blm.shape}")
     # formats, transparency, fonts
     x.save_png(d / "map.pdf", FS.preset("publication"))
     x.save_png(d / "map.svg", FS.options({"format": "svg"}))
@@ -454,6 +526,20 @@ def saving_map(qa, x, view):
           "see-through around the figure", pdf.startswith(b"%PDF") and b"/FontFile2" in pdf and "<text" in svg
           and np.array_equal(_png(d / "map.tif")[..., :3], new[..., :3]) and tr.shape[2] == 4 and tr[0, 0, 3] == 0,
           f"{len(pdf)} {tr.shape}")
+    # (2026-10-15) every TIFF LZW-compressed (it was written uncompressed): the figure (matplotlib), full resolution
+    # (Pillow) and full resolution with the outlines (matplotlib's figimage); the same pixels as uncompressed
+    x.save_png(d / "full_voids.tif", dict(bare, voids=True))
+    tifs = {}
+    for name in ("map.tif", "full.tif", "full_voids.tif"):
+        with Image.open(d / name) as im:
+            arr = np.asarray(im)
+            tifs[name] = im.info.get("compression")
+        Image.fromarray(arr).save(d / ("raw_" + name))              # Pillow's default: uncompressed
+        tifs[name] = (tifs[name], np.array_equal(_png(d / ("raw_" + name)), arr),
+                      (d / name).stat().st_size < (d / ("raw_" + name)).stat().st_size)
+    check("TIFF: LZW-compressed (the figure, full resolution, full resolution with outlines), smaller than the "
+          "uncompressed file and pixel-identical to it", all(v == ("tiff_lzw", True, True) for v in tifs.values()),
+          str(tifs))
     s = FS.preset("slide")
     with matplotlib.rc_context(FS.rc(s)):
         fig, _ = x.map_figure(s)
@@ -539,6 +625,53 @@ def saving_grid(qa, x, view):
     bl = _png(d / "borderless.png")
     check("margins none: the panels fill the file (2 x 4.2 in by 4.2 in at 100 dpi = 840 x 420); the SVG keeps its "
           "text", bl.shape[:2] == (420, 840) and "<text" in (d / "grid.svg").read_text(errors="replace"), f"{bl.shape}")
+    # ---- (2026-10-15) the title's position in the axes' unit; one unit in every panel; match the data; TIFF
+    import types
+    from PIL import Image
+    a, pos = req["position_at"]
+    h = G.hubble(items[0]["output"])
+    fig, _ = x.grid_figure(FS.options({"unit": "mpc_h"}))
+    sup_h = fig._suptitle.get_text() if fig._suptitle is not None else ""
+    fig, _ = x.grid_figure(FS.options({"unit": "cells"}))
+    sup_c = fig._suptitle.get_text() if fig._suptitle is not None else ""
+    check("the grid's title: the slice position in the axes' unit (Mpc/h, cells), Mpc on screen",
+          f"({'xyz'[a]} = {pos * h:.2f} Mpc/h)" in sup_h and f"({'xyz'[a]} = {req['index'] + 0.5:.2f} cells)" in sup_c
+          and f"({'xyz'[a]} = {pos:.2f} Mpc)" in x._grid_title, f"{sup_h!r} {sup_c!r} {x._grid_title!r}")
+    known, unknown = types.SimpleNamespace(_hubble=0.7), types.SimpleNamespace(_hubble=None)
+    o1 = items[1]["output"]
+    keep_h, said = o1._hubble, []
+
+    def say(msg):
+        said.append(msg)
+    x.status.connect(say)
+    o1._hubble = None                               # one panel's h not known (a custom run, an opened file)
+    try:
+        x.save_grid(d / "noh.png", FS.options({"unit": "mpc_h"}))
+        fig, _ = x.grid_figure(FS.options({"unit": "mpc_h"}))
+        names = [ax.get_xlabel() for ax in fig.axes[:2]]
+    finally:
+        o1._hubble = keep_h
+        x.status.disconnect(say)
+    xa = "xyz"[items[0]["rest"][0]]
+    check("Mpc/h asked, one panel's h not known: every panel in Mpc and the status line says so (grid_unit); all "
+          "known: Mpc/h", names == [f"{xa} [Mpc]"] * 2 and said and "not known" in said[-1] and "--" not in said[-1]
+          and E.grid_unit([{"output": known}, None, {"output": known}], "mpc_h") == ("mpc_h", "")
+          and E.grid_unit([{"output": known}, {"output": unknown}], "mpc_h")[0] == "mpc", f"{names} {said[-1:]}")
+    m = FS.options({"match_data": True})
+    fig, _ = x.grid_figure(m)
+    dpi = E.grid_dpi(fig, req, items, m)
+    fig.set_dpi(dpi)
+    widths = [ax.get_window_extent(fig.canvas.get_renderer()).width for ax in fig.axes[:2]]
+    check("the grid, match the data: 64-cell panels at 72 dpi in a smaller figure, each panel 64 pixels across "
+          "(2026-10-15: about 210, resampled)", dpi == FS.DPI_MIN and all(abs(w - T) < 0.6 for w in widths),
+          f"{dpi} {widths}")
+    x.save_grid(d / "grid.tif", FS.options())
+    x.save_grid(d / "borderless_match.png", FS.options({"margins": "none", "match_data": True, "voids": False}))
+    with Image.open(d / "grid.tif") as im:
+        comp = im.info.get("compression")
+    check("the grid as TIFF: LZW-compressed; no margins with 'match the data': the panels' own pixels, touching as in "
+          "that figure (64 x 128)", comp == "tiff_lzw" and _png(d / "borderless_match.png").shape == (T, 2 * T, 3),
+          f"{comp} {_png(d / 'borderless_match.png').shape}")
     x.grid_merge.setChecked(True)
     ok = wait_for(qa, lambda: x._grid_shown and not x._grid_busy and x.grid_request()["merged"], 30)
     fig, _ = x.grid_figure(FS.options({"colorbar": False, "panel_titles": False, "tick_labels": False}))
@@ -607,6 +740,37 @@ def saving_dialog(qa, x):
     nohub = FS.make_dialog(x, x.save_options, dict(ctx, hubble=None))
     check("without a known h, Mpc/h is not offered", not nohub.unit.model().item(nohub.unit.findData("mpc_h")).isEnabled())
     nohub.deleteLater()
+    # (2026-10-15) Mpc/h remembered, this output's h not known (an opened file, a custom run without an h-free input;
+    # grids.hubble's cached answer faked): the map in Mpc, said in the status line and in the dialog's note, and the
+    # remembered choice kept for the outputs that know h
+    o, d = x.current, TMP / "save map"
+    keep_h, said = o._hubble, []
+
+    def say(msg):
+        said.append(msg)
+    x.status.connect(say)
+    real_ask, kept = x._ask_image_path, x.save_options
+    x._ask_image_path = lambda *a, **k: (str(d / "noh.png"), "png")
+    x.save_options = FS.options({"unit": "mpc_h", "voids": False})
+    o._hubble = None
+    try:
+        x._save_image()
+        import matplotlib.pyplot as plt
+        fig, _ = x.map_figure()
+        label, title = fig.axes[0].get_xlabel(), fig.axes[0].get_title()
+        plt.close(fig)
+        dlg = FS.make_dialog(x, x.save_options, x.save_context())
+        note, unit_ok = dlg.note.text(), dlg.options()["unit"]
+        dlg.deleteLater()
+        after = x.save_options["unit"]
+    finally:
+        o._hubble = keep_h
+        x._ask_image_path, x.save_options = real_ask, kept
+        x.status.disconnect(say)
+    check("Mpc/h remembered where h is not known: the map's axes and title in Mpc, the status line and the dialog's "
+          "note say so, Mpc/h stays the choice", label.endswith("[Mpc]") and title == x._map_title()
+          and said and "h is not known" in said[-1] and "h is not known" in note and "stays your choice" in note
+          and "--" not in note and unit_ok == "mpc_h" and after == "mpc_h", f"{label} {said[-1:]} {note!r}")
     real = FS.make_dialog
     saved = []
 
@@ -922,6 +1086,33 @@ def fold_map():
         ok = wait_for(qa, lambda: not x._busy and x._req is not None and x._req["field"] == "caustic_class", 30)
         check("... and the caustic-class map stays the stored mask",
               ok and np.array_equal(np.asarray(x._plane), np.take(ccm, x._req["index"], axis=x._req["axis"])))
+        # (2026-10-15) a job running caps the cube cache (1 GB; here 2.5 cubes): the three cubes of the fold map no
+        # longer fit together, so only their planes are read -- each was read whole and they evicted each other, three
+        # 0.5 GB reads per step at 512³. Uncapped (they fit) the cubes are cached as before: stepping stays fast.
+        real_read, real_run = G._read_plane, G.RUN_CUBE_BYTES
+        reads = []
+
+        def spy(path, *a):
+            reads.append(Path(path).name)
+            return real_read(path, *a)
+        fold_files = {f"ps_output.{s}" for s in ("a_streams", "a_hidden_streams", "causticClass")}
+        G.drop_cubes()
+        G._read_plane, G.RUN_CUBE_BYTES = spy, int(2.5 * N ** 3 * 4)
+        G.cap_cubes(True)
+        try:
+            planes = [(k_, o.slice("caustic", 2, k_)) for k_ in (19, 20, 21)]
+            cached = {Path(str(key[0])).name for key in G._CUBES}
+            G.cap_cubes(False)
+            o.slice("caustic", 2, 22)
+            cached_free = {Path(str(key[0])).name for key in G._CUBES}
+        finally:
+            G._read_plane, G.RUN_CUBE_BYTES = real_read, real_run
+            G.cap_cubes(False)
+        check("a job running (the cube cache capped below the three cubes): the fold map reads only its planes (three "
+              "per step), caches no cube, and is the same exact flag; uncapped the three cubes are cached as before",
+              sorted(reads) == sorted(list(fold_files) * 3) and not (cached & fold_files)
+              and all(np.array_equal(p, np.take(want, k_, axis=2).astype(np.float64)) for k_, p in planes)
+              and fold_files <= cached_free, f"{sorted(reads)} {cached} {cached_free}")
         # the exact zoom (load_exact_planes): a new run's grids, one cell thick. Until 2026-10-13 its fold map masked
         # both parity bits of the 0/1 '.caustic' grid, so it showed no fold cell at all, and its class map showed 0/1
         import types
@@ -957,6 +1148,287 @@ def write_grids(d: Path, prefix: str, n: int, dim: int = 3, seed: int = 0):
     (1.0 + 0.1 * np.random.default_rng(seed).normal(size=shape)).astype(np.float32).tofile(str(d / f"{prefix}.a_den"))
     np.zeros(shape + (dim,), np.float32).tofile(str(d / f"{prefix}.a_vel"))
     np.ones(shape, np.float32).tofile(str(d / f"{prefix}.a_streams"))
+
+
+MF_N, MF_Z, MF_H, MF_BOX = 32, 1.0, 0.7, 32.0
+MF_STORED = (("divergence", "velDiv", 1), ("shear", "velShear", 5), ("vorticity", "velVort", 3),
+             ("gradient", "velGrad", 9), ("vweb", "velVweb", 1), ("vweb_eigenvalues", "velVwebEig", 3))
+
+
+def mean_field_data(data: Path) -> Path:
+    """A z = 1 snapshot (h = 0.7, a 32 Mpc box) with a PS-DTFE output whose velocity is random (every mode up to the
+    grid's Nyquist) and whose stored velocity derivatives are unrelated noise, its run log's lambda_th 0.2, and a
+    standard-DTFE 'output' with its own (noise) divergence beside it."""
+    import h5py
+    d = data / "SYNMF-1-Dark" / "snapdir_050"
+    d.mkdir(parents=True, exist_ok=True)
+    n = MF_N
+    with h5py.File(d / "combined_050.hdf5", "w") as f:
+        h = f.create_group("Header").attrs
+        h["BoxSize"], h["Redshift"], h["HubbleParam"], h["HFreeUnits"] = MF_BOX * 1000.0, MF_Z, MF_H, 1
+        h["NumPart_ThisFile"], h["MassTable"] = np.array([0, n ** 3, 0, 0, 0, 0]), np.array([0, 1.0, 0, 0, 0, 0])
+    rng = np.random.default_rng(21)
+    write_grids(d, "ps_output", n)
+    (300.0 * rng.normal(size=(n, n, n, 3))).astype(np.float32).tofile(str(d / "ps_output.a_vel"))
+    for _name, sfx, c in MF_STORED:
+        rng.normal(size=(n, n, n) + ((c,) if c > 1 else ())).astype(np.float32).tofile(str(d / f"ps_output.a_{sfx}"))
+    (d / "ps_output.runlog").write_text("RUNNING: ./PS-DTFE in out --grid 32 --periodic --lambda_th 0.2\n")
+    (1.0 + 0.1 * rng.normal(size=(n, n, n))).astype(np.float32).tofile(str(d / "output.a_den"))
+    rng.normal(size=(n, n, n, 3)).astype(np.float32).tofile(str(d / "output.a_vel"))
+    rng.normal(size=(n, n, n)).astype(np.float32).tofile(str(d / "output.a_velDiv"))
+    return d
+
+
+def mean_field_pure():
+    """9. (no Qt) the mean-field planes of grids.OutputSet against dtfelib's FieldSet, the outputs that cannot have
+    them, the labels, the cube cache's rules while a job runs."""
+    import json
+    from dtfelib import FieldSet
+    from dtfelib.cli import add_ps_gradient_arg
+    import argparse
+    print("PS velocity derivatives: the mean field (2026-10-15)")
+    data = TMP / "mf data"
+    d = mean_field_data(data)
+    outs = {o.prefix: o for _t, o in G.find_outputs(data)}
+    ps_o, dt_o = outs["ps_output"], outs["output"]
+    fs = FieldSet(d, method="ps")
+    # the reference: dtfelib's own mean field (raw u-units, as the binary stores its grids) written as another
+    # output's STORED grids, so slice() applies the same components, curl and sqrt(a) to both
+    ref = data / "ref"
+    ref.mkdir(exist_ok=True)
+    write_grids(ref, "ps_ref", MF_N)
+    for name, sfx, _c in MF_STORED:
+        fs.load(name, scaled=False, mean_field=True).tofile(str(ref / f"ps_ref.a_{sfx}"))
+    ref_o = G.OutputSet(ref / "ps_ref", box=ps_o.box, redshift=ps_o.redshift)
+    bad = []
+    for name, _sfx, _c in MF_STORED:
+        for comp in G.components(name, ps_o.files[name].ncomp):
+            for axis in range(3):
+                got = ps_o.slice(name, axis, 9, comp, "mean-field")
+                want = ref_o.slice(name, axis, 9, comp)
+                if name == "vweb":
+                    off = float(np.mean(got != want))
+                    if off > 1e-3:
+                        bad.append(f"{name} axis {axis}: {off:.4f} of the labels differ")
+                    continue
+                err = float(np.abs(got - want).max() / max(np.abs(want).max(), 1e-30))
+                if not err < 1e-5:
+                    bad.append(f"{name} [{comp}] axis {axis}: {err:.2e}")
+    check("9. a PS output's mean-field planes (every name and component, every axis) are dtfelib's FieldSet.load("
+          "name, mean_field=True) cut there, through slice()'s components, curl and sqrt(a) (the run log's lambda_th, "
+          "the header's h for the V-web)", not bad, "; ".join(bad[:6]))
+    stored = np.fromfile(d / "ps_output.a_velDiv", dtype=np.float32).reshape((MF_N,) * 3)
+    sa = np.sqrt(1.0 / (1.0 + MF_Z))
+    dt_div = np.fromfile(d / "output.a_velDiv", dtype=np.float32).reshape((MF_N,) * 3)
+    check("9. 'stored' (and the default of slice()) is the stored stream average; standard DTFE's stored grid either "
+          "way (its families: 'mean' always; PS: 'mean' or 'stream')",
+          np.allclose(ps_o.slice("divergence", 2, 9, "value", "stored"), stored[:, :, 9] * sa, rtol=1e-6)
+          and np.allclose(ps_o.slice("divergence", 2, 9), stored[:, :, 9] * sa, rtol=1e-6)
+          and np.allclose(dt_o.slice("divergence", 2, 9, "value", "mean-field"), dt_div[:, :, 9] * sa, rtol=1e-6)
+          and dt_o.gradient_family("divergence", "stored") == "mean" == dt_o.gradient_family("vweb", "mean-field")
+          and ps_o.gradient_family("shear", "mean-field") == "mean" and ps_o.gradient_family("shear", "stored") == "stream"
+          and ps_o.gradient_family("density", "mean-field") == "" and ps_o.mean_field_reason() == "")
+    parser = add_ps_gradient_arg(argparse.ArgumentParser())
+    check("9. the launcher's default is the figure scripts' ('--ps-gradient' of dtfelib.cli: the mean field)",
+          G.PS_GRADIENT_DEFAULT == parser.parse_args([]).ps_gradient == "mean-field"
+          and set(G.PS_GRADIENT_CHOICES) == {"mean-field", "stored"})
+    # the outputs that keep the stored grid: 2D, not periodic, a window
+    other = data / "other"
+    other.mkdir(exist_ok=True)
+    for name, side, dim in (("np", {"estimator": "ps", "periodic": False}, 3), ("win", {"estimator": "ps",
+                            "window": [0, 10, 0, 10, 0, 10]}, 3), ("flat", {"estimator": "ps", "dim": 2}, 2)):
+        write_grids(other, name, 16, dim)
+        np.zeros((16,) * dim, np.float32).tofile(str(other / f"{name}.a_velDiv"))
+        (other / f"{name}.gui.json").write_text(json.dumps(dict(side, box_mpc=[0.0, 16.0] * dim)))
+    kept = {nm: G.OutputSet(other / nm, box=G.custom_box(G.sidecar(other / nm))) for nm in ("np", "win", "flat")}
+    reasons = {nm: o.mean_field_reason() for nm, o in kept.items()}
+    check("9. a non-periodic run, a window of the grid and a 2D grid keep the stored stream average with 'mean-field', "
+          "and say why", reasons["np"] == "not a periodic box" and "window" in reasons["win"] and "2D" in reasons["flat"]
+          and all(o.gradient_family("divergence", "mean-field") == "stream" for o in kept.values())
+          and all(o.slice("divergence", 2, 3, "value", "mean-field").shape == (16, 16) for o in kept.values()), str(reasons))
+    lab = (G.field_label(ps_o, "divergence", "mean"), G.field_label(ps_o, "divergence", "stream"),
+           G.field_label(dt_o, "divergence", "mean"), G.field_label(dt_o, "divergence", "mean", qualify=True),
+           G.field_label(ps_o, "density", ""))
+    check("9. field_label: a PS map says its family, a standard-DTFE map alone keeps its name (qualified beside a PS "
+          "one), other fields unchanged; no '--'",
+          lab == ("velocity divergence (mean field ∇⟨v⟩)", "velocity divergence (stream average ⟨∇v⟩)",
+                  "velocity divergence", "velocity divergence (mean field ∇⟨v⟩)", "density ρ/ρ̄")
+          and not any("--" in t for t in lab), str(lab))
+    # a job running: the cube cache capped below the velocity cube -> slabs from the file, nothing cached whole
+    real_run, real_get = G.RUN_CUBE_BYTES, G._SlabFile.__getitem__
+    slabs = []
+
+    def spy(self, sl):
+        slabs.append(self.path.name)
+        return real_get(self, sl)
+    try:
+        G.drop_cubes()
+        free = ps_o.slice("divergence", 1, 7, "value", "mean-field")
+        cached_free = {Path(str(k[0])).name for k in G._CUBES}
+        G.drop_cubes()
+        G._SlabFile.__getitem__, G.RUN_CUBE_BYTES = spy, 300_000      # the velocity grid is 393 kB
+        G.cap_cubes(True)
+        capped = ps_o.slice("divergence", 1, 7, "value", "mean-field")
+        n_first = len(slabs)
+        again = ps_o.slice("shear", 1, 7, "1", "mean-field")          # the same plane: no second pass
+        cached_capped = {Path(str(k[0])).name for k in G._CUBES}
+        check("9. a job running (the cube cache capped below the velocity grid): the plane is computed from slabs read "
+              "off the file, the velocity is not cached whole, the numbers are the same; another derivative of the "
+              "same plane reads nothing again; uncapped the velocity cube is cached as any grid",
+              n_first > 0 and set(slabs) == {"ps_output.a_vel"} and len(slabs) == n_first
+              and "ps_output.a_vel" not in cached_capped and np.array_equal(free, capped)
+              and "ps_output.a_vel" in cached_free and again.shape == (MF_N, MF_N),
+              f"{slabs} {cached_capped} {cached_free}")
+    finally:
+        G._SlabFile.__getitem__, G.RUN_CUBE_BYTES = real_get, real_run
+        G.cap_cubes(False)
+    # a rewritten velocity grid (a re-run): the plane cache must not answer for it
+    v = np.fromfile(d / "ps_output.a_vel", dtype=np.float32)
+    before = ps_o.slice("divergence", 0, 4, "value", "mean-field")
+    time.sleep(0.01)
+    (2.0 * v).tofile(str(d / "ps_output.a_vel"))
+    after = ps_o.slice("divergence", 0, 4, "value", "mean-field")
+    v.tofile(str(d / "ps_output.a_vel"))
+    check("9. a velocity grid written again: its new mean field, not the cached plane (twice the velocity, twice "
+          "the divergence)", np.allclose(after, 2.0 * before, rtol=1e-5, atol=1e-6 * np.abs(before).max()))
+    G.drop_cubes()
+
+
+def mean_field_gui():
+    """9. the window: the choice, the map's labels, Compare with, the figure grid, the saved figure, the state."""
+    try:
+        from PySide6.QtWidgets import QApplication
+    except ImportError as e:
+        print(f"SKIP (PS derivatives in the window): PySide6 is not importable ({e})")
+        return
+    import types
+    import explore as E
+    qa = QApplication.instance() or QApplication([])
+    data = TMP / "mf data"
+    view = E.ExploreView()
+    x = E.ExploreControls(view, lambda: str(data), lambda: [])
+    view.resize(700, 600)
+    texts = []
+
+    def shown():
+        ok_ = wait_for(qa, lambda: not x._busy and x._req is not None and x._req["output"] is x.current
+                       and x._plane is not None, 30)
+        texts.extend([view.title.text(), view.colorbar.label, x.ps_gradient_note.text(), x.zoom_state.text()])
+        return ok_
+
+    def pick(combo, value):
+        combo.setCurrentIndex(combo.findData(value))
+        return shown()
+    try:
+        x.refresh_outputs()
+        shown()
+        ps_root = str(data / "SYNMF-1-Dark" / "snapdir_050" / "ps_output")
+        dt_root = str(data / "SYNMF-1-Dark" / "snapdir_050" / "output")
+        pick(x.prefix_combo, ps_root)
+        ok = pick(x.field, "divergence")
+        o, req = x.current, x._req
+        from dtfelib import FieldSet                    # the figure scripts' mean field, cut at the map's slice
+        mf = np.take(FieldSet(Path(ps_root).parent, method="ps").load("divergence", mean_field=True), req["index"],
+                     axis=req["axis"])
+        title = view.title.text()
+
+        def same(a, b):                                 # equal to float32 rounding (the FFTs sum in other orders)
+            return np.shape(a) == np.shape(b) and float(np.abs(np.asarray(a) - b).max()) <= 1e-5 * float(np.abs(b).max())
+        check("9. the choice starts at the mean field; a PS divergence map is the mean field, and its title and colour "
+              "bar say so", ok and x.ps_gradient.currentData() == "mean-field" and req.get("ps_gradient") == "mean-field"
+              and same(x._plane, mf) and "mean field ∇⟨v⟩" in title and "mean field ∇⟨v⟩" in view.colorbar.label
+              and not x.ps_gradient_note.text(), f"{title} | {view.colorbar.label}")
+        import matplotlib.pyplot as plt
+        fig, _dpi = x.map_figure()
+        saved = [t.get_text() for ax in fig.axes for t in (ax.title,)] + [ax.get_ylabel() for ax in fig.axes]
+        plt.close(fig)
+        check("9. ... the saved figure's title and colour bar say it too", any("mean field ∇⟨v⟩" in t for t in saved[:1])
+              and any("mean field ∇⟨v⟩" in t for t in saved[1:]), str(saved))
+        ok = pick(x.ps_gradient, "stored")
+        st = o.slice("divergence", req["axis"], req["index"], "value", "stored")
+        check("9. 'stream average': the stored grid, and the title says so", ok and np.allclose(x._plane, st)
+              and not np.allclose(st, mf) and "stream average ⟨∇v⟩" in view.title.text(), view.title.text())
+        # Compare with: A = PS, B = standard DTFE
+        x.compare.setCurrentIndex(x.compare.findData(dt_root))
+        ok = shown()
+        t_stored = view.title.text()
+        b_plane = x._planes[1] if x._planes is not None else None
+        x.ps_gradient.setCurrentIndex(x.ps_gradient.findData("mean-field"))
+        ok2 = shown()
+        t_mean = view.title.text()
+        check("9. Compare with a standard-DTFE output: B is its stored grid; the title names A's and B's families when "
+              "they differ, the one family when they agree; A follows the choice",
+              ok and ok2 and b_plane is not None
+              and "(A stream average ⟨∇v⟩, B mean field ∇⟨v⟩)" in t_stored and "A − B: velocity divergence (mean field ∇⟨v⟩)" in t_mean
+              and same(x._planes[0], mf), f"{t_stored} | {t_mean}")
+        x.compare.setCurrentIndex(0)
+        shown()
+        # the figure grid: the standard and the phase-space divergence side by side
+        x.grid_set_layout(1, 2)
+        x.grid_fill("types")
+        x.grid_merge.setChecked(True)
+        req_g = x.grid_request()
+        items = E.grid_items(req_g)
+        q_mean = E.grid_differences(items)["quantities"]
+        sup_mean = E.grid_suptitle(req_g, items)
+        x.ps_gradient.setCurrentIndex(x.ps_gradient.findData("stored"))
+        shown()
+        req_s = x.grid_request()
+        items_s = E.grid_items(req_s)
+        q_stored = E.grid_differences(items_s)["quantities"]
+        labels_s = sorted(E.panel_label(it, E.grid_differences(items_s)) for it in items_s if it)
+        fig, _n = E.grid_figure(req_s, items_s)
+        bars = [ax.get_ylabel() for ax in fig.axes[2:]]
+        fig_m, _n = E.grid_figure(req_g, items)
+        bars_m = [ax.get_ylabel() for ax in fig_m.axes[2:]]
+        check("9. the figure grid: with the mean field the standard and PS divergence are one quantity (one colour bar, "
+              "the family in the title); stored, two (two bars, each panel named with its family)",
+              req_g["ps_gradient"] == "mean-field" and len(q_mean) == 1 and "mean field ∇⟨v⟩" in sup_mean
+              and len(bars_m) == 1 and len(q_stored) == 2 and len(bars) == 2
+              and any("stream average" in t for t in labels_s) and any("mean field" in t for t in labels_s)
+              and any("stream average" in b for b in bars), f"{q_mean} {sup_mean} {bars_m} | {q_stored} {labels_s} {bars}")
+        texts.extend([sup_mean] + labels_s + bars + bars_m)
+        st_ = x.state()
+        x.ps_gradient.setCurrentIndex(x.ps_gradient.findData("mean-field"))
+        shown()
+        x.restore_state(st_)
+        back = x.ps_gradient.currentData()
+        x.restore_state({k: v for k, v in st_.items() if k != "ps_gradient"})     # a state saved before 2026-10-15
+        check("9. the choice is remembered (state / restore_state); a state saved before it leaves the choice alone",
+              st_.get("ps_gradient") == "stored" and back == "stored" and x.ps_gradient.currentData() == "stored")
+        x.ps_gradient.setCurrentIndex(x.ps_gradient.findData("mean-field"))
+        shown()
+        # a zoom is a point evaluation: the stream average, said; the zoom line is text (2026-10-15: it showed the
+        # function that writes the window)
+        ax_ = x.axis.currentIndex()
+        shp = [8, 8, 8]
+        shp[ax_] = 1
+        g = np.zeros(shp + [3, 3])
+        g[..., 0, 0] = 1.0
+        f = types.SimpleNamespace(density=np.ones(shp), streams=None, caustic=None, velocity=None, dispersion=None,
+                                  sigma=None, velocity_gradient=g, offsets=None)
+        zreq = {"output": x.current, "axis": ax_, "index": x.index.value(), "rest": [a for a in range(3) if a != ax_],
+                "a0": (2.0, 10.0), "a1": (4.0, 12.0), "res": 8, "depth": 1, "stamp": x._file_stamp(x.current)}
+        x._zoomed(zreq, f)
+        zl, zt = x.zoom_state.text(), view.title.text()
+        check("9. a zoom of the PS divergence: the stream average in the title, the zoom line says why, and its window "
+              "is written out (no '<function')", x.is_zoomed() and "stream average ⟨∇v⟩" in zt
+              and "a point evaluation has no mean field" in zl and "<function" not in zl and "2.00–10.00" in zl,
+              f"{zt} | {zl}")
+        texts.extend([zl, zt])
+        x.zoom_out()
+        shown()
+        # an opened non-periodic phase-space output: the stored grid, said under the choice
+        ok = x.open_file(str(data / "other" / "np.a_den"))
+        ok = ok and wait_for(qa, lambda: not x._busy and x.current is not None and x.current.prefix == "np", 30)
+        pick(x.field, "divergence")
+        check("9. a non-periodic PS output: its stored stream average, the note under the choice says why",
+              ok and "stream average" in view.title.text() and "not a periodic box" in x.ps_gradient_note.text()
+              and not x.ps_gradient_note.isHidden(), f"{view.title.text()} | {x.ps_gradient_note.text()}")
+        texts.extend([x.ps_gradient.toolTip(), x.ps_gradient.itemText(0), x.ps_gradient.itemText(1)])
+        check("9. the choice's texts carry no '--'", not [t for t in texts if "--" in t], str([t for t in texts if "--" in t]))
+    finally:
+        x.shutdown()
 
 
 def keep_slice():
@@ -1078,6 +1550,14 @@ def keep_slice():
         check("7. ... back on the snapshot zoomed: its zoom of the window, from memory",
               ok and x.is_zoomed() and x._zoom_fields is f99 and x._zoom["a0"] == (20.0, 30.0)
               and x._zoom["a1"] == (40.0, 50.0) and x.zoom_time.text() == "from memory", x.zoom_state.text())
+        import figsave as FS                              # (2026-10-15) a saved zoom's title in the axes' unit
+        h99, z = G.hubble(x.current), x._zoom
+        zt = x._map_title(lambda a_, v_: FS.position(x.current, a_, v_, "mpc_h", h99))
+        r0, r1 = (E.AXES[k] for k in z["rest"])
+        want = (f"{r0} {20 * h99:.2f}–{30 * h99:.2f}, {r1} {40 * h99:.2f}–{50 * h99:.2f} Mpc/h — "
+                f"{E.AXES[z['axis']]} = {x._slice_position() * h99:.2f} Mpc/h")
+        check("8. a zoom's saved title in Mpc/h: its window and the slice both converted (the screen's in Mpc)",
+              want in zt and f"{r0} 20.00–30.00, {r1} 40.00–50.00 Mpc — " in x._map_title(), f"{zt!r} {want!r}")
         # the query server running on the other output: the window is evaluated there (the request stood in for)
         sent = []
         spy = sent.append
@@ -1186,9 +1666,11 @@ def keep_slice():
 def main():
     try:
         pure()
+        mean_field_pure()
         gui()
         fold_map()
         keep_slice()
+        mean_field_gui()
         save_settings()
     finally:
         shutil.rmtree(TMP, ignore_errors=True)

@@ -42,6 +42,15 @@
 #       10 partitions' answers back, computes the other 17, and every output -- the '.pts_*' files and the grids -- is
 #       byte-identical to the uninterrupted run (until 2026-10-14 such a run wrote no checkpoint and '--resume'
 #       refused it: 'its point accumulators are not checkpointed')
+#   D14 (2026-10-15) the partition loop's LOOK-AHEAD (partition k+1 selected, split and triangulated on CPU threads of
+#       its own while partition k is interpolated; on by default under '--gpu', DTFE_OVERLAP=1 forces it on the CPU):
+#       every output byte-identical to the run without it -- the grids of D1's reference (the log says it ran;
+#       '--no-overlap' wins over DTFE_OVERLAP=1), a run killed after 10 partitions while the 11th was being prepared,
+#       resumed for 2 more with '--no-overlap' (out of the settings key) and then with the look-ahead (it looks ahead
+#       to the next partition the checkpoint lacks), D13's plane (one tessellation
+#       per partition), a cold and a warm '--tessellation-cache' (the warm run loads every sub-domain: the cache
+#       folder is left untouched), a machine without the free memory for it (the look-ahead pauses), and on GPU builds D12's '--gpu --exact-average' reference against '--no-overlap'
+#       and a '--gpu' (Monte-Carlo average) pair with and without it
 # About a minute on the Mac (about 30 runs of 2-4 s).
 # Usage: tests/dtfe_resume_check.sh [--no-build]   (--no-build is accepted and ignored: the binaries are used as built)
 set -uo pipefail
@@ -337,6 +346,61 @@ check "D13 --resume with another point file under the same name refuses, naming 
     && [ "$(grep -c '<<< Interpolating the fields for partition' "$TMP/p3.log")" = 17 ] && [ ! -e "$PK" ]
 check "D13 the resume read the 10 partitions' answers back and computed the other 17 (exit $rc); checkpoint removed" $?
 same "$TMP/pref" "$TMP/p"; check "D13 every output (.pts_* and grids) byte-identical to the uninterrupted plane run" $?
+
+echo ">> D14: the look-ahead (partition k+1 prepared while partition k is interpolated)"
+# (DTFE_FREE_GB: the free-memory check before each look-ahead reads a roomy machine, whatever else runs beside the test)
+LA=(env OMP_NUM_THREADS=2 DTFE_OVERLAP=1 DTFE_FREE_GB=1000 "$BIN" "$SNAP")
+"${LA[@]}" "$TMP/la" "${C[@]}" "${MC[@]}" > "$TMP/la.log" 2>&1 || { echo "FAIL: la (see $TMP/la.log)"; exit 1; }
+"${LA[@]}" "$TMP/lb" "${C[@]}" "${MC[@]}" --no-overlap > "$TMP/lb.log" 2>&1 || { echo "FAIL: lb (see $TMP/lb.log)"; exit 1; }
+grep -q "DTFE: look-ahead on" "$TMP/la.log" && [ "$(grep -c 'look-ahead: partition [0-9]* prepared' "$TMP/la.log")" = 26 ] \
+    && ! grep -q "look-ahead on" "$TMP/lb.log"
+check "D14 the look-ahead ran for partitions 2..27 (DTFE_OVERLAP=1), and not with --no-overlap" $?
+same "$TMP/ref" "$TMP/la"; check "D14 every output (T-web included) byte-identical to the run without the look-ahead" $?
+env OMP_NUM_THREADS=2 DTFE_OVERLAP=1 DTFE_FREE_GB=1 "$BIN" "$SNAP" "$TMP/lf" "${C[@]}" "${MC[@]}" > "$TMP/lf.log" 2>&1 \
+    || { echo "FAIL: lf (see $TMP/lf.log)"; exit 1; }
+grep -q "look-ahead paused: 1 GB free" "$TMP/lf.log" && ! grep -q "look-ahead: partition [0-9]* prepared" "$TMP/lf.log" \
+    && same "$TMP/ref" "$TMP/lf"
+check "D14 1 GB free (DTFE_FREE_GB=1): the look-ahead pauses, says so, and every output is the same" $?
+DTFE_TEST_EXIT_AFTER_PARTITIONS=10 "${LA[@]}" "$TMP/lk" "${C[@]}" "${MC[@]}" > "$TMP/lk1.log" 2>&1; rc1=$?
+# '--no-overlap' is left out of the settings key: a resume that adds it is accepted (and then runs without the look-ahead)
+DTFE_TEST_EXIT_AFTER_PARTITIONS=2 "${LA[@]}" "$TMP/lk" "${C[@]}" "${MC[@]}" --no-overlap --resume > "$TMP/lk15.log" 2>&1; rc15=$?
+"${LA[@]}" "$TMP/lk" "${C[@]}" "${MC[@]}" --resume > "$TMP/lk2.log" 2>&1; rc2=$?
+[ "$rc1" = 137 ] && [ "$rc15" = 137 ] && ! grep -q "refused\|look-ahead on" "$TMP/lk15.log" && [ "$rc2" = 0 ] \
+    && grep -q -- "--resume: 12 of 27" "$TMP/lk2.log" \
+    && grep -q "look-ahead: partition 14 prepared" "$TMP/lk2.log" && ! grep -q "look-ahead: partition [1-9] prepared\|look-ahead: partition 1[0-3] prepared" "$TMP/lk2.log" \
+    && same "$TMP/ref" "$TMP/lk"
+check "D14 killed after 10 partitions with the look-ahead (exit $rc1), 2 more with '--no-overlap --resume' (accepted, exit $rc15), resumed with it from partition 13: byte-identical" $?
+"${LA[@]}" "$TMP/lp" "${P[@]}" > "$TMP/lp.log" 2>&1 || { echo "FAIL: lp (see $TMP/lp.log)"; exit 1; }
+grep -q "DTFE: look-ahead on" "$TMP/lp.log" && same "$TMP/pref" "$TMP/lp"
+check "D14 the plane (one tessellation per partition) with the look-ahead: every output byte-identical" $?
+mkdir -p "$TMP/ltc"
+"${LA[@]}" "$TMP/lc1" "${C[@]}" "${MC[@]}" --tessellation-cache "$TMP/ltc" > "$TMP/lc1.log" 2>&1 || { echo "FAIL: lc1"; exit 1; }
+before="$(ls -li "$TMP/ltc")"
+"${LA[@]}" "$TMP/lc2" "${C[@]}" "${MC[@]}" --tessellation-cache "$TMP/ltc" > "$TMP/lc2.log" 2>&1 || { echo "FAIL: lc2"; exit 1; }
+[ "$(ls "$TMP/ltc" | grep -c '\.tess$')" -ge 27 ] && [ "$before" = "$(ls -li "$TMP/ltc")" ] \
+    && same "$TMP/ref" "$TMP/lc1" && same "$TMP/ref" "$TMP/lc2"
+check "D14 --tessellation-cache under the look-ahead: cold and warm runs byte-identical, the warm one loaded every sub-domain" $?
+if [ "$GPU" = 1 ]; then
+    "${RUN[@]}" "$TMP/gn" "${G[@]}" --no-overlap > "$TMP/gn.log" 2>&1 || { echo "FAIL: gn (see $TMP/gn.log)"; exit 1; }
+    grep -q "look-ahead on: .* on the GPU" "$TMP/gref.log" && ! grep -q "look-ahead on" "$TMP/gn.log" \
+        && ! grep -q "using the CPU interpolation" "$TMP/gref.log" "$TMP/gn.log"
+    check "D14 --gpu: the look-ahead is on by default (D12's reference) and off with --no-overlap" $?
+    if [ "${DTFE_METAL_FLOAT_GRIDS:-0}" = 1 ] || [ "${DTFE_GPU_FLOAT_GRIDS:-0}" = 1 ]; then
+        echo "  SKIP D14 GPU byte identity: the float atomics were asked for"
+    else
+        same "$TMP/gref" "$TMP/gn"; check "D14 --gpu --exact-average with and without the look-ahead: every output byte-identical" $?
+        # the GPU's Monte-Carlo average (the production default) too, the look-ahead made to run (DTFE_FREE_GB)
+        env OMP_NUM_THREADS=2 DTFE_FREE_GB=1000 "$BIN" "$SNAP" "$TMP/gm" "${C[@]}" "${MC[@]}" --gpu > "$TMP/gm.log" 2>&1 \
+            || { echo "FAIL: gm (see $TMP/gm.log)"; exit 1; }
+        env OMP_NUM_THREADS=2 DTFE_FREE_GB=1000 "$BIN" "$SNAP" "$TMP/gmn" "${C[@]}" "${MC[@]}" --gpu --no-overlap \
+            > "$TMP/gmn.log" 2>&1 || { echo "FAIL: gmn (see $TMP/gmn.log)"; exit 1; }
+        [ "$(grep -c 'look-ahead: partition [0-9]* prepared' "$TMP/gm.log")" = 26 ] && ! grep -q "look-ahead on" "$TMP/gmn.log" \
+            && ! grep -q "using the CPU interpolation" "$TMP/gm.log" "$TMP/gmn.log" && same "$TMP/gm" "$TMP/gmn"
+        check "D14 --gpu (Monte-Carlo average) with the look-ahead for partitions 2..27 and without it: every output byte-identical" $?
+    fi
+else
+    echo "  SKIP D14 GPU: $OBJ carries no GPU stamp"
+fi
 
 echo "RESULT: $PASS passed, $FAILS failed"
 [ "$FAILS" = 0 ] || exit 1

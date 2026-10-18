@@ -10,12 +10,12 @@
 #   D5  GPU deposits of the DOUBLE binaries (--ps-gpu / --gpu): the GPU kernels are single precision and the
 #       double build hands them float copies of its tetrahedra, so each must match ITS OWN CPU run the way the
 #       single build's GPU matches its CPU (means to 1e-5, per-cell to 5e-2 outside a 1e-3 fraction) and must
-#       conserve mass; skipped when the double pair was built without METAL=1. Its stream counts may differ from
-#       the CPU's in at most 1e-4 of the cells (2026-10-13): the kernel's float error bound covers its own arithmetic,
-#       not the rounding of the double vertices to float, so a sub-sample within that rounding of a tetrahedron's
-#       face can be counted on the wrong side. The 2026-10-12 double binary already did this in 0-2 cells of 48^3
-#       on five of six seeds of this wave (none on seed 7, this suite's); the periodic-seam fix moves which copy of
-#       a seam tetrahedron deposits it, and with it those cells (1 on seed 7). The single build stays identical.
+#       conserve mass; skipped when the double pair was built without METAL=1. Its stream counts are IDENTICAL to
+#       the CPU's, as in the single build (2026-10-18; from 2026-10-13 up to 1e-4 of the cells were allowed to
+#       differ): the host used to round the double vertices to float before building the GPU's per-tet record, and
+#       the kernel's error bound covers the record's own roundings, not that shift, so a sub-sample within it of a
+#       face could be counted on the wrong side -- 0-2 cells of 48^3 on five of six seeds of this wave. The record
+#       is now built from the double vertices (ps_deposit_params.h psFillTetRecord).
 #   D6  the Python side reads float64 grids: python/gui/grids.py infers the dtype from the file size
 # Both pairs must be built (./DTFE ./PS-DTFE ./DTFE-double ./PS-DTFE-double); --no-build is accepted and ignored.
 set -uo pipefail
@@ -127,8 +127,7 @@ if dgpu:
               m < 1e-5 and p < 5e-2 and f < 1e-3 and perg == 8, f"mean-rel {m:.1e} peak-rel {p:.1e} frac {f:.1e} bytes {perg}")
     c, _ = rd(tmp / "ps_d.a_streams"); g, _ = rd(tmp / "ps_dg.a_streams")
     nd = int((c != g).sum()) if c.shape == g.shape else c.size
-    check("D5 PS-DTFE-double GPU stream counts match its CPU (at most 1e-4 of the cells differ: float copies)",
-          c.shape == g.shape and nd <= 1e-4 * c.size, f"{nd} differ")
+    check("D5 PS-DTFE-double GPU stream counts identical to its CPU", c.shape == g.shape and nd == 0, f"{nd} differ")
     c, _ = rd(tmp / "ps_d.a_den"); g, _ = rd(tmp / "ps_dg.a_den")
     check("D5 PS-DTFE-double GPU conserves the mass (sum to 1e-6)", abs(c.sum() - g.sum()) / c.sum() < 1e-6, f"{abs(c.sum()-g.sum())/c.sum():.1e}")
 # D6 the GUI reader

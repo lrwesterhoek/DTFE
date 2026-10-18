@@ -365,8 +365,13 @@ class RunRecord:
         if self.dim == 2:
             bits.append("2D")
         if self.sliced:
-            bits.append("slice")
+            bits.append("slice" + (" (legacy conventions)" if self.legacy_points else ""))
         return ", ".join(bits)
+
+    @property
+    def legacy_points(self) -> bool:
+        """A phase-space plane asked for in the conventions before 2026-10-13 ('--pts-conventions legacy')."""
+        return re.search(r"(^|\s)--pts-conventions\s+legacy(\s|$)", self.command) is not None
 
     def settings(self) -> dict:
         """The Grids-tab (RunSpec) settings this run used, as far as its command shows them."""
@@ -389,6 +394,8 @@ class RunRecord:
             m = re.search(r"(?:^|\s)--ps-alpha-shape\s+([0-9.]+)", self.command)
             if m:
                 d["alpha_shape"] = float(m.group(1))
+            if self.sliced:                 # the plane's conventions (2026-10-15): 'legacy' only when the log says it
+                d["pts_conventions"] = "legacy" if self.legacy_points else "grid"
             if self.nsub:
                 d["nsub"] = self.nsub
             if self.fields:
@@ -795,7 +802,7 @@ KNOWN_FIXES: tuple[Fix, ...] = (
         "it with the grids",
         lambda r: r.estimator == "ps" and r.has("--sample-points")
                   and (r.has("--ps-vertex-mass") or r.has("--ps-volume-weighted"))
-                  and re.search(r"(^|\s)--pts-conventions\s+legacy(\s|$)", r.command) is None),
+                  and not r.legacy_points),
 )
 
 

@@ -29,7 +29,13 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <limits>
+#include <thread>
+#include <vector>
 #include <gsl/gsl_qrng.h>
+#ifdef OPEN_MP
+#include <omp.h>
+#endif
 
 #ifndef PHASE_SPACE
 // The standard binary's GPU deposit counters (2026-10-13; the PS binary's are psGpuRetries & co. in
@@ -316,6 +322,27 @@ inline Pvector<Real,noScalarComp> averageScalar(Cell &cell)
 
 
 
+// The threads of the CPU exact average (2026-10-15; the CPU loop of interpolateGrid_averaged_1 says how they split
+// the work): every core when this triangulation is the only one being processed -- a single-domain run, or each
+// partition of a '--sample-points' run (DTFE_parallel's single-triangulation branch) -- and, inside DTFE_parallel's
+// OpenMP team of sub-domains, the cores left per sub-domain, so the two levels never oversubscribe (PS-DTFE's
+// psDepositThreads rule). DTFE_DEPOSIT_THREADS pins it, as for the PS deposit.
+static int exactAverageThreads()
+{
+    if ( const char *env = std::getenv("DTFE_DEPOSIT_THREADS") )
+    {
+        int const v = std::atoi(env);
+        if ( v > 0 ) return v;
+    }
+    int cores = int( std::thread::hardware_concurrency() );
+#ifdef OPEN_MP
+    cores = omp_get_max_threads();
+    if ( omp_in_parallel() )
+        return std::max( 1, cores / std::max( 1, omp_get_num_threads() ) );
+#endif
+    return std::max( 1, cores );
+}
+
 // Volume-averaged grid interpolation (method 1): quasi-Monte-Carlo sampling inside each Delaunay cell,
 // with the sample count proportional to cell volume; scatters each sample's field value into its grid cell.
 // --exact-average replaces the MC inner loop by analytic cell∩tet integration (r3d; NO_DIM==3 only).
@@ -579,6 +606,11 @@ void interpolateGrid_averaged_1(DT &dt,
             else
                 for (int v=0; v<NO_DIM+1; ++v)
                     tetDens.push_back( float(mc.v[v]->info().density()) );
+            // DTFE_TEST_NAN_SHARE (2026-10-15, ps_deposit_params.h): this tetrahedron's vertex densities NaN, so the
+            // kernel's density shares of it are NaN and the non-finite guard drops and counts them
+            if ( fixedShareTestNanEvery() and fixedShareTestNan( double(mc.v[0]->point()[0]), double(mc.v[0]->point()[1]),
+                                                                 double(mc.v[0]->point()[2]) ) )
+                for (int v=0; v<NO_DIM+1; ++v) tetDens[tetDens.size() - 1 - size_t(v)] = std::numeric_limits<float>::quiet_NaN();
 #ifdef VELOCITY
             if ( needVel )
             {
@@ -806,6 +838,27 @@ void interpolateGrid_averaged_1(DT &dt,
 
     if ( not metalDeposited )
     {
+    // The CPU loop on several threads under --exact-average (2026-10-15). It ran on ONE thread wherever this
+    // function sees a whole triangulation: a single-domain run, and every partition of a '--sample-points' run
+    // (DTFE_parallel's single-triangulation branch) -- among them a GPU run's fallback, which a watchdog kill during
+    // the 4096^2 image planes (recipe stage dtfe27planes) sent to a serial exact average of a whole partition. Now
+    // the grid's x planes are dealt out to nT threads in interleaved slabs of slabW planes (exactAverageThreads), and
+    // EVERY thread walks every Delaunay cell in the triangulation's order but deposits only into the cells of its own
+    // slabs: a cell receives its contributions in exactly the single-threaded order, so the grids are identical, bit
+    // for bit, at any thread count (PS-DTFE's slab deposit, the same idea). A thread skips a cell none of whose x
+    // planes it owns right after the cheap vertex differences, before the inverse, the gradients and the clipping,
+    // so the replicated part is the CGAL walk and that test; the r3d / ps_clip2d clipping, the cost, is divided.
+    // The Monte-Carlo average keeps the single thread: its samples are the work, and a slab test per sample would
+    // repeat it on every thread.
+    int const nT = exactAvg ? exactAverageThreads() : 1;
+    int const slabW = std::max( 1, int( nGrid[0] / size_t( 8 * nT ) ) );   // ~8 slabs per thread: the load balances
+    auto owns = [&](int const th, int const gi) { return nT == 1 or ( gi / slabW ) % nT == th; };
+    if ( nT > 1 )
+        message << "(exact average on " << nT << " CPU threads, slabs of " << slabW << " x planes) " << MESSAGE::Flush;
+    std::vector< std::vector<size_t> > incD( static_cast<size_t>( nT ) ), incF( static_cast<size_t>( nT ) );   // TEST_PADDING's flagged cells, per thread
+    auto cpuLoop = [&](int const th, std::vector<size_t> &incompleteCells_d, std::vector<size_t> &incompleteCells)
+    {
+    (void)incompleteCells_d; (void)incompleteCells;
     size_t prev = 0, amount100 = 0, count = 0;
 #if NO_DIM==2
     size_t noTotalCells = dt.number_of_faces();
@@ -816,7 +869,7 @@ void interpolateGrid_averaged_1(DT &dt,
 #endif
     {
         amount100 = (100 * count++)/ noTotalCells;
-        if (prev < amount100)
+        if (th == 0 and prev < amount100)   // (the progress: thread 0's walk, which every thread repeats)
             message.updateProgress( ++prev );
 
 
@@ -835,11 +888,37 @@ void interpolateGrid_averaged_1(DT &dt,
         int baseGridCell[NO_DIM];  // grid cell containing the base point
         Real basePosition[NO_DIM]; // base point position relative to the box's lower-left corner
         int cellPosition = checkCellPosition( mc, boxCoordinates, dx, vertexMatrix, baseGridCell, basePosition );
+        size_t index;
+
+        // threads (above): a cell none of whose x planes this thread owns -- the single grid cell it falls in, or
+        // the x range of its clip window (the exact path's own expression, below) -- is another thread's
+        if ( nT > 1 )
+        {
+            if ( cellPosition==SINGLE_GRID_CELL and isGridCellIndex( baseGridCell, nGrid, &index ) )
+            {
+                if ( not owns( th, baseGridCell[0] ) ) continue;
+            }
+            else
+            {
+                double lo = 0., hi = 0.;
+                for (int v = 0; v < NO_DIM; ++v)
+                {
+                    if (vertexMatrix[v][0] < lo) lo = vertexMatrix[v][0];
+                    if (vertexMatrix[v][0] > hi) hi = vertexMatrix[v][0];
+                }
+                int a = int( std::floor( (double(basePosition[0]) + lo) / double(dx[0]) ) );
+                int b = int( std::floor( (double(basePosition[0]) + hi) / double(dx[0]) ) ) + 1;
+                if (a < 0) a = 0;
+                if (b > int(nGrid[0])) b = int(nGrid[0]);
+                bool mine = false;
+                for (int gi = a; gi < b and not mine; ++gi) mine = owns( th, gi );
+                if ( not mine ) continue;
+            }
+        }
 
         Real cellVolume = volume( dt, itC );
         Real posMatrixInverse[NO_DIM][NO_DIM];  // inverse vertex position-difference matrix
         matrixInverse( vertexMatrix, posMatrixInverse );
-        size_t index;
 
         // cell fits in one grid cell -> add its centroid value times volume, no MC sampling needed
 #ifndef MY_SCALAR
@@ -925,6 +1004,7 @@ void interpolateGrid_averaged_1(DT &dt,
             for (int gj = iLo[1]; gj < iHi[1]; ++gj)
             for (int gk = iLo[2]; gk < iHi[2]; ++gk)
             {
+                if ( nT > 1 and not owns( th, gi ) ) continue;   // another thread's x plane
                 int const gijk[3] = {gi, gj, gk};
                 r3d_plane planes[6];   // the 6 half-spaces of this cell, n.x + d >= 0 kept
                 for (int d = 0; d < NO_DIM; ++d)
@@ -1003,6 +1083,7 @@ void interpolateGrid_averaged_1(DT &dt,
             for (int gi = iLo[0]; gi < iHi[0]; ++gi)
             for (int gj = iLo[1]; gj < iHi[1]; ++gj)
             {
+                if ( nT > 1 and not owns( th, gi ) ) continue;   // another thread's x plane
                 int const gij[2] = {gi, gj};
                 double lo[2], hi[2], mom[psClip2d::MOMENTS];
                 for (int d = 0; d < 2; ++d)
@@ -1100,6 +1181,23 @@ void interpolateGrid_averaged_1(DT &dt,
 #endif
         }
     }
+    };   // cpuLoop
+    if ( nT == 1 )
+        cpuLoop( 0, incD[0], incF[0] );
+    else
+    {
+        std::vector<std::thread> pool;
+        for (int th = 1; th < nT; ++th) pool.emplace_back( cpuLoop, th, std::ref( incD[size_t(th)] ), std::ref( incF[size_t(th)] ) );
+        cpuLoop( 0, incD[0], incF[0] );
+        for (std::thread &x : pool) x.join();
+    }
+#ifdef TEST_PADDING
+    for (int th = 0; th < nT; ++th)   // (showCellsContainingDummyPoints sorts and de-duplicates them)
+    {
+        incompleteCells_d.insert( incompleteCells_d.end(), incD[size_t(th)].begin(), incD[size_t(th)].end() );
+        incompleteCells.insert( incompleteCells.end(), incF[size_t(th)].begin(), incF[size_t(th)].end() );
+    }
+#endif
     }   // end of the CPU interpolation (skipped when the Metal deposit succeeded)
 
 

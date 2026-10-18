@@ -169,7 +169,10 @@ bool psGpuDepositFields(std::vector<float>& verts,
     bool massFixed = false;
     {
         double totalMass = massExtra > 0. ? massExtra : 0.;
-        for (float const mt : masses) totalMass += double(mt);
+        // (a non-finite mass -- bad input, or the DTFE_TEST_NAN_SHARE hook -- is left out of the unit: its shares are
+        // the non-finite guard's to drop and count, 2026-10-15, not a reason to lose the whole grid's fixed point)
+        for (float const mt : masses) if (std::isfinite(mt)) totalMass += double(mt);
+        if (fxUnits.massTotal > 0.) totalMass = fxUnits.massTotal;   // (a --ps-window pass: the caller's total, 2026-10-15)
         bool const floatMass = getenv("PS_METAL_FLOAT_MASS") && atoi(getenv("PS_METAL_FLOAT_MASS")) != 0;
         massFixed = !floatMass && psMassFixedScale(totalMass, massScale);
     }
@@ -296,10 +299,12 @@ bool psGpuDepositFields(std::vector<float>& verts,
     MTL::Buffer* bDW    = zeroBuf(dwBytes);
     MTL::Buffer* bScal  = zeroBuf(scalBytes);
     MTL::Buffer* bSG    = zeroBuf(sgBytes);
-    if (!bV || !bU || !bM || !bD || !bSc || !bP || !bMass || !bMassFx || !bMom || !bM2 || !bGrad || !bStr || !bMomW || !bCaust || !bSV || !bDV || !bDW || !bScal || !bSG)
+    // the non-finite guard's counters of depositFields (2026-10-15; ps_deposit.metal FieldGrids.bad), one word per slot
+    MTL::Buffer* bBad   = zeroBuf(FX_DROP_SLOTS * 4);
+    if (!bV || !bU || !bM || !bD || !bSc || !bP || !bMass || !bMassFx || !bMom || !bM2 || !bGrad || !bStr || !bMomW || !bCaust || !bSV || !bDV || !bDW || !bScal || !bSG || !bBad)
     {
         err = "Metal buffer allocation failed (out of GPU-visible memory?)";
-        for (MTL::Buffer* b : {bV,bU,bM,bD,bSc,bP,bMass,bMassFx,bMom,bM2,bGrad,bStr,bMomW,bCaust,bSV,bDV,bDW,bScal,bSG}) if (b) b->release();
+        for (MTL::Buffer* b : {bV,bU,bM,bD,bSc,bP,bMass,bMassFx,bMom,bM2,bGrad,bStr,bMomW,bCaust,bSV,bDV,bDW,bScal,bSG,bBad}) if (b) b->release();
         pool->release();
         return false;
     }
@@ -348,6 +353,12 @@ bool psGpuDepositFields(std::vector<float>& verts,
     std::vector<MTL::Buffer*> const gridBufs = { bMass, bMassFx, bMom, bM2, bGrad, bStr, bMomW, bCaust, bSV, bDV, bDW, bScal, bSG };
     GpuSnapshot snap;
     int nFailed = 0, nResumedCk = 0;   // failed buffers of this deposit, and how many resumed from a periodic checkpoint
+    // The shares the non-finite guard dropped in this deposit, by slot (2026-10-15; ps_deposit_params.h
+    // psFixedShareOk): each pass zeroes its counter words before a command buffer and adds them here after one that
+    // succeeded, and a restore rolls these sums back to the held snapshot's -- so a failed buffer (which may have
+    // counted part or all of its shares) and the redone ones count once. Handed to the run's counters only when
+    // the deposit is kept (a CPU fallback deposits, and counts, the partition itself).
+    unsigned long long badRun[FX_DROP_SLOTS] = {};
     int const MAX_FAILS_SAME_CHUNK = 3, MAX_FAILS_TOTAL = 16;
 
     // One paced, chunked run of 'pso' over nThreads threads; bind(enc, start, n) binds the buffers
@@ -356,9 +367,10 @@ bool psGpuDepositFields(std::vector<float>& verts,
     // as such, without a copy); gridsKeepZero: the pass never writes them (the exact items' phase 0),
     // so its periodic checkpoints skip them too. False (lastErr set) when the pass gave up (the caller
     // falls back).
+    // badW: this pass's counter words of the non-finite guard (badRun above).
     auto runChunked = [&](MTL::ComputePipelineState* pso, size_t nThreads, size_t firstChunk,
                           size_t minChunk, std::vector<MTL::Buffer*> const& extras, bool gridsZero,
-                          bool gridsKeepZero, auto&& bind) -> bool
+                          bool gridsKeepZero, uint32_t* badW, auto&& bind) -> bool
     {
         NS::UInteger tg = pso->maxTotalThreadsPerThreadgroup();
         if (tg > 256) tg = 256;
@@ -372,6 +384,8 @@ bool psGpuDepositFields(std::vector<float>& verts,
         if (gridsZero) std::fill(zeroMask.begin(), zeroMask.begin() + gridBufs.size(), true);
         bool ckOn = snap.take(ckBufs, zeroMask, 0);
         bool ckPeriodic = false;           // the held snapshot is a periodic checkpoint (not the pass start)
+        unsigned long long badCk[FX_DROP_SLOTS];   // badRun at the held snapshot
+        std::memcpy(badCk, badRun, sizeof badCk);
         // failures of the 'same chunk': a failure that comes before the redo got past the previous failed
         // buffer's end (chunk boundaries move with the timing controller, so a start offset is no identity)
         int  failsHere = 0;
@@ -383,6 +397,7 @@ bool psGpuDepositFields(std::vector<float>& verts,
             MTL::CommandBuffer* cb = c.q->commandBuffer();
             MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
             enc->setComputePipelineState(pso);
+            std::memset(badW, 0, FX_DROP_SLOTS * 4);   // (the previous buffer completed: waitUntilCompleted below)
             bind(enc, start, n);
             enc->dispatchThreads(MTL::Size(n, 1, 1), MTL::Size(tg, 1, 1));
             enc->endEncoding();
@@ -426,6 +441,7 @@ bool psGpuDepositFields(std::vector<float>& verts,
                     baseChunk = std::max(baseChunk / 2, MIN_CHUNK);
                 }
                 snap.restore();
+                std::memcpy(badRun, badCk, sizeof badCk);
                 if (ckPeriodic) ++nResumedCk;
                 fprintf(stderr, "%sPS-DTFE Metal: %s -- resuming from the %s at thread %zu of %zu "
                                 "(redoing %zu; failure %d of this chunk, target %.0f ms buffers, %.0f ms gaps)%s\n",
@@ -444,6 +460,7 @@ bool psGpuDepositFields(std::vector<float>& verts,
             ++nBuf;
             ++sinceCk;
             busy += el;
+            for (int k = 0; k < FX_DROP_SLOTS; ++k) badRun[k] += badW[k];
             if (el > 1e-4)   // retarget the next chunk toward targetSec (bounded rescale)
             {
                 double scale = pace.targetSec / el;
@@ -467,7 +484,8 @@ bool psGpuDepositFields(std::vector<float>& verts,
             long const every = ckChunks >= 0 ? ckChunks : std::max(1L, long(std::lround(10.0 / pace.targetSec)));
             if (ckOn && every > 0 && long(sinceCk) >= every && start < nThreads)
             {   // the queue is drained (waitUntilCompleted above): the buffers hold exactly [0, start)
-                if (snap.take(ckBufs, gridsKeepZero ? zeroMask : std::vector<bool>(), start)) { ++snap.taken; ckPeriodic = true; sinceCk = 0; }
+                if (snap.take(ckBufs, gridsKeepZero ? zeroMask : std::vector<bool>(), start))
+                { ++snap.taken; ckPeriodic = true; sinceCk = 0; std::memcpy(badCk, badRun, sizeof badCk); }
                 // else: no host memory for the spare copy; the last snapshot stays valid
             }
             usleep(pace.gapUs);   // deliberate idle gap: lets WindowServer take the GPU
@@ -500,7 +518,7 @@ bool psGpuDepositFields(std::vector<float>& verts,
     auto runPerTet = [&](MTL::Buffer* vB, MTL::Buffer* uB, MTL::Buffer* mB, MTL::Buffer* dB, MTL::Buffer* sB, size_t nT,
                          bool gridsZero) -> bool
     {
-        return runChunked(c.pso, nT, baseChunk, MIN_CHUNK, { mB }, gridsZero, false,
+        return runChunked(c.pso, nT, baseChunk, MIN_CHUNK, { mB }, gridsZero, false, static_cast<uint32_t*>(bBad->contents()),
                           [&](MTL::ComputeCommandEncoder* enc, size_t start, uint32_t n)
         {
             P.nTet = n;
@@ -525,6 +543,7 @@ bool psGpuDepositFields(std::vector<float>& verts,
             enc->setBuffer(bSG,   0, 20);
             enc->setBuffer(bMassFx, 0, 21);
             bindWords(enc);
+            enc->setBuffer(bBad,  0, 30);
         });
     };
 
@@ -587,7 +606,9 @@ bool psGpuDepositFields(std::vector<float>& verts,
                     nTetTotal, nItems, blockCells, total);
         bItems = c.dev->newBuffer(std::max<size_t>(nItems, 1) * 2 * sizeof(uint32_t), MTL::ResourceStorageModeShared);
         // the per-tet weight totals: a float each, or (sumWFixed, 2026-10-14) two uint words in the tet's own unit
-        bSumW  = c.dev->newBuffer(std::max<size_t>(nTetTotal, 1) * (sumWFixed ? 8 : sizeof(float)), MTL::ResourceStorageModeShared);
+        // (+ the non-finite guard's counter words of the items kernel, at ExactItemParams.badAt: 2026-10-15)
+        bSumW  = c.dev->newBuffer(std::max<size_t>(nTetTotal, 1) * (sumWFixed ? 8 : sizeof(float)) + FX_DROP_SLOTS * 4,
+                                  MTL::ResourceStorageModeShared);
         if (!bItems || !bSumW)
         {
             // too big for GPU-visible memory: the one-thread-per-tet kernel still works
@@ -606,7 +627,8 @@ bool psGpuDepositFields(std::vector<float>& verts,
             }
         }
     }
-    struct ExactItemParams { uint32_t nItems, phase, blockCells, pad; };   // == the MSL struct
+    struct ExactItemParams { uint32_t nItems, phase, blockCells, badAt; };   // == the MSL struct
+    uint32_t const badAt = uint32_t(std::max<size_t>(nTetTotal, 1) * (sumWFixed ? 2 : 1));   // past the per-tet totals
     auto runItems = [&](uint32_t phase) -> bool
     {
         // an item clips at most blockCells cells: far cheaper and more uniform than a whole tet.
@@ -614,9 +636,10 @@ bool psGpuDepositFields(std::vector<float>& verts,
         std::vector<MTL::Buffer*> extras;
         if (phase == 0) extras.push_back(bSumW);
         return runChunked(c.psoItems, nItems, 8192, 1024, extras, true, phase == 0,
+                          static_cast<uint32_t*>(bSumW->contents()) + badAt,
                           [&](MTL::ComputeCommandEncoder* enc, size_t start, uint32_t n)
         {
-            ExactItemParams const IP{ n, phase, blockCells, 0u };
+            ExactItemParams const IP{ n, phase, blockCells, badAt };
             enc->setBuffer(bV,    0, 0);
             enc->setBuffer(bU,    0, 1);
             enc->setBuffer(bM,    0, 2);
@@ -723,10 +746,13 @@ bool psGpuDepositFields(std::vector<float>& verts,
     if (!success)
     {
         err = lastErr;
-        for (MTL::Buffer* b : {bV,bU,bM,bD,bSc,bP,bMass,bMassFx,bMom,bM2,bGrad,bStr,bMomW,bCaust,bSV,bDV,bDW,bScal,bSG}) b->release();
+        for (MTL::Buffer* b : {bV,bU,bM,bD,bSc,bP,bMass,bMassFx,bMom,bM2,bGrad,bStr,bMomW,bCaust,bSV,bDV,bDW,bScal,bSG,bBad}) b->release();
         pool->release();
         return false;
     }
+    // the deposit is kept: its dropped shares join the run's counts (reported once at the end, DTFE.cpp)
+    for (int k = 0; k < FX_DROP_SLOTS; ++k)
+        if (badRun[k]) fixedShareDropped(k, badRun[k]);
 
     // tets the kernel could not classify exactly (a sample within float rounding of a face):
     // it negated their masses and deposited nothing; the caller deposits them on the CPU
@@ -772,7 +798,7 @@ bool psGpuDepositFields(std::vector<float>& verts,
     if (fCaustic) std::memcpy(out.caustic.data(), bCaust->contents(), nCell * 4);
     if (fDispOwn && !dispwIsMass) std::memcpy(out.dispw.data(), bDW->contents(), nCell * 4);
 
-    for (MTL::Buffer* b : {bV,bU,bM,bD,bSc,bP,bMass,bMassFx,bMom,bM2,bGrad,bStr,bMomW,bCaust,bSV,bDV,bDW,bScal,bSG}) b->release();
+    for (MTL::Buffer* b : {bV,bU,bM,bD,bSc,bP,bMass,bMassFx,bMom,bM2,bGrad,bStr,bMomW,bCaust,bSV,bDV,bDW,bScal,bSG,bBad}) b->release();
     pool->release();
     return true;
 }

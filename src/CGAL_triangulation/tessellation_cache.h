@@ -588,6 +588,13 @@ inline std::string makeDescriptor(User_options const &userOptions)
     if ( userOptions.psLagPadding > Real(0.) and userOptions.partitionOn and userOptions.partNo < 0 )
         d << "lagPadding=" << userOptions.psLagPadding << '\n';
 #endif
+    /* (The standard binary's per-partition identity, 2026-10-15: written out, no line of its own.) A partitioned
+       standard run caches one file per THREAD SUB-DOMAIN of every partition (DTFE_parallel: 'partNo' = the thread,
+       'region' = its sub-box, 'partition' = the thread grid, and 'box' = its PARTITION's region, which DTFE_parallel
+       makes the sub-domain's full box -- the box whose padded copy its particles are selected from), or one per
+       partition when the partition is one tessellation ('--sample-points', one thread: 'partNo' = the partition,
+       'region' = its box, as PS's lagRegion is). The lines above therefore name the partition already; a
+       'partitionRegion' line repeating 'box' was tried and left out, since it only made every existing cache miss. */
     // anything that changes WHICH particles are triangulated, or their coordinates. The random
     // SEED belongs here only when '--randomSample' is on, because that is the one case where it
     // decides which particles enter the triangulation (random.cc); otherwise it merely seeds the
@@ -638,10 +645,13 @@ inline std::string cachePath(User_options const &userOptions)
  * partition of a Lagrangian split (DTFE.cpp: psPartitioned = partitionOn and partNo<0) and cannot
  * tell them apart.
  *
- * The one case still refused is a partitioned run of the STANDARD binary, where no Lagrangian
- * region exists to distinguish the sub-domains and 'partNo' is only set in the explicit
- * '--partNo' mode. Rather than reason about whether the processor split is fully pinned by the
- * region/padding already in the descriptor, that combination simply does not cache.
+ * The STANDARD binary caches its partitioned runs too, per sub-domain: every tessellation it builds
+ * is one partition's (or one of its threads' sub-boxes), and buildTessellation only ever sees
+ * those options, where 'partNo' is the partition or the thread (>= 0) and 'region' the box the
+ * tessellation covers (plus, for a thread's sub-box, its partition's region as its 'box':
+ * makeDescriptor). The refusal below is for an options set that names a split but no part of it (partitionOn with
+ * partNo < 0), which never reaches a build -- the comment said until 2026-10-15 that a partitioned
+ * standard run does not cache; tests/ps_tessellation_cache_check.sh (G2) shows that it does.
  *
  * This must be checked HERE and not only at option parsing: the auto-tuner turns partitioning on
  * at RUNTIME (auto_tune.h), long after the flags are validated.
@@ -664,10 +674,8 @@ inline void warnUnusable(User_options const &userOptions)
     if ( warned ) return;
     warned = true;
     MESSAGE::Warning warning( userOptions.verboseLevel );
-    warning << "--tessellation-cache is ignored for this run: the standard binary splits the box "
-               "into several triangulations here (--partition, possibly chosen by the auto-tuner) "
-               "and they are not separately identified in the cache key. Phase-space runs cache "
-               "every partition; the results are unaffected either way.\n" << MESSAGE::EndWarning;
+    warning << "--tessellation-cache is ignored for this tessellation: its options name a partition split "
+               "(--partition) but not which part it is; the results are unaffected.\n" << MESSAGE::EndWarning;
 }
 
 
