@@ -147,6 +147,25 @@ static inline void psAddMassFixed(int64_t *grid, size_t const flat, int64_t cons
     if ( atomic ) __atomic_fetch_add( grid + flat, q, __ATOMIC_RELAXED );
     else grid[flat] += q;
 }
+// The deposit's order-free COUNTS and FLAGS (2026-10-18), by the same rule: the int stream count (+1), the byte flags
+// subSampleMassFlag / flippedFlag (set to 1) and the caustic mask (OR). The copy mode's threads share them as they share
+// the fixed-point words -- +1, set and OR commute, so every thread count gives the same arrays and none needs a copy.
+static inline void psAddCount(int &c, bool const atomic)
+{
+    if ( atomic ) __atomic_fetch_add( &c, 1, __ATOMIC_RELAXED );
+    else ++c;
+}
+static inline void psSetFlag(unsigned char &f, bool const atomic)
+{
+    if ( atomic ) __atomic_store_n( &f, (unsigned char)1, __ATOMIC_RELAXED );
+    else f = 1;
+}
+template <class Mask> static inline void psOrMask(Mask &m, Mask const bits, bool const atomic)
+{
+    if ( !atomic ) m |= bits;
+    else if ( ( __atomic_load_n( &m, __ATOMIC_RELAXED ) & bits ) != bits )   // (mostly set already: skip the RMW)
+        __atomic_fetch_or( &m, bits, __ATOMIC_RELAXED );
+}
 
 // The moment grids' fixed-point words (2026-10-14; 'fxg' in interpolateGrid_phaseSpace) and their Real grids: a
 // cell element is a Pvector (component c) or a plain Real, and the words lie in the same layout, cell by cell.
@@ -1146,10 +1165,13 @@ void interpolateGrid_phaseSpace(DT &dt,
     // Since 2026-10-13 it is also the '--ps-caustics' parity bit 1 (det < 0 overlaps the cell): the
     // export below ORs it, still raw, into the caustic mask.
     std::vector<unsigned char> flippedFlag(totalGrid, 0);
-    // xLo/xHi: only cells whose local x index lies in [xLo, xHi) -- the slab deposit's thread owns them
+    // xLo/xHi: only cells whose local x index lies in [xLo, xHi) -- the slab deposit's thread owns them;
+    // shared: the copy mode's threads write the same flags (relaxed atomics, psSetFlag; a flag only goes 0 -> 1)
     auto markFlipped = [&](PSCellGeometry const &geo, std::vector<unsigned char> &flags,
-                           long const xLo = 0, long const xHi = LONG_MAX)
+                           long const xLo = 0, long const xHi = LONG_MAX, bool const shared = false)
     {
+        auto isSet = [&flags, shared](size_t const f) -> bool
+        { return shared ? __atomic_load_n( &flags[f], __ATOMIC_RELAXED ) != 0 : flags[f] != 0; };
 #if NO_DIM==3
         if ( !(geo.cellDet < 0.) ) return;
         Real const (&ep)[NO_DIM+1][NO_DIM] = geo.eulerPos;
@@ -1205,12 +1227,12 @@ void interpolateGrid_phaseSpace(DT &dt,
                 if (d == 0 && (loc < xLo || loc >= xHi)) { inSub = false; break; }   // another slab's cell
                 flat = flat * subDims[d] + (size_t)loc;
             }
-            if ( !inSub || flags[flat] ) continue;
-            if ( cells == 1 ) { flags[flat] = 1; continue; }   // the whole (non-degenerate) tet is in this cell
+            if ( !inSub || isSet(flat) ) continue;
+            if ( cells == 1 ) { psSetFlag( flags[flat], shared ); continue; }   // the whole (non-degenerate) tet is in this cell
             double c[3];
             for (int d = 0; d < 3; ++d)
                 c[d] = double(boxCoordinates[2*d]) + (raw[d] + 0.5) * double(dx[d]) - double(ep[0][d]);
-            if ( sat.overlaps(c) ) flags[flat] = 1;
+            if ( sat.overlaps(c) ) psSetFlag( flags[flat], shared );
         }
 #else
         // 2D: a folded triangle overlapping the cell with positive area (ps_clip2d.h); under
@@ -1261,14 +1283,14 @@ void interpolateGrid_phaseSpace(DT &dt,
                 if (d == 0 && (loc < xLo || loc >= xHi)) { inSub = false; break; }   // another slab's cell
                 flat = flat * subDims[d] + (size_t)loc;
             }
-            if ( !inSub || flags[flat] ) continue;
+            if ( !inSub || isSet(flat) ) continue;
             double lo[NO_DIM], hi[NO_DIM], mom[psClip2d::MOMENTS];
             for (int d = 0; d < NO_DIM; ++d)
             {
                 lo[d] = double(boxCoordinates[2*d]) + raw[d] * double(dx[d]) - double(ep[0][d]);
                 hi[d] = lo[d] + double(dx[d]);
             }
-            if ( psClip2d::clipTriangleToCell( tri, lo, hi, mom ) ) flags[flat] = 1;
+            if ( psClip2d::clipTriangleToCell( tri, lo, hi, mom ) ) psSetFlag( flags[flat], shared );
         }
 #endif
     };
@@ -2320,7 +2342,8 @@ void interpolateGrid_phaseSpace(DT &dt,
     // a given thread count (DTFE_DEPOSIT_THREADS pins it). Thread 0 writes the real arrays. Serial
     // before: a small box on a fine grid (0.26M particles, 256^3) took 145 s where the GPU took 25.
     // The single build's MASS grid is the exception (2026-10-12): one fixed-point grid for all threads
-    // (massFx), the same at every thread count.
+    // (massFx), the same at every thread count; so are its moment grids (fxg, 2026-10-14) and, in every
+    // build, the stream count, the two flags and the caustic mask (2026-10-18: relaxed atomics).
     // GPU-deferred cells and --ps-caustic-cusps (CGAL's incident_cells marks visited cells, so it is
     // not re-entrant) stay on one thread. After a GPU deposit only the cells it deferred run here:
     // deferredOrd holds their finite-cell ordinals in the GPU extraction loop's order.
@@ -2334,13 +2357,11 @@ void interpolateGrid_phaseSpace(DT &dt,
         std::vector<unsigned char> *subSampleMassFlag = nullptr, *flippedFlag = nullptr;
         // the fixed-point mass grid (massFxOn; else null): ONE grid for every thread, never copied
         int64_t *massFx = nullptr;
-        // the private copies of threads > 0 (thread 0 points at the real arrays)
+        // the private copies of threads > 0 (thread 0 points at the real arrays): the Real accumulators only -- the
+        // stream count, the two flags and the caustic mask are the real arrays for every thread (2026-10-18, psAddCount)
         Quantities ownQ;
-        std::vector<int> ownStreamCount;
         std::vector<Real> ownReleasedMult, ownExactMult, ownDispWeight, ownMassWeight;
         std::vector< Pvector<Real,noVelComp> > ownDispVel;
-        std::vector<PSCausticClass::CausticMask> ownOrientBits;
-        std::vector<unsigned char> ownSubSampleMassFlag, ownFlippedFlag;
         // per-tetrahedron scratch, reused
         std::vector<size_t> insideFlat;
         std::vector<Real>   insideRel, insideW;
@@ -2350,13 +2371,13 @@ void interpolateGrid_phaseSpace(DT &dt,
         double auditTets = 0., auditShares = 0.;
         size_t auditNTets = 0;
     };
-    // bytes of one private copy of every accumulator this run uses (the density is EMPTY while the fixed-point
-    // mass grid stands in for it, and that one is shared, not copied)
+    // bytes of one private copy of every accumulator this run uses: the Real ones only. A grid whose fixed-point
+    // words stand in for it is EMPTY (the density under massFx, the moment grids under fxg: the words are shared),
+    // and the counts and flags are shared too (2026-10-18) -- so the default single build copies NOTHING, and only
+    // the float sums (PS_METAL_FLOAT_MOMENTS=1 / PS_METAL_FLOAT_MASS=1, the double build) still cost a copy per thread.
     auto vecBytes = [](auto const &v) -> double { return double(v.size()) * double(sizeof(v[0])); };
-    double accBytes = vecBytes(streamCount) + vecBytes(releasedMult) + vecBytes(exactMult) + vecBytes(dispWeight)
-                    + vecBytes(massWeight)
-                    + vecBytes(dispVel) + vecBytes(orientBits) + vecBytes(subSampleMassFlag) + vecBytes(flippedFlag)
-                    + vecBytes(quantities->density) + vecBytes(quantities->velocity)
+    double accBytes = vecBytes(releasedMult) + vecBytes(exactMult) + vecBytes(dispWeight) + vecBytes(massWeight)
+                    + vecBytes(dispVel) + vecBytes(quantities->density) + vecBytes(quantities->velocity)
                     + vecBytes(quantities->velocity_gradient) + vecBytes(quantities->velocity_dispersion);
 #ifdef SCALAR
     accBytes += vecBytes(quantities->scalar) + vecBytes(quantities->scalar_gradient);
@@ -2385,8 +2406,8 @@ void interpolateGrid_phaseSpace(DT &dt,
         int const wantThreads = psDepositThreads();
         nDepThreads = wantThreads;
         double const extra = psDepositThreadBytes();
-        if ( accBytes > 0. )
-            nDepThreads = std::max( 1, std::min( nDepThreads, 1 + int( extra / accBytes ) ) );
+        if ( accBytes > 0. )   // (the quotient capped before the int conversion: a few cells' copy is a few bytes)
+            nDepThreads = std::max( 1, std::min( nDepThreads, 1 + int( std::min( double(nDepThreads), extra / accBytes ) ) ) );
         size_t const blocks = noTotalCells / 256 + 1;                      // at least a few blocks per thread (DEP_BLOCK)
         int const blockCap = std::max( 1, int( blocks / 4 ) + 1 );
         nDepThreads = std::max( 1, std::min( nDepThreads, blockCap ) );
@@ -2397,10 +2418,12 @@ void interpolateGrid_phaseSpace(DT &dt,
         // straddling tet once per slab (~1.6x the work, 2026-10-05, with a filter pass in the binning since
         // dropped): on a clustered TNG sub-cube at 512^3 (2 cells per tet, copies for 5 of 10 threads) 10
         // slab threads took 46.8 s, the 5 copy threads 42.5 s; on 768^3 (copies for 2) slabs took 28 s
-        // instead of 64. Since the fixed-point grids are shared (2026-10-14) a copy is 6 B/cell for density +
+        // instead of 64. Since the fixed-point grids are shared (2026-10-14) a copy was 6 B/cell for density +
         // velocity (the int stream count and two flags): 768^3 0.26M crossed waves, nSub 1, 2026-10-18 --
         // 6 copy threads 26-30 s / 36 GB, 10 slab threads 24 s / 23 GB, 1 thread 126 s; folded (A k = 4) 157,
-        // 190, 772 s. At 256^3 (copies fit) 10 copy threads are 2x the slab speed.
+        // 190, 772 s. At 256^3 (copies fit) 10 copy threads are 2x the slab speed. Since 2026-10-18 those are
+        // shared as well (psAddCount), so the default single build copies nothing and this switch only meets
+        // the float sums (the double build, PS_METAL_FLOAT_MOMENTS=1) on fine grids.
         if ( slabSetting != 0 and slabThreads > 1 and subDims[0] >= 2
              and ( slabSetting == 1 or 2 * nDepThreads < slabThreads ) and noTotalCells < size_t(UINT32_MAX) )
         {
@@ -2430,7 +2453,7 @@ void interpolateGrid_phaseSpace(DT &dt,
         message << MESSAGE::cBold() << "PS-DTFE:" << MESSAGE::cReset() << " CPU deposit on " << nDepThreads
                 << ( nDepThreads == 1 ? " thread" : " threads" ) << " (copy mode: " << accBytes / 1.e6
                 << " MB of private accumulators per extra thread, budget " << psDepositThreadBytes() / 1.e9
-                << " GB; any fixed-point grids are shared).\n" << MESSAGE::Flush;
+                << " GB; the fixed-point grids, counts and flags are shared).\n" << MESSAGE::Flush;
     if ( slabMode )
     {
         // binning: each tetrahedron's x range of global cells -- the bounding box of its Eulerian
@@ -2652,15 +2675,15 @@ void interpolateGrid_phaseSpace(DT &dt,
         zeroLike( D.ownQ.scalar, quantities->scalar );
         zeroLike( D.ownQ.scalar_gradient, quantities->scalar_gradient );
 #endif
-        zeroLike( D.ownStreamCount, streamCount );         zeroLike( D.ownReleasedMult, releasedMult );
-        zeroLike( D.ownExactMult, exactMult );             zeroLike( D.ownDispWeight, dispWeight );
-        zeroLike( D.ownDispVel, dispVel );                 zeroLike( D.ownOrientBits, orientBits );
+        zeroLike( D.ownReleasedMult, releasedMult );       zeroLike( D.ownExactMult, exactMult );
+        zeroLike( D.ownDispWeight, dispWeight );           zeroLike( D.ownDispVel, dispVel );
         zeroLike( D.ownMassWeight, massWeight );
-        zeroLike( D.ownSubSampleMassFlag, subSampleMassFlag ); zeroLike( D.ownFlippedFlag, flippedFlag );
-        D.q = &D.ownQ; D.streamCount = &D.ownStreamCount; D.releasedMult = &D.ownReleasedMult;
+        D.q = &D.ownQ; D.releasedMult = &D.ownReleasedMult;
         D.exactMult = &D.ownExactMult; D.dispWeight = &D.ownDispWeight; D.dispVel = &D.ownDispVel;
         D.massWeight = &D.ownMassWeight;
-        D.orientBits = &D.ownOrientBits; D.subSampleMassFlag = &D.ownSubSampleMassFlag; D.flippedFlag = &D.ownFlippedFlag;
+        // shared by every thread, written with relaxed atomics (countAtomicL in depositLoop)
+        D.streamCount = &streamCount;
+        D.orientBits = &orientBits; D.subSampleMassFlag = &subSampleMassFlag; D.flippedFlag = &flippedFlag;
     }
 
     // One thread's share of the deposit: the loop over the cells, whose body is the serial loop's,
@@ -2736,6 +2759,8 @@ void interpolateGrid_phaseSpace(DT &dt,
         int64_t *const massFxL = TH.massFx;
         float const massFxScaleL = massFxScale;
         bool const massFxAtomicL = nT > 1 && slab < 0;
+        // the stream count, the two flags and the caustic mask: the same rule (2026-10-18; psAddCount, psSetFlag, psOrMask)
+        bool const countAtomicL = massFxAtomicL;
         // the moment grids' fixed-point words (2026-10-14, fxg; null: the grid's Real accumulator), ONE set for every
         // thread, added exactly as the mass words are (the same atomic rule); each share is the float product the
         // Real grid would have added. DW is not accumulated while the mass words are this pass's (massFxOn): it
@@ -2792,7 +2817,7 @@ void interpolateGrid_phaseSpace(DT &dt,
                 if ( !slabList || int(slabFirst[curOrd]) == slab ) nDegenerateInverse += degenerateHere;   // once per tet
                 continue;
             }
-            if ( !metalDeposited ) markFlipped(geo, flippedFlag, slabLoL, slabHiL);   // (GPU-deferred tets: the host loop marked them)
+            if ( !metalDeposited ) markFlipped(geo, flippedFlag, slabLoL, slabHiL, countAtomicL);   // (GPU-deferred tets: the host loop marked them)
             bool const useVolumeRatioDensity = geo.useVolumeRatioDensity;
             Real (&eulerPos)[NO_DIM+1][NO_DIM] = geo.eulerPos;
             Real (&posMatInv)[NO_DIM][NO_DIM] = geo.posMatInv;
@@ -3338,11 +3363,11 @@ void interpolateGrid_phaseSpace(DT &dt,
                             else quantities->scalar_gradient[flatIdx] += sgrad * momShare;
                         }
     #endif
-                        streamCount[flatIdx]++;   // raw tet-touch count -> '.tetTouch'
+                        psAddCount( streamCount[flatIdx], countAtomicL );   // raw tet-touch count -> '.tetTouch'
                         if ( fxWL[PS_FX_SV] ) fxAddL( PS_FX_SV, flatIdx, Real( m[0] / double(cellVolumeL) ) );
                         else exactMult[flatIdx] += Real( m[0] / double(cellVolumeL) );   // exact multiplicity share
                         if ( psCausticsL )
-                            orientBits[flatIdx] |= (PSCausticClass::CausticMask)((geo.cellDet > 0. ? 1 : 2) | tetCausticClass);
+                            psOrMask( orientBits[flatIdx], (PSCausticClass::CausticMask)((geo.cellDet > 0. ? 1 : 2) | tetCausticClass), countAtomicL );
                     }
                     continue;   // next tetrahedron (the sampled PASS 1/2 below is skipped)
                 }
@@ -3662,16 +3687,16 @@ void interpolateGrid_phaseSpace(DT &dt,
                 // tet (never sampled) adds its volume fraction; a sampled tet that caught no sample
                 // (useCentroid) moves mass only. Under psExactL the counter is the tet-touch count.
                 if ( useCentroid )
-                    subSampleMassFlag[flatIdx] = 1;   // mass from a tet with no sample here
+                    psSetFlag( subSampleMassFlag[flatIdx], countAtomicL );   // mass from a tet with no sample here
                 if ( psExactL )
-                    streamCount[flatIdx]++;
+                    psAddCount( streamCount[flatIdx], countAtomicL );
                 else if ( released )
                 {
                     if ( fxWL[PS_FX_RM] ) fxAddL( PS_FX_RM, flatIdx, Real( geo.cellAbsDet / factorial(NO_DIM) / double(cellVolumeL) ) );
                     else releasedMult[flatIdx] += Real( geo.cellAbsDet / factorial(NO_DIM) / double(cellVolumeL) );
                 }
                 else if ( !useCentroid )
-                    streamCount[flatIdx]++;
+                    psAddCount( streamCount[flatIdx], countAtomicL );
                 // --ps-exact-deposit fall-through (empty clip window, released or sub-resolution
                 // tets): the tet's volume is shared equally among its nInside samples, so each
                 // carries V_tet/nInside -- for the monolithic centroid fallback (nInside==1) that
@@ -3684,7 +3709,7 @@ void interpolateGrid_phaseSpace(DT &dt,
                 }
                 if ( psCausticsL )
                     // fold parity (sign of det(Ax)) plus this tetrahedron's stratification bits
-                    orientBits[flatIdx] |= (PSCausticClass::CausticMask)((geo.cellDet > 0. ? 1 : 2) | tetCausticClass);
+                    psOrMask( orientBits[flatIdx], (PSCausticClass::CausticMask)((geo.cellDet > 0. ? 1 : 2) | tetCausticClass), countAtomicL );
             }
         } while (false);
         }   // end cell loop
@@ -3722,15 +3747,14 @@ void interpolateGrid_phaseSpace(DT &dt,
         }
         for (std::exception_ptr const &e : errors)
             if ( e ) std::rethrow_exception( e );
-        // sum (or OR) the private copies into the real arrays in thread order, cell ranges in parallel
-        // (slab mode has none: every thread wrote its own cells)
-        if ( nT > 1 && !slabMode )
+        // sum the private copies into the real arrays in thread order, cell ranges in parallel (slab mode has none:
+        // every thread wrote its own cells; nor has a copy mode whose accumulators are all shared, accBytes == 0)
+        if ( nT > 1 && !slabMode && accBytes > 0. )
         {
             auto merge = [&](size_t part)
             {
                 size_t const lo = totalGrid * part / nT, hi = totalGrid * (part + 1) / nT;
                 auto addInto = [lo, hi](auto &real, auto const &own) { if (!own.empty()) for (size_t c = lo; c < hi; ++c) real[c] += own[c]; };
-                auto orInto  = [lo, hi](auto &real, auto const &own) { if (!own.empty()) for (size_t c = lo; c < hi; ++c) real[c] |= own[c]; };
                 for (size_t th = 1; th < nT; ++th)
                 {
                     DepositThread const &D = depT[th];
@@ -3742,11 +3766,9 @@ void interpolateGrid_phaseSpace(DT &dt,
                     addInto( quantities->scalar, D.ownQ.scalar );
                     addInto( quantities->scalar_gradient, D.ownQ.scalar_gradient );
 #endif
-                    addInto( streamCount, D.ownStreamCount );   addInto( releasedMult, D.ownReleasedMult );
-                    addInto( exactMult, D.ownExactMult );       addInto( dispWeight, D.ownDispWeight );
-                    addInto( dispVel, D.ownDispVel );           addInto( massWeight, D.ownMassWeight );
-                    orInto( orientBits, D.ownOrientBits );      orInto( subSampleMassFlag, D.ownSubSampleMassFlag );
-                    orInto( flippedFlag, D.ownFlippedFlag );
+                    addInto( releasedMult, D.ownReleasedMult ); addInto( exactMult, D.ownExactMult );
+                    addInto( dispWeight, D.ownDispWeight );     addInto( dispVel, D.ownDispVel );
+                    addInto( massWeight, D.ownMassWeight );
                 }
             };
             std::vector<std::thread> pool;

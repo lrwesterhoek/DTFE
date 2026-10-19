@@ -3029,8 +3029,7 @@ class ExploreControls(QWidget):
             with matplotlib.rc_context(FS.rc(opts, fmt)):    # the font size and the text kept as text
                 fig, dpi = self.map_figure(opts)
                 try:
-                    FS.check_pixels(*fig.get_size_inches(), dpi)     # before Agg allocates it (2026-10-14, review)
-                    fig.savefig(f, **FS.save_kwargs(opts, dpi, fmt))
+                    FS.savefig(fig, f, opts, dpi, fmt)     # the pixel guard, the titles' line breaks, savefig
                 finally:
                     plt.close(fig)
         if opts["voids"] and self.voids_shown():
@@ -3735,8 +3734,7 @@ class ExploreControls(QWidget):
             with matplotlib.rc_context(FS.rc(opts, fmt)):    # the font size and the text kept as text
                 fig, _n = grid_figure(req, items, opts=opts)
                 dpi = grid_dpi(fig, req, items, opts)
-                FS.check_pixels(*fig.get_size_inches(), dpi)     # before Agg allocates it (2026-10-14, review)
-                fig.savefig(str(path), **FS.save_kwargs(opts, dpi, fmt))
+                FS.savefig(fig, str(path), opts, dpi, fmt)     # the pixel guard, the titles' line breaks, savefig
         self.status.emit(f"saved {path}" + (f"; {note}" if note else ""))
         return str(path)
 

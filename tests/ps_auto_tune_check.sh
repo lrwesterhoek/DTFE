@@ -53,6 +53,9 @@
 #  R) STANDARD DTFE '--region' / '--regionMpc' (2026-10-13): the tuner plans the region's particles, not the whole
 #     snapshot's (the launcher's exact zoom of a 20^3-cell TNG50 region was split 3x3x3 with 10 threads: ~21 min
 #     instead of ~1). Uses the standard binary (built here too); SKIP when it is not built.
+#  S) ONE DOMAIN (2026-10-18): '--partition 1 1 1' deposits into the run's own grids, so the prediction counts them
+#     once -- the 768^3 crossed-waves report sits between the measured peak and 15% above it (it said 38.8 for 22.9) --
+#     and a real one-domain run's peak stays under its prediction.
 #
 # The 2^32 GPU sub-grid guard (ps_interpolation.cc) is NOT exercised here: it needs a real
 # >4.29e9-cell partition sub-grid, i.e. >32 GB of buffers. It mirrors the validated guard in
@@ -566,6 +569,35 @@ if [ -x "${DTFE_BIN}" ]; then
 else
     echo "   SKIP  R (${DTFE_BIN} is not built)"
 fi
+
+# ---------- (S) one domain: its grids are counted once (2026-10-18) ----------
+# '--partition 1 1 1' (and one domain picked by the tuner) deposits straight into the run's own grids, which 'fixed'
+# books; the partition term added them again, plus every fixed-point grid's conversion at once: 38.84 GB predicted for
+# the 64^3 crossed waves on a 768^3 grid, measured at 22.9 GB peak footprint (24.87 GB in the double build, whose peak
+# is the export). S1 pins that report (the run itself takes 23 GB): at or above the measurement, within 15% of it; the
+# threads and the machine are pinned (the copy budget and the threads' sample lists follow both). S2 runs one domain
+# for real and its peak must stay under the prediction -- the model's contract; no upper bound there: the model follows
+# macOS's allocator, which keeps freed blocks under 4 GiB, and glibc returns them (the Linux peak is lower).
+echo ">> S: one domain (the 768^3 report; a real 256^3 run)"
+SNAP_W="${TMP}/at_input_waves.hdf5"
+"${PY}" "${SCRIPT_DIR}/generate_ps_test_data.py" --out "${SNAP_W}" --n 64 --crossed-waves >/dev/null
+env OMP_NUM_THREADS=10 DTFE_RAM_GB=64 "${BIN}" "${SNAP_W}" "${TMP}/at_s1" --grid 768 --periodic --input 105 --MpcUnit 1 \
+    --avg-subsamples 1 --field density_a velocity_a --partition 1 1 1 --auto-tune-report > "${TMP}/at_s1.log" 2>&1
+ps1=$(sed -n 's/^AUTO-TUNE-REPORT .*predicted_gb=\([0-9.]*\) .*/\1/p' "${TMP}/at_s1.log" | head -1)
+if precision_double; then ms1=24.87; else ms1=22.9; fi
+check "S1 one domain at 768^3 predicts ${ps1:-none} GB: at least the measured ${ms1} GB, at most 15% above it" \
+      "$(awk -v p="${ps1:-0}" -v m="${ms1}" 'BEGIN{print (p >= m && p <= 1.15*m) ? 1 : 0}')"
+"${BIN}" "${SNAP_W}" "${TMP}/at_s2" --grid 256 --periodic --input 105 --MpcUnit 1 --verbose 1 \
+    --avg-subsamples 1 --field density_a velocity_a --partition 1 1 1 > "${TMP}/at_s2.log" 2>&1 || true
+ms2=$("${PY}" - "${TMP}/at_s2.log" <<'PYEOF'
+import re, sys
+m = re.search(r"memory model\s*:\s*([\d.]+) GB predicted \(auto-tune\) vs ([\d.]+) GB measured", open(sys.argv[1]).read())
+print(f"{m.group(1)} {m.group(2)}" if m else "none none")
+PYEOF
+)
+check "S2 a real one-domain 256^3 run stays under its prediction (predicted / measured GB: ${ms2})" \
+      "$(echo "${ms2}" | awk '$1 != "none" && $1 >= $2 {ok=1} END{print ok ? 1 : 0}')"
+rm -f "${SNAP_W}" "${TMP}"/at_s1* "${TMP}"/at_s2.*[a-z]
 
 echo "------------------------------------------------------------"
 if [ "${FAILS}" -gt 0 ]; then

@@ -30,9 +30,17 @@
 #       X1's CPU run then writes a different '.a_den' (its mean is reported).
 #   X6  the audit only observes: every run above sets PS_MASS_AUDIT=1, so X1's 4-thread GPU run and X2's copy-mode
 #       run are repeated with PS_MASS_AUDIT=0 (the production path) and must write the same '.a_den'.
+#   X7  the copy mode shares its counts and flags (2026-10-18): the int stream count, the two hidden-stream flags and the
+#       caustic mask are written by every thread into the real arrays (relaxed atomics), as the fixed-point words are,
+#       so the single build keeps NO private copy. 32^3 crossed waves (multi-stream) on 64^3 at nSub 2, --ps-caustics,
+#       PS_MASS_AUDIT=0, copy mode (DTFE_DEPOSIT_SLABS=0) on 1, 4 and 10 threads: the logs must say 'CPU deposit on 4 /
+#       10 threads (copy mode' (single build: '0 MB of private accumulators'), and EVERY output file is byte-identical
+#       to the 1-thread run's. Double build: the counts, flags and masks (.a_streams .a_hidden_streams .caustic
+#       .causticClass) byte-identical, the double sums (.a_den .a_vel, still copies summed in thread order) to 1e-12.
 # The GPU halves (X1 GPU, X3 GPU) need a GPU build (Metal, or CUDA/HIP incl. the CUDAEMU=1 emulation); they print
 # SKIP otherwise and the CPU halves still run, so the suite runs in tests/ci_suite.sh (core and double). 12 s
-# without the GPU halves, 23 s with them (M-series Mac, 10 cores). The shared binary of before fails X1-X3 and X5.
+# without the GPU halves, 23 s with them (M-series Mac, 10 cores; X7 adds ~8 s: 31 s). The shared binary of before
+# fails X1-X3 and X5; the binary before 2026-10-18 fails X7 (its copy mode kept 8 B/cell of count/flag copies).
 # Usage: tests/ps_mass_exact_check.sh [--no-build]
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -54,9 +62,10 @@ if [ -d "$OBJ" ] && [ ! -f "$OBJ/.gpu_mode_off" ]; then
 fi
 TMP="${DTFE_TEST_TMP}/ps_mass_exact_check"
 mkdir -p "$TMP"
-LAT="$TMP/lattice32.hdf5"; PAN="$TMP/pancake64.hdf5"
+LAT="$TMP/lattice32.hdf5"; PAN="$TMP/pancake64.hdf5"; CW="$TMP/crossed32.hdf5"
 "$PY" "${SCRIPT_DIR}/generate_ps_test_data.py" --out "$LAT" --n 32 --amplitude-factor 0.5 --jitter-frac 0 >/dev/null \
     || { echo "FAIL data gen"; exit 1; }
+"$PY" "${SCRIPT_DIR}/generate_ps_test_data.py" --out "$CW" --n 32 --crossed-waves >/dev/null || { echo "FAIL data gen"; exit 1; }
 "$PY" "${SCRIPT_DIR}/generate_ps_test_data.py" --out "$PAN" --n 64 >/dev/null || { echo "FAIL data gen"; exit 1; }
 
 echo "============================================================"
@@ -100,6 +109,11 @@ run pan_t1 "$PAN" DTFE_DEPOSIT_THREADS=1 -- "${P[@]}"
 run pan_t4c "$PAN" DTFE_DEPOSIT_THREADS=4 DTFE_DEPOSIT_SLABS=0 -- "${P[@]}"
 run pan_t4s "$PAN" DTFE_DEPOSIT_THREADS=4 DTFE_DEPOSIT_SLABS=1 -- "${P[@]}"
 run pan_t4c_na "$PAN" DTFE_DEPOSIT_THREADS=4 DTFE_DEPOSIT_SLABS=0 PS_MASS_AUDIT=0 -- "${P[@]}"
+echo ">> X7 crossed waves with caustics, copy mode on 1, 4 and 10 threads (shared counts and flags)"
+for t in 1 4 10; do
+    run "cw_t$t" "$CW" DTFE_DEPOSIT_THREADS=$t DTFE_DEPOSIT_SLABS=0 PS_MASS_AUDIT=0 -- \
+        --grid 64 --avg-subsamples 2 --ps-caustics --partition 1 1 1
+done
 if ! precision_double; then
     echo ">> X5 PS_METAL_FLOAT_MASS=1 (the float grid, for A/B)"
     run lat_cpu_float "$LAT" PS_METAL_FLOAT_MASS=1 -- "${L[@]}" --partition 1 1 1
@@ -170,6 +184,33 @@ check("X3", slab is not None and int(slab.group(1)) > 1, f"the slab run used sla
 same("pan_t1", "pan_t4c", "pancake, CPU, 1 thread vs 4 (copy mode)")
 same("pan_t1", "pan_t4s", "pancake, CPU, 1 thread vs 4 (slab mode)")
 same("pan_t4c_na", "pan_t4c", "pancake, CPU, 4 threads (copy mode), PS_MASS_AUDIT=0 vs 1", "X6")
+
+# X7: the copy mode on 1/4/10 threads, its counts and flags shared -- the thread count from the log, every file cmp'ed
+SHARED = {".a_streams", ".a_hidden_streams", ".caustic", ".causticClass"}   # integer counts, flags, masks
+ref = sorted(p for p in tmp.glob("cw_t1.*") if p.suffix != ".log")
+exts = {p.name[len("cw_t1"):] for p in ref}
+check("X7", SHARED <= exts, f"the 1-thread run wrote {' '.join(sorted(exts))} (needs {' '.join(sorted(SHARED))})")
+for t in (4, 10):
+    log = (tmp / f"cw_t{t}.log").read_text()
+    m = re.search(r"CPU deposit on (\d+) threads? \(copy mode: ([0-9.eE+-]+) MB of private accumulators", log)
+    nt, mb = (int(m.group(1)), float(m.group(2))) if m else (None, None)
+    check("X7", nt == t and (double or mb == 0.), f"{t}-thread run: the copy mode on {nt} threads with {mb} MB of "
+          f"private accumulators per extra thread (want {t}{'' if double else ', 0 MB: nothing copied'})")
+    same_b, close, bad = [], [], []
+    for p in ref:
+        ext = p.name[len("cw_t1"):]
+        q = tmp / f"cw_t{t}{ext}"
+        x, y = p.read_bytes(), (q.read_bytes() if q.exists() else b"")
+        if x == y and x:
+            same_b.append(ext)
+        elif double and ext not in SHARED and len(x) == len(y) and x:
+            u, v = np.frombuffer(x, REAL).astype(np.float64), np.frombuffer(y, REAL).astype(np.float64)
+            rel = float(np.max(np.abs(u - v)) / max(np.max(np.abs(u)), 1e-300))
+            (close if rel < 1e-12 else bad).append(f"{ext} ({rel:.1e})")
+        else:
+            bad.append(ext)
+    check("X7", not bad and same_b, f"{t} vs 1 thread: byte-identical {' '.join(same_b) or 'nothing'}"
+          + (f"; to 1e-12 {' '.join(close)}" if close else "") + (f"; DIFFER {' '.join(bad)}" if bad else ""))
 
 # X4: the audit lines, when the binary has them
 num = r"([-+0-9.eE]+|nan|inf)"

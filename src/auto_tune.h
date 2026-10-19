@@ -95,8 +95,10 @@ inline double autoTunePhysicalRAM()
 
 // The memory the PS-DTFE CPU deposit threads' private accumulator copies may take per partition:
 // 20% of physical RAM (at least 2 GB), or DTFE_DEPOSIT_MEM_GB. ps_interpolation.cc lowers its
-// thread count to fit (a 256^3 grid with density, velocity and dispersion is ~1 GB per copy, so
-// 2 GB allowed only 3 threads); the partition model below budgets the same amount.
+// thread count to fit (a 256^3 grid with density, velocity and dispersion was ~1 GB per copy, so
+// 2 GB allowed only 3 threads); the partition model below budgets the same amount. Since the
+// fixed-point grids (2026-10-12/14) and the shared counts and flags (2026-10-18) the single build
+// copies nothing by default: the budget binds only the float sums (double build, PS_METAL_FLOAT_*).
 inline double psDepositThreadBytes()
 {
     if ( const char *env = std::getenv("DTFE_DEPOSIT_MEM_GB") )
@@ -393,6 +395,80 @@ inline double autoTuneFxMomentBytes(Field &f, AutoTunePS const &ps)
     return b;
 }
 
+// The same grids ONE BY ONE, in the order the deposit converts them after its loop (ps_deposit_params.h PSFxGrid:
+// fxToReal walks g = 0, 1, ...), as Real bytes per sub-grid cell each (2026-10-18; their words take twice that, and
+// the entries add up to autoTuneFxMomentBytes): the one-domain model below follows that conversion grid by grid.
+inline std::vector<double> autoTuneFxGrids(Field &f, AutoTunePS const &ps)
+{
+    std::vector<double> g;
+    if ( not f.selected() or not ps.phaseSpace ) return g;
+    double const R = double(sizeof(Real));
+    bool const gradient = f.velocity_gradient or f.velocity_divergence or f.velocity_shear
+                          or f.velocity_vorticity or f.velocity_vweb;
+    bool const densityGrid = f.density or f.velocity_tweb;
+    bool const needWeight = f.velocity or f.velocity_gradient or f.velocity_dispersion
+                            or f.velocity_divergence or f.velocity_shear or f.velocity_vorticity
+                            or f.velocity_vweb or f.scalar or f.scalar_gradient;
+    if ( f.velocity or (f.velocity_dispersion and not ps.volumeWeighted) ) g.push_back( 3.*R );   // PS_FX_MOM
+    if ( f.velocity_dispersion ) g.push_back( 6.*R );                                         // PS_FX_M2
+    if ( gradient ) g.push_back( 9.*R );                                                      // PS_FX_GRAD
+    if ( needWeight and not (densityGrid and not ps.volumeWeighted) ) g.push_back( R );       // PS_FX_MOMW
+    if ( ps.exactDeposit ) g.push_back( R );                                                  // PS_FX_SV
+    if ( ps.volumeWeighted and f.velocity_dispersion )
+    {
+        g.push_back( 3.*R );                                                                  // PS_FX_DV
+        if ( not densityGrid ) g.push_back( R );                                              // PS_FX_DW
+    }
+    if ( f.scalar ) g.push_back( noScalarComp*R );                                            // PS_FX_SCAL
+    if ( f.scalar_gradient ) g.push_back( noScalarGradComp*R );                               // PS_FX_SG
+    if ( ps.haloRelease and not ps.exactDeposit ) g.push_back( R );                           // PS_FX_RM
+    return g;
+}
+
+// One Quantities' PS COUNT, FLAG and MASK grids in bytes per sub-grid cell (part of autoTuneBytesPerCell): none of
+// them is a private copy of the deposit's copy mode -- the deposit's own int stream count, its two byte flags and
+// its caustic mask are shared by the threads (2026-10-18, ps_interpolation.cc psAddCount), and the others are
+// DTFE.cpp's output grids -- so the partition model's copy term leaves them out.
+inline double autoTunePSCountBytes(Field &f, AutoTunePS const &ps, int const phase)
+{
+    if ( not f.selected() or not ps.phaseSpace ) return 0.;
+    double const R = double(sizeof(Real));
+    double b = 0.;
+    b += R;                                                    // stream_count (both phases)
+    b += R;                                                    // hidden_streams (both phases, DTFE.cpp)
+    if ( phase == 0 )      b += 2.;                            // subSampleMassFlag + flippedFlag, the deposit's byte accumulators
+    if ( ps.caustics )     b += R;                             // caustic_bits (DTFE.cpp:512)
+    if ( ps.exactDeposit ) b += R;                             // tet_touch    (DTFE.cpp:519)
+    /* orientBits, the deposit's per-cell accumulator (ps_interpolation.cc): a CausticMask,
+       not a byte, since the A4 indicator needs bit 8. Deposit phase only -- freed before the
+       derived fields are allocated. Counted once per selected Quantities, like caustic_bits;
+       when only one of the u/a pair is deposited that over-counts slightly, deliberately,
+       since for a memory budget the safe rounding direction is up. */
+    if ( ps.caustics and phase == 0 ) b += double(sizeof(PSCausticClass::CausticMask));
+    return b;
+}
+
+// The grids only the POST phase allocates (autoTuneBytesPerCell's phase 1, below), in bytes per cell: the derived
+// fields, made after the deposit loop (DTFE.cpp:83, ~1238-1257), and the T-web tidal stage.
+inline double autoTuneDerivedBytes(Field &f)
+{
+    if ( not f.selected() ) return 0.;
+    double const R = double(sizeof(Real));
+    double b = 0.;
+    if ( f.velocity_divergence ) b += R;
+    if ( f.velocity_shear ) b += 5.*R;
+    if ( f.velocity_vorticity ) b += 3.*R;
+    if ( f.velocity_std ) b += R;
+    if ( f.velocity_tweb ) b += R + 3.*R;                      // web label + eigenvalues
+    if ( f.velocity_vweb ) b += R + 3.*R;
+    // T-web tidal stage (computeTidalWebClassification, DTFE.cpp:1126-1200): all live at
+    // once -- work(N) 8 B + deltaK/tensK fftw_complex ~16.03 B + tens[0..5] 6*R. 48 B/cell
+    // on top of every resident grid; invisible at the 256-512 sizes this was calibrated on
+    // (6.5 GB at 512^3) but 51.6 GB at 1024^3.
+    if ( f.velocity_tweb ) b += 8. + 16.032 + 6.*R;
+    return b;
+}
+
 inline double autoTuneBytesPerCell(Field &f, AutoTunePS const &ps, int const phase)
 {
     if ( not f.selected() ) return 0.;
@@ -415,20 +491,7 @@ inline double autoTuneBytesPerCell(Field &f, AutoTunePS const &ps, int const pha
     if ( f.scalar_gradient ) b += noScalarGradComp*R;
 
     if ( phase == 1 )
-    {
-        // derived fields: allocated only after the deposit loop (DTFE.cpp:83, ~1238-1257)
-        if ( f.velocity_divergence ) b += R;
-        if ( f.velocity_shear ) b += 5.*R;
-        if ( f.velocity_vorticity ) b += 3.*R;
-        if ( f.velocity_std ) b += R;
-        if ( f.velocity_tweb ) b += R + 3.*R;                      // web label + eigenvalues
-        if ( f.velocity_vweb ) b += R + 3.*R;
-        // T-web tidal stage (computeTidalWebClassification, DTFE.cpp:1126-1200): all live at
-        // once -- work(N) 8 B + deltaK/tensK fftw_complex ~16.03 B + tens[0..5] 6*R. 48 B/cell
-        // on top of every resident grid; invisible at the 256-512 sizes this was calibrated on
-        // (6.5 GB at 512^3) but 51.6 GB at 1024^3.
-        if ( f.velocity_tweb ) b += 8. + 16.032 + 6.*R;
-    }
+        b += autoTuneDerivedBytes( f );   // derived fields: allocated only after the deposit loop (above)
     else if ( ps.phaseSpace )
     {
         // ---- deposit-phase PS weight grids (freed at DTFE.cpp:659, before the derived fields) ----
@@ -458,17 +521,7 @@ inline double autoTuneBytesPerCell(Field &f, AutoTunePS const &ps, int const pha
     }
     if ( ps.phaseSpace )
     {
-        b += R;                                                    // stream_count (both phases)
-        b += R;                                                    // hidden_streams (both phases, DTFE.cpp)
-        if ( phase == 0 )      b += 2.;                            // subSampleMassFlag + flippedFlag, the deposit's byte accumulators
-        if ( ps.caustics )     b += R;                           // caustic_bits (DTFE.cpp:512)
-        if ( ps.exactDeposit ) b += R;                             // tet_touch    (DTFE.cpp:519)
-        /* orientBits, the deposit's per-cell accumulator (ps_interpolation.cc): a CausticMask,
-           not a byte, since the A4 indicator needs bit 8. Deposit phase only -- freed before the
-           derived fields are allocated. Counted once per selected Quantities, like caustic_bits;
-           when only one of the u/a pair is deposited that over-counts slightly, deliberately,
-           since for a memory budget the safe rounding direction is up. */
-        if ( ps.caustics and phase == 0 ) b += double(sizeof(PSCausticClass::CausticMask));
+        b += autoTunePSCountBytes(f, ps, phase);                   // the counts, flags and masks (above)
         // --ps-halo-release on the sampled deposit: released tets add their volume fraction to
         // a per-cell Real accumulator (releasedMult, ps_interpolation.cc). Deposit phase only.
         if ( ps.haloRelease and not ps.exactDeposit and phase == 0 ) b += R;
@@ -1013,6 +1066,9 @@ inline AutoTuneReport autoTunePartitioning(User_options &u,
     // partitionGiven, not only partitionOn: '--partition 1 1 1' asks for one triangulation, which
     // leaves partitionOn false -- reading that as "not given" used to split the data anyway
     bool const autoPart = not (u.partitionOn or u.partitionGiven);
+    // ... and a user's split that is not one domain on every axis ('--partition 1 2 2': partition[0] is 1, but it
+    // runs the partition path): the model's n == 1 is the single-domain path only without it (partitionBytes)
+    bool const userPartitionOn = u.partitionOn;
     bool const autoConc = not u.maxConcurrentOn;
     AutoTuneReport report;
     if ( (not autoPart and not autoConc and not u.autoTuneReport) or u.partNo>=0 or u.redshiftConeOn
@@ -1281,6 +1337,84 @@ inline AutoTuneReport autoTunePartitioning(User_options &u,
     // words live (as many again as its Real moment grids: the larger pass), which also leave the private copies
     double const fxMom   = ( ps.phaseSpace and sizeof(Real) == 4 and momFx )
                          ? std::max( autoTuneFxMomentBytes(u.uField, ps), autoTuneFxMomentBytes(u.aField, ps) ) : 0.;
+    // ... and the counts, flags and masks, which the deposit threads share in every build (2026-10-18)
+    double const countCell = autoTunePSCountBytes(u.uField, ps, 0) + autoTunePSCountBytes(u.aField, ps, 0);
+    // One private copy of the CPU deposit's copy mode, per sub-grid cell (2026-10-18): the Real accumulators of ONE
+    // pass -- the passes deposit one after the other, each copying only its own grids that are not fixed-point
+    // sums (ps_interpolation.cc accBytes, of the 'quantities' it fills). The model took both passes' grids less one
+    // pass's words (bCellDeposit - fxCell - fxMom - countCell): with u and a fields both selected, 16 B/cell of
+    // copies in the single build, which copies nothing (384^3: 13.8 GB predicted, 5.1 measured), and twice the
+    // double build's 32 B/cell -- so few threads that it predicted SLAB mode while the run took 8 threads in the copy
+    // mode (384^3: 12.4 GB predicted, 18.0 measured). One pass alone is the same number as before.
+    double copyCell = 0.;
+    for (Field *f : { &u.uField, &u.aField })
+    {
+        if ( not f->selected() ) continue;
+        double const R = double(sizeof(Real));
+        bool const massFx = ps.phaseSpace and sizeof(Real) == 4 and ( f->density or f->velocity_tweb );   // as fxCell
+        double const fxPass = ( ps.phaseSpace and sizeof(Real) == 4 and momFx ) ? autoTuneFxMomentBytes(*f, ps) : 0.;
+        copyCell = std::max( copyCell, autoTuneBytesPerCell(*f, ps, 0) - autoTunePSCountBytes(*f, ps, 0)
+                                       - ( massFx ? R : 0. ) - fxPass );
+    }
+
+    // ONE DOMAIN on the CPU (2026-10-18). '--partition 1 1 1', or one domain picked here, leaves partitionOn false:
+    // the single triangulation deposits straight into the run's own grids (DTFE_interpolation: no reserveMemory, no
+    // partition sub-grid, no addFromSubgrid), so the grids 'fixed' books are the deposit's own -- partitionBytes(1)
+    // added them a second time (copyOne) and booked every grid's conversion at once: 38.8 GB predicted for a 768^3
+    // run measured at 22.9. What the run holds instead, per pass (u, then a), in the deposit's own order
+    // (ps_interpolation.cc): during the loop the fixed-point words (the density's 8 B, each moment grid's 2 x its Real
+    // bytes), the int stream count, the flags and every Real accumulator that is not a fixed-point sum; after it each
+    // moment grid's Real grid is made beside the words and the words freed, grid by grid (psFxToReal), then the
+    // density from the mass words; then the export grids ('.streams' or '.tetTouch', '.hidden_streams', the caustic
+    // bits, the volume-weighted dispersion's copy of the density). AND what is freed stays in the footprint: macOS's
+    // allocator keeps a freed block under 4 GiB (2^32 B) for reuse (measured with a malloc/free probe: 0.1 .. 4.29 GB
+    // all kept, 4.30 GB and up returned; kept blocks serve later requests of at least half their size), so the export
+    // grids pile on top of the freed words unless those were 4 GiB or more: 62 B/cell for density + velocity at
+    // 256^3 .. 512^3 (8.59 GB measured at 512^3 where the live peak is 6.7), but the 50 B/cell live conversion peak at
+    // 768^3, whose 10.9 GB velocity words go back. The next pass's own temporaries reuse what the previous one freed
+    // (the same sizes) as far as they go; the derived fields come after it all. Bytes, for 'cells' sub-grid cells.
+    auto oneDomainPeak = [&](double const cells) -> double
+    {
+        double const B4 = 4294967296.;          // the allocator returns a freed block of this size or more
+        double const R = double(sizeof(Real));
+        bool const fxOn = ps.phaseSpace and sizeof(Real) == 4 and momFx;
+        double live = 0., kept = 0., peak = 0.;
+        auto alloc = [&](double const b) { live += b*cells; peak = std::max( peak, live + kept ); };
+        auto release = [&](double const b) { live -= b*cells; if ( b*cells < B4 ) kept += b*cells; };
+        for (Field *f : { &u.uField, &u.aField })
+        {
+            if ( not f->selected() ) continue;
+            bool const massFx = ps.phaseSpace and sizeof(Real) == 4 and ( f->density or f->velocity_tweb );   // fxCell
+            std::vector<double> const G = fxOn ? autoTuneFxGrids(*f, ps) : std::vector<double>();
+            double sumG = 0.;
+            for (double const g : G) sumG += g;
+            double const mask = ps.caustics ? double(sizeof(PSCausticClass::CausticMask)) : 0.;
+            double const E = R + R + ( ps.caustics ? R : 0. )                                    // the export grids
+                           + ( ( ps.volumeWeighted and f->velocity_dispersion and massFx ) ? R : 0. );
+            // the loop's temporaries: the pass's slots, less the grids made after it, plus the words and the int count
+            double const pre = autoTuneBytesPerCell(*f, ps, 0) - E - sumG - ( massFx ? R : 0. )
+                             + 2.*sumG + ( massFx ? 8. : 0. ) + double(sizeof(int));
+            double const reuse = std::min( kept, pre*cells );   // ... in what the previous pass freed
+            kept -= reuse;
+            live += pre*cells;
+            peak = std::max( peak, live + kept );
+            for (double const g : G) { alloc( g ); release( 2.*g ); }
+            if ( massFx ) { alloc( R ); release( 8. ); }
+            alloc( E );
+            release( double(sizeof(int)) + 2. + mask );   // the int count, the flags, the caustic mask (pass end)
+        }
+        // the derived fields and the T-web stage come on top of what the passes left
+        alloc( autoTuneDerivedBytes(u.uField) + autoTuneDerivedBytes(u.aField) );
+        return peak;
+    };
+    // ... and each deposit thread's per-tetrahedron sample lists (DepositThread insideFlat/insideRel/insideW, 16 B
+    // per sample of the largest tetrahedron it meets), which a very fine grid over few particles makes visible:
+    // ~33 MB per thread at 512^3 over 8^3 particles: ~50x the samples of a mean owned tetrahedron of a single-stream
+    // sheet, grid x nSub^3 / 6 N (crossed waves, 256^3 .. 512^3; which tetrahedra a thread meets depends on the
+    // scheduling). Booked at 128x that mean; negligible at production densities (768^3 over 0.26M: 6 MB in all).
+    int const nSubScratch = std::max( 1, psExact ? 3 : int(u.psAvgSubsamples) );
+    double const sampleCube = ( u.aField.selected() or psExact ) ? std::pow( double(nSubScratch), double(NO_DIM) ) : 1.;
+    double const threadScratch = double(cores) * 16. * 128. * gridTotal * sampleCube / ( 6. * std::max( 1., N ) );
 
     // per-partition bytes for an n^3 Lagrangian split
     auto partitionBytes = [&](int n) -> double
@@ -1345,12 +1479,23 @@ inline AutoTuneReport autoTunePartitioning(User_options &u,
             // copies and slab lists are freed by then, so that moment only counts when it exceeds them.
             // The moment grids' words (fxMom, 2026-10-14) likewise: +fxMom during the deposit, no private copy of
             // them, and their conversion after the loop takes them grid by grid (under the same max).
+            // The counts, flags and masks (countCell) are not copied either (2026-10-18: the threads share them), so
+            // the default single build has copyPriv = 0 and every core in the copy mode, as ps_interpolation.cc
+            // (its accBytes) -- only the float sums (double build, PS_METAL_FLOAT_MOMENTS=1) still book copies.
             double const copyOne = bCellDeposit*subCells;
-            double const copyPriv = std::max( 0., bCellDeposit - fxCell - fxMom )*subCells;
-            int const copyThreads = std::min( cores, 1 + int( psDepositThreadBytes() / std::max( 1., copyPriv ) ) );
+            double const copyPriv = std::max( 0., copyCell )*subCells;   // (copyCell above: one pass's copy)
+            int const copyThreads = copyPriv > 0.
+                ? std::min( cores, 1 + int( std::min( double(cores), psDepositThreadBytes() / copyPriv ) ) ) : cores;
             double const slabBytes = 6.77 * nPad * ( 8. + 1. + 2.*4. + 20. );
             double const helpers = 2 * copyThreads < cores ? slabBytes : double(copyThreads - 1) * copyPriv;
-            m += copyOne + (fxCell + fxMom)*subCells + std::max( helpers, (fxCell + fxMom)*subCells );
+            // One domain (oneDomainPeak above): its grids are 'fixed''s, so only what the deposit holds beyond them
+            // counts here, with the copies or slab lists and the threads' sample lists, all kept by the allocator
+            // once freed. A user's split such as '--partition 1 2 2' runs the partition path (userPartitionOn), and
+            // with --scratch-dir 'fixed' has no grid term: both keep the partition formula.
+            if ( n == 1 and not userPartitionOn and not scratchOn )
+                m += helpers + threadScratch + std::max( 0., oneDomainPeak( subCells ) - bCell*subCells );
+            else
+                m += copyOne + (fxCell + fxMom)*subCells + std::max( helpers, (fxCell + fxMom)*subCells );
         }
         return m;
     };

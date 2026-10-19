@@ -12,6 +12,8 @@ with or without borders, titles, axes, axes names and units, full resolution, et
   fit_width           the figure scaled so the saved file has the width asked for
   match_dpi           the dpi that puts one data pixel on one image pixel inside the map's axes (a plane too small
                       for 72 dpi shrinks the figure instead, 2026-10-15)
+  settle_wraps        wrapped titles given their drawn line breaks, so every matplotlib version measures them alike
+  savefig             a matplotlib figure saved with the options (pixel guard, settled wraps, save_kwargs)
   writes_pixels       the options that save the data's own pixels: full resolution, or no margins + match the data
   write_pixels        the full-resolution file: one image pixel per data pixel, the screen's colours, overlays optional
   SaveOptionsDialog   the one dialog behind Save image…, Save figure… and Explore > Save Options…
@@ -305,6 +307,42 @@ def save_kwargs(opts: dict, dpi: float, fmt: str = "png") -> dict:
     return kw
 
 
+def settle_wraps(fig, dpi: float) -> None:
+    """Give every wrapped text of 'fig' the line breaks it gets at the figure's current size and 'dpi', as explicit
+    newlines with wrapping off; the original text is kept on the artist, so a later call re-wraps it after a resize.
+    matplotlib 3.6 (Ubuntu 24.04, the CI) wraps text only while drawing: its extents, get_tightbbox and savefig's
+    tight crop measure a wrapped title unwrapped, so fit_width could not converge (a map asked 900 px wide came out
+    907) and the crop took the unwrapped title's width. matplotlib 3.10 lays the wrapped lines out everywhere, and
+    the same breaks give the same file there."""
+    from matplotlib.text import Text
+    own = fig.dpi
+    fig.set_dpi(dpi)
+    try:
+        renderer = fig.canvas.get_renderer()
+        for t in fig.findobj(Text):
+            src = getattr(t, "_figsave_wrap_src", None)
+            if src is None:
+                if not (t.get_wrap() and t.get_text()):
+                    continue
+                src = t._figsave_wrap_src = t.get_text()
+            t.set_text(src)
+            t.set_wrap(True)
+            t.get_window_extent(renderer)          # the renderer the line-width measure uses (matplotlib 3.6)
+            lines = t._get_wrapped_text()
+            t.set_wrap(False)
+            t.set_text(lines)
+    finally:
+        fig.set_dpi(own)
+
+
+def savefig(fig, path, opts: dict, dpi: float, fmt: str = "png") -> None:
+    """Save a matplotlib figure with the options: the pixel guard before Agg allocates it, the wrapped texts' line
+    breaks for this size (settle_wraps), then savefig with save_kwargs."""
+    check_pixels(*fig.get_size_inches(), dpi)
+    settle_wraps(fig, dpi)
+    fig.savefig(path, **save_kwargs(opts, dpi, fmt))
+
+
 class TooLarge(ValueError):
     """A width or dpi that would make a picture of more than MAX_SIDE_PX pixels a side (2026-10-14, review)."""
 
@@ -349,6 +387,7 @@ def fit_width(fig, opts: dict, dpi: float, relayout=None) -> None:
             check_pixels(*fig.get_size_inches(), dpi)   # every renderer below allocates the whole figure
             if relayout is not None:
                 relayout()
+            settle_wraps(fig, dpi)                  # measure the title as it will be drawn at this size
             bb = fig.get_tightbbox(fig.canvas.get_renderer())
             have = bb.width + 2 * pad
             if abs(have - target) * dpi < 0.5:
