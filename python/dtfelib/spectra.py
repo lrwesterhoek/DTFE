@@ -1,4 +1,4 @@
-"""Density power spectra (survey item 25, 2026-10-05): P(k) of a grid, and the linear-theory P(k) of the
+"""Density power spectra: P(k) of a grid, and the linear-theory P(k) of the
 simulation's cosmology to compare it with.
 
     from dtfelib import spectra
@@ -130,7 +130,7 @@ def transfer_eh98(k_mpc, cosmo: dict | None = None, h: float = _H, t_cmb: float 
     """Eisenstein & Hu (1998) no-wiggle transfer function T(k), k in 1/Mpc (h-free). The sound horizon s
     (their eq 26, in Mpc) and alpha_Gamma (eq 31) carry the baryons' suppression into Gamma_eff (eq 30),
     whose k s is k in 1/Mpc times s in Mpc (Eisenstein's own TFnowiggles converts to 1/Mpc first; a k in
-    h/Mpc there put the suppression 1/h too far in k -- review 2026-10-05); only q (eq 28) is written with
+    h/Mpc there would put the suppression 1/h too far in k); only q (eq 28) is written with
     k in h/Mpc. T from q (eq 29)."""
     c = cosmo or _COSMO
     om, ob = c["Omega_m"], c["Omega_b"]

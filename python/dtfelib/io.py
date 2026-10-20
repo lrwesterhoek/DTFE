@@ -9,9 +9,8 @@ analysis/plot script works with either method unchanged:
                        (rho/rho_bar, mean ~1, from factor=(NO_DIM+1)/averageDensity in
                        triangulation.cpp). FieldSet.density(units=...) converts either way using
                        rho_bar derived from the snapshot header, so scripts never see the
-                       difference. This asymmetry is what made old cross-method figures differ
-                       by ~1e8; files produced before the 2026-06-17 h-free unit overhaul of
-                       combined_*.hdf5 are stale on top of that and should be regenerated.
+                       difference. Files produced before the h-free unit overhaul of
+                       combined_*.hdf5 are stale and should be regenerated.
   * metadata           grid N inferred from file size; box size [Mpc], redshift, h, particle
                        mass/count read from the snapshot's combined_*.hdf5 header (kills the
                        hardcoded BOX_SIZE / FIELD_RESOLUTION / REDSHIFT constants).
@@ -21,12 +20,12 @@ analysis/plot script works with either method unchanged:
     quantity           vweb) is the gradient of the mean velocity under DTFE but the stream
                        average of each stream's own gradient <grad v> under PS-DTFE; the two agree
                        only in single-stream cells (see the note above FIELDS). load(name,
-                       mean_field=True) gives the DTFE quantity for both (2026-10-13). The fold-caustic
-                       flag of grids written before 2026-10-13 is per sample and low: take it
+                       mean_field=True) gives the DTFE quantity for both. The fold-caustic
+                       flag of older grids is per sample and low: take it
                        from FieldSet.fold_mask(), never from the raw 'caustic' grid.
   * memory             load() AUTO-TUNES against the machine: fields within the load budget
                        (DTFE_PY_LOAD_FRAC x available RAM; DTFE_PY_RAM_GB overrides) read
-                       eagerly as before, bigger ones return a read-only memmap. Per-plane
+                       eagerly, bigger ones return a read-only memmap. Per-plane
                        access via load_slice(), streaming via iter_slabs()/field_stats() --
                        a 1024^3 velGrad (38.6 GB) plots and summarizes at MB-level RSS.
 
@@ -50,7 +49,7 @@ import numpy as np
 # canonical field name -> (file suffix, components, ps_only)
 # The 'a_' averaged prefix is inserted automatically (averaged=True default).
 #
-# THE VELOCITY-GRADIENT FAMILY UNDER PS-DTFE (audit finding 4, 2026-10-13): 'gradient', 'divergence',
+# THE VELOCITY-GRADIENT FAMILY UNDER PS-DTFE: 'gradient', 'divergence',
 # 'shear', 'vorticity' and the V-web ('vweb', 'vweb_eigenvalues', classified from that gradient with
 # the Hoffman thresholds) hold, in a multi-stream cell, the STREAM AVERAGE OF EACH STREAM'S OWN
 # GRADIENT <grad v> = sum_s w_s grad(v_s) / sum_s w_s (w_s = the stream's Eulerian volume in the cell
@@ -59,7 +58,7 @@ import numpy as np
 # single-stream cells only (deep void interiors agree to <1.5%); in folds they differ in sign and
 # size: the inverted stream inside a wall has a POSITIVE divergence (in 1-D dv/dx = Ddot psi'/(1 +
 # D psi') changes sign with the Jacobian, and diverges at the caustic) while the mean velocity
-# converges onto the wall. Consequences, measured on TNG100-3-Dark z=1 (audit 2026-10-13):
+# converges onto the wall. Consequences, measured on TNG100-3-Dark z=1:
 #   * the box mean of 'divergence' is NOT 0 (DTFE's is, by Gauss on a periodic single-valued field):
 #     with volume weights the box mean of divergence * streams is the growth rate of the total
 #     stream volume, (1/V_box) d(sum_tets V_tet)/dt (the two agree to 4%: 159.7 vs 154.0 u-units);
@@ -67,8 +66,8 @@ import numpy as np
 #     against DTFE's 54.2/39.0/6.62/0.20%) -- a different quantity, not a worse estimate;
 #   * a velocity-divergence--density relation from PS grids needs an intercept or the single-stream
 #     mask (velocity_single_stream / single_stream_mask): multi-stream cells add +12 to +56 km/s/Mpc.
-# Compare PS with DTFE stored gradients in single-stream cells only -- or compare the MEAN-FIELD quantity
-# (2026-10-13): FieldSet.load(name, mean_field=True) returns, for every name of MEAN_FIELD_NAMES, the derivatives
+# Compare PS with DTFE stored gradients in single-stream cells only -- or compare the MEAN-FIELD quantity:
+# FieldSet.load(name, mean_field=True) returns, for every name of MEAN_FIELD_NAMES, the derivatives
 # of the mean velocity grad<v> under BOTH methods: standard DTFE's stored grid as it is, and for PS-DTFE the
 # spectral (FFT) derivatives of its 'velocity' grid with the binary's components, units and V-web normalisation
 # (dtfelib/fields.py, mean_field_derivatives: applied to a standard run's own a_vel it reproduces the binary's
@@ -77,16 +76,16 @@ import numpy as np
 # FieldSet.mean_field() computes it from the velocity grid for either method. The figure scripts that set PS
 # beside DTFE or theory use it for PS by default ('--ps-gradient stored' restores the stored grids; dtfelib/cli.py):
 # plot_velDiv_den, plot_cosmic_web, plot_web_streams, plot_shear_triaxial, plot_DTFE and plot_halo_tracking
-# (through environment.sample_fields_at), and since 2026-10-15 the launcher's Explore (its 'PS velocity derivatives'
+# (through environment.sample_fields_at), and the launcher's Explore (its 'PS velocity derivatives'
 # choice, the mean field by default: fields.mean_field_plane, one slice at a time). The raw-field viewer
-# plot_PS_DTFE still shows the stored PS grids.
+# plot_PS_DTFE shows the stored PS grids.
 FIELDS = {
     "density":           ("den",           1, False),
     "velocity":          ("vel",           3, False),
     "streams":           ("streams",       1, True),
-    "hidden_streams":    ("hidden_streams", 1, True),  # bitmask: bit 1 = multi-stream volume the stream count does not show (a folded tetrahedron overlaps the cell while '.streams' reads 1 -- a fold thinner than the sampling; exact in a periodic box), bit 2 = the cell holds mass from a tetrahedron none of whose sub-samples lies in it (a quadrature note, usually the SAME stream). Single-stream mask = streams==1 and not (hidden_streams & 1): velocity_single_stream does it. Written as '.unresolved' by the 2026-09-28/29 builds (0/1 = the old mass flag, read as bit 1: conservative; see LEGACY_SUFFIX); older outputs have neither and counted those tets in '.streams'
-    "caustic":         ("caustic",       1, True),   # 0/1 fold-caustic cell flag (--ps-caustics): tetrahedra of BOTH orientations overlap the cell. Geometric since 2026-10-13 (the det<0 half is the separating-axis overlap test, the raw '.hidden_streams' bit 1); grids written BEFORE that set it only where a folded tetrahedron deposited a sample and miss every fold thinner than the sampling (TNG100-3-Dark z=1: 21.0% of the cells against the exact 33.6%; ~2x low at z>=3). Read the fold with FieldSet.fold_mask() (= caustic_is_fold(mask, streams=, hidden=)), exact for old and new grids alike
-    "caustic_class":     ("causticClass",  1, True),   # --ps-caustics (CPU or GPU; --ps-linear-deposit forces CPU): caustic stratification bitmask. bit0/1 = a det(J)>0 / det(J)<0 tetrahedron overlaps the cell (both = fold, i.e. '.caustic'; bit1 is the geometric overlap since 2026-10-13, per sample before -- see 'caustic'), bits 2-5 = a tetrahedron with 0/1/2/3 collapsed axes deposited a sample here (1 = wall, 2 = filament, 3 = node; PER SAMPLE, so they depend on nSub and a fold thinner than the sampling shows only the k of the streams around it, typically k = 0 -- bit 0 and bits 6-8 are per sample too), bit6 = two eigenvalues coincide AT ZERO (umbilic/D4 INDICATOR, not a D4 identification; both halves matter -- merely coincident eigenvalues occur throughout caustic-free volume), bit7 = the A3 CUSP indicator and bit8 = the A4 SWALLOWTAIL indicator, both present only under '--ps-caustic-cusps'. See src/CGAL_triangulation/ps_caustic_class.h; decode with caustic_collapse_max() / caustic_is_fold() / caustic_is_cusp() / caustic_is_swallowtail()
+    "hidden_streams":    ("hidden_streams", 1, True),  # bitmask: bit 1 = multi-stream volume the stream count does not show (a folded tetrahedron overlaps the cell while '.streams' reads 1 -- a fold thinner than the sampling; exact in a periodic box), bit 2 = the cell holds mass from a tetrahedron none of whose sub-samples lies in it (a quadrature note, usually the SAME stream). Single-stream mask = streams==1 and not (hidden_streams & 1): velocity_single_stream does it. An output with '.unresolved' instead holds a 0/1 mass flag there (read as bit 1: conservative; see LEGACY_SUFFIX); an output with neither counts those tets in '.streams'
+    "caustic":         ("caustic",       1, True),   # 0/1 fold-caustic cell flag (--ps-caustics): tetrahedra of BOTH orientations overlap the cell. Geometric (the det<0 half is the separating-axis overlap test, the raw '.hidden_streams' bit 1); older grids set it only where a folded tetrahedron deposited a sample and miss every fold thinner than the sampling (TNG100-3-Dark z=1: 21.0% of the cells against the exact 33.6%; ~2x low at z>=3). Read the fold with FieldSet.fold_mask() (= caustic_is_fold(mask, streams=, hidden=)), exact for either kind of grid
+    "caustic_class":     ("causticClass",  1, True),   # --ps-caustics (CPU or GPU): caustic stratification bitmask. bit0/1 = a det(J)>0 / det(J)<0 tetrahedron overlaps the cell (both = fold, i.e. '.caustic'; bit1 is the geometric overlap, per sample in older grids -- see 'caustic'), bits 2-5 = a tetrahedron with 0/1/2/3 collapsed axes deposited a sample here (1 = wall, 2 = filament, 3 = node; PER SAMPLE, so they depend on nSub and a fold thinner than the sampling shows only the k of the streams around it, typically k = 0 -- bit 0 and bits 6-8 are per sample too), bit6 = two eigenvalues coincide AT ZERO (umbilic/D4 INDICATOR, not a D4 identification; both halves matter -- merely coincident eigenvalues occur throughout caustic-free volume), bit7 = the A3 CUSP indicator and bit8 = the A4 SWALLOWTAIL indicator, both present only under '--ps-caustic-cusps'. See src/CGAL_triangulation/ps_caustic_class.h; decode with caustic_collapse_max() / caustic_is_fold() / caustic_is_cusp() / caustic_is_swallowtail()
     "tet_touch":         ("tetTouch",      1, True),   # --ps-exact-deposit: raw count of tetrahedra touching the cell (geometric multiplicity, runs to hundreds -- NOT a stream count; use 'streams' for that)
     "dispersion":        ("velDisp",       1, True),
     "dispersion_tensor": ("velDispTensor", 6, True),   # xx,xy,xz,yy,yz,zz
@@ -135,7 +134,7 @@ def caustic_is_cusp(mask):
     gradient it needs does not exist inside a tetrahedron where the deformation is constant -- it is
     estimated by least squares over the tetrahedra sharing a vertex with each near-fold tetrahedron.
     On a 1-D Zel'dovich wave whose caustic is two parallel planes, and which therefore has NO cusps
-    anywhere, about 0.01% of the fold cells are still flagged (it was 7% when the fit used only the
+    anywhere, about 0.01% of the fold cells are still flagged (7% with a fit over only the
     four face neighbours). Good enough to map, but it remains an indicator at the tessellation's
     resolution rather than a pointwise A3 identification.
     """
@@ -173,12 +172,12 @@ def caustic_is_fold(mask=None, streams=None, hidden=None, tol: float | None = No
     """Boolean mask of the fold (A2) condition: tetrahedra of BOTH orientations overlap the cell/point.
 
     mask only: BOTH parity bits set in a 'caustic_class' / '.pts_caustic' mask -- identical to the 0/1
-    '.caustic' grid of the same run. Exact for point masks and for grids written since 2026-10-13, whose
-    det<0 bit is the geometric overlap (audit finding 3). NOT for older grids: their bits were set only
-    where a folded tetrahedron deposited a SAMPLE, so every fold thinner than the sampling was missed
+    '.caustic' grid of the same run. Exact for point masks and for grids whose
+    det<0 bit is the geometric overlap (the current binary's). NOT for older grids: their bits are set only
+    where a folded tetrahedron deposited a SAMPLE, so every fold thinner than the sampling is missed
     (TNG100-3-Dark z=1: 21.0% of the cells against 33.6%, about 2x low at z >= 3, and nSub-dependent).
 
-    streams (and hidden): THE fold definition for grids (2026-10-13), exact for old and new grids alike:
+    streams (and hidden): THE fold definition for grids, exact for either kind of grid:
 
         fold = (streams > 1 + tol)  |  (hidden_streams & 1)  [ | both parity bits of mask ]
 
@@ -186,18 +185,18 @@ def caustic_is_fold(mask=None, streams=None, hidden=None, tol: float | None = No
     folded (det<0) tetrahedron covers it, and then positive ones cover it too: "a folded tetrahedron
     overlaps the cell" IS the fold flag. '.hidden_streams' bit 1 holds exactly that overlap (the binary's
     separating-axis test) wherever '.streams' reads single-stream, and '.streams' > 1 implies it everywhere
-    else, so the union is the geometric flag. The audit of 2026-10-13 checked it on the TNG100-3-Dark z=1
-    grids (no '.caustic' cell outside it; 33.6% of the cells), and tests/ps_caustic_class_check.sh (J) checks
-    that the fixed binary's '.caustic' equals it cell for cell. Either streams grid works ('.streams' with '.hidden_streams', or the
-    averaged 'a_' pair: both reduce to the same overlap). With 'mask' given its fold cells are OR-ed in, which
+    else, so the union is the geometric flag. On the TNG100-3-Dark z=1
+    grids no '.caustic' cell lies outside it (33.6% of the cells), and tests/ps_caustic_class_check.sh (J) checks
+    that the binary's '.caustic' equals it cell for cell. Either streams grid works ('.streams' with '.hidden_streams',
+    or the averaged 'a_' pair: both reduce to the same overlap). With 'mask' given its fold cells are OR-ed in, which
     never changes the result (they lie inside the union) but keeps it whole if a grid is missing.
 
     Caveats. Periodic runs only: a non-periodic sheet has an edge whose image can overlap without folding,
     and there '.hidden_streams' bit 1 also carries the conservative mass flag, so the union over-flags. A
     cell that '.streams' counts twice without a fold -- the Lagrangian periodic seam's double cover, a few
-    hundred cells per snapshot until the seam fix -- reads as fold here. Outputs of 2026-09-28/29 store the
-    old mass flag as '.unresolved' (read as bit 1: over-flags); outputs without either grid leave only
-    streams > 1 (per sample: under-flags, like the old '.caustic').
+    hundred cells per snapshot in older outputs -- reads as fold here. Outputs with '.unresolved'
+    store a 0/1 mass flag there (read as bit 1: over-flags); outputs without either grid leave only
+    streams > 1 (per sample: under-flags, like an older '.caustic').
 
     Inputs may be read-only memmaps of any size: the work runs in axis-0 slabs, so the only full-size array
     is the boolean result (1 byte per cell). The streams test is single_stream_mask's own float32 arithmetic
@@ -256,11 +255,10 @@ def caustic_collapse_max(mask):
 # Velocity-derived fields are stored in Gadget u-units (u = v_pec/sqrt(a)): the binaries
 # difference the snapshot velocities verbatim. FieldSet.load() converts them to peculiar
 # km/s by scaling with a**exp -- exp = 0.5 for first moments (velocity and its spatial
-# derivatives), 1.0 for second moments (the dispersion is a velocity VARIANCE). This
-# centralizes what plot_shear_triaxial.py and plot_velDiv_den.py used to do ad hoc while
-# every other consumer silently read raw u-units (1/sqrt(a) inflated at high z; 4.6x at
-# z=20). At z=0 the factor is exactly 1.0, so outputs are bit-identical there.
-# NOT listed: vweb/vweb_eigenvalues -- the BINARY applies sqrt(a) itself since 2026-07-18
+# derivatives), 1.0 for second moments (the dispersion is a velocity VARIANCE), in one
+# place for every consumer: raw u-units are 1/sqrt(a) inflated at high z (4.6x at
+# z=20). At z=0 the factor is exactly 1.0, so the values there are the raw ones bit for bit.
+# NOT listed: vweb/vweb_eigenvalues -- the BINARY applies sqrt(a) itself
 # (scaling here would double-correct); tweb is density-based; caustic/streams/tetTouch are
 # dimensionless.
 _VELOCITY_SCALE_EXP = {
@@ -270,16 +268,16 @@ _VELOCITY_SCALE_EXP = {
 
 # Tolerance for comparing 'streams' against an integer multiplicity. '.streams' is a float32
 # under every deposit -- the sampled one carries a sub-sample mean, the exact one the analytic
-# volume-weighted multiplicity -- so an exact '== 1' test is never correct (it masked the whole
+# volume-weighted multiplicity -- so an exact '== 1' test is never correct (it would mask the whole
 # grid under --ps-exact-deposit, where single-stream cells land on 1.0 +/- float32 eps).
 STREAM_TOL = 1e-3
 
 
 # ---------------------------------------------------------------- machine awareness
 # The C++ side auto-tunes against the machine (src/auto_tune.h); these are the Python
-# loader's equivalents. FieldSet.load(mode="auto") keeps today's eager-ndarray behavior
+# loader's equivalents. FieldSet.load(mode="auto") returns an eager ndarray
 # whenever the field fits the budget -- memmap only kicks in where an eager load would
-# have swapped (1024^3 velGrad is 38.6 GB), so existing workflows are unchanged.
+# swap (1024^3 velGrad is 38.6 GB).
 #
 # Env overrides (mirroring the binary's DTFE_RAM_GB style; also what makes tests deterministic):
 #   DTFE_PY_RAM_GB     available-RAM override in GB
@@ -335,7 +333,7 @@ def _load_budget_bytes() -> int:
 
 def run_lambda_th(runlog) -> float:
     """The web threshold of the run whose log is 'runlog' (FieldSet.lambda_th; the launcher's Explore reads its
-    outputs' logs with it, 2026-10-15): the last '--lambda_th X' in it (the binary's command line on the 'RUNNING:'
+    outputs' logs with it): the last '--lambda_th X' in it (the binary's command line on the 'RUNNING:'
     line run_dtfe.sh / run_ps_dtfe.sh write), else the binary's own T-web report '(lambda_th = X)', else
     DEFAULT_LAMBDA_TH (0.3, the run scripts' default; also for a log that cannot be read)."""
     import re
@@ -484,7 +482,7 @@ class FieldSet:
             if mass <= 0:                                    # per-particle masses instead of table
                 mass = float(f["PartType1/Masses"][0])
             if "HFreeUnits" not in h:
-                # combined files from before the units unification copied the raw TNG
+                # combined files from before the units unification copy the raw TNG
                 # MassTable (1e10 Msun/h) verbatim; normalize so meta is h-free either way
                 mass /= float(h["HubbleParam"])
             return SnapshotMeta(
@@ -537,7 +535,7 @@ class FieldSet:
 
         mode='auto' (default) AUTO-TUNES the read against the machine, mirroring the
         binary's auto_tune: a field within the load budget (DTFE_PY_LOAD_FRAC x available
-        RAM, DTFE_PY_RAM_GB overrides detection) is read eagerly exactly as before --
+        RAM, DTFE_PY_RAM_GB overrides detection) is read eagerly --
         scaling happens IN PLACE on the freshly read buffer, so there is no second
         full-grid copy -- while a larger one comes back as a READ-ONLY np.memmap that the
         kernel pages against the file (velGrad at 1024^3 is 38.6 GB; slicing and reductions
@@ -549,7 +547,7 @@ class FieldSet:
         streaming statistics, scaled=False for raw u-units, or mode='ram' to accept the
         memory hit. At z=0 (every factor exactly 1) memmap serves ANY field.
 
-        mean_field=True (2026-10-13; names of MEAN_FIELD_NAMES only): the derivatives of the MEAN velocity grad<v>,
+        mean_field=True (names of MEAN_FIELD_NAMES only): the derivatives of the MEAN velocity grad<v>,
         the quantity standard DTFE stores, whatever the method -- the stored grid under standard DTFE (exactly what
         load(name) returns), under PS-DTFE mean_field(name) computed from the 'velocity' grid instead of the
         stored stream average <grad v> (the note above FIELDS). Same units and layout as the stored grids; the
@@ -713,10 +711,9 @@ class FieldSet:
         units='physical' -> 1e10 Msun / Mpc^3 (comoving, h-free)
 
         The on-disk convention is AUTO-DETECTED from the grid's own mean (mass conservation
-        pins it to either 1 or rho_bar): current binaries write rho/rho_bar for BOTH methods
-        (PS-DTFE switched 2026-07); PS files from before that store the physical mass density
-        and still load correctly. A grid whose mean matches neither convention (e.g. standard
-        DTFE outputs from before the 2026-06-17 unit overhaul) triggers a loud warning --
+        pins it to either 1 or rho_bar): current binaries write rho/rho_bar for BOTH methods;
+        older PS files store the physical mass density and load correctly too. A grid whose mean matches neither
+        convention (e.g. standard DTFE outputs from before the h-free unit overhaul) triggers a loud warning --
         regenerate those with the current binary before using absolute values.
         """
         raw = self.load("density")
@@ -767,9 +764,9 @@ class FieldSet:
         raising the count. The flag is geometric and exact in a periodic box -- a point is
         multi-stream exactly where a folded tetrahedron covers it -- so every cell this keeps
         is single-stream at every point, and none is dropped just for holding a small tet of
-        its own stream (bit 2, which the mask ignores). Outputs from 2026-09-28/29 store the old
-        conservative 0/1 mass flag as '.unresolved', which reads as bit 1; outputs without either grid
-        predate it and counted such tets +1 in '.streams', so the streams test alone is correct
+        its own stream (bit 2, which the mask ignores). Outputs with '.unresolved' instead store a
+        conservative 0/1 mass flag, which reads as bit 1; outputs without either grid
+        count such tets +1 in '.streams', so the streams test alone is correct
         there.
         """
         if self.method != "ps":
@@ -786,15 +783,15 @@ class FieldSet:
 
     def fold_mask(self) -> np.ndarray:
         """bool (N,N,N): the fold-caustic cells of this PS output -- a folded (det<0) tetrahedron overlaps the
-        cell, so it holds several streams -- EXACT for grids written before AND after the 2026-10-13 fix of
+        cell, so it holds several streams -- EXACT for older and current grids alike, whatever their
         '.caustic' (see caustic_is_fold: streams > 1 + tol, or '.hidden_streams' bit 1, OR the class mask's
         fold bits when the run wrote one). Use this, never the raw 'caustic' grid, wherever a fold fraction is
-        measured: the pre-fix '.caustic' was set per deposited sample and ~1.6x low at z=1, ~2x at z>=3.
+        measured: an older '.caustic' is set per deposited sample and ~1.6x low at z=1, ~2x at z>=3.
 
-        Needs no '--ps-caustics' grid at all: every PS output since 2026-09-30 carries 'streams' and
+        Needs no '--ps-caustics' grid at all: every current PS output carries 'streams' and
         'hidden_streams'. Which pair is read follows this FieldSet (averaged=True: 'a_streams' with
         'a_hidden_streams'); both give the same overlap. An output without a streams grid falls back to the
-        class mask's parity bits or the 0/1 'caustic' grid, with that grid's own (pre-fix: per-sample) meaning.
+        class mask's parity bits or the 0/1 'caustic' grid, with that grid's own (in older grids: per-sample) meaning.
         Grids are opened as memmaps and reduced in slabs: the result is the only full-size array."""
         if self.method != "ps":
             raise ValueError("fold_mask() needs PS-DTFE outputs (method='ps'): standard DTFE has no streams")
@@ -1066,7 +1063,7 @@ def single_stream_mask(streams, hidden=None, tol: float = STREAM_TOL):
     '.streams': a sub-sample mean or the exact volume-weighted multiplicity, see velocity_single_stream)
     AND, when a 'hidden_streams' grid is given, bit 1 clear (multi-stream volume the count does not show).
     THE one rule: velocity_single_stream masks its complement, webstreams.stream_bins names its bins by it,
-    profiles samples it on the voids' shells (2026-10-05)."""
+    profiles samples it on the voids' shells."""
     import numpy as np
     s = np.asarray(streams, dtype=np.float32)
     out = np.abs(s - 1.0) <= tol

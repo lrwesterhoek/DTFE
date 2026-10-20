@@ -216,8 +216,6 @@ def analyze(den, streams, grid=GRID, box=BOX, amp=AMP, n=N,
             update_baseline=False, baseline_path=BASELINE,
             extra_metrics=None, extra_tol=None, pts_streams=None):
     f_analytic, xlo_a, xhi_a = analytic_pancake(amp)
-    expected_mean = n ** 3 * 1.0 / box ** 3
-    cell_vol = (box / grid) ** 3
 
     # Stream statistics use the EXACT containment counts from the point evaluation
     # (--sample-points at the cell centres) when available. The deposit's .streams at

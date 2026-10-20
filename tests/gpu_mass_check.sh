@@ -1,30 +1,28 @@
 #!/usr/bin/env bash
-# The Metal GPU deposit's MASS grid (2026-10-08): an exact 64-bit fixed-point sum (two atomic words per cell,
-# metal/ps_deposit.metal depositMass) in place of the float atomic add, which lost small shares downward and
-# depended on the atomic order (TNG50-3-Dark z=0: box mean 0.99941). Asserted on synthetic snapshots:
+# The Metal GPU deposit's MASS grid: an exact 64-bit fixed-point sum (two atomic words per cell,
+# metal/ps_deposit.metal depositMass), not a float atomic add, which loses small shares downward and
+# depends on the atomic order (TNG50-3-Dark z=0: box mean 0.99941). Asserted on synthetic snapshots:
 #   M1  two identical --ps-gpu runs write byte-identical '.a_den', on one domain and with --partition 2 2 2
-#       --max-concurrent 1 (the float grid differed run to run), and since 2026-10-14 byte-identical '.a_vel'
+#       --max-concurrent 1 (the float grid differs run to run), and byte-identical '.a_vel'
 #       too: the moment grids are exact fixed-point sums as well (tests/ps_fixed_moments_check.sh covers every
-#       grid; PS_METAL_FLOAT_MOMENTS=1 brings back their float sums, and this check then skips '.a_vel').
-#       One partition at a time: concurrent partitions were
-#       merged in completion order (DTFE.cpp, unless the auto-tuner's speed split ordered them; index order is the
-#       default since 2026-10-14, '--completion-order-merge' the old way), and those float
-#       sums differed in the last bit from run to run on the CPU as well (--max-concurrent 4: 259 of 32^3 cells
-#       at 1e-16 in the double build), which is not the deposit's doing; the pin is kept so the check does not
-#       depend on the merge
-#   M2  PS_METAL_FLOAT_MASS=1 (the old float grid, kept for A/B) still runs and agrees with the default to 1e-5
+#       grid; PS_METAL_FLOAT_MOMENTS=1 selects their float sums, and this check then skips '.a_vel').
+#       One partition at a time: concurrent partitions merged in completion order ('--completion-order-merge';
+#       index order is the default) give float sums that differ in the last bit from run to run on the CPU as
+#       well (--max-concurrent 4: 259 of 32^3 cells at 1e-16 in the double build), which is not the deposit's
+#       doing; the pin keeps the check independent of the merge
+#   M2  PS_METAL_FLOAT_MASS=1 (the float grid, kept for A/B) still runs and agrees with the default to 1e-5
 #       of the peak
 #   M3  heavy accumulation (a 128^3 pancake on a 2^3 grid, nSub 1: 1.47e7 tetrahedra, ~1.8e6 deposits per
 #       cell): the GPU box mean equals the CPU's to 3e-6 (measured 8.7e-7 against the single-precision CPU,
-#       1.5e-8 against the double one; the float grid gave 7.8e-6 on the same case, so the old grid fails here)
-#   M4  the run log splits 'field interpolation' into its phases (2026-10-11: extraction walk, cost sort, GPU
+#       1.5e-8 against the double one; the float grid gives 7.8e-6 on the same case, so it would fail here)
+#   M4  the run log splits 'field interpolation' into its phases (extraction walk, cost sort, GPU
 #       deposit, deferred tets on the CPU, normalization), with the deferred-tet count equal to the GPU deposit's
 #       own count, and a partitioned run prints the run's totals over all 8 passes (the per-partition deferred
 #       line is suppressed there, so these totals are the only place the deferred work shows)
 #   M5  many GPU-deferred tetrahedra (48^3 crossed waves, A k = 3, on 96^3 at nSub 3: ~12000 of them) are
-#       deposited on several CPU threads in slab mode (2026-10-11; they were one thread, which outlasted the GPU
-#       deposit on such data), and the grids are byte-identical to the one-thread loop (DTFE_DEPOSIT_SLABS=0)
-# GPU builds only: Metal, and the CUDA/HIP port since it has the fixed-point grid too (2026-10-11; CUDAEMU=1 runs it
+#       deposited on several CPU threads in slab mode (one thread would outlast the GPU deposit on such
+#       data), and the grids are byte-identical to the one-thread loop (DTFE_DEPOSIT_SLABS=0)
+# GPU builds only: Metal, and the CUDA/HIP port, which has the fixed-point grid too (CUDAEMU=1 runs it
 # on the CPU emulation): skipped (exit 0) otherwise,
 # like tests/gpu_scalar_check.sh, and a local GPU suite (not in tests/ci_suite.sh). M3 takes ~40 s.
 # Usage: tests/gpu_mass_check.sh [--no-build]   (--no-build is accepted and ignored)
@@ -34,14 +32,9 @@ ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$ROOT" || exit 1
 source "${SCRIPT_DIR}/precision.sh"     # DTFE_TEST_PRECISION=double: the double pair
 precision_require "${PS_BIN}"
-PY="${PYTHON:-python3}"
-command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/python3.14
 [ -x "${PS_BIN}" ] || { echo "FAIL: ${PS_BIN} is not built"; exit 1; }
 OBJ=o_ps; precision_double && OBJ=o_ps_d
-if [ ! -d "$OBJ" ] || [ -f "$OBJ/.gpu_mode_off" ]; then echo "SKIP: $OBJ carries no GPU stamp (build with METAL=1)"; exit 0; fi
-gpu_stamp=""                                              # any one GPU backend stamp will do
-for m in metal cudaemu cuda hip; do [ -f "$OBJ/.gpu_mode_$m" ] && gpu_stamp="$m"; done
-if [ -z "$gpu_stamp" ]; then echo "SKIP: $OBJ is neither a Metal nor a CUDA/HIP (or CUDAEMU) build"; exit 0; fi
+require_gpu_backend "$OBJ"                                # sets gpu_stamp (tests/lib.sh)
 TMP="${DTFE_TEST_TMP:-${TMPDIR:-/tmp}/dtfe-tests}/gpu_mass_check"
 mkdir -p "$TMP"
 SNAP="$TMP/waves.hdf5"; PAN="$TMP/pancake128.hdf5"; DEF="$TMP/waves_deferred.hdf5"
@@ -51,7 +44,7 @@ SNAP="$TMP/waves.hdf5"; PAN="$TMP/pancake128.hdf5"; DEF="$TMP/waves_deferred.hdf
 [ -f "$DEF" ] || "$PY" tests/generate_ps_test_data.py --out "$DEF" --n 48 --crossed-waves --amplitude-factor 3.0 \
     --seed 9 >/dev/null || { echo "FAIL data gen"; exit 1; }
 # run <out> <command...>: a non-zero exit or a CPU fallback (any of the deposit's fallback warnings, and the
-# aggregate count of the partition passes, 2026-10-08) fails the suite
+# aggregate count of the partition passes) fails the suite
 run() { local out="$1"; shift; "$@" > "$out.log" 2>&1 || { echo "FAIL: $(basename "$out") (see $out.log)"; exit 1; }
         grep -q "using the CPU deposit\|deposit unavailable\|ran on the CPU instead" "$out.log" \
             && { echo "FAIL: $(basename "$out") fell back to the CPU (see $out.log)"; exit 1; }; return 0; }

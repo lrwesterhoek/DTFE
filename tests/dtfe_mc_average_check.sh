@@ -1,28 +1,27 @@
 #!/usr/bin/env bash
 # The standard-DTFE Monte-Carlo cell average ('_a', method 1, the default without --exact-average) is UNBIASED
-# and independent of the partition / thread / padding split (2026-10-13, audit finding 1). Until today every
-# tetrahedron mapped the same short Sobol prefix from CGAL's vertex(0); the prefix does not average to the
-# centroid and CGAL's vertex slots follow density, so every production '_a' grid lost 0.17-0.29% of its mass,
-# and the realization changed by ~10-23% rms per cell with the thread count or the partitioning. Now the
-# vertices are ordered by a hash of the cell's vertex set and every sample is centred (averaged_interpolation_1.cc:
-# the comment above 'mcLegacy'). Asserted on demo/z0_64.gadget (262144 particles, z=0, tracked in the repo) at
-# 64^3, --periodic --padding 12, density_a velocity_a:
+# and independent of the partition / thread / padding split. Mapping the same short Sobol prefix from CGAL's
+# vertex(0) into every tetrahedron is neither: the prefix does not average to the centroid and CGAL's vertex
+# slots follow density, so such '_a' grids lose 0.17-0.29% of their mass, and the realization changes by ~10-23%
+# rms per cell with the thread count or the partitioning. So the vertices are ordered by a hash of the cell's
+# vertex set and every sample is centred (averaged_interpolation_1.cc: the comment above 'mcLegacy'). Asserted on
+# demo/z0_64.gadget (262144 particles, z=0, tracked in the repo) at 64^3, --periodic --padding 12, density_a velocity_a:
 #   A1  box mean of '.a_den' within 1e-4 of 1 (measured +2.0e-5; double build +1.4e-5), and with '-s 20' (the
-#       minimum count 4, the worst Sobol prefix; measured -5.1e-6). The old realization (DTFE_MC_LEGACY=1, kept
+#       minimum count 4, the worst Sobol prefix; measured -5.1e-6). The vertex(0) realization (DTFE_MC_LEGACY=1, kept
 #       for A/B) must FAIL the same bound (measured -3.35e-3), so the check is known to see the bias
-#   A2  the per-cell noise against --exact-average, rms(a - exact) / <exact>, is no larger than the old
+#   A2  the per-cell noise against --exact-average, rms(a - exact) / <exact>, is no larger than the vertex(0)
 #       realization's and below 0.07 (measured 0.0625 against 0.0826, both builds)
 #   A3  split invariance: --partition 2 2 2 --max-concurrent 1, OMP_NUM_THREADS=1 and --padding 20 against
 #       the default run: the cells agree to float summation order (measured 6e-6 relative), except where a
 #       sample lies EXACTLY on a cell face, which the region frames of two splits may round to different sides
 #       (the demo's float-kpc positions and the dyadic Sobol samples put one there in the double build: two
 #       cells 3e-3 apart); at most 1e-4 of the cells may differ by more than 1e-4, and the box sums agree to
-#       1e-6. The old realization differed in all cells, by 10% rms between one and ten threads
+#       1e-6. The vertex(0) realization differs in all cells, by 10% rms between one and ten threads
 #   A4  the momentum: the box sum of '.a_vel' agrees with --exact-average's to 1e-4 of sum|v| (measured 1.2e-5)
 #   A5  GPU builds only (a GPU stamp in o/ or o_d/; SKIP otherwise, so CI's CPU-only build runs A1-A4): --gpu
 #       keeps the box mean within 1e-4 of 1 and matches the CPU grid like tests/dtfe_metal_check.sh (means
 #       to 1e-5 of the peak, at most 1e-3 of the cells more than 1e-3 apart: a sample on a cell face)
-# --exact-average itself is untouched (its grids are byte-identical to before; tests/run_tests.py's stored
+# --exact-average itself does not sample (tests/run_tests.py's stored
 # regression covers it). About 20 s on the Mac (7 runs of 2-3 s).
 # Usage: tests/dtfe_mc_average_check.sh [--no-build]   (--no-build is accepted and ignored: nothing is built)
 set -uo pipefail
@@ -31,8 +30,6 @@ ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$ROOT" || exit 1
 source "${SCRIPT_DIR}/precision.sh"     # DTFE_TEST_PRECISION=double: the double pair
 precision_require "${DTFE_BIN}"
-PY="${PYTHON:-python3}"
-command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/python3.14
 [ -x "${DTFE_BIN}" ] || { echo "FAIL: ${DTFE_BIN} is not built"; exit 1; }
 SNAP="demo/z0_64.gadget"
 [ -f "$SNAP" ] || { echo "FAIL: $SNAP is missing (it is tracked in the repository)"; exit 1; }
@@ -40,7 +37,7 @@ TMP="${DTFE_TEST_TMP}/dtfe_mc_average_check"
 mkdir -p "$TMP"
 OBJ=o; precision_double && OBJ=o_d
 GPU=0
-for m in metal cudaemu cuda hip; do [ -f "$OBJ/.gpu_mode_$m" ] && GPU=1; done
+[ -n "$(gpu_backend_of "$OBJ")" ] && GPU=1
 
 C=(--grid 64 --periodic --field density_a velocity_a)
 # run <name> [env assignments ...] -- [extra args ...]   (--padding 12 unless the extra args give one)

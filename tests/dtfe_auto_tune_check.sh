@@ -1,25 +1,23 @@
 #!/usr/bin/env bash
-# The STANDARD-DTFE auto-tuner (src/auto_tune.h, 2026-10-13): what PS-DTFE's tuner had and the standard one lacked,
-# and the memory model of the production '--exact-average' runs.
+# The STANDARD-DTFE auto-tuner (src/auto_tune.h): the report, the counted split and the thread plan of PS-DTFE's
+# tuner, and the memory model of the production '--exact-average' runs.
 #
-# The 2026-10-13 audit measured the exact-average standard runs 25-30% above the sampled ones in peak footprint and
-# found no term for it in the tuner. The code allocates nothing extra for the exact average; what made the model
-# wrong is the padded vertex count: the tuner took every thread sub-box to hold the box-average particle count, while
-# the load-balanced split gives a dense partition a small volume and a fixed-length padding shell (TNG50-3-Dark z=0:
-# 35.4M padded particles in one partition's 4 threads, 7.8M modeled; the exact run, whose threads all wait on the
-# GPU with their triangulations alive, peaked at 44.5 GB against 39.9 predicted). The tuner now replays the run's
-# own split on a count grid of the particles. Verified here, on synthetic crossed waves (clustered knots) and the
-# repository's binaries:
+# The exact average allocates nothing extra; what drives the peak is the padded vertex count. The load-balanced split
+# gives a dense partition a small volume and a fixed-length padding shell, so a box-average particle count per thread
+# sub-box under-counts it (TNG50-3-Dark z=0: 35.4M padded particles in one partition's 4 threads, 7.8M at the box
+# average; the exact run, whose threads all wait on the GPU with their triangulations alive, peaks at 44.5 GB). The
+# tuner replays the run's own split on a count grid of the particles. Verified here, on synthetic crossed waves
+# (clustered knots) and the repository's binaries:
 #
-#  A) '--auto-tune-report' on the standard binary: ONE valid 'AUTO-TUNE-REPORT partition=.. mc=..' line (it printed
+#  A) '--auto-tune-report' on the standard binary: ONE valid 'AUTO-TUNE-REPORT partition=.. mc=..' line (not
 #     'AUTO-TUNE-REPORT unsupported'), exit 0, nothing written; a hand-set split and thread count are reported as
 #     given (mc = the threads of a partition; the partitions run one after another).
 #  B) the counted padded vertices (DTFE_AUTO_TUNE_DEBUG=1) against the run's own 'Thread i had N particles' lines:
 #     the same busiest partition, its sum and every thread's count within 10%, at 3^3 x 8 and 4^3 x 4 threads.
-#  C) the reason for B: on this clustered set the busiest partition holds well over the box-average count the old
-#     model used (N / P^3 x the padding factor) -- at least 1.5x.
-#  D) a user's --max-concurrent is the thread count the tuner plans with when it chooses the split (the standard
-#     tuner started at every core whatever the user gave).
+#  C) the reason for B: on this clustered set the busiest partition holds well over the box-average count
+#     (N / P^3 x the padding factor) -- at least 1.5x.
+#  D) a user's --max-concurrent is the thread count the tuner plans with when it chooses the split (not every
+#     core, whatever the user gave).
 #  E) an auto-tuned run ends its SUMMARY with the 'memory model' line (predicted vs measured, as PS runs do), and the
 #     measured peak stays within 1.35x of the prediction (the allocator keeps freed triangulation memory between
 #     partitions: up to ~30% above the plan on sub-GB runs, while at TNG scale the prediction is 19-90% HIGH, see
@@ -28,7 +26,7 @@
 #  G) on a simulated small machine the tuner picks a split its counted model says fits (over_budget=0) and names the
 #     busiest partition's vertex count in its AUTO-TUNE line.
 #  H) the 2D build (DTFE-2d, when built): a valid report from the counted model, counts within 15% of the run's.
-#  I) (2026-10-15) the terms the plan lacked, each a field of the report line: I1 a '--sample-points' plane's records
+#  I) the plan's further terms, each a field of the report line: I1 a '--sample-points' plane's records
 #     (pts_gb: 326 B per point with --pts-vel-grad, one record per point, in fixed_gb too; DTFE_AUTO_PTS_N sizes a plane
 #     that is not on disk); on GPU builds I2 the GPU deposit's host snapshot of its grids (snapshot_gb: 8-B words, half
 #     under DTFE_METAL_FLOAT_GRIDS=1, none on the CPU), I3 the partition loop's look-ahead (lookahead_gb, in
@@ -40,8 +38,6 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PY="${PYTHON:-python3}"
-command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/python3.14
 ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT}"
 source "${SCRIPT_DIR}/precision.sh"     # DTFE_TEST_PRECISION=double: the double pair
@@ -120,7 +116,7 @@ if m and real and all(real):
     print(f"   .... busiest partition {pm} of {nparts} (the run's: {ir + 1} of {len(real)}): {vm:.0f} counted vs {vr} "
           f"padded vertices; per thread worst {100 * worst:.1f}%")
     ok_b = nparts == len(real) and abs(vm - vr) / vr < 0.10 and worst < 0.10 and sum(real[pm - 1]) > 0.9 * vr
-    # the old model's count: every sub-box at the box average, (N / P^3) x prod(1 + 2 pad P T^(1/3)), pad in box units
+    # the box-average count: every sub-box at the box average, (N / P^3) x prod(1 + 2 pad P T^(1/3)), pad in box units
     pad = 10. / n
     uniform = n**3 / P**3 * (1. + 2. * pad * P * T ** (1. / 3.)) ** 3
     print(f"   .... the uniform count of the old model: {uniform:.0f} ({vr / uniform:.2f}x less than the run's)")

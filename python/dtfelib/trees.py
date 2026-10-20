@@ -28,7 +28,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-from .cli import DATA_ROOT, sim_dir
+from .cli import sim_dir
 
 _RAW_FACTOR = 10 ** 12   # SubhaloIDRaw = SnapNum * 1e12 + SubfindID
 

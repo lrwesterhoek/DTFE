@@ -16,7 +16,6 @@ install can never turn the suite silently green.
 Usage: ~/.venvs/dtfe-gui/bin/python tests/py_gui_app_test.py
 """
 
-import atexit
 import os
 import shutil
 import subprocess
@@ -27,13 +26,11 @@ from pathlib import Path
 
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "python" / "gui"))
+from _harness import REPO as ROOT, check_ok as check, setup, summary
+
+setup("gui_app_figs_", paths=("python/gui",), no_mirror=False, mpl_agg=False)    # BEFORE runspec is imported
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ["DTFE_GUI_NO_NOTIFY"] = "1"          # no desktop notifications from a test run
-FIGS_TMP = tempfile.mkdtemp(prefix="gui_app_figs_")
-os.environ["DTFE_FIGURES_ROOT"] = FIGS_TMP      # BEFORE runspec is imported: no test figure on the T7
-atexit.register(shutil.rmtree, FIGS_TMP, True)
 REQUIRED = os.environ.get("DTFE_GUI_TEST_REQUIRED") == "1"
 
 try:
@@ -50,7 +47,6 @@ import grids as G  # noqa: E402
 from PySide6.QtCore import QPointF  # noqa: E402
 import runspec as rs  # noqa: E402
 
-PASS, FAIL = [], []
 SIM = "GUITEST-1-Dark"
 DL_SIM = "GUIDL-1-Dark"
 SECRET = "gui-test-secret-key-0123"
@@ -93,11 +89,6 @@ def make_raw_chunks(folder: Path, n: int, chunks: int, per_chunk: int = 2048, h:
             p["Coordinates"] = rng.uniform(0, 75000.0, (per_chunk, 3))
             p["ParticleIDs"] = np.arange(c * per_chunk, (c + 1) * per_chunk, dtype=np.uint64)
             p["Velocities"] = rng.normal(0, 100, (per_chunk, 3)).astype(np.float32)
-
-
-def check(name, ok, detail=""):
-    (PASS if ok else FAIL).append(name)
-    print(f"   {'PASS' if ok else 'FAIL'}  {name}" + (f"  ({detail})" if detail and not ok else ""))
 
 
 def wait_idle(w, limit):
@@ -281,7 +272,7 @@ def main():
               and str(sim / "hires_plane_z64.json") in w.pipe.steps()[1].argv)
 
         print("pipeline options:")
-        # 2026-10-13: the caustic classes are on by default (run_ps_dtfe.sh's default, the production runs'), so the
+        # the caustic classes are on by default (run_ps_dtfe.sh's default, the production runs'), so the
         # cusps box is enabled (unticked) from the start
         check("the run options show the scripts' defaults; cusps wait for caustics, the slab and projection for planes",
               w.p_deposit.currentData() == "sampled" and w.p_nsub.value() == 3 and w.p_nsub.isEnabled()
@@ -494,8 +485,7 @@ def main():
         w.grid_combo.setCurrentText("16")
         qa.processEvents()
         check("changed settings are not covered by the old check", any("memory not checked" in t for t in lines()))
-        # 2026-10-13: standard DTFE too -- run_dtfe.sh AUTO_TUNE_REPORT=1 asks the standard binary's own tuner (the
-        # button was PS-only, and the binary printed 'AUTO-TUNE-REPORT unsupported')
+        # standard DTFE too -- run_dtfe.sh AUTO_TUNE_REPORT=1 asks the standard binary's own tuner
         w.dtfe_radio.setChecked(True)
         w.plane_combo.setCurrentIndex(0)                         # no slice: a standard slice needs one triangulation
         qa.processEvents()
@@ -528,7 +518,7 @@ def main():
         qa.processEvents()
         # Planes large enough that their points, not the tessellation, set the difference (1024²: ~0.2
         # GB of point records, 512²: ~0.05). The budget must sit between the two sizes' SMALLEST
-        # possible footprints: since 2026-10-02 the tuner splits a small particle set whose one domain
+        # possible footprints: the tuner splits a small particle set whose one domain
         # does not fit, so a budget between the unsplit predictions is met by a split at the larger
         # plane, and nothing would be halved. A budget just above the fixed part (the full grid and
         # the points, which no split reduces) makes the binary report that smallest split.
@@ -687,7 +677,7 @@ def main():
         wait_queue(w, 300)
         check("resumed once free, the job runs", w.queue[0].state == "done"
               and (sim / "snapdir_050" / "ps_q2.a_den").is_file(), w.queue[0].note)
-        # 2026-10-08: a queued job never starts beside a memory check (it polls until the check is over), and a
+        # a queued job never starts beside a memory check (it polls until the check is over), and a
         # Pipeline job that finds nothing to compute (a simulation folder without merged snapshots) fails:
         # run_ps_pipeline.sh exits 1 and the render chained to it is skipped, not run on nothing
         empty = data / "GUIEMPTY" / "GUIEMPTY-1-Dark"
@@ -735,7 +725,7 @@ def main():
               str([(j.kind, j.state) for j in w3.queue]))
         w2.close()
         w3.close()
-        # 2026-10-13 (integration item 8): a state saved before then holds the launcher's old start, 'sampled', for a
+        # a state saved before the exact default holds the launcher's old start, 'sampled', for a
         # standard-DTFE job: it opens at the exact cell average, once; a Monte-Carlo choice made afterwards is kept
         import json as _json
         mig = QSettings(str(tmp / "gui_mig.ini"), QSettings.IniFormat)
@@ -753,7 +743,7 @@ def main():
               moved == ("exact",) * 4 and wk.spec.estimator == "dtfe" and wk.spec.deposit == "sampled"
               and wk.custom.deposit == "exact", f"{moved} {wk.spec.deposit} {wk.custom.deposit}")
         wk.close()
-        # 2026-10-14: the partitions merge in index order by default (the staged merge); a state saved before then
+        # the partitions merge in index order by default (the staged merge); a state saved before that default
         # holds the old start, the tick off, on the Grids, Pipeline and Custom tabs: on, once; unticking it is kept
         mig2 = QSettings(str(tmp / "gui_mig2.ini"), QSettings.IniFormat)
         mig2.setValue("spec", _json.dumps(rs.RunSpec(data_root=str(data), ordered_merge=False).to_dict()))
@@ -820,8 +810,7 @@ def main():
         shutil.rmtree(tmp, ignore_errors=True)
         shutil.rmtree(repo_figs, ignore_errors=True)       # only the synthetic simulation's figures
     print("-" * 60)
-    print(f"RESULT: {len(PASS)} passed, {len(FAIL)} failed")
-    return 1 if FAIL else 0
+    return summary(show_zero_skips=False)
 
 
 def spin(ms):
@@ -867,7 +856,7 @@ def new_user_features(qa, w, tmp, data, sim):
     # the window's own words never contain '--' (flags live in the commands, which are exempt)
     def visible_texts():
         from PySide6.QtWidgets import (QAbstractButton, QComboBox, QGroupBox, QLabel, QLineEdit,
-                                       QListWidget, QPlainTextEdit, QTableWidget, QTabWidget, QWidget)
+                                       QListWidget, QTableWidget, QTabWidget, QWidget)
         exempt = {w.cmd_view, w.log, w.q_detail}
         out = []
         for wd in w.findChildren(QWidget):
@@ -977,8 +966,8 @@ def new_user_features(qa, w, tmp, data, sim):
     w.gpu_check.setChecked(False)
     qa.processEvents()
     # standard DTFE: the same choice is its cell average (run_dtfe.sh -e = the exact one), in its own words. Switching
-    # the estimator moves the choice to the new estimator's production setting (2026-10-13, integration item 8): for
-    # standard DTFE the exact cell average (it started at the biased Monte-Carlo one), which ticks the GPU (when built)
+    # the estimator moves the choice to the new estimator's production setting: for
+    # standard DTFE the exact cell average (not the biased Monte-Carlo one), which ticks the GPU (when built)
     def dtfe_e(text):
         return any("run_dtfe.sh" in ln and " -e " in ln + " " for ln in text.splitlines())
     w.dtfe_radio.setChecked(True)
@@ -1006,8 +995,8 @@ def new_user_features(qa, w, tmp, data, sim):
           "(the sampled deposit, sub-samples editable)",
           w.deposit_combo.itemText(w.deposit_combo.findData("exact")) == P.label("exact") and w.spec.estimator == "ps"
           and w.spec.deposit == "sampled" and w.deposit_combo.currentData() == "sampled" and w.nsub_spin.isEnabled())
-    # 2026-10-15: a choice made for an estimator comes back with it: PS-DTFE's exact deposit after PS -> standard ->
-    # PS (it became the sampled deposit), standard DTFE's Monte-Carlo average after standard -> PS -> standard
+    # a choice made for an estimator comes back with it: PS-DTFE's exact deposit after PS -> standard ->
+    # PS (not the sampled deposit), standard DTFE's Monte-Carlo average after standard -> PS -> standard
     w.deposit_combo.setCurrentIndex(w.deposit_combo.findData("exact"))
     w.dtfe_radio.setChecked(True)
     qa.processEvents()
@@ -1065,7 +1054,7 @@ def new_user_features(qa, w, tmp, data, sim):
           and Path(w.o_file.text()) == Path(demo.input_file), w.custom.input_file)
     w.custom = keep_custom
     w._load_into_widgets()
-    # 2026-10-13 (integration items 6, 8): the Custom tab's standard run starts at the exact cell average and pads with
+    # the Custom tab's standard run starts at the exact cell average and pads with
     # 15 mean spacings (the binary's own 5 leaves wrong values near the box faces); PS-DTFE keeps its own padding
     w.o_dtfe.setChecked(True)
     qa.processEvents()
@@ -1080,7 +1069,7 @@ def new_user_features(qa, w, tmp, data, sim):
     check("... back on PS-DTFE: the sampled deposit again, no '--padding'",
           w.custom.estimator == "ps" and w.custom.deposit == "sampled" and "--padding" not in w.cmd_view.toPlainText()
           and "--avg-subsamples" in w.cmd_view.toPlainText(), w.cmd_view.toPlainText())
-    w.o_deposit.setCurrentIndex(w.o_deposit.findData("exact"))      # 2026-10-15: the choice per estimator, here too
+    w.o_deposit.setCurrentIndex(w.o_deposit.findData("exact"))      # the choice per estimator, here too
     w.o_dtfe.setChecked(True)
     w.o_ps.setChecked(True)
     qa.processEvents()
@@ -1132,7 +1121,7 @@ def new_user_features(qa, w, tmp, data, sim):
     lines = [w.checks.item(i).text() for i in range(w.checks.count())]
     check("... and the binary's report says it fits, with the auto-tuner's split",
           any("memory: fits" in t and "auto-tuner plans" in t for t in lines), str(lines))
-    w.custom.estimator = "dtfe"                       # 2026-10-13: the standard binary reports too
+    w.custom.estimator = "dtfe"                       # the standard binary reports too
     w._load_into_widgets()
     w._changed()
     qa.processEvents()
@@ -1218,7 +1207,7 @@ def new_user_features(qa, w, tmp, data, sim):
     ok = wait_for(lambda: not x._busy and x.current is not None and x.current.snap == 50, 30)
     check("choosing a redshift shows that snapshot's output", ok and x.current.dir.name == "snapdir_050"
           and w.explore_view.canvas._img is not None, str(x.current and x.current.root))
-    # the void outlines (2026-10-08): over a simulation snapshot's 3D grids, the analysis pipeline's catalogue found
+    # the void outlines: over a simulation snapshot's 3D grids, the analysis pipeline's catalogue found
     # by tools/void_outlines.py in its own process (its cache pinned to a temp folder)
     E.VOID_CACHE_DIR = tmp / "void cache"
     check("the void outlines apply to a simulation snapshot's 3D grids", x.voids.isEnabled()
@@ -1231,9 +1220,9 @@ def new_user_features(qa, w, tmp, data, sim):
           and res.get("snap") == 50 and any((tmp / "void cache").rglob("*_voids.npz")),
           str(res.get("error", sorted(res)))[:300])
     c = w.explore_view.canvas
-    # something must be found AND drawn: 'the canvas holds what _void_circles gives' alone passed with no void at
+    # something must be found AND drawn: 'the canvas holds what _void_circles gives' alone would pass with no void at
     # all ([] == []). The fixture (24^3 pancake, seed 42, 32^3 grid) has 38 distinct voids, and 14 or more of
-    # them cut every slice along every axis (probe of 2026-10-08), so both slices tried must show circles
+    # them cut every slice along every axis, so both slices tried must show circles
     n_distinct = int(np.sum(res.get("distinct", [])))
     check(f"... and outlines the distinct ones over the map ({n_distinct} distinct, "
           f"{len(c.circles or [])} cutting this slice)", n_distinct > 0 and isinstance(c.circles, list)
@@ -1559,7 +1548,7 @@ def new_user_features(qa, w, tmp, data, sim):
         x.field.setCurrentIndex(x.field.findData(keep_field))
         wait_for(lambda: not x._busy, 30)
     # the scalar field in a zoom (an exact zoom of a run with a scalar dataset), the server's resident partitions,
-    # and the server button after a restore (refresh_outputs judged it before the snapshots were back)
+    # and the server button after a restore (judged once the snapshots are back, not by refresh_outputs before)
     import types as _types
     saved_zoom = (x._zoom, x._zoom_fields)
     x._zoom = {"axis": 2, "output": x.current}
@@ -1607,7 +1596,7 @@ def new_user_features(qa, w, tmp, data, sim):
     T = n0 // 2
     rgb, _labels, _bar = E.grid_tiles(req0, items, max_tile=T)
     same = True
-    for k, it in enumerate(items):                                 # the old order, inline: colour, then resample
+    for k, it in enumerate(items):                                 # the other order, inline: colour, then resample
         old, _ = Gm.colorize(it["img"], it["cmap"], log=it["log"], clip=(req0["clip"], 100 - req0["clip"]),
                              symmetric=it["symmetric"], vrange=(it["lo"], it["hi"]))
         ri = (np.arange(T) * old.shape[0]) // T
@@ -1709,7 +1698,7 @@ def new_user_features(qa, w, tmp, data, sim):
     rows = [x.grid_row(i) for i in range(2)]
     typ0 = x.grid_table.cellWidget(0, E._C_TYPE)
     labels = [typ0.itemText(k) for k in range(typ0.count())]
-    # the whole menu in type_order (review 2026-10-05 [38]): DTFE, the production run, the preferred prefix (ps_q2),
+    # the whole menu in type_order: DTFE, the production run, the preferred prefix (ps_q2),
     # then the rest by name -- built from what is listed at 050, so a run an earlier section left there still fits
     at50 = sorted({o_.prefix for _t, o_ in x.outputs if o_.sim == SIM and o_.snap == 50})
     want_types = ["DTFE", "PS-DTFE", "PS-DTFE · ps_q2"] + [f"PS-DTFE · {p}" for p in at50
@@ -1820,9 +1809,9 @@ def new_user_features(qa, w, tmp, data, sim):
     check("two opened folders named 'elsewhere' read 'opened_a/elsewhere' and 'opened_b/elsewhere' in the Redshift menu, "
           "and the row kept its output", texts == ["opened_a/elsewhere", "opened_b/elsewhere"]
           and x.grid_row(0) is not None and str(x.grid_row(0)[0].root) == str(opened[0]), str(texts))
-    # review 2026-10-05 [38] fix 3: a refresh re-lists row 0's opened file under the custom snapshots (its folder joined
+    # a refresh re-lists row 0's opened file under the custom snapshots (its folder joined
     # them): the row follows its OUTPUT into that group -- kept on 'Opened files', which no longer holds it, the row
-    # swapped to opened_b
+    # would swap to opened_b
     w.custom_dirs.append(str(opened[0].parent))
     try:
         x.refresh_outputs()
@@ -1877,7 +1866,7 @@ def new_user_features(qa, w, tmp, data, sim):
     w._register_custom_output(bad_spec)
     check("a sidecar that cannot be written is logged ('!! cannot write the settings sidecar'), not swallowed",
           "!! cannot write the settings sidecar bad.gui.json" in w.log.toPlainText(), w.log.toPlainText()[-200:])
-    # ... and through a Run-button job's real start (review 2026-10-05 [32]): _begin clears the log FIRST, then writes
+    # ... and through a Run-button job's real start: _begin clears the log FIRST, then writes
     # the sidecar, so the line survives. _next_step held: the finish would write (and log) the sidecar again
     idle = w.proc is None
     w.log.appendPlainText("an earlier job's log")
@@ -1893,7 +1882,7 @@ def new_user_features(qa, w, tmp, data, sim):
     if str(kd) in w.custom_dirs:
         w.custom_dirs.remove(str(kd))
     shutil.rmtree(kd)
-    # REVIEW 2026-10-05: custom runs of one NAME in two folders (the Custom tab's default name is the input file's
+    # custom runs of one NAME in two folders (the Custom tab's default name is the input file's
     # stem) -- the row's choice sticks by its root and estimator, duplicate labels get their folder, deep paths tell
     in_dir = tmp / "cust_in"; in_dir.mkdir(exist_ok=True)
     cds = {k: tmp / f"cust_{k}" for k in ("dtfe", "ps", "ps2", "z")}
@@ -2138,7 +2127,7 @@ def new_user_features(qa, w, tmp, data, sim):
     ok = wait_for(lambda: not x.is_zoomed() and not x._busy and x._plane is not None and x._plane.shape == (64, 64), 30)
     check("Zoom Out returns to the slice from disk", ok and not w.zoom_out_action.isEnabled() and x.zoom_state.text() == "")
     check("... and Back is off again (no zoom history on the slice)", not x.zoom_back_btn.isEnabled())
-    # 2026-10-08: a zoom that lands after the slice changed is not drawn in the new slice's frame (it is memoised);
+    # a zoom that lands after the slice changed is not drawn in the new slice's frame (it is memoised);
     # with a zoom on screen, a slice result asked for before it landed (or its failure) leaves it; the zoom keeps to
     # the files it was made from (a re-run under the same name drops it). Zoom results stood in for (memo=True)
     import types as _types
@@ -2257,7 +2246,7 @@ def new_user_features(qa, w, tmp, data, sim):
           "indexing partition 2 of 3" in shown, shown)
 
     print("exact zoom and the standard-DTFE server:")
-    # B2 (2026-10-05): the planes an exact zoom wrote are in u-units; with the output's redshift the loader
+    # the planes an exact zoom wrote are in u-units; with the output's redshift the loader
     # applies the slice map's (1/(1+z))^exp (velocity 0.5, dispersion 1.0), the density stays
     ez = Path(tempfile.mkdtemp(prefix="gui_exact_")) / "zoom"
     try:
@@ -2266,7 +2255,7 @@ def new_user_features(qa, w, tmp, data, sim):
         np.full(4 * 4 * 1, 5.0, dtype=np.float32).tofile(str(ez) + ".a_velDisp")
         raw = E.load_exact_planes(ez, (4, 4, 1))
         at_z1 = E.load_exact_planes(ez, (4, 4, 1), redshift=1.0)
-        # the planes stay in the files' float32 (2026-10-06: no float64 copy of every component), so the factor
+        # the planes stay in the files' float32 (no float64 copy of every component), so the factor
         # is applied at float32 rounding
         check("an exact zoom's velocity and dispersion planes get the slice map's redshift factor, the density not",
               float(raw.velocity.max()) == 3.0 and abs(float(at_z1.velocity.max()) - 3.0 * 0.5 ** 0.5) < 3e-7
@@ -2690,9 +2679,9 @@ def new_user_features(qa, w, tmp, data, sim):
 
 
 def trash_and_vanish(qa, w, x, tmp, root):
-    """2026-10-08: Explore drops an output whose grids left the disk (a trashed run stayed listed, and its next
-    slice read failed), and the Runs browser's Move to Trash takes every log of the set (a '.runlog.failed' or
-    '.partial' left behind showed up as a failed run without outputs). The Trash and its question are stood in
+    """Explore drops an output whose grids left the disk (a trashed run left listed would fail its next
+    slice read), and the Runs browser's Move to Trash takes every log of the set (a '.runlog.failed' or
+    '.partial' left behind would show up as a failed run without outputs). The Trash and its question are stood in
     for: nothing leaves the temp folder."""
     import types as _types
     import runs_view as RV
@@ -2704,7 +2693,7 @@ def trash_and_vanish(qa, w, x, tmp, root):
     t0 = time.time() - 600.0
     os.utime(tr / "gone.a_den", (t0 - 10, t0 - 10))
     for sfx, dt_ in ((".runlog", 0.0), (".runlog.partial", 30.0), (".runlog.failed", 60.0)):
-        (tr / f"gone{sfx}").write_text(f"RUNNING: /x/PS-DTFE in.hdf5 gone --grid 32\n"
+        (tr / f"gone{sfx}").write_text("RUNNING: /x/PS-DTFE in.hdf5 gone --grid 32\n"
                                        + ("   total wall time   : 1s\n" if sfx == ".runlog" else ""))
         os.utime(tr / f"gone{sfx}", (t0 + dt_, t0 + dt_))
     w.custom_dirs.append(str(tr))
@@ -2757,7 +2746,7 @@ def trash_and_vanish(qa, w, x, tmp, root):
 
 
 def launcher_run_log(qa, w, tmp):
-    """The launcher's own run log keeps the run-log contract (2026-10-08): a step with a tee writes '<log>.partial';
+    """The launcher's own run log keeps the run-log contract: a step with a tee writes '<log>.partial';
     exit 0 renames it onto '<log>' (a stale '<log>.failed' goes), any other end -- a failure, a program that cannot
     start, Stop -- onto '<log>.failed', so the log of the grids still on disk is never truncated. And every step's
     Python is unbuffered: its lines reach the log while it runs, not when it exits."""

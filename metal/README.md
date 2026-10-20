@@ -1,438 +1,224 @@
 # GPU acceleration — the deposit kernels (Metal; CUDA / HIP port)
 
-Offloads the PS-DTFE grid **deposit** (the dominant cost, ~28 min/partition at nSub=3) to the Apple
-GPU via **metal-cpp**, validated against the CPU path and analytic references.
+For whoever builds or maintains the GPU backends. Two things run on the GPU: the PS-DTFE grid **deposit**
+(`--ps-gpu`) and the standard-DTFE volume-averaged `_a` **interpolation** (`--gpu`). Both are data-parallel over
+the ~10M tetrahedra of a partition and dominate the run time; the Delaunay triangulation (CGAL) and point evaluation
+stay on the CPU. Any failure (no device, compile, allocation, a deposit the retries give up on) falls back to the CPU
+with a warning, as do scalar fields of more than one component.
 
-One kernel in `ps_deposit.metal`, `depositFields`: mass + velocity moment + dispersion second
-moment (upper-triangle σ_ij) + velocity-gradient moment + stream count, all mass-share weighted
-exactly like `interpolateGrid_phaseSpace` in `src/CGAL_triangulation/ps_interpolation.cc`; a
-density-only run switches the moment grids off. The scalar field (`scalar_a`, `scalarGradient_a`;
-builds with one scalar component, `NO_SCALARS=1`, the default) is deposited like the velocity
-moment -- the linear profile's value at the sample or at the exact piece's centroid, times the
-moment weight -- into buffers 19/20 (the vertex scalars arrive in buffer 18); `tests/gpu_scalar_check.sh`
-pins it for both binaries, sampled and exact. (T-web/V-web are host-side post-processing of the
-gradient grid. The old density-only prototype kernel is gone.)
+## Build and test
 
-**Which samples a tetrahedron contains is decided exactly as on the CPU**
-(`src/CGAL_triangulation/ps_exact_inside.h`). Metal has no double, so the kernel classifies each
-sample in float with a rigorous error bound, from a per-tet record the host builds in the exact
-test's canonical frame (vertex 0 as a cell index plus an in-cell fraction, the edges as
-differences of the canonical positions, from the double build's own doubles since 2026-10-18;
-`psFillTetRecord` in `ps_deposit_params.h`). Outside the bound the float decision
-provably equals the exact one. A tet with a sample inside it (within float rounding of a face;
-2291 of 14.7M at nSub=1, 57k at nSub=3) is **deferred**: the kernel negates its mass and deposits
-nothing, and the host deposits it with the CPU's exact test. Stream counts and the sub-sample mass flag
-(`.hidden_streams` bit 2) are then byte-identical CPU vs GPU, partitioned or not.
+```bash
+make DTFE PS-DTFE METAL=1          # Apple Silicon (Metal 3, M-series)
+make DTFE PS-DTFE CUDA=1           # NVIDIA (nvcc; CUDA_PATH, GPU_ARCH=sm_86)
+make DTFE PS-DTFE HIP=1 GPU_ARCH=gfx90a   # AMD ROCm (hipcc has no portable intermediate code: set GPU_ARCH)
+make DTFE PS-DTFE CUDAEMU=1        # the CUDA/HIP sources on a CPU emulation of the device (no GPU needed)
+make DTFE PS-DTFE DOUBLE=1 METAL=1 # the double pair: float copies of the tetrahedra go to the same kernels
+```
+One backend per build (`-DPS_GPU` / `-DDTFE_GPU`). The mode (metal, cuda, hip, cudaemu or off) is stamped in `o/` and
+`o_ps/` (`.gpu_mode_*`, `.build_mode` holds its make argument); a switch wipes the objects, so a binary never mixes GPU
+and plain objects. `make DTFE $(cat o/.build_mode)` rebuilds in the current mode. The Metal kernels are embedded at build
+time (`o/dtfe_deposit_msl.h`, `o_ps/ps_deposit_msl.h`, each with `exact_clip.metal.inc` prepended) and compiled once per
+process. Dependency: the header-only **metal-cpp**, vendored at `third_party/metal-cpp`.
 
-**The exact deposit (`--ps-exact-deposit`) runs on a second kernel, `depositExactItems`**, which
-splits the work below the tetrahedron: one thread per *item* = (tet, block of 16 cells of its
-bounding-box window). With one thread per tet the per-thread cost spans five orders of magnitude
-once cells are much smaller than tets (a stretched void tet clips ~10⁴ cells, a halo tet one), each
-buffer waited on its few giants and the dispatch controller shrank buffers to 50 tets: 0.26M
-particles on 256³ ran for more than 17 minutes. Two dispatches over all items: phase 0 adds each
-item's clipped weights into a per-tet total `sumW[tet]` (atomic), phase 1 deposits each cell with
-the share m/sumW[tet], so every tet still deposits exactly its mass. Tets whose total stays 0
-(float-degenerate, or a window that clips empty or lies outside the grid) go through
-`depositFields`, which falls through to the sampled path and centroid fallback or defers them,
-exactly as before. Both kernels skip a window cell wholly outside one of the tet's face planes
-before clipping it. The host builds the items from an upper bound of each window (the kernel
-re-derives the window in float; surplus items idle) and caps the list at 32M items (256 MB).
-`PS_EXACT_ITEMS=0` keeps the one-thread path (A/B), `PS_EXACT_ITEM_CELLS` sets the block size
-(16–32 run within 10% of each other), `PS_METAL_TIMING=1` prints one line per kernel run.
-**The exact clip's frame** (2026-10-02). r3d's moments come from origin-apex simplices, so a clipped
-piece far from the origin loses its volume to cancellation. Every GPU exact path (`depositExactItems`,
-the one-thread exact section, `depositExactAverage`; Metal and CUDA) therefore clips with the origin at
-the centre of the overlap of the tet's bounding box with the cell, where the piece lies, and shifts the
-centroid back for the linear profiles (the covariance is taken about that origin, which also removes a
-cancellation from the dispersion). In the tet's vertex-0 frame a zoom's fine cells were 1.6% off per cell
-at 12 kpc and 20% at 3 kpc; in a cell-centre frame a small tet inside a large cell cancelled instead.
-The overlap frame agrees with the CPU to about 1e-6 at every resolution (`tests/ps_window_check.sh`'s
-fine-grid case, `tests/dtfe_metal_check.sh`'s fine region). The CPU keeps r3d in double in the vertex-0
-frame (fine to about 1 kpc cells).
+Tests (GPU builds; the PS suites use the GPU when the `o_ps/` stamp names one):
+- `tests/dtfe_metal_check.sh` (builds in the `o/.build_mode` mode; `GPU_BUILD=CUDA=1` overrides): standard DTFE
+  CPU/GPU parity, a repeated GPU run, the per-tet A/B kernel, the shared grid, the exact average.
+- `tests/gpu_scalar_check.sh` (the scalar fields, both binaries), `tests/gpu_mass_check.sh` (the exact mass grid),
+  `tests/gpu_retry_check.sh` and `tests/dtfe_gpu_retry_check.sh` (checkpoints, retries by cause, pace recovery).
+- The PS suites with a `--ps-gpu` part: `ps_linear_deposit_check.sh`, `ps_vertex_mass_check.sh`,
+  `ps_volume_weighted_check.sh`, `ps_halo_release_check.sh`, `ps_hidden_streams_check.sh`, `ps_caustic_class_check.sh`,
+  `ps_window_check.sh`, `ps_mass_exact_check.sh`, `ps_fixed_moments_check.sh`, `point_exact_serve_check.sh`,
+  `python3 tests/ps_nonperiodic_test.py`, and `ps_double_check.sh` for the double pair.
+- `tests/cudaemu_check.sh` runs these (all but `ps_double_check.sh`, plus `ps_smoke_test.sh`) on a `CUDAEMU=1`
+  build at warp width 32 and 64 (it builds nothing).
+- The kernel harness (Metal only): `bash metal/build_prototype.sh && ./metal/validate_deposit` (T1-T15 below;
+  `BENCH=1` adds a 1M-tet timing, `DUMP_PROFILES=1` per-bin profiles, `VALIDATE_FLOAT_MASS=1` the float mass grid).
 
-**`--ps-window`** (2026-10-02; the launcher's exact zoom on any snapshot) deposits only into a window of
-the full grid. The sampled kernel visits every cell of a straddling tet's bounding box as before and
-counts the samples outside the window for the tet's normalization (`window_flat` = 1: inside the grid,
-outside the sub-box), depositing only the inside ones, so the window is the full run's cells to the
-usual float parity. The exact items are built from the HULL of each tet's bounding box intersected with
-the window's periodic images (`window_hull` in the kernel, `psWindowHull` in `gpu_host.h` for the host's
-item bound -- keep them in sync) and the tet is normalized by its whole weight `wFull`, as a straddling
-tet is: on the fine virtual grid of a zoom a void tet's bounding box holds millions of cells, nearly all
-outside a one-slice window, and clipping them for the normalization would cost more than the whole full
-run. A tet whose window pieces are all empty then means "no volume inside the window", not "degenerate":
-`depositFields` returns without the sampled fallback under windowMode. The CPU loop does the same
-(`tests/ps_window_check.sh`: the sampled CPU window's counts and masks identical bytes and its sums to the last
-fixed-point unit, a window pass taking its own units since 2026-10-15, the exact one to 1e-5 relative in
-the moments and identical in the counts and masks, the GPU in its parity class; a 256x256x16 grid
-windowed to one slice: 7 s full vs 0 s window, exact deposit).
-On a non-periodic grid a tetrahedron cut by the grid face keeps only its inside share: the exact path
-normalizes it by its whole weight, the sampled path counts its samples beyond the grid too
-(`count_beyond_grid`: one sample column at a time — the certified numerators are affine along a
-column, so the samples clearing the bound on all four faces are one run found by a seeded binary
-search, and only those within the bound of a face are classified one by one; the count, and the
-deferral decisions, are the per-sample ones). Crossed waves, 0.26M particles on 256³: more than 17 min → 30 s; the 11.8M-particle TNG100-3 region
-on 256³: more than 25 min → 133 s; 128³ unchanged (about 15 s). Against the one-thread path: every
-grid within ~1e-7 (atomic order), tet-touch counts identical (T14).
+CI: the `cudaemu` job (warp 32 and 64), `cuda-compile` (CUDA 12.6 image) and `hip-compile` keep the port building and
+passing; the Metal path and real-hardware runs are local. **First thing to run on an NVIDIA or AMD machine:**
+`GPU_BUILD=CUDA=1 tests/dtfe_metal_check.sh`, then the PS suites above.
 
 ## Files
 
 | file | role |
 |---|---|
-| `ps_deposit.metal` | Metal compute kernels: `depositFields` (one thread per tetrahedron, mass-conserving deposit: the mass grid an exact 64-bit fixed-point sum, the moment grids an `atomic_float` scatter; mirrors `src/CGAL_triangulation/ps_interpolation.cc`) and `depositExactItems` (the exact deposit, one thread per block of a tet's window cells). |
-| `validate_deposit.cpp` | Correctness harness (T1–T14): analytic edge cases, nSub sweep, determinism, random stress CPU-vs-GPU on every grid, analytic velocity-field checks, partition sub-grid support, the flag paths, a sheared Zel'dovich pancake against an EXACT piecewise-linear pushforward reference (see below), and `depositExactItems` against the analytic cube and the one-thread path (T14: periodic, wrapped sub-grid, non-periodic). It builds the per-tet records like the host and deposits deferred tets with its CPU reference. `BENCH=1` adds a 1M-tet timing; `DUMP_PROFILES=1` prints per-bin profiles. |
-| `build_prototype.sh` | Builds the harness; offline-compiles the kernel to `ps_deposit.metallib` when Xcode's Metal toolchain is installed, else deletes any stale one (the harness would load it) and the harness compiles the source at run time. |
-| `ps_deposit.metallib` | Offline-compiled kernels; hosts load it if present, else runtime-compile the `.metal`. Git-ignored. |
+| `metal/ps_deposit.metal` | PS-DTFE kernels: `depositFields` (one thread per tetrahedron: mass, velocity moment, dispersion second moment, gradient moment, stream count, scalar; the sampled path, the centroid fallback and the deferrals) and `depositExactItems` (the exact deposit, one thread per block of a tetrahedron's window cells) |
+| `metal/dtfe_deposit.metal` | standard-DTFE kernels: `depositAveraged1` (per tetrahedron, A/B), `depositAveraged1Items2/4/8` (the item kernels), `depositExactAverage` (`--exact-average`) |
+| `metal/exact_clip.metal.inc` | the float32 r3d port (tetrahedron-cell clipping and moments), prepended to both kernel sources |
+| `metal/validate_deposit.cpp`, `metal/build_prototype.sh` | the kernel harness and its build (offline-compiles `ps_deposit.metallib` when Xcode's Metal toolchain is installed, which only the harness loads; git-ignored) |
+| `src/CGAL_triangulation/gpu_host.h` | the backend-neutral host interface (deposit calls, `PSGpuGrids`, the shared-grid API `dtfeGpuShared*`, `psWindowHull`) |
+| `src/CGAL_triangulation/ps_metal_host.cc`, `dtfe_metal_host.cc` | the Metal hosts: device and pipelines, the chunked dispatch controller, retries |
+| `src/CGAL_triangulation/ps_gpu_cuda.cu`, `dtfe_gpu_cuda.cu` | the CUDA/HIP ports of kernels and hosts |
+| `src/CGAL_triangulation/gpu_cuda_compat.h`, `gpu_cuda_emu.h`, `gpu_exact_clip.cuh` | the CUDA/HIP macro shim and warp collectives, the CPU emulation (`-DGPU_EMU`), the r3d port's CUDA twin |
+| `src/CGAL_triangulation/gpu_metal_retry.h`, `gpu_cuda_retry.cuh` | the shared retry policy: snapshots, causes, pace, fault injection |
+| `src/CGAL_triangulation/ps_deposit_params.h`, `dtfe_gpu_fixed.h` | the per-tet record (`psFillTetRecord`) and the fixed-point units (`psMassFixedScale`, `psMomentFixedScale`, `PSFixedBounds`; the standard grids' units) |
+| `src/CGAL_triangulation/ps_exact_inside.h` | the CPU's exact sample-inside test the kernels' certified float test reproduces |
 
-Dependency: **metal-cpp** headers, vendored at `third_party/metal-cpp` — copied from
-the Game Porting Toolkit volume (`/Volumes/Game Porting Toolkit/metal-cpp`). Metal-cpp is header-only
-and standalone; the GPTK volume is only where they were found.
+The call sites: `interpolateGrid_phaseSpace` in `ps_interpolation.cc` (PS-DTFE) and `averaged_interpolation_1.cc`
+(standard DTFE).
 
-## Run
+## PS-DTFE deposit
 
-```
-bash metal/build_prototype.sh
-./metal/validate_deposit
-```
+The host extracts flat per-tetrahedron arrays (a 16-float record, vertex velocities, masses) with **exactly the CPU
+loop's filters** (ownership, hull, degeneracy), cost-sorts them by grid footprint (a chunk ends with its slowest
+thread, so mixing one stretched void tetrahedron with cheap halo ones idles most lanes), dispatches the kernels, copies
+the grids back and runs the CPU loop over the deferred tetrahedra only. The kernels honour the partition sub-grid
+(`subOrigin/subDims`), including a box that wraps a periodic axis.
 
-## Validation results (Apple M1 Max, Metal 3) — all T1–T10 pass
+**Which samples a tetrahedron contains is decided as on the CPU.** Metal has no double, so the kernel classifies each
+sample in float against a rigorous error bound, from a record the host builds in the exact test's canonical frame
+(vertex 0 as a cell index plus an in-cell fraction, the edges as differences of the canonical positions;
+`psFillTetRecord`). Outside the bound the float decision provably equals the exact one. A tetrahedron with a sample
+within the bound of a face is **deferred**: the kernel negates its mass and deposits nothing, and the host deposits it
+with the CPU's exact test. So stream counts and `.hidden_streams` are byte-identical CPU against GPU, partitioned or not
+(single build). A tetrahedron the kernel's float degeneracy check would reject but the host kept is deferred, not lost.
 
-Analytic velocity plumbing (T9): a constant field is reproduced exactly (v̄ ≡ v0 to 5e-6, σ ≡ 0,
-gradient ≡ 0) and a linear field v = Gx recovers grad/W == G to 2e-5 in every covered cell
-(well-conditioned tets; near-degenerate conditioning is covered by CPU-parity instead).
+**The exact deposit** (`depositExactItems`) splits the work below the tetrahedron: one thread per item = (tetrahedron,
+block of 16 cells of its bounding-box window; `PS_EXACT_ITEM_CELLS`). With one thread per tetrahedron the per-thread
+cost spans five orders of magnitude once cells are smaller than tetrahedra, and each buffer waits on its few giants
+(0.26M particles on 256^3: 30 s with items, more than 17 min without). Phase 0 adds each item's clipped weights into a
+per-tet total `sumW`, phase 1 deposits each piece with the share m/sumW, so every tetrahedron deposits exactly its
+mass; a tetrahedron whose total stays 0 goes through `depositFields` (sampled path, centroid fallback or deferral). The
+host bounds every window from its own copy (the kernel re-derives it in float; surplus items idle) and caps the list at
+32M items. `PS_EXACT_ITEMS=0` keeps the one-thread path for A/B.
 
-Edge cases (analytic): tet-in-one-cell mass placement, tiny-tet centroid fallback, periodic-wrap
-shift equivalence (bit-exact), degenerate-tet drop, nSub∈{1..4} mass conservation (ratio 1.0000000),
-determinism (~1e-6 atomic-order ULP).
+**The clip's frame.** r3d's moments come from origin-apex simplices, so a piece far from the origin loses its volume
+to cancellation. Every GPU exact path clips with the origin at the centre of the overlap of the tetrahedron's bounding
+box with the cell and shifts the centroid back; it agrees with the CPU (double r3d, vertex-0 frame) to about 1e-6 at
+every resolution (`ps_window_check.sh`'s fine grid, `dtfe_metal_check.sh`'s fine region).
 
-The mass grid (2026-10-08): float atomics drop every share below half an ulp of a busy cell's running
-sum, always downward -- the GPU run of TNG50-3-Dark z=0 had a box mean of 0.99941 (a few % low in
-halo-core cells with 1e6-1e7 deposits). The kernel now adds each mass share as the integer
-rint(share * 2^k) into two `atomic_uint` words per cell with a hand-made carry (`depositMass`; the host
-puts the partition's mass at 2^61..2^62 units, `psMassFixedScale` in ps_deposit_params.h): exact, and
-independent of the atomics' order, so the mass grid is bit-reproducible run to run (T6: 0 difference;
-T10: sub-grid vs full grid 0 difference). The unit must be that fine: a first try with the mean tet at
-2^32 units left the 3 kpc cells of a --ps-window zoom 5e-4 off (tests/ps_window_check.sh). Cost: 4 more
-bytes per cell on the device and a second atomic per mass share; on an M1 Max (2.1M particles, 256^3,
-nSub 3) the density-only deposit is unchanged (5.95 s) and the full field set ~2% slower (12.0 vs 11.8 s).
-Since 2026-10-14 the moment grids are fixed-point sums too (`PSDepositParams.fxMask`, word views at buffers
-22-29; the exact items' per-tet weight totals at 30), each in its own unit from a bound the caller sums
-(`PSFixedBounds`, `psMomentFixedScale` in ps_deposit_params.h); `PS_METAL_FLOAT_MOMENTS=1` keeps the float atomics.
-(Before, their normalizer was this exact mass while they stayed float, so in cells with ~1e7 deposits a
-mass-weighted sigma^2 no longer had the mass grid's matching float loss to cancel its own.)
-`PS_METAL_FLOAT_MASS=1` (and the harness's `VALIDATE_FLOAT_MASS=1`) brings back the float mass grid
-for comparison. The CUDA/HIP port has the same fixed-point grid since 2026-10-11 (PS_GPU_FLOAT_MASS=1, or the Metal
-spelling, for its float grid); tests/cudaemu_check.sh runs the parity suites on it through the CPU emulation.
-Since 2026-10-12 the hosts hand the words over unconverted (`PSGpuGrids::massFx`), and the CPU adds the
-tetrahedra the kernel deferred, and the `--ps-halo-release` centroid deposits, as the same integers (the
-single-precision build; ps_interpolation.cc `massFx`): their float adds had put TNG50-3-Dark z=0.5 at a box
-mean of 1 - 1.63e-5, every bit of it the deferred deposit. A CPU-only deposit sums into such a grid too; the
-float density is formed once per cell after the loop (tests/ps_mass_exact_check.sh).
+**`--ps-window`.** The sampled kernel visits every cell of a straddling tetrahedron's bounding box and counts the
+samples outside the window for its normalization, depositing only those inside. The exact items are built from the
+hull of each bounding box intersected with the window's periodic images (`window_hull` in the kernel and `psWindowHull`
+on the host: keep them in sync), and the tetrahedron is normalized by its whole weight `wFull`; an empty window piece
+then means "no volume inside", so `depositFields` takes no sampled fallback in window mode. On a non-periodic grid a
+tetrahedron cut by the grid face keeps only its inside share (`count_beyond_grid` counts the samples beyond the grid
+column by column).
 
-Random stress set (60% normal + 25% flat/caustic + 15% tiny tets): CPU-vs-GPU mean-rel agreement
-mass 4e-6, momentum 3e-6, second moment 7e-7, gradient 9e-9; stream counts differ in 0.003% of
-cells by ±1 -- the harness's CPU REFERENCE still uses a float test with a ±1e-6 tolerance; the
-production CPU deposit and the kernel agree exactly (tests/point_exact_serve_check.sh D3/D4).
+## Standard-DTFE `_a` interpolation
 
-Sheared Zel'dovich pancake (546k tets, 3-stream caustic flow) against an **exact** reference — for a
-z-only displacement the Freudenthal interpolant is exactly the 1D piecewise-linear map, and the added
-affine shear (αx+βy) makes the expected profile its pushforward convolved with two box kernels:
-- mass conservation exact (1e-8); full grid coverage; density & stream slab profiles within
-  **3.1% / 4.1%** of the exact expectation across ALL bins including caustics (nSub=3);
-- tensor invariants exact: σ_xx…σ_yz ≡ 0 for the z-only flow (vs σ_zz ~ 6e6 (km/s)²);
-  single-stream cells at nSub=1 have σ_zz ≤ 1.3 (km/s)² (float ULP floor — the same
-  floor the production CPU pipeline shows);
-- normalized σ and v̄ agree CPU-vs-GPU to ~1e-7 mean-rel.
+Method 1 of `averaged_interpolation_1.cc`: a tetrahedron inside one cell deposits its centroid value times its volume;
+a larger one scatters value × V/n at n shared Sobol samples (centred, in the hashed vertex order; up to 10 000). The CPU
+precomputes volumes, sample counts and single-cell indices with its own helpers, so both paths make the same decisions.
 
-Test-construction notes (matter if you modify the harness): a perfectly grid-commensurate tet
-lattice puts sub-samples exactly on shared tet faces (double-counted streams via the ±1e-6
-tolerance) and repeats one quantization pattern per slab (correlated moiré in profiles). The
-harness decommensurates periods (N=45), offsets phases per axis, and adds the affine shear —
-all while keeping the reference exact. At nSub=1, tets smaller than the sample spacing make
-per-cell profiles quantization-noisy by construction (mass still conserved; informational only).
+- **Item kernels** `depositAveraged1Items{2,4,8}` (default 2 slots, `DTFE_GPU_CACHE_K`): one thread per work item =
+  (tetrahedron, run of at most 48 samples, `DTFE_GPU_ITEM_SAMPLES`). Items are implicit (a prefix sum and a block table,
+  no per-item buffer); a tetrahedron's samples are dealt round-robin to its items, so adjacent lanes read consecutive
+  table entries. A per-thread cell cache sums samples that land in the same cell; the host orders tetrahedra along a
+  Morton curve of their base cell, and the flush is a SIMD-group reduction by cell (one atomic per field per distinct
+  cell per group). The kernels are specialized per field set (function constants `FC_DEN/FC_VEL/FC_GRAD`) and
+  register-bound, which is why 2 slots beat 4 and 8 and 48-64 samples per item is the plateau.
+- **Evictions go to a threadgroup cell table** (32 KB, open addressing; 1024 entries for density + velocity, 512 with
+  the gradient, half that under the exact sums), flushed once per threadgroup; a full probe falls back to device atomics
+  (`DTFE_GPU_TABLE=0` turns it off). This matters in voids, where a tetrahedron's samples never repeat a cell within one
+  item. On 2.1M particles at 512^3 the largest sub-domain takes 0.7 s on the item kernels and 45 s on the per-tet kernel
+  (`depositAveraged1`, `DTFE_GPU_ITEMS=0`), whose 10 000-sample threads trip the watchdog.
+- **`--exact-average`** (`depositExactAverage`): the exact deposit's item split (16 cells, `DTFE_GPU_EXACT_CELLS`), each
+  piece depositing the interpolant's centroid value and the gradients times its volume, one dispatch. Agrees with the
+  CPU to float rounding (density 5e-7, velocity 4e-6, gradient 8e-6 of the peak on the 96^3 test box).
+- **Sub-domains.** Each OpenMP sub-domain deposits its own sub-grid, serialized on the one queue. The alternative, one
+  full grid on the device for the whole call (`DTFE_GPU_SHARED=1`, `DTFE_GPU_SHARED_GB` cap), is tested but off: its
+  atomics' footprint on the full grid cost more than the zeroing and read-back it saves (2.1M at 512^3: 12.9 s against
+  10.6 s). It keeps float sums and sampled averages only.
 
-- **Speedup:** density-only ~18× vs one CPU core (1M tets: 61 s → 3.4 s); **all-fields ~23×**
-  (1M tets, nSub=3: 243.5 s → 10.7 s). Compare against the OpenMP CPU baseline (cores actually
-  used) before concluding net gain.
+The sampled GPU grid agrees with the CPU's except in 0.1-0.2% of the cells, where a sample within float rounding of a
+cell face lands in the neighbouring cell (`dtfe_metal_check.sh`: means to 1e-5, cells to 5e-2 outside a 1e-3 fraction).
 
-## Why the deposit (and not the triangulation)
+## Exact sums
 
-The Delaunay triangulation is CGAL, sequential, and cheap (~35 s/partition). The deposit is
-data-parallel over ~10M tetrahedra and dominates the runtime — the right GPU target.
+Float atomics drop every share below half an ulp of a busy cell's running sum, always downward (0.06% of TNG50-3-Dark
+z = 0's box mass), and their order varies, so the grids are fixed-point integer sums instead:
+- **PS mass grid**: each share added as rint(share · 2^k) into two `atomic_uint` words per cell with a carry
+  (`depositMass`), the partition's mass at 2^61..2^62 units (`psMassFixedScale`; coarser units put a zoom's 3 kpc cells
+  5e-4 off).
+- **PS moment grids** (velocity, dispersion and its own mean and weight, gradients, scalar): each in its own unit from a
+  bound the caller sums (`PSDepositParams.fxMask`, `PSFixedBounds`, `psMomentFixedScale`).
+- **Standard `_a` grids**: 64-bit sums with a unit per batch from a bound on its total share (`dtfe_gpu_fixed.h`); the
+  item kernel's chunks start at multiples of 256 items (`DTFE_METAL_CHUNK` / `DTFE_GPU_CHUNK` are rounded up), so the
+  SIMD-group sums are fixed too.
 
-## Pipeline integration (DONE)
+The hosts hand the words over unconverted (`PSGpuGrids::massFx`); the CPU adds the deferred tetrahedra and the
+`--ps-halo-release` centroid deposits as the same integers and converts once. So every grid is identical from run to
+run whatever the order of the atomics (`gpu_mass_check.sh`, `ps_fixed_moments_check.sh`, `dtfe_gpu_retry_check.sh`);
+the remaining differences against the CPU are its float arithmetic (~1e-6 of the peak). A share without an integer
+value (NaN, infinity, beyond 2^63 units) is left out and counted, and the run warns per grid (`DTFE_TEST_NAN_SHARE`).
+A double build converts the words to double once. The float modes stay for A/B: `PS_METAL_FLOAT_MASS=1` /
+`PS_GPU_FLOAT_MASS=1`, `PS_METAL_FLOAT_MOMENTS=1` / `PS_GPU_FLOAT_MOMENTS=1`, `DTFE_METAL_FLOAT_GRIDS=1` /
+`DTFE_GPU_FLOAT_GRIDS=1` (and `DTFE_GPU_SHARED=1`), all run-to-run variable at the ulp level. Each dispersion share
+w·v_i·v_j is a float32 product before the sum, as on the CPU path.
 
-Build with `make PS-DTFE METAL=1`, run with `--ps-gpu`. Pieces:
+## Pacing and retries
 
-- `src/CGAL_triangulation/ps_metal_host.cc` — metal-cpp host implementing the backend-neutral
-  `gpu_host.h` interface (singleton device/pipeline; the kernel source is embedded at build time
-  via the generated `o_ps/ps_deposit_msl.h` and compiled once per process). Compiled only when
-  `METAL=1` (which defines `-DPS_GPU`); links `-framework Metal -framework Foundation`.
-- `interpolateGrid_phaseSpace` (ps_interpolation.cc) extracts flat per-tet arrays (the 16-float
-  record above, vertex velocities, tet mass ρ̄·V_lag) with **exactly the CPU loop's filters**
-  (ownership, hull, degeneracy), dispatches `depositFields` (the exact deposit: `depositExactItems`,
-  then `depositFields` on its leftovers), copies the moment grids back, and then
-  runs the CPU loop over just the deferred tets' cells (their finite-cell ordinals travel through
-  the cost sort with the records); the shared normalization/statistics tail is unchanged. Any
-  failure (no device, compile, allocation) falls back to the CPU deposit with a warning. Scalar
-  fields fall back to CPU.
-- The kernel honours the **partition sub-grid** (`subOrigin/subDims` in `DepositParams`, matching
-  the production `inSub` guard), including a box that WRAPS a periodic axis, so
-  `--partition`/`--max-concurrent`/deferred-normalization work identically. (The sampled path
-  missed that wrap from 2026-07-16 to 2026-09-28: in a periodic `--partition` run on the GPU most
-  of each partition's cells were skipped and their mass went to centroid fallbacks -- 91% of cells
-  wrong on crossed waves at 2×2×2. `tests/point_exact_serve_check.sh` D4 now guards it.)
+macOS kills command buffers when sustained GPU load starves the display
+(`kIOGPUCommandBufferCallbackErrorImpactingInteractivity`); a pipelined submission was killed even with ~0.1 s
+buffers, serialized submission with small gaps survives. So the hosts submit serialized chunks that adapt toward ~0.25 s each (PS start 25 000 tetrahedra, 500 for the exact deposit;
+`PS_METAL_CHUNK` / `PS_GPU_CHUNK`, `DTFE_METAL_CHUNK` / `DTFE_GPU_CHUNK`) with an ~8 ms gap (zero on CUDA/HIP until a
+failure). A killed buffer may have deposited part of its atomics, so a chunk is never retried alone: each pass keeps a
+host snapshot of its grids at its start and every ~10 s of GPU work (`DTFE_GPU_CHECKPOINT_CHUNKS=n`: every n buffers,
+0 = the pass start only), and a failure drains the queue, restores the last snapshot and continues. An "innocent
+victim" error (another process hung the GPU) retries at once; a watchdog or memory error makes the process-wide pace
+4x shorter buffers with 3x wider gaps, easing back one notch after 90 s of clean GPU work
+(`DTFE_GPU_PACE_RECOVER_SEC`). Three failures of one chunk, sixteen in one deposit or a lost device hand the partition
+(standard DTFE: the sub-domain) to the CPU. A CUDA launch timeout is sticky and loses the context, so there the CPU
+takes over. `DTFE_GPU_FAULT_AT=<k>[:innocent|timeout|oom|persist]` makes the k-th buffer fail after it ran (the retry
+suites). Running with the display idle avoids the watchdog.
 
-A/B parity (crossed waves 128³, single-domain and 2×2×2 partitioned, nSub 1 and 3): `.streams`
-and `.hidden_streams` byte-identical, float fields within ~1e-6 of peak (atomic summation order). A
-tet the kernel's float degeneracy check would reject but the host's double one kept is deferred,
-not dropped, so no mass is lost there either.
+## The CUDA / HIP port
 
-## Operational notes
+`ps_gpu_cuda.cu` and `dtfe_gpu_cuda.cu` are line-by-line ports of the two `.metal` files (every helper, the same float32
+arithmetic, the same deferral rule) with hosts mirroring the Metal ones; one source compiles under `nvcc` and `hipcc`
+through `gpu_cuda_compat.h`. What differs by design:
+- **Warp width.** `__shfl_xor_sync` / `__any_sync` over 32 lanes (CUDA), `__shfl_xor` / `__any` over `warpSize` (64 on
+  CDNA/GCN, 32 on RDNA) under HIP; only the order of the float additions changes.
+- **Every lane reaches the collectives.** A thread beyond the chunk's last item runs the body with `valid = false`
+  instead of returning, and no `return` precedes the item kernel's `__syncthreads()`.
+- **Templates for function constants**: `depositItemsKernel<K, FD, FV, FG, FX>`, all 48 instantiations compiled ahead
+  of time; the cell table is dynamic shared memory sized by the host (32 KB).
+- **Memory.** Device memory and explicit copies instead of unified buffers; the masses keep a 4-byte-per-tet host
+  mirror for the leftovers and deferrals, which a small kernel gathers on the device.
+- **Compiler flags**: `-O3` only; `--use_fast_math` would make `sqrt` and division approximate and break the
+  degeneracy sentinel and the exact clipping.
+- The knobs keep their names; timing and chunk knobs accept both spellings (`DTFE_METAL_TIMING` or `DTFE_GPU_TIMING`,
+  `PS_METAL_TIMING` or `PS_GPU_TIMING`).
 
-- **GPU watchdog**: macOS kills command buffers when GPU pressure starves the display
-  (`kIOGPUCommandBufferCallbackErrorImpactingInteractivity`). Empirically this reacts to SUSTAINED
-  queue saturation, not just per-buffer duration: a pipelined (two-in-flight) submission was killed
-  even with ~0.1 s buffers under active display use, while serialized submission with small
-  host-side gaps survives. The host therefore submits SERIALIZED chunks that adapt toward ~0.25 s
-  each (start 25k tets, `PS_METAL_CHUNK=<n>` overrides) with an ~8 ms sleep between buffers. A
-  killed buffer may have partially deposited, so a failed chunk is never retried alone: each pass
-  keeps a host-side snapshot of the buffers it writes (at its start and every ~10 s of GPU work,
-  `DTFE_GPU_CHECKPOINT_CHUNKS=<n>` = every n buffers, 0 = pass start only), and a failure restores
-  the last snapshot and continues from there (2026-10-11; before, every retry redid the whole
-  partition). The retry depends on the error: "Innocent Victim" retries at once at the same pace, a
-  watchdog/timeout or resource error escalates to 4× shorter buffers and wider gaps for the rest of
-  the process (logged to stderr); three failures of the same chunk, or a lost device, hand the
-  partition to the CPU deposit. `DTFE_GPU_FAULT_AT=<k>[:innocent|timeout|oom|persist]` is the test
-  hook (tests/gpu_retry_check.sh). Running with the display idle/locked avoids the watchdog entirely.
-- **No mixed builds**: the PS build GPU mode (metal/off) is stamped in `o_ps/`; changing
-  it wipes all PS objects, so an incremental rebuild can never mix `-DPS_GPU` and plain objects
-  (which would produce a binary that half-believes it has GPU support). `o_ps/.build_mode` records
-  the mode's make argument so tests can rebuild without downgrading the binary.
+**Status: compiled, fallback-tested and validated by CPU emulation, not run on hardware.** The objects compile with
+CUDA 12.6 and ROCm, a GPU run in a container without a device falls back to the CPU, and the unchanged kernels and
+hosts pass every suite above through the emulation at warp 32 and 64 with the Metal backend's parity figures.
 
-- **Full GPU utilization**: a chunk finishes when its slowest thread finishes, so mixing one
-  stretched void tet (thousands of cells) with cheap halo tets idles most cores at every chunk
-  boundary (~5× waste). The extraction therefore **cost-sorts** tets by grid footprint before
-  dispatch — every chunk gets uniformly-sized work.
-- **CPU ∥ GPU pipelining**: the partition loop is OpenMP over partitions; `--max-concurrent 2`
-  (what the binary's auto-tuner targets under `--ps-gpu` when memory allows; set
-  `MAX_CONCURRENT` to override) lets one partition triangulate on the CPU while another runs
-  its GPU deposit (the Metal host mutex serializes GPU access). Measured steady-state:
-  ~4–4.5 min per 512³ nSub=3 all-fields partition, ~45 min per full 8-partition run
-  (vs ~13 min/partition unsorted-serialized, ~28 min/partition CPU-only).
+**The CPU emulation** (`gpu_cuda_emu.h`, `-DGPU_EMU`, a C++20 translation unit): a launch runs the grid one block at a
+time, a block's warps are OS threads and each warp's lanes are coroutines (a register-only stack switch; verified on
+arm64, on x86-64 only under Rosetta) run in lockstep at the collectives. Non-uniform control flow at a collective aborts
+with a message instead of hanging; `GPU_EMU_WARP=64` runs the reductions over 64 lanes. Atomics are real atomics and
+device memory is host memory, so it checks the port's transliteration and host logic, not the memory model, scheduling
+or numerics of a real device.
 
-## Standard DTFE (`make DTFE METAL=1`, `--gpu`): the volume-averaged `_a` interpolation
+## Harness tests (`metal/validate_deposit.cpp`)
 
-`metal/dtfe_deposit.metal` + `src/CGAL_triangulation/dtfe_metal_host.cc` port method 1 of
-`averaged_interpolation_1.cc`: a tetrahedron inside one grid cell deposits its centroid value times
-its volume; a larger one scatters value × V/n at n shared Sobol sample points (n = 100 per cell
-volume, capped at 10 000). The CPU precomputes volumes, sample counts and the single-cell indices
-with its own helpers, so both paths make the same decisions; the table of barycentric samples is
-shared. `tests/dtfe_metal_check.sh` pins the parity (means to 1e-5, per-cell to 5e-2 outside a 1e-3
-fraction -- float vs double sample placement flips a borderline sample now and then), a repeated GPU
-run and the per-tet A/B kernel to 1e-4, and the shared grid against the per-call path on a coarse
-grid where most tetrahedra take the single-cell fast path.
+T1-T15: analytic edge cases (a tetrahedron in one cell, the tiny-tet centroid fallback, periodic-wrap shift
+equivalence, the degenerate-tet drop), nSub 1-4 mass conservation, determinism, a random CPU-vs-GPU stress set on every
+grid, analytic velocity fields (constant and linear v = Gx), the partition sub-grid (T10), the volume-weighted (T11),
+caustic (T12) and exact (T13) paths, a sheared Zel'dovich pancake against an exact piecewise-linear pushforward
+reference, `depositExactItems` against the analytic cube and the one-thread path (T14: periodic, wrapped sub-grid,
+non-periodic) and the inside share of a tetrahedron cut by a non-periodic face (T15). It builds the per-tet records like
+the host and deposits deferred tetrahedra with its own CPU reference, whose float inside test with a ±1e-6 tolerance
+differs from the kernel's exact decisions in 0.003% of the stream counts (the production CPU deposit agrees exactly,
+`point_exact_serve_check.sh` D3/D4). It skips zero-mass tetrahedra, which production deposits with weight 0 into the
+stream counts. A test lattice must not be grid-commensurate (samples on shared faces, moiré per slab): the harness
+decommensurates the periods, offsets the phases and adds an affine shear while keeping the reference exact.
 
-**The regime flip.** The original kernel, `depositAveraged1` (kept for A/B runs, `DTFE_GPU_ITEMS=0`),
-is one thread per tetrahedron with one atomic per field per sample. That is fine while most
-tetrahedra fit in one cell (7.1M particles on 256³: ~2.8 tetrahedra per cell), but at 512³ there are
-0.35 per cell: nearly every tetrahedron takes the sampled path with hundreds of samples, the loops
-reach 10 000 samples per thread and trip the GPU watchdog (whole sub-domain deposits restarted), and
-the run was 10× SLOWER than the CPU's plain `+=` (397 s against 37 s, 2026-10-01).
+## Knobs
 
-**The item kernels** `depositAveraged1Items{2,4,8}` (2026-10-01; the default is the 2-slot one):
-- one thread per **work item** = (tetrahedron, run of ≤ `itemSamples` samples, default 48). Items
-  are implicit: `itemStart[t]` (a prefix sum) and a block table map a thread index to its tetrahedron
-  with a short binary search, so there is no per-item buffer (180 M items of a 512³ sub-domain would
-  be 1.4 GB). A tetrahedron's samples are dealt to its items round-robin, so the items of one
-  tetrahedron -- adjacent lanes -- read consecutive entries of the (float4) sample table: one
-  512-byte run per SIMD group instead of 32 scattered lines.
-- a per-thread **cell cache** (`K` slots of flat index, Σden, Σvel, count, indexed only inside unrolled
-  predicated loops so it stays in registers) sums the samples landing in the same cell; the weight
-  V/n is applied once at the flush, the gradient (constant over the tetrahedron) as gradFlat × count
-  × V/n.
-- the flush is a **SIMD-group reduction by cell**: the host orders the tetrahedra along a Morton curve
-  of their base cell (measured 1.0-1.3 distinct base cells per 32 consecutive items at 512³), each
-  slot elects the smallest pending key with `simd_min`, `simd_sum`s the lanes holding it and lets one
-  lane add -- one atomic per field per distinct cell per SIMD group.
-- the kernels are **specialized per field set** with function constants (`FC_DEN/FC_VEL/FC_GRAD`): the
-  density-only pipeline carries no velocity registers. The item kernels are register-bound (640 of
-  1024 threads per threadgroup at K=4, 832 at K=2; the lean per-tet kernel 1024), which is why 2
-  slots beat 4 and 8, and why shorter items once won: with the reduction and the coalesced table in
-  place, 48-64 samples per item is the plateau.
-- **evictions go to a threadgroup cell table.** In the void regime a tetrahedron spans hundreds of
-  cells and its ~10 000 samples never repeat a cell within one item, so every sample evicts its
-  cache slot -- and samples are proportional to volume, so most samples ARE void samples. Each
-  cell is still hit ~20 times, but across the tetrahedron's ~200 items, which sit in the same
-  threadgroup (consecutive items). A 32 KB threadgroup table (open addressing, linear probing,
-  32-bit cell keys claimed by compare-exchange, threadgroup float atomics; 1024 entries for
-  density + velocity, 512 with the nine gradient sums) collects the evictions, and the threadgroup
-  flushes it once at its end with one device atomic per field per entry. A full probe sequence
-  falls back to direct device atomics (`DTFE_GPU_TABLE=0` turns the table off). This was the
-  decisive step for the gradient: with 13 device atomics per evicted sample the gradient
-  pipeline ran at 320 M samples/s whatever the cache size or item length; the probe that found
-  it skipped only those eviction atomics and jumped to 1.05 G.
-
-What each step bought, on 2.1M particles at 512³ (GPU seconds of the largest sub-domain, 2.0 G
-samples): per-tet kernel 45 s (with retries); items + cache 2.7 s (16 samples, K=4; atomics per
-distinct cell per item); Morton order, SIMD reduction, coalesced table, specialization, K=2, 48
-samples: 1.97 s (~1.05 G samples/s); + the threadgroup table: 0.7 s (2.4-2.9 G samples/s; the
-gradient pipeline 3.1 s, 650-750 M). Lesson from the way there: the density-only run that first
-pointed at "atomics" was confounded with the velocity registers, and the SIMD reduction, which
-removed most FLUSH atomics, changed nothing because the EVICTION atomics were the cost -- measure
-the branch you think is hot by skipping exactly that branch.
-
-**Sub-domains: one grid or one each?** The OpenMP sub-domains of a standard-DTFE run each deposit
-their own sub-grid, serialized on the one command queue (the host-side upload now runs outside the
-mutex, so it overlaps the queue). The alternative is in place and tested -- `dtfeGpuShared*` in
-gpu_host.h: one full grid on the device for the whole `DTFE_parallel` call, each thread's batch
-streamed into it with its owner box (positions stay sub-domain-relative so the cell classification is
-the CPU loop's bit for bit; the fast-path indices are shifted on the host), a warm chunk controller,
-owner-box re-zeroing on a retry, one read-back added into the main grid (a sub-domain handed back to
-the CPU has zeros there, so the add is exact) -- but it is **off by default** (`DTFE_GPU_SHARED=1`):
-the same kernel runs at 450-780 M samples/s into the 2 GB full grid against 880-1100 M into the
-sub-grids. The atomics' footprint on the big grid costs more in TLB and cache reach than the
-per-sub-domain zeroing and read-back it saves; the Morton order recovered most of it (32.8 → 22.2 s
-for the whole run) but not all (per-call 17-19 s). A brick-ordered full grid would be the next step
-if sharing is ever needed. With the threadgroup table the gap narrowed but stayed: 2.1M at 512³
-whole run 12.9 s shared against 10.6 s per-call.
-
-**Double-precision binaries.** `make DTFE PS-DTFE DOUBLE=1 METAL=1` builds `DTFE-double` / `PS-DTFE-double`
-with the same kernels: the extraction narrows the double tetrahedra to float for the GPU and the
-float sums are added into the double grids (everything else in those binaries is double; the standard binary's
-exact fixed-point sums of 2026-10-13 reach them rounded to float). Their
-GPU deposits match their own CPU runs within the parity class above (`tests/ps_double_check.sh`, D5).
-
-Knobs: `DTFE_GPU_ITEM_SAMPLES`, `DTFE_GPU_CACHE_K=2|4|8`, `DTFE_GPU_TABLE=0`, `DTFE_GPU_ITEMS=0`,
-`DTFE_GPU_SHARED=1` (+ `DTFE_GPU_SHARED_GB` cap), `DTFE_METAL_FLOAT_GRIDS=1` / `DTFE_GPU_FLOAT_GRIDS=1` (the float
-atomics instead of the exact fixed-point sums of 2026-10-13, for A/B), `DTFE_METAL_TIMING=1` (per batch: items, samples,
-table size, chunks, retries, M samples/s, pipeline occupancy, cells per SIMD group),
-`DTFE_GPU_DEBUG_NOWRITE` / `DTFE_GPU_DEBUG_NOATOMIC=1|2|3` (timing experiments). Whole runs (CPU / GPU, 2026-10-01 evening): 7.1M particles at 512³ 39.1 / 17.3 s (with the velocity
-gradient 48.2 / 32.0 s; the per-tet kernel of the morning: 396.7 s), 2.1M at 512³ 24.6 / 10.6 s
-(gradient 30.9 / 26.3), 0.26M at 256³ 3.8 / 2.0 s (gradient 4.4 / 3.9), 7.1M at 256³ 14.2 / 14.4 s
-(the floor: reading, triangulation, writing). The remaining gradient cost is the nine component
-sums per table entry and per flush.
-
-A retry (never seen with items) **drains the queue** before re-zeroing: the per-tet kernel's retried
-512³ runs differed run to run by a whole sample in void cells (2e-2 of max|v|, against 3e-6 without
-retries), consistent with atomics of a killed buffer landing after the memset; the parity test's
-repeated GPU run pins the reproducibility at 1e-4. Since 2026-10-13 a failed buffer restores the batch's last
-checkpoint (the PS policy, `gpu_metal_retry.h`) instead of re-zeroing the owner box; the drain stays.
-
-## CUDA / HIP (Linux): `make <target> CUDA=1` or `HIP=1` — a port of these kernels
-
-`src/CGAL_triangulation/ps_gpu_cuda.cu` and `dtfe_gpu_cuda.cu` are line-by-line ports of
-`ps_deposit.metal` and `dtfe_deposit.metal` (every helper, the same float32 arithmetic, the same
-deferral rule, the same two kernels per binary), with hosts that mirror `ps_metal_host.cc` and
-`dtfe_metal_host.cc` (the chunked dispatch controller, the exact-deposit items + leftovers +
-deferrals, the owner-box re-zero before a retry, the shared full-grid accumulator). One source
-compiles under both `nvcc` (CUDA, NVIDIA) and `hipcc` (HIP, AMD ROCm) through the macro shim
-`gpu_cuda_compat.h`, which also carries the warp collectives. The build is selected per target like
-`METAL=1` (one backend per build; the mode stamp wipes the object directory on a switch; `.build_mode`
-holds `CUDA=1` / `HIP=1`), `scripts/install.sh` picks it up when `nvcc` / `hipcc` is found, and the
-launcher's Setup names the backend from the stamp. `--gpu` / `--ps-gpu` and the automatic CPU
-fallback are the same.
-
-**Status (2026-10-02): compiled, fallback-tested and validated by CPU emulation, not on hardware.**
-The two objects compile cleanly with CUDA 12.6 (`nvidia/cuda:12.6.3-devel-ubuntu24.04`;
-`depositFields` 128 registers / 1.8 KB stack, the K=2 item kernels 48–64 registers), the whole pair
-links with `CUDA=1` in that image, and a run with the GPU flag in a container without a device falls
-back to the CPU with the usual warning. The kernels and hosts, unchanged, pass every parity suite
-through the CPU emulation described below (`CUDAEMU=1`), at warp width 32 and 64. No NVIDIA or AMD
-machine was available, so the kernel numerics have NOT been checked on real hardware. **First thing
-to run on a GPU machine:**
-`GPU_BUILD=CUDA=1 tests/dtfe_metal_check.sh` (CPU/GPU parity of the standard DTFE, the repeated run,
-the per-tet A/B kernel, the shared grid), then the PS suites that take `--ps-gpu` when the stamp is a
-GPU one (`tests/ps_linear_deposit_check.sh`, `ps_vertex_mass_check.sh`, `ps_volume_weighted_check.sh`,
-`ps_halo_release_check.sh`, `ps_hidden_streams_check.sh`, `ps_caustic_class_check.sh`,
-`python3 tests/ps_nonperiodic_test.py`) and `tests/ps_double_check.sh` for the double pair.
-`metal/validate_deposit.cpp` is Metal-only. The CI job `cuda-compile` keeps the port compiling.
-
-What is different from the Metal backend, by design:
-
-- **Warp width.** Metal's `simd_*` operations act on 32 lanes; the port uses `__shfl_xor_sync` /
-  `__any_sync` (32 lanes) under CUDA and `__shfl_xor` / `__any` over `warpSize` (64 on CDNA/GCN,
-  32 on RDNA) under HIP. The reduction by cell is the same algorithm; only the group over which the
-  sums are formed changes, which only reorders the float additions.
-- **Every lane reaches the reduction.** Metal lets inactive lanes drop out of a SIMD operation; a
-  CUDA warp collective needs all 32. A thread beyond the chunk's last item therefore runs the item
-  body with nothing pending (`valid = false`) instead of returning, and no `return` precedes the two
-  `__syncthreads()` of the item kernel.
-- **Field-set specialization** is a template (`depositItemsKernel<K, FD, FV, FG>`, all 24
-  instantiations compiled ahead of time) instead of Metal function constants; the cell table is
-  dynamic shared memory sized by the host (32 KB budget, as the threadgroup memory).
-- **Memory.** Device memory and explicit copies instead of unified buffers read in place: the exact
-  deposit's item windows are bounded from the host copy of the records before it is uploaded, the
-  masses keep a 4-byte-per-tet host mirror (leftovers and deferrals are read from it; the compact
-  leftovers are gathered on the device by a small kernel), and the shared full grid is copied back to
-  host vectors at `Result`. The chunk controller is kept because a display-attached Linux GPU kills
-  kernels after a few seconds; the idle gap between kernels (the Metal host's concession to the window
-  server) is zero. A CUDA kernel timeout is a *sticky* error: the retries then fail as well and the
-  caller's CPU fallback takes over for the rest of the process.
-- **Knobs** keep their names (`DTFE_GPU_ITEMS`, `DTFE_GPU_ITEM_SAMPLES`, `DTFE_GPU_CACHE_K`,
-  `DTFE_GPU_TABLE`, `DTFE_GPU_SHARED[_GB]`, `PS_EXACT_ITEMS`, `PS_EXACT_ITEM_CELLS`); the timing and
-  chunk knobs accept both spellings (`DTFE_METAL_TIMING` or `DTFE_GPU_TIMING`, `PS_METAL_CHUNK` or
-  `PS_GPU_CHUNK`, `DTFE_METAL_CHUNK` or `DTFE_GPU_CHUNK`).
-- **Compiler flags.** `-O3` only: Metal compiles its kernels with fast math on, and nvcc's default
-  fma contraction covers what the certified inside test assumes, but `--use_fast_math` would make
-  `sqrt` and division approximate and break the degeneracy sentinel and the exact clipping. `GPU_ARCH`
-  pins an architecture (`sm_86`; for HIP it is practically required, `gfx90a`, because hipcc has no
-  portable intermediate code).
-
-## Standard DTFE: `--exact-average` on the GPU (`depositExactAverage`)
-
-The analytic volume average (r3d, `--exact-average`) runs on the GPU as of 2026-10-02: one thread per
-item = (tetrahedron, block of 16 cells of its bounding-box window), the phase-space exact items'
-split, each piece depositing the linear interpolant's centroid value times the piece volume (order-1
-moments) and the gradients times the piece volume -- no per-tetrahedron normalization, one dispatch;
-single-cell tetrahedra take the centroid fast path by their only item. The r3d port now lives in
-`metal/exact_clip.metal.inc`, which the Makefile prepends to BOTH kernel sources when it embeds them
-(and `validate_deposit.cpp` prepends when it loads the source); the CUDA twin is
-`src/CGAL_triangulation/gpu_exact_clip.cuh`. `tests/dtfe_metal_check.sh` pins the CPU/GPU pair: with
-no sampling involved it agrees to float rounding (density 5e-7, velocity 4e-6, gradient 8e-6 peak
-relative on the 96³ test box). 0.26M particles on 256³: CPU 26.9 s, GPU 4.1 s (the sampled average
-3.3 vs 1.9 s). `DTFE_GPU_EXACT_CELLS` sets the block size. The shared full grid stays sampled-only.
-
-## Validation without hardware: `make <target> CUDAEMU=1`
-
-The CUDA/HIP sources can be compiled as plain C++ against a CPU emulation of the device API
-(`src/CGAL_triangulation/gpu_cuda_emu.h`, selected by `-DGPU_EMU`; a C++20 translation unit): a
-launch runs the grid one block at a time, a block's warps are OS threads and each warp's lanes are
-coroutines (a register-only stack switch; arm64 verified, the x86-64 switch written but not yet run) run in lockstep at the collectives -- a
-lane that calls a warp collective or `__syncthreads()` yields, and the warp's scheduler resumes it
-with the result once every lane has arrived there. Non-uniform control flow (lanes of a warp at
-different collectives, a lane exited before one) aborts with a message instead of hanging silently;
-`GPU_EMU_WARP=64` runs the reductions over 64 lanes, the HIP wavefront width. Atomics are real
-atomics, device memory is host memory, every runtime call succeeds, the device reports "CPU emulation".
-It validates the port's transliteration and host logic, NOT the memory model, scheduling or numerics
-of real hardware. On 2026-10-02 the UNCHANGED kernels and hosts passed, through this emulation, every
-suite the Metal backend passes -- `dtfe_metal_check` (parity, repeat, per-tet A/B, shared grid, exact
-average), `gpu_scalar_check`, the PS linear-deposit / vertex-mass / volume-weighted / halo-release /
-hidden-streams / caustic-class / non-periodic / point-exact-serve suites and the smoke test -- at
-warp 32 and at warp 64, with the same parity figures as the Metal backend. A run on an NVIDIA or AMD
-machine remains the final word.
-
-## Remaining (optional)
-
-1. Skip allocating unused moment grids (saves GPU memory when only density is requested).
-2. Persistent GPU grids across partitions (skip per-partition readback/re-upload).
-3. Split giant tets of the SAMPLED phase-space deposit across threads (the exact deposit and the
-   exact average already split below the tetrahedron).
-
-## Caveats
-
-- Single GPU; no multi-GPU. Unified memory (`StorageModeShared`) avoids host↔device copies on Apple Si.
-- Atomic-add ordering is non-deterministic → ULP-level run-to-run variation where the sums are float (fine for
-  science, not bit-reproducible): the PS velocity and dispersion moments, the standard shared full grid
-  (`DTFE_GPU_SHARED=1`) and the `*_FLOAT_GRIDS=1` A/B modes. Accumulation via `atomic_uint` fixed-point is done for
-  the PS mass grid (2026-10-08) and every standard-DTFE `_a` grid (2026-10-13; chunks aligned to 256 items so the
-  SIMD-group sums are fixed), which are bit-reproducible (the PS mass grid per partition: several partitions in
-  flight are still added in float in the order they finish, unless `--ordered-merge`).
-- Requires Metal 3 (Apple7+/M-series) for native `atomic_float`. Verified on M1 Max.
-- Fields grids at 512³ are 20 floats/cell ≈ 10.7 GB (mass 1 + momentum 3 + σ second-moment 6 +
-  gradient 9 + streams 1). Fits M1 Max 64 GB unified memory; use the partition sub-grid (integration
-  step 3) to shrink it.
-- The m2 accumulator sums w·v_i·v_j in float32 (v ~ 10³ km/s ⇒ terms ~10⁶·w); fine at current scales
-  (validated to 1e-7 vs CPU float), but consider Kahan or fixed-point if grids get much hotter. The
-  raw-second-moment σ cancellation this implies is inherited from the production CPU path by design.
-- The harness skips zero-mass tets (production deposits them with weight 0 into stream counts —
-  irrelevant for physical masses).
+| variable | effect |
+|---|---|
+| `DTFE_GPU_ITEMS=0` | standard DTFE: the per-tet kernel instead of the item kernels |
+| `DTFE_GPU_ITEM_SAMPLES=n`, `DTFE_GPU_CACHE_K=2\|4\|8`, `DTFE_GPU_TABLE=0` | item length (48), cell-cache slots (2), no threadgroup table |
+| `DTFE_GPU_EXACT_CELLS=n` | cells per `--exact-average` item (16) |
+| `DTFE_GPU_SHARED=1`, `DTFE_GPU_SHARED_GB` | one shared full grid on the device (sampled, float sums), its cap |
+| `PS_EXACT_ITEMS=0`, `PS_EXACT_ITEM_CELLS=n` | the one-thread exact deposit; cells per item (16) |
+| `PS_METAL_CHUNK` / `PS_GPU_CHUNK`, `DTFE_METAL_CHUNK` / `DTFE_GPU_CHUNK` | the starting chunk size |
+| `PS_METAL_TIMING=1`, `DTFE_METAL_TIMING=1` (or `*_GPU_TIMING`) | one line per kernel run / batch |
+| `DTFE_GPU_DEBUG_NOWRITE`, `DTFE_GPU_DEBUG_NOATOMIC=1\|2\|3` | timing experiments |
+| `*_FLOAT_MASS`, `*_FLOAT_MOMENTS`, `*_FLOAT_GRIDS` | the float sums, for A/B (see Exact sums) |
+| `DTFE_GPU_CHECKPOINT_CHUNKS=n`, `DTFE_GPU_PACE_RECOVER_SEC=s`, `DTFE_GPU_FAULT_AT=k[:cause]` | snapshots, pace recovery, fault injection |
+| `GPU_EMU_WARP=64` | the emulation's warp width |

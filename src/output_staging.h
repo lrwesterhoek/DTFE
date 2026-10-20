@@ -1,6 +1,5 @@
-/*  Crash-safe outputs (2026-10-11). Every result was in RAM until the very last step, written in place over the
-    previous run's files, and a missing output folder at that step ended the run with exit(1): a T7 that dropped
-    off during an 8 h run threw the grids away, and a kill during the write phase left a mixed old/new set. Now:
+/*  Crash-safe outputs: every result is in RAM until the very last step, so a disk that drops off during a long
+    run must not throw the grids away, and a kill during the write phase must not leave a mixed old/new set:
 
       * each output file is written as '<file>.part.<pid>' and the whole set is renamed into place only once
         every file is written (outputStageCommit), so the folder only ever shows a complete old or new set;
@@ -10,14 +9,14 @@
         it, and exits with status 3 -- the hours of computing are kept;
       * a folder that vanishes after some files were written sends the remaining ones to the rescue folder; the
         files staged before it went may still be on the disk as '.part.<pid>' (a USB disk that comes back): the
-        run lists them with the mv that puts each in place (2026-10-11: it called them lost);
+        run lists them with the mv that puts each in place;
       * at the start of a run, '.part.<pid>' leftovers of THIS output name whose pid no longer runs are deleted --
         except one whose final file is missing: it may be the only copy of that output, so it is kept and its
-        place and mv are printed (2026-10-11).
+        place and mv are printed.
 
     Header-only: the state is one function-local static shared by main.cpp, input_output.cc (the grid
     writers' openOutput*File) and ps_point_eval.cc (the '.pts_*' writer). Before outputStageBegin() every
-    path passes through unchanged, so a writer used outside the write phase behaves as before. */
+    path passes through unchanged, so a writer used outside the write phase writes straight to its path. */
 #ifndef OUTPUT_STAGING_H
 #define OUTPUT_STAGING_H
 
@@ -106,7 +105,7 @@ inline int outputStageCleanStale(std::string const &outputFilename)
         if ( pid <= 0 or pid == long( ::getpid() ) ) continue;
         if ( ::kill( pid_t( pid ), 0 ) == 0 or errno == EPERM ) continue;   // that writer is alive
         // no final file beside it: a write phase whose rename failed (the disk went away and came back) may
-        // have left the only copy here -- never delete that one (2026-10-11)
+        // have left the only copy here -- never delete that one
         std::string const finalPath = dir + "/" + f.substr( 0, f.rfind( ".part." ) );
         struct stat st;
         if ( ::stat( finalPath.c_str(), &st ) != 0 )
@@ -231,7 +230,7 @@ inline int outputStageCommit()
     if ( not s.rescue and unplaced.empty() ) { s.committedOk = true; return 0; }
     if ( not unplaced.empty() )
     {
-        // 2026-10-11: these were called lost, but a disk that drops off and comes back still holds them as
+        // these are not lost: a disk that drops off and comes back still holds them as
         // '.part.<pid>' -- the next run keeps a part whose final file is missing (outputStageCleanStale), yet
         // deletes it where an older final file exists, so the mv must happen before the rerun
         std::fprintf( stderr, "~~~ OUTPUT RESCUE ~~~ %zu file(s) written to '%s' before it went away could not be put "

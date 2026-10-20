@@ -1,13 +1,12 @@
-"""Void-centred stacked profiles in r / R (survey item 8, 2026-10-05): the density, the radial
+"""Void-centred stacked profiles in r / R: the density, the radial
 velocity and the single-stream fraction around the catalogue's voids, averaged over spherical shells,
-stacked in bins of R with bootstrap bands. R is the MEASURED void radius R_v by default (2026-10-07:
-pipeline.void_radius_cells, where the spherically averaged smoothed density contrast first rises to 0), or the
-ellipsoid's R_eff (radius='r_eff'; with distinct=False and the old bins the profiles before 2026-10-07): R_eff is a
-curvature length, ~1.75x R_v
-(median R_v/R_eff 0.53-0.65 in TNG100 and TNG300 at z = 0, 1, 5), and in the R_eff stacks the density reached
-the mean, v_r turned to infall and the single-stream fraction bottomed out all at 0.5-0.7 R_eff -- at R_v.
+stacked in bins of R with bootstrap bands. R is the MEASURED void radius R_v by default
+(pipeline.void_radius_cells, where the spherically averaged smoothed density contrast first rises to 0), or the
+ellipsoid's R_eff (radius='r_eff'): R_eff is a curvature length, ~1.75x R_v (median R_v/R_eff 0.53-0.65 in TNG100 and
+TNG300 at z = 0, 1, 5), and in the R_eff stacks the density reached the mean, v_r turned to infall and the single-stream
+fraction bottomed out all at 0.5-0.7 R_eff -- at R_v.
 In the R_v stacks the raw density crossing the mean at 1.0 R_v is the definition of R_v (the first up-crossing of
-the SMOOTHED profile), a check of the smoothing against the raw density, not a finding (2026-10-11); the infall
+the SMOOTHED profile), a check of the smoothing against the raw density, not a finding; the infall
 radius, the compensation ridge and the single-stream fraction are independent of it.
 
     from dtfelib import pipeline, profiles
@@ -46,19 +45,19 @@ profile taken flat inside the first shell), gives v_r(r) = -(1/3) f(z) H(z) a r 
 comoving (fields.get_cosmology_params: f = Omega_m(z)^0.55, H in km/s/Mpc). What the measured v_r panel
 would be if the voids expanded linearly: the comparison is the point of the figure.
 
-THE INTERIOR SINGLE-STREAM FRACTION (2026-10-11, interior_single_fraction): per void, the fraction of the
+THE INTERIOR SINGLE-STREAM FRACTION (interior_single_fraction): per void, the fraction of the
 cells whose centres lie within x R of the void's cell centre (periodic) that are single-stream, for x in
 INTERIOR_X = (0.5, 1.0): a VOLUME fraction counted cell by cell, not the x^2-weighted integral of the shells
 (whose first shell sits at 0.1 R). void_profiles returns it as 'single_interior' (n_voids, len(INTERIOR_X)).
 
-THE UNIVERSAL PROFILE (2026-10-11, hsw_delta / fit_hsw / fit_stack): Hamaus, Sutter & Wandelt (2014, PRL 112,
+THE UNIVERSAL PROFILE (hsw_delta / fit_hsw / fit_stack): Hamaus, Sutter & Wandelt (2014, PRL 112,
 251302) delta(r) = delta_c (1 - (r/r_s)^alpha) / (1 + (r/R_v)^beta), with r in units of the stack's own R
 (x = r/R, so R_v = 1 and r_s is r_s/R_v), fitted by scipy's curve_fit to a stack's mean rho/rho_bar - 1 with
 the stack's scatter as the error of each shell (std / sqrt(n) over its voids, absolute_sigma). The shells of one
 stack are correlated (the same voids), so chi2/dof is a guide, not a probability.
 
-THE R_V DEFINITION (contract C3, 2026-10-11): radius='r_v' takes catalog.r_v_mpc(cat, definition) with
-definition in catalog.R_V_DEFINITIONS ('crossing' = today's R_v, 'delta08', 'ridge'); a catalogue without that
+THE R_V DEFINITION: radius='r_v' takes catalog.r_v_mpc(cat, definition) with
+definition in catalog.R_V_DEFINITIONS ('crossing' = the default R_v, 'delta08', 'ridge'); a catalogue without that
 key (all NaN) falls back to 'crossing' and says so.
 """
 
@@ -87,7 +86,7 @@ def default_edges_mpc(sigma_mpc: float, box_mpc: float, radius: str = "r_v") -> 
     """Bin edges in R for a stack in this simulation: DEFAULT_EDGES_SIGMA[radius] x sigma, closed at the wrap
     rule's cap L/6 (3 R <= L/2: a void beyond it is dropped anyway). Both radii scale with the smoothing (R_eff is a
     curvature length, 5-7 sigma for most voids passing the 10-sigma cut; R_v of the distinct ones 2-7.5 sigma), in
-    EVERY simulation, while the old Mpc edges 0-2-4-8-16 put no TNG300 void in any bin (2026-10-07)."""
+    EVERY simulation, while the Mpc edges 0-2-4-8-16 (DEFAULT_EDGES) put no TNG300 void in any bin."""
     if not float(sigma_mpc) > 0:
         raise ValueError(f"the smoothing length must be positive, got {sigma_mpc!r} (pipeline.smoothing_length_mpc)")
     if radius not in DEFAULT_EDGES_SIGMA:
@@ -151,7 +150,7 @@ def profile_grids(grids: dict, centers_frac, r_eff_cells, bins=DEFAULT_BINS, m: 
     if not len(r_eff):
         return out
     if single is not None:
-        # converted ONCE (2026-10-11): inside the bin loop it was a fresh 512 MB float32 copy of a 512^3 mask per bin
+        # converted ONCE: inside the bin loop it would be a fresh 512 MB float32 copy of a 512^3 mask per bin
         # (30 bins); the ngp gather reads the same values either way
         single = np.asarray(single).astype(np.float32)
     for j, x in enumerate(bins):
@@ -167,7 +166,7 @@ def profile_grids(grids: dict, centers_frac, r_eff_cells, bins=DEFAULT_BINS, m: 
 def interior_single_fraction(single, coords, radii_cells, x=INTERIOR_X) -> np.ndarray:
     """(n_voids, len(x)): per void, the fraction of the cells whose CENTRES lie within x * R of the void's cell
     centre (periodic; 'coords' (n, 3) integer cells, 'radii_cells' (n,) R in cells) that are True in 'single'
-    (N,N,N) bool -- the interior single-stream VOLUME fraction (2026-10-11). The void's centre is its cell's centre,
+    (N,N,N) bool -- the interior single-stream VOLUME fraction. The void's centre is its cell's centre,
     so the offsets to the other cells' centres are whole cells and the centre cell itself is always counted.
     NaN for a void without a finite positive radius."""
     single = np.asarray(single)
@@ -191,9 +190,9 @@ def interior_single_fraction(single, coords, radii_cells, x=INTERIOR_X) -> np.nd
 
 
 def r_v_by_definition(cat, definition: str = "crossing", say=print) -> tuple[np.ndarray, str]:
-    """(R_v in Mpc per catalogue row, the definition used): catalog.r_v_mpc(cat, definition) (contract C3,
-    2026-10-11). A catalogue without that definition's key (r_v_<definition>_cells: built before the definitions),
-    or a catalog module without it, falls back to 'crossing', today's R_v, said through 'say'. A key that is there
+    """(R_v in Mpc per catalogue row, the definition used): catalog.r_v_mpc(cat, definition).
+    A catalogue without that definition's key (r_v_<definition>_cells: built before the definitions),
+    or a catalog module without it, falls back to 'crossing', the default R_v, said through 'say'. A key that is there
     but NaN everywhere is an answer, not a gap: delta08 is undefined at z >= 3 in TNG100 (the enclosed contrast
     never reaches -0.8), and a fallback there would mix two definitions on one axis."""
     if definition == "crossing":
@@ -217,7 +216,7 @@ def void_profiles(products, bins=DEFAULT_BINS, m: int = DEFAULT_M, sample: str =
                   distinct: bool = True, definition: str = "crossing", interior=INTERIOR_X) -> dict:
     """profile_grids() on one snapshot's grids and catalogue (pipeline.SnapshotProducts): the voids of the
     'sample' ('resolved': well_resolved; 'deep': well_resolved and deep) with a finite 'radius' ('r_v', the
-    measured catalog.r_v_mpc under 'definition' (contract C3), or 'r_eff', catalog.r_eff_mpc), only the distinct
+    measured catalog.r_v_mpc under 'definition', or 'r_eff', catalog.r_eff_mpc), only the distinct
     ones of them unless distinct=False, the frame checked by catalog.frame_of. Adds 'r_mpc' (the radius the shells
     are in), 'r_v_mpc', 'r_eff_mpc', 'radius', 'distinct', 'delta_c', 'sample', 'cell_mpc', 'n_grid', 'definition',
     and on phase-space grids 'single_interior' (interior_single_fraction at 'interior' x R) and 'single_box' (the

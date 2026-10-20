@@ -56,7 +56,7 @@ void psPointEvalFinalize(User_options const &userOptions);
 // README (PS-DTFE point evaluation) for the exact file layout.
 void psPointEvalWriteOutputs(User_options const &userOptions);
 
-// '--resume' of a partitioned '--sample-points' run (2026-10-13; partition_checkpoint.h). The stream records
+// '--resume' of a partitioned '--sample-points' run (partition_checkpoint.h). The stream records
 // are the point evaluation's only accumulators, and each belongs to the ONE partition that owns its
 // tetrahedron, so they are kept per partition and checkpointed as such:
 //   psPointEvalSetPartition    the partition the calling thread deposits (DTFE.cpp's batch loop, beside the
@@ -100,7 +100,7 @@ void psServeCompositeAddPartition(int index, User_options &partOptions,
                                   double const *ownLo, double const *ownHi);
 [[noreturn]] void psServeCompositeRun(User_options &userOptions);
 
-// Standard binary, PARTITIONED point evaluation (the composite '--serve' above and, since 2026-10-13, a batch
+// Standard binary, PARTITIONED point evaluation (the composite '--serve' above and a batch
 // '--sample-points' run with '--partition'): a tetrahedron belongs to the partition whose Eulerian sub-box holds
 // its centroid, so a point is answered by exactly one partition. psPointEvalOwnBox turns a sub-box of the split
 // into that ownership box: lo/hi are the sub-box, outerLo/outerHi[d] say that its face on axis d is a face of the
@@ -130,7 +130,7 @@ bool psTessellationCached(User_options const &opts);
 
 // The deposit passes since the last reset that asked for the GPU (--ps-gpu) and ran on the CPU instead
 // (ps_interpolation.cc); reset = true also zeroes the count. Each pass warns itself, but the partition
-// loop runs its non-master threads at verbose 0, so DTFE() reports the count after the loop (2026-10-08).
+// loop runs its non-master threads at verbose 0, so DTFE() reports the count after the loop.
 int psGpuFallbacksTaken(bool reset = false);
 
 // Auto-tune: the mean number of streams at a random point of the box -- sum|V_Euler| over
@@ -138,7 +138,7 @@ int psGpuFallbacksTaken(bool reset = false);
 // patches, before any triangulation of the run exists. Needs the particles' Lagrangian
 // positions (phase-space runs). Returns < 0 when it cannot tell (too few particles, 2D);
 // *patchesUsed = the patches that contributed. Deterministic for given data.
-// regionLo/regionHi (2026-10-11, optional): the mean over that EULERIAN box instead of the whole box -- the
+// regionLo/regionHi (optional): the mean over that EULERIAN box instead of the whole box -- the
 // slab of a '--sample-points' plane, whose stream count can be 3x below the box mean when it misses the big
 // haloes. Only patches whose Eulerian image meets the region are triangulated, and each tetrahedron counts
 // the part of its Eulerian extent inside it. Falls back to the box mean when fewer than 16 patches meet it.

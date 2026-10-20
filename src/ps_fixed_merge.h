@@ -1,12 +1,12 @@
-/* THE FIXED-POINT MERGE of the PS-DTFE partition loop ('--fixed-point-merge', DTFE.cpp; 2026-10-15, OPT-IN).
+/* THE FIXED-POINT MERGE of the PS-DTFE partition loop ('--fixed-point-merge', DTFE.cpp; OPT-IN).
 
    The default merge (the staged ordered merge, DTFE.cpp) adds each partition's sub-grid -- Real values, each an exact
    fixed-point sum of the deposit rounded to Real once, so a partition's values do not depend on the run -- into float
    full grids in partition INDEX order: float adds do not commute, so only one order gives the same bits, and a
    partition that finishes early must park (in RAM, or spilled to disk) until its turn. This mode adds every partition
    AS IT FINISHES into exact INTEGER full-grid accumulators instead; integer adds commute, so the result cannot depend
-   on the completion order, the concurrency or the thread count, and nothing parks. Luuk asked for it as an opt-in to
-   compare its memory and speed against the default on TNG data; the default is unchanged.
+   on the completion order, the concurrency or the thread count, and nothing parks. It is opt-in, for comparing its
+   memory and speed against the default merge.
 
    THE ACCUMULATORS. Every accumulator addFromSubgrid SUMS (forEachSummed below: its '+=' list; caustic_bits and
    hidden_streams are OR-merged, order-free already, and stay Real grids, as do the T-web / V-web labels, which no
@@ -16,7 +16,7 @@
    with __builtin_add_overflow; on a signed overflow the carry takes the sign of q. A cell is then carry * 2^64 + word,
    an exact 72-bit integer whatever the order of the adds. The integer arrays replace the pre-sized Real grids when
    the merge is set up, before the first partition starts (so the memory gate's free-memory reading holds them, as
-   the default's holds its Real grids; review, 2026-10-15), except those of the grids no partition fills (derived
+   the default's holds its Real grids), except those of the grids no partition fills (derived
    after the merge); an accumulator the default grows at its first values (the moment weights) gets its arrays at a
    partition's first value of it (the units are fixed before, so the allocation order changes nothing); the Real full
    grids do not exist during the loop (the pre-sized ones are freed when the merge is set up). Allocations of >= 1 GB
@@ -227,10 +227,10 @@ struct Merge
                 s.K = 37 - e + shift;    // S * 2^K in [2^36, 2^37)
                 s.presized = v.size();
                 V().swap( v );           // the Real grid: none during the loop
-                // its integer twin NOW, before any partition starts (review, 2026-10-15): allocated at the first
-                // merge instead, the memory gate admitted the first partitions with a free-memory reading that did
-                // not hold the 9 B grids yet (the default's Real grids are pre-sized before the loop, so its gate
-                // saw them) -- a hand-set --max-concurrent could then overcommit. Not for the grids no partition
+                // its integer twin NOW, before any partition starts: allocated at the first merge instead, the
+                // memory gate would admit the first partitions with a free-memory reading that does not hold the
+                // 9 B grids yet (the default's Real grids are pre-sized before the loop, so its gate sees them) --
+                // a hand-set --max-concurrent could then overcommit. Not for the grids no partition
                 // fills (derived after the merge); those not pre-sized (the moment weights) still come with their
                 // first values, as the default's do.
                 if ( s.presized > 0 and not derivedAfterMerge( name ) )

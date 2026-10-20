@@ -26,8 +26,6 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PY="${PYTHON:-python3}"
-command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/python3.14
 ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT}"
 source "${SCRIPT_DIR}/precision.sh"     # DTFE_TEST_PRECISION=double: the double pair
@@ -45,17 +43,13 @@ echo "============================================================"
 echo " PS-DTFE --ps-vertex-mass check   N=${N}^3  grid=${GRID}^3  alpha=${ALPHA}"
 echo "============================================================"
 
-if [ "${1:-}" != "--no-build" ] && ! precision_double; then
-    echo ">> building PS-DTFE ..."
-    BUILD_MODE="$(cat o_ps/.build_mode 2>/dev/null || true)"
-    make PS-DTFE ${BUILD_MODE:+"$BUILD_MODE"} >/dev/null
-fi
+build_target "${1:-}" PS-DTFE o_ps
 [ -x "${BIN}" ] || { echo "FAIL: ${BIN} not built"; exit 1; }
 GPU_BUILT=0
 [ -f o_ps/.gpu_mode_off ] || GPU_BUILT=1
 # capture FIRST -- piping the binary straight into grep -q would SIGPIPE it under pipefail
 # a help that fails is a broken binary, not a missing feature; a missing feature fails under DTFE_TEST_REQUIRED=1
-# (skip_or_fail, tests/precision.sh: 2026-10-08)
+# (skip_or_fail, tests/precision.sh)
 FULL_HELP="$("${BIN}" --full_help 2>/dev/null)" || { echo "FAIL: ${BIN} --full_help exited non-zero"; exit 1; }
 if ! grep -q -- '--ps-vertex-mass' <<<"${FULL_HELP}"; then
     skip_or_fail "this PS-DTFE has no --ps-vertex-mass support."
@@ -101,11 +95,7 @@ run() {  # $1 = output root, $2 = input snapshot, rest = extra flags
         --input 105 --MpcUnit 1 --verbose 1 --avg-subsamples 1 --periodic "$@" > "$log" 2>&1
     local rc=$?
     set -e
-    if [ "$rc" -ne 0 ]; then
-        echo "   ERROR: PS-DTFE exited with code $rc -- last 25 lines of $log:"
-        tail -n 25 "$log" | sed 's/^/      | /'
-        exit 1
-    fi
+    die_on_failed_run "$rc" "$log"
 }
 
 echo ">> run 1: uniform box, --ps-vertex-mass"
@@ -188,8 +178,8 @@ check("C perturbed-IC mass conserved (vertex-mass)", abs((dv + 1).mean() - 1.0) 
 # ---------- (E) mass survives dropped tets: the degree counts only DEPOSITING tets ----------
 # Crossed waves at this amplitude drop a handful of degenerate (non-invertible) Eulerian
 # cells. Because deg(v) counts only deposit-surviving tets, the dropped tets' vertex shares
-# renormalize onto the kept tets and the total stays sum(m_v) -- before this, every dropped
-# tet took its shares with it (deficit ~ the dropped fraction; 0.74% at TNG z=0, 5.8e-4 here).
+# renormalize onto the kept tets and the total stays sum(m_v) -- counting every tet would let each dropped
+# tet take its shares with it (deficit ~ the dropped fraction; 0.74% at TNG z=0, 5.8e-4 here).
 dc = load(f"{tmp}/pvm_crw_vm", ".den")
 check("E crossed-waves mass survives dropped tets", abs(dc.mean() - 1.0) < 5e-5,
       f"mean = {dc.mean():.8f} (pre-fix binaries: ~0.99942)")

@@ -18,7 +18,7 @@
    dispersion is identically 0. The context, bucket index, reduction and writers below are
    shared verbatim; only the per-triangulation worker differs (interpolatePoints_standard).
    --per-stream/--per-stream-ids and --ps-stream-density are PS-only (rejected at option
-   parsing); the legacy Sample_point mechanism is untouched.
+   parsing); the Sample_point mechanism is a separate path.
 
    Per-stream density comes in two variants (--ps-stream-density):
      'dtfe'      (default) linear interpolation of the Lagrangian-vertex DTFE densities
@@ -28,7 +28,7 @@
      'geometric' the constant per-tetrahedron density m_tet / V_eul (= rho_bar V_lag/V_eul)
                  -- the density whose cell-averaged, quantized rendering the mass-conserving
                  grid deposit produces. Discontinuous across tetrahedra, conserves mass.
-   Both follow the run's grid conventions since 2026-10-13 ('--pts-conventions grid', the default):
+   Both follow the run's grid conventions ('--pts-conventions grid', the default):
    under --ps-vertex-mass they carry the grid's tetrahedron masses through a per-vertex mass-model
    ratio, under --ps-volume-weighted the per-point velocity, its gradient and the scalar are
    equal-volume stream means (see 'The grid deposit's conventions at the points' below);
@@ -62,7 +62,7 @@
        the same way in all tetrahedra.
    A cheap double-precision classification decides every point that is not within a
    rigorous per-tetrahedron uncertainty band of a face; only the band goes to the exact
-   predicates, so the common path costs what the old tolerance test did.
+   predicates, so the common path costs what a tolerance test would.
 
    Each triangulation's cells are processed by a small thread pool (pointEvalThreads): all
    cores for a single-triangulation run, cores / concurrent partitions inside the
@@ -231,7 +231,7 @@ struct Context
     bool   ptsScalar = false;       // --pts-scalar: also interpolate the vertex scalars per stream
     bool   ptsLagrangian = false;   // --pts-lagrangian (PS): also record each stream's Lagrangian coordinate
     bool   useGeometric = false;    // variant used for totals, weights and per-stream output
-    // the grid deposit's conventions, followed by the points since 2026-10-13 ('--pts-conventions grid', the
+    // the grid deposit's conventions, followed by the points ('--pts-conventions grid', the
     // default; 'legacy' clears both): see the notes at interpolatePoints_phaseSpace and psPointEvalFinalize
     bool   vertexMass = false;      // --ps-vertex-mass: the grid's tetrahedron masses in both per-stream densities
     bool   volumeWeighted = false;  // --ps-volume-weighted: equal-volume stream means (velocity, its gradient, scalars)
@@ -248,8 +248,8 @@ struct Context
     // one; a composite server's partition owns its own region. The PS worker's ownership is the
     // Lagrangian-centroid test inside psFilterCell (the partition's lagrangianRegion) instead.
     OwnBox own;
-    // a batch '--sample-points --partition' run set a partition's box here (psPointEvalSetOwnership,
-    // 2026-10-13): finalize() then words its overlap warning for partitions
+    // a batch '--sample-points --partition' run set a partition's box here (psPointEvalSetOwnership):
+    // finalize() then words its overlap warning for partitions
     bool   ownPartitioned = false;
 
     size_t nPoints = 0;
@@ -264,13 +264,13 @@ struct Context
     // The stream records of every point, appended in BLOCKS by (possibly concurrent) workers.
     // An entry is the uint32 point index followed by the PACKED record (RecLayout: only the
     // members the options fill); finalize() groups the entries by point with a counting sort.
-    // Records used to live in one std::vector per point (a heap block each) and every worker
-    // held its partition's hits UNPACKED (~200 B each) until one merge at the end: 16.8M points
-    // at 2.1M particles peaked at 28 GB. Now a worker holds one block at most.
+    // A worker holds one block at most: one std::vector per point (a heap block each), with every
+    // worker holding its partition's hits UNPACKED (~200 B each) until one merge at the end, would
+    // peak at 28 GB for 16.8M points at 2.1M particles.
     std::vector< std::vector<unsigned char> > recBlocks;
     // the partition each block's records belong to (psPointEvalSetPartition; -1 outside a partition loop), one
     // per block: a worker's sink serves one triangulation, so a block never mixes partitions. The '--resume'
-    // checkpoint saves a merged partition's blocks (2026-10-13)
+    // checkpoint saves a merged partition's blocks
     std::vector<int> recBlockPart;
     size_t nRecs = 0;
     RecLayout layout;
@@ -419,7 +419,7 @@ inline void canonicalQuery(uint32_t p, double pc[NO_DIM])
 // can: (1) the usual barycentrics on the wrapped geometry, outside the tetrahedron's fineBand;
 // (2) a double-precision classification in the canonical frame, outside its own (much
 // narrower) band; (3) the exact predicate. Every tier-1/2 decision equals the exact one, so
-// the whole test IS the exact, tie-consistent one -- at the cost of the old tolerance test
+// the whole test IS the exact, tie-consistent one -- at the cost of a plain tolerance test
 // for all but the points hugging a face. The returned bary[] are the usual interpolation
 // weights on the wrapped geometry (Ax stores edges as rows, so bary = inv^T * rel -- note the
 // [i][v] transpose). Shared by the PS and standard workers.
@@ -629,7 +629,7 @@ void psPointEvalInit(User_options &userOptions)
     g_ctx.useGeometric = userOptions.psStreamDensityGeometric;
     g_ctx.periodic     = userOptions.periodic;
 #ifdef PHASE_SPACE
-    // the grid deposit's mass model and velocity weighting, unless '--pts-conventions legacy' (2026-10-13)
+    // the grid deposit's mass model and velocity weighting, unless '--pts-conventions legacy'
     g_ctx.vertexMass     = userOptions.psVertexMass and not userOptions.psPtsLegacyConventions;
     g_ctx.volumeWeighted = userOptions.psVolumeWeighted and not userOptions.psPtsLegacyConventions;
     g_ctx.rhoBar       = double( userOptions.averageDensity );   // PS vertex densities are physical
@@ -686,7 +686,7 @@ void psPointEvalInit(User_options &userOptions)
 }
 
 
-/* Partitioned point evaluation in the standard binary (2026-10-13; ps_point_eval.h). The Eulerian tessellation of
+/* Partitioned point evaluation in the standard binary (ps_point_eval.h). The Eulerian tessellation of
    the whole box is cut into the partitions' sub-boxes, each triangulated with its padding, and a tetrahedron is
    OWNED by the partition whose sub-box holds its centroid (vertices min-image wrapped to vertex 0, standardCell).
    The sub-boxes tile the box -- neighbours share the SAME float cut (optimalPartitionSplit forms both sides from one
@@ -696,9 +696,7 @@ void psPointEvalInit(User_options &userOptions)
    from the owner's own triangulation, so the values agree to float rounding). Only the box's outer faces need care:
    on a periodic box they are the single run's primary-box faces, bit for bit, so the two images of a tetrahedron
    that straddles the seam are told apart exactly as in the single run; on a non-periodic one they open to
-   infinity, as the single run keeps every tetrahedron. The composite server used to compare float coordinates
-   for the outer faces (non-periodic only; periodic ones were the float cut), the same whenever the last cut lands
-   on the box face -- a box from 0 on its 64-per-axis split grid. */
+   infinity, as the single run keeps every tetrahedron. */
 void psPointEvalOwnBox(double const lo[], double const hi[], bool const outerLo[], bool const outerHi[],
                        double ownLo[], double ownHi[])
 {
@@ -818,7 +816,7 @@ void setQueryRecords()
     std::vector< std::vector<unsigned char> >().swap( g_ctx.recBlocks );
     std::vector<int>().swap( g_ctx.recBlockPart );
     g_ctx.nRecs = 0;
-    if ( std::getenv("DTFE_PTS_FULL_RECORDS") )     // test switch: store every member, as before
+    if ( std::getenv("DTFE_PTS_FULL_RECORDS") )     // test switch: store every member, unpacked
         g_ctx.layout.init( true, true, true, true, true );   // packing (tests/ps_point_eval_check.sh compares)
     else
         g_ctx.layout.init( g_ctx.ptsDenGrad, g_ctx.ptsVelGrad, g_ctx.perStreamIds, g_ctx.ptsScalar, g_ctx.ptsLagrangian );
@@ -906,17 +904,16 @@ inline bool anyPointInBuckets(int const bLo[NO_DIM], int const bHi[NO_DIM])
 
 namespace psPointEvalDetail {
 
-/* The grid deposit's conventions at the points (2026-10-13, '--pts-conventions grid', the default).
+/* The grid deposit's conventions at the points ('--pts-conventions grid', the default).
 
-   The 13 October audit found the production planes and grids of the same run measuring different things: the
-   grids used --ps-vertex-mass (tetrahedron masses from the particles, m_tet = sum_v m_v/deg_v) and
-   --ps-volume-weighted (volume-weighted velocity moments), the planes rho_bar*V_lag masses and density-weighted
-   stream means. With TNG's evolved z = 127 positions as the Lagrangian input rho_bar*V_lag carries the initial
-   contrast, so every density mode of a plane came out filtered by 1 - D(z_ic)/D(z): at z = 20 the 4096^2 plane's
-   contrast was 0.81-0.82 times the grid's (rms 0.211 against 0.280), and its multi-stream velocity divergence 2-4x
-   smaller.
+   Without them the planes and grids of the same run measure different things: the grids use --ps-vertex-mass
+   (tetrahedron masses from the particles, m_tet = sum_v m_v/deg_v) and --ps-volume-weighted (volume-weighted
+   velocity moments), the planes rho_bar*V_lag masses and density-weighted stream means. With TNG's evolved
+   z = 127 positions as the Lagrangian input rho_bar*V_lag carries the initial contrast, so every density mode of
+   a plane comes out filtered by 1 - D(z_ic)/D(z): at z = 20 a 4096^2 plane's contrast is 0.81-0.82 times the
+   grid's (rms 0.211 against 0.280), and its multi-stream velocity divergence 2-4x smaller.
 
-   Under --ps-vertex-mass both point estimators now carry the grid's tetrahedron masses, through ONE number per
+   Under --ps-vertex-mass both point estimators carry the grid's tetrahedron masses, through ONE number per
    vertex: the ratio of the two mass models over the vertex's star of depositing tetrahedra,
 
        c_v = sum_{t in star(v)} m_tet / sum_{t in star(v)} rho_bar V_lag(t)      (the grid's / rho_bar V_lag),
@@ -929,7 +926,7 @@ namespace psPointEvalDetail {
      'geometric'  rho_tet -> rho_tet <c_v>, the mean over the tetrahedron's vertices: (V_lag/V_eul)(t) times the
                   local Lagrangian density. Over the depositing cells this conserves the grid's mass exactly,
                   sum_t V_lag(t) <c_v> rho_bar = sum_v M(star_v)/(d+1) = sum_t m_tet.
-   With the default masses c_v = 1 and both are the old estimators. Why not m_tet/V_eul(t) itself, the grid's own
+   With the default masses c_v = 1 and both are the plain estimators. Why not m_tet/V_eul(t) itself, the grid's own
    per-tetrahedron density: near-lattice initial conditions (TNG's) tile with near-flat slivers whose equal vertex
    shares give them a normal mass in almost no volume -- a cell average of the grid holds that mass, a POINT is
    almost never inside such a sliver: on a 32^3 crossed-wave box (jitter 0.05) a 64^3 point set's mean density
@@ -938,7 +935,7 @@ namespace psPointEvalDetail {
    24^3 lattice, jitter 0.01: vertex std 0.19 against 0.08). The non-periodic hull cells keep their constant density,
    corrected the same way; the density gradient (--pts-den-grad) belongs to the corrected 'dtfe' profile. Under
    --ps-volume-weighted the per-point velocity, its gradient and the scalar are equal-weight stream means
-   (psPointEvalFinalize). '--pts-conventions legacy' keeps the old estimators; without the two grid options both
+   (psPointEvalFinalize). '--pts-conventions legacy' keeps the plain estimators; without the two grid options both
    choices run the same code, byte for byte.
 
    c_v is computed by prepareVertexMass over the whole tessellation (the batch worker per partition, before the
@@ -1149,7 +1146,7 @@ void interpolatePoints_phaseSpace(DT &dt, User_options &userOptions)
             // the same matrix as the grid deposit's velGrad (ps_interpolation.cc
             // matrixMultiplication(posMatInv, dvel)), stored TRANSPOSED: the grid writes it
             // [j*3+d] (field_computation.h velocityGradient), a point [d*3+j] (measured on a rigid
-            // rotation, 2026-10-03). The velocity profile is linear on every
+            // rotation). The velocity profile is linear on every
             // kept cell -- hull cells included -- so there is no volume-ratio gate here.
             for (int d = 0; d < NO_DIM; ++d)
                 for (size_t j = 0; j < noVelComp; ++j)
@@ -1572,7 +1569,7 @@ void psPointEvalFinalize(User_options const &userOptions)
         }
         if ( g_ctx.volumeWeighted and nS > 0 )
         {
-            // --ps-volume-weighted under the grid conventions (2026-10-13): the grid weights each stream's
+            // --ps-volume-weighted under the grid conventions: the grid weights each stream's
             // velocity, gradient and scalar by the Eulerian volume it fills in the cell, and at a point every one
             // of its streams fills the point -- equal shares, so the plain mean over the streams (the sorted
             // order, as above). The DISPERSION stays what the grid keeps it: the mass-weighted second moment about
@@ -1680,7 +1677,7 @@ void psPointEvalFinalize(User_options const &userOptions)
             << ( covered < N ? "  (uncovered points lie outside the tessellation or in empty regions)" : "" )
             << "\n" << MESSAGE::Flush;
 #ifndef PHASE_SPACE
-    // The safety net above used to be silent (2026-10-13). The Eulerian tessellation gives every point exactly one
+    // The safety net above warns: the Eulerian tessellation gives every point exactly one
     // containing tetrahedron (exact containment), and on a periodic box every point has one. A second record, or
     // none on a periodic box, means that a tetrahedron was OWNED twice or not at all: by partitions (or a composite
     // server's) whose padding does not reproduce the tessellation near their faces, or -- the same in a single run --
@@ -1794,13 +1791,12 @@ void psPointEvalWriteOutputs(User_options const &userOptions)
 }
 
 
-/* ---- '--resume' with '--sample-points' (2026-10-13) --------------------------------------------------------
+/* ---- '--resume' with '--sample-points' ---------------------------------------------------------------------
 
-   Every production run log said 'no checkpoints: a --sample-points run cannot be resumed': the planes are made by
-   the grid runs themselves, so a killed run (TNG50-3-Dark z = 0: 2.5 h, partitions 5-10 in flight; a future
-   8192^2 plane) restarted from zero. The point evaluation's only accumulators are the stream records, and each
-   record belongs to the one partition that owns its tetrahedron; but they were one pool, filled by every
-   partition in flight, so a checkpoint could not say which of them went with the partitions it lists. Now every
+   The planes are made by the grid runs themselves, so without checkpoints a killed run (TNG50-3-Dark z = 0:
+   2.5 h, partitions 5-10 in flight) would restart from zero. The point evaluation's only accumulators are the
+   stream records, and each record belongs to the one partition that owns its tetrahedron; one pool filled by
+   every partition in flight could not say which records go with the partitions a checkpoint lists, so every
    block carries its partition (a sink serves one triangulation, so a block never mixes two), and a checkpoint
    (partition_checkpoint.h) writes, BEFORE its manifest, one file per merged partition not saved yet:
 
@@ -1814,7 +1810,7 @@ void psPointEvalWriteOutputs(User_options const &userOptions)
    outputs are byte-identical to an uninterrupted run's (tests/ps_resume_points_check.sh). The files hold the
    bytes the run keeps in memory anyway, once: a 4096^2 plane with --pts-vel-grad at z = 0 (~4 streams per point,
    118 B per entry) writes ~8 GB over the whole run, inside the checkpoint's 5% time throttle and room rule.
-   The STANDARD binary's partition loop tags its records the same way since 2026-10-14 (DTFE.cpp; one record per
+   The STANDARD binary's partition loop tags its records the same way (DTFE.cpp; one record per
    point there, from the partition owning its tetrahedron), so a standard '--sample-points --partition' run is
    checkpointed and resumed by the same files ('DTFE-PS-POINTS 1' names the format, shared by both binaries; the
    key hash in each header keeps a standard run's files from being read into a PS run and the other way round). */
@@ -2018,8 +2014,8 @@ void psPointEvalRemoveUnsaved(std::string const &dir, std::vector<char> const &s
        char[8]  "DTFEERR1",  uint64 length,  char message[length]
    and the session continues.
 
-   Version 2 (2026-09-30) added the scalar/Lagrangian arrays and the partition counts; the
-   header changed with it, so a version-1 client stops at the handshake instead of misreading. */
+   Version 2 has the scalar/Lagrangian arrays and the partition counts that version 1 lacks; its
+   header differs too, so a version-1 client stops at the handshake instead of misreading. */
 
 static int g_serveFd = -1;   // the protocol channel: a private duplicate of the original stdout
 
@@ -2454,9 +2450,9 @@ namespace psPointEvalDetail {
 static const int OCC_N = 64;                 // occupancy buckets per axis (32 KB per partition)
 // A partition's cell index is built only once the partition has answered this many requests by
 // walking its cells while in memory. Measured on TNG100-3-Dark's 14.3M-vertex partitions: the index
-// took 18-22 s to build, a walk for a 512^2 zoom (or a click) 1.1-1.4 s, a request through the index
-// 0.2-0.9 s -- so building it on the first request made the first zoom or click in a region 3-15x
-// slower, and a partition evicted again (a region needing more partitions than fit) rebuilt it every time.
+// takes 18-22 s to build, a walk for a 512^2 zoom (or a click) 1.1-1.4 s, a request through the index
+// 0.2-0.9 s -- so building it on the first request would make the first zoom or click in a region 3-15x
+// slower, and a partition evicted again (a region needing more partitions than fit) would rebuild it every time.
 static const uint64_t INDEX_AFTER_WALKS = 8;
 // Memory of a resident partition, for the automatic resident set: its tessellation per vertex (the
 // server's RSS with 8 resident 3.65M-vertex partitions: 664 B/vertex; the same figures as
@@ -2616,8 +2612,8 @@ static std::string occPath(User_options const &o) { return TessellationCache::ca
 static void writeOccupancy(ServePart const &P)
 {
     std::string const desc = TessellationCache::makeDescriptor( P.opts );
-    // the temp name is this writer's own (2026-10-08): the composite server and a batch run share the cache
-    // folder, and two writers of one map truncated one '.tmp' under each other
+    // the temp name is this writer's own: the composite server and a batch run share the cache
+    // folder, and two writers of one map would truncate one shared '.tmp' under each other
     std::string const path = occPath( P.opts ), tmp = path + ".tmp." + std::to_string( long( ::getpid() ) );
     std::ofstream f( tmp.c_str(), std::ios::binary | std::ios::trunc );
     if ( not f ) return;
@@ -2683,7 +2679,7 @@ inline double serveTriBytes(ServePart const &P)
     return SERVE_TRI_BYTES_PER_VERTEX * double( std::max<uint64_t>( P.nVertices, 1 ) );
 }
 
-// the memory of the resident CACHED partitions (uncached ones are pinned and not counted, as before)
+// the memory of the resident CACHED partitions (uncached ones are pinned and not counted)
 static double residentBytes()
 {
     double b = 0.;
@@ -2858,8 +2854,8 @@ void psServeCompositeAddPartition(int const index, User_options &partOptions,
     // which cached partitions may be in memory at once: --serve-resident N of them, else as many as
     // fit in the auto-tune memory budget -- their tessellations (SERVE_TRI_BYTES_PER_VERTEX) plus the
     // cell indexes that exist (built only when they fit too, see the request loop). Counting an index
-    // for every partition (850 B/vertex, before 2026-10-02) kept TNG100-3-Dark's server at 3 resident
-    // 14.3M-vertex partitions where 4 fit, so a zoom needing 4 reloaded one every time.
+    // for every partition (850 B/vertex) would keep TNG100-3-Dark's server at 3 resident
+    // 14.3M-vertex partitions where 4 fit, so a zoom needing 4 would reload one every time.
     // DTFE_SERVE_BUDGET_GB overrides the budget (tests).
     g_comp.byBytes = false;
     if ( userOptions.serveResident > 0 )
@@ -2925,9 +2921,9 @@ void psServeCompositeAddPartition(int const index, User_options &partOptions,
         // background threads -- as many as fit under the resident cap once the partitions this request
         // does not need are dropped -- while the resident ones are evaluated. A load (inflate + CGAL
         // deserialization, ~8 s for a 6M-vertex TNG100-3 partition) is independent of every other, so
-        // k loads take about one load's time on k cores. The evaluation ORDER is unchanged (resident
-        // first, then the others in 'need' order), so every answer is too. Partitions beyond the cap
-        // are loaded one at a time afterwards, as before.
+        // k loads take about one load's time on k cores. The evaluation ORDER does not depend on the
+        // loads (resident first, then the others in 'need' order), so no answer does. Partitions beyond the
+        // cap are loaded one at a time afterwards.
         std::vector<size_t> toLoad;
         std::vector<char> inNeed( nParts, 0 );
         for (size_t const p : need)
@@ -3212,8 +3208,8 @@ void psWriteOccupancyIfMissing(DT &dt, User_options &partOpts)
 
 #else // NO_DIM != 3
 
-// Point evaluation and '--serve' exist in 2D and 3D builds (2D since 2026-10-02/03; the server's
-// handshake carries the dimension). These stubs only keep any other NO_DIM linking.
+// Point evaluation and '--serve' exist in 2D and 3D builds (the server's handshake carries the
+// dimension). These stubs only keep any other NO_DIM linking.
 #include "triangulation_common.h"
 #ifdef PHASE_SPACE
 void interpolatePoints_phaseSpace(DT &, User_options &) {}
@@ -3340,7 +3336,7 @@ double psEstimateMeanStreams(std::vector<Particle_data> const &particles, double
         }
         return c;
     };
-    // The length of [lo,hi] inside the region on axis d, over the periodic images (2026-10-11)
+    // The length of [lo,hi] inside the region on axis d, over the periodic images
     auto overlap = [&](double lo, double hi, int d) {
         double sum = 0.;
         for (int k = (periodic ? -1 : 0); k <= (periodic ? 1 : 0); ++k)
@@ -3351,7 +3347,7 @@ double psEstimateMeanStreams(std::vector<Particle_data> const &particles, double
         return sum;
     };
 
-    // '--sample-points' region (2026-10-11): the candidate patches are the Lagrangian cells whose Eulerian image
+    // '--sample-points' region: the candidate patches are the Lagrangian cells whose Eulerian image
     // meets the region -- the image's bounding box from one pass over the particles, each position taken at its
     // minimum image from the cell's Lagrangian centre (displacements stay below half a box), so a cell across the
     // box edge is not stretched over the whole axis

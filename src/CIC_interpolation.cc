@@ -67,7 +67,7 @@ void CIC_interpolation(vector<Particle_data> *particles,
 
 
 // CIC kernel policy for the shared engine: linear weights over a 3-cell stencil (one side
-// always zero); boundary particles use the stencil clipped to the grid (2026-10-11, see the engine).
+// always zero); boundary particles use the stencil clipped to the grid (see the engine).
 struct CIC_kernel
 {
     static int const STENCIL = 3;

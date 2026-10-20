@@ -151,7 +151,7 @@ struct Density_header
         if ( userOptions.regionOn and not userOptions.regionMpcOn )
         {
             for (size_t i=0; i<userOptions.region.size(); ++i )
-                userOptions.region[i] = userOptions.boxCoordinates[2*(i/2)] + userOptions.region[i] * (userOptions.boxCoordinates[2*(i/2)+1]-userOptions.boxCoordinates[2*(i/2)]);   // axis i/2 ([i%2] until 2026-10-11)
+                userOptions.region[i] = userOptions.boxCoordinates[2*(i/2)] + userOptions.region[i] * (userOptions.boxCoordinates[2*(i/2)+1]-userOptions.boxCoordinates[2*(i/2)]);   // axis i/2
             userOptions.regionMpcOn = true;
         }
         

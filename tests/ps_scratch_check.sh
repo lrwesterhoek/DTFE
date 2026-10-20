@@ -10,14 +10,14 @@
 #     WITHOUT scratch) and the unpartitioned deposit paths. It is the same memory semantics,
 #     so anything but equality is a bug.
 #  B) GPU parity path (GPU builds): scratch + --ps-gpu also bit-identical to plain --ps-gpu (exact
-#     fixed-point GPU sums since 2026-10-14; a float tolerance until 2026-10-15).
+#     fixed-point GPU sums).
 #  C) NO LEFTOVER FILES: scratch files are unlinked at creation, so the directory must be
 #     empty after every run -- even though GBs flowed through it.
 #  D) GUARDS: an iCloud path and a nonexistent directory are both rejected up front.
-#  S) the staged ordered merge's SPILL (2026-10-15) into the scratch folder, with the sub-grids themselves in
+#  S) the staged ordered merge's SPILL into the scratch folder, with the sub-grids themselves in
 #     scratch mappings: bit-identical to A's --max-concurrent 1 run, and C covers its files too.
 #
-# Portable (2026-10-11): runs on Linux too (tests/ci_suite.sh core); B is GPU-only and SKIPs on a CPU build.
+# Portable: runs on Linux too (tests/ci_suite.sh core); B is GPU-only and SKIPs on a CPU build.
 #
 # Usage: tests/ps_scratch_check.sh [--no-build]
 
@@ -33,7 +33,7 @@ N="${N:-64}"; BOX="${BOX:-100.0}"
 BIN="./PS-DTFE"
 TMP="${DTFE_TEST_TMP:-${TMPDIR:-/tmp}/dtfe-tests}"; mkdir -p "${TMP}"
 SNAP="${TMP}/scr_input_pancake.hdf5"
-# a LOCAL temp folder on either system (was /private/tmp: macOS only; 2026-10-11 Linux port). TMPDIR on a Mac is
+# a LOCAL temp folder on either system (not /private/tmp: macOS only). TMPDIR on a Mac is
 # /var/folders/..., local and never under iCloud, which the binary would refuse (section D)
 SC="$(mktemp -d "${TMPDIR:-/tmp}/dtfe-scratch-check.XXXXXX")"
 trap 'rm -rf "${SC}"' EXIT
@@ -48,7 +48,7 @@ if [ "${1:-}" != "--no-build" ]; then
     make PS-DTFE ${BUILD_MODE:+"$BUILD_MODE"} >/dev/null
 fi
 [ -x "${BIN}" ] || { echo "FAIL: ${BIN} not built"; exit 1; }
-# GPU deposit compiled in: the build mode names a backend (o_ps/.gpu_mode_off alone also called the CUDA
+# GPU deposit compiled in: the build mode names a backend (o_ps/.gpu_mode_off alone would also call the CUDA
 # emulator and a never-stamped tree "GPU")
 GPU_BUILT=0
 grep -Eq "METAL=1|CUDA=1|HIP=1|CUDAEMU=1" o_ps/.build_mode 2>/dev/null && GPU_BUILT=1
@@ -89,10 +89,9 @@ compare_outputs "${TMP}/scr_u_ref" "${TMP}/scr_u_mm" "A unpartitioned"
 if grep -q "SCRATCH:" "${TMP}/scr_p_mm.log"; then check "A arming banner printed" 1; else check "A arming banner printed" 0; fi
 
 # ---------- (B) GPU parity path ----------
-# Since 2026-10-14 every grid of a GPU deposit is an exact 64-bit fixed-point sum (the mass since 2026-10-08,
-# the moments since 2026-10-14; ps_deposit_params.h PSFxGrid), and --max-concurrent 1 merges the partitions in
-# index order, so the scratch run equals the plain --ps-gpu run byte for byte, as the CPU runs of A do. (Until
-# 2026-10-15 this compared to a float tolerance: the float atomics of before landed in a different order per run.)
+# Every grid of a GPU deposit is an exact 64-bit fixed-point sum (the mass and the moments; ps_deposit_params.h
+# PSFxGrid), and --max-concurrent 1 merges the partitions in index order, so the scratch run equals the plain
+# --ps-gpu run byte for byte, as the CPU runs of A do.
 if [ "${GPU_BUILT}" -eq 1 ]; then
     echo ">> B: GPU deposit path (exact fixed-point sums: bit-identity)"
     "${BIN}" "${SNAP}" "${TMP}/scr_g_ref" "${BASEARGS[@]}" --ps-gpu --partition 2 2 2 \
@@ -110,7 +109,7 @@ else
     echo "   SKIP  B (this build has no GPU backend)"
 fi
 
-# ---------- (S) the staged ordered merge's spill into the scratch folder (2026-10-15) ----------
+# ---------- (S) the staged ordered merge's spill into the scratch folder ----------
 # four partitions in flight, partition 0 held back so the others park, every parked one SPILLED (DTFE_MERGE_SPILL=1)
 # to --scratch-dir while the tiny threshold puts their sub-grids themselves in scratch mappings: freed mappings and
 # sub-grids read back into new ones, through the replaced operator new/delete. Byte-identical to A's mc=1 run, and

@@ -32,20 +32,13 @@ struct PSCellGeometry
 // on success 'g' holds the wrapped positions and edge-matrix geometry every consumer needs.
 //
 // checkSingularInverse: additionally drop cells whose matrixInverse() is the ALL-ZERO matrix
-// (|det| below REAL_PRECISSION x the product of the edge lengths -- a RELATIVE, unit-free test
-// since 2026-09; the old absolute |det| < 1e-6 dropped every small but well-shaped tetrahedron,
-// losing their mass; counted in *nDegenerateInverse when given). A zero inverse
-// makes every barycentric coordinate below exactly 0, which the point-in-simplex test then
-// reads as "inside" for EVERY grid point in the cell's bounding box -- so the cell floods its
-// whole axis-aligned bbox. That is the source of the grid-aligned "square" artefacts: worst
-// at caustics (flat, collapsed cells cluster there) and amplified by sub-sampling (nSub>1
-// puts more sample points inside the bbox). A collapsed cell has no reliable Eulerian
-// volume, so drop it; an adjacent non-degenerate stream covers the region. NOTE: this must
-// stay consistent with matrixInverse()'s degeneracy criterion. With both tests relative, the
-// pre-filter below (|det| < 1e-6 avgEdge^3, avgEdge the largest vertex-star mean) already implies
-// it (avgEdge^3 >= the product of the vertex-0 edge lengths, by AM-GM, for any labelling), so this
-// check is now a safety net -- keep it anyway: the zero
-// sentinel is what the "square" artefact came from, and the Metal kernel mirrors it.
+// (|det| below REAL_PRECISSION x the product of the edge lengths: a RELATIVE test, as an absolute one would
+// drop small well-shaped tetrahedra; counted in *nDegenerateInverse when given). A zero inverse makes every
+// barycentric coordinate exactly 0, which the point-in-simplex test reads as "inside" for every grid point of the
+// cell's bounding box: the cell floods its bbox, the grid-aligned "square" artefacts at caustics. The
+// degeneracy pre-filter below already implies this test (see there), so it is a safety net, kept because the
+// zero sentinel is what the artefact comes from and the Metal kernel mirrors it. It must stay consistent
+// with matrixInverse()'s degeneracy criterion.
 // 'skipOwnership': apply every CHART-INDEPENDENT filter (dummy, hull artefact, degeneracy)
 // but NOT the Lagrangian-partition ownership tiling. Used by the --ps-vertex-mass degree
 // pass, which must count a vertex's GLOBALLY-depositing incident tets: ownership only decides
@@ -79,17 +72,12 @@ inline bool psFilterCell(Cell_handle &cell,
     }
 #endif
 
-    // Lagrangian-partition ownership: padding zones overlap, so keep a cell only if its
-    // Lagrangian centroid (not an arbitrary vertex) lies in the primary box -> tiles without double-counting
-    //
-    // Decided as sum_v (x_v - edge) against 0, per edge (2026-10-13) -- lo <= centroid < hi exactly when
-    // sum (x_v - lo) >= 0 and sum (x_v - hi) < 0. Each x_v - edge is a difference of two Reals, exact in double,
-    // and where the answer is close (every vertex within a tetrahedron's extent of the edge) so is their sum, in
-    // any order CGAL lists the vertices. A tetrahedron and its periodic copy -- an exact shift by L at the
-    // periodic seam (subpartition.h psPeriodicSeam), whose period's edges are exactly L apart -- therefore get
-    // complementary answers bit for bit: one of them is owned, never both or neither. The old test (the raw
-    // coordinates summed, divided by NO_DIM+1, compared) gives the same answers whenever that sum is exact,
-    // i.e. unless a coordinate ~2^-29 of the others' size made it round.
+    // Lagrangian-partition ownership: padding zones overlap, so a cell is kept only if its Lagrangian centroid (not
+    // an arbitrary vertex) lies in the primary box, and the partitions tile without double counting. Decided per edge
+    // as sum_v (x_v - lo) >= 0 and sum_v (x_v - hi) < 0: each x_v - edge is exact in double, and so is their sum where
+    // the answer is close, in any vertex order. A tetrahedron and its periodic copy (an exact shift by L,
+    // subpartition.h psPeriodicSeam) thus get complementary answers bit for bit: exactly one is owned. (Summing the
+    // raw coordinates first can round, and then both or neither may be owned.)
     if ( !skipOwnership && !userOptions.lagrangianRegion.isNullBox() )
     {
         bool owned = true;
@@ -109,16 +97,12 @@ inline bool psFilterCell(Cell_handle &cell,
         if (!owned) { return false; }
     }
 
-    // Non-periodic clouds (--ps-alpha-shape): keep only the tetrahedra of the cloud's ALPHA SHAPE,
-    // whose Lagrangian circumradius is at most psLagAlphaRadius (3 mean spacings by default). Interior
-    // tetrahedra of lattice-like initial conditions stay below ~0.9 spacings (measured on jittered
-    // lattices and on TNG100-3 ICs); the cut removes the flat slivers on the convex hull and the
-    // tetrahedra bridging concavities, which are no flow elements -- a hull sliver joins particles up
-    // to a whole cloud face apart, and its stretched Eulerian image put spurious mass and streams
-    // across the region. They are also why --partition runs differed from single ones: the hull of a
-    // nearly flat face is a GLOBAL object, built differently by each partition, whereas a tetrahedron
-    // within the cut is in a partition's Delaunay triangulation exactly when it is in the global one
-    // (its empty circumsphere lies inside the padded box: the partition plan pads by >= 4 cuts).
+    // Non-periodic clouds (--ps-alpha-shape): keep only the cloud's ALPHA SHAPE, the tetrahedra whose Lagrangian
+    // circumradius is at most psLagAlphaRadius (default 3 mean spacings; interior tetrahedra of lattice-like ICs stay
+    // below ~0.9). This drops the hull slivers and the tetrahedra bridging concavities, which are no flow elements
+    // and smear spurious mass and streams across the region. They are also GLOBAL objects that each partition builds
+    // differently, whereas a tetrahedron within the cut is in a partition's triangulation exactly when it is in the
+    // global one (its empty circumsphere lies inside the padded box: the plan pads by >= 4 cuts).
     // A drop filter, so it applies with skipOwnership too; a function of the four vertices only.
     if ( userOptions.psLagAlphaRadius > 0. )
     {
@@ -200,23 +184,13 @@ inline bool psFilterCell(Cell_handle &cell,
     g.cellDet = determinant(g.Ax);
     g.cellAbsDet = std::fabs(g.cellDet);
 
-    // drop only degenerate cells (near-zero Eulerian volume -> divergent 1/volume density).
-    // |det| < tol*(mean edge)^3 is resolution-independent.
-    //
-    // The edge scale is the LARGEST over the NO_DIM+1 vertices of the mean squared length of the edges
-    // meeting there (2026-10-12). It used to be the edges at vertex 0 only -- and which vertex CGAL calls 0
-    // follows the insertion history, so it differs between a single triangulation and every --partition /
-    // --padding / --ps-lag-padding / parallel-insert variant of it. Folded tetrahedra at a caustic sit right
-    // at the cut (a 32^3 crossed-wave test: ratios 2e-7 .. 1.2e-6 for the four labellings of one tet), so ~20
-    // of them were kept by one run and dropped by the other: their whole mass (most are centroid-fallback
-    // tets) appeared or vanished in one cell -- '.a_den' 0.7 relative in ~40 cells, hidden-stream flags and
-    // '.a_streams' samples flipping, and with --ps-vertex-mass the degrees (and so every neighbour's mass)
-    // changing too. A function of the tetrahedron, not of its labelling, makes the kept set the same in
-    // every run. The maximum (not the 6-edge mean) because it bounds the vertex-0 scale of EVERY labelling:
-    // a kept tet then passes matrixInverse()'s relative test (product of the vertex-0 rows <= their mean^3,
-    // AM-GM) and the GPU kernels' float re-check (vertex-0 mean) whatever order it arrives in, so neither
-    // can reintroduce the order dependence. Only the order-ambiguous tets change: kept under every
-    // labelling -> still kept, dropped under every labelling -> still dropped.
+    // Drop only degenerate cells (near-zero Eulerian volume -> divergent 1/volume density): |det| < tol * edge^3,
+    // resolution-independent. The edge scale is the LARGEST over the vertices of the mean squared length of the edges
+    // meeting there: a function of the tetrahedron, not of CGAL's labelling. (Vertex 0 follows the insertion history,
+    // which differs with --partition / --padding / --ps-lag-padding / parallel insert, and folded caustic tets sit
+    // right at the cut, so a vertex-0 scale would keep a tet's mass in one run and drop it in another.) The maximum
+    // bounds the vertex-0 scale of EVERY labelling, so a kept tet also passes matrixInverse()'s relative test (product
+    // of the vertex-0 rows <= their mean^3, AM-GM) and the GPU kernels' float re-check (vertex-0 mean) in any order.
     double const DEGENERATE_DET_TOL = 1.e-6;
     {
         // squared edge lengths, each unordered pair once (wrapped positions, the frame of Ax)
@@ -271,9 +245,8 @@ inline bool psFilterCell(Cell_handle &cell,
 }
 
 
-/* --ps-vertex-mass, shared by the grid deposit (ps_interpolation.cc) and the point evaluation (ps_point_eval.cc,
-   2026-10-13). The grid deposit's degree pass and share mass moved here unchanged, so that both read one
-   definition.
+/* --ps-vertex-mass, shared by the grid deposit (ps_interpolation.cc) and the point evaluation (ps_point_eval.cc),
+   so that both read one definition.
 
    psForEachDepositingCell(dt, ..., f) calls f(cell, geometry) for every finite cell that DEPOSITS -- every
    chart-independent drop filter of psFilterCell, the Lagrangian ownership skipped (it decides WHICH partition

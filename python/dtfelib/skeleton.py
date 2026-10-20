@@ -1,4 +1,4 @@
-"""The caustic skeleton (survey item 9, 2026-10-05): walls, filaments and nodes from the 'caustic_class'
+"""The caustic skeleton: walls, filaments and nodes from the 'caustic_class'
 bitmask of a '--ps-caustics' run, as periodic connected components, with their volume and mass fractions,
 and -- per void of the catalogue -- how much caustic sits on its edge and how far the nearest wall is.
 
@@ -11,13 +11,13 @@ no tetrahedron ever deposited into it, 0: single-stream / uncollapsed only, 1: a
 collapsed and inverted), 2: a filament, 3: a node). The FRACTIONS are over these EXCLUSIVE classes
 ('none', 'k=0', 'k=1', 'k=2', 'k=3' = webstreams.COLLAPSE_BINS, so the two modules' tables agree and the
 fractions sum to 1), plus the fold (both map parities overlap the cell: pass fold=FieldSet.fold_mask(), the
-exact flag for grids of any date -- the mask's own parity bits, the default, are exact only for grids written
-since 2026-10-13, see io.caustic_is_fold), the A3 cusp and A4 swallowtail indicators (bits 7, 8, only under --ps-caustic-cusps) and the umbilic bit 6, each as a
-fraction alone (never labelled: they are proximity indicators). The COMPONENTS are built from the
-CUMULATIVE masks -- 'sheet' = k >= 1 (every collapsed cell: the walls with the filaments and nodes
-running through them), 'line' = k >= 2, 'node' = k = 3 -- because a wall is the connected sheet, not the
-sheet with its filaments cut out. Mass weights are the density grid (rho/rho_bar or physical: a
-constant cancels in every fraction).
+exact flag for any grid -- the mask's own parity bits, the default, are exact only for grids of
+the current binary, see io.caustic_is_fold), the A3 cusp and A4 swallowtail indicators (bits 7, 8, only under
+--ps-caustic-cusps) and the umbilic bit 6, each as a fraction alone (never labelled: they are proximity indicators). The
+COMPONENTS are built from the CUMULATIVE masks -- 'sheet' = k >= 1 (every collapsed cell: the walls with the filaments
+and nodes running through them), 'line' = k >= 2, 'node' = k = 3 -- because a wall is the connected sheet, not the sheet
+with its filaments cut out. Mass weights are the density grid (rho/rho_bar or physical: a constant cancels in every
+fraction).
 
 CONNECTIVITY AND THE PERIODIC BOX. label_periodic labels a mask with scipy.ndimage.label under a chosen
 connectivity (default 26 -- face, edge and corner neighbours: a sheet tilted to the grid falls apart into
@@ -32,8 +32,8 @@ the void's centre to the nearest sheet cell, from the Euclidean distance transfo
 of 'cutout_cells' half-width around the centre (np.take with wrap); no sheet in the cut-out -> NaN with
 the cut-out's half-width as the lower bound.
 
-THE CONTROL (2026-10-11; the per-void numbers alone -- per-sample fold shell 0.285 against a box fold fraction of 0.249, the
-wall at 0.105 R_v -- could not be interpreted): random_sphere_null draws the same metrics in random spheres with the
+THE CONTROL (the per-void numbers alone -- per-sample fold shell 0.285 against a box fold fraction of 0.249, the
+wall at 0.105 R_v -- cannot be interpreted): random_sphere_null draws the same metrics in random spheres with the
 voids' own radii, null_zscores gives the voids' median against the null's mean +- std as a z-score, and
 filter_components keeps only the sheet components above a size (cells) or mass threshold before the shells and the
 distance transform see them.
@@ -46,7 +46,7 @@ from scipy import ndimage
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 
-from .io import (CAUSTIC_DEGENERATE, CAUSTIC_PARITY_NEG, CAUSTIC_PARITY_POS, caustic_collapse_max, caustic_is_cusp,
+from .io import (CAUSTIC_DEGENERATE, CAUSTIC_PARITY_POS, caustic_collapse_max, caustic_is_cusp,
                  caustic_is_fold, caustic_is_swallowtail)
 
 CLASSES = ("none", "k=0", "k=1", "k=2", "k=3")                 # exclusive, = webstreams.COLLAPSE_BINS
@@ -58,14 +58,14 @@ def class_masks(caustic_class, fold=None) -> dict:
     """{'exclusive': {name: bool mask} over CLASSES, 'indicator': over INDICATORS, 'cumulative': over
     CUMULATIVE} of a caustic_class grid (any integer-valued array). 'fold' (bool, the grid's shape) replaces
     the mask's own fold bits as the 'fold' indicator: FieldSet.fold_mask() / io.caustic_is_fold(cc,
-    streams=, hidden=), the geometric flag for grids of any date (2026-10-13; the default is exact only for
-    grids written since then)."""
+    streams=, hidden=), the geometric flag for any grid (the default is exact only for
+    grids of the current binary)."""
     cc = np.rint(np.asarray(caustic_class)).astype(np.int64)
     kmax = caustic_collapse_max(cc)
     # every deposited SAMPLE sets a parity bit TOGETHER with one collapse bit; a cell with the det>0 parity bit and
     # no collapse bit comes from a parity-only grid (--ps-caustics with --ps-linear-deposit --ps-gpu writes the fold
-    # flag alone), which would read as 99.96% 'none' (review 2026-10-05). Bit 0 only (2026-10-13): the det<0 bit is
-    # the geometric overlap since then, legitimately alone in a cell a folded tetrahedron overlaps but no sample
+    # flag alone), which would read as 99.96% 'none'. Bit 0 only: the det<0 bit is
+    # the geometric overlap, legitimately alone in a cell a folded tetrahedron overlaps but no sample
     # reached (a coverage hole); a parity-only grid carries bit 0 in every deposited cell, so it is still refused.
     if np.any(((cc & CAUSTIC_PARITY_POS) != 0) & (kmax == -1)):
         raise ValueError("parity-only caustic_class grid (fold bits without collapse bits: a --ps-caustics "
@@ -180,7 +180,7 @@ def void_shell_fractions(caustic_class, centers_frac, r_eff_cells, shells=(1.0, 
     averaged over the shells: {'fold': (n,), 'sheet': (n,), 'shells': x, 'per_shell': {name: (n, len(x))}}.
     'masks' {'fold': bool grid, 'sheet': bool grid} replaces the class masks of 'caustic_class' (which may then be
     None): a sheet filtered by filter_components, or masks computed once for many calls (the random-sphere null).
-    Without 'masks' the fold is the mask's own parity bits, exact only for grids written since 2026-10-13: pass
+    Without 'masks' the fold is the mask's own parity bits, exact only for grids of the current binary: pass
     masks={'fold': FieldSet.fold_mask(), ...} for older ones (plot_caustic_skeleton does)."""
     from .profiles import fibonacci_sphere, shell_means
     if masks is None:
@@ -220,7 +220,7 @@ def nearest_wall_distance(sheet_mask, centers_cells, cutout_cells: int = 32, sta
     centres not yet resolved, up to 'cutout_cells'; with no sheet cell within that the distance is NaN and
     'bounded' True (the half-width is a lower bound). A wall found at d <= the half-width is THE nearest (every
     closer cell lies inside the cube), so the result is the one of a single search at 'cutout_cells' -- at a
-    fraction of the cost: a 100-cell cut-out for every void was 31x slower than 32 (2026-10-07)."""
+    fraction of the cost: a 100-cell cut-out for every void is 31x slower than 32."""
     mask = np.asarray(sheet_mask, dtype=bool)
     centers = np.asarray(centers_cells, dtype=np.float64).reshape(-1, 3)
     full = int(cutout_cells)
@@ -246,8 +246,8 @@ def filter_components(mask, min_cells: int = 0, density=None, min_mass_fraction:
                       connectivity: int = 26) -> tuple[np.ndarray, dict]:
     """The mask with only its periodic components of at least 'min_cells' cells AND at least 'min_mass_fraction' of
     the box's mass (with a density grid; rho/rho_bar or physical, the constant cancels): (filtered mask, {'n': the
-    components, 'kept', 'cells_removed', 'min_cells', 'min_mass_fraction'}). The caustic skeleton's control
-    (2026-10-11): a wall distance to a 3-cell flake of k >= 1 cells inside a void says nothing about its walls."""
+    components, 'kept', 'cells_removed', 'min_cells', 'min_mass_fraction'}). The caustic skeleton's control:
+    a wall distance to a 3-cell flake of k >= 1 cells inside a void says nothing about its walls."""
     mask = np.asarray(mask, dtype=bool)
     info = {"n": None, "kept": None, "cells_removed": 0, "min_cells": int(min_cells),
             "min_mass_fraction": float(min_mass_fraction)}
@@ -288,7 +288,7 @@ def sphere_metrics(masks, centers_cells, r_cells, n_grid: int, shells, cutout_ce
 
 def random_sphere_null(masks, r_cells, n_grid: int, shells, cutout_cells: int, n_draws: int = 50,
                        seed: int = 0) -> dict:
-    """The random-sphere null of the per-void wall metrics (2026-10-11): 'n_draws' realisations, each one sphere per
+    """The random-sphere null of the per-void wall metrics: 'n_draws' realisations, each one sphere per
     void at a uniformly random cell of the box carrying THAT void's radius (so the radius distribution is the voids'
     exactly), the same metrics (sphere_metrics) and per realisation their median over the spheres: {metric:
     (n_draws,) medians, 'bounded_fraction': (n_draws,)}. A void sample whose median sits several null standard

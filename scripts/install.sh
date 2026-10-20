@@ -160,14 +160,14 @@ info "step 2/6: build backend -> ${BACKEND}"
 
 # ---------------------------------------------------------------- 3/6 clean rebuild
 # The binaries already there are kept aside until the new ones have LINKED: 'make clean' then a failing
-# compile used to leave a user (re-running install.sh to add --double, say) with no ./PS-DTFE at all. The
+# compile would leave a user (re-running install.sh to add --double, say) with no ./PS-DTFE at all. The
 # build goes through a log; on a failure its tail and the usual causes are printed and the old binaries
-# come back. (survey rank 24, 2026-10-05)
+# come back.
 info "step 3/6: make clean + rebuild (jobs: ${JOBS})"
 # 'make clean' deletes EVERY binary set, the double and 2D ones too: the sets already built are noted first
 # and rebuilt below, with the double pair's backend and the 2D programs CPU-only as the Setup wizard builds
-# them. Until 2026-10-08 a re-run rebuilt only the single pair and threw the old binaries away, so a 2D
-# pair built from the launcher's Setup (or a double pair without --double) was silently gone.
+# them: rebuilding only the single pair would silently drop a 2D pair built from the launcher's Setup (or a
+# double pair built without --double).
 EXTRA_SETS=()                              # make arguments per extra set, after the single pair
 EXTRA_NAMES=""
 if [ -n "$PREC_ARG" ] || [ -f DTFE-double ] || [ -f PS-DTFE-double ]; then

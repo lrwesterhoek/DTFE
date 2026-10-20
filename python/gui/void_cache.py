@@ -1,5 +1,5 @@
 """The void catalogue of a run's grids: is it cached, and building it -- for the launcher's Runs tab and its
-'Build void catalogue' queue job (2026-10-11).
+'Build void catalogue' queue job.
 
 The catalogue is the analysis pipeline's own (pipeline.SnapshotProducts.voids(), cached under python/cache or
 DTFE_CACHE_DIR), in the frame ADOPTED from the grid (pipeline.adopt_snapshot_grid), exactly as the Explore tab's
@@ -60,7 +60,7 @@ def status_one(sim: str, snap: int, method: str, prefix: str | None, data_root=N
         if ok is None:
             return {"state": "stale", "why": "built from another version of the grid (rewritten since)"}
         import void_outlines as VO
-        why = VO.r_v_stale(ok)                       # the pipeline's own R_v test (catalog_r_v_ok), 2026-10-11
+        why = VO.r_v_stale(ok)                       # the pipeline's own R_v test (catalog_r_v_ok)
         if why:
             return {"state": "stale", "why": why}
         return {"state": "cached", "why": p.name}

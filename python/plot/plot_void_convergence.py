@@ -1,4 +1,4 @@
-"""Resolution and estimator convergence of the void statistics (2026-10-11): are the R_v distribution, the distinct-void
+"""Resolution and estimator convergence of the void statistics: are the R_v distribution, the distinct-void
 abundance and the stacked profiles properties of the voids, or of the grid, the particle mass, the field estimator?
 
 Three rows per redshift (dtfelib.convergence holds the machinery; every definition is the pipeline's: minima,
@@ -24,7 +24,7 @@ Outputs (figures/void_convergence/<sim>/[<smoothing tag>/]; never mirrored -- a 
   convergence_<set>.txt                  the numbers (per z: per factor, the masses, the estimators)
   convergence_<set>.npz                  the same as arrays
   estimator_voids_<snap>[_<set>].txt     (c)'s void-by-void table when both grids exist
-<set> is the method for its default grids, else the --prefix (set_name, 2026-10-11); with --prefix, row (c)'s side of
+<set> is the method for its default grids, else the --prefix (set_name); with --prefix, row (c)'s side of
 --method reads that set too. The coarse velocity is block-averaged as the run deposited it (volume or mass weighted:
 convergence.velocity_weighting, from the run log; named in the txt and npz).
 The coarse catalogues are cached under their own frame's namespace (python/cache/r256_s5_f5_.../..._voids_block2.npz).
@@ -59,9 +59,9 @@ PER_VOLUME = 1.0e6                   # densities per (100 Mpc)^3
 
 
 def set_name(method, prefix) -> str:
-    """The grid set a run reads (2026-10-11): the method for its own default grids ('ps_output.' / 'output.'), else
+    """The grid set a run reads: the method for its own default grids ('ps_output.' / 'output.'), else
     the prefix -- lagrangian.link_tag's and plot_void_population's name_tag rule. The output names carry it, so a
-    --prefix run no longer replaced the default set's figure, txt and npz (the default names are unchanged)."""
+    --prefix run never replaces the default set's figure, txt and npz."""
     default_prefix = {"ps": "ps_output.", "dtfe": "output."}
     if not prefix or str(prefix).rstrip(".") + "." == default_prefix.get(method):
         return method
@@ -83,8 +83,8 @@ def grid_rows(prod, args, factors, log=print) -> dict:
     vel = prod.fs.load("velocity", mode="ram") if (args.velocity and prod.fs.has("velocity")) else None
     ref_rows = cv.distinct_rows(ref, n)
     lo, hi = (k * sigma for k in args.rv_range)
-    # the coarse velocity the way the run deposited it (2026-10-11: always mass-weighted before, though the production
-    # PS-DTFE grids are volume-weighted, so the coarse v_r stacks were another quantity than the native one)
+    # the coarse velocity the way the run deposited it: the production PS-DTFE grids are volume-weighted, and a
+    # mass-weighted block mean would make the coarse v_r stacks another quantity than the native one
     weighting, why = cv.velocity_weighting(prod)
     if vel is not None:
         log(f"  velocity: {weighting}-weighted block means ({why})")
@@ -119,8 +119,8 @@ def grid_rows(prod, args, factors, log=print) -> dict:
 
 def estimator_rows(s, args, log=print):
     """(c) at one snapshot: PS-DTFE (reference) against DTFE, matched; None (said) without both grids. The side of
-    the run's --method reads the run's --prefix set (2026-10-11: both sides were always the default grids, so a
-    --prefix run's row (a) and row (c) came from different sets); 'sets' names the two."""
+    the run's --method reads the run's --prefix set (else a
+    --prefix run's row (a) and row (c) would come from different sets); 'sets' names the two."""
     method, prefix = getattr(args, "method", "ps"), getattr(args, "prefix", None)
     pfx = {m: (prefix if m == method else None) for m in ("ps", "dtfe")}
     ps = pipeline.products(s, sim=args.sim, method="ps", prefix=pfx["ps"], data_root=args.data_root)
@@ -167,9 +167,9 @@ def estimator_table(est, path):
 
 def load_crossbox(args):
     """(b): the crossbox per-box results at the common sigma UNDER THIS PROCESS'S VOID GATE (plot_void_crossbox's own
-    file tag, sigma_tag: '_gatenone' under DTFE_VOID_GATE=none); [] (said) when none is there. 2026-10-11 (review):
-    the glob was the gated name only, so an ungated run found no files and row (b) was lost -- the thesis recipe ran
-    the whole check gated for it, though rows (a) and (b) are R_v statistics, which the thesis takes ungated."""
+    file tag, sigma_tag: '_gatenone' under DTFE_VOID_GATE=none); [] (said) when none is there. The
+    gate matters: rows (a) and (b) are R_v statistics, which the thesis takes ungated, so an ungated run must find
+    the ungated files."""
     import plot_void_crossbox as cb
     d = Path(args.crossbox_dir).expanduser()
     tag = cb.sigma_tag(args.crossbox_smooth_mpc)
@@ -403,7 +403,7 @@ def main(argv=None):
     pipeline.apply_smoothing_args(args, "void-convergence")
     method = "ps" if args.method == "auto" else args.method
     args.method = method
-    name = set_name(method, args.prefix)                 # 'ps' / 'dtfe' for the default grids: the names as before
+    name = set_name(method, args.prefix)                 # 'ps' / 'dtfe' for the default grids: untagged names
     tag = "" if name == method else f"_{name}"
     use_data_root(args.data_root)
     ztab = gc.redshift_table(args.sim)

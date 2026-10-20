@@ -1,4 +1,4 @@
-"""The void radius of the size-function theory measured on the RAW density (2026-10-11): where the ENCLOSED density
+"""The void radius of the size-function theory measured on the RAW density: where the ENCLOSED density
 contrast Delta(<R) around a void centre first reaches DELTA_V_NONLINEAR = -0.8 going outward, on the unsmoothed DTFE
 rho/rho_bar -- 'delta08raw', beside catalog's 'delta08' (the same rule on the SMOOTHED field).
 
@@ -9,10 +9,10 @@ rho/rho_bar -- 'delta08raw', beside catalog's 'delta08' (the same rule on the SM
 
 WHY. The size function (theory.void_size_function, Vdn) counts spheres whose enclosed contrast has reached the
 shell-crossing -0.8. On the smoothed field that radius follows the smoothing length at every sigma tried (TNG100,
-10/5/3/2 cells: median 0.7-1.06 sigma) and measured/Vdn stays at 1e-3-1e-2 (~/DTFE-rerun/batch2-2026-10-11/
-convergence/notes.md): the -0.8 sphere of a smoothed minimum is a smoothing length. The raw field keeps the void's own
-emptiness (rho/rho_bar ~ 0.1 inside TNG voids), so the -0.8 sphere about a centre can be a void size -- if it does not
-scale with sigma; plot_void_population.py measures that (notes in its docstring).
+10/5/3/2 cells: median 0.7-1.06 sigma) and measured/Vdn stays at 1e-3-1e-2: the -0.8 sphere of a smoothed minimum is a
+smoothing length. The raw field keeps the void's own emptiness (rho/rho_bar ~ 0.1 inside TNG voids), so the -0.8 sphere
+about a centre can be a void size -- if it does not scale with sigma; plot_void_population.py measures that (notes in
+its docstring).
 
 THE MEASUREMENT. Centres: the catalogue's minima of the smoothed field, at their cell CENTRES ((i + 0.5) / N, as
 profiles and pipeline.void_radii_cells). Around each, the raw delta = rho/rho_bar - 1 is averaged over spherical shells
@@ -42,9 +42,9 @@ settings() (step, reach, directions, threshold, ALGORITHM). NOT on pipeline.r_v_
 range changes the distinct set, not these radii. Rows not yet measured are measured and added; written atomically
 (pipeline._save_npz: temp file, then rename).
 
-RE-CENTRING (raw_radii(..., recentre=True), 2026-10-12). The catalogue's centres are minima of the SMOOTHED field; the
-fixed-R size function still followed the smoothing (TNG300 z = 0: 0.84 / 0.78 / 0.58 of Vdn at 3.66 / 3 / 2 cells) and
-the guess was that a small-sigma minimum sits off the raw void's centre, so the raw -0.8 sphere about it is too small.
+RE-CENTRING (raw_radii(..., recentre=True)). The catalogue's centres are minima of the SMOOTHED field; the uncentred
+fixed-R size function follows the smoothing (TNG300 z = 0: 0.84 / 0.78 / 0.58 of Vdn at 3.66 / 3 / 2 cells), which a
+small-sigma minimum sitting off the raw void's centre would explain (the raw -0.8 sphere about it too small).
 The option moves each centre to the MINIMUM OF THE RAW DENSITY smoothed by RC_SMOOTH_CELLS (a Gaussian in CELLS, so it
 brings no sigma back; periodic) inside a ball of RC_SEARCH_FRAC x the void's own uncentred raw radius R0 about the
 catalogue centre, then measures the -0.8 radius there (raw_radii_cells, unchanged); up to RC_ITER passes, each
@@ -80,10 +80,10 @@ RAW_DIRS = 256              # Fibonacci directions per shell: twice R_V_DIRS, th
 RAW_LEVEL = theory.DELTA_V_NONLINEAR    # -0.8: the enclosed contrast of a void at shell crossing
 RAW_BLOCK = 24              # shells per outward block (voids that crossed are dropped between blocks)
 # Bumped by hand when the measurement changes (a cache records it in settings() and is re-measured otherwise):
-# 1 = 2026-10-11, the first up-crossing after the first point below the level.
+# 1 = the first up-crossing after the first point below the level.
 ALGORITHM = 1
 NAME = "voids_raw08"        # the cache's product name (products._cpath(NAME))
-# Re-centring (raw_radii(..., recentre=True), 2026-10-12; module docstring):
+# Re-centring (raw_radii(..., recentre=True); module docstring):
 RC_SMOOTH_CELLS = 1.0       # the light Gaussian on the raw density before its minimum is taken (cells, not sigma)
 RC_SEARCH_FRAC = 0.5        # the search ball: this x the uncentred raw radius R0 (x the crossing R_v without an R0)
 RC_ITER = 8                 # at most this many search passes; each searches about the last centre with the radius
@@ -269,7 +269,7 @@ def raw_radii(products, cat, rows=None, say=print, recentre=False) -> dict:
     """raw_radii_cells for the catalogue 'cat' of 'products' (pipeline.SnapshotProducts; its grids, frame and cache
     namespace) at the rows 'rows' (bool mask or indices; default cat['well_resolved']), cached (module docstring):
     {'r_cells', 'r_mpc', 'never_below', 'capped', 'measured', 'min_enclosed'}, every array per catalogue row (NaN /
-    False where not measured). recentre=True (2026-10-12): the radii about the RE-CENTRED centres (module docstring),
+    False where not measured). recentre=True: the radii about the RE-CENTRED centres (module docstring),
     cached apart (NAME_RC), plus 'coords_rc' (the catalogue's own cell where not measured), 'offset_cells', 'rule'."""
     if recentre:
         return _raw_radii_rc(products, cat, rows, say)
@@ -306,8 +306,9 @@ def raw_radii(products, cat, rows=None, say=print, recentre=False) -> dict:
                 "measured": np.zeros(nrow, bool), "min_enclosed": np.full(nrow, np.nan)}
     todo = np.nonzero(want_rows & ~have["measured"])[0]
     if todo.size:
-        # the grid the products already hold (2026-10-11): raw_radii is called while a fresh voids() build still has
-        # its density_raw (that same fs.density(units='mean')), and fs.density read a second 0.5 GB copy from disk.
+        # the grid the products already hold: raw_radii is called while a fresh voids() build still has
+        # its density_raw (that same fs.density(units='mean')), and fs.density would read a second 0.5 GB copy from
+        # disk.
         # Not the property: on a cached catalogue it would load the grid into the products until release()
         rho = getattr(products, "_ram", {}).get("density_raw")
         if rho is None:

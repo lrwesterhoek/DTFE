@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for the void-environment classification and the caustic skeleton's control (2026-10-11).
+"""Tests for the void-environment classification and the caustic skeleton's control.
 
   * SYNTHETIC (always run): the enclosed contrast against analytic profiles; void-in-cloud / void-in-void on a
     top-hat grid with and without a compensating shell, the wrap rule; classify_catalog's sample; the figure
@@ -12,7 +12,6 @@
 Usage:  python3 tests/py_environment_test.py            (exit 0 = pass)
 """
 
-import atexit
 import io as _io
 import os
 import shutil
@@ -25,38 +24,15 @@ from pathlib import Path
 
 import numpy as np
 
-REPO = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO / "python"))
-sys.path.insert(0, str(REPO / "python" / "plot"))
-_FIGS_TMP = tempfile.mkdtemp(prefix="env_figs_")      # before config is imported: never the real figure root
-os.environ["DTFE_FIGURES_ROOT"] = _FIGS_TMP
-os.environ["DTFE_NO_MIRROR"] = "1"
-atexit.register(shutil.rmtree, _FIGS_TMP, True)
+from _harness import REPO, check as _check, setup, summary
 
-PASS, FAIL, SKIP = [], [], []
+setup("env_figs_", mpl_agg=False)
 DATA_BACKED = False
 
 
 def check(name, fn):
-    try:
-        fn()
-        PASS.append(name)
-        print(f"  PASS  {name}")
-    except AssertionError as e:
-        FAIL.append(name)
-        print(f"  FAIL  {name}: {e}")
-    except FileNotFoundError as e:
-        if DATA_BACKED:
-            SKIP.append(name)
-            print(f"  SKIP  {name}  (data not on disk: {e})")
-        else:
-            FAIL.append(name)
-            print(f"  FAIL  {name}: FileNotFoundError: {e}")
-    except Exception as e:
-        import traceback
-        FAIL.append(name)
-        print(f"  FAIL  {name}: {type(e).__name__}: {e}")
-        print("".join("        " + ln for ln in traceback.format_exc().splitlines(True)[-6:]), end="")
+    """A missing file is a SKIP in the data-backed tier only (main() sets DATA_BACKED), a FAILURE before it."""
+    _check(name, fn, missing=(FileNotFoundError,), data_backed=DATA_BACKED)
 
 
 # ---------------------------------------------------------------- synthetic: the classification
@@ -190,7 +166,7 @@ def t_environment_script():
         text = buf.getvalue()
         out = Path(config.figures_path("void_environment")) / "SYN"
         names = sorted(q.name for q in out.iterdir())
-        # density_raw: the untagged names (2026-10-11: they keep what they held before the velocity default)
+        # density_raw: the untagged names (existing density_raw files keep their names)
         want = ["environment_evolution.png", "environment_stats.npz", "environment_tracking.png",
                 "environment_z0.00.png", "environment_z1.00.png"]
         assert names == want, (names, text[-500:])
@@ -360,8 +336,7 @@ def main():
     DATA_BACKED = True
     print("data-backed")
     check("TNG100-3-Dark z = 0: void-in-cloud fraction of the distinct resolved voids", t_tng100_vic)
-    print(f"\nRESULT: {len(PASS)} passed, {len(FAIL)} failed" + (f", {len(SKIP)} skipped" if SKIP else ""))
-    return 1 if FAIL else 0
+    return summary(blank_line=True, show_zero_skips=False)
 
 
 if __name__ == "__main__":

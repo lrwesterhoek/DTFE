@@ -1,33 +1,33 @@
 #!/usr/bin/env bash
-# The partition loop's run-time features (2026-10-11), on small synthetic snapshots:
+# The partition loop's run-time features, on small synthetic snapshots:
 #   R1  '--ordered-merge': two runs at --max-concurrent 4 merge in index order and write byte-identical grids
 #   R2  the partition look-ahead (forced on the CPU deposit with DTFE_PS_OVERLAP=1): every output byte-identical
 #       to '--ps-no-overlap', and the log says it ran
 #   R3  GPU builds only: the look-ahead of a '--ps-gpu' run at --max-concurrent 1 (on by default) against
-#       '--ps-no-overlap': every grid byte-identical (.den, .a_den, .streams, ... and since 2026-10-15 the velocity,
-#       an exact fixed-point sum like the rest since 2026-10-14); SKIP on a CPU build
+#       '--ps-no-overlap': every grid byte-identical (.den, .a_den, .streams, ... and the velocity, an exact
+#       fixed-point sum like the rest); SKIP on a CPU build
 #   R4  crash-safe outputs: a finished run leaves no '<file>.part.<pid>' and no progress sidecar; a stale
 #       '.part.<pid>' of a dead pid is removed at the start, one of a live pid is kept, and one whose final file
-#       is missing is kept with its mv (it may be the only copy, 2026-10-11); a run whose output
+#       is missing is kept with its mv (it may be the only copy); a run whose output
 #       folder is missing writes the whole set to $TMPDIR/dtfe-rescue/<folder>_<name>, byte-identical to a
 #       normal run, says so and exits 3
 #   R5  the progress sidecar '<output>.runlog.progress' while a run goes: the contract's keys, phase
-#       'partitions', done counting up to total; since 2026-10-11 also predicted_gb (-1 here: the split and the
+#       'partitions', done counting up to total; also predicted_gb (-1 here: the split and the
 #       concurrency are given, so the tuner predicts nothing) and peak_gb (> 0)
-#   R6  the SUMMARY's 'memory model' line (2026-10-11): a run whose concurrency the auto-tuner picks prints its
+#   R6  the SUMMARY's 'memory model' line: a run whose concurrency the auto-tuner picks prints its
 #       predicted peak against the measured one (macOS: the peak footprint), both positive; R5's run, with
 #       nothing left to the tuner, prints none
-#   R7  the STAGED ordered merge, the default since 2026-10-14. Partition 0 is held 2 s before its merge
+#   R7  the STAGED ordered merge, the default. Partition 0 is held 2 s before its merge
 #       (DTFE_TEST_DELAY_PARTITION=0:2), so the others finish first: with NO merge flag the run says it merges in
 #       index order, its 'ordered merge:' line counts staged partitions (> 0, none waiting), and every output is
-#       byte-identical to R1's '--ordered-merge' run; DTFE_MERGE_STAGE_GB=0 (no staging: the old ordered merge) and
+#       byte-identical to R1's '--ordered-merge' run; DTFE_MERGE_STAGE_GB=0 (no staging: the plain ordered merge) and
 #       a machine with no free memory (DTFE_FREE_GB=0.001: no room to stage) wait instead and are byte-identical too;
 #       '--completion-order-merge' says so, stages nothing and equals R1 to float rounding; it and '--ordered-merge'
 #       together are refused; a default run killed after 10 merges (DTFE_TEST_EXIT_AFTER_PARTITIONS=10) while
 #       partitions are staged has checkpointed exactly partitions 0-9 (the merge order is the index order) and
 #       resumes to R1's grids byte for byte; with the concurrency left to the auto-tuner (the memory gate guards
 #       every partition start) a partition is always staged, and the grids equal DTFE_MERGE_STAGE_GB=0's byte for byte.
-#       THE SPILL (2026-10-15): with no free memory a parked partition is spilled to disk (--scratch-dir, which is
+#       THE SPILL: with no free memory a parked partition is spilled to disk (--scratch-dir, which is
 #       empty afterwards: the files are unlinked) instead of waiting -- the 'ordered merge:' line counts the spills,
 #       none waited -- and DTFE_MERGE_SPILL=1 spills every parked one (the system temp folder, with DTFE_SPILL_MIN_GB=2:
 #       a CI runner has less than its 16 GB margin free; and under the memory gate): every output byte-identical to a
@@ -40,8 +40,6 @@ ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$ROOT" || exit 1
 source "${SCRIPT_DIR}/precision.sh"     # DTFE_TEST_PRECISION=double: the double pair
 precision_require "${PS_BIN}"
-PY="${PYTHON:-python3}"
-command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/python3.14
 [ -x "${PS_BIN}" ] || { echo "FAIL: ${PS_BIN} is not built"; exit 1; }
 BIN="$(cd "$(dirname "${PS_BIN}")" && pwd)/$(basename "${PS_BIN}")"
 TMP="${DTFE_TEST_TMP}/ps_runtime_check"
@@ -51,16 +49,7 @@ SNAP="$TMP/waves.hdf5"
     --jitter-frac 0.02 --seed 7 --crossed-waves >/dev/null || { echo "FAIL data gen"; exit 1; }
 PASS=0; FAILS=0
 check() { if [ "$2" = 0 ]; then PASS=$((PASS+1)); echo "  PASS $1"; else FAILS=$((FAILS+1)); echo "  FAIL $1"; fi; }
-# same <a> <b>: every output of run a has a byte-identical twin in run b (and there is at least one)
-same() {
-    local n=0 f
-    for f in "$1".*; do
-        case "$f" in *.log|*.runlog*|*.part.*) continue ;; esac
-        cmp -s "$f" "$2${f#"$1"}" || { echo "    differs: ${f#"$1"}"; return 1; }
-        n=$((n+1))
-    done
-    [ "$n" -gt 0 ]
-}
+# same <a> <b>: tests/lib.sh
 C=(--grid 48 --periodic --input 105 --MpcUnit 1 --verbose 2 --field density velocity density_a)
 
 echo ">> R1: --ordered-merge, --partition 3 3 3 --max-concurrent 4, twice"
@@ -82,13 +71,13 @@ grep -q "partition merge order  : partition index" "$TMP/st.log" && grep -q "PS-
 check "R7 no merge flag: index order, ${nst:-?} partition(s) staged, ${nwt:-?} waited" $?
 same "$TMP/o1" "$TMP/st"; check "R7 ... every output byte-identical to the --ordered-merge run (R1)" $?
 DTFE_MERGE_STAGE_GB=0 "${R7[@]}" "$TMP/st0" "${C[@]}" "${P3[@]}" > "$TMP/st0.log" 2>&1 || { echo "FAIL: st0 (see $TMP/st0.log)"; exit 1; }
-# no free memory and no spill (2026-10-15: with the spill on, such a partition goes to disk; below)
+# no free memory and no spill (with the spill on, such a partition goes to disk; below)
 DTFE_MERGE_SPILL=0 DTFE_FREE_GB=0.001 "${R7[@]}" "$TMP/stf" "${C[@]}" "${P3[@]}" > "$TMP/stf.log" 2>&1 || { echo "FAIL: stf (see $TMP/stf.log)"; exit 1; }
 grep -q "ordered merge: 0 partition(s) finished before their turn" "$TMP/st0.log" && ! grep -q " 0 waited for their turn" "$TMP/st0.log" \
     && grep -q "ordered merge: 0 partition(s) finished before their turn" "$TMP/stf.log" && grep -q "(no room to stage)" "$TMP/stf.log" \
     && same "$TMP/o1" "$TMP/st0" && same "$TMP/o1" "$TMP/stf"
 check "R7 DTFE_MERGE_STAGE_GB=0 and no free memory (DTFE_MERGE_SPILL=0): nothing staged, partitions wait their turn, byte-identical" $?
-# THE SPILL (2026-10-15): the reference is the same split at --max-concurrent 1 (no parking at all), on ONE thread:
+# THE SPILL: the reference is the same split at --max-concurrent 1 (no parking at all), on ONE thread:
 # four partitions on four threads deposit each on one, and the double build's CPU sums are equal between thread
 # counts only to rounding (README: run-to-run identical grids)
 OMP_NUM_THREADS=1 "$BIN" "$SNAP" "$TMP/m1" "${C[@]}" --partition 3 3 3 --max-concurrent 1 --ps-no-overlap > "$TMP/m1.log" 2>&1 \
@@ -140,8 +129,8 @@ DTFE_MERGE_SPILL=1 DTFE_SPILL_MIN_GB=2 "${GA[@]}" "$TMP/sgs" "${C[@]}" --partiti
 nsgs="$(nspill "$TMP/sgs.log")"
 grep -q "the memory gate admits the next partition" "$TMP/sgs.log" && [ "${nsgs:-0}" -gt 0 ] && same "$TMP/sg0" "$TMP/sgs"
 check "R7 ... and spilling under the memory gate (DTFE_MERGE_SPILL=1): ${nsgs:-?} spilled, byte-identical" $?
-# the budget room (2026-10-15): the free memory plentiful (DTFE_FREE_GB=1000), but no room in the budget beside the
-# plan's predicted peak -- every parked partition must spill (TNG100 z=0 parked 74 GB on the free-memory rule alone)
+# the budget room: the free memory plentiful (DTFE_FREE_GB=1000), but no room in the budget beside the
+# plan's predicted peak -- every parked partition must spill (on the free-memory rule alone TNG100 z=0 parks 74 GB)
 DTFE_TEST_PARK_ROOM_GB=0 DTFE_SPILL_MIN_GB=2 "${GA[@]}" "$TMP/sgr" "${C[@]}" --partition 3 3 3 > "$TMP/sgr.log" 2>&1 || { echo "FAIL: sgr (see $TMP/sgr.log)"; exit 1; }
 nsgr="$(nspill "$TMP/sgr.log")"
 nstr="$(sed -n 's/.*ordered merge: \([0-9]*\) partition(s) finished before their turn.*/\1/p' "$TMP/sgr.log")"
@@ -182,8 +171,7 @@ else
         && ! grep -q "using the CPU deposit\|deposit unavailable\|ran on the CPU instead" "$TMP/gl.log" "$TMP/gn.log"
     check "R3 a --ps-gpu run at --max-concurrent 1 looks ahead by default (and neither run fell back to the CPU)" $?
     ok=0
-    # the velocity too: every PS grid of a GPU deposit is an exact fixed-point sum since 2026-10-14 (it was a
-    # float-atomic sum, checked to 1e-5 of its peak until 2026-10-15)
+    # the velocity too: every PS grid of a GPU deposit is an exact fixed-point sum
     for e in den a_den streams a_streams hidden_streams a_hidden_streams vel; do
         cmp -s "$TMP/gn.$e" "$TMP/gl.$e" || { echo "    differs: .$e"; ok=1; }
     done

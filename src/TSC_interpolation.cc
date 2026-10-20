@@ -67,7 +67,7 @@ void TSC_interpolation(vector<Particle_data> *particles,
 
 
 // TSC kernel policy for the shared engine: quadratic weights over a 3-cell stencil; boundary
-// particles use the stencil clipped to the grid (2026-10-11, see the engine).
+// particles use the stencil clipped to the grid (see the engine).
 struct TSC_kernel
 {
     static int const STENCIL = 3;

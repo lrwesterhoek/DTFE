@@ -1,6 +1,6 @@
-/*  The run's progress sidecar (2026-10-11): '<output>.runlog.progress', a small JSON file the binary rewrites
+/*  The run's progress sidecar: '<output>.runlog.progress', a small JSON file the binary rewrites
     at every phase change and after every partition, so the launcher (and a phone, through the Runs tab) can
-    follow a run started from a terminal without parsing a 200 KB log. The run directory contract (C1):
+    follow a run started from a terminal without parsing a 200 KB log. The run directory contract:
 
         {"pid":..,"phase":"..","done":..,"total":..,"elapsed_s":..,"eta_s":..,"rss_gb":..,
          "gpu_retries":..,"gpu_retries_by_cause":{"innocent":..,"timeout":..,"oom":..,"other":..},
@@ -9,11 +9,10 @@
     predicted_gb is the auto-tuner's predicted peak (-1 when it decided nothing: '--partition' and
     '--max-concurrent' both given) and peak_gb the measured peak so far -- the peak physical footprint on macOS
     (what /usr/bin/time -l calls 'peak memory footprint': it counts Metal's shared buffers, which RSS can miss),
-    the maximum RSS elsewhere -- both in GB of 1e9 bytes, the tuner's unit (2026-10-11: the tuner under-predicted
-    13 of 28 production runs by up to 5.7 GB, seen only by reading two logs side by side; main.cpp's SUMMARY now
-    prints the pair too). eta_s is -1 when unknown. gpu_retries is the total of gpu_retries_by_cause (G1, 2026-10-11), by construction:
+    the maximum RSS elsewhere -- both in GB of 1e9 bytes, the tuner's unit (main.cpp's SUMMARY prints the pair
+    too). eta_s is -1 when unknown. gpu_retries is the total of gpu_retries_by_cause, by construction:
     the sidecar writes the sum of the four counters it prints (psGpuRetries -- dtfeGpuRetries in the standard binary,
-    which counts its GPU retries the same way since 2026-10-13 --, the hosts' own total, is for the
+    which counts its GPU retries the same way --, the hosts' own total, is for the
     closing log line, written after the partitions with no failure in flight): an innocent
     victim (another process hung the GPU; retried at once), a timeout (a watchdog kill: CUDA's
     cudaErrorLaunchTimeout, Metal's Impacting Interactivity), out of memory, anything else. Written atomically ('.tmp.<pid>' then rename), so a reader never sees half a
@@ -41,12 +40,12 @@
 
 #ifdef PHASE_SPACE
 // failed GPU buffers / kernels (each one resumes the pass from its last checkpoint; 3 failures of one chunk send
-// the partition to the CPU, 2026-10-11);
+// the partition to the CPU);
 // counted by the GPU hosts (ps_metal_host.cc, ps_gpu_cuda.cu), defined in ps_interpolation.cc
 extern std::atomic<int> psGpuRetries;
-extern std::atomic<int> psGpuRetriesByCause[4];   // innocent, timeout, oom, other (2026-10-11)
+extern std::atomic<int> psGpuRetriesByCause[4];   // innocent, timeout, oom, other
 #else
-// the standard binary's (2026-10-13): the same policy in its GPU hosts (dtfe_metal_host.cc, dtfe_gpu_cuda.cu: a
+// the standard binary's: the same policy in its GPU hosts (dtfe_metal_host.cc, dtfe_gpu_cuda.cu: a
 // failed buffer resumes the sub-domain's batch from its last checkpoint; 3 failures of one chunk send the
 // sub-domain to the CPU), defined in averaged_interpolation_1.cc -- zero in a CPU-only build
 extern std::atomic<int> dtfeGpuRetries;
@@ -159,7 +158,7 @@ inline void runProgressWriteLocked(RunProgress &p)
     double const elapsed = std::chrono::duration<double>( std::chrono::steady_clock::now() - p.start ).count();
     double const rss = runProgressRss();
     double const peak = runProgressPeak();
-    // the four causes loaded ONCE and the total written as THEIR sum (2026-10-11): a host bumps psGpuRetries and
+    // the four causes loaded ONCE and the total written as THEIR sum: a host bumps psGpuRetries and
     // the cause's counter as two increments, and this write may run while another partition's deposit fails
     // (--max-concurrent >= 2), so five separate loads could print a total its causes do not add up to
     int byCause[4];

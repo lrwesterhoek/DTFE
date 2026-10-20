@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
-# PS-DTFE point evaluation in the grids' conventions ('--pts-conventions grid', the default since 2026-10-13).
+# PS-DTFE point evaluation in the grids' conventions ('--pts-conventions grid', the default).
 #
-# The 13 October audit: the production planes (--sample-points) used rho_bar*V_lag tetrahedron masses and
-# density-weighted stream means while the grids of the same run used --ps-vertex-mass and --ps-volume-weighted,
-# so with evolved (z = 127) initial positions as the Lagrangian input a plane's density contrast was ~0.8 of the
-# grid's at z = 20. The points now follow the two grid options (ps_point_eval.cc, 'The grid deposit's conventions
-# at the points'); '--pts-conventions legacy' keeps the old estimators. Verified here, on synthetic boxes:
+# The points follow the run's two grid options, --ps-vertex-mass and --ps-volume-weighted (ps_point_eval.cc, 'The
+# grid deposit's conventions at the points'). With rho_bar*V_lag tetrahedron masses and density-weighted stream means
+# instead ('--pts-conventions legacy' keeps those estimators), evolved (z = 127) initial positions as the Lagrangian
+# input put a plane's density contrast at ~0.8 of the grid's at z = 20. Verified here, on synthetic boxes:
 #  A) IDENTITY: without --ps-vertex-mass / --ps-volume-weighted 'grid' and 'legacy' give byte-identical '.pts_*'
 #     files, and with both options the GRIDS of the two runs are byte-identical (the conventions are the points').
 #  B) THE IC BIAS: single-stream crossed waves whose InitialCoordinates are displaced towards the final positions
@@ -16,7 +15,7 @@
 #     sampled nSub=3 deposit of this one-particle-per-cell box is itself noisy at the cell scale (printed).
 #  C) MASS AND NOISE on a uniform near-lattice box (jitter 0.01, TNG-like initial conditions): random points
 #     average to rho_bar, and the point noise stays below the vertex-share grid's own (the per-tetrahedron
-#     m_tet/V_eul -- the grid's density -- put a normal mass into near-flat slivers no point hits: a mean of 0.89).
+#     m_tet/V_eul -- the grid's density -- puts a normal mass into near-flat slivers no point hits: a mean of 0.89).
 #  D) VOLUME WEIGHTING on a pancake and crossed waves (--per-stream): '.pts_vel' is the plain mean of the stream
 #     velocities under 'grid' and their density-weighted mean under 'legacy'; '.pts_velDisp', '.pts_den' and
 #     '.pts_streams' do not depend on --ps-volume-weighted; single-stream points agree between the two.
@@ -28,8 +27,6 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PY="${PYTHON:-python3}"
-command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/python3.14
 ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT}"
 source "${SCRIPT_DIR}/precision.sh"     # DTFE_TEST_PRECISION=double: the double pair
@@ -43,11 +40,7 @@ echo "============================================================"
 echo " PS-DTFE point conventions check   N=${N}^3  grid=${GRID}^3  alpha=${ALPHA}"
 echo "============================================================"
 
-if [ "${1:-}" != "--no-build" ] && ! precision_double; then
-    echo ">> building PS-DTFE ..."
-    BUILD_MODE="$(cat o_ps/.build_mode 2>/dev/null || true)"
-    make PS-DTFE ${BUILD_MODE:+"$BUILD_MODE"} >/dev/null
-fi
+build_target "${1:-}" PS-DTFE o_ps
 [ -x "${BIN}" ] || { echo "FAIL: ${BIN} not built"; exit 1; }
 FULL_HELP="$("${BIN}" --full_help 2>/dev/null)" || { echo "FAIL: ${BIN} --full_help exited non-zero"; exit 1; }
 grep -q -- '--pts-conventions' <<<"${FULL_HELP}" || skip_or_fail "this PS-DTFE has no --pts-conventions."

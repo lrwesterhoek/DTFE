@@ -3,7 +3,7 @@
   1  Data folder      where simulations and grids live (defaults to the configured root when it
                       exists -- an external disk that is unplugged is said so -- else ~/DTFE-data); and, when
                       the repository sits in iCloud Drive with the analysis caches still inside it, an offer
-                      to keep those caches outside it (2026-10-11: analyze.py cache --move, the same move)
+                      to keep those caches outside it (analyze.py cache --move, the same move)
   2  Programs         are DTFE / PS-DTFE built, with which GPU backend (Metal, CUDA, HIP) and (PS-DTFE) the TBB parallel
                       triangulation, are the optional double-precision pair and the 2D programs there,
                       and does the Python that runs the figure scripts have its packages? 'Build' runs
@@ -162,7 +162,7 @@ class SetupDialog(QDialog):
         if data_root and not Path(data_root).is_dir():
             pv.addWidget(self._text(f"(The configured folder {data_root} is not there right now. An external "
                                     "disk that is unplugged? Choose it again once it is connected.)"))
-        # the analysis caches out of iCloud Drive (2026-10-11): offered only while the repository is synced AND the
+        # the analysis caches out of iCloud Drive: offered only while the repository is synced AND the
         # caches are still inside it (config.icloud_cache_offer); the move is analyze.py's own, run as a process so
         # a gigabyte of copying never freezes the dialog
         self._cache_proc: QProcess | None = None
@@ -421,7 +421,7 @@ class SetupDialog(QDialog):
 
     def _build_error(self, err):
         """'finished' never comes for a program that cannot start (no make on a fresh machine): say so and
-        free the button (before 2026-10-06 it stayed disabled for good)."""
+        free the button (else it stays disabled for good)."""
         if err != QProcess.FailedToStart or self._build is None:
             return
         self.build_log.appendPlainText(f"cannot start {self._build.program()}: {self._build.errorString()} "

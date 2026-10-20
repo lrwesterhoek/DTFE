@@ -26,10 +26,12 @@ SNAPSHOT_TO_REDSHIFT = {
 PANEL_SNAPSHOTS = ['000', '017', '050', '099']
 
 # ---- Active simulation & box geometry ---------------------------------------------------
-# One simulation is analysed at a time: DTFE_SIM env var, else dtfelib's default. Every
-# script that opens fields via dtfelib.cli can also override per run with --sim.
-from dtfelib.cli import DATA_ROOT, DEFAULT_SIM, FIGURES_ROOT, sim_dir
-SIMULATION = os.environ.get("DTFE_SIM", DEFAULT_SIM)
+# One simulation is analysed at a time, named by DTFE_SIM; there is no default (None when unset). Every script
+# that opens fields via dtfelib.cli names it per run with --sim instead. The box-derived constants below (BOX_SIZE,
+# CELL_SIZE, SMOOTHING_SIGMA_MPC) exist only once a simulation is named: reading one without it raises
+# dtfelib.cli.NoSimulation (module __getattr__ at the end of this file).
+from dtfelib.cli import FIGURES_ROOT, require_sim, sim_dir
+SIMULATION = os.environ.get("DTFE_SIM") or None
 
 # Comoving box sizes in h-free Mpc (raw BoxSize[ckpc/h] / h / 1000). Known simulations are
 # pinned here (immune to stale on-disk headers from older unit conventions); a simulation
@@ -38,7 +40,7 @@ SIMULATION = os.environ.get("DTFE_SIM", DEFAULT_SIM)
 SIMULATION_BOX_MPC = {
     "TNG50-3-Dark":  51.668142899320934,
     "TNG50-4-Dark":  51.668142899320934,
-    "TNG100-3-Dark": 110.71744906997343,    # 75 Mpc/h / 0.6774 (added 2026-10-07: CI has no snapshot to read it from)
+    "TNG100-3-Dark": 110.71744906997343,    # 75 Mpc/h / 0.6774 (CI has no snapshot to read it from)
     "TNG300-3-Dark": 302.62769412459404,
 }
 
@@ -57,9 +59,10 @@ def _box_size_mpc(sim):
         f"(box in h-free Mpc) or merge the snapshots first (python/tools/merge_HDF5.py).")
 
 
-BOX_SIZE = _box_size_mpc(SIMULATION)
 FIELD_RESOLUTION = 512     # grid of the C++ field outputs; FieldSet.grid_n reads the true value per file
-CELL_SIZE = BOX_SIZE / FIELD_RESOLUTION
+if SIMULATION:
+    BOX_SIZE = _box_size_mpc(SIMULATION)
+    CELL_SIZE = BOX_SIZE / FIELD_RESOLUTION
 
 HUBBLE_H = 0.6774          # identical for every IllustrisTNG run (Planck 2015)
 COSMOLOGY = {
@@ -96,23 +99,25 @@ def footprint_for(sigma_cells):
     return max(3, 2 * int(round((1.1 * float(sigma_cells) - 1.0) / 2.0)) + 1)
 
 
-# A smoothing length FIXED IN Mpc (2026-10-07): DTFE_SIGMA_MPC=2.16 smooths every box at the same physical scale --
-# 10 cells is 1.0 / 2.2 / 5.9 Mpc in TNG50 / 100 / 300, so their catalogues were different voids -- and the footprint
-# follows it (footprint_for). Here, at import, so every module-level copy follows; the void scripts' --smooth-mpc
-# does the same at run time (dtfelib.pipeline.set_smoothing). FOR THE VOID SCRIPTS AND 'analyze.py export' (which
-# tag their outputs): analyze.py compute/plot/all refuse to run under it, and no figure made under it is copied
-# into the thesis Figures/ tree. The cells are rounded to 1e-9, so 10 x CELL_SIZE gives exactly 10.0 cells,
-# footprint 11 and today's caches.
+# A smoothing length FIXED IN Mpc: DTFE_SIGMA_MPC=2.16 smooths every box at the same physical scale --
+# 10 cells is 1.0 / 2.2 / 5.9 Mpc in TNG50 / 100 / 300, so their 10-cell catalogues are different voids -- and the
+# footprint follows it (footprint_for). Here, at import, so every module-level copy follows; the void scripts'
+# --smooth-mpc does the same at run time (dtfelib.pipeline.set_smoothing). FOR THE VOID SCRIPTS AND 'analyze.py export'
+# (which tag their outputs): analyze.py compute/plot/all refuse to run under it, and no figure made under it is copied
+# into the thesis Figures/ tree. The cells are rounded to 1e-9, so 10 x CELL_SIZE gives exactly 10.0 cells, footprint 11
+# and the production caches.
 if os.environ.get("DTFE_SIGMA_MPC"):
-    SMOOTHING_SIGMA_CELLS = round(float(os.environ["DTFE_SIGMA_MPC"]) / CELL_SIZE, 9)
+    SMOOTHING_SIGMA_CELLS = round(float(os.environ["DTFE_SIGMA_MPC"])
+                                  / (_box_size_mpc(require_sim(SIMULATION)) / FIELD_RESOLUTION), 9)
     FOOTPRINT_SIZE = footprint_for(SMOOTHING_SIGMA_CELLS)
-SMOOTHING_SIGMA_MPC = SMOOTHING_SIGMA_CELLS * CELL_SIZE
+if SIMULATION:
+    SMOOTHING_SIGMA_MPC = SMOOTHING_SIGMA_CELLS * CELL_SIZE
 
-# The cross-box comparison's common smoothing length in Mpc (2026-10-11, contract G2): 10.0002 TNG100-3-Dark cells
-# (110.7 Mpc / 512; production 10 cells = 2.16245 Mpc), the 2026-10-07 comparison's value, kept so its results stay
+# The cross-box comparison's common smoothing length in Mpc: 10.0002 TNG100-3-Dark cells
+# (110.7 Mpc / 512; production 10 cells = 2.16245 Mpc), the value the comparison was made with, kept so its results stay
 # comparable. ONE number every Python user imports -- plot_void_crossbox.DEFAULT_SIGMA_MPC, analyze.py's cache
 # inventory (CACHE_SMOOTHING_MPC), the launcher (gui/runspec.py) -- because it names cache namespaces
-# (r512_s21.4291_f23 on TNG50): 2.16 next to 2.1625 on 2026-10-11 morning made a second, unreachable namespace.
+# (r512_s21.4291_f23 on TNG50): 2.16 next to 2.1625 makes a second, unreachable namespace.
 # scripts/thesis_runs.sh keeps the literal (a recipe of the runs made), commented with this name.
 CROSSBOX_SMOOTHING_MPC = 2.1625
 
@@ -120,20 +125,20 @@ GRADIENT_THRESHOLD = 0.1
 
 DEEP_VOID_THRESHOLD = -0.1
 # The ellipsoid fit's resolution gate (a void's well_resolved flag) as RULES in the field's own scales; in Mpc
-# only at call time, through dtfelib.pipeline.ellipsoid_cuts_mpc(), so a script's --smooth reaches it. Until
-# 2026-10-07 the gate was a fixed 10 Mpc -- TNG50's 10 sigma -- which kept 2 of 495 TNG100 voids and 0 of 650
+# only at call time, through dtfelib.pipeline.ellipsoid_cuts_mpc(), so a script's --smooth reaches it. A
+# fixed 10 Mpc gate -- TNG50's 10 sigma -- would keep 2 of 495 TNG100 voids and 0 of 650
 # TNG300 voids at z = 0: the semi-axes are curvature lengths of the smoothed field and grow with the smoothing.
 # 10 sigma reproduces the TNG50 sample (+72/-0 of 8433 flags over the thesis snapshots; no thesis number used
 # the gate: its tables average ALL voids) and keeps 103 (TNG100) and 409 (TNG300) voids at z = 0. The box
 # clause: a semi-axis beyond L/2 overlaps its own periodic image (inert at sigma = 10 cells, binding above 25.6).
-# The minimum axis (was 0.1 Mpc, one TNG50 cell) and the axis ratio never decide a void at sigma = 10 cells.
+# The minimum axis and the axis ratio never decide a void at sigma = 10 cells.
 ELLIPSOID_CUT_RULES = {
     'min_axis_cells': 1.0,
     'max_axis_sigma': 10.0,
     'max_axis_box_frac': 0.5,
     'max_axis_ratio': 10.0,
 }
-# The void sample gate (2026-10-11), DTFE_VOID_GATE: 'ellipsoid' (default) = well_resolved is the gate above;
+# The void sample gate, DTFE_VOID_GATE: 'ellipsoid' (default) = well_resolved is the gate above;
 # 'none' = its max-axis clause dropped, so the R_v samples are defined on R_v and depth, not on the curvature length
 # (dtfelib.pipeline.gate_view; applied to the catalogue a process reads, never to the cache; outputs tagged 'gatenone').
 VOID_GATE = (os.environ.get('DTFE_VOID_GATE') or 'ellipsoid').strip().lower()
@@ -170,7 +175,7 @@ SHEAR_MAPS_SIGMA = 1.0
 def correlation_max_sep():
     if CORRELATION_MAX_SEP is not None:
         return float(CORRELATION_MAX_SEP)
-    return float(3 ** 0.5 / 2 * BOX_SIZE)
+    return float(3 ** 0.5 / 2 * _box_size_mpc(require_sim(SIMULATION)))
 
 VOID_EIGENVALUE_CRITERION = 'trace'
 
@@ -186,16 +191,16 @@ def _find_thesis_dir():
 
 
 _THESIS_DIR = _find_thesis_dir()
-# The fallback is the 'Figures' folder NEXT TO the repo. _REPO_ROOT is DTFE/python (config.py moved there
-# 2026-07-10), so that folder is two levels up: one level up is DTFE/Figures, which on macOS's case-insensitive
-# disk IS the repo's own figures/ folder -- every mirrored figure from the move to 2026-10-06 landed there.
+# The fallback is the 'Figures' folder NEXT TO the repo. _REPO_ROOT is DTFE/python,
+# so that folder is two levels up: one level up is DTFE/Figures, which on macOS's case-insensitive
+# disk IS the repo's own figures/ folder.
 THESIS_FIGURES_DIR = (_THESIS_DIR / 'Figures') if _THESIS_DIR else (_REPO_ROOT.parent.parent / 'Figures')
 
-# What the thesis's figures and tables were made from (HANDOFF 2026-10-07: TNG50-3-Dark, not -4 -- the unprefixed
+# What the thesis's figures and tables were made from (TNG50-3-Dark, not -4 -- the unprefixed
 # caches equal TNG50-3-Dark_dtfe_*, tex 615/626 -- with standard DTFE). The thesis scripts name their figures without
 # either (figures_path), so only this simulation's figures of this estimator may go into the thesis Figures/ tree
 # (dtfelib.figures.save_plot_to_multiple_paths): a TNG100 run, or one on PS-DTFE grids (FieldSet's auto-detect picks
-# them when they are there, as on the T7), replaced the thesis figures under the same names (2026-10-08).
+# them when they are there, as on the T7), would replace the thesis figures under the same names.
 THESIS_SIMULATION = "TNG50-3-Dark"
 THESIS_METHOD = "dtfe"
 
@@ -218,7 +223,7 @@ ANALYSIS_DIRS = {
 
 
 # the folders figures_path has handed out: their figures carry neither the simulation nor the estimator in their
-# names, so the thesis mirror takes them only from THESIS_SIMULATION's THESIS_METHOD grids (2026-10-08)
+# names, so the thesis mirror takes them only from THESIS_SIMULATION's THESIS_METHOD grids
 THESIS_NAMED_DIRS = set(ANALYSIS_DIRS.values())
 
 
@@ -230,16 +235,16 @@ def figures_path(analysis_key):
 
 # Data location: single source of truth is dtfelib (DATA_ROOT / SIMULATION, both env-
 # overridable; every plot script can also override per run with --sim / --data-root).
-# Note: TNG50-3-Dark's on-disk DTFE outputs predate the 2026-06-17 unit overhaul and are
+# Note: TNG50-3-Dark's on-disk DTFE outputs predate the h-free unit overhaul and are
 # stale for absolute units (mean-relative quantities remain usable).
 
-# DTFE_CACHE_DIR (2026-10-11) moves the derived-product caches (python/cache: the void catalogues, slices, limits)
+# DTFE_CACHE_DIR moves the derived-product caches (python/cache: the void catalogues, slices, limits)
 # elsewhere, e.g. off iCloud Drive, which syncs every catalogue; unset, the default and every existing cache stay.
-# Since the evening of 2026-10-11 a PERSISTENT per-user setting does the same without an environment variable: the
+# A PERSISTENT per-user setting does the same without an environment variable: the
 # one line of cache_setting_file() (~/.config/dtfe/cache_dir, or under $XDG_CONFIG_HOME), written by
 # 'analyze.py cache --move DIR' and the launcher's setup, which move the existing cache there first. Order: the
-# variable, then the setting, then python/cache. The repository lives in iCloud Drive on Luuk's Mac, so the 1.2 GB of
-# catalogues were synced on every rebuild.
+# variable, then the setting, then python/cache. In a repository inside iCloud Drive the 1.2 GB of
+# catalogues would sync on every rebuild.
 DEFAULT_CACHE_DIR = _REPO_ROOT / 'cache'
 
 
@@ -304,7 +309,7 @@ def local_cache_dir():
 
 def icloud_cache_offer(repo_root=None, cache_dir=None):
     """The folder to offer for the caches (local_cache_dir) when the repository sits in iCloud Drive AND the cache
-    is still inside it (the setup's question, 2026-10-11); None when there is nothing to offer: the repository is
+    is still inside it (the setup's question); None when there is nothing to offer: the repository is
     not synced, or the cache already lives elsewhere (DTFE_CACHE_DIR or the setting)."""
     repo = Path(_REPO_ROOT.parent if repo_root is None else repo_root)
     cache = Path(CACHE_DIR if cache_dir is None else cache_dir)
@@ -351,8 +356,8 @@ DPI = 300
 SHOW_TITLES = False
 
 # the density slice maps' colour range in rho/rho_bar, the same for both estimators so DTFE and PS-DTFE
-# panels compare side by side (None for either end: the slice's own range); plot_DTFE.py and
-# plot_PS_DTFE.py used to carry this pair each (survey item 11, 2026-10-05)
+# panels compare side by side (None for either end: the slice's own range); shared by plot_DTFE.py and
+# plot_PS_DTFE.py
 DENSITY_MAP_RANGE = (1e-1, 1e4)
 
 SLICE_PLANES = {
@@ -386,7 +391,7 @@ def cosmic_time_gyr(z, n_steps=20000):
 
 def verify_snapshot_redshifts(base_dir=None, tolerance=0.02):
     import glob
-    base = Path(base_dir) if base_dir else sim_dir(SIMULATION)
+    base = Path(base_dir) if base_dir else sim_dir(require_sim(SIMULATION))
     mismatches = []
     try:
         import h5py
@@ -403,3 +408,11 @@ def verify_snapshot_redshifts(base_dir=None, tolerance=0.02):
         if abs(z_hdr - z_cfg) > tolerance:
             mismatches.append((snap, z_cfg, z_hdr))
     return mismatches
+
+
+def __getattr__(name):
+    """The box-derived constants exist only once a simulation is named (DTFE_SIM): without one, reading
+    BOX_SIZE, CELL_SIZE or SMOOTHING_SIGMA_MPC raises NoSimulation instead of using a default box."""
+    if name in ("BOX_SIZE", "CELL_SIZE", "SMOOTHING_SIGMA_MPC"):
+        require_sim(SIMULATION)
+    raise AttributeError(f"module 'config' has no attribute {name!r}")

@@ -5,18 +5,16 @@
 #   B  a complete split of THIS snapshot in the cache: reused, nothing rebuilt
 #   C  a split cached for ANOTHER snapshot: ignored (the scan compares the snapshot's key lines)
 #   D  a cached split too coarse for the memory budget: not reused, and said so
-#   E  a split cached under ANOTHER partition padding ('--ps-lag-padding 0', i.e. every partition cache written
-#      before 2026-10-12): ignored -- the run would miss all of it (2026-10-12)
+#   E  a split cached under ANOTHER partition padding ('--ps-lag-padding 0', as every older partition cache):
+#      ignored -- the run would miss all of it
 # A small set and a small DTFE_MEM_BUDGET_GB force the composite path; every cache is a fresh folder. 40^3 and
-# 0.075 GB (2026-10-12): with the default '--ps-lag-padding 8' a 24^3 set pads a coarse partition by a third of
-# the box, so no budget kept A finer than a cached 3^3 that still fits (B); at 40^3 0.06-0.09 GB all give A = 4^3.
+# 0.075 GB: with the default '--ps-lag-padding 8' a 24^3 set pads a coarse partition by a third of
+# the box, so no budget keeps A finer than a cached 3^3 that still fits (B); at 40^3 0.06-0.09 GB all give A = 4^3.
 # Usage: tests/serve_split_check.sh [--no-build]
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$ROOT" || exit 1
-PY="${PYTHON:-python3}"
-command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/python3.14
 source "${SCRIPT_DIR}/precision.sh"
 BIN="${PS_BIN}"
 precision_require "${BIN}"

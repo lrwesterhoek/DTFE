@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Resume of a killed partitioned PS-DTFE run WITH '--sample-points' (2026-10-13; src/partition_checkpoint.h 'POINTS',
-# ps_point_eval.cc '--resume with --sample-points'). Until then such a run wrote no checkpoint ('no checkpoints: a
-# --sample-points run cannot be resumed' in every production run log) and '--resume' refused it. On a synthetic
+# Resume of a killed partitioned PS-DTFE run WITH '--sample-points' (src/partition_checkpoint.h 'POINTS',
+# ps_point_eval.cc '--resume with --sample-points'). On a synthetic
 # crossed-wave snapshot split into 64 partitions, with a plane of points and every per-point option the production
 # runs use (--per-stream --pts-vel-grad --ps-caustics, --ps-vertex-mass --ps-volume-weighted):
 #   R1  an uninterrupted '--ordered-merge' run (the reference) checkpoints its point records too and removes the
@@ -13,7 +12,7 @@
 #   R4  '--resume' continues: EVERY output -- the '.pts_*' files and the grids -- byte-identical to the reference,
 #       and the log says the records were read back; the checkpoint is removed
 #   R5  a damaged 'points.<i>' (cut short) is refused, naming the file
-#   R6  a run killed while merging in COMPLETION order (--completion-order-merge since 2026-10-14) resumes too: the '.pts_*' files are
+#   R6  a run killed while merging in COMPLETION order (--completion-order-merge) resumes too: the '.pts_*' files are
 #       byte-identical to the reference all the same (every point's records are sorted before any sum), the grids
 #       equal to float rounding
 #   R7  a fresh run (no --resume) over an old checkpoint replaces it: after its first write the folder holds only
@@ -30,8 +29,6 @@ ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$ROOT" || exit 1
 source "${SCRIPT_DIR}/precision.sh"     # DTFE_TEST_PRECISION=double: the double pair
 precision_require "${PS_BIN}"
-PY="${PYTHON:-python3}"
-command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/python3.14
 [ -x "${PS_BIN}" ] || { echo "FAIL: ${PS_BIN} is not built"; exit 1; }
 BIN="$(cd "$(dirname "${PS_BIN}")" && pwd)/$(basename "${PS_BIN}")"
 TMP="${DTFE_TEST_TMP}/ps_resume_points_check"
@@ -50,17 +47,7 @@ np.stack([X.ravel(), Y.ravel(), np.full(X.size, 31.7)], 1).astype(np.float64).to
 PYEOF
 PASS=0; FAILS=0
 check() { if [ "$2" = 0 ]; then PASS=$((PASS+1)); echo "  PASS $1"; else FAILS=$((FAILS+1)); echo "  FAIL $1"; fi; }
-# same <a> <b> [pattern]: every output of run a (matching the pattern) has a byte-identical twin in run b
-same() {
-    local n=0 f
-    for f in "$1".${3:-*}; do
-        case "$f" in *.log|*.runlog*|*.part.*) continue ;; esac
-        cmp -s "$f" "$2${f#"$1"}" || { echo "    differs: ${f#"$1"}"; return 1; }
-        n=$((n+1))
-    done
-    [ "$n" -gt 0 ]
-}
-merged_count() { grep -a -m1 '^merged_count' "$1/checkpoint" | awk '{print $2}'; }
+# same <a> <b> [pattern], merged_count <checkpoint folder>: tests/lib.sh
 merged_bits() { grep -a -m1 '^merged ' "$1/checkpoint" | awk '{print $2}'; }
 # the 'points.<i>' files of a checkpoint folder, as a sorted list of i
 points_list() { ls "$1" 2>/dev/null | sed -n 's/^points\.\([0-9]*\)$/\1/p' | sort -n | tr '\n' ' '; }

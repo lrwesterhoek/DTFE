@@ -38,7 +38,7 @@
 #endif
 
 #ifndef PHASE_SPACE
-// The standard binary's GPU deposit counters (2026-10-13; the PS binary's are psGpuRetries & co. in
+// The standard binary's GPU deposit counters (the PS binary's are psGpuRetries & co. in
 // ps_interpolation.cc): the failed GPU command buffers / kernels of the run by cause -- [0] innocent victim,
 // [1] timeout (a watchdog kill), [2] out of memory, [3] any other; they sum to dtfeGpuRetries -- counted by the
 // GPU host (dtfe_metal_host.cc, dtfe_gpu_cuda.cu), read by run_progress.h for the progress sidecar's gpu_retries /
@@ -135,8 +135,8 @@ inline uint64_t mcMix(uint64_t z)
 // coordinates for the same vertex (a periodic image is x -/+ L, computed the same way everywhere), so the hash
 // is a property of the vertex, not of the triangulation that holds it. The coordinates are hashed as FLOATS:
 // the single and the double build then share the realization (a kpc snapshot scaled to Mpc gives float- and
-// double-rounded coordinates whose double bit patterns differ in every vertex, and the two builds' grids
-// differed by 8% rms per cell; the float patterns agree but for rare double roundings). Two vertices of one
+// double-rounded coordinates whose double bit patterns differ in every vertex, which would make the two builds'
+// grids differ by 8% rms per cell; the float patterns agree but for rare double roundings). Two vertices of one
 // cell that round to the same float hash alike and are ordered by their exact coordinates (mcVertexOrder).
 inline uint64_t mcVertexHash(Vertex_handle const &v)
 {
@@ -150,15 +150,15 @@ inline uint64_t mcVertexHash(Vertex_handle const &v)
     return h;
 }
 
-// The vertex order of the Monte-Carlo average (2026-10-13, audit finding 1). 'legacy' keeps CGAL's own order
-// (vertex(0) as the base), which the --exact-average path still uses (its results stay byte-identical) and
-// DTFE_MC_LEGACY=1 restores for the sampled path (A/B). Otherwise the NO_DIM+1 vertices are sorted by a key
-// that depends only on the cell's own vertex SET: each vertex's coordinate hash mixed with the (order-free)
-// sum of the cell's hashes, ties (never seen; 64-bit keys) broken by the coordinates.
+// The vertex order of the Monte-Carlo average. 'legacy' keeps CGAL's own order (vertex(0) as the base), which
+// the --exact-average path uses and DTFE_MC_LEGACY=1 selects for the sampled path (A/B). Otherwise the
+// NO_DIM+1 vertices are sorted by a key that depends only on the cell's own vertex SET: each vertex's
+// coordinate hash mixed with the (order-free) sum of the cell's hashes, ties (never seen; 64-bit keys) broken
+// by the coordinates.
 //   Why: the fixed Sobol prefix of n samples does not average to the centroid (barycentric slot means
 //   0.160/0.262/0.275/0.302 at n = 17, the minimum count), so each slot carries a fixed weight error, and
 //   CGAL's labelling correlates with density (slot densities 1.023/1.012/1.006/0.959 at TNG100 z=1). The
-//   product was a systematic mass loss of 0.17-0.29% in every production '_a' grid. A pseudo-random,
+//   product is a systematic mass loss of 0.17-0.29% in an '_a' grid. A pseudo-random,
 //   order-free slot assignment decorrelates the slots from the density AND makes the realization of each
 //   tetrahedron independent of the insertion order, the thread count and the partition split.
 inline McCell mcVertexOrder(Finite_cells_iterator &cell,
@@ -322,7 +322,7 @@ inline Pvector<Real,noScalarComp> averageScalar(Cell &cell)
 
 
 
-// The threads of the CPU exact average (2026-10-15; the CPU loop of interpolateGrid_averaged_1 says how they split
+// The threads of the CPU exact average (the CPU loop of interpolateGrid_averaged_1 says how they split
 // the work): every core when this triangulation is the only one being processed -- a single-domain run, or each
 // partition of a '--sample-points' run (DTFE_parallel's single-triangulation branch) -- and, inside DTFE_parallel's
 // OpenMP team of sub-domains, the cores left per sub-domain, so the two levels never oversubscribe (PS-DTFE's
@@ -424,35 +424,20 @@ void interpolateGrid_averaged_1(DT &dt,
 #endif
 
 
-    // The Monte-Carlo average (2026-10-13, audit finding 1). Each tetrahedron maps the first n entries of
-    // ONE shared Sobol table into itself, and before today it did so from CGAL's vertex(0). Two things
-    // made that a BIAS, not noise: (a) a short Sobol prefix does not average to the centroid (barycentric
-    // slot means 0.160/0.262/0.275/0.302 at n = 17, the minimum count with the default --samples 100), so
-    // for the linear interpolant the tet's sampled mass is V f(sample mean), not V f(centroid); and
-    // (b) CGAL's vertex slots correlate with density. Every production '_a' grid lost 0.17-0.29% of its
-    // mass (TNG100 z=1: box mean - 1 = -2.43e-3; demo/z0_64.gadget at 128^3: -2.42e-3), and the
-    // realization changed with the thread count and the partition split (23% rms per cell between
-    // --partition 1 and 2 2 2 on the demo). Two changes, both in the CPU loop and in the GPU extraction:
-    //   - vertex order: mcVertexOrder() sorts the vertices by a hash of the cell's vertex SET (absolute
-    //     coordinates), so the base vertex and the slots are pseudo-random (no density correlation) and the
-    //     same in every partition / thread / padding: the grids of --partition 2 2 2, one thread and ten
-    //     threads now agree to float summation order (4e-6 max per cell on the demo at 128^3; a sample lying
-    //     EXACTLY on a cell face can still land on either side, as the splits round it in different region
-    //     frames: one sample in the double build's 64^3 demo grid);
-    //   - centring: every sample value is shifted by grad f . (centroid - sample mean), i.e. evaluated at
-    //     p + delta with delta = sum_j c_j (v_j - v_0), c_j = 1/(D+1) - mean_j(n) over the table prefix
-    //     actually used. For the linear interpolant the n samples then sum to n f(centroid) exactly, under
-    //     any vertex order, so a tetrahedron's mass (and momentum) is exact; only its split over the grid
-    //     cells is sampled. The shifted weights (lambda_ij + c_j) stay >= 0 for every n <= 34 (all of the
-    //     small, dense-region tetrahedra); beyond, the most negative one is -0.013 (n = 88), which would need
-    //     a 70x density contrast across one large, smooth void tetrahedron to give a negative sample.
-    // Demo (z0_64.gadget, --periodic --padding 12, density_a velocity_a), box mean - 1, old -> new:
-    // 64^3 -3.35e-3 -> +2.0e-5, 128^3 -2.42e-3 -> +4.0e-6, 128^3 -s 20 -5.5e-3 -> +9.3e-6; the remainder
-    // comes from the tetrahedra cut by the periodic box faces (their two images are labelled independently,
-    // the coordinates differ by L). rms(cell - exact)/mean: 8.3e-2 -> 6.2e-2 (64^3), 0.183 -> 0.146 (128^3).
-    // CPU == GPU as before (2150 of 128^3 cells differ by a sample on a cell face; 2235 before).
-    // --exact-average keeps CGAL's order (its grids are byte-identical to before). DTFE_MC_LEGACY=1 restores
-    // the old sampled realization (A/B, and to reproduce grids made before 2026-10-13).
+    // The Monte-Carlo average: every tetrahedron maps the first n entries of ONE shared Sobol table into itself.
+    // Mapped from CGAL's vertex(0) that is a BIAS (0.17-0.29% of an '_a' grid's mass; mcVertexOrder's comment says
+    // why), so the CPU loop and the GPU extraction both apply two measures:
+    //   - vertex order: mcVertexOrder() sorts the vertices by a hash of the cell's vertex SET, so the slots carry no
+    //     density correlation and are the same in every partition / thread / padding split (the grids agree to float
+    //     summation order, but for a sample lying EXACTLY on a cell face, which two splits may round apart);
+    //   - centring: every sample value is shifted by grad f . delta, delta = sum_j c_j (v_j - v_0), c_j = 1/(D+1) -
+    //     mean_j(n) over the table prefix used. For the linear interpolant the n samples then sum to n f(centroid)
+    //     exactly, so a tetrahedron's mass and momentum are exact and only their split over the grid cells is
+    //     sampled. The shifted weights lambda_ij + c_j stay >= 0 for n <= 34; beyond, the most negative is -0.013
+    //     (n = 88), which gives a negative sample only at a 70x density contrast across one tetrahedron.
+    // tests/dtfe_mc_average_check.sh checks the mass, the momentum and the split invariance. --exact-average keeps
+    // CGAL's order. DTFE_MC_LEGACY=1 selects the uncentred CGAL-order realization (A/B, and to reproduce grids
+    // made with it).
     bool const mcLegacy = getenv("DTFE_MC_LEGACY") != nullptr and atoi( getenv("DTFE_MC_LEGACY") ) != 0;
     bool const legacyOrder = exactAvg or mcLegacy;
     bool const centreMC = not exactAvg and not mcLegacy;
@@ -526,7 +511,7 @@ void interpolateGrid_averaged_1(DT &dt,
         bool const needScal = fScal or fSGrad;
 
         // reserve for all finite cells (upper bound; a counting pre-pass would cost a full extra
-        // CGAL cell walk, which measured comparably to the whole extraction -- the padded fraction
+        // CGAL cell walk, which measures comparably to the whole extraction -- the padded fraction
         // outside the region is small for standard-DTFE partitions, unlike the PS Lagrangian ones)
         size_t const nKept = dt.number_of_finite_cells();
 
@@ -578,7 +563,7 @@ void interpolateGrid_averaged_1(DT &dt,
             else
                 cnt = uint32_t( sampleCount( cellVolume ) );
 
-            // Centring on the GPU without a kernel change (2026-10-13): the kernels evaluate a sample as
+            // Centring on the GPU without a kernel change: the kernels evaluate a sample as
             // f_0 + grad f . p with grad f built from the vertex DIFFERENCES f_j - f_0, so adding the same
             // constant C = sum_j c_j (f_j - f_0) (= grad f . delta of the CPU loop) to all NO_DIM+1 vertex
             // values shifts every sample value by C and leaves the gradient alone. Only for sampled tets:
@@ -606,7 +591,7 @@ void interpolateGrid_averaged_1(DT &dt,
             else
                 for (int v=0; v<NO_DIM+1; ++v)
                     tetDens.push_back( float(mc.v[v]->info().density()) );
-            // DTFE_TEST_NAN_SHARE (2026-10-15, ps_deposit_params.h): this tetrahedron's vertex densities NaN, so the
+            // DTFE_TEST_NAN_SHARE (ps_deposit_params.h): this tetrahedron's vertex densities NaN, so the
             // kernel's density shares of it are NaN and the non-finite guard drops and counts them
             if ( fixedShareTestNanEvery() and fixedShareTestNan( double(mc.v[0]->point()[0]), double(mc.v[0]->point()[1]),
                                                                  double(mc.v[0]->point()[2]) ) )
@@ -673,10 +658,10 @@ void interpolateGrid_averaged_1(DT &dt,
         // Order the tetrahedra along a Morton curve of their base cell before dispatch, so the
         // threads running together deposit into neighbouring cells: the deposit is bound by its
         // atomics, and random cells across a 2 GB grid cost 3x the throughput of local ones (TLB
-        // and cache reach), measured on the shared full grid of a 512^3 run. The old cost sort (by
-        // sample count, so that a chunk's threads were uniformly sized) is no longer needed: the
+        // and cache reach), measured on the shared full grid of a 512^3 run. No cost sort (by
+        // sample count, so that a chunk's threads are uniformly sized) is needed: the
         // work items bound every thread to itemSamples samples (the per-tet A/B kernel,
-        // DTFE_GPU_ITEMS=0, pays for that with its old imbalance). The permutation is applied one
+        // DTFE_GPU_ITEMS=0, pays for that with its imbalance). The permutation is applied one
         // array at a time so only a single extra copy is alive at once.
         {
             size_t const nT = tetCnts.size();
@@ -778,9 +763,9 @@ void interpolateGrid_averaged_1(DT &dt,
                 sharedFailed = true;
             }
         }
-        // The per-call path. A deposit that fails AFTER its upload consumed the arrays (the retry policy gave up,
-        // 2026-10-13) warns too: the warning used to need the arrays still there, so such a runtime fallback to
-        // the CPU loop below was silent -- and the suites' 'using the CPU interpolation' check blind to it.
+        // The per-call path. A deposit that fails AFTER its upload consumed the arrays (the retry policy gave up)
+        // warns too, so a runtime fallback to the CPU loop below is never silent -- the suites' 'using the CPU
+        // interpolation' check relies on it.
         bool perCallOk = false, perCallFailed = false;
         if ( not sharedDone and not sharedFailed and not tetCnts.empty() )
         {
@@ -838,18 +823,13 @@ void interpolateGrid_averaged_1(DT &dt,
 
     if ( not metalDeposited )
     {
-    // The CPU loop on several threads under --exact-average (2026-10-15). It ran on ONE thread wherever this
-    // function sees a whole triangulation: a single-domain run, and every partition of a '--sample-points' run
-    // (DTFE_parallel's single-triangulation branch) -- among them a GPU run's fallback, which a watchdog kill during
-    // the 4096^2 image planes (recipe stage dtfe27planes) sent to a serial exact average of a whole partition. Now
-    // the grid's x planes are dealt out to nT threads in interleaved slabs of slabW planes (exactAverageThreads), and
-    // EVERY thread walks every Delaunay cell in the triangulation's order but deposits only into the cells of its own
-    // slabs: a cell receives its contributions in exactly the single-threaded order, so the grids are identical, bit
-    // for bit, at any thread count (PS-DTFE's slab deposit, the same idea). A thread skips a cell none of whose x
-    // planes it owns right after the cheap vertex differences, before the inverse, the gradients and the clipping,
-    // so the replicated part is the CGAL walk and that test; the r3d / ps_clip2d clipping, the cost, is divided.
-    // The Monte-Carlo average keeps the single thread: its samples are the work, and a slab test per sample would
-    // repeat it on every thread.
+    // --exact-average runs the CPU loop on nT = exactAverageThreads() threads, also where this function sees a whole
+    // triangulation (a single-domain run; every partition of a '--sample-points' run, DTFE_parallel's
+    // single-triangulation branch, including a GPU run's fallback). The x planes are dealt out in interleaved slabs of
+    // slabW planes; EVERY thread walks every Delaunay cell in order but deposits only into its own slabs, so each grid
+    // cell gets its contributions in the single-threaded order: bit-identical at any thread count (as PS-DTFE's slab
+    // deposit). A thread skips a cell outside its slabs before the inverse and the r3d / ps_clip2d clipping (the cost).
+    // The Monte-Carlo average stays single-threaded: its samples are the work, and a slab test would repeat them.
     int const nT = exactAvg ? exactAverageThreads() : 1;
     int const slabW = std::max( 1, int( nGrid[0] / size_t( 8 * nT ) ) );   // ~8 slabs per thread: the load balances
     auto owns = [&](int const th, int const gi) { return nT == 1 or ( gi / slabW ) % nT == th; };

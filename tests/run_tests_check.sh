@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The suites' own skip / fail contract (2026-10-08). A suite that cannot run says SKIP and exits 0, unless
+# The suites' own skip / fail contract. A suite that cannot run says SKIP and exits 0, unless
 # DTFE_TEST_REQUIRED=1 (ci_suite.sh's double and 2d stages, after building what they test) makes that a FAILURE;
 # a binary that is broken is never a skip; and a check with nothing to compare against says so. Copies of the
 # suites run in scratch trees beside stand-in binaries, so every case is deterministic and needs no build. The
@@ -12,10 +12,9 @@
 #       under DTFE_TEST_REQUIRED=1 both FAIL ('DTFE_TEST_REQUIRED=1, but ...') and it exits 1
 #   R3  run_tests.py, a fresh DTFE_TEST_REFERENCE_DIR: the regression is a SKIP (', 1 skipped' in the Results
 #       line) and the run exits 0 EVEN under DTFE_TEST_REQUIRED=1 (no build can supply a reference; ci_suite.sh
-#       relied on it until 2026-10-11, it now compares with the stored one: R5); the next run compares against the
-#       reference written
-#   R5  run_tests.py against the STORED reference (tests/reference/regression_periodic.txt, which CI compares with
-#       since 2026-10-11): it PASSES as stored, and with every value moved by 5e-5 relative (rounding-level, under
+#       compares with the stored one: R5); the next run compares against the reference written
+#   R5  run_tests.py against the STORED reference (tests/reference/regression_periodic.txt, which CI compares
+#       with): it PASSES as stored, and with every value moved by 5e-5 relative (rounding-level, under
 #       the 3e-4 tolerance); ONE value moved by 1e-3 relative (the size of moving one of the 1000 particles by
 #       0.05% of the box) makes it FAIL and the run exit 1
 #   R4  run_tests.py, DTFE_TEST_PRECISION=double with no ./DTFE-double: 'SKIP:' and exit 0, or 'FAIL
@@ -40,7 +39,7 @@ check() { if [ "$1" = "0" ]; then printf '   PASS  %s\n' "$2"; else printf '   F
 has()   { grep -aqE -e "$2" "$1" && echo 0 || echo 1; }
 count() { grep -acE -e "$2" "$1" || true; }
 
-# the scratch tree of run_tests.py: today's script (copied now, never a stale one) beside the stand-in ./DTFE
+# the scratch tree of run_tests.py: the current script (copied now, never a stale one) beside the stand-in ./DTFE
 cp tests/run_tests.py "$TMP/rt/tests/"
 cat > "$TMP/rt/DTFE" <<'EOF'
 #!/usr/bin/env bash

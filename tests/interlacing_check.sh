@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
 # Interlacing ('--interlace', src/interlacing.cc) against an exact answer: tests/interlacing_unit.cpp
 # compiled against the source in 3D and 2D, single and double precision: the function is checked on grids
-# holding exact samples of a band-limited field (see the .cpp). Then end to end (2026-10-11), when the binaries
+# holding exact samples of a band-limited field (see the .cpp). Then end to end, when the binaries
 # are built: the second pass must grid the box moved by half a cell. A periodic run's pass 2 equals a plain
-# run on the particles moved by -dx/2 (what main.cpp now runs), so '--interlace' must equal interlace(plain,
+# run on the particles moved by -dx/2 (what main.cpp runs), so '--interlace' must equal interlace(plain,
 # plain of the moved particles) -- for TSC, the DTFE estimator and PS-DTFE; and a non-periodic run without a
-# region is refused. Until 2026-10-11 a run without '--region' gridded
-# the SAME cells twice (the setup reset the shifted region to the box): interlace(plain, plain), a
-# low-passed copy moved half a cell.
+# region is refused. A second pass that grids the SAME cells (a setup that resets the shifted region to the
+# box) would give interlace(plain, plain), a low-passed copy moved half a cell.
 # Usage: tests/interlacing_check.sh [--no-build]   (the flag is accepted for the battery; the end-to-end part uses the built binaries)
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

@@ -251,8 +251,8 @@ def render_fields(fs, out_dir, fields=None, label=None, force=True, quiet=False,
     for name in names:
         src = Path(f"{pp.prefix}{PointPlane._PTS_FIELDS.get(name, ('.pts_den',))[0]}")
         base = f"{fs.method}_{name}_pointeval_{plane_name}_z{z:.2f}"
-        # a non-default rendering gets its own name (2026-10-08): they all shared the plane render's, so --project
-        # slab / --smooth / --fixed-range overwrote it -- or were skipped as 'up to date' against it
+        # a non-default rendering gets its own name: under the plane render's, --project
+        # slab / --smooth / --fixed-range would overwrite it -- or be skipped as 'up to date' against it
         base += ("_slab" if project == "slab" else "") + (f"_smooth{smooth:g}" if smooth > 0 else "") \
             + ("_fixed" if fixed_range else "")
         # the raw (primary) output, plus -- for the faceted gradient fields -- a smoothed

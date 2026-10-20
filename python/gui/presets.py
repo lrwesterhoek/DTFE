@@ -20,9 +20,9 @@ _SEVEN = ["density_a", "velocity_a", "gradient_a", "divergence_a", "shear_a", "v
 
 # name -> (one-line description, settings). The settings are RunSpec / CustomSpec fields; a
 # preset leaves every field it does not name as it was. 'slice_plane': "largest" = the largest
-# image plane found for the simulation (none: no slice). 'deposit' is PS-DTFE's; 'deposit_dtfe' (2026-10-13), when
+# image plane found for the simulation (none: no slice). 'deposit' is PS-DTFE's; 'deposit_dtfe', when
 # given, is the cell average a standard-DTFE job gets instead (the thesis settings: the exact one, standard DTFE's
-# production setting since 2026-10-13; before, 'Standard' put a standard job on the Monte-Carlo average).
+# production setting).
 BUILTIN_PRESETS: dict[str, tuple[str, dict]] = {
     "Quick look": ("128³ grid, density and velocity only: about a minute on a laptop-sized "
                    "snapshot, for checking that everything works",
@@ -75,7 +75,7 @@ def apply_preset(spec, settings: dict, planes=()) -> list[str]:
     changed = []
     known = spec.to_dict()
     if settings.get("estimator", known.get("estimator")) == "dtfe" and "deposit_dtfe" in settings:
-        settings = dict(settings, deposit=settings["deposit_dtfe"])     # standard DTFE: its cell average (2026-10-13)
+        settings = dict(settings, deposit=settings["deposit_dtfe"])     # standard DTFE: its cell average
     for k, v in settings.items():
         if k not in known:
             continue
@@ -107,7 +107,7 @@ OPTION_TEXT = {
     "per_stream_ids":  ("... with each stream's tetrahedron particle IDs", "--per-stream-ids"),
     "slice_vel_grad":  ("Velocity gradient at each slice point (divergence, shear, vorticity maps)",
                         "--pts-vel-grad"),
-    "pts_conventions": ("Plane conventions", "--pts-conventions"),     # (2026-10-15) the image plane's estimators
+    "pts_conventions": ("Plane conventions", "--pts-conventions"),     # the image plane's estimators
     "exact":           ("Exact: analytic tetrahedron-cell clipping (noise-free; best on the GPU)", "--ps-exact-deposit"),
     "parallel_triangulation": ("Parallel triangulation (faster; repeats differ at float rounding)",
                                "--parallel-triangulation"),

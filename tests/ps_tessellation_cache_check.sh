@@ -16,14 +16,14 @@
 #     next run, and demonstrably different tessellations. 'partNo' stays -1 for all of them, so the
 #     descriptor separates them by their unpadded Lagrangian region -- without that, partitions
 #     2..N would silently load the first partition's tessellation.
-#  E2) The partition padding is part of a partition's identity. Since 2026-10-12 the partitions are padded by
-#     '--ps-lag-padding 8' mean spacings BY DEFAULT (before: the Eulerian '--padding' fraction, floored at 0.3 of
-#     a partition), which selects other particles: a default partition records 'lagPadding=8', a default run
-#     MISSES the caches of the Eulerian padding (every partition cache written before 2026-10-12: what
-#     '--ps-lag-padding 0' writes), and '--ps-lag-padding 0' -- the way back -- hits them.
+#  E2) The partition padding is part of a partition's identity. The partitions are padded by '--ps-lag-padding 8'
+#     mean spacings BY DEFAULT (not the Eulerian '--padding' fraction, floored at 0.3 of a partition, which
+#     selects other particles): a default partition records 'lagPadding=8', a default run MISSES the caches of the
+#     Eulerian padding (what '--ps-lag-padding 0' writes, and every older partition cache), and
+#     '--ps-lag-padding 0' hits them.
 #  F) A partitioned cache hit also reproduces the uncached run bit-for-bit.
 #  G) The standard binary caches its thread sub-domains too.
-#  G2) (2026-10-15) ... and a PARTITIONED standard run every partition's: one file per thread sub-box of each
+#  G2) ... and a PARTITIONED standard run every partition's: one file per thread sub-box of each
 #     partition, whose descriptor names its partition's region (its 'box=' line: DTFE_parallel makes the partition's
 #     region the sub-domain's full box), a warm run that loads them all (the folder left untouched) and outputs
 #     byte-identical to the uncached run; under '--sample-points' one file per partition (keyed by the partition's own
@@ -34,7 +34,7 @@
 #  J) A symlinked or relative name of the input hits the cache its absolute name wrote (canonical keys).
 #  K) libdeflate (when compiled in) and zlib read each other's chunked files.
 #  L) Two runs writing one cache folder at the same moment both succeed and leave a whole cache and no temp
-#     file: each writer has its own '<file>.part.<pid>' / '<map>.occ.tmp.<pid>' (2026-10-08).
+#     file: each writer has its own '<file>.part.<pid>' / '<map>.occ.tmp.<pid>'.
 #  M) A save removes the temp files of DEAD writers of that file and keeps a live writer's.
 #  A2) The body is DEFLATED while magic/version/descriptor stay plaintext, so a staleness check
 #     needs no inflation. Compression takes 735 MB down to 225 MB per 1.5e6 vertices at zlib
@@ -45,8 +45,6 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PY="${PYTHON:-python3}"
-command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/python3.14
 ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT}"
 source "${SCRIPT_DIR}/precision.sh"     # DTFE_TEST_PRECISION=double: the double pair
@@ -65,11 +63,7 @@ echo "============================================================"
 echo " PS-DTFE --tessellation-cache check   N=${N}^3  grid=${GRID}^3"
 echo "============================================================"
 
-if [ "${1:-}" != "--no-build" ] && ! precision_double; then
-    echo ">> building PS-DTFE ..."
-    BUILD_MODE="$(cat o_ps/.build_mode 2>/dev/null || true)"
-    make PS-DTFE ${BUILD_MODE:+"$BUILD_MODE"} >/dev/null
-fi
+build_target "${1:-}" PS-DTFE o_ps
 [ -x "${BIN}" ] || { echo "FAIL: ${BIN} not built"; exit 1; }
 
 rm -rf "${CACHE}"; mkdir -p "${CACHE}"
@@ -177,8 +171,8 @@ check "$([ "$(hits)" = "8" ] && echo 1 || echo 0)" "warm partitioned run hits al
 # the partitions must NOT all be the same tessellation
 ndistinct=$(echo "${RUN_OUT}" | grep -oE "Reused the cached tessellation \([0-9]+" | grep -oE "[0-9]+$" | sort -u | wc -l | tr -d ' ')
 check "$([ "${ndistinct}" -ge "2" ] && echo 1 || echo 0)" "partitions restored DIFFERENT tessellations (${ndistinct} distinct vertex counts)"
-# E2 (2026-10-12): the default padding is k = 8 spacings and its descriptor says so; an old Eulerian-padded cache
-# (no 'lagPadding' line: what '--ps-lag-padding 0' writes, and every partition cache written before 2026-10-12)
+# E2: the default padding is k = 8 spacings and its descriptor says so; an Eulerian-padded cache
+# (no 'lagPadding' line: what '--ps-lag-padding 0' writes, and every older partition cache)
 # must MISS in a default run, and '--ps-lag-padding 0' must still find it
 ndesc=$( { grep -l -a "lagPadding=8" "${PCACHE}"/*.tess 2>/dev/null || true; } | wc -l | tr -d ' ')
 check "$([ "${ndesc}" = "8" ] && echo 1 || echo 0)" "E2 every default partition records 'lagPadding=8' in its descriptor (got ${ndesc} of 8)"
@@ -235,7 +229,7 @@ echo "(G2) a PARTITIONED standard run caches every partition's sub-domains (2026
 # A standard partition is split into thread sub-boxes, each its own tessellation (DTFE_parallel), so a 2x2x2 split at
 # 2 threads writes 16 files; a sub-box's particles are selected from its partition's padded copy, so its descriptor
 # names the partition's region too (as its 'box=': 8 distinct ones over the 16 files). Under '--sample-points' a
-# partition is ONE tessellation: one file each, keyed by the partition's own region as before (the composite '--serve'
+# partition is ONE tessellation: one file each, keyed by the partition's own region (the composite '--serve'
 # of the same split shares them).
 PSCACHE="${CACHE}-stdpart"; rm -rf "${PSCACHE}"; mkdir -p "${PSCACHE}"
 if [ -x "${DTFE_BIN}" ]; then
@@ -373,8 +367,8 @@ done
 
 echo ""
 echo "(J) one key per FILE: a symlinked or relative name of the input hits the cache its absolute name wrote"
-# The descriptor stores the input's realpath (canonical_path.h). Before, '/tmp/x' and '/private/tmp/x' or
-# 'x' run from its folder were three keys, i.e. two needless rebuilds of the same tessellation.
+# The descriptor stores the input's realpath (canonical_path.h), so '/tmp/x' and '/private/tmp/x' or 'x' run
+# from its folder are one key, not three (two needless rebuilds of the same tessellation).
 LINKDIR="${TMP}_link"; rm -f "${LINKDIR}"; ln -s "${TMP}" "${LINKDIR}"
 nbefore=$(ls -1 "${CACHE}"/*.tess 2>/dev/null | wc -l | tr -d ' ')
 RUN_OUT="$( "${BIN}" "${LINKDIR}/$(basename "${SNAP}")" "${TMP}/ptc_sym" --grid "${GRID}" "${COMMON[@]}" \
@@ -421,12 +415,12 @@ fi
 
 echo ""
 echo "(L) two runs writing ONE cache folder at the same moment: each writer has its own temp file (2026-10-08)"
-# Two writers of one partition (a batch run beside the composite server, which shares the folder) both truncated
-# one '<file>.part' -- and one '<map>.occ.tmp', and the globals record's '.part' -- so the first rename could
-# publish a file with a hole. Now each writes '<file>.part.<pid>' (the map '.occ.tmp.<pid>') and renames it into
-# place. Whether the two saves really overlap depends on the timing; what must hold either way: both runs
-# succeed and reproduce the uncached run (F's ptc_part_ref), no temp file is left, and the cache they leave is
-# whole (a third run hits all 8 partitions, bit-identically).
+# Two writers of one partition (a batch run beside the composite server, which shares the folder) that shared one
+# '<file>.part' -- or one '<map>.occ.tmp', or the globals record's '.part' -- would both truncate it, so the first
+# rename could publish a file with a hole. So each writes '<file>.part.<pid>' (the map '.occ.tmp.<pid>') and renames it
+# into place. Whether the two saves really overlap depends on the timing; what must hold either way: both runs succeed
+# and reproduce the uncached run (F's ptc_part_ref), no temp file is left, and the cache they leave is whole (a third
+# run hits all 8 partitions, bit-identically).
 CC="${CACHE}-conc"; rm -rf "${CC}"; mkdir -p "${CC}"
 CARGS=(--grid "${GRID}" "${COMMON[@]}" --partition 2 2 2 --tessellation-cache "${CC}" --verbose 3)
 "${BIN}" "${SNAP}" "${TMP}/ptc_conc1" "${CARGS[@]}" > "${TMP}/ptc_conc1.log" 2>&1 & pid1=$!
@@ -454,7 +448,7 @@ echo ""
 echo "(M) a DEAD writer's temp file is removed by the next save of that file; a live writer's is kept"
 # Per-writer names would strand a SIGKILLed writer's file (multi-GB on TNG50), so save() first removes the
 # '<file>.part.<pid>' siblings whose writer no longer exists (kill(pid, 0) fails with ESRCH). It keeps a running
-# writer's file, the old shared '<file>.part' and the files of other cache files (only a save scans, and only
+# writer's file, a shared (pid-less) '<file>.part' and the files of other cache files (only a save scans, and only
 # beside the file it writes). The dead pid is one that has just exited: a fixed number could be alive on Linux.
 victim=$(ls -1 "${CC}"/*.tess 2>/dev/null | head -1)
 other=$(ls -1 "${CC}"/*.tess 2>/dev/null | sed -n 2p)

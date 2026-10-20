@@ -7,25 +7,23 @@
 # windowed to one coarse slice, exact deposit, with the wall times of both runs.
 # Contracts: the SAMPLED deposit counts a straddling tet's samples over its whole bounding box, so
 # the CPU window has the full run's values: its counts and masks identical bytes, its summed grids identical to
-# the rounding of the fixed-point units -- a window pass takes ITS OWN units since 2026-10-15 (from the tets that
+# the rounding of the fixed-point units -- a window pass takes ITS OWN units (from the tets that
 # reach the window, the same on the GPU and the CPU: ps_interpolation.cc fxBoundWalk), so a share below ~2^-38 of
 # the bound can round to another last unit than in the full run (peak-relative < 1e-8; measured 1e-10, in the
-# velocity gradient only, on these waves; until 2026-10-15 identical bytes, the CPU taking the full run's units
-# and the GPU its window's). The EXACT deposit clips only the window's cells and normalizes each tet by its
-# whole weight, so its moments agree to float rounding (the counts, masks and multiplicity are still identical
+# velocity gradient only, on these waves). The EXACT deposit clips only the window's cells and normalizes each tet by
+# its whole weight, so its moments agree to float rounding (the counts, masks and multiplicity are still identical
 # bytes); the GPU takes the usual parity class. GPU builds: a GPU window and the CPU window of the same pass
-# (--partition 2 2 2, --verbose 3) take the same fixed-point units -- their 'fixed-point units' lines, one per
-# pass, are equal -- and their grids agree to the GPU parity class (the kernels form their shares in float). With '--tessellation-cache', a window run skips the partitions whose occupancy
-# maps (written by a composite server or by an earlier batch run) never reach the window: identical
-# bytes to the uncached run, the skip count reported. The units comparison runs in the single build only (the double
-# build's CPU sums are doubles). --no-build is accepted and ignored.
+# (--partition 2 2 2, --verbose 3) take the same fixed-point units -- their 'fixed-point units' lines, one per pass, are
+# equal -- and their grids agree to the GPU parity class (the kernels form their shares in float). With
+# '--tessellation-cache', a window run skips the partitions whose occupancy maps (written by a composite server or by an
+# earlier batch run) never reach the window: identical bytes to the uncached run, the skip count reported. The units
+# comparison runs in the single build only (the double build's CPU sums are doubles). --no-build is accepted and
+# ignored.
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$ROOT" || exit 1
 source "${SCRIPT_DIR}/precision.sh"     # DTFE_TEST_PRECISION=double: the double pair
-PY="${PYTHON:-python3}"
-command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/python3.14
 precision_require "$PS_BIN"
 [ -x "$PS_BIN" ] || { echo "FAIL: $PS_BIN is not built"; exit 1; }
 OBJ_PS=o_ps; precision_double && OBJ_PS=o_ps_d     # the build whose GPU mode counts
@@ -78,9 +76,9 @@ run "$TMP/zoom_full" "$PS_BIN" "$SNAP" "$TMP/zoom_full" --grid 256 256 16 "${BAS
 run "$TMP/zoom_win"  "$PS_BIN" "$SNAP" "$TMP/zoom_win"  --grid 256 256 16 "${BASE[@]}" --ps-exact-deposit --ps-window 25 75 25 75 50 56.25
 if [ $GPU = 1 ]; then
     run "$TMP/zoom_wingpu" "$PS_BIN" "$SNAP" "$TMP/zoom_wingpu" --grid 256 256 16 "${BASE[@]}" --ps-exact-deposit --ps-window 25 75 25 75 50 56.25 --ps-gpu
-    # the units of a GPU and a CPU window pass (2026-10-15): before, the CPU walk bounded every tet of the partition
-    # and the GPU extraction only the window's, so the two took different units (and different last bits). Single
-    # build only: the double build's CPU deposit keeps double sums (no units to compare)
+    # the units of a GPU and a CPU window pass: both must bound the same tets (the window's), else the two take
+    # different units (and different last bits). Single build only: the double build's CPU deposit keeps double
+    # sums (no units to compare)
     precision_double && echo ">> GPU vs CPU window units: SKIP (the double build's CPU sums are doubles)"
     precision_double || echo ">> GPU vs CPU window: the same fixed-point units per pass (--partition 2 2 2, --verbose 3)"
     precision_double || for v in "sampled:--avg-subsamples 2" "exact:--ps-exact-deposit --ps-vertex-mass --ps-volume-weighted" "hr:--ps-halo-release 2"; do
@@ -197,7 +195,7 @@ if grep -q "does not fit in memory" "$TMP/huge.log"; then echo "  FAIL the auto-
 if [ $GPU = 1 ]; then
     echo ">> the GPU exact deposit on a fine virtual grid (32768^2 x 64: 3 kpc cells) agrees with the CPU"
     # the GPU clips each piece in a frame near the piece (exact_clip.metal.inc); in the tetrahedron's
-    # vertex-0 frame a 3 kpc piece Mpc away lost its volume to float cancellation (20% per cell here)
+    # vertex-0 frame a 3 kpc piece Mpc away would lose its volume to float cancellation (20% per cell here)
     FW=(--grid 32768 32768 64 "${BASE[@]}" --ps-exact-deposit "${PART[@]}" --ps-window 40 40.390625 40 40.390625 50 51.5625)
     run "$TMP/fine_cpu" "$PS_BIN" "$SNAP" "$TMP/fine_cpu" "${FW[@]}"
     run "$TMP/fine_gpu" "$PS_BIN" "$SNAP" "$TMP/fine_gpu" "${FW[@]}" --ps-gpu
@@ -278,7 +276,7 @@ for mode, cls in (("sampled", "window"), ("exact", "tight")):
         compare(f"{mode} GPU window ~ CPU full",             f"{mode}_full",     f"{mode}_wingpu",  LO,   DIMS, SHAPE, "gpu")
         compare(f"{mode} GPU seam window ~ CPU full",        f"{mode}_full",     f"{mode}_seamgpu", SEAM, DIMS, SHAPE, "gpu")
         compare(f"{mode} GPU halo-release window ~ CPU full", f"{mode}_fullhr",  f"{mode}_winhrgpu", LO, DIMS, SHAPE, "gpu")
-        # the GPU window against the CPU window of the same pass (2026-10-15: the same units, checked above)
+        # the GPU window against the CPU window of the same pass (the same units, checked above)
         compare(f"{mode} GPU window ~ CPU window",           f"{mode}_win",      f"{mode}_wingpu",  (0, 0, 0), DIMS, DIMS, "gpu")
         compare(f"{mode} GPU seam window ~ CPU seam window", f"{mode}_seam",     f"{mode}_seamgpu", (0, 0, 0), DIMS, DIMS, "gpu")
 ZLO, ZDIMS, ZSHAPE = (64, 64, 8), (128, 128, 1), (256, 256, 16)

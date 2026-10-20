@@ -81,7 +81,7 @@ def process_snapshot(snapshot, redshift, sim, method, prefix=None, data_root=Non
         p.release()
 
         stats_row = {'snapshot': snapshot, 'z': redshift}
-        lines = [f"Eigenvalue statistics (cached slices, all 3 planes)",
+        lines = ["Eigenvalue statistics (cached slices, all 3 planes)",
                  f"Snapshot {snapshot}, z = {redshift:.2f}", "=" * 50]
         for k in ('lambda1', 'lambda2', 'lambda3'):
             v = np.concatenate([np.ravel(eig_slices[d][k]) for d in eig_slices])

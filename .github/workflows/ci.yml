@@ -1,18 +1,17 @@
-# Two jobs. build-and-test -- the Linux CPU build of all three binary pairs (single, DOUBLE=1, DIM=2)
+# Six jobs. build-and-test -- the Linux CPU build of all three binary pairs (single, DOUBLE=1, DIM=2)
 # and the test battery through tests/ci_suite.sh, the SAME list the Dockerfile runs, so the two cannot
-# drift (a previous cross-platform-test.yml was removed on purpose, commit eb243c8; this job stays
-# CPU-only -- it exists to catch "does not compile on Linux", "the deposit broke" and "the GUI no
-# longer runs what it shows" regressions). The Metal GPU path is macOS-only and validated locally
+# drift (this job is CPU-only: it exists to catch "does not compile on Linux", "the deposit broke" and
+# "the GUI no longer runs what it shows" regressions). The Metal GPU path is macOS-only and validated locally
 # (tests/dtfe_metal_check.sh, tests/gpu_scalar_check.sh, tests/gpu_mass_check.sh, metal/validate_deposit.cpp).
 # cuda-compile -- the CUDA/HIP backend (src/CGAL_triangulation/*_gpu_cuda.cu, a port of the Metal
 # kernels) compiled with nvcc in NVIDIA's toolkit image: no GPU on the runner, so this only keeps the
 # port compiling (the two .cu files are self-contained, so no CGAL is needed for this).
 # hip-compile -- the same port compiled with ROCm's hipcc (AMD), compile only as well.
-# old-python -- every .py parses under Python 3.10, the oldest pyproject supports (2026-10-11: ci_suite's
-# check skipped on the runner, which has no 3.10, so a PEP 701 f-string could pass CI).
+# old-python -- every .py parses under Python 3.10, the oldest pyproject supports (ci_suite's own check
+# skips on the runner, which has no 3.10, so without this job a PEP 701 f-string could pass CI).
 # cudaemu -- the CUDA/HIP port RUN (not only compiled) through its CPU emulation (CUDAEMU=1, gpu_cuda_emu.h): the
 # GPU parity suites via tests/cudaemu_check.sh at warp 32 (CUDA) and 64 (HIP wavefront). Validates the
-# transliteration and the host logic, not real hardware (2026-10-11).
+# transliteration and the host logic, not real hardware.
 # compile-variants -- what users build beyond the pairs: no TBB and no libdeflate (neither installed),
 # 'make library' and the demo/examples program linked against it (tests/ci_suite.sh variants).
 # The C++ jobs share their compiler output through ccache (Debian's /usr/lib/ccache masquerade: the
@@ -20,8 +19,8 @@
 
 name: ci
 
-# The working branch is Phase-Space: until 2026-10-02 the workflow ran only on master and on pull
-# requests, so it never ran at all. workflow_dispatch adds a manual "Run workflow" button.
+# The working branch is Phase-Space, so the workflow runs on it as well as on master and pull
+# requests. workflow_dispatch adds a manual "Run workflow" button.
 on:
   push:
     branches: [master, Phase-Space]
@@ -31,8 +30,8 @@ on:
 jobs:
   build-and-test:
     runs-on: ubuntu-24.04
-    # 60 until 2026-10-15: the single-precision battery alone outgrew it on the 4-core runner (cancelled at 1 h in
-    # 'Test battery (single precision)'; locally it is 18 min on 10 cores), the double and 2D passes come after it
+    # the single-precision battery alone outgrows 60 min on the 4-core runner (locally it is 18 min on 10 cores),
+    # and the double and 2D passes come after it
     timeout-minutes: 150
     env:
       CCACHE_MAXSIZE: 500M
@@ -57,14 +56,13 @@ jobs:
           restore-keys: ccache-build-and-test-
 
       # single + DOUBLE=1 + DIM=2: each is a separate compile of every translation unit, so only a
-      # build catches a float-only or 3D-only construct creeping in (the 2D build was broken for a
-      # day by the 3D-only cache reader before anyone noticed)
+      # build catches a float-only or 3D-only construct creeping in
       - name: Build the single, double and 2D binaries (CPU-only)
         run: tests/ci_suite.sh build
 
-      # every CPU suite against ./DTFE and ./PS-DTFE (tests/ci_suite.sh lists them, with why); since
-      # 2026-10-11 with the standard-DTFE regression against its STORED reference (it compared nothing
-      # here before) and the auto-tune and --scratch-dir suites (ported off macOS-only commands)
+      # every CPU suite against ./DTFE and ./PS-DTFE (tests/ci_suite.sh lists them, with why), the
+      # standard-DTFE regression against its STORED reference and the auto-tune and --scratch-dir
+      # suites (free of macOS-only commands) included
       - name: Test battery (single precision)
         run: tests/ci_suite.sh core
 
@@ -139,7 +137,7 @@ jobs:
   cudaemu:
     runs-on: ubuntu-24.04
     # non-blocking until its first green run on the runners' x86-64 (the emulation's context switch has run there
-    # only under Rosetta); the Linux-only std::bad_alloc that made it red is fixed (src/subpartition.h, 2026-10-11)
+    # only under Rosetta)
     continue-on-error: true
     timeout-minutes: 75
     strategy:
@@ -198,8 +196,7 @@ jobs:
           ls -la /tmp/*_gpu_cuda.o
 
   # The same two files as HIP (AMD, ROCm's hipcc, '-x hip' as the Makefile's HIP=1 build): compile only,
-  # for one common datacenter target. First compiled 2026-10-02 (HIP 7.15, rocm/dev-ubuntu-24.04, under
-  # x86 emulation): clean once gpuFree's [[nodiscard]] hipError_t was discarded explicitly.
+  # for one common datacenter target.
   hip-compile:
     runs-on: ubuntu-24.04
     container: rocm/dev-ubuntu-24.04:latest

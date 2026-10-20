@@ -15,7 +15,7 @@
 #     jitter-free pancake the transverse gradient vanishes and grad_x matches a central
 #     finite difference of '.pts_den' at x +- eps probe points.
 #  E) clear rejections: --per-stream / --per-stream-ids (PS-only) and --partNo (one partition
-#     would answer only its own share of the points). '--partition' is accepted since 2026-10-13:
+#     would answer only its own share of the points). '--partition' is accepted:
 #  F) --partition: each partition triangulates its padded sub-box and answers the points inside
 #     the tetrahedra whose Eulerian centroid lies in its sub-box (the composite server's ownership),
 #     so every point is answered exactly once, by the tetrahedron the single triangulation uses.
@@ -37,8 +37,6 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PY="${PYTHON:-python3}"
-command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/python3.14
 ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT}"
 source "${SCRIPT_DIR}/precision.sh"     # DTFE_TEST_PRECISION=double: the double pair
@@ -59,16 +57,12 @@ echo "============================================================"
 echo " standard-DTFE --sample-points check   N=${N}^3  grid=${GRID}^3"
 echo "============================================================"
 
-if [ "${1:-}" != "--no-build" ] && ! precision_double; then
-    echo ">> building DTFE ..."
-    BUILD_MODE="$(cat o/.build_mode 2>/dev/null || true)"
-    make DTFE ${BUILD_MODE:+"$BUILD_MODE"} >/dev/null
-fi
+build_target "${1:-}" DTFE o
 [ -x "${BIN}" ] || { echo "FAIL: ${BIN} not built"; exit 1; }
 
 # capture FIRST -- piping the binary straight into grep -q would SIGPIPE it under pipefail
 # a help that fails is a broken binary, not a missing feature; a missing feature fails under DTFE_TEST_REQUIRED=1
-# (skip_or_fail, tests/precision.sh: 2026-10-08)
+# (skip_or_fail, tests/precision.sh)
 FULL_HELP="$("${BIN}" --full_help 2>/dev/null)" || { echo "FAIL: ${BIN} --full_help exited non-zero"; exit 1; }
 if ! grep -q -- '--sample-points' <<<"${FULL_HELP}"; then
     skip_or_fail "this DTFE has no --sample-points support."
@@ -103,11 +97,7 @@ run() {  # $1 = binary, $2 = output root, $3 = input snapshot, rest = extra flag
         --input 105 --MpcUnit 1 --verbose 1 "$@" > "$log" 2>&1
     local rc=$?
     set -e
-    if [ "$rc" -ne 0 ]; then
-        echo "   ERROR: $(basename "${bin}") exited with code $rc -- last 25 lines of $log:"
-        tail -n 25 "$log" | sed 's/^/      | /'
-        exit 1
-    fi
+    die_on_failed_run "$rc" "$log" "$(basename "${bin}")"
 }
 
 runp() {  # like run, at --verbose 2 (the partition and GPU lines) and with the caller's own --field
@@ -118,11 +108,7 @@ runp() {  # like run, at --verbose 2 (the partition and GPU lines) and with the 
     "${bin}" "${snap}" "${out}" --grid "${GRID}" --input 105 --MpcUnit 1 --verbose 2 "$@" > "$log" 2>&1
     local rc=$?
     set -e
-    if [ "$rc" -ne 0 ]; then
-        echo "   ERROR: $(basename "${bin}") exited with code $rc -- last 25 lines of $log:"
-        tail -n 25 "$log" | sed 's/^/      | /'
-        exit 1
-    fi
+    die_on_failed_run "$rc" "$log" "$(basename "${bin}")"
 }
 
 echo ">> run 1: uniform lattice, standard binary, cell centres (binary points)"
@@ -193,7 +179,7 @@ set -e
 echo "   OK"
 
 # ---------------------------------------------------------------------------------------------
-# (F) --partition (2026-10-13): partitioned point evaluation == the single triangulation
+# (F) --partition: partitioned point evaluation == the single triangulation
 # ---------------------------------------------------------------------------------------------
 SNAP_X="${TMP}/dpe_input_crossed.hdf5"
 SNAP_NP="${TMP}/dpe_input_cloud.hdf5"
@@ -255,7 +241,7 @@ grep -q "covered by none, although the box is periodic" "${TMP}/dpe_x_low.log" \
 echo "   OK"
 OBJ=o; precision_double && OBJ=o_d
 GPU=0
-for m in metal cudaemu cuda hip; do [ -f "${OBJ}/.gpu_mode_${m}" ] && GPU=1; done
+[ -n "$(gpu_backend_of "${OBJ}")" ] && GPU=1
 if [ "${GPU}" = "1" ]; then
     echo ">> run 11: --gpu (the '_a' grid per partition on the GPU): the points are the CPU's, byte for byte"
     GPU_FLAGS=(--sample-points "${PTS_X}" --pts-den-grad --pts-vel-grad --periodic --field density_a --partition 2 2 2)

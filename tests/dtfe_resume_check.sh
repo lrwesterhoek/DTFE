@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Resume of a killed partitioned STANDARD-DTFE run (2026-10-13): the standard partition loop checkpoints through
+# Resume of a killed partitioned STANDARD-DTFE run: the standard partition loop checkpoints through
 # PS-DTFE's code (src/partition_checkpoint.h: beginLoop / afterMerge / reportWrites; tests/ps_resume_check.sh is
 # the PS half). demo/z0_64.gadget (262144 particles, z=0, tracked in the repo) on a 40^3 grid, --periodic
 # --padding 5, split 3 3 3 (27 partitions), 2 threads each (OMP_NUM_THREADS=2 --max-concurrent 2), the fields
@@ -23,8 +23,8 @@
 #       writes none either
 #   D8  a checkpoint of another binary ('binary=' key line) is refused, naming the line and DTFE_RESUME=0; a PS-DTFE
 #       checkpoint is not read as a standard one
-#   D9  the production path: NO --partition, the auto-tuner splits (DTFE_RAM_GB=0.08: 5 5 5 at 1-2 threads since the
-#       standard memory plan of 2026-10-13); killed, then '--resume' without --partition on a "bigger machine" (DTFE_RAM_GB=64, where the tuner
+#   D9  the production path: NO --partition, the auto-tuner splits (DTFE_RAM_GB=0.08: 5 5 5 at 1-2 threads);
+#       killed, then '--resume' without --partition on a "bigger machine" (DTFE_RAM_GB=64, where the tuner
 #       alone would not split) adopts the checkpoint's split and finishes, byte-identical, at the killed run's thread
 #       count (passed as --max-concurrent: the count is left out of the key on purpose, as PS-DTFE's --max-concurrent,
 #       but another count re-splits each partition, which with this short padding moves the grids beyond rounding)
@@ -34,15 +34,14 @@
 #       file, do not
 #   D12 GPU builds only (a GPU stamp in o/ or o_d/; SKIP otherwise): a killed '--gpu --exact-average' run (the
 #       production standard) resumes; '.den' (CPU) byte-identical, and the '_a' grids too (the GPU's exact fixed-point
-#       sums, 2026-10-13; within 1e-5 of their peak when DTFE_METAL_FLOAT_GRIDS / DTFE_GPU_FLOAT_GRIDS=1)
-#   D13 (2026-10-14) a '--sample-points --pts-vel-grad' plane (64^2 points across the box, the shape of the
+#       sums; within 1e-5 of their peak when DTFE_METAL_FLOAT_GRIDS / DTFE_GPU_FLOAT_GRIDS=1)
+#   D13 a '--sample-points --pts-vel-grad' plane (64^2 points across the box, the shape of the
 #       dtfe27planes runs) with the same split: the uninterrupted run checkpoints its point answers too and removes the
 #       checkpoint; killed after 10 partitions it leaves exactly one 'points.<i>' file per merged partition; a resume
 #       with another point file under the same name refuses, naming the 'sample-points' key line; '--resume' reads the
 #       10 partitions' answers back, computes the other 17, and every output -- the '.pts_*' files and the grids -- is
-#       byte-identical to the uninterrupted run (until 2026-10-14 such a run wrote no checkpoint and '--resume'
-#       refused it: 'its point accumulators are not checkpointed')
-#   D14 (2026-10-15) the partition loop's LOOK-AHEAD (partition k+1 selected, split and triangulated on CPU threads of
+#       byte-identical to the uninterrupted run
+#   D14 the partition loop's LOOK-AHEAD (partition k+1 selected, split and triangulated on CPU threads of
 #       its own while partition k is interpolated; on by default under '--gpu', DTFE_OVERLAP=1 forces it on the CPU):
 #       every output byte-identical to the run without it -- the grids of D1's reference (the log says it ran;
 #       '--no-overlap' wins over DTFE_OVERLAP=1), a run killed after 10 partitions while the 11th was being prepared,
@@ -59,8 +58,6 @@ ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$ROOT" || exit 1
 source "${SCRIPT_DIR}/precision.sh"     # DTFE_TEST_PRECISION=double: the double pair
 precision_require "${DTFE_BIN}"
-PY="${PYTHON:-python3}"
-command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/python3.14
 [ -x "${DTFE_BIN}" ] || { echo "FAIL: ${DTFE_BIN} is not built"; exit 1; }
 BIN="$(cd "$(dirname "${DTFE_BIN}")" && pwd)/$(basename "${DTFE_BIN}")"
 SNAP="$ROOT/demo/z0_64.gadget"
@@ -83,7 +80,7 @@ same() {
     done
     [ "$n" -gt 0 ]
 }
-merged_count() { grep -a -m1 '^merged_count' "$1/checkpoint" | awk '{print $2}'; }
+# merged_count <checkpoint folder>: tests/lib.sh
 C=(--grid 40 --periodic --padding 5 --field density velocity density_a velocity_a gradient_a tweb_a vweb_a
    --lambda_th 0.3 --verbose 2 --partition 3 3 3)
 RUN=(env OMP_NUM_THREADS=2 "$BIN" "$SNAP")
@@ -208,12 +205,12 @@ splitof() { grep -a -m1 'partitions defined via the grid' "$1" | sed 's/.*the gr
 threadsof() { grep -a -m1 'AUTO-TUNE: .* thread(s)' "$1" | sed 's/.*, \([0-9]*\) thread(s).*/\1/'; }
 split="$(splitof "$TMP/aref.log")"
 t1="$(threadsof "$TMP/a1.log")"
-# The resume runs at the killed run's thread count (2026-10-13, integration of the parity batch). '--max-concurrent' is
+# The resume runs at the killed run's thread count. '--max-concurrent' is
 # left out of the key on purpose (a run killed for memory may resume with fewer threads), but the thread count is the
-# sub-box split inside each partition, and this test's padding of 5 spacings is short at z = 0: the resume re-tuned on
-# the "bigger machine" took 2 threads where the double build's killed run had 1 (the standard memory plan of the same
-# batch), and its grids differed by 2.8e-2 of the peak, not by float rounding. So the thread count is passed, as a user
-# resuming would keep it; the split is still the checkpoint's (no --partition), on a machine where the tuner would not split.
+# sub-box split inside each partition, and this test's padding of 5 spacings is short at z = 0: a resume re-tuned on
+# the "bigger machine" can take 2 threads where the killed run had 1, and its grids then differ by 2.8e-2 of the
+# peak, not by float rounding. So the thread count is passed, as a user resuming would keep it; the split is still the
+# checkpoint's (no --partition), on a machine where the tuner would not split.
 env OMP_NUM_THREADS=2 DTFE_RAM_GB=64 DTFE_AUTO_MINN=1000 "$BIN" "$SNAP" "$TMP/a" "${A[@]}" --resume ${t1:+--max-concurrent "$t1"} \
     > "$TMP/a2.log" 2>&1; rc2=$?
 [ "$rc1" = 137 ] && [ "$rc2" = 0 ] && [ -n "$split" ] && [ "$split" != "1,1,1" ] && [ -n "$t1" ] \
@@ -273,7 +270,7 @@ check "D11 SCRATCH_DIR: the checkpoint in the scratch folder makes the run pass 
 
 echo ">> D12: a killed --gpu --exact-average run"
 GPU=0
-for m in metal cudaemu cuda hip; do [ -f "$OBJ/.gpu_mode_$m" ] && GPU=1; done
+[ -n "$(gpu_backend_of "$OBJ")" ] && GPU=1
 if [ "$GPU" != 1 ]; then
     echo "  SKIP D12: $OBJ carries no GPU stamp (a METAL=1 / CUDA=1 / HIP=1 / CUDAEMU=1 build runs it)"
 else
@@ -299,8 +296,8 @@ for e in ("a_den", "a_vel", "a_velGrad"):
 sys.exit(0 if worst < 1e-5 else 1)
 PYEOF
     check "D12 the '_a' grids within 1e-5 of their peak" $?
-    # the exact GPU sums (2026-10-13): a resumed GPU run is byte-identical as a CPU one is, unless the float atomics
-    # are asked back (the integrator's check of the GPU and resume patches together)
+    # the exact GPU sums: a resumed GPU run is byte-identical as a CPU one is, unless the float atomics
+    # are asked back
     if [ "${DTFE_METAL_FLOAT_GRIDS:-0}" = 1 ] || [ "${DTFE_GPU_FLOAT_GRIDS:-0}" = 1 ]; then
         echo "  SKIP D12 byte identity: the float atomics were asked for"
     else

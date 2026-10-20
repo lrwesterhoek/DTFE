@@ -4,11 +4,11 @@ One row per run -- simulation, snapshot, output name, grid, options, when, how l
 size on disk -- and a status that names every known output-changing fix the run predates (by
 the binary's build stamp, else the run date). Actions: open the log, load the run's settings into
 the Grids tab (re-run with the same settings), open it in Explore, show it in Finder, move its
-outputs to the Trash (never a hard delete), and (2026-10-11) build the run's void catalogue as a queue job; the
+outputs to the Trash (never a hard delete), and build the run's void catalogue as a queue job; the
 'Voids' column says whether that catalogue is cached, stale (the grid was rewritten after it) or absent, read in a
 background thread (results.void_status).
 
-RunningNow (2026-10-11): the runs going on this machine wherever they were started (nohup, a terminal script,
+RunningNow: the runs going on this machine wherever they were started (nohup, a terminal script,
 this launcher), from the processes' command lines and their progress sidecars (runspec.running_now), with a Stop.
 """
 
@@ -170,9 +170,9 @@ class RunsBrowser(QWidget):
                       else "✔ ok")
             if r.attempt == "running" and r.progress:          # C1: a run going under this name, with its sidecar
                 status = "▶ " + (R.progress_text(r.progress) or "running")
-            elif r.attempt == "resumable":                     # K2: killed with its checkpoint kept (2026-10-11)
+            elif r.attempt == "resumable":                     # K2: killed with its checkpoint kept
                 status = "⏸ resumable"
-            elif r.gpu_retries:                                # G1: the log's GPU retry tally, per cause (2026-10-11)
+            elif r.gpu_retries:                                # G1: the log's GPU retry tally, per cause
                 status += ", " + R.retries_text(r.gpu_retries, r.gpu_retries_by_cause)
             vstate, vwhy = self.void_states.get(str(r.path), ("", ""))
             voids = VOID_TEXT.get(vstate, "…" if R.void_candidate(r) and self._void_gen else "")
@@ -239,7 +239,7 @@ class RunsBrowser(QWidget):
                   f"{_gb(r.peak_rss_gb)} resident",
                   f"outputs   {len(r.outputs)} files, {r.size_bytes / 1e9:.2f} GB",
                   f"settings  {r.options_text() or '—'}" + (f", {r.grid}{'²' if r.dim == 2 else '³'} grid" if r.grid else "")]
-        if r.gpu_retries:           # the log's closing tally (G1, 2026-10-11)
+        if r.gpu_retries:           # the log's closing tally (G1)
             lines.append(f"retries   {R.retries_text(r.gpu_retries, r.gpu_retries_by_cause)} of the deposit")
         elif r.gpu_retried:
             lines.append("retries   the GPU deposit was restarted (this log has no per-cause tally)")
@@ -268,7 +268,7 @@ class RunsBrowser(QWidget):
         r = self._sel()
         if r is None:
             return
-        # every log of the set (.runlog, .runlog.failed, .runlog.partial: 2026-10-08), or a left-behind attempt log
+        # every log of the set (.runlog, .runlog.failed, .runlog.partial), or a left-behind attempt log
         # shows up as a failed run after the outputs are gone
         files = [p for p in r.outputs if p.is_file()] + [r.path] + [p for p in r.log_files() if p != r.path]
         side = Path(str(r.path.parent / r.prefix) + ".gui.json")
@@ -315,7 +315,7 @@ def running_cells(e: dict) -> list[str]:
         state = "died: the process is gone, its progress file left behind"
     retries = p.get("gpu_retries") if isinstance(p, dict) else None
     if state.startswith("running") and retries:
-        try:        # per cause when the sidecar has them (G1, 2026-10-11)
+        try:        # per cause when the sidecar has them (G1)
             state += ", " + R.retries_text(int(retries), p.get("gpu_retries_by_cause"))
         except (TypeError, ValueError):
             state += f", {retries} GPU retries"
@@ -325,7 +325,7 @@ def running_cells(e: dict) -> list[str]:
 
 
 class RunningNow(QWidget):
-    """The runs going on this machine, wherever they were started (2026-10-11): the launcher's own, a terminal
+    """The runs going on this machine, wherever they were started: the launcher's own, a terminal
     script, a nohup'ed overnight batch. Filled by the window's background poll (runspec.running_now): simulation
     and snapshot from the binary's command line, phase, done/total, ETA and memory from its progress sidecar
     '<output>.runlog.progress' (C1), elapsed from ps. A leftover sidecar whose pid is gone reads 'died'. Stop

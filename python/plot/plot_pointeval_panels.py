@@ -27,8 +27,7 @@ PANELS = ("density", "sheet", "streams")
 def load_planes(prefix: Path, side: dict):
     """(density, streams), each (planes, nv, nu). A plane made with --supersample K holds KxK sub-samples per pixel
     (make_image_plane.py writes planes x nv*K x nu*K points): the density is averaged over each block, the pixel-area
-    mean dtfelib.io.PointPlane makes too; the stream count, a whole number, takes the block's largest. 2026-10-11:
-    the K was ignored, so every K > 1 plane died here with 'wrong --plane or --prefix?'."""
+    mean dtfelib.io.PointPlane makes too; the stream count, a whole number, takes the block's largest."""
     k = int(side.get("supersample", 1))
     planes, nv, nu = int(side["planes"]), int(side["nv"]), int(side["nu"])
     shape = (planes, nv * k, nu * k)
@@ -121,7 +120,7 @@ def main() -> None:
             out = base if (len(panels) == 1 and args.output) else \
                 base.with_name(f"{base.stem}_{name}{base.suffix}")
             # flip: same origin='lower' as the figure. A COPY: matplotlib < 3.9 hands the reversed view to PIL,
-            # which refuses a non-C-contiguous array (every --image run failed there, 2026-10-11; CI's numpy 1.26 set)
+            # which refuses a non-C-contiguous array (CI's numpy 1.26 set)
             plt.imsave(out, np.ascontiguousarray(rgba[::-1]))
             print(f"wrote {out}  ({side['nu']} x {side['nv']} px, pixel-exact, no decorations)")
         return

@@ -24,7 +24,7 @@ catalogue (no grids, no snapshot header).
 every box: the cross-box comparison), cached under that smoothing's own namespace; 'r_v_defs' carries every R_v
 definition the catalogue has (catalog.R_V_DEFINITIONS once it exists: 'crossing', 'delta08', 'ridge'). --csv PATH
 also writes the table of the voids (write_csv: centre, the R_v's, R_eff, delta, the flags), as the launcher's
-Explore map does for the voids it shows (2026-10-11).
+Explore map does for the voids it shows.
 """
 
 import argparse
@@ -76,9 +76,9 @@ _R_V_KEYS = ("r_v_settings", "r_v_cells", "r_v_delta08_cells", "r_v_ridge_cells"
 
 def r_v_stale(path) -> str | None:
     """Why voids() would re-measure the radii of the cached catalogue at 'path' (the pipeline's own test,
-    pipeline.catalog_r_v_ok: today's R_v settings and all three radii), None when it reads them as they are. Only
-    the four keys are loaded (an npz loads per key), so the Runs tab's status stays cheap (2026-10-11: testing for
-    'r_v_cells' alone called a cache with older R_v settings, or none recorded, 'cached')."""
+    pipeline.catalog_r_v_ok: the current R_v settings and all three radii), None when it reads them as they are. Only
+    the four keys are loaded (an npz loads per key), so the Runs tab's status stays cheap; testing for
+    'r_v_cells' alone would call a cache with older R_v settings, or none recorded, 'cached'."""
     import numpy as np
     from dtfelib import pipeline
     with np.load(path) as z:
@@ -211,7 +211,7 @@ def main(argv=None):
     try:
         with contextlib.redirect_stdout(sys.stderr):          # the pipeline's progress lines: not on the JSON line
             res = outlines(a.sim, a.snap, a.prefix, a.data_root, a.method, a.sigma_mpc)
-    # a damaged cache member (pipeline._cached reads only the stamp) is a reason, not a traceback (2026-10-08)
+    # a damaged cache member (pipeline._cached reads only the stamp) is a reason, not a traceback
     except (OSError, ValueError, KeyError, MemoryError, EOFError, zipfile.BadZipFile) as e:
         raise SystemExit(f"no void catalogue for {a.sim} snapshot {a.snap}: {e}")
     if a.csv is not None:

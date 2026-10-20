@@ -220,7 +220,7 @@ EOF
 # the executable: runs launcher.sh as its CHILD and waits, so it stays the process macOS asks
 # about file access (the GUI and every job it starts inherit it). It also runs an (invisible) AppKit
 # event loop: a second double-click while the GUI is open makes macOS "reopen" THIS app, which has no
-# window, so it brings the GUI forward instead (before 2026-10-02 nothing appeared to happen).
+# window, so it brings the GUI forward instead.
 command -v cc >/dev/null 2>&1 || { echo "no C compiler (xcode-select --install)" >&2; exit 1; }
 cat > "$BUILD/launcher.m" <<'EOF'
 #import <AppKit/AppKit.h>

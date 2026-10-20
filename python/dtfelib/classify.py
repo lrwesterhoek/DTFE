@@ -1,4 +1,4 @@
-"""Void-in-void versus void-in-cloud (2026-10-11): each distinct resolved void classified as S-type, VOID-IN-CLOUD
+"""Void-in-void versus void-in-cloud: each distinct resolved void classified as S-type, VOID-IN-CLOUD
 (being squeezed by an overdense surrounding, expected to shrink or be crushed), or R-type, VOID-IN-VOID (inside a
 larger underdense region, expanding), by one of CRITERIA; every criterion's measure is reported for each void.
 
@@ -9,7 +9,7 @@ larger underdense region, expanding), by one of CRITERIA; every criterion's meas
     classify.agreement(env)                   # the fraction of voids two criteria label the same
 
 THE CRITERIA (classify.CRITERIA, DEFAULT_CRITERION = 'velocity'; CRITERION_SHELL gives each one's shell in R_v):
-  'velocity'          (default, 2026-10-11) the mean peculiar RADIAL velocity of the shell between 2 and 3 R_v is
+  'velocity'          (default) the mean peculiar RADIAL velocity of the shell between 2 and 3 R_v is
                       negative: the surroundings beyond the compensation ridge are falling IN, the void is being
                       squeezed. This is the dynamical statement Sheth & van de Weygaert (2004, MNRAS 350, 517) make
                       about the void-in-cloud process, measured directly instead of inferred from the density.
@@ -21,7 +21,7 @@ THE CRITERIA (classify.CRITERIA, DEFAULT_CRITERION = 'velocity'; CRITERION_SHELL
                       2 R_v), so it measures the walls more than the larger-scale environment.
 WHY THE VELOCITY BY DEFAULT: the velocity in the 2-3 R_v shell, beyond the ridge, responds to the mass of the whole
 region inside it (linear theory: v_r = -(1/3) f H a r Delta(<r)), which smooths over individual walls and haloes,
-and it says directly whether the void is being squeezed. Measured (TNG100-3-Dark / TNG50-3-Dark, 2026-10-11): it
+and it says directly whether the void is being squeezed. Measured (TNG100-3-Dark / TNG50-3-Dark): it
 labels 80-94% of the voids (R_v <= L/6) void-in-cloud, against 40-46% of random centres with the same radii (whose
 mean flux is ~0), agrees with the smoothed Delta(<3 R_v) on 87-95% of the voids and with the raw rule on 70-88%,
 and its S voids are the smaller ones at every z and the shallower ones at z >= 1 (Sheth & van de Weygaert's
@@ -47,7 +47,7 @@ criterion's measure is NaN where its own (larger) shell is dropped.
 THE SAMPLE is the profiles': every well-resolved void with a measured R_v (catalog.r_v_mpc), only the DISTINCT ones
 (catalog.distinct_mask) unless distinct=False. Nothing is cached: the grid reads dominate (density 0.5 GB, velocity
 1.6 GB at 512^3) and the shell sampling takes seconds; the figure script stores the per-void table in its own npz.
-classify_grid / classify_catalog keep the raw-density defaults of the first version (2026-10-11 morning): the default
+classify_grid / classify_catalog default to the raw-density criterion; the default
 criterion is the velocity at the snapshot level, classify_voids, which has the FieldSet to read the velocity from.
 """
 

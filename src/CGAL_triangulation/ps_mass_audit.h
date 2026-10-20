@@ -1,4 +1,4 @@
-/* PS_MASS_AUDIT=1: the PS-DTFE deposit's mass bookkeeping (2026-10-12; a diagnostic, OFF by default --
+/* PS_MASS_AUDIT=1: the PS-DTFE deposit's mass bookkeeping (a diagnostic, OFF by default --
    unset, none of it runs and every output is unchanged). Each grid pass (interpolateGrid_phaseSpace) prints
    one 'PS mass audit: partition i ...' line to stderr, and a partitioned run one 'PS mass audit: run ...'
    line per pass kind after the merge (DTFE.cpp). All sums in double, in mass units:

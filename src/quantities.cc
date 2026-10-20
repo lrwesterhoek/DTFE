@@ -291,7 +291,7 @@ void Quantities::normalizePhaseSpace(Field const &field, Real const weightFromDe
 
 
 // Like addField, but 'src' is a sub-grid (dims m, global origin o) of the full grid 'full'; each cell is mapped by
-// subgridTarget (quantities.h since 2026-10-15: the fixed-point merge, src/ps_fixed_merge.h, maps cells by it too).
+// subgridTarget (quantities.h; the fixed-point merge, src/ps_fixed_merge.h, maps cells by it too).
 template <typename T>
 void addFieldSubgrid(std::vector<T> const &src, std::vector<T> *dst,
                      size_t const *o, size_t const *m, size_t const *full,
@@ -313,7 +313,7 @@ void addFieldSubgrid(std::vector<T> const &src, std::vector<T> *dst,
 
 // The bitwise-OR twin of addFieldSubgrid, for the mask fields (caustic_bits, hidden_streams): same
 // sub-grid -> global mapping -- INCLUDING the '% full[d]' wrap of a sub-box that straddles a
-// periodic seam; a hand-rolled copy of this loop once lacked it and indexed past the end --
+// periodic seam; a hand-rolled copy of this loop without it indexes past the end --
 // but OR instead of '+='.
 void orFieldSubgrid(std::vector<Real> const &src, std::vector<Real> *dst,
                     size_t const *o, size_t const *m, size_t const *full,

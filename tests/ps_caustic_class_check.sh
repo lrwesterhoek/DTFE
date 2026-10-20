@@ -8,12 +8,12 @@
 # 1-D collapses make the multiplicity structure known by construction:
 #  A) '.causticClass' is written and uses only the documented bits (0..6).
 #  B) The parity bits agree EXACTLY with '.caustic': cells with both bits set are precisely the
-#     cells the fold flag marks. (This is what proves the added bits did not disturb the old ones.)
+#     cells the fold flag marks. (This is what proves the class bits leave the fold bits alone.)
 #  C) k = 0 in every single-stream cell -- no axis can have collapsed where there is one stream.
 #  D) The mean stream count increases strictly with k: uncollapsed < wall < filament < node.
 #  E) The GPU deposit reproduces BOTH '.caustic' and '.causticClass' byte-for-byte; only the
 #     --ps-linear-deposit combination falls back to the parity-only fold flag, and says so.
-#  J) (2026-10-13) The fold flag is the GEOMETRIC overlap of a folded tetrahedron, not a per-sample
+#  J) The fold flag is the GEOMETRIC overlap of a folded tetrahedron, not a per-sample
 #     hit: on thin young folds it equals dtfelib's (streams > 1 + tol) | (hidden_streams & 1) cell for
 #     cell, is the same for nSub 1, nSub 3 and the exact deposit, and is split- and GPU-invariant.
 #
@@ -22,8 +22,6 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PY="${PYTHON:-python3}"
-command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/python3.14
 ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT}"
 source "${SCRIPT_DIR}/precision.sh"     # DTFE_TEST_PRECISION=double: the double pair
@@ -39,11 +37,7 @@ echo "============================================================"
 echo " PS-DTFE caustic stratification check   N=${N}^3  grid=${GRID}^3"
 echo "============================================================"
 
-if [ "${1:-}" != "--no-build" ] && ! precision_double; then
-    echo ">> building PS-DTFE ..."
-    BUILD_MODE="$(cat o_ps/.build_mode 2>/dev/null || true)"
-    make PS-DTFE ${BUILD_MODE:+"$BUILD_MODE"} >/dev/null
-fi
+build_target "${1:-}" PS-DTFE o_ps
 [ -x "${BIN}" ] || { echo "FAIL: ${BIN} not built"; exit 1; }
 
 rm -f "${OUT}".*
@@ -100,7 +94,7 @@ check(len(means) >= 3 and all(a < b for a, b in zip(means, means[1:])),
 
 # (D4) the umbilic indicator must live ON the caustic: two eigenvalues vanishing together makes the
 # map singular there by construction, so a flagged cell on no fold cannot be an umbilic. Without the
-# at-zero half of the test this flagged 15% of cells, two thirds of them off-fold.
+# at-zero half of the test 15% of cells are flagged, two thirds of them off-fold.
 umb = ((m >> 6) & 1) != 0
 fold_cells = (m & 3) == 3
 check(int((umb & ~fold_cells).sum()) == 0,
@@ -157,8 +151,8 @@ check(int(m.max()) <= 0x7F, f"only bits 0..6 used (max mask {int(m.max())})")
 # One-way implications, and the identity they combine to. With exact point location a
 # multi-stream point always lies in an inverted tetrahedron (the map has degree 1, so
 # streams = 1 + 2 x folds crossed), whose negative eigenvalue gives k >= 1; so k = 0 <=>
-# streams = 1 exactly. (It was a near-identity while a +-1e-6 tolerance let a point on a
-# shared face be claimed by both tetrahedra.)
+# streams = 1 exactly. (A +-1e-6 tolerance, which lets a point on a shared face be claimed by
+# both tetrahedra, makes it only a near-identity.)
 covered = s > 0
 check(bool((k[s == 1] == 0).all()), f"every single-stream point has k = 0 ({int((s==1).sum())} points)")
 check(bool((s[(m & 3) == 3] > 1).all()), "every point flagged on a fold is multi-stream")
@@ -194,7 +188,15 @@ done
 # and one default run: the opt-in flag must be the ONLY way bit 7 appears
 "${BIN}" "${TMP}/pcc_w1.8.hdf5" "${TMP}/pcc_nocusp" --grid 48 --periodic --field density \
          --MpcUnit 1 --max-concurrent 1 --ps-caustics >/dev/null
-"${PY}" - "${TMP}" <<'PYEOF' || py_rc=1
+# --ps-gpu with the cusp indicator: the deposit runs on the CPU (the stencil needs the triangulation's neighbours),
+# so bits 7 and 8 are the CPU run's, byte for byte -- a GPU deposit left them unset in nearly every cell
+GPUG=0
+[ -d o_ps ] && [ ! -f o_ps/.gpu_mode_off ] && grep -q "METAL=1\|CUDA=1\|HIP=1" o_ps/.build_mode 2>/dev/null && GPUG=1
+if [ "${GPUG}" = 1 ]; then
+    "${BIN}" "${TMP}/pcc_w1.0.hdf5" "${TMP}/pcc_c1.0_gpu" --grid 48 --periodic --field density \
+             --MpcUnit 1 --max-concurrent 1 --ps-caustics --ps-caustic-cusps --ps-gpu > "${TMP}/pcc_c1.0_gpu.log" 2>&1
+fi
+"${PY}" - "${TMP}" "${GPUG}" <<'PYEOF' || py_rc=1
 import sys
 import numpy as np
 import os as _os; REAL = np.dtype(_os.environ.get("DTFE_TEST_REAL", "float32"))   # tests/precision.sh
@@ -218,14 +220,25 @@ fold = ((g & 3) == 3)
 cusp = ((g >> 7) & 1) != 0
 rate = float(cusp.sum()) / max(int(fold.sum()), 1)
 # Finite differences on an irregular tessellation are never perfectly clean, but the
-# vertex-incident stencil brought the floor on this provably cusp-free case down to ~0.01% of the
-# fold cells (it was ~7% with only the four face neighbours). The bound is set well above the
-# measured value and far below the old one, so it catches a regression back to a narrow stencil.
+# vertex-incident stencil keeps the floor on this provably cusp-free case at ~0.01% of the
+# fold cells (~7% with only the four face neighbours). The bound is set well above the
+# measured value and far below the narrow stencil's, so it catches a regression back to it.
 check(rate < 0.01, f"A*k=1.8 (no cusps exist): false-positive rate {rate*100:.3f}% of fold cells, bound 1%")
 
 t = mask("pcc_c1.0")
 tang = int((((t >> 7) & 1) != 0).sum())
 check(tang > 0, f"A*k=1.0 (fold exactly tangent): {tang} cells flagged on the tangency plane")
+
+if len(sys.argv) > 2 and sys.argv[2] == "1":
+    import filecmp
+    log = open(f"{tmp}/pcc_c1.0_gpu.log").read()
+    gt = mask("pcc_c1.0_gpu")
+    check(filecmp.cmp(f"{tmp}/pcc_c1.0.causticClass", f"{tmp}/pcc_c1.0_gpu.causticClass", shallow=False)
+          and "needs the CPU deposit" in log,
+          f"--ps-gpu with --ps-caustic-cusps deposits on the CPU: '.causticClass' byte-identical to the CPU run "
+          f"({int((((gt >> 7) & 1) != 0).sum())} cusp cells)")
+else:
+    print("   SKIP  --ps-gpu with --ps-caustic-cusps (CPU-only build)")
 
 sys.exit(1 if fails else 0)
 PYEOF
@@ -273,7 +286,7 @@ check(a2 == 0, f"A*k=1.8 (generic A2 fold): {a2} cells flagged A4, want 0")
 c3_a3, c4_a3 = counts("pcc_c1.0")
 floor = c4_a3 / max(c3_a3, 1)
 # Bounds sit BETWEEN the deduplicated nearest-64 stencil (0.51% floor / 74.5% signal / ~146x) and
-# the old duplicate-filled gather (1.38% / 17.2% / 12x), so a regression to that gather FAILS.
+# a duplicate-filled gather (1.38% / 17.2% / 12x), so a regression to that gather FAILS.
 check(floor < 0.01,
       f"A*k=1.0 (exact A3, not A4): false-positive floor {floor*100:.2f}% of cusp cells, bound 1%")
 
@@ -431,9 +444,8 @@ echo "    The per-tet mask reaches the kernel through the otherwise-unused 'dens
 echo "    --ps-linear-deposit combination (which needs that buffer) falls back to parity."
 # GPU grid == CPU grid ($1 = extension): byte for byte in the single build. The double build hands the GPU
 # float copies of its double tetrahedra (ps_double_check D5), so a sample on a face may count differently there:
-# up to 1e-4 of the cells may differ (2026-10-13 -- the 2026-10-12 double binary already counted 2 streams
-# instead of 1 in one cell of this snapshot on the GPU, unseen because only these two grids are compared; the
-# periodic-seam fix changes CGAL's vertex labelling and that cell's fold class then differs too)
+# up to 1e-4 of the cells may differ (a cell whose GPU sample counts 2 streams instead of 1 differs in its
+# fold class too)
 gpu_matches() {
     cmp -s "${OUT}.$1" "${OUT}_gpu.$1" && return 0
     precision_double || return 1

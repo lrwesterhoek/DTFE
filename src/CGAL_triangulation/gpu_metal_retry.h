@@ -1,10 +1,9 @@
-/* The Metal GPU hosts' chunk-level checkpoints and cause-aware retry policy (2026-10-11 in ps_metal_host.cc;
-   moved here 2026-10-13 so the standard-DTFE host, dtfe_metal_host.cc, runs the SAME policy -- the code below is
-   ps_metal_host.cc's, unchanged but for the counter split noted at gpuRetryCause).
+/* The Metal GPU hosts' chunk-level checkpoints and cause-aware retry policy, shared by ps_metal_host.cc and the
+   standard-DTFE host, dtfe_metal_host.cc, so both run the SAME policy.
 
-   A failed command buffer used to redo the WHOLE deposit (a PS partition: up to ~2000 s per TNG50 partition; a
-   standard-DTFE sub-domain batch: the whole batch, three times, then the CPU) without saying why. Now every pass
-   keeps a snapshot of the buffers its kernel writes (the accumulator grids; PS also the exact items' sumW and the
+   Without checkpoints a failed command buffer would redo the WHOLE deposit (a PS partition: up to ~2000 s per
+   TNG50 partition; a standard-DTFE sub-domain batch: the whole batch). So every pass keeps a snapshot of the
+   buffers its kernel writes (the accumulator grids; PS also the exact items' sumW and the
    per-tet masses the kernel negates when it defers a tet), taken at the pass's start and every
    DTFE_GPU_CHECKPOINT_CHUNKS chunks; a failed buffer (which may have deposited part or all of its atomics)
    restores the last snapshot and continues from its chunk, at a pace that depends on the cause (GpuFault).
@@ -48,11 +47,11 @@ GpuFault classifyGpuFault(long code, std::string const& desc)
     return GpuFault::Resource;
 }
 
-// G1 (2026-10-11): the run's retry counters (run_progress.h: the sidecar's gpu_retries and
+// The run's retry counters (run_progress.h: the sidecar's gpu_retries and
 // gpu_retries_by_cause, DTFE.cpp's closing 'GPU deposit retries:' line) by the cause a reader can act on:
 // 0 innocent victim, 1 timeout (the watchdog), 2 out of memory -- split off the Resource class, which also
 // holds page faults and internal errors -- and 3 everything else (those, and the fatal causes). The index
-// only (2026-10-13): each host bumps its own binary's counters with it (countGpuRetry in the host).
+// only: each host bumps its own binary's counters with it (countGpuRetry in the host).
 int gpuRetryCause(GpuFault f, long code, std::string const& desc)
 {
     int k = 3;
@@ -64,11 +63,11 @@ int gpuRetryCause(GpuFault f, long code, std::string const& desc)
     return k;
 }
 
-// The dispatch pace, kept across partitions once escalated (dtfe_metal_host.cc's batches share it since 2026-10-13):
+// The dispatch pace, kept across partitions once escalated (dtfe_metal_host.cc's batches share it):
 // a machine whose display load killed one partition's buffers will kill the next one's at the same pace.
-// But not for the rest of the PROCESS (2026-10-11): one 'Impacting Interactivity' fault -- a moment of display
-// use -- then slowed every later partition (72% GPU duty after one escalation, 29% after two: about +2.5 h,
-// up to +9.5 h, on the 8 h TNG50 z=0 run, whose runlog has two such faults at partitions 7 and 39). So the pace
+// But not for the rest of the PROCESS: one 'Impacting Interactivity' fault -- a moment of display
+// use -- would then slow every later partition (72% GPU duty after one escalation, 29% after two: hours
+// on an 8 h TNG50 run). So the pace
 // steps back one notch -- the inverse of one escalation, buffers x4 and gaps /3, toward 0.25 s / 8 ms -- after
 // every DTFE_GPU_PACE_RECOVER_SEC (default 90) seconds of GPU work (buffers + gaps) without a fault of ours;
 // counted in GPU work, not wall time, so the triangulations between deposits are no evidence the display is

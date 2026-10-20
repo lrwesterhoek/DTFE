@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# PS-DTFE periodic seam check (2026-10-13).
+# PS-DTFE periodic seam check.
 #
 # A periodic run tiles one Lagrangian period [s - L, s) per axis with the tetrahedra whose centroid lies in it
 # (psFilterCell). That tiles the box only when the tessellation at the two edges of the period is the same up to
-# the shift L, i.e. when the periodic copies beyond the edges are exact translates. The period used to end at the
-# top particle plane, its padding made of the +L copies of the bottom particles, which round in float (y + L of a
+# the shift L, i.e. when the periodic copies beyond the edges are exact translates. A period that ends at the
+# top particle plane pads with the +L copies of the bottom particles, which round in float (y + L of a
 # y near 0 keeps only ulp(L)); on near-lattice initial conditions those roundings flip near-degenerate Delaunay
 # choices, so the two frames' tetrahedra overlap or leave gaps: on TNG, up to 394 double-covered and tens of
-# uncovered '.a_streams' cells near the box faces and +-1e-7 of the box mass per snapshot (audit 2026-10-13).
-# The fix ends the period where every copy is an exact -L shift (subpartition.h psPeriodicSeam).
+# uncovered '.a_streams' cells near the box faces and +-1e-7 of the box mass per snapshot.
+# So the period ends where every copy is an exact -L shift (subpartition.h psPeriodicSeam).
 #
 # The defect needs a near-degenerate tessellation AND rounding copies; at TNG's N it is ~1e-5 of a spacing, at a
 # test's N=32 ~1e-6. Two ways to make it testable:
@@ -16,23 +16,24 @@
 #           to 2^-6 (2.5e-3 of a spacing, 100x TNG's), the -L copies are exact -- the same structure as a [0, L)
 #           box at TNG's N, amplified. Jittered lattice (0.2 spacings), crossed waves.
 #   NEARLAT the snapshot box [0, 100), a lattice jittered by only 1e-5 spacings (TNG's IC lattices are
-#           near-degenerate too): the old seam's copies had different Delaunay stars (degrees 22 vs 26), so
-#           under --ps-vertex-mass ~400 particles deposited more or less than their weight.
-# Runs (--grid 64, --ps-vertex-mass, PS_MASS_AUDIT=2 for the per-particle closure on one domain), checks:
-#   S1 OFFSET, single stream (A k = 0.5), --partition 1, 2 2 2, 3 3 3: '.a_streams' = 1 in EVERY cell (the old seam:
-#      177 cells below 1, down to 0.11, and 18 above, the same in all three), box mean of '.a_den' = 1 (old:
-#      -6.4e-5), the per-particle closure exact (old: 123 particles off). (Not '.a_den' cell by cell across the
+#           near-degenerate too): a top-plane seam's copies have different Delaunay stars (degrees 22 vs 26), so
+#           under --ps-vertex-mass ~400 particles deposit more or less than their weight.
+# Runs (--grid 64, --ps-vertex-mass, PS_MASS_AUDIT=2 for the per-particle closure on one domain), checks ("top
+# plane": what a seam at the top particle plane gives, so each check is seen to catch it):
+#   S1 OFFSET, single stream (A k = 0.5), --partition 1, 2 2 2, 3 3 3: '.a_streams' = 1 in EVERY cell (top plane:
+#      177 cells below 1, down to 0.11, and 18 above, the same in all three), box mean of '.a_den' = 1 (top plane:
+#      -6.4e-5), the per-particle closure exact (top plane: 123 particles off). (Not '.a_den' cell by cell across the
 #      partitionings: at 131000 the float sample positions sit 2^-7 apart, and with the partitions' sub-grid
-#      origins they catch a few near-flat tetrahedra differently -- ~60 interior cells O(1) apart, before and after
-#      the fix alike; tests/ps_partition_padding_check.sh holds that to rounding in a [0, L) box.)
+#      origins they catch a few near-flat tetrahedra differently -- ~60 interior cells O(1) apart, with either
+#      seam; tests/ps_partition_padding_check.sh holds that to rounding in a [0, L) box.)
 #   S2 OFFSET, crossed waves A k = 1.8, ONE sample per cell (--avg-subsamples 1), --partition 1 and 2 2 2: every
-#      sample's stream count is odd (old: 167 even counts -- 0, 2, 8, 10 -- along the faces), mean density 1
-#   S3 NEARLAT, single stream: the per-particle closure exact (old: 409 off), mean 1 (old: +6.1e-5), '.a_streams' = 1
-#      within 4 cells of every face (an interior near-flat tetrahedron of this degenerate lattice double-covers one
-#      cell in the old and new runs alike: not the seam)
+#      sample's stream count is odd (top plane: 167 even counts -- 0, 2, 8, 10 -- along the faces), mean density 1
+#   S3 NEARLAT, single stream: the per-particle closure exact (top plane: 409 off), mean 1 (top plane: +6.1e-5),
+#      '.a_streams' = 1 within 4 cells of every face (an interior near-flat tetrahedron of this degenerate lattice
+#      double-covers one cell with either seam: not the seam)
 #   S4 the logs name the exact seam on every axis (no "top particle plane" fallback)
 # Tolerances: float 1e-7 (mean), 1e-5 (streams), double 1e-12 / 1e-9. The double build reads the same float32
-# coordinates; its copies round 2^29 times less, so it passes before and after -- it checks the new seam keeps the
+# coordinates; its copies round 2^29 times less, so it passes with either seam -- it checks the exact seam keeps the
 # double path exact. ~15 s.
 #
 # Usage:
@@ -41,8 +42,6 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PY="${PYTHON:-python3}"
-command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/python3.14
 ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT}"
 source "${SCRIPT_DIR}/precision.sh"
@@ -57,11 +56,7 @@ echo "============================================================"
 echo " PS-DTFE periodic seam (exact periodic copies)   grid=${GRID}^3  (${DTFE_TEST_PRECISION})"
 echo "============================================================"
 
-if [ "${1:-}" != "--no-build" ] && ! precision_double; then
-    echo ">> building PS-DTFE ..."
-    BUILD_MODE="$(cat o_ps/.build_mode 2>/dev/null || true)"
-    make PS-DTFE ${BUILD_MODE:+"$BUILD_MODE"} >/dev/null
-fi
+build_target "${1:-}" PS-DTFE o_ps
 [ -x "${BIN}" ] || { echo "FAIL: ${BIN} not built"; exit 1; }
 
 X0=131022; X1=131122

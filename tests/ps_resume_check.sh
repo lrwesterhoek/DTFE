@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Resume of a killed partitioned PS-DTFE run (2026-10-11, src/partition_checkpoint.h), on a small synthetic
+# Resume of a killed partitioned PS-DTFE run (src/partition_checkpoint.h), on a small synthetic
 # snapshot split into 64 partitions:
 #   C1  an uninterrupted '--ordered-merge' run (the reference) checkpoints, says what it cost, and removes its
 #       '<output>.runlog.checkpoint' once the outputs are in place
@@ -11,7 +11,7 @@
 #       The same --max-concurrent and thread count as the killed run: the deposit inside a partition splits its
 #       sums by the threads a partition gets, so another count differs at float rounding (C6 covers that case)
 #   C5  '--resume' with nothing to resume refuses
-#   C6  a run killed while merging in COMPLETION order ('--completion-order-merge': no flag before 2026-10-14) resumes too: mass conserved
+#   C6  a run killed while merging in COMPLETION order ('--completion-order-merge') resumes too: mass conserved
 #   C7  '--scratch-dir': the checkpoint goes to the scratch folder under the name scripts/config.sh
 #       ps_checkpoint_dir computes (the basename + a hash of the whole output path)
 #   C9  too little room for a checkpoint (DTFE_TEST_CHECKPOINT_FREE_BYTES): the run warns, writes none, and finishes
@@ -21,13 +21,12 @@
 #       (DTFE_RAM_GB=64, where the tuner alone picks 2 2 2) adopts the checkpoint's split and finishes; the grids equal an
 #       uninterrupted run's (byte-identical when both ran at the same --max-concurrent)
 #   C11 '--interlace' (two passes, the second on a half-cell-shifted grid) writes no checkpoint, and '--resume' with it
-#       is refused: one checkpoint and key for both passes mixed the shifted and unshifted grids
+#       is refused: one checkpoint and key for both passes would mix the shifted and unshifted grids
 #   C12 a run killed before any checkpoint could be written leaves no (empty) checkpoint folder for the driver to resume
 #   C13 a checkpoint of another binary ('binary=' key line: the revision AND link time) is refused, naming PS_RESUME=0
 #   C14 a commit whose renames failed (exit 3, the outputs left as '.part.<pid>') keeps the checkpoint
 #   C8  GPU builds only: a killed '--ps-gpu' run resumes to the exactly summed grids of an uninterrupted one
-#       byte for byte in EVERY grid, the velocity and dispersion included (exact fixed-point sums since 2026-10-14;
-#       the velocity was a float-atomic sum checked to 1e-5 of its peak until 2026-10-15); SKIP otherwise
+#       byte for byte in EVERY grid, the velocity and dispersion included (exact fixed-point sums); SKIP otherwise
 # Usage: tests/ps_resume_check.sh [--no-build]   (--no-build is accepted and ignored: the binaries are used as built)
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -35,8 +34,6 @@ ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$ROOT" || exit 1
 source "${SCRIPT_DIR}/precision.sh"     # DTFE_TEST_PRECISION=double: the double pair
 precision_require "${PS_BIN}"
-PY="${PYTHON:-python3}"
-command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/python3.14
 [ -x "${PS_BIN}" ] || { echo "FAIL: ${PS_BIN} is not built"; exit 1; }
 BIN="$(cd "$(dirname "${PS_BIN}")" && pwd)/$(basename "${PS_BIN}")"
 TMP="${DTFE_TEST_TMP}/ps_resume_check"
@@ -47,17 +44,7 @@ SNAP="$TMP/waves.hdf5"
     --jitter-frac 0.02 --seed 7 --crossed-waves >/dev/null || { echo "FAIL data gen"; exit 1; }
 PASS=0; FAILS=0
 check() { if [ "$2" = 0 ]; then PASS=$((PASS+1)); echo "  PASS $1"; else FAILS=$((FAILS+1)); echo "  FAIL $1"; fi; }
-# same <a> <b>: every output of run a has a byte-identical twin in run b (and there is at least one)
-same() {
-    local n=0 f
-    for f in "$1".*; do
-        case "$f" in *.log|*.runlog*|*.part.*) continue ;; esac
-        cmp -s "$f" "$2${f#"$1"}" || { echo "    differs: ${f#"$1"}"; return 1; }
-        n=$((n+1))
-    done
-    [ "$n" -gt 0 ]
-}
-merged_count() { grep -a -m1 '^merged_count' "$1/checkpoint" | awk '{print $2}'; }
+# same <a> <b>, merged_count <checkpoint folder>: tests/lib.sh
 C=(--grid 48 --periodic --input 105 --MpcUnit 1 --field density velocity density_a velocity_a dispersion_a
    --partition 4 4 4)
 
@@ -177,8 +164,8 @@ PYEOF
 fi
 
 echo ">> C11: '--interlace' is not checkpointed, and '--resume' refuses it"
-# both interlace passes (the second on a half-cell-shifted grid) used ONE checkpoint and key: a resume mixed the
-# shifted and unshifted grids (2026-10-11 review). A killed interlaced run now leaves nothing to resume from.
+# both interlace passes (the second on a half-cell-shifted grid) would share ONE checkpoint and key, so a resume
+# would mix the shifted and unshifted grids: a killed interlaced run leaves nothing to resume from.
 OMP_NUM_THREADS=4 DTFE_TEST_EXIT_AFTER_PARTITIONS=5 "$BIN" "$SNAP" "$TMP/il" "${C[@]}" --verbose 2 --max-concurrent 4 \
     --interlace > "$TMP/il.log" 2>&1; rc1=$?
 "$BIN" "$SNAP" "$TMP/il" "${C[@]}" --verbose 2 --max-concurrent 4 --interlace --resume > "$TMP/il2.log" 2>&1; rc2=$?
@@ -192,7 +179,7 @@ OMP_NUM_THREADS=4 "$BIN" "$SNAP" "$TMP/il" "${C[@]}" --verbose 2 --max-concurren
 check "C11 a whole --interlace run (both passes) writes no checkpoint (exit $rc)" $?
 
 echo ">> C12: a run killed without ever writing a checkpoint leaves no checkpoint folder"
-# the folder was made before the room check, so an empty one outlived the kill and run_ps_dtfe.sh resumed from it
+# a folder made before the room check would outlive the kill empty, and run_ps_dtfe.sh would resume from it
 OMP_NUM_THREADS=4 DTFE_TEST_CHECKPOINT_FREE_BYTES=1000000 DTFE_TEST_EXIT_AFTER_PARTITIONS=10 "$BIN" "$SNAP" "$TMP/nr" \
     "${C[@]}" --verbose 2 --max-concurrent 4 > "$TMP/nr.log" 2>&1; rc=$?
 [ "$rc" = 137 ] && grep -q "checkpoint could not be written (only 0 GB free" "$TMP/nr.log" && [ ! -e "$TMP/nr.runlog.checkpoint" ]
@@ -219,7 +206,7 @@ check "C13 refused, naming the 'binary=' line and PS_RESUME=0; the checkpoint is
 rm -rf "$TMP/rb.runlog.checkpoint"
 
 echo ">> C14: outputs that could not be put in place keep the checkpoint"
-# a commit whose renames fail exits 3 with the outputs as '.part.<pid>' files; the checkpoint was deleted all the same
+# a commit whose renames fail exits 3 with the outputs as '.part.<pid>' files; the checkpoint must not be deleted then
 mkdir -p "$TMP/cm.den"; : > "$TMP/cm.den/blocker"   # a folder where the '.den' output goes: its rename fails
 OMP_NUM_THREADS=4 "$BIN" "$SNAP" "$TMP/cm" "${C[@]}" --verbose 2 --max-concurrent 4 > "$TMP/cm.log" 2>&1; rc=$?
 [ "$rc" = 3 ] && grep -q "could not be put in place" "$TMP/cm.log" && [ -s "$TMP/cm.runlog.checkpoint/checkpoint" ]
@@ -239,9 +226,9 @@ else
         && ! grep -q "ran on the CPU instead" "$TMP/gref.log" "$TMP/g1.log" "$TMP/g2.log"
     check "C8 killed after 12 GPU partitions, resumed the other 52 (no CPU fallback)" $?
     ok=0
-    # every grid, the velocity included: since 2026-10-14 every PS grid of a GPU deposit is an exact fixed-point sum
+    # every grid, the velocity included: every PS grid of a GPU deposit is an exact fixed-point sum
     # (the moments too, ps_deposit_params.h PSFxGrid) and the partitions merge in index order, so the resumed run
-    # is byte-identical in all of them (the velocity used to be a float-atomic sum, checked to 1e-5 of its peak)
+    # is byte-identical in all of them
     for e in den a_den streams a_streams hidden_streams a_hidden_streams vel a_vel a_velDisp; do
         cmp -s "$TMP/gref.$e" "$TMP/g.$e" || { echo "    differs: .$e"; ok=1; }
     done

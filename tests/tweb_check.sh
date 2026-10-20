@@ -13,8 +13,7 @@
 #     tetrahedron's mass over the samples it happens to hold, which is not); the check verifies it.
 #  C) the classification is the number of eigenvalues above --lambda_th (cells within rounding of the
 #     threshold are left out).
-# Nothing else tested the T-web before 2026-10-02 (it was certified once against a python reference).
-# The 2D builds compute it too since 2026-10-03 (two eigenvalues, {delta, 0} for the 1D field): the same
+# The 2D builds compute it too (two eigenvalues, {delta, 0} for the 1D field): the same
 # three checks run on a 2D pancake with PS-DTFE-2d and DTFE-2d when they are built (single precision), and
 #  D) on 2D crossed waves (a large xy cross term) the eigenvalues equal an independent numpy FFT solve of
 #     the same density grid (full axis: Nyquist negative; half axis: positive).
@@ -28,8 +27,6 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PY="${PYTHON:-python3}"
-command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/python3.14
 ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT}"
 source "${SCRIPT_DIR}/precision.sh"     # DTFE_TEST_PRECISION=double: the double pair

@@ -8,15 +8,14 @@ with several snapshots, the single-stream fraction of each class against redshif
 NOT in analyze.py's PLOT_SCRIPTS: that series is the standard-DTFE thesis pipeline, this needs the
 phase-space grids (streams, hidden_streams; caustic_class is optional).
 
-Names (2026-10-08): web_streams_<web>_z<z>.* and single_stream_vs_z_<web>.png for the default grids (ps_output.,
+Names: web_streams_<web>_z<z>.* and single_stream_vs_z_<web>.png for the default grids (ps_output.,
 averaged) over every snapshot of the simulation on disk; another --prefix or --raw adds '_<prefix>' / '_raw', and a
-series over fewer snapshots '_snaps<a>-<b>-...'. They all used to overwrite the default files (a ps_caustic run had
-replaced the TNG100 z = 0 T-web table, and a subset run would replace the full series).
+series over fewer snapshots '_snaps<a>-<b>-...', so none of them overwrites the default files.
 
     python3 plot/plot_web_streams.py --sim TNG100-3-Dark --snaps 99 67 50 40
     python3 plot/plot_web_streams.py --sim TNG100-3-Dark --snap 99 --web tweb --raw
 
-THE V-WEB (2026-10-13) is the MEAN-FIELD one by default: classified from the FFT gradient of the PS velocity grid
+THE V-WEB is the MEAN-FIELD one by default: classified from the FFT gradient of the PS velocity grid
 with the binary's normalisation and the run's lambda_th (FieldSet.load('vweb', mean_field=True)), the V-web standard
 DTFE stores and the literature means. The binary's own PS V-web classifies the stream average of each stream's
 gradient <grad v>, in which the inverted stream inside a fold has a POSITIVE divergence, so fold cells read as
@@ -96,13 +95,13 @@ def plot_vs_redshift(rows, web_name, path):
 
 
 def grid_tag(fs):
-    """'' for the default grids (ps_output., volume-averaged); else '_<prefix>' and/or '_raw' (2026-10-08)."""
+    """'' for the default grids (ps_output., volume-averaged); else '_<prefix>' and/or '_raw'."""
     prefix = fs.prefix.rstrip(".")
     return ("" if prefix == "ps_output" else f"_{prefix}") + ("" if fs.averaged else "_raw")
 
 
 def web_tag(key, mean_field=True):
-    """'_stored' for the V-web of the stored PS gradient grids ('--ps-gradient stored'), else '' (2026-10-13)."""
+    """'_stored' for the V-web of the stored PS gradient grids ('--ps-gradient stored'), else ''."""
     return "_stored" if key == "vweb" and not mean_field else ""
 
 
@@ -183,7 +182,7 @@ def main():
         if not n_done:
             failed.append(snap)
     # the series' default name holds the whole ladder on disk; a subset of it gets its own name, so a
-    # '--snaps 99 67 50 40' run no longer replaces the full series (a snapshot that failed still counts as asked)
+    # '--snaps 99 67 50 40' run never replaces the full series (a snapshot that failed still counts as asked)
     ladder = sorted({int(d.name.split("_")[1]) for d in sim_dir(args.sim, args.data_root).glob("snapdir_*")
                      if d.name.split("_")[1].isdigit()})
     asked = sorted(set(snaps))

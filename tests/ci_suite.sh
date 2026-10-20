@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # The Linux CI suite, ONE list shared by .github/workflows/ci.yml and the Dockerfile so the two cannot
 # drift. CPU-only: the GPU suites (dtfe_metal_check, gpu_scalar_check, gpu_mass_check, gpu_retry_check, and the
-# standard binary's dtfe_gpu_retry_check since 2026-10-13) need a GPU
-# build and stay local (the CUDA/HIP port runs them through its CPU emulation in the ci.yml job cudaemu:
-# tests/cudaemu_check.sh). ps_auto_tune_check and ps_scratch_check run here since 2026-10-11 (ported: the peak RSS from
-# getrusage instead of '/usr/bin/time -l', a temp folder instead of /private/tmp; their GPU parts SKIP).
+# standard binary's dtfe_gpu_retry_check) need a GPU build and stay local (the CUDA/HIP port runs them through its
+# CPU emulation in the ci.yml job cudaemu: tests/cudaemu_check.sh). ps_auto_tune_check and ps_scratch_check run
+# here (portable: the peak RSS from getrusage, not '/usr/bin/time -l'; a temp folder, not /private/tmp; their GPU
+# parts SKIP).
 #
 #   tests/ci_suite.sh build     the single pair, the double pair (DOUBLE=1) and the 2D pair (DIM=2)
 #   tests/ci_suite.sh core      every CPU suite against ./DTFE and ./PS-DTFE
@@ -42,8 +42,8 @@ stage_build() {
 
 # the suites that run the programs (also the double pass); the python ones take --no-build
 # The standard-DTFE regression compares with the STORED reference (tests/reference/regression_periodic.txt, a
-# periodic set without Delaunay ties, to 3e-4 relative: run_tests.py says why) -- until 2026-10-11 it wrote a fresh
-# one here and compared nothing. The double pass compares the same reference (the double build sits 2.7e-5 from it).
+# periodic set without Delaunay ties, to 3e-4 relative: run_tests.py says why); writing a fresh one here would
+# compare nothing. The double pass compares the same reference (the double build sits 2.7e-5 from it).
 run_program_suites() {
     step "standard DTFE regression (stored reference)"; env -u DTFE_TEST_REFERENCE_DIR "$PY" tests/run_tests.py
     step "standard DTFE Monte-Carlo average (unbiased, split-invariant)"; tests/dtfe_mc_average_check.sh --no-build
@@ -73,7 +73,7 @@ run_program_suites() {
     step "non-periodic suite";                  "$PY" tests/ps_nonperiodic_test.py --no-build
     step "batch drivers";                       tests/run_scripts_check.sh --no-build
     step "T-web (tidal tensor)";                tests/tweb_check.sh --no-build
-    # 2026-10-13: dtfelib's mean-field velocity derivatives (a PS grid given standard DTFE's grad<v> and V-web), checked
+    # dtfelib's mean-field velocity derivatives (a PS grid given standard DTFE's grad<v> and V-web), checked
     # against the standard binary's own a_velDiv / a_velGrad / V-web and a PS run; single and double pair alike
     step "mean-field velocity derivatives + V-web"; MPLBACKEND=Agg "$PY" tests/py_meanfield_test.py
     step "interlacing (unit, 2D + 3D)";         tests/interlacing_check.sh
@@ -86,8 +86,8 @@ run_program_suites() {
 }
 
 # The oldest supported Python (pyproject: >= 3.10) must PARSE every file: a PEP 701 f-string (3.12) is a
-# SyntaxError there, and the suites run under a newer interpreter that cannot see it (plot_caustic_skeleton.py,
-# review 2026-10-05). Needs a REAL 3.10/3.11 -- ast.parse(feature_version=) under 3.12+ does not catch it.
+# SyntaxError there, and the suites run under a newer interpreter that cannot see it. Needs a REAL 3.10/3.11 --
+# ast.parse(feature_version=) under 3.12+ does not catch it.
 old_python_parse() {
     local p
     for p in ${OLD_PYTHON:-} python3.10 python3.11; do
@@ -120,9 +120,9 @@ stage_core() {
     step "every .py parses under the oldest supported Python"; old_python_parse
     run_program_suites
     # against the single pair (the double stage does not repeat them): the memory model's predictions against a measured peak,
-    # and the out-of-core accumulators bit-identical to in-RAM runs (2026-10-11, ported to Linux)
+    # and the out-of-core accumulators bit-identical to in-RAM runs
     step "auto-tune (memory model, budget, splits)"; tests/ps_auto_tune_check.sh --no-build
-    # 2026-10-14: the standard binary's tuner too (its report, the counted padded vertices of the run's own split, the
+    # the standard binary's tuner too (its report, the counted padded vertices of the run's own split, the
     # user's thread count, the SUMMARY's memory model line). CPU-only here: its GPU half (E with --gpu --exact-average)
     # skips on a build whose o/.build_mode names no GPU, H runs on the DTFE-2d the build stage makes; it pins
     # OMP_NUM_THREADS=10 on purpose (the plans of a 10-core machine), so a 4-core runner only oversubscribes. The one
@@ -132,10 +132,10 @@ stage_core() {
     # AFTER the program suites: ps_caustic_class_check.sh leaves the crossed-waves run (pcc_out.*) under the
     # temp root, which the caustic-skeleton test's real-grid half reads (else it is a SKIP, not a pass)
     step "dtfelib python suite (synthetic tier; the data-backed tier skips without the T7)"; "$PY" tests/py_dtfelib_test.py
-    # the suites' own contract (2026-10-08): skips that DTFE_TEST_REQUIRED=1 turns into failures, which the double
+    # the suites' own contract: skips that DTFE_TEST_REQUIRED=1 turns into failures, which the double
     # stage relies on, and run_tests.py's regression SKIP in a fresh reference folder, which it does not
     step "skip / fail contract of run_tests.py and ps_double_check.sh"; tests/run_tests_check.sh --no-build
-    # the 2026-10-11 void analyses, one suite each (synthetic; the T7 parts skip)
+    # the void analyses, one suite each (synthetic; the T7 parts skip)
     step "void catalogue: R_v definitions, cache identity, gate"; MPLBACKEND=Agg "$PY" tests/py_void_core_test.py
     step "void profiles across z + HSW fits";   MPLBACKEND=Agg "$PY" tests/py_profiles_test.py
     step "size function theory, cross-box shapes"; MPLBACKEND=Agg "$PY" tests/py_population_test.py
@@ -144,7 +144,7 @@ stage_core() {
     step "void convergence: grid, mass, estimator"; MPLBACKEND=Agg "$PY" tests/py_convergence_test.py
     step "size function on the raw density";    MPLBACKEND=Agg "$PY" tests/py_size_function_test.py
     step "void-in-cloud criteria";               MPLBACKEND=Agg "$PY" tests/py_vic_test.py
-    # 2026-10-11: what the README tells a user to type exists in the code, and the drivers' knobs are documented
+    # what the README tells a user to type exists in the code, and the drivers' knobs are documented
     step "docs drift (README / COMMANDS.md against the code)"; "$PY" tests/docs_drift_check.py
     # the python analysis stack end to end on a synthetic two-snapshot set (pins its own temp folders; its mirror
     # check needs the thesis mirror ON, so a DTFE_NO_MIRROR from the caller's shell is dropped)
@@ -155,7 +155,7 @@ stage_oldpy() {
     step "every .py parses under the oldest supported Python (required)"; old_python_parse required
 }
 
-# Compile-only checks of the configurations the main job does not build (2026-10-11). Run in a fresh checkout:
+# Compile-only checks of the configurations the main job does not build. Run in a fresh checkout:
 # the TBB toggle wipes o_ps/ by its stamp, but nothing else here should reuse the pairs' objects.
 stage_variants() {
     step "build: PS-DTFE + DTFE without TBB and libdeflate (TBB=0 LIBDEFLATE=0)"
@@ -170,8 +170,8 @@ stage_variants() {
 }
 
 # after stage_build the pairs EXIST: a suite that would skip for a missing binary or feature is a failure here
-# (DTFE_TEST_REQUIRED=1 turns every skip_or_fail into exit 1; survey rank 20, 2026-10-05; run_tests.py's regression
-# compares with the stored reference here too since 2026-10-11)
+# (DTFE_TEST_REQUIRED=1 turns every skip_or_fail into exit 1; run_tests.py's regression compares with the stored
+# reference here too)
 stage_double() {
     step "the double pair against the single pair"; DTFE_TEST_REQUIRED=1 tests/ps_double_check.sh --no-build
     export DTFE_TEST_PRECISION=double DTFE_TEST_REQUIRED=1
@@ -189,7 +189,7 @@ stage_gui() {
         step "launcher end-to-end (offscreen)"
         QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-offscreen}" DTFE_GUI_TEST_REQUIRED=1 "$DTFE_GUI_PYTHON" tests/py_gui_app_test.py
     fi
-    # the 2026-10-11 launcher additions: their Qt tier runs with PySide6, their pure tier everywhere
+    # these launcher suites: their Qt tier runs with PySide6, their pure tier everywhere
     local gp="${DTFE_GUI_PYTHON:-$PY}"
     step "Explore: void inspector, outlines, smoothing, memory guard"; QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-offscreen}" "$gp" tests/py_gui_explore_test.py
     step "launcher: memory strip, Running now, void catalogues, run files"; QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-offscreen}" "$gp" tests/py_gui_app2_test.py

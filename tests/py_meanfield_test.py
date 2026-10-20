@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for the MEAN-FIELD velocity derivatives (2026-10-13): dtfelib.fields.mean_field_derivatives, the
+"""Tests for the MEAN-FIELD velocity derivatives: dtfelib.fields.mean_field_derivatives, the
 FieldSet API around it (load(name, mean_field=True), mean_field(), has(..., mean_field=True), lambda_th) and the
 figure scripts' '--ps-gradient' default.
 
@@ -9,14 +9,14 @@ a PS output the standard quantity, from its velocity grid, in the binary's conve
 
   * SYNTHETIC (always run): a band-limited analytic flow with both a potential and a rotational part -- the spectral
     gradient equals the analytic one (float64 to 1e-10, float32 to 3e-6 of the largest value), the divergence, the
-    5 shear and 3 vorticity components equal a transliteration of DTFE.cpp's velocityShear / velocityVorticity loops
+    5 shear and 3 vorticity components equal a transliteration of web_fields.cc's velocityShear / velocityVorticity loops
     (which pins the component ORDER and the axis convention c = a*3 + b = dv_a/dx_b), the V-web eigenvalues equal
     numpy's of -sqrt(a)/(2*100h) (g + g^T) and the labels count them above lambda_th; the vectorized Cardano
     against numpy (random, isotropic, the pancake's {d, 0, 0}); the spectra plan (one alive for the divergence, two
     for the V-web, three for the shear) and memmap input; FieldSet: PS mean_field == the analytic grid times sqrt(a),
     standard DTFE's mean_field=True byte-identical to its stored grid, has() needs the velocity grid for PS, the
     run log's --lambda_th, the refusals (a non-gradient name, the memory gate); the figure scripts' default
-    (plot_web_streams' table source and names, plot_cosmic_web and plot_shear_triaxial's report). (2026-10-15) the
+    (plot_web_streams' table source and names, plot_cosmic_web and plot_shear_triaxial's report). The
     one-plane entry point the launcher's Explore uses, mean_field_plane: np.take of the cube's result to float
     rounding for all six names, every axis, planes at the box faces and on a slab boundary, random (not band-limited)
     float32 and float64 grids of even and odd size, read through a minimal slab reader (no array, no memmap).
@@ -32,7 +32,6 @@ a PS output the standard quantity, from its velocity grid, in the binary's conve
 Usage:  python3 tests/py_meanfield_test.py        (exit 0 = pass; DTFE_TEST_TMP = where the binary runs write)
 """
 
-import atexit
 import json
 import os
 import shutil
@@ -43,40 +42,14 @@ from pathlib import Path
 
 import numpy as np
 
-REPO = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO / "python"))
-_FIGS_TMP = tempfile.mkdtemp(prefix="meanfield_figs_")      # before config is imported: never the real figure root
-os.environ["DTFE_FIGURES_ROOT"] = _FIGS_TMP
-os.environ["DTFE_NO_MIRROR"] = "1"
-atexit.register(shutil.rmtree, _FIGS_TMP, True)
+from _harness import REPO, Skip, check as _check, setup, summary
 
-PASS, FAIL, SKIP = [], [], []
-
-
-class Skip(Exception):
-    """A binary-backed check whose binary is not built."""
+setup("meanfield_figs_", paths=("python",), mpl_agg=False)
 
 
 def check(name, fn):
-    try:
-        fn()
-        PASS.append(name)
-        print(f"  PASS  {name}")
-    except Skip as e:
-        if os.environ.get("DTFE_TEST_REQUIRED", "0") == "1":
-            FAIL.append(name)
-            print(f"  FAIL  {name}: required but skipped: {e}")
-        else:
-            SKIP.append(name)
-            print(f"  SKIP  {name}  ({e})")
-    except AssertionError as e:
-        FAIL.append(name)
-        print(f"  FAIL  {name}: {e}")
-    except Exception as e:
-        import traceback
-        FAIL.append(name)
-        print(f"  FAIL  {name}: {type(e).__name__}: {e}")
-        print("".join("        " + ln for ln in traceback.format_exc().splitlines(True)[-6:]), end="")
+    """Skip marks a binary-backed check whose binary is not built: a FAILURE under DTFE_TEST_REQUIRED=1."""
+    _check(name, fn, required=True)
 
 
 # ---------------------------------------------------------------- the analytic flow
@@ -106,7 +79,7 @@ def analytic_flow(n, box, dtype=np.float64, scale=1.0):
 
 
 def cpp_shear(g):
-    """DTFE.cpp velocityShear, line for line (velGrad[i*3+j] = g[..., i, j])."""
+    """web_fields.cc velocityShear, line for line (velGrad[i*3+j] = g[..., i, j])."""
     vg = g.reshape(g.shape[:-2] + (9,))
     temp = []
     for i in range(2):
@@ -122,7 +95,7 @@ def cpp_shear(g):
 
 
 def cpp_vorticity(g):
-    """DTFE.cpp velocityVorticity, line for line."""
+    """web_fields.cc velocityVorticity, line for line."""
     vg = g.reshape(g.shape[:-2] + (9,))
     return np.stack([(vg[..., i * 3 + j] - vg[..., j * 3 + i]) / 2.0 for i in range(3) for j in range(i + 1, 3)], axis=-1)
 
@@ -216,7 +189,7 @@ class _Slabs:
 
 
 def t_plane():
-    """mean_field_plane (2026-10-15): the plane 'index' normal to 'axis' of mean_field_derivatives' result, from one
+    """mean_field_plane: the plane 'index' normal to 'axis' of mean_field_derivatives' result, from one
     pass in slabs -- the normal derivative as the periodic kernel irfft(i k) summed along the line, the in-plane ones
     as 1-D FFTs of the plane."""
     from dtfelib import fields
@@ -493,7 +466,7 @@ def t_binary_standard():
 
 
 def t_binary_ps():
-    from dtfelib import FieldSet, fields
+    from dtfelib import FieldSet
     dtfe_bin, ps_bin, real = _binaries()
     for b in (dtfe_bin, ps_bin):
         if not os.access(b, os.X_OK):
@@ -536,8 +509,7 @@ def main():
     print("binary (acceptance)")
     check("standard DTFE: the mean field of its own a_vel reproduces its a_velDiv / gradient / shear / vorticity / V-web (32^3, 64^3)", t_binary_standard)
     check("PS-DTFE: stored divergence box mean > 0, mean field ~0; the mean-field V-web's filaments closer to standard DTFE's", t_binary_ps)
-    print(f"\nRESULT: {len(PASS)} passed, {len(FAIL)} failed" + (f", {len(SKIP)} skipped" if SKIP else ""))
-    return 1 if FAIL else 0
+    return summary(blank_line=True, show_zero_skips=False)
 
 
 if __name__ == "__main__":

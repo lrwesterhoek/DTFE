@@ -22,8 +22,6 @@ ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$ROOT" || exit 1
 source "${SCRIPT_DIR}/precision.sh"     # DTFE_TEST_PRECISION=double: the double pair (built by make ... DOUBLE=1)
 
-PY="${PYTHON:-python3}"
-command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/python3.14
 
 TMP="${DTFE_TEST_TMP:-${TMPDIR:-/tmp}/dtfe-tests}/metal_check"
 mkdir -p "$TMP"
@@ -72,10 +70,9 @@ echo ">> single box, per-tetrahedron kernel (DTFE_GPU_ITEMS=0: the A/B reference
 DTFE_GPU_ITEMS=0 run gpu-pertet "$TMP/s_gpu0" --gpu
 assert_gpu "--gpu per-tet kernel" "$TMP/s_gpu0.log"
 # A coarse grid makes most tetrahedra single-cell: the fast path, whose cell index the host
-# shifts into the shared full grid (a 512^3 run once put those in the wrong cells while this
-# test's 96^3 grid, with hardly any single-cell tetrahedron, stayed green). The shared grid
-# (DTFE_GPU_SHARED=1, off by default: the per-sub-domain grids measured faster) is compared
-# with the default per-call path and the CPU.
+# shifts into the shared full grid (a 96^3 grid, with hardly any single-cell tetrahedron, would
+# not catch a wrong shift). The shared grid (DTFE_GPU_SHARED=1, off by default: the per-sub-domain
+# grids measured faster) is compared with the default per-call path and the CPU.
 echo ">> coarse 32^3 grid: the single-cell fast path through the shared grid"
 COARSE=(--grid 32 --periodic --input 105 --MpcUnit 1 --field $FIELDS)
 "${DTFE_BIN}" "$SNAP" "$TMP/c_cpu" "${COARSE[@]}" > "$TMP/c_cpu.log" 2>&1 || { echo "FAIL run coarse cpu"; exit 1; }
@@ -99,7 +96,7 @@ run cpu-exact "$TMP/e_cpu" --exact-average
 run gpu-exact "$TMP/e_gpu" --exact-average --gpu
 assert_gpu "--exact-average --gpu" "$TMP/e_gpu.log"
 # a FINE region (the launcher's exact zoom: 512^2 cells of 1.95 kpc): the GPU clips each piece in a
-# frame near the piece -- in the tetrahedron's vertex-0 frame a kpc piece Mpc away lost its volume
+# frame near the piece -- in the tetrahedron's vertex-0 frame a kpc piece Mpc away would lose its volume
 # to float cancellation. Same tolerance as the box above, the cells are 260x smaller.
 FINE=(--grid 512 512 1 --periodic --input 105 --MpcUnit 1 --field density_a velocity_a --exact-average --regionMpc 40 41 40 41 50 50.002)
 "${DTFE_BIN}" "$SNAP" "$TMP/f_cpu" "${FINE[@]}" > "$TMP/f_cpu.log" 2>&1 || { echo "FAIL run fine region cpu"; exit 1; }
@@ -116,14 +113,12 @@ MEAN_TOL  = 1e-5    # field means must agree this closely (relative to max|field
 REPEAT_TOL = 1e-4   # two GPU runs: atomic summation order only (a stray deposit would be ~1e-2)
 # the velocity GRADIENT is constant per tetrahedron and jumps across its faces, so one borderline sample that the
 # float GPU puts in the neighbouring tetrahedron moves a cell by a whole jump (7.7e-2 in 3.4e-5 of the values on
-# CI's x86-64 under CUDAEMU, 2026-10-11). Only that case is let past the peak ceiling: a SAMPLED pair ('s', 'p';
+# CI's x86-64 under CUDAEMU). Only that case is let past the peak ceiling: a SAMPLED pair ('s', 'p';
 # the exact average 'e' samples nothing, so nothing can flip there), a differing fraction 10x below FRAC_TOL and a
 # peak still bounded: a misplaced deposit in a few hundred cells exceeds that fraction. A gradient's signed mean is ~0
 # on a periodic box, blind to a corrupted or scaled gradient, so it is also held to its mean |value|
 # (tests/gpu_scalar_check.sh's rule; measured 3e-7 - 2e-6 on the Mac, CI's worst case bounded by 270 values x 7.7e-2
-# x max/mean|g| ~ 110 -> 3e-4; a pure permutation leaves it unchanged, the fraction catches that). 2026-10-11
-# (review): the exemption had dropped the peak check altogether, for every pair, so a misplaced velGrad deposit in a
-# few hundred cells passed.
+# x max/mean|g| ~ 110 -> 3e-4; a pure permutation leaves it unchanged, the fraction catches that).
 GRAD_FRAC_TOL = 1e-4
 GRAD_PEAK_TOL = 0.5
 GRAD_MEANABS_TOL = 1e-3
@@ -147,7 +142,7 @@ def judge(pre, suf, c, g):
         bad = bad or meanabs > GRAD_MEANABS_TOL
     return bad, line
 
-# the rule itself on synthetic grids (fails on the old rule, which let any velGrad peak pass below FRAC_TOL)
+# the rule itself on synthetic grids (a rule that let any velGrad peak pass below FRAC_TOL would fail it)
 _rng = np.random.default_rng(1)
 _c = _rng.normal(size=96 ** 3 * 9)
 _flip = _c.copy(); _flip[_rng.choice(_c.size, 270, replace=False)] += 0.077 * np.abs(_c).max()   # CI's case

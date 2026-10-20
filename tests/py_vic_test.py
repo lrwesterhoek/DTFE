@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for the void-in-cloud criteria (2026-10-11): the velocity criterion (net infall in the 2-3 R_v shell, the
+"""Tests for the void-in-cloud criteria: the velocity criterion (net infall in the 2-3 R_v shell, the
 default), the smoothed Delta(<3 R_v) and the raw Delta(<2 R_v), and plot_void_environment.py's --criterion.
 
   * SYNTHETIC (always run): the shell velocity of a linear (Hubble-like) flow against its analytic volume-weighted
@@ -15,7 +15,6 @@ default), the smoothed Delta(<3 R_v) and the raw Delta(<2 R_v), and plot_void_en
 Usage:  python3 tests/py_vic_test.py            (exit 0 = pass)
 """
 
-import atexit
 import io as _io
 import os
 import shutil
@@ -28,38 +27,15 @@ from pathlib import Path
 
 import numpy as np
 
-REPO = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO / "python"))
-sys.path.insert(0, str(REPO / "python" / "plot"))
-_FIGS_TMP = tempfile.mkdtemp(prefix="vic_figs_")      # before config is imported: never the real figure root
-os.environ["DTFE_FIGURES_ROOT"] = _FIGS_TMP
-os.environ["DTFE_NO_MIRROR"] = "1"
-atexit.register(shutil.rmtree, _FIGS_TMP, True)
+from _harness import REPO, check as _check, setup, summary
 
-PASS, FAIL, SKIP = [], [], []
+setup("vic_figs_", mpl_agg=False)
 DATA_BACKED = False
 
 
 def check(name, fn):
-    try:
-        fn()
-        PASS.append(name)
-        print(f"  PASS  {name}")
-    except AssertionError as e:
-        FAIL.append(name)
-        print(f"  FAIL  {name}: {e}")
-    except FileNotFoundError as e:
-        if DATA_BACKED:
-            SKIP.append(name)
-            print(f"  SKIP  {name}  (data not on disk: {e})")
-        else:
-            FAIL.append(name)
-            print(f"  FAIL  {name}: FileNotFoundError: {e}")
-    except Exception as e:
-        import traceback
-        FAIL.append(name)
-        print(f"  FAIL  {name}: {type(e).__name__}: {e}")
-        print("".join("        " + ln for ln in traceback.format_exc().splitlines(True)[-6:]), end="")
+    """A missing file is a SKIP in the data-backed tier only (main() sets DATA_BACKED), a FAILURE before it."""
+    _check(name, fn, missing=(FileNotFoundError,), data_backed=DATA_BACKED)
 
 
 # the volume-weighted mean of x over 2 <= x <= 3: int x^3 dx / int x^2 dx = (3/4)(3^4 - 2^4) / (3^3 - 2^3)
@@ -182,7 +158,7 @@ def t_criteria_catalog():
     bad[48 + 10, 48, 48] = np.nan
     nb = classify.classify_catalog(cat, rho, 1.0, criterion="velocity", **dict(kw, velocity=bad))
     assert list(nb["index"]) == [0, 2] and nb["dropped"] == 2, (nb["index"], nb["dropped"])
-    # the raw criterion alone (no other grid): only it is measured, and the old default call is unchanged
+    # the raw criterion alone (no other grid): only it is measured, and a call that names no criterion uses it
     old = classify.classify_catalog(cat, rho, 1.0, distinct=False)
     assert old["criterion"] == "density_raw" and old["measured"] == ("density_raw",)
     assert list(old["type"][:3]) == ["S", "R", "S"] and classify.agreement(old) == {}
@@ -292,7 +268,7 @@ def t_environment_script():
         text = buf.getvalue()
         out = Path(config.figures_path("void_environment")) / "SYN"
         names = sorted(q.name for q in out.iterdir())
-        # the default criterion is TAGGED (2026-10-11): the untagged names keep density_raw's meaning
+        # the default criterion is TAGGED: the untagged names keep density_raw's meaning
         want = ["environment_evolution_overlaps_velocity.png", "environment_stats_overlaps_velocity.npz",
                 "environment_tracking_overlaps_velocity.png", "environment_z0.00_overlaps_velocity.png",
                 "environment_z1.00_overlaps_velocity.png"]
@@ -308,7 +284,7 @@ def t_environment_script():
             assert list(z["tracked_type"]) == ["R", "S"] and z["tracked_measure"][0] > 0 > z["tracked_measure"][1]
         assert titles and all("--" not in t for t in titles), titles
         assert all("v_r(2-3 R_v) < 0" in t for t in titles), titles
-        # the raw criterion: the UNTAGGED files (what they held before the velocity became the default), its own
+        # the raw criterion: the UNTAGGED files (existing density_raw files keep their names), its own
         # fraction, D (3 R_v beyond the wrap rule) now kept
         titles.clear()
         with redirect_stdout(_io.StringIO()):
@@ -373,8 +349,7 @@ def main():
     DATA_BACKED = True
     print("data-backed")
     check("TNG100-3-Dark z = 0: the three fractions, the voids' infall against random centres (mean flux ~0)", t_tng100_criteria)
-    print(f"\nRESULT: {len(PASS)} passed, {len(FAIL)} failed" + (f", {len(SKIP)} skipped" if SKIP else ""))
-    return 1 if FAIL else 0
+    return summary(blank_line=True, show_zero_skips=False)
 
 
 if __name__ == "__main__":

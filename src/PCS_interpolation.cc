@@ -74,9 +74,8 @@ struct PCS_kernel
     static constexpr double PAD_CELLS = 2.0;    // PCS kernel extends 2 cells from center
     // The 4 cells are the host cell f of (position - half a cell), i.e. the cell whose CENTRE is the nearest
     // one to the left, f-1 .. f+2, and s = 0.5 + temp the distance to f's centre -- the distances d0..d3 below.
-    // Without the offset (until 2026-10-11) f was the cell holding the particle and s its distance to f's
-    // LEFT EDGE: every particle's mass landed half a cell further along every axis (a deposit's centroid
-    // +0.50 cells; the grid was the field moved by +dx/2)
+    // Without the offset f would be the cell holding the particle and s its distance to f's LEFT EDGE:
+    // every particle's mass would land half a cell further along every axis (the field moved by +dx/2)
     static constexpr double CELL_OFFSET = 0.5;
     static char const* name() { return "PCS"; }
 

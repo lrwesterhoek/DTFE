@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
-# PS-DTFE partition/padding independence check (2026-10-12).
+# PS-DTFE partition/padding independence check.
 #
 # A partitioned run must deposit the same tetrahedra as one single triangulation, whatever the padding:
 # ownership tiles them, and a tetrahedron's keep/drop decision must be a function of the tetrahedron.
-# It was not: psFilterCell's degeneracy cut scaled |det| by the edges at CGAL's vertex 0, and which
-# vertex is 0 follows the insertion history -- different for every --partition / --padding /
-# --ps-lag-padding variant. Folded tetrahedra on a caustic sit right at that cut, so ~20 of them were kept
-# by one run and dropped by another: '.a_den' moved by up to 0.8 relative in ~40 cells (2,000 with
-# --ps-vertex-mass, whose degrees then changed too), hidden-stream flags flipped, and the vertex-mass
-# total was off by ~5e-6. The OLD binaries fail every check below; the fix makes the differences pure
-# rounding (double: <= 4e-15 relative).
+# A degeneracy cut that scales |det| by the edges at CGAL's vertex 0 is not: which vertex is 0 follows the
+# insertion history -- different for every --partition / --padding / --ps-lag-padding variant. Folded
+# tetrahedra on a caustic sit right at such a cut, so ~20 of them are kept by one run and dropped by another:
+# '.a_den' moves by up to 0.8 relative in ~40 cells (2,000 with --ps-vertex-mass, whose degrees then change
+# too), hidden-stream flags flip, and the vertex-mass total is off by ~5e-6. With psFilterCell's cut a
+# function of the tetrahedron alone the differences are pure rounding (double: <= 4e-15 relative).
 #
 # 32^3 crossed waves (two fold planes per axis), --grid 64, --ps-vertex-mass (the run_ps_dtfe.sh default),
 # CPU deposit; runs: single, --partition 2 2 2 at the default padding, at --padding 50, and at
@@ -25,8 +24,6 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PY="${PYTHON:-python3}"
-command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/python3.14
 ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT}"
 source "${SCRIPT_DIR}/precision.sh"
@@ -42,11 +39,7 @@ echo "============================================================"
 echo " PS-DTFE partition/padding independence   N=${N}^3  grid=${GRID}^3  (${DTFE_TEST_PRECISION})"
 echo "============================================================"
 
-if [ "${1:-}" != "--no-build" ] && ! precision_double; then
-    echo ">> building PS-DTFE ..."
-    BUILD_MODE="$(cat o_ps/.build_mode 2>/dev/null || true)"
-    make PS-DTFE ${BUILD_MODE:+"$BUILD_MODE"} >/dev/null
-fi
+build_target "${1:-}" PS-DTFE o_ps
 [ -x "${BIN}" ] || { echo "FAIL: ${BIN} not built"; exit 1; }
 
 "${PY}" "${SCRIPT_DIR}/generate_ps_test_data.py" --out "${SNAP}" --n "${N}" --box 100 \

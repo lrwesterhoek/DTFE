@@ -20,13 +20,12 @@ Figures/ tree takes them only from config.THESIS_SIMULATION's standard-DTFE grid
 
 'voids' runs VOID_SCRIPTS with --sim config.SIMULATION (DTFE_SIM): each writes per-simulation folders and tags a
 non-default smoothing itself, so DTFE_SIGMA_MPC is allowed there. A script named there (or in --only) that is not in
-python/plot yet is skipped with a note, not failed (2026-10-11: the profile-evolution, environment and fate figures
-were written alongside).
+python/plot yet is skipped with a note, not failed.
 
-'cache' (2026-10-11) lists python/cache's namespaces with their sizes and whether today's code can still reach
+'cache' lists python/cache's namespaces with their sizes and whether the current code can still reach
 them (cache_inventory: an older '_v<N>' format, or a smoothing no current setting produces); '--prune' is a DRY RUN
 listing what would be deleted and its size, and only '--prune --yes' deletes. '--keep-mpc' / '--keep-cells' count
-more smoothings as current. 'cache --move DIR' (2026-10-11 evening) moves the whole cache to DIR -- every entry
+more smoothings as current. 'cache --move DIR' moves the whole cache to DIR -- every entry
 copied and verified before any source is removed -- and records DIR as the cache folder (config.cache_setting_file,
 read after DTFE_CACHE_DIR), e.g. out of iCloud Drive; a DRY RUN without '--yes', refused while a figure script, an
 analysis, the launcher or a DTFE binary may be using the cache (move_cache, cache_users).
@@ -61,10 +60,10 @@ PLOT_SCRIPTS = [
     'plot_tidal_correlation.py'
 ]
 
-# The void-population scripts, run by 'voids' (2026-10-11), in this order: the catalogue statistics first (the
+# The void-population scripts, run by 'voids', in this order: the catalogue statistics first (the
 # population script also draws the size function), then the profiles, their evolution, the environment (S/R
 # types), the fate census and the convergence check of the void statistics across resolution and estimator
-# (plot_void_convergence.py, contract K4, 2026-10-11 afternoon; default arguments '--sim <SIM>' like the others).
+# (plot_void_convergence.py; default arguments '--sim <SIM>' like the others).
 # Registered by name; a missing one is skipped with a note (run_scripts).
 VOID_SCRIPTS = [
     'plot_void_population.py',
@@ -95,7 +94,7 @@ def grid_estimator(d):
 
 def snapshots_on_disk():
     """The default snapshot list: config's ladder where the simulation has a snapdir, and the ids it has not. Each
-    -3-Dark box has 9 of the 16, so the whole ladder made compute (and 'all') fail on the 7 absent ones (2026-10-08)."""
+    -3-Dark box has 9 of the 16, so the whole ladder would make compute (and 'all') fail on the 7 absent ones."""
     from dtfelib import pipeline
     base = pipeline.sim_dir(config.SIMULATION)
     present = [s for s in config.SNAPSHOT_TO_REDSHIFT if (base / f"snapdir_{s}").is_dir()]
@@ -106,8 +105,8 @@ def snapshots_on_disk():
 
 def check_data():
     """Per config snapshot: absent (not on disk: compute and plot leave it out), or the estimator the scripts load
-    there and whether its grids are complete. Until 2026-10-08 only standard DTFE's output.* counted, so a box with
-    PS-DTFE grids alone (every box on the T7) read INCOMPLETE everywhere while compute and plot used those grids.
+    there and whether its grids are complete. Counting standard DTFE's output.* alone, a box with
+    PS-DTFE grids alone (every box on the T7) would read INCOMPLETE everywhere while compute and plot use those grids.
     'missing' = the incomplete snapdirs (exit 1), and no snapdir at all."""
     from dtfelib.cli import sim_dir
     base = sim_dir(config.SIMULATION)
@@ -134,7 +133,7 @@ def check_data():
     for snap, z_cfg, z_hdr in mism:
         print(f"  !! redshift mismatch snap {snap}: config {z_cfg} vs header {z_hdr}")
     if len(absent_dirs) == len(config.SNAPSHOT_TO_REDSHIFT):
-        missing = absent_dirs                       # nothing on disk at all: every snapshot is missing, as before
+        missing = absent_dirs                       # nothing on disk at all: every snapshot is missing
         print(f"\n  !! no snapshot of the config ladder under {base}")
     elif absent_dirs:
         print(f"\n  not on disk (compute and plot leave them out): {', '.join(absent_dirs)}")
@@ -182,7 +181,7 @@ def compute(snaps):
         p = pipeline.products(snap, z)
         try:
             p.data_dir                  # builds the FieldSet: raises for a missing snapdir, no grids, no snapshot file,
-        except Exception as e:          # an unreadable one (h5py: OSError) -- the old 'exists()' test sat after the raise
+        except Exception as e:          # an unreadable one (h5py: OSError)
             print(f"    data missing or unreadable, skipped: {e}")
             failed.append(snap)
             continue
@@ -204,7 +203,7 @@ def compute(snaps):
         print(f"    done in {(time.time() - t0) / 60:.1f} min")
 
     # the global limits = the maximum over EVERY snapshot computed so far (the per-snapshot store), not
-    # over this run's: a subset run used to overwrite the series' limits with its own (2026-10-06)
+    # over this run's, so a subset run cannot overwrite the series' limits with its own
     limits, covered, missing = pipeline.record_limits(per_snap, sim=config.SIMULATION)
     if limits is not None:
         print(f"\nGlobal cross-epoch limits written for {config.SIMULATION}: {limits}")
@@ -233,7 +232,7 @@ def export(snaps, out_dir=None, formats=("csv", "hdf5")):
     if snaps:
         snaps = [pipeline.canonical_snapshot_id(s) for s in snaps]
     else:
-        snaps, absent = snapshots_on_disk()         # as compute: the ladder's snapshots on disk (2026-10-08)
+        snaps, absent = snapshots_on_disk()         # as compute: the ladder's snapshots on disk
     if absent:
         print(f"Not on disk, left out: {', '.join(absent)}")
     out = Path(out_dir).expanduser() if out_dir else \
@@ -279,9 +278,9 @@ def export(snaps, out_dir=None, formats=("csv", "hdf5")):
 
 # ---------------------------------------------------------------- cache (list / prune the namespaces)
 
-# The physical smoothings (Mpc) today's code asks for by default: the cross-box comparison's sigma,
-# config.CROSSBOX_SMOOTHING_MPC (2026-10-11, G2: the one number plot_void_crossbox, the launcher and this read). A
-# namespace made with another Mpc value (2.16 on 2026-10-11 morning: r512_s21.4043_f23 next to 2.1625's
+# The physical smoothings (Mpc) the current code asks for by default: the cross-box comparison's sigma,
+# config.CROSSBOX_SMOOTHING_MPC (the one number plot_void_crossbox, the launcher and this read). A
+# namespace made with another Mpc value (2.16: r512_s21.4043_f23 next to 2.1625's
 # r512_s21.4291_f23) is reached only by typing that value again; 'cache --keep-mpc' and DTFE_SIGMA_MPC add values.
 CACHE_SMOOTHING_MPC = (config.CROSSBOX_SMOOTHING_MPC,)
 NAMESPACE_RE = r"^r(?P<res>\d+)_s(?P<sig>[^_]+)_f(?P<fp>\d+)_(?P<crit>.+)_g(?P<g>[^_]+)_v(?P<ver>\d+)$"
@@ -318,13 +317,14 @@ FIXED_R_CELLS = (10.0, 5.0, 3.0, 2.0)     # see cache_inventory
 
 
 def cache_inventory(root=None, keep_mpc=(), keep_cells=()):
-    """Every entry of the pipeline cache (config.CACHE_DIR) with a verdict (2026-10-11, contract K5): a list of
+    """Every entry of the pipeline cache (config.CACHE_DIR) with a verdict: a list of
     {'path', 'kind' ('namespace' / 'file'), 'bytes', 'files', 'newest', 'prune' (bool), 'reason'}.
 
     A NAMESPACE (r<N>_s<sigma>_f<footprint>_<criterion>_g<threshold>_v<version>, pipeline._param_hash) is UNREACHABLE,
     and pruned, when
-      * its version is not today's ('_v1': the format before the June unit overhaul; nothing reads it), or
-      * no smoothing today's code asks for produces its sigma/footprint: the production one (config.PRODUCTION_SMOOTHING),
+      * its version is not the current one ('_v1': the format before the h-free unit overhaul; nothing reads it), or
+      * no smoothing the current code asks for produces its sigma/footprint: the production one
+        (config.PRODUCTION_SMOOTHING),
         a --smooth in cells with the production footprint for config.SMOOTHING_COMPARISON_SIGMAS (+ keep_cells), or a
         smoothing in Mpc -- CACHE_SMOOTHING_MPC, DTFE_SIGMA_MPC and keep_mpc -- for a simulation whose files it holds
         (round(mpc / cell, 9) cells, config.footprint_for), the way config / pipeline.set_smoothing spell it.
@@ -340,7 +340,7 @@ def cache_inventory(root=None, keep_mpc=(), keep_cells=()):
     m_now = re.match(NAMESPACE_RE, pipeline._param_hash())
     sig0, fp0 = config.PRODUCTION_SMOOTHING
     # the fixed-R size function's catalogues (plot_void_population.FIXED_R_SMOOTH_CELLS 10 5 3, and TNG300's 3 2 in
-    # thesis_runs.sh voids) and its --size-smooth 5 are live too (2026-10-12)
+    # thesis_runs.sh voids) and its --size-smooth 5 are live too
     cells_ok = {f"{float(c):g}" for c in (sig0, *config.SMOOTHING_COMPARISON_SIGMAS, *FIXED_R_CELLS, *keep_cells)}
     mpcs = list(CACHE_SMOOTHING_MPC) + [float(m) for m in keep_mpc]
     if os.environ.get('DTFE_SIGMA_MPC'):
@@ -466,15 +466,15 @@ def cache_command(prune=False, yes=False, keep_mpc=(), keep_cells=(), root=None)
     return freed
 
 
-# ---------------------------------------------------------------- cache --move (2026-10-11 evening)
+# ---------------------------------------------------------------- cache --move
 
 # what reads or writes the cache: the figure / analysis scripts, the launcher (its Explore tab and Runs status read
 # catalogues in-process, its jobs run the scripts) and the binaries a Pipeline job runs before its analysis. A python
 # whose command line names one of these is a user; the binaries are found by name, as the launcher's own check does
 # (runspec.dtfe_processes' pgrep pattern). The interpreter may also be the macOS host bundle scripts/gui.sh starts the
 # launcher in ('<venv>/DTFE Launcher.app/Contents/MacOS/DTFE Launcher <repo>/python/gui/app.py'; its sys.executable,
-# runspec.PYTHON's last fallback for the jobs), and the launcher is matched by its script path whatever runs it: the
-# old pattern wanted a 'python...' word before it and so missed the usual way the launcher is open (2026-10-11 review).
+# runspec.PYTHON's last fallback for the jobs), and the launcher is matched by its script path whatever runs it: a
+# pattern that wants a 'python...' word before it misses the usual way the launcher is open.
 _CACHE_USER_SCRIPTS = re.compile(r"(?i)(?:python[^\s/]*|DTFE Launcher)\s.*?(?:\banalyze\.py|\bselftest\.py|"
                                  r"\bplot_\w+\.py|\bvoid_outlines\.py|\bvoid_cache\.py)(?:\s|$)"
                                  r"|(?:^|[\s/])gui/app\.py(?:\s|$)")
@@ -612,11 +612,10 @@ def move_cache(dest, yes=False, src=None, users=None, setting_file=None):
         free = None
     why = []
     # an EVICTED iCloud file is a '.<name>.icloud' stub beside where it was: copying moves the stub, and removing it
-    # from iCloud Drive deletes the file in the cloud -- the catalogue would be gone (2026-10-11). Current macOS no
-    # longer writes stubs: it evicts in place under the real name with SF_DATALESS in st_flags (_evicted), and copying
+    # from iCloud Drive deletes the file in the cloud -- the catalogue would be gone. Current macOS writes
+    # no stubs: it evicts in place under the real name with SF_DATALESS in st_flags (_evicted), and copying
     # one downloads it first, onto the source's disk -- so its bytes count twice in the room needed when the
-    # destination shares that disk (2026-10-11 review: the check never fired on this Mac, and the space check reserved
-    # 1.05x where the copy took up to 2x).
+    # destination shares that disk (the copy takes up to 2x).
     evicted = [q for p in items for q in ([p] if p.is_file() else [p, *p.rglob('*')]) if _evicted(q)]
     evicted_bytes = sum(_lstat_size(q) for q in evicted if not q.name.endswith('.icloud'))
     if evicted:
@@ -728,6 +727,9 @@ def main():
     parser.add_argument('--keep-cells', type=float, nargs='*', default=[], metavar='CELLS',
                         help="'cache': more smoothings in cells (footprint 11) to count as current")
     args = parser.parse_args()
+    if args.mode != 'cache' and not config.SIMULATION:      # the cache modes span every simulation
+        parser.error("no simulation given: set DTFE_SIM=NAME (e.g. DTFE_SIM=TNG100-3-Dark python3 analyze.py "
+                     f"{args.mode}); there is no default simulation")
     if args.yes and not (args.mode == 'cache' and (args.prune or args.move)):
         parser.error("--yes goes with 'cache --prune' or 'cache --move' only")
     if args.mode != 'cache' and (args.prune or args.keep_mpc or args.keep_cells or args.move):
@@ -787,8 +789,8 @@ def main():
     except ValueError as e:
         sys.exit(f"refused: {e}")
     if gate != 'ellipsoid' and args.mode in ('plot', 'all'):
-        # checked apart from the smoothing (2026-10-11): smoothing_tag() carries 'gatenone' too, and the smoothing
-        # refusal below blamed DTFE_SIGMA_MPC at the production smoothing. 'compute' stays allowed: its caches (the
+        # checked apart from the smoothing: smoothing_tag() carries 'gatenone' too, and the smoothing
+        # refusal below would blame DTFE_SIGMA_MPC at the production smoothing. 'compute' stays allowed: its caches (the
         # void catalogue keeps the production gate, gate_view is never saved; slices, limits) do not depend on it
         sys.exit(f"refused: DTFE_VOID_GATE={os.environ.get('DTFE_VOID_GATE', '')!r} (void gate '{gate}', not the "
                  f"production 'ellipsoid'): '{args.mode}' writes the thesis figures under their production names. "

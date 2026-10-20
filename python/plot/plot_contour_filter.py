@@ -103,7 +103,7 @@ def process_snapshot(snapshot, redshift, sim, method, prefix=None, data_root=Non
         p.release()
 
         if len(cat['coords']) == 0:
-            print(f"  Warning: No valid minima found after filtering")
+            print("  Warning: No valid minima found after filtering")
             return None
 
         print(f"  {len(cat['coords'])} voids passing the {config.VOID_EIGENVALUE_CRITERION!r} eigenvalue criterion")
@@ -123,29 +123,29 @@ def process_snapshot(snapshot, redshift, sim, method, prefix=None, data_root=Non
         valid_bbks_mask = ~(np.isnan(bbks_params[:, 0]) | np.isnan(bbks_params[:, 1]))
         
         with open(summary_file, 'w') as f:
-            f.write(f"Void Shape Analysis Summary\n")
+            f.write("Void Shape Analysis Summary\n")
             f.write(f"Snapshot: {snapshot}, Redshift: {redshift:.2f}\n")
             f.write(f"{'='*50}\n\n")
-            f.write(f"Parameters:\n")
+            f.write("Parameters:\n")
             f.write(f"  Grid resolution: {p.fs.grid_n}³\n")
             f.write(f"  Footprint size: {FOOTPRINT_SIZE}\n")
             f.write(f"  Smoothing sigma: {SMOOTHING_SIGMA} cells ({config.SMOOTHING_SIGMA_MPC:.2f} Mpc)\n")
             f.write(f"  Eigenvalue criterion: {config.VOID_EIGENVALUE_CRITERION}\n")
-            f.write(f"  Method: FFT-based Hessian\n\n")
-            f.write(f"Results:\n")
+            f.write("  Method: FFT-based Hessian\n\n")
+            f.write("Results:\n")
             f.write(f"  Total minima found: {len(minima_indices)}\n")
             f.write(f"  Valid axis ratios: {np.sum(valid_axis_mask)}\n")
             f.write(f"  Valid BBKS params: {np.sum(valid_bbks_mask)}\n")
             
             if np.any(valid_axis_mask):
                 valid_axis_ratios = axis_ratios[valid_axis_mask]
-                f.write(f"  Mean axis ratios:\n")
+                f.write("  Mean axis ratios:\n")
                 f.write(f"    b/a: {np.mean(valid_axis_ratios[:, 0]):.3f} ± {np.std(valid_axis_ratios[:, 0]):.3f}\n")
                 f.write(f"    c/a: {np.mean(valid_axis_ratios[:, 1]):.3f} ± {np.std(valid_axis_ratios[:, 1]):.3f}\n")
             
             if np.any(valid_bbks_mask):
                 valid_bbks_params = bbks_params[valid_bbks_mask]
-                f.write(f"  BBKS parameters:\n")
+                f.write("  BBKS parameters:\n")
                 f.write(f"    Mean ellipticity (e): {np.mean(valid_bbks_params[:, 0]):.3f} ± {np.std(valid_bbks_params[:, 0]):.3f}\n")
                 f.write(f"    Mean prolateness (p): {np.mean(valid_bbks_params[:, 1]):.3f} ± {np.std(valid_bbks_params[:, 1]):.3f}\n")
                 prolate_percentage = 100 * np.sum(valid_bbks_params[:, 1] > 0.05) / len(valid_bbks_params)
@@ -200,7 +200,7 @@ def plot_contour_axis_ratios(snapshots_data, snapshot_ids, output_path=None):
         print(f"  z={redshift:.2f}: {len(valid_data)} valid axis ratio points")
 
         if len(valid_data) < 10:
-            print(f"    Skipping - too few points (need at least 10)")
+            print("    Skipping - too few points (need at least 10)")
             continue
 
         b_a = valid_data[:, 0]
@@ -241,14 +241,14 @@ def plot_contour_axis_ratios(snapshots_data, snapshot_ids, output_path=None):
                     plt.scatter(mean_b_a, mean_c_a, color=color, s=120, edgecolor='black',
                               marker='o', linewidths=2.5, zorder=10)
                 else:
-                    print(f"    Warning: No positive Z values, only plotting mean")
+                    print("    Warning: No positive Z values, only plotting mean")
                     color = colors[i]
                     mean_b_a = np.mean(b_a)
                     mean_c_a = np.mean(c_a)
                     plt.scatter(mean_b_a, mean_c_a, color=color, s=120, edgecolor='black',
                               marker='o', linewidths=2.5, zorder=10)
             else:
-                print(f"    Warning: z_max <= z_min, skipping")
+                print("    Warning: z_max <= z_min, skipping")
 
             legend_elements.append(Line2D([0], [0], color=colors[i], linewidth=2,
                                           label=f'z = {redshift:.2f}'))
@@ -332,7 +332,7 @@ def plot_contour_bbks(snapshots_data, snapshot_ids, output_path=None):
         print(f"  z={redshift:.2f}: {len(valid_data)} valid BBKS points")
 
         if len(valid_data) < 10:
-            print(f"    Skipping - too few points (need at least 10)")
+            print("    Skipping - too few points (need at least 10)")
             continue
 
         e_values = valid_data[:, 0]
@@ -376,14 +376,14 @@ def plot_contour_bbks(snapshots_data, snapshot_ids, output_path=None):
                     plt.scatter(mean_e, mean_p, color=color, s=120, edgecolor='black',
                               marker='o', linewidths=2.5, zorder=10)
                 else:
-                    print(f"    Warning: No positive Z values, only plotting mean")
+                    print("    Warning: No positive Z values, only plotting mean")
                     color = colors[i]
                     mean_e = np.mean(e_values)
                     mean_p = np.mean(p_values)
                     plt.scatter(mean_e, mean_p, color=color, s=120, edgecolor='black',
                               marker='o', linewidths=2.5, zorder=10)
             else:
-                print(f"    Warning: z_max <= z_min, skipping")
+                print("    Warning: z_max <= z_min, skipping")
 
             legend_elements.append(Line2D([0], [0], color=colors[i], linewidth=2,
                                         label=f'z = {redshift:.2f}: Pro={prolate_percentage:.1f}%, Obl={oblate_percentage:.1f}%'))
@@ -598,7 +598,7 @@ def main():
     print(f"Data directory: {sim_dir(args.sim, args.data_root)}")
     print(f"Output directory: {OUTPUT_DIR}")
     print(f"Processing {len(SNAPSHOT_TO_REDSHIFT)} snapshots")
-    print(f"Method: FFT-based Hessian computation")
+    print("Method: FFT-based Hessian computation")
 
     Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 

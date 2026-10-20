@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""The launcher's 2026-10-11 additions (python/gui): run-directory files of a run going (contract C1) in the Runs
+"""Launcher features (python/gui): run-directory files of a run going (contract C1) in the Runs
 browser, the memory status strip, the 'Running now' panel, the void-catalogue status and its build job, keep-awake,
-the new Plots sets, the memory check's log; (2026-10-14) the Explore menu's Save Options…; (2026-10-15) the plane
+the void Plots sets, the memory check's log; the Explore menu's Save Options…; the plane
 conventions' menu on the Grids, Custom and Pipeline tabs.
 
 Three tiers:
@@ -26,18 +26,14 @@ import tempfile
 import time
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "python" / "gui"))
+from _harness import FAIL, PASS, REPO as ROOT, SKIP, setup, summary
+
+setup("gui_app2_figs_", paths=("python/gui",), no_mirror=False, mpl_agg=False)    # before runspec is imported
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ["DTFE_GUI_NO_NOTIFY"] = "1"
-_FIGS_TMP = tempfile.mkdtemp(prefix="gui_app2_figs_")
-os.environ["DTFE_FIGURES_ROOT"] = _FIGS_TMP      # before runspec is imported: no test figure on the T7
-atexit.register(shutil.rmtree, _FIGS_TMP, True)
 
 import results as R  # noqa: E402
 import runspec as rs  # noqa: E402
-
-PASS, FAIL, SKIP = [], [], []
 
 
 def check(name, cond, detail=""):
@@ -114,7 +110,7 @@ def t_run_files(tmp: Path):
           text == "deposit 3/10 (30%), ETA 2h 03m, 12.5 GB, 1 GPU retries" and note is not None and text in note[1],
           (text, note))
     # the sidecar's pid alive but another program's (pids wrap within a day of the launcher's polling): this
-    # process is python, not a DTFE binary, so the run was killed (2026-10-11: a bare pid test said 'running')
+    # process is python, not a DTFE binary, so the run was killed (a bare pid test would say 'running')
     prog["pid"] = os.getpid()
     (d / "ps_output.runlog.progress").write_text(json.dumps(prog))
     rec = R.scan_runs(tmp)[0]
@@ -227,7 +223,7 @@ def t_running_now(tmp: Path):
         dd = by.get("died", {})
         check("... and the leftover sidecar of a dead pid reads 'died' with its snapshot",
               dd.get("snap") == 17 and dd.get("sim") == "TNGX-1-Dark" and (dd.get("progress") or {}).get("done") == 5, dd)
-        # the sidecar's pid must be a live DTFE binary to ps (results.dtfe_pid_alive, 2026-10-11): the exec -a
+        # the sidecar's pid must be a live DTFE binary to ps (results.dtfe_pid_alive): the exec -a
         # 'sleep' above is 'sleep' to Linux's comm, so a symlink named PS-DTFE runs this one
         fake_bin = tmp / "bin" / "PS-DTFE"
         fake_bin.parent.mkdir(exist_ok=True)
@@ -291,8 +287,8 @@ def t_plot_sets(tmp: Path):
           and c[c.index("--smooth-mpc") + 1] == "3" and c[c.index("--z") + 1:c.index("--z") + 3] == ["0", "2"]
           and c[c.index("--n-boot") + 1] == "50" and "--replot" in c
           and t[t.index("--radius") + 1] == "r_eff" and t[t.index("--smooth-mpc") + 1] == "2.1625", (c, t))
-    # every flag the launcher passes is one the script's own parser knows (scripts other agents may still be writing
-    # are judged only once they exist)
+    # every flag the launcher passes is one the script's own parser knows (a script not on disk is judged only
+    # once it exists)
     flat = {n: a for n, a in list(got.items()) + [(k, v.argv) for k, v in plain.items()]}
     for name, argv in sorted(flat.items()):
         script = ROOT / "python" / ("gui" if name == "void_cache.py" else "plot") / name
@@ -413,7 +409,7 @@ def t_qt(tmp: Path):
     rb.filter.setText("voids stale")
     check("... and the filter knows the state", len(rb._rows) >= 1 and all(
         rb.void_states.get(str(r.path), ("",))[0] == "stale" for r in rb._rows))
-    # K2 (2026-10-11): a killed run with its checkpoint directory shows 'resumable' in the Status column
+    # a killed run with its checkpoint directory shows 'resumable' in the Status column
     dk = snapdir(tmp, sim="TNGK-1-Dark", snap=99)
     (dk / "ps_output.runlog.partial").write_text(f"RUNNING: ./PS-DTFE in.hdf5 {dk / 'ps_output'} --grid 8 "
                                                  "--partition 2 2 2\n")
@@ -468,7 +464,7 @@ def t_qt(tmp: Path):
               (w.status.text(), w.log.toPlainText()[-300:]))
         check("the queue box names every kind that waits (custom included: HEAVY_KINDS)",
               "custom" in w.q_wait.text() and all(k in rs.HEAVY_KINDS for k in ("grids", "pipeline", "custom")))
-        # K1 (2026-10-11): the ordered-merge tick on the Grids, Pipeline and Custom tabs reaches each job, and
+        # the ordered-merge tick on the Grids, Pipeline and Custom tabs reaches each job, and
         # 'Load settings' of a run made with it ticks it again (and of one without, unticks it)
         for cb in (w.om_check, w.p_om, w.o_om):
             cb.setChecked(True)
@@ -481,7 +477,7 @@ def t_qt(tmp: Path):
         (d / "om.runlog").write_text(LOG_OK.format(root=d / "om").replace("--periodic", "--periodic --ordered-merge"))
         w._load_run_settings(R.parse_runlog(d / "om.runlog", "TNGQ-1-Dark", 99))
         on = w.om_check.isChecked()
-        # 2026-10-14: off only for a run made with '--completion-order-merge' (a run without a flag loads today's
+        # off only for a run made with '--completion-order-merge' (a run without a flag loads the
         # default, on)
         (d / "co.runlog").write_text(LOG_OK.format(root=d / "co").replace("--periodic", "--periodic --completion-order-merge"))
         w._load_run_settings(R.parse_runlog(d / "co.runlog", "TNGQ-1-Dark", 99))
@@ -490,7 +486,7 @@ def t_qt(tmp: Path):
         check("'Load settings' carries the ordered merge: on for a run made with it (and for one without a flag, "
               "today's default), off for a --completion-order-merge run",
               on and off and w.om_check.isChecked(), (on, off))
-        # 2026-10-11: the start-over tick (Grids, Pipeline) reaches run_ps_dtfe.sh as PS_RESUME=0; the banner of a
+        # the start-over tick (Grids, Pipeline) reaches run_ps_dtfe.sh as PS_RESUME=0; the banner of a
         # refused resume ticks it; its text has no '--'; 'Load settings' leaves it alone (a one-off choice)
         so, pso = getattr(w, "so_check", None), getattr(w, "p_so", None)
         ok = so is not None and pso is not None
@@ -521,7 +517,7 @@ def t_qt(tmp: Path):
 
 
 def t_qt_save_options(w):
-    """The Explore menu's Save Options… (2026-10-14): right after Save Image…, enabled without a map, it brings up
+    """The Explore menu's Save Options…: right after Save Image…, enabled without a map, it brings up
     Explore and the Save options dialog; a window that does not remember its settings keeps them for the session."""
     import app as A
     menu = next(a.menu() for a in w.menuBar().actions() if a.text() == "Explore")
@@ -543,7 +539,7 @@ def t_qt_save_options(w):
 
 
 def t_qt_pts_conventions(w, tmp: Path):
-    """The plane conventions' menu (2026-10-15): on the Grids tab (PS-DTFE with a hi-res slice), the Custom tab (a
+    """The plane conventions' menu: on the Grids tab (PS-DTFE with a hi-res slice), the Custom tab (a
     phase-space run with sample points) and the Pipeline tab, starting at the grids' conventions; what it says reaches
     the job (PTS_CONVENTIONS for the scripts, '--pts-conventions legacy' for the binary) and comes back on loading."""
     pts = tmp / "pc_points.txt"
@@ -580,7 +576,7 @@ def t_qt_pts_conventions(w, tmp: Path):
 
 
 def t_qt_void_options(w):
-    """The void scripts' own options on the Plots tab (2026-10-11): grouped options share one form row (compact),
+    """The void scripts' own options on the Plots tab: grouped options share one form row (compact),
     and what the widgets say reaches the job's commands (= the exported script)."""
     import app as A
     keys = [fs.key for fs in rs.FIGURE_SETS]
@@ -614,7 +610,7 @@ def t_qt_void_options(w):
 
 
 def t_qt_gpu_retries(tmp: Path):
-    """G1 (2026-10-11): the Runs tab shows the GPU deposit retries per cause: the 'Running now' state from the
+    """The Runs tab shows the GPU deposit retries per cause: the 'Running now' state from the
     sidecar, a finished run's status and details from its log's closing line."""
     import runs_view as RV
     rn = RV.RunningNow()
@@ -652,8 +648,7 @@ def main() -> int:
     t_qt(tmp)
     t_void_status_t7()
     print("-" * 60)
-    print(f"RESULT: {len(PASS)} passed, {len(FAIL)} failed, {len(SKIP)} skipped")
-    return 1 if FAIL else 0
+    return summary()
 
 
 if __name__ == "__main__":

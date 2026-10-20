@@ -23,28 +23,28 @@
 #      --ps-vertex-mass, --ps-volume-weighted, --ps-halo-release, --ps-linear-deposit conserve mass;
 #      a non-periodic clump conserves mass and covers its interior; the tessellation cache hits and
 #      reproduces the run bit for bit; --ps-gpu on the 2D build (no GPU backend in DIM=2) runs every
-#      partition on the CPU, exits 0 and says how many passes fell back (2026-10-08)
+#      partition on the CPU, exits 0 and says how many passes fell back
 #   D  the standard 2D build runs on the same file: its mean density is the particle density
-#   PE point evaluation (--sample-points, 2D since 2026-10-02): at the cell centres the point stream
+#   PE point evaluation (--sample-points): at the cell centres the point stream
 #      counts equal the same run's nSub = 1 grid counts EXACTLY; single-stream point velocities are
 #      the analytic ones; a --partition 2 2 run gives the same points; a text points file the same
 #      outputs as the binary one; the standard DTFE-2d evaluates points too; and the interactive
-#      server (--serve, 2D since 2026-10-03): dtfelib's Estimator(dim=2) answers byte-identical to
+#      server (--serve): dtfelib's Estimator(dim=2) answers byte-identical to
 #      --sample-points, a composite (partition 2 2) server equals the same split's point run, and
 #      Estimator.from_arrays builds a 2D estimator from (N, 2) arrays
-#   W  --ps-window (2D since 2026-10-02): the window run's cells are the full run's -- the stream counts and the
+#   W  --ps-window: the window run's cells are the full run's -- the stream counts and the
 #      hidden-stream masks bit for bit, the sums within 1e-8 of the peak with the sampled deposit (a window pass takes
-#      its own fixed-point units since 2026-10-15, ps_interpolation.cc fxBoundWalk), to float rounding with the exact one
-#   CU --ps-caustic-cusps (2D since 2026-10-02) on a pancake modulated along y, psi_x = A sin(kq_x)
+#      its own fixed-point units, ps_interpolation.cc fxBoundWalk), to float rounding with the exact one
+#   CU --ps-caustic-cusps on a pancake modulated along y, psi_x = A sin(kq_x)
 #      (1 + eps cos(kq_y)), whose fold lens closes in two analytic cusps: both are flagged, every flag
 #      lies on the ridge k q_x = pi where the null-direction derivative of lambda_c vanishes (the
 #      indicator marks that ridge within its fold band, as in 3D), the unmodulated pancake -- no cusps
 #      -- gets none, and no swallowtail bit is ever set in 2D
 #   CO the 2D redshift cone (DTFE-2d --redshiftCone, origin x != y): the Monte Carlo cell averages agree with the
-#      centre values (2026-10-11: the samples used origin x for y)
+#      centre values (with origin x for y the samples would average another cell)
 #   DM a 3-column snapshot through DTFE-2d / PS-DTFE-2d (and a 2-column one through DTFE / PS-DTFE, when built)
-#      is refused with a message naming the binaries to use (2026-10-11: a segfault or a garbage grid at exit 0)
-#   EA the standard DTFE-2d's --exact-average (2D since 2026-10-02, triangles clipped by ps_clip2d.h):
+#      is refused with a message naming the binaries to use (not a segfault or a garbage grid at exit 0)
+#   EA the standard DTFE-2d's --exact-average (triangles clipped by ps_clip2d.h):
 #      density 1 to float rounding on a perfect lattice (the sampled average is off by percents), mass
 #      conserved on a pancake, and the sampled average agrees with it to its own noise
 # Usage: tests/ps_2d_check.sh [--no-build]
@@ -83,8 +83,8 @@ RUN "$TMP/pan_hr"  ./PS-DTFE-2d "$TMP/pan.hdf5" "$TMP/pan_hr"  "${COMMON[@]}" --
 RUN "$TMP/pan_lin" ./PS-DTFE-2d "$TMP/pan.hdf5" "$TMP/pan_lin" "${COMMON[@]}" --field density_a --ps-linear-deposit
 RUN "$TMP/pan_c1"  ./PS-DTFE-2d "$TMP/pan.hdf5" "$TMP/pan_c1"  "${COMMON[@]}" --field density_a --tessellation-cache "$CACHE"
 RUN "$TMP/pan_c2"  ./PS-DTFE-2d "$TMP/pan.hdf5" "$TMP/pan_c2"  "${COMMON[@]}" --field density_a --tessellation-cache "$CACHE"
-# --ps-gpu where no GPU can run: the deposit falls back pass by pass, and only the master thread's partitions
-# said so -- the run now counts every pass and says it once
+# --ps-gpu where no GPU can run: the deposit falls back pass by pass, on any thread -- the run counts every
+# pass and says it once
 RUN "$TMP/pan_gfb" ./PS-DTFE-2d "$TMP/pan.hdf5" "$TMP/pan_gfb" --grid 32 --periodic --MpcUnit 1 --verbose 2 --field density --partition 2 2 --max-concurrent 2 --ps-gpu
 echo ">> convergence series (single-stream density, nSub 3, grid 96)"
 for n in 16 24 32 48; do
@@ -120,7 +120,7 @@ RUN "$TMP/w_win"   ./PS-DTFE-2d "$TMP/pan.hdf5" "$TMP/w_win"   "${COMMON[@]}" --
 RUN "$TMP/w_xfull" ./PS-DTFE-2d "$TMP/pan.hdf5" "$TMP/w_xfull" "${COMMON[@]}" --field density --ps-exact-deposit
 RUN "$TMP/w_xwin"  ./PS-DTFE-2d "$TMP/pan.hdf5" "$TMP/w_xwin"  "${COMMON[@]}" --field density --ps-exact-deposit "${WIN[@]}"
 # a partitioned window over a tessellation cache: the first run writes the partitions and their occupancy
-# maps, the second skips the partitions whose streams never reach the window (2D maps since 2026-10-03)
+# maps, the second skips the partitions whose streams never reach the window
 WCACHE="$TMP/w_cache"; rm -rf "$WCACHE"; mkdir -p "$WCACHE"
 WP=( --field density --avg-subsamples 2 --partition 2 2 --max-concurrent 1 )
 RUN "$TMP/w_pfull" ./PS-DTFE-2d "$TMP/pan.hdf5" "$TMP/w_pfull" "${COMMON[@]}" "${WP[@]}"
@@ -142,8 +142,8 @@ GEN --out "$TMP/cone.hdf5" --n 64 --box 100 --amplitude-factor 0.5 --crossed-wav
 RUN "$TMP/cone" ./DTFE-2d "$TMP/cone.hdf5" "$TMP/cone" --grid 16 64 --periodic --MpcUnit 1 --verbose 2 \
     --field density density_a --redshiftCone 2 25 0 359 --origin 30 60
 # a 3-column (3D) snapshot through the 2D binaries, a 2-column one through the 3D binaries (when built): refused
-# by name before any read -- until 2026-10-11 HDF5 wrote 3N values into a 2N buffer (a segfault or a garbage grid
-# at exit 0) or read 3N values from a 2N dataset (a garbage grid at exit 0)
+# by name before any read -- else HDF5 writes 3N values into a 2N buffer (a segfault or a garbage grid
+# at exit 0) or reads 3N values from a 2N dataset (a garbage grid at exit 0)
 "$PY" tests/generate_ps_test_data.py --dim 3 --out "$TMP/dim3.hdf5" --n 8 --box 100 >/dev/null || { echo "FAIL data gen 3D"; exit 1; }
 : > "$TMP/dimcheck.txt"
 for pair in "./DTFE-2d dim3 3" "./PS-DTFE-2d dim3 3" "./DTFE pan 2" "./PS-DTFE pan 2"; do
@@ -347,7 +347,7 @@ def close(a, b):
     return a.shape == b.shape and float(np.abs(a - b).max()) <= 1e-8 * max(float(np.abs(a).max()), 1e-300)
 same_den = close(grid("w_full", "den")[xs, ys], win("w_win", "den"))
 same_str = np.array_equal(grid("w_full", "streams")[xs, ys], win("w_win", "streams"))
-# '.hidden_streams' is what the window port changed (markFlipped walks the window's hull only)
+# '.hidden_streams' is the field a window can change (markFlipped walks the window's hull only)
 same_hid = np.array_equal(grid("w_full", "hidden_streams")[xs, ys], win("w_win", "hidden_streams"))
 fv = grid("w_full", "vel", ncomp=2)[xs, ys]
 wv = np.fromfile(tmp / "w_win.vel", np.float32).astype(np.float64).reshape(36, 78, 2)
@@ -397,7 +397,7 @@ l1 = float(np.abs(px - ps_).mean() / px.mean())
 check("EA3 sampled ~ exact", l1 < 0.02, f"relative L1 |exact - sampled(400)| {l1:.1e}")
 
 # CO: the 2D redshift cone's Monte Carlo cell average (method 2) samples the cell around the origin's (x, y);
-# until 2026-10-11 it used origin x for y, so with origin (30, 60) every cell averaged the field 30 Mpc away
+# with origin x for y, origin (30, 60) would make every cell average the field 30 Mpc away
 cu = np.fromfile(tmp / "cone.den", np.float32).astype(np.float64)
 ca = np.fromfile(tmp / "cone.a_den", np.float32).astype(np.float64)
 l1 = float(np.abs(ca - cu).mean() / cu.mean())

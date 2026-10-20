@@ -21,7 +21,7 @@
    original (DTFE.cpp's global copies, subpartition.h's per-partition copies, the standard
    binary's findParticlesInBox) -- keep it that way.
 
-   2D (a DIM=2 phase-space build, 2026-10-02): the same three tiers for a point in a TRIANGLE. The
+   2D (a DIM=2 phase-space build): the same three tiers for a point in a TRIANGLE. The
    frame, the canonical images and tier 1 are dimension-free; the exact predicate is the 2D
    orientation, and its simulation of simplicity reduces to exact comparisons of coordinates. */
 

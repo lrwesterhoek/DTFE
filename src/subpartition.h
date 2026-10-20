@@ -115,43 +115,35 @@ void findParticlesInBoxLagrangianPeriodic(std::vector<Particle_data> &p,
 }
 
 
-/* The periodic SEAM of the Lagrangian ownership tiling (2026-10-13).
+/* The periodic SEAM of the Lagrangian ownership tiling.
 
    A periodic PS-DTFE run tiles ONE period [s - L, s) of Lagrangian space per axis: a tetrahedron is
    deposited by the copy (the original or a periodic image) whose Lagrangian centroid lies in that period, or
    in the partition region that tiles it (psFilterCell). That is exclusive and exhaustive only if the
    tessellation around the two edges of the period is the SAME up to the shift L -- the copies that sit
-   beyond the edges must be exact translates of their originals. They were not. The period used to end at the
-   top particle plane, s = lagBox_hi (2026-10-02), so the padding above it came from the +L copies of the
-   bottom particles, made in Real arithmetic: y + L of a y near 0 keeps only ulp(L) (2^-7 kpc/h at L = 75
-   Mpc/h), so those copies sat up to half an ulp(L) off the translates of the originals they stand for. On
-   near-lattice initial conditions (TNG's IC positions are a lattice displaced by a small fraction of a
-   spacing) the Delaunay tessellation is near-degenerate in every cube, and that offset flips some of its
-   choices: the tetrahedra above the seam are not the translates of those below it, so the tiles of the two
-   frames overlap or leave gaps -- whole tetrahedra deposited twice or never, and under --ps-vertex-mass a
-   particle whose copies have different degrees deposits more or less than its weight. That is the likely
-   source of the 2026-10-13 audit's seam defect on TNG (up to 394 double-covered and tens of uncovered
-   '.a_streams' cells within a few cells of the box faces, moving with the flow; a +-1e-7 box-mass offset that
-   is constant in z) -- inferred, not measured on TNG. Measured on synthetic periodic boxes (PS_MASS_AUDIT=2,
-   tests/ps_periodic_seam_check.sh): a 32^3 lattice jittered by 1e-5 spacings has ~400 seam particles whose
-   shares do not close (their copies' degrees 22 vs 26) and +6e-5 of the box mass; a box across the float
-   binade 2^17 (its +L copies round to 2^-6) has 177 uncovered and 18 double-covered cells and -6.4e-5 of the
-   mass. Quantizing its coordinates so that every shift is exact removes all of it, and no ownership rule
-   alone does: the min-particle-ID vertex instead of the centroid still left 68 holes and 65 doubles -- the
-   tessellations differ, not just the test.
+   beyond the edges must be exact translates of their originals. A period ending at the top particle plane,
+   s = lagBox_hi, takes the padding above it from the +L copies of the bottom particles, made in Real
+   arithmetic: y + L of a y near 0 keeps only ulp(L) (2^-7 kpc/h at L = 75 Mpc/h), so those copies sit up to
+   half an ulp(L) off the translates of the originals they stand for. On near-lattice initial conditions
+   (TNG's IC positions are a lattice displaced by a small fraction of a spacing) the Delaunay tessellation is
+   near-degenerate in every cube, and that offset flips some of its choices: the tetrahedra above the seam
+   are not the translates of those below it, so the tiles of the two frames overlap or leave gaps -- whole
+   tetrahedra deposited twice or never, and under --ps-vertex-mass a particle whose copies have different
+   degrees deposits more or less than its weight (measured on synthetic periodic boxes by PS_MASS_AUDIT=2,
+   tests/ps_periodic_seam_check.sh). No ownership rule alone removes that (the min-particle-ID vertex instead
+   of the centroid leaves holes and doubles too): the tessellations differ, not just the test.
 
-   The fix moves the seam to where every copy IS exact: s = lagBox_lo + L - pad (less a margin), as high as
+   So the seam sits where every copy IS exact: s = lagBox_lo + L - pad (less a margin), as high as
    the padding allows without any +L copy, so the padded period [s - L - pad, s + pad] holds the originals and
    the -L copies of the originals above s - pad only, and the generators (DTFE()'s global copies and
    findParticlesInBoxLagrangianPeriodic) make no other. A float y - L is exact whenever its result is no
    coarser than y and L (psShiftDownExact; Sterbenz's lemma for y in [L/2, 2L], i.e. any snapshot box [0, L)
    with pad < L/4): the copies are then translates bit for bit, the tessellation of the padded period is the
-   periodic one, and the centroid ownership tiles it exactly (psFilterCell's relative centroid test). Nothing
-   about a tetrahedron's own geometry or its keep/drop decision changes; only WHICH copy of a seam tetrahedron
-   deposits it, and the partition boundaries (they tile [s - L, s) now: every partition's tessellation cache
-   identity changes once). When no such s exists (a padding above ~L/4 -- tiny test boxes, '--ps-lag-padding
-   0' on one partition -- or a box whose coordinates do not allow exact shifts), the axis keeps the
-   2026-10-02 seam, as before. */
+   periodic one, and the centroid ownership tiles it exactly (psFilterCell's relative centroid test). The seam
+   decides only WHICH copy of a seam tetrahedron deposits it (not its geometry or its keep/drop decision) and
+   the partition boundaries, which tile [s - L, s). When no such s exists (a padding above ~L/4 -- tiny test
+   boxes, '--ps-lag-padding 0' on one partition -- or a box whose coordinates do not allow exact shifts), the
+   axis keeps the seam s = lagBox_hi. */
 
 // The granularity of a Real: the ulp of the binade of x (x > 0), as a double.
 inline double psRealUlp(double const x)
@@ -179,7 +171,7 @@ inline bool psShiftDownExact(double const A, double const B, Real const L)
 // The top edge s of the ownership period [s - L, s) on one axis (see above), for the global Lagrangian bounding
 // box [lagLo, lagHi] (computeLagrangianBoundingBox: the particles' extent plus a 1e-6 margin), the period L and
 // the padding 'pad' of the copies around the period (the single triangulation's, or the largest a partition
-// adds). Returns true and the exact seam, or false and the old anchor lagHi.
+// adds). Returns true and the exact seam, or false and the fallback anchor lagHi.
 inline bool psPeriodicSeam(Real const lagLo, Real const lagHi, Real const L, Real const pad, Real &seam)
 {
     seam = lagHi;
@@ -245,18 +237,17 @@ inline bool selectionRunsParallel(size_t const N)
 #endif
 }
 
-/* Ordered parallel box selection (2026-10-12). Appends to 'output' every particle of 'p' inside boxes[k]
+/* Ordered parallel box selection. Appends to 'output' every particle of 'p' inside boxes[k]
    (stored shifted back by -offsets[k] when 'shift'), BOX-MAJOR and in particle order within each box: exactly
    the vector that calling insertParticlesInBox( p, output, boxes[k], offsets[k] ) for k = 0, 1, ... in turn
    produces, byte for byte (same particles, same order, same 'pos - offset' arithmetic) -- the spatial sort and
-   the CGAL insertion downstream see the same input. It used to be serial and, periodic, scanned all N particles
-   once per periodic offset (Box::isBoxOverlaping is true for practically every pair, so all 27 offsets): ~2 s per
-   partition at 9.4e7 particles with the other cores idle, 4% of a TNG100 run, ~1/3 of a TNG300 one.
-   Now: (1) offsets whose box cannot hold a particle are dropped EXACTLY, against the particles' own bounding box
+   the CGAL insertion downstream see the same input. A serial periodic selection scans all N particles once per
+   periodic offset (Box::isBoxOverlaping is true for practically every pair, so all 27 offsets): ~2 s per
+   partition at 9.4e7 particles with the other cores idle. So: (1) offsets whose box cannot hold a particle are dropped EXACTLY, against the particles' own bounding box
    (closed intervals, the test isParticleInBox makes; a NaN coordinate -- which every box test passes -- keeps
    all boxes); (2) one count pass and one fill pass over contiguous chunks, the fill writing straight into its
    final slot (prefix sums over box-major, chunk-minor counts), so the order never depends on the threads and
-   the vector is allocated once at its exact size. Serial (the old loops) inside an enclosing parallel region
+   the vector is allocated once at its exact size. Serial (the plain loops) inside an enclosing parallel region
    -- DTFE_parallel's threads and the '--serve' composite call this concurrently -- and for small inputs. */
 inline void selectParticlesInBoxesOrdered(std::vector<Particle_data> &p,
                                           std::vector<Particle_data> *output,
@@ -393,8 +384,8 @@ void findParticlesInBox(std::vector<Particle_data> &p,
     // reserve ~130% of the average number of particles in the given volume -- a hint only, so CAPPED at
     // p.size(): DTFE_parallel's threads call this after updateFullBox(region), so 'fullBox' is the user
     // region there, not the data box, and a thin --regionMpc (1 x 1 x 0.002 Mpc, the exact-zoom shape)
-    // made the padded/region volume ratio ~5e6 = a multi-TB reserve. macOS overcommits it (untouched
-    // pages), Linux refuses it with std::bad_alloc (2026-10-11). '!(est < cap)' also catches a NaN/inf
+    // makes the padded/region volume ratio ~5e6 = a multi-TB reserve. macOS overcommits it (untouched
+    // pages), Linux refuses it with std::bad_alloc. '!(est < cap)' also catches a NaN/inf
     // from a zero-volume region, and the double is clamped BEFORE the size_t conversion (UB if too big).
     // (The ordered parallel selection sizes the vector exactly itself; the hint serves the serial path.)
     double estimate = double( p.size() ) * double( box.volume() ) / double( fullBox.volume() ) * 1.3;
@@ -516,13 +507,13 @@ void optimalSplit(std::vector<size_t> &counts,
 		}
 	}
 
-	// Every partition keeps at least one cell (2026-10-11). The balance above can leave two edges equal -- an EMPTY
-	// range: the first edge stays at 0 when the first cell alone reaches the load, which happens always with more
-	// partitions than half the cells (-g 8 --partition 1 5 5 gave an '8*0*0' grid and TSC/CIC/PCS segfaulted) and
-	// on a cloud whose first slab holds a partition's load (DTFE_parallel's split over the threads too: a small
-	// grid left threads with empty boxes). Push each edge right of the previous one, then left of what the
-	// partitions after it need (possible: optimalPartitionSplit refuses more partitions than cells). A split that
-	// already gave every partition a cell is unchanged, so only runs that had an empty range get new edges.
+	// Every partition keeps at least one cell. The balance above can leave two edges equal -- an EMPTY range:
+	// the first edge stays at 0 when the first cell alone reaches the load, which happens always with more
+	// partitions than half the cells (-g 8 --partition 1 5 5 would give an '8*0*0' grid) and on a cloud whose
+	// first slab holds a partition's load (DTFE_parallel's split over the threads too: a small grid would leave
+	// threads with empty boxes). Push each edge right of the previous one, then left of what the partitions
+	// after it need (possible: optimalPartitionSplit refuses more partitions than cells). A split that already
+	// gives every partition a cell is unchanged.
 	size_t const n = counts.size();
 	for (size_t k=1; k<noPartitions; ++k)
 		if ( partitionIndices[k] < partitionIndices[k-1]+1 )

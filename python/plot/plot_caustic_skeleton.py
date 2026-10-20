@@ -9,19 +9,19 @@ the fold fraction of each distinct void's shells (--shells, default 0.8-1.2 R_v:
 measured void radius; --radius r_eff for the ellipsoid's, ~1.75 R_v, with 1.0-1.3) and its distance to the nearest
 sheet in units of that radius (searched within --cutout cells, default 10 smoothing lengths). The cusp and swallowtail rows are '--' unless the grid carries bit 7/8 (only --ps-caustic-cusps on
 the CPU deposit sets them); a parity-only grid (--ps-linear-deposit --ps-gpu: the fold flag without the
-collapse bits) is refused. THE FOLD (2026-10-13) is FieldSet.fold_mask() -- streams > 1 or '.hidden_streams' bit 1,
+collapse bits) is refused. THE FOLD is FieldSet.fold_mask() -- streams > 1 or '.hidden_streams' bit 1,
 the geometric 'a folded tetrahedron overlaps the cell' -- for the fractions, the void shells, the null and the
-outline alike: the caustic_class grids written before that day set their fold bits per deposited sample and miss
-every fold thinner than the sampling (TNG100-3-Dark z=1: 21.0% of the cells against 33.6%), so the fold numbers
-of earlier runs of this script were low; the collapse classes (bits 2-5) are still per sample. On the T7 only TNG100-3-Dark z = 0 carries one (2026-10-08: its ps_caustic.* grids,
+outline alike: older caustic_class grids set their fold bits per deposited sample and miss
+every fold thinner than the sampling (TNG100-3-Dark z=1: 21.0% of the cells against 33.6%); the collapse classes
+(bits 2-5) are per sample. On the T7 only TNG100-3-Dark z = 0 carries one (its ps_caustic.* grids,
 read with --prefix ps_caustic); the other boxes and snapshots need a caustics rerun.
 
-Names (2026-10-08): caustic_skeleton_z<z>.* for the defaults; a non-default option adds its tag, so a rerun with
-another one no longer overwrites them: '_<prefix>' (not ps_output), '_c6' / '_c18' (--connectivity), and with
+Names: caustic_skeleton_z<z>.* for the defaults; a non-default option adds its tag, so a rerun with
+another one never overwrites them: '_<prefix>' (not ps_output), '_c6' / '_c18' (--connectivity), and with
 --voids '_reff' (--radius r_eff), '_shells<a>-<b>-...' (not the radius's default shells), '_overlaps'
 (--keep-overlaps), '_cut<N>' (--cutout) and the smoothing tag. A run without --voids removes the set's _voids.npz.
 
-The control (2026-10-11): with --voids the same metrics are measured in --null-draws (default 50) realisations of
+The control: with --voids the same metrics are measured in --null-draws (default 50) realisations of
 random spheres, one per void at a random cell with that void's radius, and the voids' median fold / sheet shell
 fraction and wall distance are reported against the null's mean +- std with a z-score (JSON 'null', the text, and the
 grey / orange bands of the void panel); --min-component N / --min-component-mass F keep only the sheet components of
@@ -185,8 +185,8 @@ def plot_skeleton(cc, summ, fold, voids, title, path):
                            alpha=0.2, label="random spheres: median distance")
             ax.legend(fontsize=7)
         ax.grid(alpha=0.3)
-        # 'distinct' from what was applied (summ['voids']), not from the radius: --keep-overlaps under r_v was
-        # titled 'distinct' and the distinct r_eff sample was not (2026-10-08)
+        # 'distinct' from what was applied (summ['voids']), not from the radius, which would title --keep-overlaps
+        # under r_v 'distinct' and the distinct r_eff sample not
         distinct = bool(summ.get("voids", {}).get("distinct", False))
         style.set_title(ax, f"{len(voids['fold'])} {'distinct ' if distinct else ''}well-resolved voids "
                             f"({int((~ok).sum())} beyond the cut-out)")
@@ -209,9 +209,9 @@ def caustic_snapshots(sim, data_root, method, prefix):
 
 
 def skeleton_tag(args, prefix, default_shells):
-    """The file-name tag of the non-default options (2026-10-08: only the smoothing was in the name, so another
-    --connectivity, --prefix, --radius, --shells, --keep-overlaps or --cutout overwrote the default set, the
-    mirrored PNG included). The void options count only with --voids."""
+    """The file-name tag of the non-default options, so that another --connectivity, --prefix, --radius, --shells,
+    --keep-overlaps or --cutout never overwrites the default set, the mirrored PNG included. The void options count
+    only with --voids."""
     tag = "" if prefix.rstrip(".") == "ps_output" else f"_{prefix.rstrip('.')}"
     tag += "" if args.connectivity == 26 else f"_c{args.connectivity}"
     if args.voids:
@@ -221,7 +221,7 @@ def skeleton_tag(args, prefix, default_shells):
             tag += "_shells" + "-".join(f"{x:g}" for x in shells)
         tag += "_overlaps" if args.keep_overlaps else ""
         tag += "" if args.cutout is None else f"_cut{args.cutout}"
-        tag += "" if args.null_draws == NULL_DRAWS else f"_null{args.null_draws}"     # the control (2026-10-11)
+        tag += "" if args.null_draws == NULL_DRAWS else f"_null{args.null_draws}"     # the control
         tag += "" if not args.null_seed else f"_seed{args.null_seed}"
         tag += "" if args.min_component <= 1 else f"_min{args.min_component}"
         tag += "" if not args.min_component_mass > 0 else f"_minm{args.min_component_mass:g}"
@@ -291,7 +291,7 @@ def main():
                 raise FileNotFoundError(f"no caustic_class grid in {snapdir} (a --ps-caustics run writes one)")
             cc = np.rint(fs.load("caustic_class")).astype(np.int32)
             sk.class_masks(cc)                              # refuses a parity-only grid (no collapse bits) here, not later
-            fold = fs.fold_mask()                           # the geometric fold, exact for pre-2026-10-13 grids too
+            fold = fs.fold_mask()                           # the geometric fold, exact for older grids too
             den = fs.density(units="mean")
             z, cell = fs.meta.redshift, fs.cell_mpc
         except (FileNotFoundError, ValueError, OSError) as e:

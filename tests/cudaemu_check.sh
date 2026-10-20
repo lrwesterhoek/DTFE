@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The CUDA/HIP GPU backend through its CPU emulation (2026-10-11): the parity suites the Metal backend
+# The CUDA/HIP GPU backend through its CPU emulation: the parity suites the Metal backend
 # passes, run against binaries built with 'make DTFE PS-DTFE CUDAEMU=1' (src/CGAL_triangulation/
 # gpu_cuda_emu.h; metal/README.md "Validation without hardware"), at warp width 32 (CUDA) and 64 (the HIP
 # wavefront, GPU_EMU_WARP=64). No NVIDIA or AMD GPU is needed, so this runs on a plain Linux CI runner and
@@ -13,31 +13,30 @@
 #   dtfe_metal_check, gpu_scalar_check, ps_linear_deposit, ps_vertex_mass, ps_volume_weighted,
 #   ps_halo_release, ps_hidden_streams, ps_caustic_class, ps_nonperiodic_test.py, point_exact_serve,
 #   ps_window_check, ps_smoke_test, gpu_mass_check, gpu_retry_check (the chunk checkpoints + cause-aware
-#   retry the port gained from the Metal host on 2026-10-11, the per-cause retry counts, and the pace recovery
-#   after a clean stretch, R7), ps_mass_exact_check (2026-10-12: the host hands its fixed-point mass words to
+#   retry of the Metal host, the per-cause retry counts, and the pace recovery
+#   after a clean stretch, R7), ps_mass_exact_check (the host hands its fixed-point mass words to
 #   the CPU, which adds the deferred and released tetrahedra into them -- 56% of the tets deferred there),
-#   dtfe_gpu_retry_check (2026-10-13: the standard-DTFE host dtfe_gpu_cuda.cu with the same retry policy and
+#   dtfe_gpu_retry_check (the standard-DTFE host dtfe_gpu_cuda.cu with the same retry policy and
 #   its exact fixed-point '_a' sums -- two runs byte-identical, a faulted run byte-identical to a clean one),
-#   ps_fixed_moments_check (2026-10-14: every moment grid of the port is an exact fixed-point sum too --
+#   ps_fixed_moments_check (every moment grid of the port is an exact fixed-point sum too --
 #   addMoment in ps_gpu_cuda.cu -- two runs with other chunk sizes byte-identical in every grid)
-# and its own check of the fixed-point mass grid the port gained on 2026-10-11 (depositMass in
-# ps_gpu_cuda.cu, the Metal kernel's since 2026-10-08):
+# and its own check of the port's fixed-point mass grid (depositMass in ps_gpu_cuda.cu, as in the Metal kernel):
 #   E1  two --ps-gpu runs write byte-identical '.a_den' (one domain, and --partition 2 2 2
-#       --max-concurrent 1); the float atomics of before differed run to run
+#       --max-concurrent 1); float atomics would differ run to run
 #   E2  PS_GPU_FLOAT_MASS=1 (the float grid, kept for A/B) agrees with the default to 1e-5 of the peak
 #   E3  heavy accumulation (a 128^3 pancake on a 2^3 grid, nSub 1: 1.47e7 tetrahedra, ~1.8e6 deposits per
-#       cell): the GPU box mean equals the CPU's to 3e-6 (the float grid of before gives 7.8e-6 here on Metal;
+#       cell): the GPU box mean equals the CPU's to 3e-6 (the float grid gives 7.8e-6 here on Metal;
 #       a 64^3 pancake does not tell the two apart: float 1.2e-6, fixed 1.2e-7 under the emulation)
 # A suite that exits non-zero fails the run. A suite whose kept logs never name the emulated device
 # ("CPU emulation of the CUDA backend, <W>-lane warps") is marked PASS* -- informational for most (several
 # suites run at --verbose 1 or discard their logs; their own CPU-vs-GPU assertions and fallback greps still
 # ran), a failure for those in CUDAEMU_GPU_REQUIRED, whose logs always carry the device line.
-# The gates of gpu_mass_check.sh, gpu_retry_check.sh and ps_nonperiodic_test.py accept the emulated build
-# (2026-10-11; the hollow spots of before are closed), so each runs its GPU deposits here.
+# The gates of gpu_mass_check.sh, gpu_retry_check.sh and ps_nonperiodic_test.py accept the emulated build,
+# so each runs its GPU deposits here.
 #
 # The time-aware auto-tuner splits small runs into 2^3 partitions when it predicts a speed gain, and its
 # prediction depends on the core count: on a 4- or 8-core Linux machine the CPU REFERENCE runs of
-# gpu_scalar_check were split while the --ps-gpu runs were not, and a split sampled deposit differs from one
+# gpu_scalar_check would be split while the --ps-gpu runs are not, and a split sampled deposit differs from one
 # domain at 4e-3 of the peak -- a red suite that has nothing to do with the port. DTFE_AUTO_T_VERTEX (the
 # tuner's per-vertex triangulation cost) is therefore set negligible here, so no speed split ever wins and
 # every machine runs the same single domain the Mac does (export your own value to override).

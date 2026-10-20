@@ -5,22 +5,22 @@ its time estimates and its failure advice. Pure Python (no Qt): tests/py_gui_run
                                 and under the custom-snapshot output directories -> RunRecord, with
                                 a later failed, killed or running attempt ('.runlog.failed/.partial')
   stale_reasons(record)         which KNOWN_FIXES (output-changing fixes of the binary) the run
-                                predates, judged by the binary's build stamp ('Build:' line, since
-                                2026-09-30) or, without one, by the date the run finished; and the
-                                attempt after it (attempt_note)
+                                predates, judged by the binary's build stamp ('Build:' line) or,
+                                without one, by the date the run finished; and the attempt after it
+                                (attempt_note)
   time_estimate(records, ...)   the median wall time of comparable earlier runs
   diagnose(log, exit_codes)     plain-language causes and fixes for a failed job
   void_status(records, root)    whether each run's void catalogue is cached, stale or absent (void_cache.py)
-  read_progress / is_run_file   the run-directory files of a run going (contract C1, 2026-10-11): the binary's
+  read_progress / is_run_file   the run-directory files of a run going (contract C1): the binary's
                                 '<prefix>.runlog.progress', the scripts' '.runlog.lock' and '<grid>.part.<pid>'
                                 are never outputs nor logs; a '.partial' with a live sidecar shows its progress
   notify_command(title, text)   the OS command that shows a desktop notification
 
 A run log is the binary's own output, tee'd next to its outputs by run_ps_dtfe.sh, run_dtfe.sh
-and the GUI's custom-snapshot jobs, followed (macOS) by '/usr/bin/time -l'. The run-log contract
-(2026-10-08): a run writes '<prefix>.runlog.partial'; exit 0 renames it onto '<prefix>.runlog' (the
-log of the grids on disk), a failure or stop onto '<prefix>.runlog.failed' (the last failed attempt,
-the old '.runlog' untouched); a '.partial' left behind is a run still going, or one killed outright.
+and the GUI's custom-snapshot jobs, followed (macOS) by '/usr/bin/time -l'. The run-log contract:
+a run writes '<prefix>.runlog.partial'; exit 0 renames it onto '<prefix>.runlog' (the log of the
+grids on disk), a failure or stop onto '<prefix>.runlog.failed' (the last failed attempt, the old
+'.runlog' untouched); a '.partial' left behind is a run still going, or one killed outright.
 """
 
 from __future__ import annotations
@@ -51,21 +51,21 @@ _NSUB = re.compile(r"--avg-subsamples (\d+)")
 _FIELDS = re.compile(r"--field ((?:(?!--)\S+\s*)+)")
 # the GPU deposit restarted after a watchdog kill: DTFE says 'the deposit', PS-DTFE 'the partition deposit'
 _GPU_RETRY = re.compile(r"retrying the (?:partition )?deposit from scratch")
-# the run log's closing tally (contract G1, 2026-10-11), printed when N > 0
+# the run log's closing tally (contract G1), printed when N > 0
 _GPU_RETRIES = re.compile(r"^GPU deposit retries: (\d+) \(innocent (\d+), timeout (\d+), oom (\d+), other (\d+)\)", re.M)
 GPU_RETRY_CAUSES = ("innocent", "timeout", "oom", "other")
 # the run-log contract's three names: the log of record, the last failed attempt, a run going or killed
 LOG_SUFFIXES = (".runlog", ".runlog.failed", ".runlog.partial")
-# the run-directory files of a run going (contract C1, 2026-10-11): the binary's JSON progress sidecar, the run
+# the run-directory files of a run going (contract C1): the binary's JSON progress sidecar, the run
 # scripts' lock DIRECTORY (holding the driver's 'pid'), and a grid written as '<file>.part.<pid>' until renamed
 # at the end. None of them is an output or a run log.
 PROGRESS_SUFFIX = ".runlog.progress"
 LOCK_SUFFIX = ".runlog.lock"
-# the checkpoint DIRECTORY of a killed partitioned PS-DTFE run (contract K2, 2026-10-11): its merged accumulators
+# the checkpoint DIRECTORY of a killed partitioned PS-DTFE run (contract K2): its merged accumulators
 # and the manifest of finished partitions; the next run of the same job resumes from it ('--resume', which
 # run_ps_dtfe.sh passes by itself when it is there) and removes it on success
 CHECKPOINT_SUFFIX = ".runlog.checkpoint"
-# the binary's errors when '--resume' cannot continue the checkpoint (DTFE.cpp, 2026-10-11): other settings, nothing
+# the binary's errors when '--resume' cannot continue the checkpoint (DTFE.cpp): other settings, nothing
 # to resume (no manifest), not partitioned, a '--sample-points' run. Only the error phrasings: its info lines
 # ("'--resume' continues it", "... continues a killed run from it") are in the logs of runs that CAN be resumed.
 RESUME_REFUSED = re.compile(r"'--resume'(?::|\s+refused|\s+cannot|\s+continues a partitioned run)")
@@ -105,11 +105,11 @@ _DTFE_NAME = re.compile(r"^(PS-)?DTFE(-.*)?$")    # every binary set (runspec.dt
 
 def dtfe_pid_alive(pid) -> bool | None:
     """Whether process 'pid' is alive AND a DTFE / PS-DTFE binary (None: cannot say). A bare pid test is not
-    enough for a leftover sidecar (2026-10-11): a run killed outright with its driver (a reboot, a group SIGKILL)
+    enough for a leftover sidecar: a run killed outright with its driver (a reboot, a group SIGKILL)
     leaves its sidecar, and once the launcher's own polling has wrapped the pids (~a day) its pid belongs to some
-    other process, which read as the run still going. 'ps -o comm=' is argv[0] on macOS (a path, maybe with
+    other process, which would read as the run still going. 'ps -o comm=' is argv[0] on macOS (a path, maybe with
     spaces) and the executable's 15-character name on Linux: its basename is matched. Without ps the bare pid
-    test stands, as before."""
+    test stands."""
     alive = pid_alive(pid)
     if not alive:
         return alive
@@ -231,7 +231,7 @@ class RunRecord:
     build_time: _dt.datetime | None = None
     finished: _dt.datetime | None = None   # the log's modification time = when the run ended
     gpu_retried: bool = False       # the GPU deposit was restarted after a watchdog kill (the log says so)
-    gpu_retries: int = 0            # the log's 'GPU deposit retries: N (...)' line (G1, 2026-10-11): N, and per cause
+    gpu_retries: int = 0            # the log's 'GPU deposit retries: N (...)' line (G1): N, and per cause
     gpu_retries_by_cause: dict = field(default_factory=dict)
     wall_seconds: float | None = None
     peak_rss_gb: float | None = None
@@ -239,7 +239,7 @@ class RunRecord:
     ok: bool = False                # reached the binary's summary without an ERROR block
     outputs: list[Path] = field(default_factory=list)
     redshift: float | None = None
-    # a later run under this name that left no log of record (scan_runs, the run-log contract; 2026-10-08):
+    # a later run under this name that left no log of record (scan_runs, the run-log contract):
     # 'failed' ('<prefix>.runlog.failed'), 'running' or 'killed' ('<prefix>.runlog.partial' with or without a
     # live process naming it; 'partial' when ps cannot say), 'resumable' (failed or killed, with its checkpoint
     # directory '<prefix>.runlog.checkpoint' left: the same job continues from it, K2), '' when none is newer
@@ -249,9 +249,9 @@ class RunRecord:
     attempt_time: _dt.datetime | None = None
     attempt_cause: str = ""         # diagnose()'s titles for the attempt's log ("Out of memory", ...)
     attempt_resume_refused: bool = False   # the attempt failed because the binary refused to resume its checkpoint
-                                           # (RESUME_REFUSED): never 'resumable', the same job fails again (2026-10-11)
+                                           # (RESUME_REFUSED): never 'resumable', the same job fails again
     attempt_rewrote: int = 0        # outputs modified after this log was: the attempt rewrote them
-    progress: dict | None = None    # the binary's progress sidecar of a run going (C1, read_progress; 2026-10-11)
+    progress: dict | None = None    # the binary's progress sidecar of a run going (C1, read_progress)
 
     # -- the settings the RUNNING line shows
     def has(self, flag: str) -> bool:
@@ -320,7 +320,7 @@ class RunRecord:
         return Path(str(self.path.parent / self.prefix) + CHECKPOINT_SUFFIX)
 
     def log_files(self) -> list[Path]:
-        """Every log of this output set on disk (the run-log contract's three names, 2026-10-08): what Move to
+        """Every log of this output set on disk (the run-log contract's three names): what Move to
         Trash must take with the outputs, or the attempt's log alone shows up as a failed run afterwards."""
         base = str(self.path.parent / self.prefix)
         return [p for p in (Path(base + sfx) for sfx in LOG_SUFFIXES) if p.is_file()]
@@ -352,10 +352,10 @@ class RunRecord:
                 bits.append("caustics")
             if self.has("--ordered-merge"):
                 bits.append("ordered merge")
-            elif self.has("--completion-order-merge"):   # the old merge, asked for since 2026-10-14
+            elif self.has("--completion-order-merge"):   # opt-in (the default is the ordered merge)
                 bits.append("completion-order merge")
         elif self.has("--exact-average"):       # standard DTFE: the exact cell average tells the production grids
-            bits.append("exact average")        # of 2026-10-13 on from the Monte-Carlo ones
+            bits.append("exact average")        # from the Monte-Carlo ones
         if self.gpu:
             bits.append("GPU")
         if self.precision == "double":
@@ -370,7 +370,7 @@ class RunRecord:
 
     @property
     def legacy_points(self) -> bool:
-        """A phase-space plane asked for in the conventions before 2026-10-13 ('--pts-conventions legacy')."""
+        """A phase-space plane asked for in the legacy conventions ('--pts-conventions legacy')."""
         return re.search(r"(^|\s)--pts-conventions\s+legacy(\s|$)", self.command) is not None
 
     def settings(self) -> dict:
@@ -380,27 +380,27 @@ class RunRecord:
             d["grid"] = self.grid
         if self.estimator == "ps":
             d.update(deposit="exact" if self.has("--ps-exact-deposit") else "sampled",
-                     # always set: 'Load settings' must also turn the box OFF for a standard-deposit run (2026-10-08)
+                     # always set: 'Load settings' must also turn the box OFF for a standard-deposit run
                      linear_deposit=self.has("--ps-linear-deposit"),
                      vertex_mass=self.has("--ps-vertex-mass"),
                      volume_weighted=self.has("--ps-volume-weighted"),
                      caustics=self.has("--ps-caustics"), caustic_cusps=self.has("--ps-caustic-cusps"),
                      parallel_triangulation=self.has("--parallel-triangulation"),
-                     # K1 (2026-10-11); since 2026-10-14 the default is ON (the staged merge in index order), so only
-                     # a run made with '--completion-order-merge' turns it off -- an older run without either flag
-                     # merged in completion order then, but loading its settings starts today's default
+                     # K1; the default is ON (the staged merge in index order), so only
+                     # a run made with '--completion-order-merge' turns it off -- an older binary's run without either
+                     # flag merged in completion order, but loading its settings starts the current default
                      ordered_merge=not self.has("--completion-order-merge"),
                      output_prefix=self.prefix or "ps_output")
             m = re.search(r"(?:^|\s)--ps-alpha-shape\s+([0-9.]+)", self.command)
             if m:
                 d["alpha_shape"] = float(m.group(1))
-            if self.sliced:                 # the plane's conventions (2026-10-15): 'legacy' only when the log says it
+            if self.sliced:                 # the plane's conventions: 'legacy' only when the log says it
                 d["pts_conventions"] = "legacy" if self.legacy_points else "grid"
             if self.nsub:
                 d["nsub"] = self.nsub
             if self.fields:
                 d["fields"] = self.fields
-        elif self.estimator == "dtfe":      # its cell average, both ways (2026-10-13: the Grids tab's choice was kept)
+        elif self.estimator == "dtfe":      # its cell average, both ways (else the Grids tab's choice would stay)
             d["deposit"] = "exact" if self.has("--exact-average") else "sampled"
         return d
 
@@ -453,8 +453,8 @@ def run_inputs(rec: RunRecord) -> set[Path]:
     return found
 
 
-# the text-derived fields of every run log read, by path, with the (size, mtime_ns) they were read at
-# (2026-10-11): the launcher rescans every 30 s on its GUI thread, and a TNG50 z=0 log is large and on the
+# the text-derived fields of every run log read, by path, with the (size, mtime_ns) they were read at:
+# the launcher rescans every 30 s on its GUI thread, and a TNG50 z=0 log is large and on the
 # external disk; an unchanged log is not read again
 _LOG_FIELDS = ("binary", "build_rev", "build_time", "command", "gpu_retried", "gpu_retries", "gpu_retries_by_cause",
                "wall_seconds", "peak_rss_gb", "footprint_gb", "ok")
@@ -493,7 +493,7 @@ def _parse_text(rec: RunRecord, text: str):
     rec.peak_rss_gb = float(m.group(1)) if m else None
     feet = _FOOTPRINT.findall(text)
     rec.footprint_gb = int(feet[-1]) / 2**30 if feet else None     # GiB: the unit of the RSS line and of the run scripts
-    # a '.failed' or '.partial' log is an attempt that did not exit 0, whatever it printed (2026-10-08)
+    # a '.failed' or '.partial' log is an attempt that did not exit 0, whatever it printed
     rec.ok = bool(m or rec.wall_seconds is not None) and "~~~ ERROR ~~~" not in text and rec.path.name.endswith(".runlog")
 
 
@@ -582,8 +582,8 @@ def _tail(p: Path, nbytes: int = 65536) -> str:
 def _read_run(logs: dict[str, Path], sim: str = "", snap: int | None = None) -> RunRecord | None:
     """The record of one output set from its logs ({suffix: path}, the run-log contract): '<prefix>.runlog'
     when there is one, the attempt after it ('.runlog.failed' or '.runlog.partial', the newer one) noted on
-    it; without one the attempt is the record (2026-10-08: a stopped or failed re-run no longer truncates
-    the log of the old grids, so the Runs tab keeps showing them as they are). None: the logs went meanwhile."""
+    it; without one the attempt is the record (a stopped or failed re-run does not truncate the log of the
+    grids on disk, so the Runs tab keeps showing them as they are). None: the logs went meanwhile."""
     record = logs.get(".runlog")
     t0 = _mtime(record) if record is not None else None
     attempts = [(t, sfx, p) for sfx, p in logs.items() if sfx != ".runlog"
@@ -646,9 +646,9 @@ def scan_runs(root, extra_dirs=()) -> list[RunRecord]:
         elif live is not None:
             r.attempt = "running" if str(r.path.parent / r.prefix) in live else "killed"
     # K2: no process continues it, but the next run can -- when it is a Grids or Pipeline job (run_ps_dtfe.sh passes
-    # '--resume' by itself, and run_dtfe.sh since 2026-10-13; they write under the data root's snapdir_*, so the record
+    # '--resume' by itself, and so does run_dtfe.sh; they write under the data root's snapdir_*, so the record
     # has a sim; a Custom run never resumes and starts over), and not when the attempt failed BECAUSE the resume was
-    # refused (other settings, no manifest): the same job then fails the same way every time (2026-10-11), and only
+    # refused (other settings, no manifest): the same job then fails the same way every time, and only
     # 'Start over' runs it
     for r in out:
         if (r.attempt in ("failed", "killed") and r.checkpoint_dir().is_dir() and r.sim and r.estimator in ("ps", "dtfe")
@@ -714,7 +714,7 @@ _NUMBER = r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?"
 
 def _box_axes_differ(rec: RunRecord, origin: bool = True) -> bool:
     """The run's '--box' (min, max per axis) has axes of different lengths, or (origin) different minima: the
-    boxes on which the [i%2] axis indexing of the fractional region and padding mattered (2026-10-11). No
+    boxes on which the [i%2] axis indexing of the fractional region and padding mattered. No
     '--box': the snapshot's own box, cubic from the origin for every input the pipeline writes."""
     m = re.search(rf"(?:^|\s)--box((?:\s+{_NUMBER}(?=\s|$))+)", rec.command)
     if not m:
@@ -769,7 +769,7 @@ KNOWN_FIXES: tuple[Fix, ...] = (
         "negative along exactly one axis was shifted the wrong way (a band-limited field came back 31% "
         "off; fixed 2026-10-02): regenerate",
         lambda r: r.has("--interlace")),
-    # the cpp-bug fixes of 2026-10-11 (src/main.cpp, user_options.cc, grid_deposit_engine.h); 23:00 local is
+    # the fixes in src/main.cpp, user_options.cc and grid_deposit_engine.h; 23:00 local is
     # after their build, so a grid built before it predates them
     Fix("interlace-pass2", "2026-10-11T23:00", "error",
         "an interlaced grid without a region: the second pass gridded the same cells, so the output was the "
@@ -792,9 +792,9 @@ KNOWN_FIXES: tuple[Fix, ...] = (
         "a fractional padding on a box whose axes differ in length: the y and z padding took the x and y "
         "lengths, so a face could get less padding than asked (fixed 2026-10-11): regenerate",
         lambda r: r.has("--padding") and _box_axes_differ(r, origin=False)),
-    # the parity batch of 2026-10-13 (par-pspoint): a phase-space image plane takes the grids' vertex masses and
-    # volume weighting ('--pts-conventions grid', the default). 20:00 local lies between the last build of the old
-    # sources (15:21) and any build of the merged ones; '--pts-conventions legacy' keeps the old estimators on purpose
+    # the plane's grid conventions: a phase-space image plane takes the grids' vertex masses and
+    # volume weighting ('--pts-conventions grid', the default). 20:00 local lies between the last build without
+    # them (15:21) and any build with them; '--pts-conventions legacy' keeps the earlier estimators on purpose
     Fix("pts-grid-conventions", "2026-10-13T20:00", "warning",
         "an image plane made before the plane followed the grids' vertex masses and volume weighting (2026-10-13): "
         "its density misses part of the contrast the grids gained from the evolved initial positions (about 0.82 of "
@@ -806,7 +806,7 @@ KNOWN_FIXES: tuple[Fix, ...] = (
 )
 
 
-# the launcher's start-over control, as the notes name it (no '--': launcher text; 2026-10-11)
+# the launcher's start-over control, as the notes name it (no '--': launcher text)
 START_OVER_HINT = "'Start over' on the Grids or Pipeline tab (PS_RESUME=0; standard DTFE: DTFE_RESUME=0)"
 
 
@@ -821,7 +821,7 @@ def attempt_note(rec: RunRecord) -> tuple[str, str] | None:
     prog = progress_text(rec.progress) if rec.attempt == "running" else ""
     if prog:
         prog = f" ({prog})"
-    if rec.attempt == "failed" and rec.attempt_resume_refused:     # 2026-10-11: rerunning as is fails again
+    if rec.attempt == "failed" and rec.attempt_resume_refused:     # rerunning as is fails again
         return ("warning", f"the last attempt ({name}, {when}) failed because its checkpoint could not be resumed (written "
                            f"with other settings, or incomplete): {START_OVER_HINT} runs the job from the beginning"
                 + ("" if rec.path == rec.attempt_log else
@@ -865,7 +865,7 @@ def stale_reasons(rec: RunRecord) -> list[tuple[str, str]]:
             how = "" if rec.build_time else " (judged by the run date: this log has no build stamp)"
             out.append((fx.level, fx.message + how))
     # file-based: '.streams' without '.hidden_streams' (or its old name '.unresolved') predates the
-    # 2026-09-28 stream-count fix
+    # stream-count fix
     if rec.estimator == "ps" and _any_output(rec, "streams", "a_streams") \
             and not _any_output(rec, "hidden_streams", "a_hidden_streams", "unresolved", "a_unresolved"):
         out.append(("warning", "the stream counts still include centroid-fallback tetrahedra (+1 each; "
@@ -884,8 +884,7 @@ def time_estimate(records, *, sim: str, grid: int, estimator: str, gpu: bool,
     simulation, grid, estimator, GPU use, slice/no slice, precision and dimension; None without any
     (a double-precision run takes about twice as long: it must not predict a single one).
     A run under a second is one: the binary's SUMMARY prints its wall time in whole seconds ('0s', 0.0 here), and
-    a truthiness test dropped such runs as if they had no time (2026-10-12: with the Lagrangian padding default
-    the launcher test's 32^3 run went from 11.6 s to 0.5 s and lost its estimate)."""
+    a truthiness test would drop such runs as if they had no time (the launcher test's 32^3 run takes 0.5 s)."""
     times = [r.wall_seconds for r in records
              if r.ok and r.wall_seconds is not None and r.sim == sim and r.grid == grid
              and r.estimator == estimator and r.gpu == gpu and r.sliced == sliced
@@ -939,7 +938,7 @@ def diagnose(log: str, exit_codes=()) -> list[Diagnosis]:
                              "macOS refused access to a file. Apps started from Finder need Full Disk "
                              "Access for iCloud Drive and external disks (System Settings -> Privacy & "
                              "Security -> Full Disk Access).", ""))
-    if RESUME_REFUSED.search(tail):                 # 2026-10-11: the same job would fail the same way
+    if RESUME_REFUSED.search(tail):                 # the same job would fail the same way
         out.append(Diagnosis("Resume refused",
                              "A killed run's checkpoint is there, but it cannot be continued (written with other "
                              "settings, or incomplete). Tick 'Start over' on the Grids or Pipeline tab "

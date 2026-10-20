@@ -3,7 +3,6 @@
 Region [40, 71)^3 Mpc (12 Mpc inside the patch image: no particle from outside the patch gets there),
 slice z = 55.5 Mpc at 2048^2, grid 256^3 over the region."""
 import json
-import re
 import sys
 from pathlib import Path
 

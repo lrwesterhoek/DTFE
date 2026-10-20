@@ -25,8 +25,8 @@ MASS_LO, MASS_HI = 0.85, 1.15
 # Part 2, a --box REGION cut from the cloud: a coarse multi-stream clump (crossed waves, tets spanning
 # many cells), deposited on [40,60]^3 at 0.25 Mpc (holds the whole cloud: nothing crosses its faces)
 # and on the region [46,54]^3 at the same cells. Every region cell must equal the same cell of the
-# large grid -- face cells included. Before 2026-09-30 a tet cut by the region face gave its WHOLE
-# mass to its inside part: face cells ~3x too heavy, the region's interior +36%.
+# large grid -- face cells included. A tet cut by the region face must not give its WHOLE
+# mass to its inside part: face cells would be ~3x too heavy, the region's interior +36%.
 REGION_N = 24
 FULL_BOX, FULL_GRID = (40.0, 60.0), 80
 REGION_BOX, REGION_GRID = (46.0, 54.0), 32
@@ -35,10 +35,10 @@ CPU_TOL, GPU_TOL = 1e-5, 1e-4   # max |region - full| / peak (CPU: equal but for
 
 # Part 3, --partition: the same clump split 2x2x2 must equal the single triangulation (the partial
 # sums differ only in summation order). The convex hull of a finite cloud is a GLOBAL object -- the
-# flat slivers on a nearly planar face join particles a whole face apart -- so each partition used
-# to build different hull tetrahedra: 0.04% of cells off by up to 1% of peak, mass 0.99997. The
-# Lagrangian domain is now the cloud's alpha shape (--ps-alpha-shape, 3 mean spacings), which is
-# local; '--ps-alpha-shape 0' restores the hull, and must still show the old difference.
+# flat slivers on a nearly planar face join particles a whole face apart -- so each partition would
+# build different hull tetrahedra: 0.04% of cells off by up to 1% of peak, mass 0.99997. The
+# Lagrangian domain is the cloud's alpha shape (--ps-alpha-shape, 3 mean spacings), which is
+# local; '--ps-alpha-shape 0' restores the hull, and must still show that difference.
 SPLIT_TOL = 1e-5
 
 
@@ -130,7 +130,7 @@ def region_faces(binary):
     helptext = h.stdout + h.stderr
     try:
         mode = open(os.path.join(ROOT, "o_ps", ".build_mode")).read()
-        gpu = any(m in mode for m in ("METAL=1", "CUDA=1", "HIP=1", "CUDAEMU=1"))   # the emulated port too (2026-10-11)
+        gpu = any(m in mode for m in ("METAL=1", "CUDA=1", "HIP=1", "CUDAEMU=1"))   # the emulated port too
     except OSError:
         gpu = False
     variants = [("sampled", []), ("linear", ["--ps-linear-deposit"])]

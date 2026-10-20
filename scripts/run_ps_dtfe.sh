@@ -9,10 +9,10 @@
 #          the binary was built with one (the Makefile's o_ps/.gpu_mode_metal|cuda|hip stamp; o_ps_d for
 #          DTFE_PRECISION=double), else the CPU; PS_METAL=0 runs the CPU deposit on a GPU build.
 #     -e   exact conservative deposit (same as PS_EXACT=1; --ps-exact-deposit, GPU-capable, slower)
-#   Production defaults (2026-10-13): GRID_SIZE 512 (config.sh), the GPU when built, vertex masses, volume-weighted
+#   Production defaults: GRID_SIZE 512 (config.sh), the GPU when built, vertex masses, volume-weighted
 #   velocity moments, the caustic classes, FIELDS = the nine of the thesis grids (density, velocity, its gradient /
 #   divergence / shear / vorticity, the dispersion, the T-web and the V-web), LAMBDA_TH 0.3 -- the settings of the
-#   2026-10-12 rerun of all 27 snapshots (scripts/thesis_runs.sh ps27), which adds the 4096^2 image plane.
+#   production run of all 27 snapshots (scripts/thesis_runs.sh ps27), which adds the 4096^2 image plane.
 #   A rerun into a prefix that holds an earlier run's files: once it exits 0, the files it did not write (an image
 #   plane, caustics or a field the new run lacks) are MOVED into <prefix>.superseded/<date_time>/ with the old
 #   run log (config.sh supersede_extras; never deleted), so the folder holds one run's set.
@@ -67,23 +67,22 @@ PTS_VEL_GRAD="${PTS_VEL_GRAD:-0}"   # 1 = with SAMPLE_POINTS, also write '.pts_v
                            # divergence / shear / vorticity maps from it, so this is what makes
                            # the velocity-derivative fields available to the hi-res figures.
 PTS_CONVENTIONS="${PTS_CONVENTIONS:-grid}"  # with SAMPLE_POINTS (2026-10-15): the points' conventions, the binary's
-                           # --pts-conventions. 'grid' (default; the binary's own since 2026-10-13) = the grids' vertex
+                           # --pts-conventions. 'grid' (default; the binary's own) = the grids' vertex
                            # masses (PS_VERTEX_MASS) and volume weighting (PS_VOLUME_WEIGHTED) at the points too;
-                           # 'legacy' = the estimators before that date (rho_bar*V_lag masses, density-weighted stream
-                           # means), which reproduces a plane made before it -- about 0.82 of the grid's density
-                           # contrast at z = 20 (the launcher's Runs tab warns about such planes). Only 'legacy' is
-                           # passed: a 'grid' run's command line is the one it was before the knob existed.
+                           # 'legacy' = the reference implementation's estimators (rho_bar*V_lag masses, density-
+                           # weighted stream means), which reproduce a plane made with them -- about 0.82 of the grid's
+                           # density contrast at z = 20 (the launcher's Runs tab warns about such planes). Only
+                           # 'legacy' is passed, so a 'grid' run's command line carries no --pts-conventions.
 PS_METAL="${PS_METAL:-auto}"  # 1 = the deposit on the GPU (--ps-gpu), 0 = the CPU; 'auto' (default, 2026-10-13; it
-                           # was 0) = 1 when the binary is a GPU build (config.sh gpu_build_default), resolved
-                           # below once DTFE_PRECISION has chosen the binary
+                           # follows the build) = 1 when the binary is a GPU build (config.sh gpu_build_default),
+                           # resolved below once DTFE_PRECISION has chosen the binary
 ORDERED_MERGE="${ORDERED_MERGE:-1}"  # 1 (default since 2026-10-14; it was 0) = --ordered-merge: the partitions' grids are
                            # added in partition index order, so two identical runs write bit-identical grids (and a
-                           # killed run resumes to exactly the grids of an uninterrupted one). Since 2026-10-14 the
-                           # binary's own default, and STAGED: a partition finished before its turn parks its sub-grids
-                           # in memory (while the machine has it free) and its thread goes on, so it no longer costs
-                           # the time it did (35% on a TNG region's GPU run, 2026-10-11). Passed explicitly, so the run
-                           # log says it. 0 = --completion-order-merge, the old default: added as they finish, the
-                           # grids then differ run to run in the last bits.
+                           # killed run resumes to exactly the grids of an uninterrupted one). The binary's own
+                           # default, and STAGED: a partition finished before its turn parks its sub-grids in memory
+                           # (while the machine has it free) and its thread goes on, so no thread idles behind a slow
+                           # partition. Passed explicitly, so the run log says it. 0 = --completion-order-merge:
+                           # added as they finish, the grids then differ run to run in the last bits.
 FIXED_POINT_MERGE="${FIXED_POINT_MERGE:-0}"  # 1 = --fixed-point-merge (2026-10-15, OPT-IN, to compare against the default): each
                            # partition is added AS IT FINISHES into exact integer full grids (9 B per summed component and
                            # cell during the loop instead of 4), so the grids are the same bytes at any concurrency and
@@ -95,7 +94,7 @@ PS_RESUME="${PS_RESUME:-1}"  # 1 (default) = resume a killed partitioned run: wh
                            # exists (<prefix>.runlog.checkpoint/checkpoint beside the outputs, or under SCRATCH_DIR; config.sh
                            # ps_checkpoint_dir), --resume is passed and only the partitions it lacks are computed.
                            # The binary refuses, naming the differing settings, when the settings changed; then
-                           # PS_RESUME=0 starts over (the new run replaces the checkpoint). (2026-10-11)
+                           # PS_RESUME=0 starts over (the new run replaces the checkpoint).
 AUTO_TUNE_REPORT="${AUTO_TUNE_REPORT:-0}"  # 1 = only ASK the binary's auto-tuner what this run would need
                            # (--auto-tune-report): per snapshot one line
                            #   AUTO-TUNE-REPORT snap=NNN partition=.. mc=.. predicted_gb=.. budget_gb=.. over_budget=0|1 ...
@@ -121,7 +120,7 @@ PS_VOLUME_WEIGHTED="${PS_VOLUME_WEIGHTED:-1}"  # 1 (default since 2026-10-13; it
                            # deposits. Not with PS_LINEAR_DEPOSIT=1 (the binary refuses both): left unset, it is 0
                            # then (said below).
 PS_CAUSTICS="${PS_CAUSTICS:-1}"      # 1 (default since 2026-10-13, as the 2026-10-12 production rerun of all 27
-                           # snapshots: +33% time, +1.2 GB on TNG, every other output unchanged; it was 0) =
+                           # snapshots: +33% time, +1.2 GB on TNG, every other output unchanged) =
                            # flag fold-caustic cells (--ps-caustics): writes '.caustic'
                            # (0/1 fold flag) and '.causticClass' -- the caustic stratification bitmask
                            # (fold parity, how many principal axes have collapsed, and the umbilic-
@@ -160,12 +159,12 @@ PS_PARALLEL_TRI="${PS_PARALLEL_TRI:-0}"  # 1 = build each tessellation's Delauna
                            # Faster on small sets; OFF by default because two identical runs then
                            # differ at float rounding (stream counts do not). See the binary's help.
 PS_LAG_PADDING="${PS_LAG_PADDING:-}"   # k = --ps-lag-padding k: pad each Lagrangian partition by k mean particle
-                           # spacings. Empty (default) = the binary's default, k = 8 since 2026-10-12: on a 4.1M-
-                           # particle set at 2^3 it ran ~6x faster in 3.5x less memory with identical stream counts
+                           # spacings. Empty (default) = the binary's default, k = 8: on a 4.1M-particle set at 2^3
+                           # it runs ~6x faster than the Eulerian rule in 3.5x less memory with identical stream counts
                            # (density/velocity grids move in ~0.5% of cells, as two runs at PADDING 40 and 50 do).
-                           # PS_LAG_PADDING=0 = the old Eulerian rule (the PADDING fraction floored at 0.3 of a
-                           # partition: 7-9x the owned particles per TNG partition) and reuses the partition
-                           # tessellation caches written before 2026-10-12; any k > 0 rebuilds them once.
+                           # PS_LAG_PADDING=0 = the Eulerian rule (the PADDING fraction floored at 0.3 of a
+                           # partition: 7-9x the owned particles per TNG partition), which also reuses partition
+                           # tessellation caches written under that rule; any k > 0 rebuilds them once.
 OUTPUT_PREFIX="${OUTPUT_PREFIX:-ps_output}"   # -> <snapdir>/<prefix>.*  Override to keep incompatible runs side by
                            # side instead of clobbering, e.g. OUTPUT_PREFIX=ps_mw with PS_VOLUME_WEIGHTED=0 for the
                            # mass-weighted (physical) dispersion next to the default volume-weighted shear/divergence
@@ -173,10 +172,7 @@ OUTPUT_PREFIX="${OUTPUT_PREFIX:-ps_output}"   # -> <snapdir>/<prefix>.*  Overrid
 
 usage() { echo "Usage: $0 [-d DATA_DIR] [-s SIMULATION] [-g GRID_SIZE] [-n AVG_SUBSAMPLES] [-m] [-e] [snapshot ...]"; }
 
-case "${1:-}" in                                 # -h / --help print the header and run nothing; --version the revision
-    -h|--help) sed -n '2,/^$/p' "${BASH_SOURCE[0]}" | sed -e 's/^# \{0,1\}//'; usage; exit 0 ;;
-    --version) git -C "${REPO_ROOT}" describe --always --dirty 2>/dev/null || echo unknown; exit 0 ;;
-esac
+driver_help_version "${BASH_SOURCE[0]}" "${1:-}"   # -h / --help print the header and run nothing; --version the revision
 
 DRY_RUN="${DRY_RUN:-0}"          # 1 = print the commands and paths, run nothing (survey rank 19, 2026-10-05)
 while getopts "d:s:g:n:meh" opt; do
@@ -192,29 +188,17 @@ while getopts "d:s:g:n:meh" opt; do
     esac
 done
 shift $((OPTIND - 1))
+require_simulation
 
-# Any remaining positional arguments override the default snapshot list.
-if [ "$#" -gt 0 ]; then
-    SNAPSHOTS=("$@")
-fi
-# Snapshot numbers as decimal: bash's printf reads a leading zero as OCTAL, so '010' became 008 and '099'
-# an error (then 000) -- the folders are named snapdir_0NN, so typing them that way is natural (2026-10-05).
-for _k in "${!SNAPSHOTS[@]}"; do
-    _s="${SNAPSHOTS[$_k]}"
-    if ! [[ "${_s}" =~ ^[0-9]+$ ]]; then
-        echo "Error: snapshot '${_s}' is not a number." >&2
-        exit 2
-    fi
-    SNAPSHOTS[$_k]=$((10#${_s}))
-done
+snapshot_args "$@"              # positional arguments override the default snapshot list (config.sh)
 case "${PTS_CONVENTIONS}" in
     grid|legacy) ;;
     *) echo "Error: PTS_CONVENTIONS must be 'grid' or 'legacy' (got '${PTS_CONVENTIONS}')." >&2; exit 2 ;;
 esac
 
 [ -z "${DATA_DIR}" ] && DATA_DIR="$(sim_dir "${SIMULATION}")"
-# preflight (2026-10-11): with the data disk unmounted every snapshot used to print 'Input file not found'
-# under a path that was never there, and only the last line said 'check DATA_ROOT'
+# preflight: an unmounted data disk is said once, up front, rather than as an 'Input file not found' for every
+# snapshot under a path that was never there
 data_root_problem "${DATA_DIR}" || exit 2
 
 # Lagrangian positions, matched to present-day Coordinates by ParticleID. Must be in the
@@ -251,8 +235,8 @@ with h5py.File(sys.argv[1], "r") as f:
 PYEOF
 }
 
-# Phase-space fields; '.streams' and '.unresolved' are always written, each field also gets a '_a'
-# (averaged) form. Single-stream cells are streams==1 AND unresolved==0 (see demo/COMMANDS.md).
+# Phase-space fields; '.streams' and '.hidden_streams' are always written, each field also gets a '_a'
+# (averaged) form. Single-stream cells are streams==1 AND bit 1 of hidden_streams clear (see demo/COMMANDS.md).
 # Both forms are mass-conserving (each tetrahedron deposits its full mass onto the grid). The '_a'
 # fields resolve each grid cell with an nSub^3 sub-sample grid (AVG_SUBSAMPLES, default 3), so they
 # are smoother / better resolved at caustics -- prefer them for science plots. The plain fields use a
@@ -262,13 +246,13 @@ PYEOF
 # gradient (density-weighted across streams), so it inherits the same single-stream caveat.
 # tweb = T-web from the TIDAL tensor (FFT Poisson solve of the RAW density grid, in C++); vweb =
 # V-web from the multi-stream velocity shear. LAMBDA_TH is the eigenvalue threshold for BOTH webs
-# (dimensionless; literature ~0.2-0.4 -- NOTE: runs before 2026-07-03 used the old default 0.0).
+# (dimensionless; literature ~0.2-0.4; the binary's own default is 0.0).
 # The binary applies NO smoothing anywhere; smoothing is a plot-time choice in plot_PS_DTFE.py.
 LAMBDA_TH="${LAMBDA_TH:-0.3}"
 # Same velocity-derivative set as run_dtfe.sh (gradient_a divergence_a shear_a vorticity_a, all
 # derived from the density-weighted multi-stream velocity gradient -- single-stream caveat above)
-# plus the PS-only dispersion and the T-web / V-web classes: the nine fields of the thesis grids (the default
-# since 2026-10-13; the web classes were opt-in, so a bare run lacked what the void and web figures read).
+# plus the PS-only dispersion and the T-web / V-web classes: the nine fields of the thesis grids (the default,
+# so a bare run has what the void and web figures read).
 # Env-overridable, e.g. FIELDS="density_a velocity_a" for a lighter batch.
 FIELDS="${FIELDS:-density_a velocity_a gradient_a divergence_a shear_a vorticity_a dispersion_a tweb_a vweb_a}"
 
@@ -278,90 +262,18 @@ cd "$REPO_ROOT" || exit 1
 # every position, density and field in double from the input read onward, float64 outputs, about
 # twice the memory. Default single (./PS-DTFE). Nothing falls back silently: a missing binary stops.
 DTFE_PRECISION="${DTFE_PRECISION:-single}"
-case "${DTFE_PRECISION}" in
-    single) PS_BIN="./PS-DTFE" ;;
-    double) PS_BIN="./PS-DTFE-double" ;;
-    *) echo "Error: DTFE_PRECISION must be 'single' or 'double' (got '${DTFE_PRECISION}')." >&2; exit 1 ;;
-esac
-if [ ! -x "${PS_BIN}" ]; then
-    if [ "${DTFE_PRECISION}" = "double" ]; then
-        echo "Error: ${PS_BIN} not found. Build the double-precision pair with 'make DTFE PS-DTFE DOUBLE=1' (add METAL=1 on Apple Silicon), or let the launcher's Setup do it." >&2
-    else
-        echo "Error: ${PS_BIN} not found or not executable. Build it with 'make PS-DTFE'." >&2
-    fi
-    exit 1
-fi
-# PS_METAL=auto (the default): the GPU when this binary was built with one (2026-10-13; config.sh)
-gpu_auto=""
-if [ "${PS_METAL}" = "auto" ]; then
-    PS_METAL="$(gpu_build_default "${REPO_ROOT}" "${PS_BIN}")"
-    gpu_auto=" (PS_METAL unset: ${PS_BIN#./} is $([ "${PS_METAL}" = "1" ] && echo "a GPU" || echo "a CPU-only") build; PS_METAL=0 or 1 chooses)"
-fi
+driver_binary PS_BIN PS-DTFE "${DTFE_PRECISION}"      # ./PS-DTFE or ./PS-DTFE-double (config.sh)
+gpu_auto_resolve PS_METAL "${PS_BIN}"                 # PS_METAL=auto: the GPU when this binary was built with one
 
 n_ok=0; n_skipped=0; n_failed=0; n_planned=0   # summarised at the end; see the exit-status note there
 
-# Peak-RSS wrapper, resolved once and OPTIONAL: macOS spells the flag -l, GNU -v, and a bare Ubuntu
-# container has no /usr/bin/time at all. Without one the run is identical, just with no RSS line.
-TIME_WRAP=()
-if [ -x /usr/bin/time ]; then
-    if /usr/bin/time -l true >/dev/null 2>&1; then
-        TIME_WRAP=(/usr/bin/time -l)          # BSD/macOS: "<bytes>  maximum resident set size"
-    elif /usr/bin/time -v true >/dev/null 2>&1; then
-        TIME_WRAP=(/usr/bin/time -v)          # GNU: "Maximum resident set size (kbytes): <n>"
-    fi
-fi
+time_wrap_resolve                                     # TIME_WRAP: the optional peak-RSS wrapper (config.sh)
 [ -n "$THREADS" ] && export OMP_NUM_THREADS="$THREADS"
-
-# Keep the Mac awake for the whole batch; caffeinate follows this PID and lifts on exit.
-if [ "${DRY_RUN}" != "1" ] && command -v caffeinate >/dev/null 2>&1; then
-    caffeinate -i -m -w $$ &
-fi
-
-# The run-log contract (2026-10-08), the same in run_dtfe.sh and the launcher's own runs: while the
-# binary runs, its log is '<prefix>.runlog.partial'. Exit 0 renames it onto '<prefix>.runlog' (the log
-# of the grids now on disk) and removes a stale '<prefix>.runlog.failed'; a failure or a stop renames it
-# to '<prefix>.runlog.failed' and leaves '<prefix>.runlog' alone. The log used to be tee'd straight into
-# '<prefix>.runlog', so a re-run that failed early, or was stopped or killed, replaced the log of the
-# grids still on disk: the Runs browser then showed those grids as a failed run with the new settings,
-# and their own settings, build stamp, wall time and peak memory were gone. A '.runlog.partial' left
-# behind is a run killed outright (SIGKILL), or one still going.
-live_log=""; live_rc=""            # the .partial being written, and its binary's exit status once known
-live_lock=""                       # this driver's '<prefix>.runlog.lock' (config.sh run_lock_take), while held
-sup_marker=""; sup_oldlog=""       # the run's start marker and a copy of the old run log (config.sh supersede_extras)
-sup_clean() { rm -f ${sup_marker:+"${sup_marker}"} ${sup_oldlog:+"${sup_oldlog}"}; sup_marker=""; sup_oldlog=""; }
-finish_runlog() {                  # <the .partial> <the binary's exit status>
-    local part="$1" final="${1%.partial}"
-    [ -f "${part}" ] || return 0
-    # Strip ANSI colour codes so the kept log stays grep-able. Written through a temp file rather
-    # than 'sed -i': BSD sed needs a suffix ARGUMENT after -i and GNU sed does not, so the portable
-    # spelling of in-place editing is not to use it.
-    if sed -E $'s/\033\\[[0-9;]*m//g' "${part}" > "${part}.tmp" 2>/dev/null; then
-        mv "${part}.tmp" "${part}"
-    else
-        rm -f "${part}.tmp"
-    fi
-    if [ "$2" = "0" ]; then
-        mv -f "${part}" "${final}" && rm -f "${final}.failed"
-    else
-        mv -f "${part}" "${final}.failed"
-    fi
-}
-# A stop (the launcher's Stop sends SIGTERM to the binary, then to this script; ^C sends SIGINT): bash
-# runs the trap once the binary's pipeline has ended, so the attempt's log becomes '.runlog.failed'.
-# The signal is then re-raised, so a caller (run_ps_pipeline.sh) sees a stop, not a plain failure
-# it would continue past.
-on_stop() {                        # <signal name>
-    trap - "$1"
-    if [ -n "${live_log}" ] && [ -f "${live_log}" ]; then
-        finish_runlog "${live_log}" "${live_rc:-1}"
-        [ "${live_rc:-1}" = "0" ] || echo "  Stopped: snapshot ${n_str} did not finish; its log is ${live_log%.partial}.failed"
-    fi
-    run_lock_release "${live_lock}"
-    sup_clean
-    kill -s "$1" $$
-}
-trap 'on_stop INT' INT; trap 'on_stop TERM' TERM; trap 'on_stop HUP' HUP
-trap 'run_lock_release "${live_lock}"; sup_clean' EXIT   # any other way out (an error, set -u) frees the lock too
+keep_awake "${DRY_RUN}"
+# the run-log contract (config.sh), the same in run_dtfe.sh and the launcher's own runs: '<prefix>.runlog.partial'
+# while the binary runs, then '<prefix>.runlog' on exit 0 or '<prefix>.runlog.failed' on a failure or a stop; a
+# stop also releases the lock and re-raises the signal, so a caller (run_ps_pipeline.sh) sees a stop
+runlog_contract_start
 
 echo "Starting PS-DTFE processing..."
 echo "Data directory: ${DATA_DIR}"
@@ -370,17 +282,7 @@ echo "Deposit: $([ "${PS_METAL}" = "1" ] && echo "GPU (--ps-gpu)" || echo "CPU")
 echo ""
 
 for i in "${SNAPSHOTS[@]}"; do
-    n_str=$(printf "%03d" "$i")
-
-    input_dir="${DATA_DIR}/${INPUT_SUBDIR}_${n_str}"
-    input_file="${input_dir}/combined_${n_str}.hdf5"
-    output_root="${input_dir}/${OUTPUT_PREFIX}"
-
-    echo "Processing snapshot ${n_str}..."
-
-    if [ ! -f "${input_file}" ]; then
-        echo "  Warning: Input file not found: ${input_file}"
-        echo "  Skipping snapshot ${n_str}"
+    if ! snapshot_start "$i"; then          # n_str, input_dir, input_file, output_root (config.sh)
         n_skipped=$((n_skipped+1))
         continue
     fi
@@ -472,23 +374,12 @@ for i in "${SNAPSHOTS[@]}"; do
     [ -n "${PARTITION}" ] && part_args+=(--partition ${PARTITION})
     [ -n "${MAX_CONCURRENT}" ] && part_args+=(--max-concurrent "${MAX_CONCURRENT}")
     [ -n "${SCRATCH_DIR}" ] && part_args+=(--scratch-dir "${SCRATCH_DIR}")
-    # 2026-10-14: the merge order said either way (the run log names it; results.py reads the flag back)
-    # (2026-10-15: FIXED_POINT_MERGE=1 passes --fixed-point-merge instead, the opt-in order-free merge)
+    # the merge order said either way (the run log names it; results.py reads the flag back)
+    # (FIXED_POINT_MERGE=1 passes --fixed-point-merge instead, the opt-in order-free merge)
     if [ "${FIXED_POINT_MERGE}" = "1" ]; then part_args+=(--fixed-point-merge)
     elif [ "${ORDERED_MERGE}" = "0" ]; then part_args+=(--completion-order-merge); else part_args+=(--ordered-merge); fi
-    # a killed partitioned run left its checkpoint (the binary removes it once the outputs are in place): resume it.
-    # The FILE, not the folder (2026-10-11): a folder with no 'checkpoint' in it (a kill during the first write) holds
-    # nothing to resume, the binary refuses '--resume' there, and every rerun of the snapshot failed the same way
-    resume_args=()
-    ckpt_dir="$(ps_checkpoint_dir "${output_root}" "${SCRATCH_DIR}")"
-    if [ "${AUTO_TUNE_REPORT}" != "1" ] && [ -f "${ckpt_dir}/checkpoint" ]; then
-        if [ "${PS_RESUME}" = "0" ]; then
-            echo "  Note: a killed run's checkpoint is in ${ckpt_dir}; PS_RESUME=0, so this run starts over and replaces it."
-        else
-            echo "  Resuming: a killed run's checkpoint is in ${ckpt_dir}; passing --resume, only the missing partitions are computed (PS_RESUME=0 starts over)."
-            resume_args=(--resume)
-        fi
-    fi
+    # a killed partitioned run left its checkpoint: resume it (config.sh resume_args_for)
+    resume_args_for "${output_root}" PS_RESUME "${PS_RESUME}"
 
     cmd=("${PS_BIN}" "${input_file}" "${output_root}"
         --grid ${GRID_SIZE}
@@ -512,27 +403,15 @@ for i in "${SNAPSHOTS[@]}"; do
         ${resume_args[@]+"${resume_args[@]}"}
         "${lag_args[@]}")
     if [ "${DRY_RUN}" = "1" ]; then                 # DRY_RUN=1: the expanded command and the paths, nothing run
-        echo "  DRY RUN -- would run:"
-        printf '    %q' "${cmd[@]}"; echo
-        echo "  input:   ${input_file} (exists)"
-        echo "  outputs: ${output_root}.* and the run log ${run_log}"
+        dry_run_print "${input_file}" "${output_root}" "${run_log}" "${cmd[@]}"
         n_planned=$((n_planned + 1))
         echo ""
         continue
     fi
-    # Real runs only (2026-10-11): room for the grids, then the snapshot's single-instance lock (config.sh).
+    # Real runs only: room for the grids, then the snapshot's single-instance lock (config.sh).
     # A report writes nothing, so it takes neither: the launcher's memory check runs one beside a live run.
-    if [ "${AUTO_TUNE_REPORT}" != "1" ]; then
-        bpv=4; [ "${DTFE_PRECISION}" = "double" ] && bpv=8
-        if ! output_space_problem "${input_dir}" "$(expected_output_bytes "${GRID_SIZE%% *}" "${bpv}" ${FIELDS})"; then
-            echo "  Error processing snapshot ${n_str}: no room for its grids (nothing was run)"
-            n_failed=$((n_failed+1)); echo ""; continue
-        fi
-        if ! run_lock_take "${run_log}.lock"; then
-            echo "  Error processing snapshot ${n_str}: refused, another run holds it (nothing was run)"
-            n_failed=$((n_failed+1)); echo ""; continue
-        fi
-        live_lock="${run_log}.lock"
+    if [ "${AUTO_TUNE_REPORT}" != "1" ] && ! snapshot_preflight "${input_dir}" "${run_log}" "${DTFE_PRECISION}"; then
+        n_failed=$((n_failed+1)); echo ""; continue
     fi
     # the binary's output goes to '<run_log>.partial' until it exits (the run-log contract above);
     # a report's temp file takes it directly
@@ -542,59 +421,27 @@ for i in "${SNAPSHOTS[@]}"; do
     else
         tee_log="${run_log}.partial"; live_log="${tee_log}"; live_rc=""
         # what an earlier run with this prefix left, recorded before this one starts: what it does not rewrite is
-        # moved aside once it has exited 0 (config.sh supersede_extras, 2026-10-13)
-        sup_clean
-        sup_marker="$(mktemp "${TMPDIR:-/tmp}/dtfe-run-start.XXXXXX" 2>/dev/null)" || sup_marker=""
-        sup_list="$(supersede_snapshot "${output_root}")"
-        if [ -n "${sup_list}" ] && [ -f "${run_log}" ]; then
-            sup_oldlog="$(mktemp "${TMPDIR:-/tmp}/dtfe-old-runlog.XXXXXX" 2>/dev/null)" && cp -p "${run_log}" "${sup_oldlog}" \
-                || sup_oldlog=""
-        fi
+        # moved aside once it has exited 0 (config.sh sup_record, run_finish)
+        sup_record "${output_root}" "${run_log}"
     fi
     ${TIME_WRAP[@]+"${TIME_WRAP[@]}"} "${cmd[@]}" 2>&1 | tee "${tee_log}"
     rc=${PIPESTATUS[0]}
     live_rc="${rc}"
 
     if [ "${AUTO_TUNE_REPORT}" = "1" ]; then
-        report=$(grep -a '^AUTO-TUNE-REPORT' "${run_log}" | head -1)
-        rm -f "${run_log}"
-        if [ "${rc}" -eq 0 ] && [ -n "${report}" ]; then
-            echo "  AUTO-TUNE-REPORT snap=${n_str} ${report#AUTO-TUNE-REPORT }"
-            n_ok=$((n_ok+1))
-        else
-            echo "  Error: no auto-tune report for snapshot ${n_str} (exit ${rc})"
-            n_failed=$((n_failed+1))
-        fi
+        if auto_tune_report_line "${run_log}" "${rc}"; then n_ok=$((n_ok+1)); else n_failed=$((n_failed+1)); fi
         continue
     fi
 
     # de-ANSI'd, the log becomes '<prefix>.runlog' on success and '<prefix>.runlog.failed' otherwise
-    # (the contract above); the peak memory below is read from whichever it became
-    finish_runlog "${live_log}" "${rc}"
-    live_log=""
-    [ "${rc}" -eq 0 ] && supersede_extras "${output_root}" "${sup_list}" "${sup_marker}" "${sup_oldlog}"
-    sup_clean
-    run_lock_release "${live_lock}"; live_lock=""
+    # (config.sh run_finish); the peak memory below is read from whichever it became
+    run_finish "${rc}" "${output_root}"
     [ "${rc}" -eq 0 ] || run_log="${run_log}.failed"
 
-    # Peak RSS, in whichever dialect TIME_WRAP produced (absent when neither exists -- then the
-    # awk finds nothing and the block below is skipped).
-    #   BSD/macOS : "  1234567  maximum resident set size"            -- BYTES in $1
-    #   GNU       : "  Maximum resident set size (kbytes): 1234"      -- KBYTES in $NF
-    peak_bytes=$(awk 'tolower($0) ~ /maximum resident set size/ {
-                          if (tolower($0) ~ /kbytes/) { gsub(/[^0-9]/, "", $NF); print $NF * 1024 }
-                          else                        { print $1 }
-                          exit }' "${run_log}")
-    if [ -n "${peak_bytes}" ]; then
-        peak_gb=$(awk -v b="${peak_bytes}" 'BEGIN{printf "%.1f", b/1073741824}')
-        # macOS also reports the peak FOOTPRINT: what the run really needed, including the memory
-        # the system compressed or swapped out -- RSS alone hid 90 GB behind "47 GB" at TNG100-3 z=0
-        fp_bytes=$(awk 'tolower($0) ~ /peak memory footprint/ { print $1; exit }' "${run_log}")
-        if [ -n "${fp_bytes}" ]; then
-            peak_gb="$(awk -v b="${fp_bytes}" 'BEGIN{printf "%.1f", b/1073741824}') GB footprint, ${peak_gb} GB resident;"
-        else
-            peak_gb="${peak_gb} GB resident;"
-        fi
+    # peak memory (config.sh peak_memory_text; absent without TIME_WRAP) and the auto-tuner's budget
+    peak_gb="$(peak_memory_text "${run_log}")"
+    if [ -n "${peak_gb}" ]; then
+        peak_gb="${peak_gb};"
         # the budget the binary's auto-tuner planned against (60% of RAM, less what other programs
         # use; see src/auto_tune.h) -- absent when --partition and --max-concurrent were both given
         budget_gb=$(sed -n 's/^.*memory budget: \([0-9.]*\) GB.*$/\1/p' "${run_log}" | head -1)
@@ -604,29 +451,13 @@ for i in "${SNAPSHOTS[@]}"; do
             echo "  Peak memory: ${peak_gb} partition and concurrency set by hand, so no auto-tune budget applied"
         fi
     fi
-    echo "  Wall time: $((SECONDS/60)) min $((SECONDS%60)) s"
-
-    if [ "${rc}" -eq 0 ]; then
-        echo "  Snapshot ${n_str} processed successfully"
-        n_ok=$((n_ok+1))
-    else
-        echo "  Error processing snapshot ${n_str} (its log: ${run_log})"
-        # exit 3: the run finished but its output folder could not be written, so the binary put the grids in its
-        # rescue folder; the log's OUTPUT RESCUE line names it and the mv that puts them in place (2026-10-11)
-        [ "${rc}" -eq 3 ] && echo "  The grids were computed and saved to the rescue folder: see the OUTPUT RESCUE line in ${run_log}"
-        n_failed=$((n_failed+1))
-    fi
+    if snapshot_outcome "${rc}" "${run_log}"; then n_ok=$((n_ok+1)); else n_failed=$((n_failed+1)); fi
     echo ""
 done
 
 # Honest exit status: processing NOTHING, or failing a snapshot that was attempted, exits 1. A
 # partial skip stays exit 0 -- a partly-downloaded snapshot ladder is normal.
-if [ "${DRY_RUN}" = "1" ]; then
-    echo "DRY RUN: ${n_planned} snapshot(s) planned, ${n_skipped} skipped for missing inputs; nothing was run."
-    [ "${n_planned}" -gt 0 ] && exit 0
-    echo "ERROR: nothing to run (looked under '${DATA_DIR}')." >&2
-    exit 1
-fi
+[ "${DRY_RUN}" = "1" ] && dry_run_exit "${n_planned}" "${n_skipped}" "${DATA_DIR}"
 echo "PS-DTFE processing complete: ${n_ok} processed, ${n_skipped} skipped, ${n_failed} failed."
 if [ "${n_failed}" -gt 0 ]; then
     echo "ERROR: ${n_failed} snapshot(s) failed; see the messages above and their .runlog.failed files." >&2

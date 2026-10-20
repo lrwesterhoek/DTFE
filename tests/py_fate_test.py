@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for the void FATE stack (2026-10-11): dtfelib.lagrangian (members, links, classes), plot_void_fate.py
+"""Tests for the void FATE stack: dtfelib.lagrangian (members, links, classes), plot_void_fate.py
 (census, table, figure, the link cache) and plot_void_tracking.py (the tracker on synthetic merger trees, and its
 --link particles mode).
 
@@ -10,48 +10,17 @@ Two tiers:
 Usage:  python3 tests/py_fate_test.py            (exit 0 = pass)
 """
 
-import atexit
-import os
-import shutil
 import sys
-import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "python"))
-sys.path.insert(0, str(ROOT / "python" / "plot"))
-_TMP = tempfile.mkdtemp(prefix="fate_test_")
-os.environ["DTFE_FIGURES_ROOT"] = str(Path(_TMP) / "figs")     # before config is imported: never the real root
-os.environ["DTFE_NO_MIRROR"] = "1"
-os.environ.setdefault("MPLBACKEND", "Agg")
-atexit.register(shutil.rmtree, _TMP, True)
+import os
+from _harness import REPO as ROOT, Skip, check, setup, summary
 
-PASS, FAIL, SKIP = [], [], []
-
-
-class Skip(Exception):
-    pass
-
-
-def check(name, fn):
-    try:
-        fn()
-        PASS.append(name)
-        print(f"  PASS  {name}")
-    except Skip as e:
-        SKIP.append(name)
-        print(f"  SKIP  {name}  ({e})")
-    except AssertionError as e:
-        FAIL.append(name)
-        print(f"  FAIL  {name}: {e}")
-    except Exception as e:
-        import traceback
-        FAIL.append(name)
-        print(f"  FAIL  {name}: {type(e).__name__}: {e}")
-        print("".join("        " + line for line in traceback.format_exc().splitlines(True)[-6:]), end="")
+_TMP = setup("fate_test_", figures_sub="figs")
+os.environ.setdefault("DTFE_SIM", "TNG50-4-Dark")    # the box these synthetic tests stand for; a data-tier run sets its own
 
 
 # ---------------------------------------------------------------- a synthetic two-snapshot universe
@@ -148,9 +117,9 @@ def t_exclusive_members():
         q = np.linalg.norm(d, axis=1) / r
         assert q[v] <= 1 and v == int(np.argmin(q)), (pid, v, q)
     assert e.n_members.sum() == e.ids.size and np.all(e.n_members <= m.n_members)
-    # a POOL (2026-10-11): two unfollowed spheres after the followed ones, one overlapping a followed sphere. The
+    # a POOL: two unfollowed spheres after the followed ones, one overlapping a followed sphere. The
     # followed voids' share of the pool is exactly their own partition (a particle in a followed sphere stays there),
-    # and without 'exclusive' exactly their own C6 members
+    # and without 'exclusive' exactly their own (overlapping) members
     pc = np.vstack([c, [[0.55, 0.5, 0.5], [0.3, 0.3, 0.3]]])
     pr = np.concatenate([r, [0.08, 0.05]])
     ep = L.void_members(chunks, pc, pr, exclusive=True, n_sample=4)
@@ -162,7 +131,7 @@ def t_exclusive_members():
 
 
 def _lexsort_exclusive_ref(chunks, centres, radii, n_s):
-    """The exclusive pairs as _chunk_pairs made them until 2026-10-11 (every (id, q) pair of a chunk lexsorted, the
+    """The exclusive pairs as a lexsort makes them (every (id, q) pair of a chunk lexsorted, the
     first per id kept): ([(ids, void, chunk index) per chunk], particles whose nearest q is tied between spheres)
     -- the reference of the running best."""
     from scipy.spatial import cKDTree
@@ -191,7 +160,7 @@ def _lexsort_exclusive_ref(chunks, centres, radii, n_s):
 
 
 def t_exclusive_running_best():
-    """2026-10-11: the exclusive partition is a running per-particle best, not a lexsort of every pair -- the same
+    """The exclusive partition is a running per-particle best, not a lexsort of every pair -- the same
     (id, void, index) as the lexsort, ties (equal q: the lower sphere) included, with and without the pool rule."""
     from dtfelib import lagrangian as L
     rng = np.random.default_rng(11)
@@ -261,7 +230,7 @@ class _Chunks:
 class FakeVoidSnapshot:
     """What lagrangian.VoidSnapshot gives the scripts, from synthetic particles and spheres; its member methods ARE
     VoidSnapshot's (the pool read once, the followed voids' share of it, the drops). 'extra_centres' / 'extra_radii':
-    unfollowed minima of the descendant pool (2026-10-11), after the followed ones as void_pool orders them."""
+    unfollowed minima of the descendant pool, after the followed ones as void_pool orders them."""
 
     def __init__(self, snap, particles, centres, radii, n=64, box=64.0, delta=None, extra_centres=None,
                  extra_radii=None):
@@ -361,7 +330,7 @@ def t_fate_census_script():
 def _pool_universe(seed=7):
     """Four followed progenitors (A) and a later snapshot (B) with two FOLLOWED voids S0, S1 and two UNFOLLOWED
     minima of its pool, U0 and U1 (U1 a sub-minimum overlapping S1): P0 -> inside S0 (survive); P1 -> inside U0
-    only (the defect: the morning's census, whose descendants were the followed voids alone, called it a vanish; it
+    only (a census whose descendants are the followed voids alone would call it a vanish; it
     lives on, 'unresolved'); P2 -> into no sphere at all (vanish: no void receives the thresholds); P3 -> wholly in
     U1 and most of it in S1 (the followed void is preferred: survive)."""
     rng = np.random.default_rng(seed)
@@ -378,7 +347,7 @@ def _pool_universe(seed=7):
 
 
 def t_pool_unresolved():
-    """2026-10-11: the descendants are every minimum of the next catalogue, not the followed sample alone."""
+    """The descendants are every minimum of the next catalogue, not the followed sample alone."""
     import config
     from dtfelib import lagrangian as L
     import plot_void_fate as F
@@ -392,7 +361,7 @@ def t_pool_unresolved():
         assert direct is None and a.reads == 1 and b.reads == 1
         fate = intervals[0][3]
         got = [L.CLASSES[c] for c in fate["cls"]]
-        # P1's matter sits in an unfollowed minimum: NOT a vanish (the morning's census said 'vanish')
+        # P1's matter sits in an unfollowed minimum: NOT a vanish
         assert got[1] != "vanish", f"matter in an unfollowed minimum counted as vanished: {got}"
         assert got == ["survive", "unresolved", "vanish", "survive"], got
         assert fate["desc"].tolist()[:2] == [0, 2] and fate["desc"][2] == -1, fate["desc"]
@@ -400,7 +369,7 @@ def t_pool_unresolved():
         # P3: the overlapping unfollowed U1 holds all of it, the followed S1 most: S1 is the main descendant
         assert fate["desc"][3] == 1 and np.isclose(fate["f_max"][3], 1.0) and 0.5 <= fate["f_sample"][3] < 1.0, fate
         assert np.isclose(fate["f_desc"][3], fate["f_sample"][3]) and fate["n_main"].tolist() == [1, 1, 0, 1]
-        # the contrast: the same matter against the followed voids alone (the old descendant set) vanishes
+        # the contrast: the same matter against the followed voids alone vanishes
         old = L.classify(L.link(a.prog_members(), L.void_members([(u.ids, u.pb)], u.cs, u.rs)))
         assert L.CLASSES[old["cls"][1]] == "vanish" and L.CLASSES[old["cls"][2]] == "vanish"
         # the chain follows FOLLOWED main descendants only: P1's ends at U0 (pool index 2, no fate of its own)
@@ -417,7 +386,7 @@ def t_pool_unresolved():
         rows = [dict(zip(lines[0].split(","), ln.split(","))) for ln in lines[1:]]
         assert [r["fate"] for r in rows] == got and [r["desc_in_sample"] for r in rows] == ["1", "0", "-1", "1"]
         assert rows[1]["desc_row"] == str(int(b.pool_rows[2])) and int(rows[1]["desc_row"]) not in b.rows.tolist()
-        # the link cache: today's version is served; a version-1 cache (descendants = the followed voids) is not
+        # the link cache: the current version is served; a version-1 cache (descendants = the followed voids) is not
         p = L.link_cache_path(a, b)
         with np.load(p) as z:
             assert int(z["link_version"]) == L.LINK_VERSION == 2 and int(z["n_desc_sample"]) == 2
@@ -456,8 +425,8 @@ def t_void_pool():
 
 
 def t_membership_cap():
-    """2026-10-11: the membership spheres are capped at FATE_MAX_SIGMA (15) smoothing lengths -- the R_v search reaches
-    24 since that day, the census keeps the spheres its numbers come from: a followed void and a pool minimum whose
+    """The membership spheres are capped at FATE_MAX_SIGMA (15) smoothing lengths -- the R_v search reaches
+    24, the census keeps the spheres its numbers come from: a followed void and a pool minimum whose
     radius exceeds the cap get the capped sphere (an explicit sigma, or config's), one below it keeps its radius, the
     particles between the cap and R_v are no members, the catalogue's R_v is untouched, and a link cache made with an
     uncapped sphere is relinked while one the cap does not change is served."""
@@ -517,7 +486,7 @@ def _link_arrays_equal(x, y):
 
 
 def t_stream_identical():
-    """2026-10-11: link_stream (the census's descendant side, never holding the pool's member pairs) gives the SAME
+    """link_stream (the census's descendant side, never holding the pool's member pairs) gives the SAME
     links as link(a, void_members(pool)) -- prog, desc, count, members, dtypes -- for two progenitor sets at once,
     across chunks and the wrap, with and without 'exclusive'; the followed members it keeps are exactly
     void_members(pool).sample(); and its peak allocation is far below holding the pool (tracemalloc)."""
@@ -556,7 +525,7 @@ def t_stream_identical():
         assert [L.CLASSES[c] for c in L.classify(got[0])["cls"]] == [L.CLASSES[c] for c in L.classify(want[0])["cls"]]
         got2, none = L.link_stream([a1], chunks_b, cp, rp, exclusive=excl, n_sample=12, keep_sample=False)
         assert none is None and _link_arrays_equal(got2[0], want[0])
-        # 2026-10-11: chunks in worker threads change nothing, bit for bit (one worker is the path before them)
+        # chunks in worker threads change nothing, bit for bit (one worker: the serial path)
         for w in (1, 3, 8):
             g, smp = L.link_stream([a1, a2], chunks_b, cp, rp, exclusive=excl, n_sample=12, block=9_000, workers=w)
             assert all(_link_arrays_equal(x, y) for x, y in zip(g, want)), f"workers {w}, exclusive={excl}"
@@ -579,7 +548,7 @@ def t_stream_identical():
         o = np.argsort(ref_i, kind="stable")
         m = L.void_members(chunks, cp, rp, n_sample=12)
         assert np.array_equal(m.ids, ref_i[o]) and np.array_equal(m.void, ref_v[o]) and m.ids.dtype == np.uint64
-    # memory: the pool's pairs (12 B each, plus their sort) are what the old path held; the stream holds a chunk's
+    # memory: the pool's pairs (12 B each, plus their sort) are what holding the pool costs; the stream holds a chunk's
     # (15 chunks here; a real snapshot has 12-30 of 8e6 particles)
     a1 = L.void_members(chunks_a, ca, ra)
     small = [(ids[i:i + 8_000], fb[i:i + 8_000]) for i in range(0, n, 8_000)]
@@ -595,7 +564,7 @@ def t_stream_identical():
 
 
 def t_link_cache_r_v_key():
-    """2026-10-11 (G3): the link caches are keyed on both catalogues' R_v settings (their r_v_settings record): a
+    """The link caches are keyed on both catalogues' R_v settings (their r_v_settings record): a
     changed R_v search rebuilds the link even when the spheres it recorded are the same; a cache without the record
     (made before it) is rebuilt once; an unchanged one is served."""
     import config
@@ -628,7 +597,7 @@ def t_link_cache_r_v_key():
         msgs.clear()
         L.cached_link(a, b, log=msgs.append)
         assert b.reads == reads + 2 and any("recorded their catalogues' R_v settings" in m for m in msgs), msgs
-        # a catalogue's own record is the key; without one, today's settings (pipeline.r_v_settings)
+        # a catalogue's own record is the key; without one, the current settings (pipeline.r_v_settings)
         from dtfelib import pipeline
         assert np.array_equal(L.r_v_record({"r_v_settings": rec}), rec)
         assert np.array_equal(L.r_v_record({}), pipeline.r_v_settings())
@@ -740,7 +709,7 @@ def t_tracker_particles():
     outdir.mkdir()
     T.plot_void(t, 1, args, outdir, r_eff0)
     assert (outdir / "void1_evolution_particles.png").is_file()
-    # --exclusive (2026-10-11 afternoon): partitioned members, its own '_exclusive' set; refused with the trees
+    # --exclusive: partitioned members, its own '_exclusive' set; refused with the trees
     args.exclusive = True
     assert T._set_tag(args, ("ps", "ps_output.")) == "_particles_exclusive"
     assert T.parse_args(["--link", "particles", "--exclusive"]).exclusive
@@ -754,9 +723,9 @@ def t_tracker_particles():
 
 
 def t_tracker_link_tag():
-    """2026-10-11: plot_void_tracking --link particles reads the census's link files: lagrangian.link_tag is the one
+    """plot_void_tracking --link particles reads the census's link files: lagrangian.link_tag is the one
     rule ('' for PS-DTFE's grids, '_dtfe', '_<prefix>'), plot_void_fate.name_tag is it, and the tracker passes it to
-    cached_link (it passed none, so a --prefix run read and rewrote the default grids' links)."""
+    cached_link (without it a --prefix run would read and rewrite the default grids' links)."""
     import config
     import plot_void_fate as F
     import plot_void_tracking as T
@@ -781,7 +750,7 @@ def t_tracker_link_tag():
 
 
 def t_help_and_flags():
-    """The new flags are in each script's own help; the launcher text rule: the help has them, nothing else."""
+    """The fate flags are in each script's own help; the launcher text rule: the help has them, nothing else."""
     import subprocess
     for script, flags in (("plot_void_fate.py", ("--ref-snap", "--snaps", "--out", "--exclusive")),
                           ("plot_void_tracking.py", ("--link", "--exclusive"))):
@@ -838,8 +807,7 @@ def main():
     print("data-backed:")
     check("lagrangian.iter_particles on the real TNG50-3-Dark combined snapshot (one chunk)", t_real_combined_chunk)
     print("-" * 60)
-    print(f"RESULT: {len(PASS)} passed, {len(FAIL)} failed, {len(SKIP)} skipped")
-    return 1 if FAIL else 0
+    return summary()
 
 
 if __name__ == "__main__":

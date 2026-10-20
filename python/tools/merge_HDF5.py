@@ -45,17 +45,11 @@ import numpy as np
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(SCRIPT_DIR.parent))  # python/ on sys.path, for dtfelib.cli.sim_dir
 
 
 SNAPSHOT_NUMBERS = [0, 4, 17, 33, 50]
 
 NUM_SUBFILES = 4
-
-# default simulation dir; follows the project-wide DTFE_DATA_ROOT convention and layouts (see
-# config.sh / dtfelib.cli.sim_dir), override per run with -d/--data-dir
-from dtfelib.cli import sim_dir
-BASE_DIR = str(sim_dir("TNG300-3-Dark"))
 
 SINGLE_FILES = [
 ]
@@ -147,8 +141,8 @@ def _open_chunk(path):
 def _expected_chunks(found, attr):
     """The chunk count the header of the first chunk found promises ('NumFilesPerSnapshot' for
     snapshots, 'NumFiles' for group catalogues), or None when there is no chunk or no such attribute.
-    Counting the files on disk instead let a download that stopped early merge into a 'complete'
-    file with missing particles (2026-10-06)."""
+    Counting the files on disk instead would let a download that stopped early merge into a 'complete'
+    file with missing particles."""
     if not found:
         return None
     with _open_chunk(found[0]) as f:
@@ -701,8 +695,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("snapshots", type=int, nargs="*", default=None,
                     help=f"snapshot numbers to merge (default: {SNAPSHOT_NUMBERS})")
-    ap.add_argument("-d", "--data-dir", default=BASE_DIR,
-                    help=f"simulation directory holding snapdir_NNN/ (default: {BASE_DIR})")
+    ap.add_argument("-d", "--data-dir", required=True,
+                    help="the simulation's directory holding snapdir_NNN/, e.g. '/Volumes/Samsung T7/Illustris "
+                         "TNG/TNG100/TNG100-3-Dark' (required: there is no default simulation)")
     ap.add_argument("-n", "--num-subfiles", type=int, default=None,
                     help="chunk files per snapshot (default: auto-detected by globbing)")
     ap.add_argument("--hubble", type=float, default=H_VALUE,

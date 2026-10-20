@@ -1,17 +1,16 @@
-"""How the Explore tab saves its pictures (2026-10-14, Luuk's request: "more options in the GUI for saving figures;
-with or without borders, titles, axes, axes names and units, full resolution, etc").
+"""How the Explore tab saves its pictures.
 
-  options(d)          the save options, checked and completed: the DEFAULTS draw exactly what Save image… and Save
-                      figure… wrote before (a test compares the pixels), so nothing changes for whoever never opens
-                      the dialog; PRESETS fill several in one go (Publication, Bare image, Slide)
+  options(d)          the save options, checked and completed: the DEFAULTS draw exactly the reference pictures of
+                      Save image… and Save figure… (a test compares the pixels), so nothing changes for whoever
+                      never opens the dialog; PRESETS fill several in one go (Publication, Bare image, Slide)
   unit_map            the axes' unit: Mpc as stored (h-free), Mpc/h when the box's h is known, or cells
-  position            a position along any axis in that unit (the slice position in a saved title, 2026-10-15)
+  position            a position along any axis in that unit (the slice position in a saved title)
   style_axes          frame, ticks, tick labels and axis names of one matplotlib Axes as the options say
   rc / save_kwargs    the matplotlib settings (font size, text kept as text in PDF and SVG) and savefig() arguments
-                      (a TIFF compressed losslessly, LZW, 2026-10-15)
+                      (a TIFF compressed losslessly, LZW)
   fit_width           the figure scaled so the saved file has the width asked for
   match_dpi           the dpi that puts one data pixel on one image pixel inside the map's axes (a plane too small
-                      for 72 dpi shrinks the figure instead, 2026-10-15)
+                      for 72 dpi shrinks the figure instead)
   settle_wraps        wrapped titles given their drawn line breaks, so every matplotlib version measures them alike
   savefig             a matplotlib figure saved with the options (pixel guard, settled wraps, save_kwargs)
   writes_pixels       the options that save the data's own pixels: full resolution, or no margins + match the data
@@ -37,12 +36,12 @@ MARGINS = (("tight", "Tight crop (as before)"), ("pad", "Tight crop with this pa
            ("none", "None: the map fills the file"))
 DPI_MIN, DPI_MAX = 72, 1200
 FULL_DPI = 100.0                # the full-resolution file's nominal dpi: the outlines' line widths, a vector page size
-# the largest side of a figure drawn for a save (2026-10-14, review): matplotlib allocates the whole picture (4 bytes a
+# the largest side of a figure drawn for a save: matplotlib allocates the whole picture (4 bytes a
 # pixel) already while laying it out, so a width meant in pixels but typed in inches (50 in at 1200 dpi: 24 GB) must
 # stop before that; 16384 a side is 1 GB for the canvas alone (the image resampled into it takes more: a 1200 dpi map
 # of 7 in peaks at about 2 GB)
 MAX_SIDE_PX = 16384
-# a TIFF's compression (2026-10-15; it was written uncompressed): LZW, lossless (the same pixels, a test reads them
+# a TIFF's compression: LZW, lossless (the same pixels, a test reads them
 # back) and read by every TIFF reader (the 'TIFF with LZW' journals ask for); Pillow's libtiff writes it, for the
 # full-resolution file directly and for a matplotlib figure through savefig's pil_kwargs
 TIFF_COMPRESSION = "tiff_lzw"
@@ -65,7 +64,7 @@ DEFAULTS = {
     "tick_labels": True,
     "axis_names": True,
     "units": True,              # the unit in the axis names: 'x [Mpc]' or 'x'
-    "unit": "mpc",              # "mpc" (cells for a grid without a box, as before), "mpc_h" or "cells"
+    "unit": "mpc",              # "mpc" (cells for a grid without a box), "mpc_h" or "cells"
     "colorbar": True,
     "colorbar_label": True,
     "arrows": True,             # as on screen: drawn when the map shows them
@@ -168,7 +167,7 @@ def describe(opts: dict) -> str:
 
 def title_text(opts: dict, auto: str, shown: str | None = None) -> str:
     """The title drawn: the typed one when it was typed for this map (its own title then was 'auto'), else the map's
-    own title: 'shown' when given (2026-10-15: 'auto' with its positions in the axes' unit, Mpc/h or cells; 'auto'
+    own title: 'shown' when given ('auto' with its positions in the axes' unit, Mpc/h or cells; 'auto'
     stays the key a typed title is tied to, so changing the unit never detaches it), else 'auto'."""
     t = (opts.get("title_text") or "").strip()
     return t if t and opts.get("title_for", auto) == auto else (auto if shown is None else shown)
@@ -176,9 +175,9 @@ def title_text(opts: dict, auto: str, shown: str | None = None) -> str:
 
 def writes_pixels(opts: dict) -> bool:
     """The save writes the data's own pixels (write_pixels: one image pixel per data pixel, the screen's colours, no
-    resampling): full resolution, or no margins with 'match the data' and no width asked (2026-10-15: that borderless
-    figure was matplotlib's picture of the map at the matched dpi, 72 at least, so a plane under ~390 points across
-    was resampled; it is now the same file as full resolution)."""
+    resampling): full resolution, or no margins with 'match the data' and no width asked (that borderless figure is
+    the same file as full resolution: matplotlib's picture of the map at the matched dpi, 72 at least, would resample
+    a plane under ~390 points across)."""
     o = options(opts)
     return o["kind"] == "full" or (o["margins"] == "none" and o["match_data"] and not o["width"] > 0)
 
@@ -208,7 +207,7 @@ def file_filters() -> list[tuple[str, str]]:
 class UnitMap:
     """The axes' unit as one affine map per axis, x' = (x - off) k, of the positions as Explore keeps them (h-free
     Mpc of the box, or cells when the output has no box). The identity leaves the numbers untouched (bit for bit:
-    the default figure is the old one)."""
+    the default figure keeps its exact numbers)."""
 
     def __init__(self, name: str = "Mpc", k=(1.0, 1.0), off=(0.0, 0.0)):
         self.name = name
@@ -230,7 +229,7 @@ class UnitMap:
 
 def unit_map(o, rest, unit: str, hubble: float | None = None) -> tuple[UnitMap, str]:
     """(UnitMap, a note when the unit asked for cannot be used) for the in-plane axes 'rest' of output 'o'. 'mpc' is
-    the stored unit (cells for an output without a box: what the map always said); 'mpc_h' multiplies by the box's h
+    the stored unit (cells for an output without a box, as the map says); 'mpc_h' multiplies by the box's h
     ('hubble', grids.hubble: None when unknown, then Mpc and a note); 'cells' counts the grid's cells from the box's
     low corner."""
     if o.box is None:
@@ -248,7 +247,7 @@ def unit_map(o, rest, unit: str, hubble: float | None = None) -> tuple[UnitMap, 
 def position(o, axis: int, v: float, unit: str, hubble: float | None = None) -> tuple[float, str]:
     """(value, unit name) of position 'v' along axis 'axis' of output 'o', as Explore keeps it (h-free Mpc, cells for
     an output without a box), in the unit the axes get from unit_map (Mpc/h without a known h: Mpc). A saved title's
-    slice position and zoom window (2026-10-15: the axes were in Mpc/h or cells while the title said Mpc)."""
+    slice position and zoom window."""
     um, _note = unit_map(o, [axis, axis], unit, hubble)
     return float(um.x(v)), um.name
 
@@ -262,7 +261,7 @@ def axis_label(name: str, unit: str, opts: dict) -> str:
 
 def style_axes(ax, opts: dict, names, unit: str, fontsize=None, ticksize=None) -> None:
     """The axis names, frame, ticks and tick labels of one Axes as the options say. With every option on it only
-    sets the names (what the old figures did), so the default figure is unchanged."""
+    sets the names, leaving matplotlib's own frame and ticks."""
     kw = {} if fontsize is None else {"fontsize": fontsize}
     ax.set_xlabel(axis_label(names[0], unit, opts), **kw)
     ax.set_ylabel(axis_label(names[1], unit, opts), **kw)
@@ -293,8 +292,8 @@ def rc(opts: dict, fmt: str = "png") -> dict:
 
 
 def save_kwargs(opts: dict, dpi: float, fmt: str = "png") -> dict:
-    """savefig()'s arguments: the dpi, the margins (the default: bbox_inches='tight', as before), transparency; a
-    TIFF compressed losslessly (TIFF_COMPRESSION, 2026-10-15; matplotlib hands a TIFF to Pillow with pil_kwargs)."""
+    """savefig()'s arguments: the dpi, the margins (the default: bbox_inches='tight'), transparency; a
+    TIFF compressed losslessly (TIFF_COMPRESSION; matplotlib hands a TIFF to Pillow with pil_kwargs)."""
     kw = {"dpi": dpi}
     if opts["margins"] == "tight":
         kw["bbox_inches"] = "tight"
@@ -311,9 +310,9 @@ def settle_wraps(fig, dpi: float) -> None:
     """Give every wrapped text of 'fig' the line breaks it gets at the figure's current size and 'dpi', as explicit
     newlines with wrapping off; the original text is kept on the artist, so a later call re-wraps it after a resize.
     matplotlib 3.6 (Ubuntu 24.04, the CI) wraps text only while drawing: its extents, get_tightbbox and savefig's
-    tight crop measure a wrapped title unwrapped, so fit_width could not converge (a map asked 900 px wide came out
-    907) and the crop took the unwrapped title's width. matplotlib 3.10 lays the wrapped lines out everywhere, and
-    the same breaks give the same file there."""
+    tight crop measure a wrapped title unwrapped, so without this fit_width does not converge (a map asked 900 px wide
+    comes out 907) and the crop takes the unwrapped title's width. matplotlib 3.10 lays the wrapped lines out
+    everywhere, and the same breaks give the same file there."""
     from matplotlib.text import Text
     own = fig.dpi
     fig.set_dpi(dpi)
@@ -344,12 +343,12 @@ def savefig(fig, path, opts: dict, dpi: float, fmt: str = "png") -> None:
 
 
 class TooLarge(ValueError):
-    """A width or dpi that would make a picture of more than MAX_SIDE_PX pixels a side (2026-10-14, review)."""
+    """A width or dpi that would make a picture of more than MAX_SIDE_PX pixels a side."""
 
 
 def check_pixels(w_in: float, h_in: float, dpi: float) -> None:
     """Raise TooLarge, before matplotlib allocates it, for a figure of w_in by h_in inches at 'dpi' that is more than
-    MAX_SIDE_PX pixels a side (2026-10-14, review)."""
+    MAX_SIDE_PX pixels a side."""
     w, h = float(w_in) * float(dpi), float(h_in) * float(dpi)
     if max(w, h) > MAX_SIDE_PX:
         raise TooLarge(f"the figure would be {w:.0f} × {h:.0f} pixels ({4e-9 * w * h:.1f} GB in memory), more than "
@@ -406,9 +405,9 @@ def match_dpi(fig, axes_px, relayout=None) -> float:
     """The dpi at which the widest data plane fills its axes pixel for pixel: max over (axes, data pixels across) of
     pixels / the axes' drawn width in inches, at most DPI_MAX. A plane too small for DPI_MIN (fewer than 72 points per
     inch of its axes: every plane under ~390 points across in the 7 in map, a 256³ grid's slice too) SHRINKS THE
-    FIGURE instead (2026-10-15): at DPI_MIN its axes then hold the plane pixel for pixel, so the saved map has the
-    data's pixel count (the dpi stopped at 72 before and a 64-cell map came out resampled to 389 pixels), while the
-    text keeps its size in points, readable at 72 dpi (a dpi below it drew 8 pt text one to three pixels high).
+    FIGURE instead: at DPI_MIN its axes then hold the plane pixel for pixel, so the saved map has the data's pixel
+    count (stopping the dpi at 72 would resample a 64-cell map to 389 pixels), while the text keeps its size in
+    points, readable at 72 dpi (a dpi below it draws 8 pt text one to three pixels high).
     The shrink is uniform with the layout's fractions kept, which is exact in one step (the aspect of every axes box
     is kept, so its width scales with the figure); 'relayout' (the separate panels' tight_layout) is re-run between
     such steps while it still fits the text, and a last step makes the size exact whatever it did. A tiny plane
@@ -850,7 +849,7 @@ def _dialog_class():
             elif borderless:
                 notes.append("No margins: the map fills the file, without title, axes or colour bar. Tick 'match the "
                              "data' (no width) for the map's own pixels, unresampled.")
-            # a remembered Mpc/h where this output's h is not known (2026-10-15): the axes fall back, the choice stays
+            # a remembered Mpc/h where this output's h is not known: the axes fall back, the choice stays
             if deco and self.unit.currentData() != "cells" and self.opened["unit"] == "mpc_h" \
                     and not self.ctx.get("hubble"):
                 notes.append(("No box is known for this output: its axes are in cells." if not self.ctx.get("box", True)

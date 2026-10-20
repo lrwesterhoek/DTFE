@@ -1,6 +1,6 @@
-"""Generic grid-field utilities (smoothing, slices, minima, shape parameters, cosmology, and since 2026-10-13 the
-mean-field velocity derivatives: mean_field_derivatives, the V-web of the mean flow for PS-DTFE grids; since
-2026-10-15 the same on one plane in a single pass over the grid, mean_field_plane, for the launcher's Explore).
+"""Generic grid-field utilities (smoothing, slices, minima, shape parameters, cosmology, and the
+mean-field velocity derivatives: mean_field_derivatives, the V-web of the mean flow for PS-DTFE grids; and
+the same on one plane in a single pass over the grid, mean_field_plane, for the launcher's Explore).
 
 Plain numpy/scipy only -- no config or I/O; callers pass everything in. Import as
 `from dtfelib import fields as dtfe` (the historical alias used by the plot scripts).
@@ -16,8 +16,8 @@ from scipy.ndimage import (gaussian_filter, gaussian_filter1d, maximum_filter, m
                            minimum_filter1d)
 from pathlib import Path
 
-# The separable filters below run slab-threaded (2026-10-11): scipy's ndimage filters are single-threaded, and a
-# 512^3 smoothing at sigma 10 took ~11 s on one core (the 'environment' step: ~100 of its 140 s per box). Each 1-D
+# The separable filters below run slab-threaded: scipy's ndimage filters are single-threaded, and a
+# 512^3 smoothing at sigma 10 takes ~11 s on one core (the 'environment' step: ~100 of its 140 s per box). Each 1-D
 # pass is split into slabs along ANOTHER axis, so every filtered line lies whole inside one slab and is the same
 # float computation as scipy's own pass; the passes go in scipy's order (axis 0, 1, 2) with the same intermediate
 # dtype, so the result is bit-identical to gaussian_filter / minimum_filter (tests/py_dtfelib_test.py). Fields
@@ -175,7 +175,7 @@ def calculate_shape_parameters(eigenvalues):
 def box_filter(field, size, mode='wrap', maximum=False):
     """minimum_filter (maximum_filter when maximum) of field over a box of the given size, slab-threaded on a big
     field: a scalar size is a box footprint, which scipy runs as separable 1-D passes, so threaded is identical
-    (2026-10-11; find_local_minima, and the critical points and potential maxima of pipeline.py)."""
+    (find_local_minima, and the critical points and potential maxima of pipeline.py)."""
     if np.ndim(size) == 0 and int(size) > 1 and np.ndim(field) >= 2 and np.size(field) >= _THREAD_MIN:
         return _separable_threaded(maximum_filter1d if maximum else minimum_filter1d, field, (int(size),),
                                    {"mode": mode})
@@ -209,23 +209,23 @@ def ensure_output_dir(path):
     Path(path).mkdir(parents=True, exist_ok=True)
 
 
-# ---------------------------------------------------------------- mean-field velocity derivatives (2026-10-13)
+# ---------------------------------------------------------------- mean-field velocity derivatives
 # THE SAME QUANTITY FOR BOTH ESTIMATORS. Standard DTFE stores the derivatives of its one single-valued velocity
 # field: 'a_velGrad' is the cell average of the gradient of the linear interpolant, the gradient of the MEAN
 # velocity grad<v>. PS-DTFE stores, in a multi-stream cell, the stream average of each stream's own gradient
 # <grad v> (dtfelib/io.py, the note above FIELDS): its divergence has a box mean of +40 km/s/Mpc at TNG100-3-Dark
-# z=1 (standard DTFE: 0, by Gauss) and its V-web finds 1.8% filaments against standard DTFE's 6.6% (audit of
-# 2026-10-13). The functions below give a PS output the standard quantity -- the derivatives of the velocity GRID
+# z=1 (standard DTFE: 0, by Gauss) and its V-web finds 1.8% filaments against standard DTFE's 6.6%.
+# The functions below give a PS output the standard quantity -- the derivatives of the velocity GRID
 # itself ('a_vel', the stream-mean velocity: volume-weighted under --ps-volume-weighted, the production convention,
 # else the mass-weighted mean) -- by spectral (FFT) differentiation on the periodic box, in the binary's conventions:
 #   gradient          9 components, c = a*3 + b holds dv_a/dx_b (field_computation.h velocityGradient writes
 #                     [j*3+i] = dv_j/dx_i; gui/explore.py reads it so); axis 0 of the grid is x, as the T-web's FFT
 #   divergence        dv_x/dx + dv_y/dy + dv_z/dz
 #   shear             the traceless symmetric part (g_ab + g_ba)/2 - delta_ab div/3, 5 components in the order
-#                     xx, xy, xz, yy, yz (DTFE.cpp velocityShear; zz = -(xx + yy))
-#   vorticity         (g_ab - g_ba)/2 for ab = xy, xz, yz (DTFE.cpp velocityVorticity)
+#                     xx, xy, xz, yy, yz (web_fields.cc velocityShear; zz = -(xx + yy))
+#   vorticity         (g_ab - g_ba)/2 for ab = xy, xz, yz (web_fields.cc velocityVorticity)
 #   vweb_eigenvalues  the eigenvalues, DESCENDING, of Sigma_ab = -sqrt(a)/(2 H0) (g_ab + g_ba), H0 = 100 h km/s/Mpc
-#                     and g in Gadget u-units per Mpc (DTFE.cpp computeWebClassification: the Hoffman et al. 2012
+#                     and g in Gadget u-units per Mpc (web_fields.cc computeWebClassification: the Hoffman et al. 2012
 #                     V-web; sqrt(a) takes u-units to peculiar km/s), by the binary's Cardano formula in double
 #   vweb              the number of those eigenvalues above lambda_th: 0 void, 1 wall, 2 filament, 3 node
 # Units: those of the velocity grid per Mpc of a box_mpc box -- pass the RAW u-unit grid (FieldSet.load(...,
@@ -286,7 +286,7 @@ def _wavenumbers(n: int, box_mpc: float, half: bool) -> np.ndarray:
 
 def symmetric_eigenvalues3(a00, a01, a02, a11, a12, a22) -> np.ndarray:
     """Eigenvalues of the symmetric 3x3 matrices [[a00 a01 a02] [a01 a11 a12] [a02 a12 a22]], DESCENDING along a new
-    last axis, in float64: the binary's symmetricEigenvalues3x3 (DTFE.cpp, Cardano's formula in double, the
+    last axis, in float64: the binary's symmetricEigenvalues3x3 (web_fields.cc, Cardano's formula in double, the
     acos argument clamped to [-1, 1]; a matrix within 1e-15 of a multiple of the identity returns its diagonal),
     vectorized. Inputs broadcast; any float dtype."""
     a00, a01, a02, a11, a12, a22 = (np.asarray(x, dtype=np.float64) for x in (a00, a01, a02, a11, a12, a22))
@@ -314,7 +314,7 @@ def _vweb_norm(scale_factor, hubble_h) -> float:
 
 
 def classify_web(eigenvalues, lambda_th: float) -> np.ndarray:
-    """The web label of DTFE.cpp classifyWeb: how many eigenvalues (last axis) exceed lambda_th -- 0 void, 1 wall,
+    """The web label of web_fields.cc classifyWeb: how many eigenvalues (last axis) exceed lambda_th -- 0 void, 1 wall,
     2 filament, 3 node -- as float32, the binary's on-disk type of the '.velVweb' / '.tweb' grids."""
     return (np.asarray(eigenvalues) > float(lambda_th)).sum(axis=-1).astype(np.float32)
 
@@ -452,7 +452,7 @@ def mean_field_derivatives(velocity, box_mpc: float, names=("divergence",), *, s
     return out
 
 
-# ---------------------------------------------------------------- the same derivatives on ONE plane (2026-10-15)
+# ---------------------------------------------------------------- the same derivatives on ONE plane
 # The launcher's Explore shows a PS output's divergence / shear / vorticity / gradient / V-web as the mean field
 # (the figure scripts' default) one slice at a time, beside a running job whose memory budget it must leave alone:
 # mean_field_derivatives' whole-cube FFTs peak at 3.2-7.5 GB on a 512^3 grid. The spectral derivative is separable:

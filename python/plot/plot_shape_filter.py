@@ -202,30 +202,30 @@ def process_snapshot(snapshot, redshift, sim=None, method=None, prefix=None, dat
         
         summary_file = output_path / f'void_shape_analysis_summary_z{redshift:.2f}.txt'
         with open(summary_file, 'w') as f:
-            f.write(f"Void Shape Analysis Summary\n")
+            f.write("Void Shape Analysis Summary\n")
             f.write(f"Snapshot: {snapshot}, Redshift: {redshift:.2f}\n")
             f.write(f"{'='*50}\n\n")
-            f.write(f"Parameters:\n")
+            f.write("Parameters:\n")
             f.write(f"  Grid resolution: {grid_n}³\n")
             f.write(f"  Footprint size: {FOOTPRINT_SIZE}\n")
             f.write(f"  Smoothing sigma: {SMOOTHING_SIGMA}\n\n")
-            f.write(f"Results:\n")
+            f.write("Results:\n")
             f.write(f"  Total minima found: {len(minima_indices)}\n")
             f.write(f"  Valid BBKS params (e/p population): {len(bbks_v)}\n")
             f.write(f"  Valid axis ratios (all lambda > 0): {len(ax_v)}\n")
 
             if len(ax_v) > 0 and len(bbks_v) > 0:
-                f.write(f"  Mean axis ratios:\n")
+                f.write("  Mean axis ratios:\n")
                 f.write(f"    b/a: {np.mean(ax_v[:, 0]):.3f} ± {np.std(ax_v[:, 0]):.3f}\n")
                 f.write(f"    c/a: {np.mean(ax_v[:, 1]):.3f} ± {np.std(ax_v[:, 1]):.3f}\n")
-                f.write(f"  BBKS parameters:\n")
+                f.write("  BBKS parameters:\n")
                 f.write(f"    Mean ellipticity (e): {np.mean(bbks_v[:, 0]):.3f} ± {np.std(bbks_v[:, 0]):.3f}\n")
                 f.write(f"    Mean prolateness (p): {np.mean(bbks_v[:, 1]):.3f} ± {np.std(bbks_v[:, 1]):.3f}\n")
                 prolate_pct = 100 * np.sum(bbks_v[:, 1] > 0.05) / len(bbks_v)
                 oblate_pct = 100 * np.sum(bbks_v[:, 1] < -0.05) / len(bbks_v)
                 f.write(f"    Prolate shapes (p > 0.05): {prolate_pct:.1f}%\n")
                 f.write(f"    Oblate shapes (p < -0.05): {oblate_pct:.1f}%\n")
-                f.write(f"  Density statistics:\n")
+                f.write("  Density statistics:\n")
                 f.write(f"    Mean density at voids: {np.mean(density_values):.3f}\n")
                 f.write(f"    Std density at voids: {np.std(density_values):.3f}\n")
                 f.write(f"    Min density at voids: {np.min(density_values):.3f}\n")
@@ -261,7 +261,7 @@ def main():
     else:
         items = list(SNAPSHOT_TO_REDSHIFT.items())
 
-    print(f"Starting void shape analysis")
+    print("Starting void shape analysis")
     print(f"Processing {len(items)} snapshots")
 
     processed_count = 0
@@ -276,7 +276,7 @@ def main():
             print(f"Failed to process snapshot {snapshot} (z={redshift:.2f}): {str(e)}")
             failed_snapshots.append((snapshot, redshift))
 
-    print(f"\nAnalysis complete")
+    print("\nAnalysis complete")
     print(f"Successfully processed: {processed_count}/{len(items)} snapshots")
     
     if failed_snapshots:

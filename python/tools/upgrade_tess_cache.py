@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Convert a tessellation cache ('--tessellation-cache' folder) to the CHUNKED body.
 
-Since 2026-10-02 the binaries write a cached tessellation's body as independent gzip members of
+The binaries write a cached tessellation's body as independent gzip members of
 16 MB (tessellation_cache.h, ChunkDeflateBuf), which a load inflates on several threads -- about 3 s
 of the 8.4 s a 6M-vertex TNG100-3 partition took. Older files hold one gzip stream; they still load,
 on one core. This tool rewrites them: the header (magic, length, descriptor) is copied as it is, the

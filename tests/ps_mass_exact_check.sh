@@ -1,23 +1,23 @@
 #!/usr/bin/env bash
-# The PS-DTFE MASS grid is exact on the CPU too (2026-10-12). The GPU kernels sum it as 64-bit fixed point since
-# 2026-10-08, but the CPU added its shares with float '+=' -- the GPU-DEFERRED tetrahedra (a sample within float
-# rounding of a face) into the GPU's decoded floats, the --ps-halo-release centroid deposits likewise, and a whole
-# CPU deposit (no GPU, or the GPU gave up) from scratch. A float add rounds a share against the cell's running sum
-# (below half an ulp it vanishes, always downward): TNG50-3-Dark z=0.5 had its box mean 1.63e-5 low, all of it the
-# CPU's deferred deposit. Now the CPU adds rint(share * 2^k) into the same integers (ps_interpolation.cc 'massFx',
-# the GPU's own words after a GPU deposit) and converts once. Asserted on two synthetic snapshots:
+# The PS-DTFE MASS grid is exact on the CPU too. The GPU kernels sum it as 64-bit fixed point, and the CPU's
+# shares -- the GPU-DEFERRED tetrahedra (a sample within float rounding of a face), the --ps-halo-release centroid
+# deposits, and a whole CPU deposit (no GPU, or the GPU gave up) -- go into the same integers: the CPU adds
+# rint(share * 2^k) (ps_interpolation.cc 'massFx', the GPU's own words after a GPU deposit) and converts once.
+# A float add would round a share against the cell's running sum (below half an ulp it vanishes, always
+# downward; TNG50-3-Dark z=0.5: a box mean 1.63e-5 low, all of it the CPU's deferred deposit).
+# Asserted on two synthetic snapshots:
 #   X1  deferral-heavy: a 32^3 lattice WITHOUT jitter, displaced along x only (A k = 0.5), on a 2^3 grid at nSub 16
 #       (--partition 1 1 1, and 2 2 2): every sample lies exactly on a lattice plane y or z = const, i.e. on
 #       tetrahedron faces, which the GPU kernel cannot classify in float -- it defers 56% of the tetrahedra (110592
 #       of 196608) to the CPU. Box mean of '.a_den' = 1 to 1e-7: GPU, GPU with --ps-halo-release 1.2 (40% of the
-#       mass released to host-side centroid deposits) and CPU. The float adds gave +1.9e-4 (GPU), +1.4e-4 (GPU,
-#       released) and -1.4e-5 (CPU) here. The 2^3-partition runs to 2.5e-7 in single precision (2026-10-14): the
+#       mass released to host-side centroid deposits) and CPU. Float adds give +1.9e-4 (GPU), +1.4e-4 (GPU,
+#       released) and -1.4e-5 (CPU) here. The 2^3-partition runs to 2.5e-7 in single precision: the
 #       merge of 8 float partition grids rounds by an ulp (1.19e-7 at 1), deterministically so in index order.
 #   X2  heavy accumulation, CPU: a 64^3 pancake on a 4^3 grid (nSub 4, --ps-vertex-mass, so the tets carry exactly
 #       the particles' mass): 1.8e6 tetrahedra into 64 cells. Box mean = 1 to 1e-7 (the float sums: +2.3e-5 on one
 #       thread, -1.6e-6 on ten).
 #   X3  thread independence: X2's '.a_den' is byte-identical for 1 thread, 4 threads in the copy mode
-#       (DTFE_DEPOSIT_SLABS=0: one shared grid, atomic adds -- the float copies summed per thread differed) and 4 in
+#       (DTFE_DEPOSIT_SLABS=0: one shared grid, atomic adds -- float copies summed per thread would differ) and 4 in
 #       slab mode; X1's GPU deposit likewise with its deferred tets on 1 and 4 threads -- the logs must show the
 #       deferred tets deposited on 1 thread and on more than 1 in slab mode (that path never keeps float copies, so the bytes
 #       alone would also match on a binary that silently ran the 4-thread run on one). (DTFE_TEST_PRECISION=double:
@@ -26,11 +26,11 @@
 #       'gained/shares-1' = 0 (the CPU's shares all reached the grid; the double build's sums of 1.8e6 shares
 #       round: < 1e-9 there) and 'grid/tets-1' below 1e-7 (one float rounding per cell, <= 6e-8). A binary
 #       without the audit skips this check (the others still fail it).
-#   X5  PS_METAL_FLOAT_MASS=1 (single build) brings the float grid back, on the CPU too, for A/B comparisons:
+#   X5  PS_METAL_FLOAT_MASS=1 (single build) selects the float grid, on the CPU too, for A/B comparisons:
 #       X1's CPU run then writes a different '.a_den' (its mean is reported).
 #   X6  the audit only observes: every run above sets PS_MASS_AUDIT=1, so X1's 4-thread GPU run and X2's copy-mode
 #       run are repeated with PS_MASS_AUDIT=0 (the production path) and must write the same '.a_den'.
-#   X7  the copy mode shares its counts and flags (2026-10-18): the int stream count, the two hidden-stream flags and the
+#   X7  the copy mode shares its counts and flags: the int stream count, the two hidden-stream flags and the
 #       caustic mask are written by every thread into the real arrays (relaxed atomics), as the fixed-point words are,
 #       so the single build keeps NO private copy. 32^3 crossed waves (multi-stream) on 64^3 at nSub 2, --ps-caustics,
 #       PS_MASS_AUDIT=0, copy mode (DTFE_DEPOSIT_SLABS=0) on 1, 4 and 10 threads: the logs must say 'CPU deposit on 4 /
@@ -39,8 +39,7 @@
 #       .causticClass) byte-identical, the double sums (.a_den .a_vel, still copies summed in thread order) to 1e-12.
 # The GPU halves (X1 GPU, X3 GPU) need a GPU build (Metal, or CUDA/HIP incl. the CUDAEMU=1 emulation); they print
 # SKIP otherwise and the CPU halves still run, so the suite runs in tests/ci_suite.sh (core and double). 12 s
-# without the GPU halves, 23 s with them (M-series Mac, 10 cores; X7 adds ~8 s: 31 s). The shared binary of before
-# fails X1-X3 and X5; the binary before 2026-10-18 fails X7 (its copy mode kept 8 B/cell of count/flag copies).
+# without the GPU halves, 23 s with them (M-series Mac, 10 cores; X7 adds ~8 s: 31 s).
 # Usage: tests/ps_mass_exact_check.sh [--no-build]
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -48,8 +47,6 @@ ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$ROOT" || exit 1
 source "${SCRIPT_DIR}/precision.sh"     # DTFE_TEST_PRECISION=double: the double pair
 precision_require "${PS_BIN}"
-PY="${PYTHON:-python3}"
-command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/python3.14
 if [ "${1:-}" != "--no-build" ] && ! precision_double; then
     echo ">> building PS-DTFE ..."
     make PS-DTFE $(cat o_ps/.build_mode 2>/dev/null || true) >/dev/null || { echo "FAIL: build"; exit 1; }
@@ -58,7 +55,7 @@ fi
 OBJ=o_ps; precision_double && OBJ=o_ps_d
 GPU=0                                                     # any one GPU backend stamp will do (gpu_mass_check.sh)
 if [ -d "$OBJ" ] && [ ! -f "$OBJ/.gpu_mode_off" ]; then
-    for m in metal cudaemu cuda hip; do [ -f "$OBJ/.gpu_mode_$m" ] && GPU=1; done
+    [ -n "$(gpu_backend_of "$OBJ")" ] && GPU=1
 fi
 TMP="${DTFE_TEST_TMP}/ps_mass_exact_check"
 mkdir -p "$TMP"
@@ -138,10 +135,9 @@ def mean_ok(tag, what, tol=1e-7):
     check("X1" if tag.startswith("lat") else "X2", d.size > 0 and abs(dev) < tol,
           f"{what}: box mean - 1 = {dev:+.2e} (|.| < {tol:.1e}; {d.size} cells)")
 # A partitioned run adds its 8 partitions' float grids into each cell (DTFE.cpp's merge), which rounds once per add:
-# 2^-23 = 1.19e-7 is ONE float ulp at 1, so 1e-7 cannot hold there. Since 2026-10-14 the merge is in partition index
-# order by default and this lattice lands on +1.19e-7 every time -- as the binary before that date did at
-# '--max-concurrent 1' (the same order); its default completion order landed anywhere in +6e-8 ... +1.2e-7 from run to
-# run, which is how 1e-7 used to pass. Two ulps for the partitioned single-precision runs; the deposit itself stays
+# 2^-23 = 1.19e-7 is ONE float ulp at 1, so 1e-7 cannot hold there. The merge is in partition index order by
+# default and this lattice lands on +1.19e-7 every time (the completion order lands anywhere in +6e-8 ... +1.2e-7
+# from run to run). Two ulps for the partitioned single-precision runs; the deposit itself stays
 # exact (the one-domain checks, and X4's audit of the grids against the tetrahedra).
 TOL_SPLIT = 1e-7 if double else 2.5e-7
 def same(a, b, what, tag="X3"):

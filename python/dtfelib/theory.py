@@ -1,4 +1,4 @@
-"""Linear-theory expectations for the void statistics (2026-10-11): the void size function and the shapes of the
+"""Linear-theory expectations for the void statistics: the void size function and the shapes of the
 minima of a Gaussian random field, to draw beside what the catalogues measure.
 
     from dtfelib import theory
@@ -163,7 +163,7 @@ def void_size_function(r_mpc, z: float = 0.0, model: str = "vdn", delta_v: float
 
 def void_dn_dlnr_binned(edges_mpc, z: float = 0.0, n: int = 21, **kw) -> np.ndarray:
     """dn/dlnR [Mpc^-3] AVERAGED in ln R over each bin of 'edges_mpc' (len(edges) - 1 values; n points per bin):
-    what a histogram of counts / (V dlnR) measures (2026-10-11). The model falls by decades across a wide bin, so its
+    what a histogram of counts / (V dlnR) measures. The model falls by decades across a wide bin, so its
     value at the bin centre is not the comparison."""
     e = np.asarray(edges_mpc, dtype=np.float64)
     return np.array([np.mean(void_size_function(np.geomspace(lo, hi, int(n)), z, **kw))
@@ -172,7 +172,7 @@ def void_dn_dlnr_binned(edges_mpc, z: float = 0.0, n: int = 21, **kw) -> np.ndar
 
 def void_number_between(r_lo_mpc: float, r_hi_mpc: float, z: float = 0.0, n: int = 81, **kw) -> float:
     """The model's number density [Mpc^-3] of voids with r_lo <= R < r_hi: dn/dlnR integrated in ln R (trapezoid on
-    n points; 2026-10-11, the fixed-R size function's one-number ratio). 0 for an empty range."""
+    n points; the fixed-R size function's one-number ratio). 0 for an empty range."""
     lo, hi = float(r_lo_mpc), float(r_hi_mpc)
     if not (np.isfinite(lo) and np.isfinite(hi) and 0 < lo < hi):
         return 0.0

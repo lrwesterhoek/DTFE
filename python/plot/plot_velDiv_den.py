@@ -6,7 +6,7 @@ simulation- and snapshot-agnostic. Snapshots without fields on disk are skipped.
     python3 plot/plot_velDiv_den.py                    # all snapshots, TNG50-4-Dark, auto method
     python3 plot/plot_velDiv_den.py --method dtfe --snap 99
 
-PS-DTFE grids (2026-10-13): the divergence is the MEAN FIELD div<v> by default -- the FFT divergence of the PS
+PS-DTFE grids: the divergence is the MEAN FIELD div<v> by default -- the FFT divergence of the PS
 velocity grid (FieldSet.load('divergence', mean_field=True)), the quantity standard DTFE stores and linear theory
 predicts (theta = -a H f delta for the mean flow). The binary's own PS grid is the stream average of each stream's
 divergence <div v>, whose box mean is +40 km/s/Mpc at TNG100-3-Dark z=1 from multi-stream cells (dtfelib/io.py, the
@@ -54,7 +54,7 @@ SLICE_PLANES = config.SLICE_PLANES
 
 
 def process_fields(density_field, velDiv_field, sigma=0):
-    # u-units -> peculiar km/s is applied centrally by FieldSet.load() now
+    # u-units -> peculiar km/s is applied centrally by FieldSet.load()
     # (dtfelib.io._VELOCITY_SCALE_EXP) -- no sqrt(a) correction here.
     mean_density = np.mean(density_field)
     delta_field = (density_field - mean_density) / mean_density
@@ -316,7 +316,7 @@ def process_snapshot(snapshot, redshift, args):
 
         summary_file = output_path / f'analysis_summary_z{redshift:.2f}.txt'
         with open(summary_file, 'w') as f:
-            f.write(f"Velocity Divergence-Density Analysis Summary\n")
+            f.write("Velocity Divergence-Density Analysis Summary\n")
             f.write(f"Snapshot: {snapshot}, Redshift: {redshift:.2f}\n")
             # what the numbers were made from: the folder is shared by every simulation and estimator
             f.write(f"Simulation: {args.sim}, estimator: {fs.method}, grids: {fs.prefix.rstrip('.')}*"
@@ -324,25 +324,25 @@ def process_snapshot(snapshot, redshift, args):
             if fs.method == 'ps':                   # (a standard-DTFE summary is unchanged: its grid is the mean field)
                 f.write(f"Divergence: {_ps_divergence_source(args)}\n")
             f.write(f"{'='*50}\n\n")
-            f.write(f"Cosmological Parameters:\n")
+            f.write("Cosmological Parameters:\n")
             f.write(f"  Scale factor a = {a_scale:.4f}\n")
             f.write(f"  H(z) = {H_z:.2f} km/s/Mpc\n")
             f.write(f"  f(z) = {f_growth:.3f}\n")
             f.write(f"  Theoretical slope = {slope_theory:.2f} km/s/Mpc\n\n")
-            f.write(f"Regression Results:\n")
+            f.write("Regression Results:\n")
             f.write(f"  Full-range slope = {full_slope_reg:.2f} km/s/Mpc\n")
             f.write(f"  Linear regime slope = {slope_reg:.2f} km/s/Mpc\n")
             f.write(f"  Difference from theory = {(slope_reg - slope_theory) / slope_theory * 100:.1f}%\n")
             f.write(f"  Linear-regime Pearson r = {pearson_r:.4f}\n")
             f.write(f"  Residual RMS (linear regime) = {residual_rms:.2f} km/s/Mpc\n\n")
-            f.write(f"Field Statistics (from YZ plane slice):\n")
+            f.write("Field Statistics (from YZ plane slice):\n")
             f.write(f"  Delta range: [{np.min(delta_slice_stats):.3f}, {np.max(delta_slice_stats):.3f}]\n")
             f.write(f"  VelDiv range: [{np.min(velDiv_slice_stats):.1f}, {np.max(velDiv_slice_stats):.1f}] km/s/Mpc\n")
             f.write(f"  Residual range: [{np.min(residual_slice_stats):.1f}, {np.max(residual_slice_stats):.1f}] km/s/Mpc\n")
         
         print(f"Completed snapshot {snapshot}")
         # this snapshot's numbers for the evolution summary, at the precision its summary file carries (the
-        # summary was rebuilt from those files before 2026-10-11: the same figures and table for the same run)
+        # same figures and table as a summary rebuilt from those files)
         return {"redshift": redshift, "theory": float(f"{slope_theory:.2f}"), "measured": float(f"{slope_reg:.2f}"),
                 "diff": float(f"{(slope_reg - slope_theory) / slope_theory * 100:.1f}"),
                 "pearson_r": float(f"{pearson_r:.4f}"), "rms": float(f"{residual_rms:.2f}")}
@@ -354,9 +354,9 @@ def process_snapshot(snapshot, redshift, args):
         return None
 
 def create_evolution_summary(results):
-    """The redshift evolution from THIS run's snapshots (process_snapshot's numbers). 2026-10-11: it re-read every
-    snapshot_*/analysis_summary_z*.txt of the config ladder in a folder shared by all simulations and estimators, so
-    a snapshot this run skipped (no grids) or another simulation's older run filled in points of another box."""
+    """The redshift evolution from THIS run's snapshots (process_snapshot's numbers), not from the
+    snapshot_*/analysis_summary_z*.txt files of a folder shared by all simulations and estimators, where a snapshot
+    this run skipped (no grids) or another simulation's older run would fill in points of another box."""
     print("\nCreating evolution summary")
 
     redshifts = [r["redshift"] for r in results]
@@ -443,7 +443,7 @@ def main():
             parser.error(f"snapshot {key} not in config.SNAPSHOT_TO_REDSHIFT")
         snapshot_items = [(key, SNAPSHOT_TO_REDSHIFT[key])]
 
-    print(f"Starting velocity divergence-density analysis")
+    print("Starting velocity divergence-density analysis")
     print(f"Processing {len(snapshot_items)} snapshots")
 
     results = []
@@ -466,7 +466,7 @@ def main():
         except Exception as e:
             print(f"Failed to create evolution summary: {str(e)}")
 
-    print(f"\nAnalysis complete")
+    print("\nAnalysis complete")
     print(f"Successfully processed: {processed_count}/{len(snapshot_items)} snapshots")
     
     if failed_snapshots:

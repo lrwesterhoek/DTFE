@@ -33,8 +33,8 @@
 #include "interlacing.h"
 #include "ps_point_eval.h"
 #include "ps_globals_record.h"
-#include "run_progress.h"     // '<output>.runlog.progress' (2026-10-11)
-#include "output_staging.h"   // '<file>.part.<pid>' + rename, rescue folder (2026-10-11)
+#include "run_progress.h"     // '<output>.runlog.progress'
+#include "output_staging.h"   // '<file>.part.<pid>' + rename, rescue folder
 
 using namespace std;
 
@@ -158,7 +158,7 @@ int main( int argc, char *argv[] )
     {
         // Interlacing: interpolate twice (original + half-cell offset), average in Fourier space.
         // without '--periodic' the second pass grids the region moved by half a cell (below): without a region
-        // that leaves the data box, so refuse before the first pass rather than after it (2026-10-11)
+        // that leaves the data box, so refuse before the first pass rather than after it
         if ( !userOptions.periodic and !userOptions.regionOn )
             throwError( "'--interlace' without '--periodic' needs a '--region' or '--regionMpc' at least half a cell "
                         "inside the data box: the second pass grids that region moved by half a cell." );
@@ -182,10 +182,10 @@ int main( int argc, char *argv[] )
 
         if ( !density1.empty() )
         {
-            // second pass: the grid moved by half a cell along every axis. Until 2026-10-11 this shifted
-            // 'region' only, which the pass-2 setup (updateEntries, DTFE_preparePadding, the PS path) reset to
-            // the box when no '--region' was given: pass 2 gridded the SAME cells, and the output was pass 1
-            // low-passed by 0.5(1+e^{-ik.dx/2}) and moved half a cell, not de-aliased.
+            // second pass: the grid moved by half a cell along every axis. Shifting 'region' alone is not
+            // enough: the pass-2 setup (updateEntries, DTFE_preparePadding, the PS path) resets it to the box
+            // when no '--region' was given, so pass 2 would grid the SAME cells (pass 1 low-passed, not
+            // de-aliased).
             //   periodic: move the PARTICLES by -dx/2 instead (wrapped into the box), which is the same grid for
             //     every estimator and needs no region: PS-DTFE refuses '--region' (it would crop an Eulerian box
             //     of a Lagrangian tessellation), and its displacements are unwrapped modulo the box anyway
@@ -280,7 +280,7 @@ int main( int argc, char *argv[] )
             std::cout << MESSAGE::cYellowD() << "   peak memory (RSS) : " << MESSAGE::cReset()
                       << MESSAGE::cMagenta() << std::setprecision(4) << peakGB << " GB" << MESSAGE::cReset() << "\n" << std::flush;
         }
-        // the auto-tuner's predicted peak against the measured one (2026-10-11), both in GB of 1e9 B (the tuner's
+        // the auto-tuner's predicted peak against the measured one, both in GB of 1e9 B (the tuner's
         // unit; the RSS line above is in 2^30 B, as the run scripts' footprint): a model that drifts low shows up
         // in every runlog instead of only when someone reads two logs side by side (run_progress.h)
         double const predicted = runProgressPredicted();

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The Explore tab's void features of 2026-10-11, offscreen, on a synthetic snapshot (no T7, no binary):
+"""The Explore tab's void features, offscreen, on a synthetic snapshot (no T7, no binary):
 
   1. the void inspector: hovering an outline names the void (R_v, R_eff, delta, flags), clicking it fills the
      inspector (every R_v definition the catalogue has, R_eff, central delta, flags, centre), 'Go to its centre'
@@ -11,26 +11,26 @@
   4. the memory guard: no question while no DTFE run is going; with one, a question (free memory said), and a
      'no' starts nothing (server, exact zoom, catalogue); a need that fits in the free memory less 4 GB starts
      without a question even then.
-  5. (2026-10-13) the caustic (fold) map of a periodic PS run is the exact fold flag (dtfelib io.caustic_is_fold),
-     not the stored per-sample grid of the runs made before then; the caustic-class map stays the stored mask; an
-     exact zoom's fold and class maps read its class grid (they read the 0/1 '.caustic': no fold at all).
-  6. (2026-10-14) the Save options (figsave.py): the default save is the old one pixel for pixel (and byte for byte);
+  5. the caustic (fold) map of a periodic PS run is the exact fold flag (dtfelib io.caustic_is_fold),
+     not the stored per-sample grid of older runs; the caustic-class map stays the stored mask; an
+     exact zoom's fold and class maps read its class grid (the 0/1 '.caustic' would give no fold at all).
+  6. the Save options (figsave.py): the default save is the old one pixel for pixel (and byte for byte);
      full resolution = the data's shape and the screen's pixels, with or without the outlines; no axes, title, colour
      bar, units (Mpc, Mpc/h from the header's h, cells), overlays, margins none, width, dpi, PDF/SVG text kept as
      text, TIFF, transparency, font size; the same for the figure grid (separate and merged panels); the presets,
      the dialog (no '--' in its texts) and the options remembered between sessions in QSettings.
-  7. (2026-10-14) the slice kept across outputs and redshifts: another output or redshift of the same simulation
+  7. the slice kept across outputs and redshifts: another output or redshift of the same simulation
      shows the same axis and place in the box (the nearest cell of its grid: 64^3 and 32^3 outputs, the user's own
      place remembered, not re-read off the coarser grid), and the zoom window (from memory, through the query server,
      or not shown with the reason in the zoom and status lines); another simulation, a custom run or opened file in
      a box of another size start at the middle with the whole box, as the first open does; a 2D output on the way
      leaves the slice and the window to the next 3D output.
-  8. (2026-10-15) the Save options' fixes: the title's slice position in the axes' unit (map and grid); TIFF
+  8. the Save options' details: the title's slice position in the axes' unit (map and grid); TIFF
      LZW-compressed, pixel-identical; 'match the data' below 72 dpi shrinks the figure (the map keeps the data's
      pixel count), and with no margins writes the map's own pixels; Mpc/h where h is not known falls back to Mpc,
      said in the status line and the dialog, the choice kept (the grid: every panel); the fold map reads only its
      planes while a job caps the cube cache.
-  9. (2026-10-15) a phase-space output's velocity derivatives as the mean field grad<v> (the default, as the figure
+  9. a phase-space output's velocity derivatives as the mean field grad<v> (the default, as the figure
      scripts') or the stored stream average <grad v>: the mean-field planes equal dtfelib's FieldSet.load(name,
      mean_field=True) cut there (the six names, every axis, through slice()'s components and units); standard DTFE
      unchanged; 2D, non-periodic and window outputs keep the stored grid and say why; while a job caps the cube cache
@@ -136,7 +136,7 @@ def pure():
           and lines[2].startswith("1,10,11,12,,,,,-0.5,0,0") and lines[3].startswith("0,1.5,2.5,3.5,4,3,5.5,6.5,-0.9,1,1"),
           "\n".join(lines))
     # a cached catalogue whose radii voids() would re-measure is not 'cached' to the launcher, and the memory gate
-    # applies (2026-10-11: 'r_v_cells' present was enough, whatever settings measured it): pipeline.catalog_r_v_ok
+    # applies ('r_v_cells' present is not enough, whatever settings measured it): pipeline.catalog_r_v_ok
     from dtfelib import pipeline
     r3 = {k: np.ones(2) for k in ("r_v_cells", "r_v_delta08_cells", "r_v_ridge_cells")}
     old_set = pipeline.r_v_settings() + np.eye(5)[1]           # another R_V_MAX_SIGMA
@@ -161,8 +161,8 @@ def pure():
 
 
 def custom_redshift():
-    """2026-10-11: a custom snapshot's velocities in Explore get the sqrt(a) of its Gadget header's redshift, as a
-    TNG-layout snapshot's do (custom outputs were always redshift None: u-units, 1/sqrt(a) too large); the Custom tab
+    """A custom snapshot's velocities in Explore get the sqrt(a) of its Gadget header's redshift, as a
+    TNG-layout snapshot's do (redshift None would leave u-units, 1/sqrt(a) too large); the Custom tab
     records the redshift in its sidecar, an older sidecar falls back to the input's header, none = no scaling."""
     import json
     import h5py
@@ -204,7 +204,7 @@ def custom_redshift():
           f"{ {k: o.redshift for k, o in outs.items()} } {vmax}")
 
 
-# ---------------------------------------------------------------------- the Save options (2026-10-14)
+# ---------------------------------------------------------------------- the Save options
 def save_options_pure():
     """figsave's Qt-free parts: the options checked, the presets, the units, the formats, the dpi matching, the box's h."""
     import json
@@ -259,7 +259,7 @@ def save_options_pure():
           and um_c.name == "cells" and np.allclose(um_c.ext([10, 42, 20, 52]), [0, 64, 0, 64])
           and um_u.name == "Mpc" and "h" in note_u and um_n.name == "cells"
           and FS.unit_map(boxed, [0, 1], "mpc")[0].identity and FS.unit_map(boxed, [0, 1], "mpc")[0].x(1.25) == 1.25)
-    # (2026-10-15) the slice position of a saved title in the axes' unit
+    # the slice position of a saved title in the axes' unit
     pos_h, pos_c, pos_u, pos_m = (FS.position(boxed, 2, 16.25, "mpc_h", 0.7), FS.position(boxed, 2, 16.25, "cells"),
                                   FS.position(boxed, 2, 16.25, "mpc_h", None), FS.position(boxed, 2, 16.25, "mpc"))
     check("position: along any axis as the axes convert it (Mpc/h = Mpc x h; cells from the box's low corner, the "
@@ -318,7 +318,7 @@ def save_options_pure():
 
 
 def _old_save_png(x, f):
-    """ExploreControls.save_png as it was before the Save options (2026-10-13), verbatim but for 'self': the reference
+    """ExploreControls.save_png as it was before the Save options, verbatim but for 'self': the reference
     the default save must equal pixel for pixel."""
     import explore as E
     req = x._req
@@ -462,7 +462,7 @@ def saving_map(qa, x, view):
           got["mpc{}"][0] == f"{xn} [Mpc]" and got["mpc_h{}"][0] == f"{xn} [Mpc/h]" and abs(h - 0.6774) < 1e-12
           and np.allclose(got["mpc_h{}"][1], (glo[0] * h, ghi[0] * h)) and got["cells{}"][0] == f"{xn} [cells]"
           and np.allclose(got["cells{}"][1], (0, n0)) and got["mpc{'units': False}"][0] == xn, str(got))
-    # (2026-10-15) the title's slice position in the axes' unit: it said Mpc whatever the axes said
+    # the title's slice position in the axes' unit, not Mpc whatever the axes say
     req = x._req
     an, pos = "xyz"[req["axis"]], float(x._slice_position())
     tt = {}
@@ -508,7 +508,7 @@ def saving_map(qa, x, view):
           "pixels as the data (2026-10-15: 389, resampled), the text around it",
           dpi == FS.DPI_MIN and abs(ext.width - n0) < 0.6 and abs(ext.height - n1) < 0.6 and n0 + 40 < mw < 389,
           f"{dpi} {ext.width} x {ext.height} {mw}")
-    # (2026-10-15) no margins with 'match the data': the map's own pixels, unresampled (as full resolution)
+    # no margins with 'match the data': the map's own pixels, unresampled (as full resolution)
     bm = FS.options({"margins": "none", "match_data": True, "voids": False, "arrows": False})
     w_bm = x.save_png(d / "borderless_match.png", bm)
     blm = _png(d / "borderless_match.png")
@@ -526,7 +526,7 @@ def saving_map(qa, x, view):
           "see-through around the figure", pdf.startswith(b"%PDF") and b"/FontFile2" in pdf and "<text" in svg
           and np.array_equal(_png(d / "map.tif")[..., :3], new[..., :3]) and tr.shape[2] == 4 and tr[0, 0, 3] == 0,
           f"{len(pdf)} {tr.shape}")
-    # (2026-10-15) every TIFF LZW-compressed (it was written uncompressed): the figure (matplotlib), full resolution
+    # every TIFF LZW-compressed: the figure (matplotlib), full resolution
     # (Pillow) and full resolution with the outlines (matplotlib's figimage); the same pixels as uncompressed
     x.save_png(d / "full_voids.tif", dict(bare, voids=True))
     tifs = {}
@@ -549,7 +549,7 @@ def saving_map(qa, x, view):
     check("Slide: every text 1.8 times larger (the title 8 -> 14.4 pt, the axis names 10 -> 18 pt); the long title "
           "wraps instead of running over the colour bar's top label (review)",
           abs(size[0] - 14.4) < 1e-9 and abs(size[1] - 18.0) < 1e-9 and wraps, f"{size} {wraps}")
-    # (2026-10-14, review) a width or dpi far too large is refused BEFORE matplotlib allocates the picture (50 in at
+    # a width or dpi far too large is refused BEFORE matplotlib allocates the picture (50 in at
     # 1200 dpi would be 60000 px across, 12 GB): no file, no figure left open, Save image says why
     import resource
     rss0 = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
@@ -625,7 +625,7 @@ def saving_grid(qa, x, view):
     bl = _png(d / "borderless.png")
     check("margins none: the panels fill the file (2 x 4.2 in by 4.2 in at 100 dpi = 840 x 420); the SVG keeps its "
           "text", bl.shape[:2] == (420, 840) and "<text" in (d / "grid.svg").read_text(errors="replace"), f"{bl.shape}")
-    # ---- (2026-10-15) the title's position in the axes' unit; one unit in every panel; match the data; TIFF
+    # ---- the title's position in the axes' unit; one unit in every panel; match the data; TIFF
     import types
     from PIL import Image
     a, pos = req["position_at"]
@@ -680,7 +680,7 @@ def saving_grid(qa, x, view):
     check("merged: without the colour bar column, the inside labels and the tick labels: two axes, no texts inside, "
           "no tick labels", ok and len(fig.axes) == 2 and not any(ax.texts for ax in fig.axes) and not labels,
           f"{len(fig.axes)} {labels[:3]}")
-    try:                                                    # (2026-10-14, review) the grid's size guard
+    try:                                                    # the grid's size guard
         x.save_grid(d / "too_big.png", FS.options({"width": 30000, "width_unit": "px"}))
         refused = ""
     except FS.TooLarge as e:
@@ -740,7 +740,7 @@ def saving_dialog(qa, x):
     nohub = FS.make_dialog(x, x.save_options, dict(ctx, hubble=None))
     check("without a known h, Mpc/h is not offered", not nohub.unit.model().item(nohub.unit.findData("mpc_h")).isEnabled())
     nohub.deleteLater()
-    # (2026-10-15) Mpc/h remembered, this output's h not known (an opened file, a custom run without an h-free input;
+    # Mpc/h remembered, this output's h not known (an opened file, a custom run without an h-free input;
     # grids.hubble's cached answer faked): the map in Mpc, said in the status line and in the dialog's note, and the
     # remembered choice kept for the outputs that know h
     o, d = x.current, TMP / "save map"
@@ -1034,9 +1034,9 @@ def gui():
 
 
 def fold_map():
-    """Integration item 9 (2026-10-13): Explore's 'caustic (fold) cells' map of a periodic PS run is the exact fold
-    flag, dtfelib.io.caustic_is_fold(class mask, streams=, hidden=) -- the stored '.caustic' of the grids made before
-    2026-10-13 was set only where a folded tetrahedron deposited a sample and missed every fold thinner than the
+    """Explore's 'caustic (fold) cells' map of a periodic PS run is the exact fold
+    flag, dtfelib.io.caustic_is_fold(class mask, streams=, hidden=) -- the stored '.caustic' of older grids
+    is set only where a folded tetrahedron deposited a sample and misses every fold thinner than the
     sampling -- in the map, the click readout and its tooltip; the caustic-class map stays the stored mask."""
     try:
         from PySide6.QtCore import Qt
@@ -1086,9 +1086,9 @@ def fold_map():
         ok = wait_for(qa, lambda: not x._busy and x._req is not None and x._req["field"] == "caustic_class", 30)
         check("... and the caustic-class map stays the stored mask",
               ok and np.array_equal(np.asarray(x._plane), np.take(ccm, x._req["index"], axis=x._req["axis"])))
-        # (2026-10-15) a job running caps the cube cache (1 GB; here 2.5 cubes): the three cubes of the fold map no
-        # longer fit together, so only their planes are read -- each was read whole and they evicted each other, three
-        # 0.5 GB reads per step at 512³. Uncapped (they fit) the cubes are cached as before: stepping stays fast.
+        # a job running caps the cube cache (1 GB; here 2.5 cubes): the three cubes of the fold map do not
+        # fit together, so only their planes are read -- read whole they would evict each other, three
+        # 0.5 GB reads per step at 512³. Uncapped (they fit) the cubes are cached: stepping stays fast.
         real_read, real_run = G._read_plane, G.RUN_CUBE_BYTES
         reads = []
 
@@ -1113,14 +1113,14 @@ def fold_map():
               sorted(reads) == sorted(list(fold_files) * 3) and not (cached & fold_files)
               and all(np.array_equal(p, np.take(want, k_, axis=2).astype(np.float64)) for k_, p in planes)
               and fold_files <= cached_free, f"{sorted(reads)} {cached} {cached_free}")
-        # the exact zoom (load_exact_planes): a new run's grids, one cell thick. Until 2026-10-13 its fold map masked
-        # both parity bits of the 0/1 '.caustic' grid, so it showed no fold cell at all, and its class map showed 0/1
+        # the exact zoom (load_exact_planes): a new run's grids, one cell thick. Its fold map must not mask both
+        # parity bits of the 0/1 '.caustic' grid (that shows no fold cell at all), nor its class map show 0/1
         import types
         zd = TMP / "fold zoom"
         zd.mkdir(parents=True, exist_ok=True)
         zg = (8, 8, 1)
         zc = np.zeros(zg, np.float32)
-        zc[:3] = 1.0                                    # the fold cells (the fixed binary's exact flag)
+        zc[:3] = 1.0                                    # the fold cells (the binary's exact flag)
         zcc = np.full(zg, 1 + 4, np.float32)
         zcc[:3] = 1 + 2 + 8
         for sfx, arr in (("a_den", np.ones(zg, np.float32)), ("caustic", zc), ("causticClass", zcc)):
@@ -1393,13 +1393,13 @@ def mean_field_gui():
         shown()
         x.restore_state(st_)
         back = x.ps_gradient.currentData()
-        x.restore_state({k: v for k, v in st_.items() if k != "ps_gradient"})     # a state saved before 2026-10-15
+        x.restore_state({k: v for k, v in st_.items() if k != "ps_gradient"})     # a state saved before the key existed
         check("9. the choice is remembered (state / restore_state); a state saved before it leaves the choice alone",
               st_.get("ps_gradient") == "stored" and back == "stored" and x.ps_gradient.currentData() == "stored")
         x.ps_gradient.setCurrentIndex(x.ps_gradient.findData("mean-field"))
         shown()
-        # a zoom is a point evaluation: the stream average, said; the zoom line is text (2026-10-15: it showed the
-        # function that writes the window)
+        # a zoom is a point evaluation: the stream average, said; the zoom line is text (not the function that
+        # writes the window)
         ax_ = x.axis.currentIndex()
         shp = [8, 8, 8]
         shp[ax_] = 1
@@ -1432,7 +1432,7 @@ def mean_field_gui():
 
 
 def keep_slice():
-    """7. (2026-10-14, Luuk's request) switching the output or the redshift keeps the slice (the axis and the place in
+    """7. switching the output or the redshift keeps the slice (the axis and the place in
     the box, at the nearest cell of the new grid) and the zoom window; switching the simulation resets both."""
     try:
         from PySide6.QtWidgets import QApplication
@@ -1534,7 +1534,6 @@ def keep_slice():
               ok and x.current.sim == SIM and x.current.snap == 99 and at() == (0, N // 2), f"{at()}")
 
         # ---- the zoom window: kept across outputs and redshifts where it can be shown, said where it cannot
-        o99 = x.current
         f99 = fields(3.0)
         x._zoomed(zoom_req(), f99)                        # a zoom of snapshot 099 lands (and is remembered)
         z99 = x.is_zoomed() and x._zoom_fields is f99
@@ -1550,7 +1549,7 @@ def keep_slice():
         check("7. ... back on the snapshot zoomed: its zoom of the window, from memory",
               ok and x.is_zoomed() and x._zoom_fields is f99 and x._zoom["a0"] == (20.0, 30.0)
               and x._zoom["a1"] == (40.0, 50.0) and x.zoom_time.text() == "from memory", x.zoom_state.text())
-        import figsave as FS                              # (2026-10-15) a saved zoom's title in the axes' unit
+        import figsave as FS                              # a saved zoom's title in the axes' unit
         h99, z = G.hubble(x.current), x._zoom
         zt = x._map_title(lambda a_, v_: FS.position(x.current, a_, v_, "mpc_h", h99))
         r0, r1 = (E.AXES[k] for k in z["rest"])
@@ -1580,7 +1579,7 @@ def keep_slice():
             x._server_running, x._server_output = False, None
             x._to_zoom.disconnect(spy)
             x._to_zoom.connect(x._server.zoom)
-        # 'exact' ticked: a switch never starts an exact run nor asks about one (review 2026-10-14: stepping through
+        # 'exact' ticked: a switch never starts an exact run nor asks about one (stepping through
         # redshifts would otherwise ask, or run PS-DTFE over a whole snapshot, at every step); a drag does
         calls, asked = [], []
         x._exact_zoom = lambda *a: calls.append(a)

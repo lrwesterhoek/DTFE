@@ -44,9 +44,8 @@ MODE="snapshot"                   # 'snapshot' or 'groupcat' (-c)
 # short default list from config.sh with the full redshift ladder.
 SNAPSHOTS=(1 2 3 4 5 8 13 17 21 25 33 40 50 67 72 78 84 91 99)
 
-# The key travels in a header: https only (it went over plain http until 2026-10-06). Every failed
-# fetch is counted and the exit status says so -- a wget that fails left the script exiting 0 and the
-# launcher reading "Download complete!".
+# The key travels in a header: https only. Every failed fetch is counted and the exit status says so --
+# otherwise a wget that fails would leave the script exiting 0 and the launcher reading "Download complete!".
 errors=0
 finish() {
     echo ""
@@ -59,7 +58,7 @@ finish() {
 }
 
 # A chunk left half-written by a stopped download is skipped by wget -nc for ever, and a merge of it
-# would be a snapshot with missing particles (merge_HDF5.py refuses that now): before fetching, drop
+# would be a snapshot with missing particles (merge_HDF5.py refuses that): before fetching, drop
 # the files of this product that HDF5 calls truncated or signature-less, or that are too small to be
 # a chunk at all (< 4 KB; the SAME two rules as merge_HDF5.py's _is_incomplete -- keep them in step)
 # -- only those (a lock or a permission error keeps the file) and only when nothing wrote them in the
@@ -144,21 +143,9 @@ while getopts "k:d:s:ctih" opt; do
     esac
 done
 shift $((OPTIND - 1))
+require_simulation
 
-# Any remaining positional arguments override the default snapshot list.
-if [ "$#" -gt 0 ]; then
-    SNAPSHOTS=("$@")
-fi
-# Snapshot numbers as decimal: bash's printf reads a leading zero as OCTAL, so '010' became 008 and '099'
-# an error (then 000) -- the folders are named snapdir_0NN, so typing them that way is natural (2026-10-05).
-for _k in "${!SNAPSHOTS[@]}"; do
-    _s="${SNAPSHOTS[$_k]}"
-    if ! [[ "${_s}" =~ ^[0-9]+$ ]]; then
-        echo "Error: snapshot '${_s}' is not a number." >&2
-        exit 2
-    fi
-    SNAPSHOTS[$_k]=$((10#${_s}))
-done
+snapshot_args "$@"              # positional arguments override the default snapshot list (config.sh)
 
 if [ -z "${API_KEY}" ]; then
     echo "Error: an API key is required (-k, TNG_API_KEY, or ~/.tng_api_key)." >&2

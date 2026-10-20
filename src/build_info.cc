@@ -17,7 +17,7 @@
 char const *dtfeBuildRevision() { return DTFE_BUILD_REV; }
 char const *dtfeBuildTime()     { return DTFE_BUILD_TIME; }
 
-// true in the programs, which link this file (2026-10-13). partition_checkpoint.h checkpoints a partition loop only
+// true in the programs, which link this file. partition_checkpoint.h checkpoints a partition loop only
 // there: the checkpoint folder is removed once main.cpp has committed the outputs (output_staging.h), which a
 // libDTFE host program never does, so a library run would leave it behind. The header's weak fallback says false.
 bool dtfeIsProgram() { return true; }

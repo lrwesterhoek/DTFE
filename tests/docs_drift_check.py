@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Docs-drift check (2026-10-11): what README.md and demo/COMMANDS.md tell a user to type must exist in the code,
+"""Docs-drift check: what README.md and demo/COMMANDS.md tell a user to type must exist in the code,
 and the knobs the drivers read must be documented somewhere a user looks.
 
   A) every '--flag' in README.md / demo/COMMANDS.md is an option of the binaries (src/user_options.cc's
@@ -7,7 +7,7 @@ and the knobs the drivers read must be documented somewhere a user looks.
   B) every DTFE_* name in them is read somewhere in the code;
   C) the README knob table: each knob it names is a knob of scripts/config.sh / run_ps_dtfe.sh / run_dtfe.sh (or
      an environment variable the code reads), and where the table gives a plain value as the default it equals
-     the scripts' 'VAR="${VAR:-default}"' (the table once said GRID_SIZE 512 where config.sh had 1024);
+     the scripts' 'VAR="${VAR:-default}"';
   D) the other way round: every knob of the drivers and the pipeline, and every DTFE_* variable that
      scripts/config.sh or python/config.py reads, is named in README.md, demo/COMMANDS.md or a script's --help
      header (the comment block a script's --help prints).

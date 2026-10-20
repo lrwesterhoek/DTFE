@@ -68,9 +68,8 @@ void applyInterlacing(std::vector<Real> &field1,
        its transform carries exp(+i k.dx/2); undone by exp(-i k.dx/2) = exp(-i pi sum_d m_d/n_d) with
        m_d the SIGNED frequency. FFTW keeps a full axis's negative frequencies at index > n/2 (m =
        index - n; the Nyquist index counted negative, as the T-web's kFull); the last axis is the half
-       spectrum, index = m >= 0. Before 2026-10-02 the raw index was used on every axis: the phase was off
-       by pi for half the modes, which flipped the sign of their correction (tests/interlacing_check.sh:
-       a band-limited field came back 31% wrong). */
+       spectrum, index = m >= 0. The raw index on every axis would put the phase off by pi for half the
+       modes, flipping the sign of their correction (tests/interlacing_check.sh). */
     for (size_t c = 0; c < Ncomplex; ++c)
     {
         size_t rem = c;

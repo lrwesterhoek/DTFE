@@ -9,16 +9,16 @@
 //
 //  Two kernels share that arithmetic:
 //    depositAveraged1       one thread per tetrahedron, one atomic per field per SAMPLE (the
-//                           original; kept for A/B runs, DTFE_GPU_ITEMS=0).
+//                           kernel kept for A/B runs, DTFE_GPU_ITEMS=0).
 //    depositAveraged1Items  one thread per WORK ITEM = (tetrahedron, run of at most
 //                           itemSamples samples; implicit, see itemOf), with a small per-thread cell cache that
 //                           sums the samples landing in the same grid cell and issues one
 //                           atomic per field per distinct CELL. On fine grids (512^3 and up)
 //                           most tetrahedra span several cells with hundreds of samples
-//                           each, so the per-sample kernel issued hundreds of atomics per
+//                           each, so the per-sample kernel issues hundreds of atomics per
 //                           tetrahedron -- 54 G atomics for 7.1M particles on 512^3, 10x
 //                           slower than the CPU's plain '+=' -- and its unbounded per-thread
-//                           loops (up to maxNN = 10000 samples) tripped the GPU watchdog.
+//                           loops (up to maxNN = 10000 samples) trip the GPU watchdog.
 //                           Items bound the work per thread, so the chunked dispatch stays
 //                           uniform, and the cache cuts the atomics to about one set per
 //                           cell a tetrahedron covers. The samples, their positions and
@@ -30,14 +30,14 @@
 //  Remaining CPU/GPU differences are float rounding (double vertex differences on the
 //  CPU) and, with DTFE_METAL_FLOAT_GRIDS=1 only, atomic summation order.
 //
-//  Exact sums (2026-10-13). The grids are 64-bit FIXED-POINT sums by default (DepositParams.fixedSum,
+//  Exact sums. The grids are 64-bit FIXED-POINT sums by default (DepositParams.fixedSum,
 //  the phase-space mass grid's scheme, metal/ps_deposit.metal depositMass): every share becomes the
 //  integer rint(share * scale) and is added in two 32-bit words with the carry done by hand, so a cell's
-//  total does not depend on the order the atomics land in, and two runs write byte-identical grids. The
-//  float atomics of before changed 26-49% of the cells run to run (up to 1e-6, the 2026-10-13 audit).
+//  total does not depend on the order the atomics land in, and two runs write byte-identical grids.
+//  Float atomics change 26-49% of the cells run to run (up to 1e-6).
 //  Integer sums alone are not enough: the item kernel also sums in float BEFORE its atomics -- the
 //  SIMD-group reduction of a flush, the threadgroup cell table -- and which items share a SIMD group
-//  moved with the chunk boundaries, which the dispatch controller sets from the elapsed time. So (a)
+//  moves with the chunk boundaries, which the dispatch controller sets from the elapsed time. So (a)
 //  the host starts every chunk at a multiple of 256 items (dtfe_metal_host.cc runBatch): a SIMD group is
 //  then always the same 32 items, its simd_sum the same float; (b) every value is converted where it
 //  leaves a thread or a SIMD group (the leader's sums, an eviction, a per-sample or per-piece deposit),
@@ -45,7 +45,7 @@
 //  sum of |share| that the host computes before the upload, so no cell can overflow
 //  (src/CGAL_triangulation/dtfe_gpu_fixed.h batchFixedScales). DTFE_METAL_FLOAT_GRIDS=1
 //  (DTFE_GPU_FLOAT_GRIDS=1) keeps the float atomics for A/B, as does the opt-in shared full grid
-//  (DTFE_GPU_SHARED=1). Measured cost (2026-10-13, 0.26M particles at 256^3 on a GPU shared with another
+//  (DTFE_GPU_SHARED=1). Measured cost (0.26M particles at 256^3 on a GPU shared with another
 //  run, so indicative): the exact-average kernel none; the item kernel 1.6-1.9x for density + velocity
 //  (the integer table holds half the entries and every value takes two atomics), 10-15% with the velocity
 //  gradient, 0-15% for the density alone.
@@ -71,15 +71,15 @@ constant bool FC_GRAD [[function_constant(2)]];
 // constant. Grids: buffer 14 (nCell) and 15 (nCell*3, [flat*3+i] = ds/dx_i).
 constant bool FC_SCAL  [[function_constant(3)]];
 constant bool FC_SGRAD [[function_constant(4)]];
-// the exact sums (2026-10-13, P.fixedSum): the item pipelines are specialized on the mode too -- one kernel
-// carrying both paths took registers from the float one (threads per threadgroup 832 -> 704 for density +
+// the exact sums (P.fixedSum): the item pipelines are specialized on the mode too -- one kernel
+// carrying both paths would take registers from the float one (threads per threadgroup 832 -> 704 for density +
 // velocity), and the host builds the pipeline matching the batch's P.fixedSum anyway
 constant bool FC_FIXED [[function_constant(5)]];
 
 // A batch = one sub-domain's tetrahedra. Positions are relative to the SUB-DOMAIN's lower corner
 // and nGrid is its sub-grid (so the cell classification is the CPU loop's, bit for bit); a sample
 // inside the sub-grid is owned by this batch and lands at full-grid cell pos + subOff. With
-// subOff = 0 and fullGrid = nGrid this is the original single-grid deposit.
+// subOff = 0 and fullGrid = nGrid this is the plain single-grid deposit.
 struct DepositParams {
     float dx[3];
     int   nGrid[3];      // the batch's sub-grid: samples outside [0, nGrid) are not this batch's
@@ -97,7 +97,7 @@ struct DepositParams {
     uint  tableEntries;  // item kernel: entries of the threadgroup cell table (a power of two; 0 = none)
     int   fScal;         // deposit the scalar (per-tet kernel; the item kernels use FC_SCAL)
     int   fSGrad;        // deposit the scalar gradient (per-tet kernel; the item kernels use FC_SGRAD)
-    // 2026-10-13: the grids as exact 64-bit fixed-point sums (see the header). fixedSum = 1: every grid's
+    // the grids as exact 64-bit fixed-point sums (see the header). fixedSum = 1: every grid's
     // shares go to its two-word integer buffer (16..20) in units of 1/fxScale[g]; 0: the float atomics into
     // buffers 7/8/9/14/15. The host binds ONE buffer per grid at both indices (sized for the mode in use).
     uint  fixedSum;
@@ -112,12 +112,12 @@ struct DGrids {
     device atomic_float* scal; device atomic_float* sg;
     device atomic_uint*  denX; device atomic_uint*  velX; device atomic_uint*  gradX;
     device atomic_uint*  scalX; device atomic_uint* sgX;
-    device atomic_uint*  bad;   // 2026-10-15: the non-finite guard's counters, one word per grid (buffer 21, fxq)
+    device atomic_uint*  bad;   // the non-finite guard's counters, one word per grid (buffer 21, fxq)
 };
 
 // A share in fixed-point units: rint(v * scale). scale is 2^k, so the float product is exact (barring
 // overflow, which the host's bound rules out) and rint rounds to nearest even -- the integer the host
-// would compute (ps_deposit_params.h psMassFixedShare). The non-finite guard (2026-10-15; ps_deposit_params.h
+// would compute (ps_deposit_params.h psMassFixedShare). The non-finite guard (ps_deposit_params.h
 // psFixedShareOk says why, metal/ps_deposit.metal fixedShareOk is the same test): a product not below 2^63 in
 // magnitude -- NaN, inf, an overflow -- has no int64 (the conversion is unspecified there); it gives 0, which every
 // add below skips, and is counted in its grid's word of 'bad'. The float's bits are tested (fast math cannot fold
@@ -134,7 +134,7 @@ static inline ulong fxq(float v, float scale, device atomic_uint* bad, uint slot
 // wrapped iff the result is below it), the high words add modulo 2^32, so once every thread is done the words
 // hold the exact sum, whatever the interleaving. The words stay separate on purpose: rebuilding a ulong from two
 // threadgroup atomic loads (the table flush) crashed the Metal compiler service (XPC_ERROR_CONNECTION_INTERRUPTED,
-// macOS 27, 2026-10-13) when it built the item pipelines.
+// macOS 27) when it built the item pipelines.
 static inline void addWordsLH(device atomic_uint* g, ulong at, uint lo, uint hi) {
     if (lo == 0u && hi == 0u) return;
     uint const old = atomic_fetch_add_explicit(&g[at * 2ul], lo, memory_order_relaxed);
@@ -216,8 +216,8 @@ static inline void inverse3zero(thread const float A[3][3], thread float inv[3][
 }
 
 // One deposit of (den, vel, gradFlat) * w into grid cell 'flat'. Offsets are 64-bit BECAUSE
-// flat*9 WOULD overflow a 32-bit uint above ~782^3 (learned in the PS deposit) -- already
-// fixed, do not re-derive. The 2^32-cell cap on 'flat' is guarded in averaged_interpolation_1.cc.
+// flat*9 WOULD overflow a 32-bit uint above ~782^3 (as in the PS deposit). The 2^32-cell cap
+// on 'flat' is guarded in averaged_interpolation_1.cc.
 static inline void depositCell(thread const DGrids& G,
                                constant DepositParams& P,
                                ulong flat, float den,
@@ -260,7 +260,7 @@ kernel void depositAveraged1(
     device atomic_uint*     gradX    [[buffer(18)]],
     device atomic_uint*     scalX    [[buffer(19)]],
     device atomic_uint*     sgX      [[buffer(20)]],
-    device atomic_uint*     badX     [[buffer(21)]],   // 2026-10-15: the non-finite guard's counters (DGrids.bad)
+    device atomic_uint*     badX     [[buffer(21)]],   // the non-finite guard's counters (DGrids.bad)
     uint tid [[thread_position_in_grid]])
 {
     if (tid >= P.nTet) return;
@@ -455,10 +455,10 @@ static inline uint3 itemOf(device const uint* itemStart, device const uint* bloc
 // gradient sums vG * w directly (nine floats per entry), since entries mix tetrahedra. A full
 // probe sequence falls back to the direct device atomics of flushSlot. Layout per entry:
 // key, den, vx, vy, vz, [g0..g8]; the host sizes the memory per pipeline (grad or not).
-// Under FC_FIXED (2026-10-13, the pipelines of P.fixedSum) the values are two-word integers (tValsX,
+// Under FC_FIXED (the pipelines of P.fixedSum) the values are two-word integers (tValsX,
 // threadgroup(2): value v of an entry is words [2v] low, [2v+1] high; tVals is then a 16-byte dummy): a
-// float table summed the evictions of a threadgroup's threads in the order they ran, so the exact grids
-// would have inherited that order. The integer table halves the entries that fit the 32 KB.
+// float table sums the evictions of a threadgroup's threads in the order they run, so the exact grids
+// would inherit that order. The integer table halves the entries that fit the 32 KB.
 // ---------------------------------------------------------------------------------------
 #define TABLE_EMPTY 0xffffffffu
 #define TABLE_PROBES 8u

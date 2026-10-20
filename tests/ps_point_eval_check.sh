@@ -50,9 +50,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# python with a working h5py (plain python3 resolves to a broken x86_64 h5py on this machine)
-PY="${PYTHON:-python3}"
-command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/python3.14
 ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT}"
 source "${SCRIPT_DIR}/precision.sh"     # DTFE_TEST_PRECISION=double: the double pair
@@ -74,12 +71,7 @@ echo "============================================================"
 echo " PS-DTFE point-evaluation check   N=${N}^3  grid=${GRID}^3"
 echo "============================================================"
 
-if [ "${1:-}" != "--no-build" ] && ! precision_double; then
-    echo ">> building PS-DTFE ..."
-    # respect the current build mode (o_ps/.build_mode: METAL=1 / empty)
-    BUILD_MODE="$(cat o_ps/.build_mode 2>/dev/null || true)"
-    make PS-DTFE ${BUILD_MODE:+"$BUILD_MODE"} >/dev/null
-fi
+build_target "${1:-}" PS-DTFE o_ps
 [ -x "${BIN}" ] || { echo "FAIL: ${BIN} not built"; exit 1; }
 
 echo ">> generating test snapshots + sample points (all ${GRID}^3 cell centres) ..."
@@ -109,11 +101,7 @@ run() {  # $1 = output root, rest = extra args
         --input 105 --MpcUnit 1 --verbose 1 > "$log" 2>&1
     local rc=$?
     set -e
-    if [ "$rc" -ne 0 ]; then
-        echo "   ERROR: PS-DTFE exited with code $rc -- last 25 lines of $log:"
-        tail -n 25 "$log" | sed 's/^/      | /'
-        exit 1
-    fi
+    die_on_failed_run "$rc" "$log"
 }
 
 echo ">> run 1: uniform box, 'geometric', --per-stream"

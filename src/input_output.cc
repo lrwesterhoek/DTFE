@@ -105,7 +105,7 @@ FunctionReadInputData chooseInputDataReadFunction(int const inputFileType)
 
 // The quickstart footgun: the build's default input type is 105 (Gadget HDF5, Makefile
 // INPUT_FILE_DEFAULT), but a plain binary Gadget snapshot (type 101, e.g. demo/z0_64.gadget)
-// is not an HDF5 file, so the HDF5 open used to die with an opaque H5 exception. A real HDF5
+// is not an HDF5 file, so the HDF5 open would die with an opaque H5 exception. A real HDF5
 // file always begins with the 8-byte HDF5 signature; a binary Gadget file begins with a
 // Fortran record marker (256 for type 1, 8 for type 2, either endianness). Redirect exactly
 // that case to the binary Gadget reader; anything else keeps the requested type.
@@ -264,7 +264,7 @@ void readInputData(std::vector<Particle_data> *p,
                 snprintf(buf, sizeof(buf), "/PartType%d", type);
                 H5::Group grp = lagFile.openGroup(buf);
 
-                // the shapes, before reading into buffers sized N*NO_DIM / N (gadget_reader_HDF5.cc, 2026-10-11)
+                // the shapes, before reading into buffers sized N*NO_DIM / N (gadget_reader_HDF5.cc)
                 H5::DataSet coordDS = grp.openDataSet("Coordinates");
                 HDF5_checkParticleDataset(coordDS, buf, "Coordinates", chunkHeader.npart[type], NO_DIM, fn.c_str());
                 coordDS.read(&lagCoords[lagOffset * NO_DIM], H5::PredType::NATIVE_FLOAT);

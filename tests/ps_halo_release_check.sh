@@ -18,9 +18,9 @@
 #     deposit guarantees) and float-rounding FP fields. A cell holding a RELEASED tet carries
 #     its volume fraction, a float32 sum whose order depends on the deposit-thread split and on
 #     the order the concurrent partitions merge in, so those cells are held to a few ulps only
-#     (one cell in 262144 differed by one ulp in one run of six; the same run with
+#     (one cell in 262144 differs by one ulp in about one run of six; the same run with
 #     --max-concurrent 1 splits each partition's deposit over all threads and moves 1100 cells
-#     by <= 1e-6). Serial-vs-partitioned keeps the KNOWN pre-existing +-1-stream centroid-cell
+#     by <= 1e-6). Serial-vs-partitioned keeps the KNOWN +-1-stream centroid-cell
 #     edge at periodic faces, so it is not asserted bit-exact here.
 #  D) GPU parity (GPU builds): the GPU deposit classifies kept/released identically
 #     (equal released counts) and matches the CPU deposit within the usual tolerances.
@@ -30,8 +30,6 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PY="${PYTHON:-python3}"
-command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/python3.14
 ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT}"
 source "${SCRIPT_DIR}/precision.sh"     # DTFE_TEST_PRECISION=double: the double pair
@@ -48,18 +46,14 @@ echo "============================================================"
 echo " PS-DTFE --ps-halo-release check   N=${N}^3  grid=${GRID}^3  D=${D}"
 echo "============================================================"
 
-if [ "${1:-}" != "--no-build" ] && ! precision_double; then
-    echo ">> building PS-DTFE ..."
-    BUILD_MODE="$(cat o_ps/.build_mode 2>/dev/null || true)"
-    make PS-DTFE ${BUILD_MODE:+"$BUILD_MODE"} >/dev/null
-fi
+build_target "${1:-}" PS-DTFE o_ps
 [ -x "${BIN}" ] || { echo "FAIL: ${BIN} not built"; exit 1; }
 GPU_BUILT=0
 [ -f o_ps/.gpu_mode_off ] || GPU_BUILT=1
 
 # capture FIRST -- piping the binary straight into grep -q would SIGPIPE it under pipefail
 # a help that fails is a broken binary, not a missing feature; a missing feature fails under DTFE_TEST_REQUIRED=1
-# (skip_or_fail, tests/precision.sh: 2026-10-08)
+# (skip_or_fail, tests/precision.sh)
 FULL_HELP="$("${BIN}" --full_help 2>/dev/null)" || { echo "FAIL: ${BIN} --full_help exited non-zero"; exit 1; }
 if ! grep -q -- '--ps-halo-release' <<<"${FULL_HELP}"; then
     skip_or_fail "this PS-DTFE has no --ps-halo-release support."
@@ -82,11 +76,7 @@ run() {  # $1 = threads, $2 = output root, $3 = input snapshot, rest = extra fla
         --field density velocity density_a --input 105 --MpcUnit 1 --verbose 2 "$@" > "$log" 2>&1
     local rc=$?
     set -e
-    if [ "$rc" -ne 0 ]; then
-        echo "   ERROR: PS-DTFE exited with code $rc -- last 25 lines of $log:"
-        tail -n 25 "$log" | sed 's/^/      | /'
-        exit 1
-    fi
+    die_on_failed_run "$rc" "$log"
 }
 
 echo ">> run 1: pancake, base deposit"

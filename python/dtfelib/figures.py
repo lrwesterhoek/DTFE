@@ -10,6 +10,7 @@ from pathlib import Path
 
 import matplotlib as mpl
 import config
+from .cli import require_sim
 
 CMAP = {
     'density': 'plasma',
@@ -223,8 +224,8 @@ def robust_vmax(data):
 def symmetric_limits(data, pct=None):
     """(-m, m) for a diverging map centred on 0 (a divergence, an eigenvalue): m = the 'pct' (default
     config.PERCENTILE_CLIP[1]) percentile of the finite |values|; (-1, 1) when the slice is empty or all
-    zero, so imshow never gets vmin == vmax. A percentile pair (1, 99) of the signed values put 0 off
-    centre whenever the slice was skewed (plot_DTFE's divergence map, found 2026-10-05)."""
+    zero, so imshow never gets vmin == vmax. A percentile pair (1, 99) of the signed values would put 0 off
+    centre whenever the slice is skewed (plot_DTFE's divergence map)."""
     a = _finite(data)
     m = float(_np.percentile(_np.abs(a), config.PERCENTILE_CLIP[1] if pct is None else pct)) if a.size else 0.0
     if not m > 0 and a.size:            # a MOSTLY-zero slice: its percentile is 0, its few values are not
@@ -268,8 +269,8 @@ def delta_contour_levels(field_slice, norm, num_contours=20):
 def mirror_relative_path(primary_path) -> str:
     """Where a figure goes below the thesis Figures/ tree: its path below config.LOCAL_FIGURES_ROOT (read at
     call time) when it lies under it, else below its first 'figures/' folder, else its bare name. The root
-    comes first since 2026-10-07: DTFE_FIGURES_ROOT may name any folder, and under one without '/figures/' in
-    its path (the T7 default was briefly 'DTFE figures') the folder test alone dropped every mirrored file flat
+    comes first: DTFE_FIGURES_ROOT may name any folder, and under one without '/figures/' in
+    its path the folder test alone would drop every mirrored file flat
     into Figures/, simulations' names colliding."""
     p = Path(primary_path).expanduser()
     try:
@@ -280,12 +281,12 @@ def mirror_relative_path(primary_path) -> str:
     return s.split('/figures/', 1)[1] if '/figures/' in s else p.name
 
 
-# The thesis mirror's guard (2026-10-08). The thesis scripts name their figures without the simulation or the
+# The thesis mirror's guard. The thesis scripts name their figures without the simulation or the
 # estimator (config.figures_path), so a run on another box, or on PS-DTFE grids (FieldSet's auto-detect picks them
-# whenever they are there, as on the T7), replaced the thesis's TNG50-3-Dark standard-DTFE figures under the same
-# names. Those folders now take a figure only when the run is on config.THESIS_SIMULATION and every grid set the
+# whenever they are there, as on the T7), would replace the thesis's TNG50-3-Dark standard-DTFE figures under the same
+# names. Those folders take a figure only when the run is on config.THESIS_SIMULATION and every grid set the
 # script noted (note_source) is config.THESIS_METHOD's default one. The per-simulation folders (void_profiles/<sim>/,
-# web_streams/<sim>/, ...) cannot collide and mirror as before. DTFE_NO_MIRROR (analyze.py --no-mirror) turns every
+# web_streams/<sim>/, ...) cannot collide and mirror unguarded. DTFE_NO_MIRROR (analyze.py --no-mirror) turns every
 # mirror off.
 _SOURCES = set()            # (simulation, method, prefix) of the grids this process's thesis figures are made from
 _SAID = set()               # each refusal is said once per process, not once per figure
@@ -296,7 +297,7 @@ def note_source(fs):
     """A thesis script's data: the FieldSet (a pipeline product's .fs) its figures are made from. Its snapshot
     folder's parent names the simulation; the method and the prefix say which grids were read."""
     snapdir = getattr(fs, 'snapdir', None)
-    sim = Path(snapdir).parent.name if snapdir is not None else str(config.SIMULATION)
+    sim = Path(snapdir).parent.name if snapdir is not None else require_sim(config.SIMULATION)
     _SOURCES.add((sim, str(getattr(fs, 'method', '')), str(getattr(fs, 'prefix', ''))))
 
 
@@ -323,8 +324,8 @@ def save_plot_to_multiple_paths(fig, primary_path, dpi=300, mirror=True, **kwarg
     (config.THESIS_FIGURES_DIR, read at call time), preserving its path below the figure root
     (mirror_relative_path). mirror=False saves the primary path only: a script run with --out (a path outside
     the figure root) would otherwise drop its files FLAT into the thesis tree's root, where simulations' names
-    collide (review 2026-10-05). A figure in one of config.THESIS_NAMED_DIRS is mirrored only when
-    thesis_mirror_refusal() has no objection (2026-10-08), and the refusal is said."""
+    collide. A figure in one of config.THESIS_NAMED_DIRS is mirrored only when
+    thesis_mirror_refusal() has no objection, and the refusal is said."""
     primary_path = Path(primary_path)
     primary_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(primary_path, dpi=dpi, **kwargs)
@@ -349,15 +350,14 @@ def save_plot_to_multiple_paths(fig, primary_path, dpi=300, mirror=True, **kwarg
     fig.savefig(additional_path, dpi=dpi, **kwargs)
 
 
-# ---------------------------------------------------------------- slice maps in the house style (survey item 11, 2026-10-05)
-# plot_DTFE.py, plot_PS_DTFE.py and plot_cosmic_web.py drew their maps by hand: matplotlib's default sans
-# font, titles that ignored SHOW_TITLES, colour maps and ranges as literals, three private copies of the
-# axis-label and DPI constants. They are thin calls of slice_map / slice_row now. The scripts keep their
-# transposes (the data is passed rows-as-vertical, as imshow wants it), their file names and their choices
-# of which maps to write; the look changed in four stated ways: serif text and no titles (SHOW_TITLES),
-# lowercase axis letters from config.SLICE_PLANES, ONE rule per quantity (the web colours of
-# plot_cosmic_web, the eigenvalue triptychs on norm_signed_log at the field's linthresh), and the
-# density/streams colour floors (set_bad / set_under at the map's lowest colour) applied by both scripts.
+# ---------------------------------------------------------------- slice maps in the house style
+# plot_DTFE.py, plot_PS_DTFE.py and plot_cosmic_web.py draw their maps as thin calls of slice_map / slice_row,
+# sharing one font, SHOW_TITLES, the colour maps and ranges, and the axis-label and DPI constants. The scripts keep
+# their transposes (the data is passed rows-as-vertical, as imshow wants it), their file names and their choices of
+# which maps to write; the house style is: serif text and no titles (SHOW_TITLES), lowercase axis letters from
+# config.SLICE_PLANES, ONE rule per quantity (the web colours of plot_cosmic_web, the eigenvalue triptychs on
+# norm_signed_log at the field's linthresh), and the density/streams colour floors (set_bad / set_under at the map's
+# lowest colour) applied by both scripts.
 from .io import STREAM_TOL as _STREAM_TOL
 
 MAP_LABELS = {

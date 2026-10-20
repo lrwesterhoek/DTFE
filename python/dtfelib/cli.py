@@ -2,10 +2,11 @@
 
 Every script gains the same flags so the whole pipeline is method- and snapshot-agnostic:
 
-    python3 plot/plot_PS_DTFE.py                        # defaults: TNG50-4-Dark, snap 99, auto
-    python3 plot/plot_PS_DTFE.py --method dtfe
-    python3 plot/plot_PS_DTFE.py --snap 50 --smooth 1.5
-    python3 plot/plot_PS_DTFE.py --sim TNG50-3-Dark --raw
+    python3 plot/plot_PS_DTFE.py --sim TNG50-3-Dark                # snap 99, method auto
+    python3 plot/plot_PS_DTFE.py --sim TNG50-3-Dark --method dtfe
+    DTFE_SIM=TNG100-3-Dark python3 plot/plot_PS_DTFE.py --snap 50 --smooth 1.5
+
+There is no default simulation: every run names it, with --sim or DTFE_SIM (require_sim).
 
 Scripts call make_fieldset() and get a ready FieldSet plus the parsed args for their own
 extra options (pass extra=... to register script-specific flags on the same parser).
@@ -23,11 +24,29 @@ from .io import FieldSet
 # root is the Samsung T7, which groups simulations by family (Illustris TNG/TNG100/TNG100-3-Dark);
 # sim_dir() resolves that layout and the flat one (e.g. DTFE_DATA_ROOT=~/output).
 DATA_ROOT = Path(os.environ.get("DTFE_DATA_ROOT", "/Volumes/Samsung T7/Illustris TNG"))
-DEFAULT_SIM = os.environ.get("DTFE_SIM", "TNG50-4-Dark")
+
+
+class NoSimulation(ValueError):
+    """No simulation was named: there is no default, a run gives --sim NAME or DTFE_SIM=NAME."""
+
+
+def require_sim(sim: str | None = None) -> str:
+    """The simulation to work on: 'sim' when given, else $DTFE_SIM. There is no default; without either this raises
+    NoSimulation, naming both ways to give one and the simulations found under DATA_ROOT."""
+    sim = sim or os.environ.get("DTFE_SIM")
+    if sim:
+        return sim
+    try:
+        found = find_sims(DATA_ROOT) if DATA_ROOT.is_dir() else []
+    except OSError:
+        found = []
+    raise NoSimulation("no simulation given: pass --sim NAME or set DTFE_SIM=NAME"
+                       + (f" (under {DATA_ROOT}: {', '.join(found)})" if found else ""))
+
 # Where every figure goes (config.LOCAL_FIGURES_ROOT, the launcher's figure browser): DTFE_FIGURES_ROOT, else
-# the T7 while it is mounted (since 2026-10-06; python/figures had grown to 8.8 GB inside iCloud), else
+# the T7 while it is mounted (python/figures inside iCloud reaches 8.8 GB), else
 # python/figures. On the T7 it is a folder INSIDE the user's 'Illustris TNG': the volume root is root's (APFS with
-# owners), so the first choice, '/Volumes/Samsung T7/DTFE figures', could not be created (2026-10-07). NOT derived
+# owners), so a folder at the volume root, '/Volumes/Samsung T7/DTFE figures', cannot be created. NOT derived
 # from DATA_ROOT: the launcher hands its data root only to the scripts it runs, so the launcher and its scripts
 # would look in different places. The tests set DTFE_FIGURES_ROOT to a temp dir.
 _T7_DATA = Path("/Volumes/Samsung T7/Illustris TNG")
@@ -77,8 +96,9 @@ def make_parser(description: str = "") -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=description)
     p.add_argument("--data-root", type=Path, default=DATA_ROOT,
                    help=f"simulation output root (default {DATA_ROOT})")
-    p.add_argument("--sim", default=DEFAULT_SIM,
-                   help=f"simulation name (default {DEFAULT_SIM})")
+    env_sim = os.environ.get("DTFE_SIM")
+    p.add_argument("--sim", default=env_sim, required=not env_sim,
+                   help="simulation name (required unless DTFE_SIM is set; there is no default)")
     p.add_argument("--snap", type=int, default=DEFAULT_SNAP,
                    help=f"snapshot number (default {DEFAULT_SNAP})")
     p.add_argument("--method", choices=("auto", "ps", "dtfe"), default="auto",
@@ -93,7 +113,7 @@ def make_parser(description: str = "") -> argparse.ArgumentParser:
     return p
 
 
-# The PS-DTFE velocity-gradient family a figure script uses (2026-10-13): the scripts that set PS beside standard DTFE
+# The PS-DTFE velocity-gradient family a figure script uses: the scripts that set PS beside standard DTFE
 # or linear theory -- plot_velDiv_den, plot_cosmic_web, plot_web_streams, plot_shear_triaxial, plot_DTFE,
 # plot_halo_tracking -- read PS's divergence / shear / vorticity / gradient / V-web as the MEAN FIELD by default,
 # the quantity standard DTFE stores (FieldSet.load(name, mean_field=True); dtfelib/fields.py), and '--ps-gradient

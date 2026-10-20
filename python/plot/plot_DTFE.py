@@ -6,7 +6,7 @@ plotted MEAN-NORMALIZED (rho/rho_bar, identical colorbars for both estimators;
 FieldSet auto-detects the on-disk convention). --method defaults to
 'dtfe' (this is the standard-DTFE plot script); pass --method ps to plot the PS-DTFE
 versions of the same fields -- the divergence and the shear of PS's MEAN flow by default
-(2026-10-13; derived from its velocity grid, the quantities standard DTFE stores),
+(derived from its velocity grid, the quantities standard DTFE stores),
 '--ps-gradient stored' for the PS binary's stream-averaged grids.
 
     python3 plot/plot_DTFE.py                          # TNG50-4-Dark, full snapshot series
@@ -26,7 +26,7 @@ from dtfelib import make_parser, FieldSet, sim_dir, add_ps_gradient_arg, mean_fi
 from dtfelib import figures as style
 from dtfelib.fields import extract_2d_slice as extract_slice, extract_velocity_slice
 
-style.apply()                                   # the house style (serif, SHOW_TITLES, DPI): survey item 11, 2026-10-05
+style.apply()                                   # the house style (serif, SHOW_TITLES, DPI)
 
 OUTPUT_DIR = Path(config.LOCAL_FIGURES_ROOT) / "dtfe"
 
@@ -142,7 +142,7 @@ def process_snapshot(args, snap):
         if PROCESS_VELOCITY and fs.has('velocity'):
             fields['velocity'] = fs.load('velocity')
 
-        # under --method ps the divergence and the shear of the MEAN flow by default (2026-10-13), the quantities a
+        # under --method ps the divergence and the shear of the MEAN flow by default, the quantities a
         # standard-DTFE map shows: FieldSet.load(..., mean_field=True) derives them from the PS velocity grid
         # ('--ps-gradient stored': the binary's PS grids, the stream average <grad v>); standard DTFE reads its grids
         mean_field = mean_field_wanted(args)

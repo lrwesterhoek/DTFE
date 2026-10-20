@@ -257,7 +257,7 @@ def process_snapshot(snapshot, redshift, args):
             "Marked correlation analysis summary",
             f"Snapshot {snapshot}, z = {redshift:.2f}",
             "=" * 60, "",
-            f"Population: full void catalog, BBKS validity cuts",
+            "Population: full void catalog, BBKS validity cuts",
             f"  Voids: {n}   Pairs: {len(dist)}",
             f"  Mean ellipticity e: {np.mean(e_marks):.3f} "
             f"+/- {np.std(e_marks):.3f}",

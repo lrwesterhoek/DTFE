@@ -9,8 +9,8 @@
 # velocity) mean 1e-3 and per-cell 5e-2 beyond a 1e-3 fraction; GRADIENTS at caustics are a
 # float-sensitive quantity (the inverse edge matrix of a tetrahedron near a fold amplifies the
 # float rounding of its edges by |rows|^3/|det|, up to ~1e6 at the degeneracy cut), so the two
-# gradients are held to the class the phase-space VELOCITY gradient has shown since the GPU deposit
-# exists: the mean of |g| within 5e-2 (3-4% on this folded box, far less on standard DTFE), per-cell
+# gradients are held to the phase-space VELOCITY gradient's class:
+# the mean of |g| within 5e-2 (3-4% on this folded box, far less on standard DTFE), per-cell
 # 5e-2 beyond a 2e-3 fraction. The scalar gradient comes out tighter than the velocity gradient.
 # Skipped (exit 0) when the binaries carry no GPU stamp. --no-build is accepted and ignored.
 set -uo pipefail
@@ -19,8 +19,6 @@ ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$ROOT" || exit 1
 source "${SCRIPT_DIR}/precision.sh"     # DTFE_TEST_PRECISION=double: the double pair
 precision_require "${DTFE_BIN}" "${PS_BIN}"
-PY="${PYTHON:-python3}"
-command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/python3.14
 for b in DTFE PS-DTFE; do [ -x "./$b" ] || { echo "FAIL: ./$b is not built"; exit 1; }; done
 OBJS="o o_ps"; precision_double && OBJS="o_d o_ps_d"
 for d in ${OBJS}; do
@@ -43,7 +41,7 @@ PYEOF
 G=32
 FIELDS=(--field density_a velocity_a gradient_a scalar_a scalarGradient_a --scalar-dataset Phi)
 # one domain for both runs: on <= 8 cores the time-aware tuner splits the CPU reference, and a split sampled deposit
-# differs from one domain by ~4e-3, which failed this suite on Linux (2026-10-11, the CUDAEMU port's first Linux run)
+# differs from one domain by ~4e-3, which would fail this suite on Linux
 COMMON=(--grid $G --periodic --input 105 --MpcUnit 1 --verbose 1 --partition 1 1 1 "${FIELDS[@]}")
 run() { local out="$1"; shift; "$@" > "$out.log" 2>&1 || { echo "FAIL: $* (see $out.log)"; exit 1; }
         grep -q "using the CPU interpolation\|using the CPU deposit\|deposit unavailable" "$out.log" && { echo "FAIL: $out fell back to the CPU"; exit 1; }; return 0; }

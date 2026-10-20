@@ -14,13 +14,13 @@ PROJECT_DIR = os.path.dirname(SCRIPT_DIR)
 # outputs are float64; the text outputs most tests read are precision-free
 PRECISION = os.environ.get("DTFE_TEST_PRECISION", "single")
 DTFE_BIN = os.path.join(PROJECT_DIR, "DTFE-double" if PRECISION == "double" else "DTFE")
-# DTFE_TEST_REFERENCE_DIR: where the regression reference lives (default tests/reference, which CI uses too since
-# 2026-10-11: see test_regression). A folder without one gets a reference written from the run, and the
+# DTFE_TEST_REFERENCE_DIR: where the regression reference lives (default tests/reference, which CI uses too:
+# see test_regression). A folder without one gets a reference written from the run, and the
 # regression is then a SKIP, never a pass: it compared nothing (tests/run_tests_check.sh R3)
 REFERENCE_DIR = os.environ.get("DTFE_TEST_REFERENCE_DIR") or os.path.join(SCRIPT_DIR, "reference")
 # DTFE_TEST_REQUIRED=1 (ci_suite.sh's double stage, after building the pair): a missing binary or
 # feature is a FAILURE, as with tests/precision.sh's skip_or_fail -- a green stage that ran no
-# assertion is worth nothing (2026-10-08)
+# assertion is worth nothing
 REQUIRED = os.environ.get("DTFE_TEST_REQUIRED") == "1"
 
 VERBOSE = False
@@ -103,7 +103,7 @@ def report(name, success, msg=""):
 
 
 def skip(name, msg, required=True):
-    """A test that did not run: counted and said (until 2026-10-08 it only dropped out of the count,
+    """A test that did not run: counted and said (not just dropped out of the count,
     or printed CREATED). required: a missing binary or feature, which DTFE_TEST_REQUIRED=1 makes a
     failure; False for what no build provides (the regression's reference in a fresh folder)."""
     global SKIPPED
@@ -459,7 +459,7 @@ def _has_flag(name, flag):
     """True when the built binary's --full_help mentions the given option (feature gate for
     tests of flags newer than the binary; captured, never piped -- see the .sh scripts). Else
     test NAME is a SKIP (a failure under DTFE_TEST_REQUIRED=1); a binary that exits non-zero on
-    --full_help FAILS it: a broken binary is not one without the flag (2026-10-08)."""
+    --full_help FAILS it: a broken binary is not one without the flag."""
     result = subprocess.run([DTFE_BIN, "--full_help"], capture_output=True, text=True)
     binary = os.path.basename(DTFE_BIN)
     if result.returncode != 0:
@@ -544,13 +544,13 @@ def test_exact_average_convergence(tmpdir):
         report(name, False, str(e))
 
 
-# The standard-DTFE regression (2026-10-11: a stored reference CI compares with, on every platform). Until today
-# it sampled a NON-periodic cloud, whose padding-test dummy points sit on a regular lattice against the convex hull:
-# co-spherical ties that CGAL breaks differently per platform (rel err ~1.6 Mac vs Linux), so CI wrote a fresh
-# reference and compared nothing. Now: a PERIODIC box of 1000 seeded random points (no exact ties: the Delaunay
-# tessellation is unique, so every correct CGAL builds the same one), the point-sampled density and the
-# --exact-average cell average (no Monte Carlo: the sampled density_a depends on insertion order -- 25% per cell
-# when the input is shuffled), written as binary floats (the text output keeps 6 digits).
+# The standard-DTFE regression: a stored reference CI compares with, on every platform. Not a NON-periodic cloud,
+# whose padding-test dummy points sit on a regular lattice against the convex hull: co-spherical ties that CGAL
+# breaks differently per platform (rel err ~1.6 Mac vs Linux), so no stored reference could hold. Instead: a
+# PERIODIC box of 1000 seeded random points (no exact ties: the Delaunay tessellation is unique, so every correct
+# CGAL builds the same one), the point-sampled density and the --exact-average cell average (no Monte Carlo: the
+# sampled density_a depends on insertion order -- 25% per cell when the input is shuffled), written as binary
+# floats (the text output keeps 6 digits).
 REGRESSION_REF = "regression_periodic.txt"
 REGRESSION_ARGS = ["-i", "111", "-o", "101", "-g", "12", "-f", "density", "density_a", "--MpcUnit", "1",
                    "--periodic", "--exact-average"]
@@ -611,7 +611,7 @@ def test_regression(tmpdir, update_ref=False):
         else:
             # a reference made from the run under test compares nothing: a SKIP, not a silent drop from the
             # count. Never a failure under DTFE_TEST_REQUIRED=1: no build can supply the reference. (CI and
-            # Docker compare with the stored one since 2026-10-11; this is a fresh DTFE_TEST_REFERENCE_DIR.)
+            # Docker compare with the stored one; this is a fresh DTFE_TEST_REFERENCE_DIR.)
             skip(name, f"no reference in {REFERENCE_DIR}: one was written from this run, nothing compared",
                  required=False)
         return
@@ -653,9 +653,9 @@ def _run_raw(cmd_tail, input_file, output_file):
 
 
 def test_raw_binary_reader(tmpdir):
-    """Type-121 raw binary reader: the box is 2*NO_DIM floats (a 4-byte read misaligned every
-    later block) and weights/velocities must land in their own buffers (they were read into
-    the positions array, leaving the assigned weight/velocity arrays uninitialized)."""
+    """Type-121 raw binary reader: the box is 2*NO_DIM floats (a 4-byte read misaligns every
+    later block) and weights/velocities must land in their own buffers (read into
+    the positions array, they would leave the assigned weight/velocity arrays uninitialized)."""
     name = "raw_binary_reader_121"
     import struct
     box = 10.0
@@ -689,8 +689,8 @@ def test_raw_binary_reader(tmpdir):
 
 def test_text_reader_zero_velocity(tmpdir):
     """Type-111 text reader: velocities are not part of the x y z w format, so they must come
-    out exactly zero (the reader used to allocate-and-mark velocity/scalar arrays it never
-    filled, copying uninitialized memory into every particle)."""
+    out exactly zero (a reader that allocates-and-marks velocity/scalar arrays it never
+    fills copies uninitialized memory into every particle)."""
     name = "text_reader_zero_velocity_111"
     box = 10.0
     particles = make_lattice_particles(6, box)
@@ -713,7 +713,7 @@ def test_text_reader_zero_velocity(tmpdir):
 
 def test_gadget_mass_block_skip(tmpdir):
     """Binary Gadget reader: a per-particle mass block must be seeked past when masses are
-    not requested ('--input 101 5'); it used to trip a false 'snapshot file is corrupt'."""
+    not requested ('--input 101 5'), else it trips a false 'snapshot file is corrupt'."""
     name = "gadget_mass_block_skip"
     import struct
     box = 10.0
@@ -755,10 +755,10 @@ def test_gadget_mass_block_skip(tmpdir):
 
 def test_thin_region_threads(tmpdir):
     """A multi-threaded run on a THIN --regionMpc (the launcher's exact-zoom shape, here 1 x 1 x
-    2e-5 Mpc) must run and match the one-thread run. Each thread's particle search
-    reserved p.size() * padded-box/region volume = a multi-PB vector: std::bad_alloc on Linux
+    2e-5 Mpc) must run and match the one-thread run. Each thread's particle search must not
+    reserve p.size() * padded-box/region volume = a multi-PB vector: std::bad_alloc on Linux
     already at 2 kpc thickness (macOS overcommits that, so it needs this thinner slab), while
-    OMP_NUM_THREADS=1 never takes that path (2026-10-11)."""
+    OMP_NUM_THREADS=1 never takes that path."""
     name = "thin_region_threads"
     box = 100.0
     infile = os.path.join(tmpdir, f"{name}.txt")
@@ -801,9 +801,9 @@ def _offset_lattice(nx, ny, nz, lx, ly, lz, frac=0.3):
 def test_mass_assignment_periodic_faces(tmpdir):
     """Periodic CIC/TSC/PCS on a uniform (offset) lattice in a NON-CUBIC box (z twice as long, so its cells
     are twice as tall): every cell is the mean density, at the box faces and at the auto-tuner's partition
-    seams too. Until 2026-10-11 PCS and CIC got no padding at all (no periodic images: PCS 0.27-0.94 at
-    faces and seams; CIC extrapolated instead, 1.4 / 0.8 in the face cells), and the derived TSC/NGP/DTFE
-    padding took the z faces' width from the x length and grid ([i%2] for the axis i/2), half the TSC
+    seams too. PCS and CIC without padding have no periodic images (PCS 0.27-0.94 at
+    faces and seams; CIC extrapolated instead, 1.4 / 0.8 in the face cells), and a derived TSC/NGP/DTFE
+    padding that took the z faces' width from the x length and grid ([i%2] for the axis i/2) is half the TSC
     reach here."""
     name = "mass_assignment_periodic_faces"
     lx, lz = 100.0, 200.0
@@ -830,9 +830,9 @@ def test_mass_assignment_periodic_faces(tmpdir):
 
 def test_mass_assignment_thin_partitions(tmpdir):
     """'--partition 1 4 4' on an 8^3 grid gives partitions ONE cell thick: the clipped boundary stencil
-    must still give the mean density everywhere on a uniform lattice. Until 2026-10-11 TSC's edge case
-    for the first cell also wrote cell 1 of a one-cell grid (a heap overflow: 9% off here, rc 133/139 on
-    a thread's slab), CIC's extrapolated (1.74 off) and PCS had no padding (0.78 off)."""
+    must still give the mean density everywhere on a uniform lattice: a TSC edge case for the first cell that
+    also writes cell 1 of a one-cell grid is a heap overflow (9% off here, rc 133/139 on a thread's slab), CIC's
+    extrapolation is 1.74 off and PCS without padding 0.78 off."""
     name = "mass_assignment_thin_partitions"
     infile = os.path.join(tmpdir, f"{name}.txt")
     write_text_input(infile, _offset_lattice(8, 8, 8, 100.0, 100.0, 100.0), (0, 100, 0, 100, 0, 100))
@@ -857,9 +857,9 @@ def test_mass_assignment_thin_partitions(tmpdir):
 def test_partition_split_never_empty(tmpdir):
     """More partitions along an axis than half its cells ('--partition 1 5 5' and '1 8 8' on an 8^3 grid), and a
     cloud whose first slab holds every particle ('--partition 4 1 1', the 8^3 lattice squeezed into the first
-    x cell): the load-balancing split (subpartition.h optimalSplit) gave a partition no cells -- an '8*0*0' grid --
-    and TSC/CIC/PCS segfaulted (rc 139). Since 2026-10-11 every partition keeps at least one cell; a split that
-    already did is unchanged. Each run must equal the single-domain run of the same input to 1e-5."""
+    x cell): the load-balancing split (subpartition.h optimalSplit) keeps at least one cell in every partition (on
+    an '8*0*0' grid TSC/CIC/PCS segfault, rc 139); a split that already does is unchanged. Each run must equal the
+    single-domain run of the same input to 1e-5."""
     name = "partition_split_never_empty"
     lat = os.path.join(tmpdir, f"{name}_lattice.txt")
     write_text_input(lat, _offset_lattice(8, 8, 8, 100.0, 100.0, 100.0), (0, 100, 0, 100, 0, 100))
@@ -898,9 +898,9 @@ def test_partition_split_never_empty(tmpdir):
 
 def test_mass_assignment_centroid(tmpdir):
     """A mass-assignment kernel is symmetric about the particle: the centroid of one isolated particle's
-    deposit is its position (8 particles at random sub-cell offsets, one per 8^3-cell block). Until
-    2026-10-11 PCS took its 4 cells from the cell HOLDING the particle and the distance to that cell's
-    left edge, so every deposit sat half a cell too far along each axis (centroid +0.50 cells)."""
+    deposit is its position (8 particles at random sub-cell offsets, one per 8^3-cell block). PCS taking
+    its 4 cells from the cell HOLDING the particle and the distance to that cell's left edge would put
+    every deposit half a cell too far along each axis (centroid +0.50 cells)."""
     name = "mass_assignment_centroid"
     import random
     rnd = random.Random(1)
@@ -939,9 +939,9 @@ def test_mass_assignment_centroid(tmpdir):
 
 def test_fractional_region_noncubic(tmpdir):
     """On a non-cubic box, '--region' (box fractions) is the same region as '--regionMpc' in Mpc, and
-    '--padding' (box fractions) the same padding as '--paddingMpc': byte-identical grids. Until
-    2026-10-11 the conversion read the box per entry [i%2] instead of per axis [i/2], so z took the x
-    length: '--region 0 1 0 1 0.5 1' on a 0-200 z axis gridded z = 50-100 instead of 100-200."""
+    '--padding' (box fractions) the same padding as '--paddingMpc': byte-identical grids. The
+    conversion reads the box per axis [i/2]; per entry [i%2] z would take the x length:
+    '--region 0 1 0 1 0.5 1' on a 0-200 z axis would grid z = 50-100 instead of 100-200."""
     name = "fractional_region_noncubic"
     lx, lz = 100.0, 200.0
     infile = os.path.join(tmpdir, f"{name}.txt")
@@ -950,8 +950,8 @@ def test_fractional_region_noncubic(tmpdir):
     common = ["-i", "111", "-o", "101", "-g", "16", "-f", "density", "--MpcUnit", "1", "--TSC"]
     pairs = (("region", ["--region", "0", "1", "0", "1", "0.5", "1"],
               ["--regionMpc", "0", "100", "0", "100", "100", "200"]),
-             # the region in Mpc here, so only the padding conversion is under test: 5 Mpc in z (not 10) fell
-             # inside the 6.25 Mpc TSC reach and dropped particles
+             # the region in Mpc here, so only the padding conversion is under test: 5 Mpc in z (not 10) falls
+             # inside the 6.25 Mpc TSC reach and drops particles
              ("padding", ["--regionMpc", "25", "75", "25", "75", "50", "150",
                           "--padding", "0.05", "0.05", "0.05", "0.05", "0.05", "0.05"],
               ["--regionMpc", "25", "75", "25", "75", "50", "150",
@@ -975,8 +975,8 @@ def test_fractional_region_noncubic(tmpdir):
 
 def test_hi_reader_species_guard(tmpdir):
     """'--input 106' (HI mass from an HDF5 snapshot) is defined for gas only: gas plus stars must be refused.
-    The guard tested readParticleSpecies[1] five times until 2026-10-11, so gas + stars (species 0 and 4)
-    passed and the stars went in with their raw masses."""
+    A guard testing readParticleSpecies[1] five times would pass gas + stars (species 0 and 4) and take
+    the stars in with their raw masses."""
     name = "hi_reader_species_guard"
     try:
         import h5py
@@ -1014,7 +1014,7 @@ def test_hi_reader_species_guard(tmpdir):
 
 
 def main():
-    global VERBOSE, PASSED, FAILED
+    global VERBOSE
 
     parser = argparse.ArgumentParser(description="DTFE integration tests")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -1024,7 +1024,7 @@ def main():
     VERBOSE = args.verbose
 
     if not os.path.isfile(DTFE_BIN) and PRECISION == "double":
-        # a skip, unless the stage built the pair and requires it (DTFE_TEST_REQUIRED=1, 2026-10-08)
+        # a skip, unless the stage built the pair and requires it (DTFE_TEST_REQUIRED=1)
         print(("FAIL (required): " if REQUIRED else "SKIP: ")
               + f"{DTFE_BIN} is not built (make DTFE PS-DTFE DOUBLE=1 builds the double pair)")
         sys.exit(1 if REQUIRED else 0)

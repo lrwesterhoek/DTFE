@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Chunk-level checkpoints inside the GPU deposit and its cause-aware retry policy (2026-10-11,
-# src/CGAL_triangulation/ps_metal_host.cc; ported to the CUDA/HIP host ps_gpu_cuda.cu the same day, where a
-# 'buffer' below is one chunk kernel and the snapshot a device-to-host copy). A failed command buffer no longer redoes the whole partition
+# Chunk-level checkpoints inside the GPU deposit and its cause-aware retry policy
+# (src/CGAL_triangulation/ps_metal_host.cc, and the CUDA/HIP host ps_gpu_cuda.cu, where a 'buffer' below is
+# one chunk kernel and the snapshot a device-to-host copy). A failed command buffer does not redo the whole partition
 # deposit: the pass restores its last snapshot (its start, or a checkpoint every DTFE_GPU_CHECKPOINT_CHUNKS
 # buffers) and continues from there. The test hook DTFE_GPU_FAULT_AT=<k>[:<kind>] lets the k-th command
 # buffer of the process run to completion -- its atomics ARE in the grids -- and then reports it as failed,
@@ -9,29 +9,28 @@
 # PS_METAL_CHUNK=2000, and a checkpoint every 2 buffers, so the fault lands after a checkpoint):
 #   R1  one-thread-per-tet deposit, an 'innocent victim' fault at buffer 3: the run stays on the GPU, logs
 #       the resume from the checkpoint at the same pace, its '.a_den' (the exact fixed-point mass grid) is
-#       byte-identical to a run without the fault, '.a_streams' identical, and so is '.a_vel' since 2026-10-14:
-#       the moment grids are exact fixed-point sums too (it was a float atomic sum, 4e-7 apart run to run, held
-#       to 1e-6 of the peak -- a tolerance that flaked under GPU load). PS_METAL_FLOAT_MOMENTS=1 (or
-#       PS_GPU_FLOAT_MOMENTS=1) in the environment brings back the float sums and that 1e-6 tolerance
+#       byte-identical to a run without the fault, '.a_streams' identical, and so is '.a_vel': the moment
+#       grids are exact fixed-point sums too. PS_METAL_FLOAT_MOMENTS=1 (or PS_GPU_FLOAT_MOMENTS=1) in the
+#       environment selects the float sums (4e-7 apart run to run) and a tolerance of 1e-6 of the peak
 #   R2  --ps-exact-deposit (the items passes + leftovers), an 'oom' fault: same assertions, and the pace
 #       escalates (shorter buffers) as a resource error should; its '.a_streams' (the exact multiplicity) is a
-#       fixed-point sum since 2026-10-14 as well: identical
+#       fixed-point sum as well: identical
 #   R3  --partition 2 2 2 --max-concurrent 1, a 'timeout' (watchdog) fault in a later partition: same
 #   R4  a 'persist' fault (every buffer from the k-th on fails): the policy gives the partition to the CPU
 #       after 3 failures of the same chunk, and the run still finishes
 #   R5  the failed buffers count into the run's retry counter (the progress sidecar's gpu_retries reads the
 #       same counter, src/run_progress.h; the sidecar itself is removed when a run succeeds, so the count is
 #       read from the deposit's summary line)
-#   R6  the same counts by cause (G1, 2026-10-11): each run's log ends its computation with 'GPU deposit
+#   R6  the same counts by cause: each run's log ends its computation with 'GPU deposit
 #       retries: N (innocent a, timeout b, oom c, other d)' -- R1 innocent 1, R2 oom 1, R3 timeout 1, R4
 #       innocent 3 -- and a fault-free run prints no such line (the progress sidecar's gpu_retries_by_cause
 #       reads the same counters)
-#   R7  the escalated pace recovers (2026-10-11): the same watchdog fault as R3 with DTFE_GPU_PACE_RECOVER_SEC=0
+#   R7  the escalated pace recovers: the same watchdog fault as R3 with DTFE_GPU_PACE_RECOVER_SEC=0
 #       (the clean GPU work after which a notch is undone; 90 s by default) steps the pace back to the default
 #       250 ms buffers / 8 ms gaps at the next clean buffer, and the grids stay exact; R3 itself (the default
 #       90 s, a ~1 s run) keeps the escalation for the rest of its deposits. The pace is process-wide, so the
 #       later partitions start from the eased pace -- inferred from the log line, not observed with a second
-#       injected fault. The CUDA/HIP host has the same rule since 2026-10-11 (ps_gpu_cuda.cu), from its own
+#       injected fault. The CUDA/HIP host has the same rule (ps_gpu_cuda.cu), from its own
 #       pace: 250 ms kernels with no gap, escalated to 62 ms / 8 ms, eased back to 250 ms / 0 ms
 # GPU builds only: Metal, and the CUDA/HIP port (CUDAEMU=1 runs it on the CPU emulation, tests/cudaemu_check.sh):
 # skipped (exit 0) otherwise, a local GPU suite like tests/gpu_mass_check.sh (not in tests/ci_suite.sh). ~20 s
@@ -43,14 +42,9 @@ ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$ROOT" || exit 1
 source "${SCRIPT_DIR}/precision.sh"     # DTFE_TEST_PRECISION=double: the double pair
 precision_require "${PS_BIN}"
-PY="${PYTHON:-python3}"
-command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/python3.14
 [ -x "${PS_BIN}" ] || { echo "FAIL: ${PS_BIN} is not built"; exit 1; }
 OBJ=o_ps; precision_double && OBJ=o_ps_d
-if [ ! -d "$OBJ" ] || [ -f "$OBJ/.gpu_mode_off" ]; then echo "SKIP: $OBJ carries no GPU stamp (build with METAL=1)"; exit 0; fi
-gpu_stamp=""                                              # any one GPU backend stamp will do
-for m in metal cudaemu cuda hip; do [ -f "$OBJ/.gpu_mode_$m" ] && gpu_stamp="$m"; done
-if [ -z "$gpu_stamp" ]; then echo "SKIP: $OBJ is neither a Metal nor a CUDA/HIP (or CUDAEMU) build"; exit 0; fi
+require_gpu_backend "$OBJ"                                # sets gpu_stamp (tests/lib.sh)
 TMP="${DTFE_TEST_TMP:-${TMPDIR:-/tmp}/dtfe-tests}/gpu_retry_check"
 mkdir -p "$TMP"
 SNAP="$TMP/waves.hdf5"
@@ -111,9 +105,9 @@ for tag, ref, run, what, cause, pace in (
               f"{what}: the retry runs at {pace} ({'same pace' if cause == 'innocent victim' else 'escalated'})")
     x, y = (tmp / f"{ref}.a_den").read_bytes(), (tmp / f"{run}.a_den").read_bytes()
     check(tag, len(x) > 0 and x == y, f"{what}: '.a_den' byte-identical to the run without the fault ({len(x)} bytes)")
-    # the stream count is an integer atomic, and since 2026-10-14 the velocity moment and the exact deposit's
-    # multiplicity are exact fixed-point sums: all identical (with the float sums of before, under
-    # PS_METAL_FLOAT_MOMENTS=1, only to 1e-6 of the peak -- they differed run to run by ~3e-7)
+    # the stream count is an integer atomic, and the velocity moment and the exact deposit's
+    # multiplicity are exact fixed-point sums: all identical (the float sums of PS_METAL_FLOAT_MOMENTS=1
+    # only to 1e-6 of the peak -- they differ run to run by ~3e-7)
     floatMoments = any(_os.environ.get(k, "0") not in ("", "0") for k in ("PS_METAL_FLOAT_MOMENTS", "PS_GPU_FLOAT_MOMENTS"))
     for ext, exact in (("a_streams", not (floatMoments and tag == "R2")), ("a_vel", not floatMoments)):
         a, b = rd(ref, ext), rd(run, ext)

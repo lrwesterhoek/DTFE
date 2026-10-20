@@ -5,7 +5,7 @@
    per process; the pipeline states are cached.
 
    Two ways in. dtfeGpuDepositAveraged1() deposits one tetrahedron set into grids of its own
-   (the original per-call path). The dtfeGpuShared* family lets the sub-domains of one
+   (the per-call path). The dtfeGpuShared* family lets the sub-domains of one
    DTFE_parallel call deposit into ONE full grid: each thread uploads its batch (concurrently),
    the dispatches queue on the device (serialized by ctxMutex, the chunk controller warm across
    batches), and the main thread reads the full grid back once. Both use the same Batch /
@@ -13,10 +13,10 @@
    batch can be redone or handed back to the CPU without touching the other sub-domains' cells.
 
    The chunked, watchdog-safe dispatch discipline is the one validated in ps_metal_host.cc --
-   see the long comment at the dispatch loop -- and since 2026-10-13 so is its retry policy: chunk
+   see the long comment at the dispatch loop -- and so is its retry policy: chunk
    checkpoints, the cause of a failed buffer, the process-wide pace that eases back after a clean
-   stretch, the run's retry counters (gpu_metal_retry.h, shared with that host). Also since then
-   the grids are exact 64-bit fixed-point sums (metal/dtfe_deposit.metal's header; the units at
+   stretch, the run's retry counters (gpu_metal_retry.h, shared with that host). The grids are
+   exact 64-bit fixed-point sums (metal/dtfe_deposit.metal's header; the units at
    batchFixedScales), so two runs write byte-identical '_a' grids. */
 
 #define NS_PRIVATE_IMPLEMENTATION
@@ -43,7 +43,7 @@
 #include "dtfe_deposit_msl.h"   // generated: static const char DTFE_DEPOSIT_MSL[]
 #define ITEM_BLOCK_SHIFT 5      // == the kernel's: log2 of the items per entry of the block table
 #include "../message.h"         // ANSI colour helpers only (retry warning below)
-extern std::atomic<int> dtfeGpuRetries;            // averaged_interpolation_1.cc (run_progress.h), 2026-10-13
+extern std::atomic<int> dtfeGpuRetries;            // averaged_interpolation_1.cc (run_progress.h)
 extern std::atomic<int> dtfeGpuRetriesByCause[4];  // ... by cause: innocent, timeout, oom, other
 
 namespace {
@@ -67,11 +67,11 @@ struct DepositParams
     uint32_t tableEntries;  // item kernel: threadgroup cell-table entries (power of two; 0 = none)
     int32_t  fScal;         // the scalar field (per-tet kernel; the item pipelines are specialized on it)
     int32_t  fSGrad;        // its gradient
-    uint32_t fixedSum;      // the grids as exact 64-bit fixed-point sums (2026-10-13; batchFixedScales)
+    uint32_t fixedSum;      // the grids as exact 64-bit fixed-point sums (batchFixedScales)
     float    fxScale[5];    // their units 2^k: density, velocity, velocity gradient, scalar, scalar gradient
 };
 
-// The checkpoints and the cause-aware retry policy of the GPU deposit (2026-10-13, ps_metal_host.cc's, see
+// The checkpoints and the cause-aware retry policy of the GPU deposit (shared with ps_metal_host.cc, see
 // gpu_metal_retry.h): GpuFault, gpuRetryCause, the process-wide GpuPace, the DTFE_GPU_FAULT_AT test hook and
 // GpuSnapshot. The pass loop is runBatch below.
 #include "gpu_metal_retry.h"
@@ -85,7 +85,7 @@ void countGpuRetry(GpuFault f, long code, std::string const& desc)
     ++dtfeGpuRetriesByCause[k];
 }
 
-// Chunks start at multiples of this many work items (2026-10-13): with the threadgroups (<= 256 threads, a
+// Chunks start at multiples of this many work items: with the threadgroups (<= 256 threads, a
 // multiple of the 32-lane SIMD width) also starting there, a SIMD group is always the same 32 items, so its
 // float simd_sum -- the item kernel's flush, which the exact sums convert only after -- does not depend on where
 // the timing controller cut the chunks.
@@ -100,8 +100,8 @@ struct Ctx
     MTL::ComputePipelineState* pso  = nullptr;        // depositAveraged1: one thread per tetrahedron
     MTL::ComputePipelineState* psoExact = nullptr;    // depositExactAverage: one thread per (tet, cell block)
     // depositAveraged1Items{2,4,8}: one thread per (tet, sample run) with a 2/4/8-slot cell cache,
-    // specialized per field set (function constants FC_DEN/FC_VEL/FC_GRAD/FC_SCAL/FC_SGRAD) and, since
-    // 2026-10-13, on the exact sums (FC_FIXED, mask bit 32): index [K slot][mask]
+    // specialized per field set (function constants FC_DEN/FC_VEL/FC_GRAD/FC_SCAL/FC_SGRAD) and on the
+    // exact sums (FC_FIXED, mask bit 32): index [K slot][mask]
     MTL::ComputePipelineState* psoItems[3][64] = {{nullptr}};
     bool                       itemsOk = false;
     std::string                err;
@@ -206,48 +206,6 @@ MTL::ComputePipelineState* itemPso(Ctx& c, int cacheK, bool fDen, bool fVel, boo
 }
 
 
-// ---------------------------------------------------------------- knobs
-// Work items (default): every tetrahedron becomes max(1, ceil(cnt / itemSamples)) threads, so no
-// thread loops over more than itemSamples samples -- the sample count per tetrahedron reaches
-// maxNN = 10000 on fine grids, which made the per-tet kernel's chunks wildly non-uniform and
-// tripped the GPU watchdog -- and the kernel's per-thread cell cache turns hundreds of per-sample
-// atomics into one set per distinct cell (see the kernel header). DTFE_GPU_ITEMS=0 runs the
-// per-tet kernel for A/B comparisons.
-// DTFE_GPU_ITEM_SAMPLES=<n> sets the run length and DTFE_GPU_CACHE_K=2|4|8 the cell cache.
-// Measured on 2.1M particles at 512^3 (the largest sub-domain, 2.0 G samples; the per-tet kernel
-// took 45 s with watchdog retries). First kernel (atomics per distinct cell per item, cost-sorted
-// tetrahedra): items 512/128/64/32/16/8 with 4 slots = 7.1/4.3/3.6/2.9/2.7/3.1 s; 8 slots slower
-// everywhere, 2 slots slower than 4 -- then limited by threads in flight (register-bound: 640 of
-// 1024 threads per threadgroup at K=4). Final kernel (Morton-ordered tetrahedra, SIMD-group
-// reduction of the flushes, coalesced float4 table reads, field-set specialization): K=2 at items
-// 8/16/32/48/64 = 2.85/2.35/2.05/1.97/1.95 s (K=4 at 32: 2.05 s), density only 0.9 s, no atomics
-// at all 1.8 s -- the kernel is now compute/occupancy-bound at ~1.1 G samples/s, ~2.3 G for density.
-struct Knobs
-{
-    bool     useItems    = true;
-    uint32_t itemSamples = 48;
-    int      cacheK      = 2;
-    bool     noWrite     = false;   // DTFE_GPU_DEBUG_NOWRITE: timing experiment, all the work, no atomics
-    bool     floatGrids  = false;   // DTFE_METAL_FLOAT_GRIDS=1 / DTFE_GPU_FLOAT_GRIDS=1: the float atomics of before (A/B)
-};
-
-Knobs knobs(const Ctx& c)
-{
-    Knobs k;
-    k.useItems = c.itemsOk;
-    if (const char* env = getenv("DTFE_GPU_ITEMS")) k.useItems = k.useItems && atoi(env) != 0;
-    if (const char* env = getenv("DTFE_GPU_ITEM_SAMPLES"))
-    { long v = atol(env); if (v >= 4 && v <= 100000) k.itemSamples = uint32_t(v); }
-    if (const char* env = getenv("DTFE_GPU_CACHE_K")) { int v = atoi(env); k.cacheK = (v == 4 || v == 8) ? v : 2; }
-    k.noWrite = getenv("DTFE_GPU_DEBUG_NOWRITE") != nullptr;
-    auto envOn = [](const char* n) { const char* e = getenv(n); return e && atoi(e) != 0; };
-    k.floatGrids = envOn("DTFE_METAL_FLOAT_GRIDS") || envOn("DTFE_GPU_FLOAT_GRIDS");
-    return k;
-}
-
-
-
-
 // ---------------------------------------------------------------- the accumulated grids
 struct Grids
 {
@@ -258,13 +216,13 @@ struct Grids
     MTL::Buffer* sgrad = nullptr;  // nCell*3   its gradient
     size_t full[3] = {0, 0, 0};
     bool fDen = false, fVel = false, fGrad = false, fScal = false, fSGrad = false;
-    bool fixed = false;            // the components are 8-byte fixed-point words (2026-10-13), else floats
+    bool fixed = false;            // the components are 8-byte fixed-point words, else floats
 
     size_t nCell() const { return full[0] * full[1] * full[2]; }
     size_t compBytes() const { return fixed ? 8 : 4; }
     std::vector<MTL::Buffer*> buffers() const { return { den, vel, grad, scal, sgrad }; }
     // gpuZero: zero the buffers with ONE blit on the device (the per-call path allocates under the device mutex,
-    // 2026-10-13, where a CPU memset of a 512^3 sub-domain's exact words -- up to 1.6 GB -- would idle the GPU);
+    // where a CPU memset of a 512^3 sub-domain's exact words -- up to 1.6 GB -- would idle the GPU);
     // a failed blit falls back to the memset
     bool alloc(Ctx& c, const size_t fullGrid[3], bool d, bool v, bool g, bool s, bool sg, bool fx = false,
                bool gpuZero = false)
@@ -328,7 +286,7 @@ struct Batch
     size_t nTet = 0, nItems = 0, nSamples = 0, nSingle = 0;
     bool   needVel = false, needScal = false;
     bool   exact = false;          // --exact-average: depositExactAverage over cell-block items
-    Knobs  k;
+    DTFEGpuKnobs k;                // dtfe_gpu_fixed.h
 
     void release()
     {
@@ -345,15 +303,13 @@ bool uploadBatch(Ctx& c, std::vector<float>& verts, std::vector<float>& dens, st
                  const size_t subOff[3], const size_t fullGrid[3], bool fDen, bool fVel, bool fGrad,
                  bool fScal, bool fSGrad, bool exact, bool allowFixed, Batch& b, std::string& err)
 {
-    b.k = knobs(c);
+    b.k = dtfeGpuKnobs(c.itemsOk);
     b.exact = exact;
-    // the exact sums (2026-10-13): their units from this batch's values, before the upload consumes them; the
-    // shared full grid (allowFixed false) and DTFE_METAL_FLOAT_GRIDS=1 keep the float atomics
+    // the parameter block, with the exact sums' units from this batch's values (dtfe_gpu_fixed.h, shared with
+    // dtfe_gpu_cuda.cu)
     DepositParams& P = b.P;
-    P.fixedSum = 0;
-    for (int g = 0; g < 5; ++g) P.fxScale[g] = 1.f;
-    if (allowFixed && !b.k.floatGrids && !b.k.noWrite)
-        P.fixedSum = batchFixedScales(verts, dens, vels, scal, vols, fDen, fVel, fGrad, fScal, fSGrad, P.fxScale) ? 1u : 0u;
+    uint32_t const exactCells = dtfeBatchParams(P, b.k, verts, dens, vels, scal, vols, dx, nGrid, subOff, fullGrid,
+                                                fDen, fVel, fGrad, fScal, fSGrad, exact, allowFixed);
     if (exact) b.k.useItems = true;    // the exact kernel is an item kernel (cell blocks), always
     else if (b.k.useItems && !itemPso(c, b.k.cacheK, fDen && !b.k.noWrite, fVel && !b.k.noWrite, fGrad && !b.k.noWrite,
                                       fScal && !b.k.noWrite, fSGrad && !b.k.noWrite, P.fixedSum != 0))
@@ -361,92 +317,12 @@ bool uploadBatch(Ctx& c, std::vector<float>& verts, std::vector<float>& dens, st
     b.needVel = fVel || fGrad;
     b.needScal = fScal || fSGrad;
     b.nTet = cnts.size();
-    for (int d = 0; d < 3; ++d)
-    {
-        P.dx[d]       = float(dx[d]);
-        P.invDx[d]    = 1.0f / float(dx[d]);
-        P.nGrid[d]    = int32_t(nGrid[d]);
-        P.subOff[d]   = int32_t(subOff[d]);
-        P.fullGrid[d] = int32_t(fullGrid[d]);
-    }
-    P.fDen  = fDen ? 1 : 0;
-    P.fVel  = fVel ? 1 : 0;
-    P.fGrad = fGrad ? 1 : 0;
-    P.fScal = fScal ? 1 : 0;
-    P.fSGrad = fSGrad ? 1 : 0;
-    if (b.k.noWrite) P.fDen = P.fVel = P.fGrad = P.fScal = P.fSGrad = 0;
-    P.debugNoAtomic = getenv("DTFE_GPU_DEBUG_NOATOMIC") ? uint32_t(std::max(1, atoi(getenv("DTFE_GPU_DEBUG_NOATOMIC")))) : 0u;
-    // 1 = no atomics in the final reduction; 2 = also skip the gradient's reduction loop; 3 = also the
-    // gradient's eviction atomics (timing experiments only)
-    P.itemSamples = b.k.itemSamples;
-    // the exact kernel's item = a block of cells of the tetrahedron's window (DTFE_GPU_EXACT_CELLS)
-    uint32_t exactCells = 16;
-    if (exact)
-    {
-        if (const char* env = getenv("DTFE_GPU_EXACT_CELLS")) { long v = atol(env); if (v > 0) exactCells = uint32_t(v); }
-        P.itemSamples = exactCells;
-    }
-
-    // the fast path's flat indices arrive in the SUB-grid; the kernels deposit into the accumulated
-    // grid, so shift them to full-grid indices here (the sampled path adds subOff on the device)
-    bool const shifted = subOff[0] || subOff[1] || subOff[2] || fullGrid[0] != nGrid[0]
-                      || fullGrid[1] != nGrid[1] || fullGrid[2] != nGrid[2];
-    if (shifted)
-        for (size_t t = 0; t < b.nTet; ++t)
-        {
-            if (cnts[t] != 0) continue;
-            size_t const f = flats[t];
-            size_t const k = f % nGrid[2], j = (f / nGrid[2]) % nGrid[1], i = f / (nGrid[2] * nGrid[1]);
-            flats[t] = uint32_t(((i + subOff[0]) * fullGrid[1] + (j + subOff[1])) * fullGrid[2] + (k + subOff[2]));
-        }
-
-    // the item map (see the kernel's itemOf): itemStart[t] = first item of tetrahedron t (nTet+1
-    // entries) and, per block of 2^ITEM_BLOCK_SHIFT items, the tetrahedron holding the block's first
+    dtfeShiftFlats(cnts, flats, nGrid, subOff, fullGrid);
     std::vector<uint32_t> itemStart, blockTet;
     P.nTetTotal = uint32_t(b.nTet);
-    if (b.k.useItems)
-    {
-        itemStart.resize(b.nTet + 1);
-        for (size_t t = 0; t < b.nTet; ++t)
-        {
-            uint32_t const n = cnts[t];
-            itemStart[t] = uint32_t(b.nItems);
-            size_t items = n ? (n + b.k.itemSamples - 1) / b.k.itemSamples : 1u;
-            if (exact && n)
-            {   // an UPPER bound of the kernel's window (its float floor can differ from this double one
-                // only within rounding of an integer, which the margin covers; surplus blocks idle)
-                uint64_t nw = 1;
-                for (int d = 0; d < 3 && nw; ++d)
-                {
-                    double const base = verts[t*12 + d];
-                    double lo = 0., hi = 0.;
-                    for (int v = 1; v < 4; ++v)
-                    {
-                        double const a = double(verts[t*12 + v*3 + d]) - base;
-                        lo = std::min(lo, a); hi = std::max(hi, a);
-                    }
-                    double const vlo = (base + lo) / dx[d], vhi = (base + hi) / dx[d];
-                    double const flo = std::floor(vlo - (1.e-3 + 1.e-5 * std::fabs(vlo)));
-                    double const fhi = std::floor(vhi + (1.e-3 + 1.e-5 * std::fabs(vhi)));
-                    int64_t iLo = std::isfinite(flo) ? int64_t(flo) : 0, iHi = std::isfinite(fhi) ? int64_t(fhi) + 1 : 0;
-                    iLo = std::max<int64_t>(iLo, 0); iHi = std::min<int64_t>(iHi, int64_t(nGrid[d]));
-                    nw = iHi > iLo ? nw * uint64_t(iHi - iLo) : 0;
-                }
-                items = nw ? size_t((nw + exactCells - 1) / exactCells) : 1u;
-            }
-            b.nItems += items;
-            b.nSamples += exact ? 0 : n;
-            b.nSingle += n == 0;
-            if (b.nItems > size_t(UINT32_MAX)) { err = "too many work items for one batch (> 2^32)"; return false; }
-        }
-        itemStart[b.nTet] = uint32_t(b.nItems);
-        size_t const nBlocks = (b.nItems >> ITEM_BLOCK_SHIFT) + 2;
-        blockTet.assign(nBlocks, uint32_t(b.nTet ? b.nTet - 1 : 0));
-        for (size_t t = 0, blk = 0; t < b.nTet && blk < nBlocks; ++t)
-            while (blk < nBlocks && (blk << ITEM_BLOCK_SHIFT) < size_t(itemStart[t + 1])) blockTet[blk++] = uint32_t(t);
-    }
-    else
-        for (size_t t = 0; t < b.nTet; ++t) { b.nSamples += cnts[t]; b.nSingle += cnts[t] == 0; }
+    if (!dtfeItemMap(verts, cnts, dx, nGrid, b.k.useItems, exact, b.k.itemSamples, exactCells, ITEM_BLOCK_SHIFT,
+                     itemStart, blockTet, b.nItems, b.nSamples, b.nSingle, err))
+        return false;
 
     // newBuffer(ptr,...) copies the host array into the MTL buffer; free each host array
     // IMMEDIATELY so at most one array is double-held at a time (a multi-GB difference per
@@ -465,9 +341,7 @@ bool uploadBatch(Ctx& c, std::vector<float>& verts, std::vector<float>& dens, st
     b.bVol = upload(vols.data(),  vols.size()  * sizeof(float));    std::vector<float>().swap(vols);
     b.bCnt = upload(cnts.data(),  cnts.size()  * sizeof(uint32_t)); std::vector<uint32_t>().swap(cnts);
     b.bFlt = upload(flats.data(), flats.size() * sizeof(uint32_t)); std::vector<uint32_t>().swap(flats);
-    std::vector<float> sobol4(sobol.size() / 3 * 4, 0.f);     // (x, y, z, 0): one 16-byte load per sample
-    for (size_t i = 0; i < sobol.size() / 3; ++i)
-        for (int d = 0; d < 3; ++d) sobol4[i * 4 + d] = sobol[i * 3 + d];
+    std::vector<float> const sobol4 = dtfeSobol4(sobol);
     b.bS   = upload(sobol4.data(), sobol4.size() * sizeof(float));
     b.bG   = upload(itemStart.data(), itemStart.size() * sizeof(uint32_t));
     b.bB   = upload(blockTet.data(), blockTet.size() * sizeof(uint32_t));
@@ -481,9 +355,9 @@ bool uploadBatch(Ctx& c, std::vector<float>& verts, std::vector<float>& dens, st
 }
 
 // The chunk controller's chunk, carried from one batch to the next on the shared grid (a per-call batch starts
-// afresh). The pace -- the buffers' target length and the gaps -- is the process-wide GpuPace since 2026-10-13
-// (gpu_metal_retry.h): it was per call, so an escalation died with its sub-domain and the next one, on the same
-// busy display, met the watchdog at the full pace again.
+// afresh). The pace -- the buffers' target length and the gaps -- is the process-wide GpuPace (gpu_metal_retry.h):
+// a per-call pace would die with its sub-domain, and the next one, on the same busy display, would meet the
+// watchdog at the full pace again.
 struct ChunkState
 {
     size_t     chunk     = 0;       // 0 = not started: use the kernel's first chunk
@@ -493,11 +367,9 @@ struct Stats { int chunks = 0, retries = 0; };
 
 // Runs one batch into the grids (CALLER HOLDS ctxMutex). Chunked, serialized dispatch with host-side gaps --
 // the watchdog-safe discipline validated for the PS deposit (see ps_metal_host.cc for the full rationale) --
-// and, since 2026-10-13, that host's retry policy (its runChunked, here for one pass): a killed command buffer
+// and that host's retry policy (its runChunked, here for one pass): a killed command buffer
 // may have deposited part or all of its atomics, so it is never retried alone; the batch restores its last
-// snapshot and continues from there. Before, every failure re-zeroed the batch's owner box and redid the whole
-// batch, three times at most, then the CPU took the sub-domain -- with no cause in the log and no count in the
-// run's retry counters, and the exact average's long items in dense halos run the longest buffers there are.
+// snapshot and continues from there.
 //   - the snapshot: the per-call grids (all zero at the start: no copy) and a checkpoint every ~10 s of GPU work
 //     (DTFE_GPU_CHECKPOINT_CHUNKS=<n> buffers); 'sharedBox' (the opt-in shared full grid) restores its owner box
 //     to zero, the batch's start, without periodic checkpoints (a copy would be the whole 2 GB grid);
@@ -508,7 +380,7 @@ struct Stats { int chunks = 0, retries = 0; };
 //     work;
 //   - every failed buffer counts into the run's retry counters by cause (countGpuRetry).
 // Work items are uniform (<= itemSamples samples each), so their chunks can be larger and the controller never
-// meets a 100x jump in per-thread work; the per-tet kernel keeps the original, more cautious sizes. Every chunk
+// meets a 100x jump in per-thread work; the per-tet kernel keeps more cautious sizes. Every chunk
 // starts at a multiple of CHUNK_ALIGN items (the exact sums need it, see there).
 bool runBatch(Ctx& c, Batch& b, Grids& g, ChunkState& cs, Stats& st, bool sharedBox, std::string& err)
 {
@@ -542,7 +414,7 @@ bool runBatch(Ctx& c, Batch& b, Grids& g, ChunkState& cs, Stats& st, bool shared
     if (tg > 256) tg = 256;
     // the threadgroup cell table: as many power-of-two entries as fit the 32 KB threadgroup memory
     // (keys 4 B + 4 or 13 values per entry, floats or -- the exact sums -- two-word integers, next to the other
-    // mode's 16-byte dummy); DTFE_GPU_TABLE=0 turns it off (evictions go straight to the device, the old behaviour)
+    // mode's 16-byte dummy); DTFE_GPU_TABLE=0 turns it off (evictions go straight to the device)
     uint32_t tableEntries = 0;
     size_t keyBytes = 16, valBytes = 16, valXBytes = 16;
     bool const fixedSum = b.P.fixedSum != 0;
@@ -566,7 +438,7 @@ bool runBatch(Ctx& c, Batch& b, Grids& g, ChunkState& cs, Stats& st, bool shared
     b.P.tableEntries = tableEntries;
     MTL::Buffer* bP = c.dev->newBuffer(sizeof(DepositParams), MTL::ResourceStorageModeShared);
     if (!bP) { err = "Metal buffer allocation failed (params)"; return false; }
-    // The non-finite guard's counters (2026-10-15; metal/dtfe_deposit.metal fxq), one word per grid at buffer 21:
+    // The non-finite guard's counters (metal/dtfe_deposit.metal fxq), one word per grid at buffer 21:
     // zeroed before each command buffer and added into badRun after one that succeeded; a restore rolls badRun
     // back to the held snapshot's (badCk), so a failed buffer and the redone ones count once. Handed to the run's
     // counters (ps_deposit_params.h fixedShareDrops) only when the batch succeeds.
@@ -595,8 +467,8 @@ bool runBatch(Ctx& c, Batch& b, Grids& g, ChunkState& cs, Stats& st, bool shared
     int  failsHere = 0;
     size_t failEnd = 0;
     // an empty command buffer completes only after everything queued before it: drained before a restore, as the
-    // whole-batch retry did since its per-tet runs at 512^3 showed atomics of a killed buffer landing after the
-    // re-zeroing (whole samples in void cells, 2e-2 of max|v|)
+    // atomics of a killed buffer can land after it otherwise (per-tet runs at 512^3: whole samples in void
+    // cells, 2e-2 of max|v|)
     auto drainQueue = [&]() {
         MTL::CommandBuffer* drain = c.q->commandBuffer();
         drain->commit();
@@ -774,19 +646,6 @@ bool runBatch(Ctx& c, Batch& b, Grids& g, ChunkState& cs, Stats& st, bool shared
     return success;
 }
 
-void logBatch(const Batch& b, const Stats& st, double waitSec, double runSec, double sinceBegin)
-{
-    fprintf(stderr, "DTFE Metal timing: %s kernel, %zu tetrahedra (%zu single-cell), %zu items of <= %u %s, "
-                    "%zu samples, table %u, %s sums, %d chunks, %d retries, %.2f s (%.0f M samples/s)%s",
-            b.exact ? "exact" : b.k.useItems ? (b.k.cacheK == 8 ? "item/K8" : b.k.cacheK == 2 ? "item/K2" : "item/K4") : "per-tet",
-            b.nTet, b.nSingle, b.k.useItems ? b.nItems : size_t(0), b.P.itemSamples, b.exact ? "cells" : "samples", b.nSamples, b.P.tableEntries,
-            b.P.fixedSum ? "fixed-point" : "float", st.chunks, st.retries, runSec, runSec > 0 ? b.nSamples / runSec / 1e6 : 0.0,
-            sinceBegin >= 0 ? "" : "\n");
-    if (sinceBegin >= 0)
-        fprintf(stderr, "; shared grid: batch ready %.2f s after begin, waited %.2f s for the device\n",
-                sinceBegin, waitSec);
-}
-
 // ---------------------------------------------------------------- the shared accumulator
 struct Shared
 {
@@ -836,11 +695,7 @@ bool dtfeGpuDepositAveraged1(std::vector<float>& verts,
     if (!c.ready) { err = c.err; return false; }
 
     size_t const nCell = nGrid[0] * nGrid[1] * nGrid[2];
-    out.density.assign(fDen ? nCell : 0, 0.f);
-    out.velocity.assign(fVel ? nCell * 3 : 0, 0.f);
-    out.grad.assign(fGrad ? nCell * 9 : 0, 0.f);
-    out.scalar.assign(fScal ? nCell : 0, 0.f);
-    out.scalar_grad.assign(fSGrad ? nCell * 3 : 0, 0.f);
+    dtfeGpuInitGrids(out, nCell, fDen, fVel, fGrad, fScal, fSGrad);
     if (cnts.empty()) return true;    // nothing to deposit (no cells in the region)
 
     NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
@@ -856,10 +711,10 @@ bool dtfeGpuDepositAveraged1(std::vector<float>& verts,
     double el = 0.;
     {
         std::lock_guard<std::mutex> lock(ctxMutex());   // serialize dispatches (single queue)
-        // The grids are allocated HERE, under the device mutex, since 2026-10-13: before, every sub-domain waiting
-        // for the device held its zeroed grids (all of them at once while the batches queue up), and the exact
-        // sums' words are 8 B per component -- a 512^3 run with the velocity gradient would have waited on
-        // ~1.6 GB per sub-domain. Now one batch's at a time (and the one being converted below), zeroed on the GPU.
+        // The grids are allocated HERE, under the device mutex: allocated before it, every sub-domain waiting
+        // for the device would hold its zeroed grids (all of them at once while the batches queue up), and the
+        // exact sums' words are 8 B per component -- a 512^3 run with the velocity gradient would wait on
+        // ~1.6 GB per sub-domain. So one batch's at a time (and the one being converted below), zeroed on the GPU.
         if (!g.alloc(c, nGrid, fDen, fVel, fGrad, fScal, fSGrad, b.P.fixedSum != 0, true))
         {
             err = "Metal buffer allocation failed (out of GPU-visible memory?)";
@@ -872,7 +727,7 @@ bool dtfeGpuDepositAveraged1(std::vector<float>& verts,
             el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         }
     }
-    if (timingOn() && g.den) logBatch(b, st, 0., el, -1.);
+    if (timingOn() && g.den) dtfeLogBatch("Metal", b, st, 0., el, -1.);
     if (ok && g.fixed)
     {   // the exact sums: every cell's integer, rounded once to the float of the contract (psMassFixedMass:
         // q / scale in double), outside the device mutex
@@ -914,28 +769,16 @@ bool dtfeGpuSharedBegin(const size_t fullGrid[3], bool fDen, bool fVel, bool fGr
     // samples): the shared full grid runs the SAME kernel at 450-780 M samples/s against 880-1070 M
     // on the per-call path with its sub-grids -- the atomics' footprint on a 2 GB grid costs more
     // in TLB and cache reach than the per-sub-domain zeroing and read-back it saves, even with the
-    // tetrahedra in Morton order (which took it from 32.8 s to 22.2 s; the per-call path was 17-19 s).
+    // tetrahedra in Morton order (22.2 s against 17-19 s on the per-call path).
     // A tiled (brick-ordered) full grid would be the next step if sharing is ever needed; the
     // machinery (owner boxes, implicit items, batch retries) is in place and tested either way.
-    if (!(getenv("DTFE_GPU_SHARED") && atoi(getenv("DTFE_GPU_SHARED")) != 0))
-    {
-        err = "off by default (DTFE_GPU_SHARED=1 turns it on; the per-sub-domain grids measured faster)";
-        return false;
-    }
+    if (!dtfeSharedOptedIn(err)) return false;
     // The full grids live on the GPU for the whole parallel region, next to the main grid they are
     // added into afterwards and the threads' triangulations: cap them to a share of physical memory
     // (DTFE_GPU_SHARED_GB overrides). Over the cap every sub-domain takes the per-call path, which
     // holds one sub-grid at a time.
-    double capGb = 0.25 * double(physicalMemory()) / 1e9;
-    if (const char* env = getenv("DTFE_GPU_SHARED_GB")) { double v = atof(env); if (v > 0) capGb = v; }
-    double const needGb = double(nCell) * ((fDen ? 4 : 0) + (fVel ? 12 : 0) + (fGrad ? 36 : 0) + (fScal ? 4 : 0) + (fSGrad ? 12 : 0)) / 1e9;
-    if (needGb > capGb)
-    {
-        char buf[200];
-        snprintf(buf, sizeof(buf), "the shared GPU grid would take %.1f GB, over the %.1f GB cap", needGb, capGb);
-        err = buf;
+    if (!dtfeSharedGridFits(nCell, fDen, fVel, fGrad, fScal, fSGrad, 0.25 * double(physicalMemory()) / 1e9, err))
         return false;
-    }
     if (!s.grids.alloc(c, fullGrid, fDen, fVel, fGrad, fScal, fSGrad))
     {
         s.grids.release();
@@ -973,7 +816,7 @@ bool dtfeGpuSharedDeposit(std::vector<float>& verts, std::vector<float>& dens, s
     auto const tReady = std::chrono::steady_clock::now();
     Batch b;      // uploaded WITHOUT the mutex: the threads' uploads overlap each other and the queue
     // (the float atomics: the shared grid has one unit for every batch, which no batch's bound sets -- the exact
-    // sums are the per-call path's, 2026-10-13)
+    // sums are the per-call path's)
     if (!uploadBatch(c, verts, dens, vels, scal, vols, cnts, flats, sobol, dx, nGrid, subOff, s.grids.full,
                      s.grids.fDen, s.grids.fVel, s.grids.fGrad, s.grids.fScal, s.grids.fSGrad, false, false, b, err))
     { pool->release(); return false; }
@@ -991,7 +834,7 @@ bool dtfeGpuSharedDeposit(std::vector<float>& verts, std::vector<float>& dens, s
         ++s.batches;
         if (!ok) ++s.failed;
         if (timingOn())
-            logBatch(b, st, waitSec, runSec, std::chrono::duration<double>(tReady - s.began).count());
+            dtfeLogBatch("Metal", b, st, waitSec, runSec, std::chrono::duration<double>(tReady - s.began).count());
     }
     b.release();
     pool->release();

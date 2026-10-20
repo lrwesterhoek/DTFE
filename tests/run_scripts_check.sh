@@ -2,9 +2,9 @@
 # Contract check for the batch driver scripts/run_ps_dtfe.sh (and the shared scripts/config.sh, and
 # run_dtfe.sh's exact-average switch).
 #
-# Every other suite tests the BINARY; this one tests the shell around it, which is where two silent
-# failures lived unnoticed (a discarded environment variable, and snapshots skipped for a file they
-# did not need). Runs against a FAKE DATA_ROOT built here, so it never touches real data.
+# Every other suite tests the BINARY; this one tests the shell around it, where failures stay silent
+# (a discarded environment variable, or snapshots skipped for a file they do not need). Runs against a
+# FAKE DATA_ROOT built here, so it never touches real data.
 #
 #  A) GRID_SIZE from the ENVIRONMENT reaches the binary, and '-g' still beats it:
 #     precedence must be  -g flag > environment > config.sh default.
@@ -15,22 +15,22 @@
 #  D) A snapshot with NEITHER source is skipped with a message naming both, and the run exits 1.
 #  E) Exit status is honest: processing nothing exits 1, while a PARTIAL skip stays 0 -- a
 #     partly-downloaded snapshot ladder is normal.
-#  F) No macOS-only command on the critical path ('/usr/bin/time -l', 'sed -i ""'), which used to
+#  F) No macOS-only command on the critical path ('/usr/bin/time -l', 'sed -i ""'), which would
 #     kill every snapshot on Linux. Asserted structurally, so it holds on either platform.
 #  G) The PER-FAMILY data layout of the Samsung T7 (<root>/<family>/<sim>, e.g. Illustris TNG/
 #     TNG100/TNG100-3-Dark), under a root whose name has a space like the T7's: the driver finds
 #     and processes the simulation there, config.sh's sim_dir puts a new simulation beside its
 #     family and lets a flat <root>/<sim> win, and run_ps_pipeline.sh discovers nested sims -- and exits 1
 #     when it finds nothing to compute (no data root, a mistyped SIMS, a SNAPS matching nothing).
-#  H) scripts/run_dtfe.sh passes --exact-average to the standard binary by default (2026-10-13; -e and
+#  H) scripts/run_dtfe.sh passes --exact-average to the standard binary by default (-e and
 #     DTFE_EXACT_AVERAGE=1 too, DTFE_EXACT_AVERAGE=0 not); its padding default is 15 (a caller's PADDING /
-#     DTFE_PADDING wins), run_ps_dtfe.sh keeps config.sh's 50. run_dtfe.sh AUTO_TUNE_REPORT=1 (2026-10-13, as
+#     DTFE_PADDING wins), run_ps_dtfe.sh keeps config.sh's 50. run_dtfe.sh AUTO_TUNE_REPORT=1 (as
 #     run_ps_dtfe.sh): the standard binary's own report line per snapshot ('snap=099'), exit 0, nothing written.
 #  I) download_snapshots.sh + merge_HDF5.py never turn a half-finished download into a merged snapshot.
-#  J) --help runs nothing (run_ps_pipeline.sh --help used to start the whole batch), --version prints the
+#  J) --help runs nothing (run_ps_pipeline.sh --help must not start the whole batch), --version prints the
 #     revision, an argument to the pipeline is an error, DRY_RUN=1 prints the drivers' commands and runs nothing.
 #  K) the binaries' own --help lists the phase-space / GPU / point-evaluation / server options the scripts and the
-#     launcher use (it listed none of them), and the help texts carry none of the survey's misspellings.
+#     launcher use, and the help texts carry none of the known misspellings.
 #  L) scripts/install_lib.sh keeps a user's binaries through a failed rebuild: backup, restore (the 2D double pair
 #     too), the failure hint; install.sh's detection of the extra sets it rebuilds (sourced alone, never run).
 #  M) the run-log contract of run_dtfe.sh / run_ps_dtfe.sh, against stand-in binaries: a run's log is
@@ -40,38 +40,39 @@
 #  O) the drivers' single-instance lock (<prefix>.runlog.lock: a second driver refused, stale locks removed, a stop
 #     releases it) and their preflight (data disk mounted, output folder writable with room for the grids).
 #  P) run_ps_pipeline.sh's freshness test compares the run settings with the snapshot's run log, not only file times
-#     (2026-10-15: the plane's conventions too, PTS_CONVENTIONS, which it hands to run_ps_dtfe.sh).
+#     (the plane's conventions too, PTS_CONVENTIONS, which it hands to run_ps_dtfe.sh).
 #  Q) scripts/thesis_runs.sh (the thesis run recipe): DRY_RUN=1 prints the exact settings of each stage, runs nothing;
 #     the voids stage hands each figure its box, gate and flags (the size function at fixed R and the convergence
 #     check ungated, per box), in order, draws each box's environment again after its tracking, and goes on after a
-#     failed one (stand-in PY). The overnight stages (2026-10-12): DRY_RUN=1 of 'overnight' plans dtfe (TNG100
+#     failed one (stand-in PY). The overnight stages: DRY_RUN=1 of 'overnight' plans dtfe (TNG100
 #     099 050 017) < caustics2 (050 033, the z = 0 caustic run's flags whatever the caller's shell says, the
 #     Lagrangian padding the binary's default) < refresh < prune and runs nothing; finished snapshots are skipped (FORCE=1 replans them); refresh MOVES the untagged
 #     caustic_skeleton_z0.00.* into old_untagged (never deletes, never overwrites, only beside the tagged png); a
 #     second recipe is refused by the lock, a stale lock removed; the heavy stages refuse while a PS-DTFE runs.
-#     2026-10-13: 'production' and 'tng50z0' are refused without HISTORICAL=1 (and pin the caustics off); ps27 and dtfe27
-#     plan the 27 snapshots of the 2026-10-12 drivers in their order with their exact flags (the standard-DTFE ones with
-#     the exact average at padding 15), the caller's knobs ignored; a snapshot is skipped only when its run log shows
-#     those settings; a real run (stand-in binaries and ps) MOVES the old files to _backup/<prefix>_<date>/... first and
-#     back again when the run fails. 2026-10-14: dtfe27planes plans the standard-DTFE 4096^2 planes of the same 27
-#     snapshots (dtfe27's splits and order, the box's hires_plane_z4096.bin, --pts-vel-grad, density_a only, padding 15,
-#     GPU, the exact average) under the prefix output_plane, the caller's knobs ignored; 'all' runs it after dtfe27; a
-#     snapshot is skipped only when output_plane.runlog shows that plane run; a real run moves old output_plane.* files
-#     to _backup/output_plane_<date>/... and never touches the output.* grids beside them.
-#  R) run_ps_dtfe.sh ORDERED_MERGE=1 (the default since 2026-10-14) passes --ordered-merge, ORDERED_MERGE=0
-#     --completion-order-merge, FIXED_POINT_MERGE=1 --fixed-point-merge instead of either (2026-10-15);
+#     'production' and 'tng50z0' are refused without HISTORICAL=1 (and pin the caustics off); ps27 and dtfe27
+#     plan the 27 snapshots of the drivers that made the grids on the data disk, in their order with their exact flags
+#     (the standard-DTFE ones with the exact average at padding 15), the caller's knobs ignored; a snapshot is skipped
+#     only when its run log shows those settings; a real run (stand-in binaries and ps) MOVES the old files to
+#     _backup/<prefix>_<date>/... first and back again when the run fails. dtfe27planes plans the standard-DTFE 4096^2
+#     planes of the same 27 snapshots (dtfe27's splits and order, the box's hires_plane_z4096.bin, --pts-vel-grad,
+#     density_a only, padding 15, GPU, the exact average) under the prefix output_plane, the caller's knobs ignored;
+#     'all' runs it after dtfe27; a snapshot is skipped only when output_plane.runlog shows that plane run; a real run
+#     moves old output_plane.* files to _backup/output_plane_<date>/... and never touches the output.* grids beside
+#     them.
+#  R) run_ps_dtfe.sh ORDERED_MERGE=1 (the default) passes --ordered-merge, ORDERED_MERGE=0
+#     --completion-order-merge, FIXED_POINT_MERGE=1 --fixed-point-merge instead of either;
 #     PTS_CONVENTIONS=legacy with SAMPLE_POINTS passes '--pts-conventions legacy', grid (the default) and a run without
-#     points pass nothing, another value is refused (2026-10-15); a killed run's checkpoint (<prefix>.runlog.checkpoint,
+#     points pass nothing, another value is refused; a killed run's checkpoint (<prefix>.runlog.checkpoint,
 #     or config.sh ps_checkpoint_dir's name under SCRATCH_DIR) makes the next run pass --resume and say so; PS_RESUME=0,
 #     an auto-tune report and a checkpoint folder with no 'checkpoint' file in it do not.
-#  S) the production defaults and the rerun hygiene of 2026-10-13 (audit finding 7), against the stand-in binaries:
+#  S) the production defaults and the rerun hygiene, against the stand-in binaries:
 #     the GPU when the Makefile's stamp says the binary has one (metal/cuda/hip; not off or cudaemu; DTFE_METAL /
 #     PS_METAL=0 wins), the drivers' production flags by default (run_ps_dtfe.sh: volume weighting, caustics, the nine
 #     fields; run_dtfe.sh: the exact average and the web fields; PS_LINEAR_DEPOSIT=1 drops the volume weighting),
 #     run_dtfe.sh's OUTPUT_PREFIX (a 'ps_*' one refused), and a rerun's left-over files: after exit 0 the files the run
 #     did not write are MOVED to <prefix>.superseded/<stamp>/ with the old run log (the rewritten ones, the run log
 #     family, a lock and a checkpoint stay); a failed run, a dry run and an auto-tune report move nothing.
-#     run_ps_pipeline.sh's PS_GPU unset follows the PS binary's stamp the same way (it was 1 on every build).
+#     run_ps_pipeline.sh's PS_GPU unset follows the PS binary's stamp the same way.
 #
 # Usage: tests/run_scripts_check.sh [--no-build]
 
@@ -83,10 +84,7 @@ cd "${ROOT_DIR}"
 source "${SCRIPT_DIR}/precision.sh"     # DTFE_TEST_PRECISION=double: the drivers run the double pair
 precision_double && export DTFE_PRECISION=double     # the drivers' own switch (run_ps_dtfe.sh / run_dtfe.sh)
 
-# python with a working h5py (plain python3 resolves to a broken x86_64 h5py on the dev machine)
-PY="${PYTHON:-python3}"
-command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/python3.14
-export PY                               # run_ps_pipeline.sh runs make_image_plane.py with the same python
+export PY                               # (tests/lib.sh) run_ps_pipeline.sh runs make_image_plane.py with the same python
 
 N="${N:-16}"
 GRID="${GRID:-24}"
@@ -99,11 +97,7 @@ echo "============================================================"
 echo " run_ps_dtfe.sh contract check   N=${N}^3  grid=${GRID}^3"
 echo "============================================================"
 
-if [ "${1:-}" != "--no-build" ] && ! precision_double; then
-    echo ">> building PS-DTFE ..."
-    BUILD_MODE="$(cat o_ps/.build_mode 2>/dev/null || true)"
-    make PS-DTFE ${BUILD_MODE:+"$BUILD_MODE"} >/dev/null
-fi
+build_target "${1:-}" PS-DTFE o_ps
 precision_require "${PS_BIN}"
 [ -x "${PS_BIN}" ] || { echo "FAIL: ${PS_BIN} not built"; exit 1; }
 
@@ -234,7 +228,7 @@ mkdir -p "${FAMROOT}/FAM/FAM-1-Dark/snapdir_099"
 cp "${TMP}/HASIC/snapdir_099/combined_099.hdf5" "${FAMROOT}/FAM/FAM-1-Dark/snapdir_099/"
 rc=0
 # GRID_SIZE=24 like every other section: without it the config default 1024^3 (~14 GB of grids)
-# ran here -- slow on a 64 GB Mac, and killed for memory in a 16 GB Linux container
+# would run here -- slow on a 64 GB Mac, and killed for memory in a 16 GB Linux container
 env "${COMMON_ENV[@]}" GRID_SIZE=24 DTFE_DATA_ROOT="${FAMROOT}" DTFE_SIM=FAM-1-Dark "${DRIVER}" 99 \
     >"${TMP}/g_family.log" 2>&1 || rc=$?
 check "$([ "${rc}" = "0" ] && echo 0 || echo 1)" "a run on the per-family layout succeeds (exit ${rc})"
@@ -249,12 +243,12 @@ mkdir -p "${FAMROOT}/FAM-3-Dark"
 flat="$(DTFE_DATA_ROOT="${FAMROOT}" bash -c 'source scripts/config.sh; sim_dir FAM-3-Dark')"
 check "$([ "${flat}" = "${FAMROOT}/FAM-3-Dark" ] && echo 0 || echo 1)" \
       "an existing flat <root>/FAM-3-Dark wins (got '${flat}')"
-rc=0; DRY_RUN=1 DTFE_DATA_ROOT="${FAMROOT}" scripts/run_ps_pipeline.sh >"${TMP}/g_pipeline.log" 2>&1 || rc=$?
+rc=0; DRY_RUN=1 SIMS=all DTFE_DATA_ROOT="${FAMROOT}" scripts/run_ps_pipeline.sh >"${TMP}/g_pipeline.log" 2>&1 || rc=$?
 check "$(has "${TMP}/g_pipeline.log" '^Simulations:.* FAM-1-Dark')" \
       "run_ps_pipeline.sh discovers the nested FAM-1-Dark"
 check "$([ "${rc}" = "0" ] && echo 0 || echo 1)" "... and a dry run with a snapshot to plan exits 0 (${rc})"
-# the pipeline's knobs (2026-10-04): the GPU flag follows PS_GPU, the plane's geometry reaches
-# make_image_plane.py, and a plane whose sidecar has another geometry is regenerated. PS_GPU unset (2026-10-13): the
+# the pipeline's knobs: the GPU flag follows PS_GPU, the plane's geometry reaches
+# make_image_plane.py, and a plane whose sidecar has another geometry is regenerated. PS_GPU unset: the
 # GPU exactly when this repository's PS binary is a GPU build (config.sh gpu_build_default; (S) varies the stamp)
 g_bin="$([ "${DTFE_PRECISION:-single}" = double ] && echo PS-DTFE-double || echo PS-DTFE)"
 g_gpu="$(bash -c 'source scripts/config.sh >/dev/null 2>&1; gpu_build_default "$1" "$2"' _ "${ROOT_DIR}" "${g_bin}")"
@@ -268,25 +262,28 @@ fi
 check "$(has "${TMP}/g_pipeline.log" 'make_image_plane.py .*--planes 1 --thickness 2 --supersample 1 -o ')" \
       "... and makes a single plane without sub-sampling"
 DRY_RUN=1 PS_GPU=0 PS_VOLUME_WEIGHTED=0 PLANES=4 THICKNESS=3 SUPERSAMPLE=2 WINDOW="0 50 0 25" CENTER=40 \
-    DTFE_DATA_ROOT="${FAMROOT}" scripts/run_ps_pipeline.sh >"${TMP}/g_pipeline2.log" 2>&1 || true
+    SIMS=all DTFE_DATA_ROOT="${FAMROOT}" scripts/run_ps_pipeline.sh >"${TMP}/g_pipeline2.log" 2>&1 || true
 check "$(has "${TMP}/g_pipeline2.log" 'PS_VOLUME_WEIGHTED=0 .*run_ps_dtfe.sh -s FAM-1-Dark -g [0-9]+ 99')" \
       "PS_GPU=0 drops -m and PS_VOLUME_WEIGHTED=0 is passed on"
 check "$(has "${TMP}/g_pipeline2.log" 'make_image_plane.py .*--axis z --nu [0-9]+ --planes 4 --thickness 3 --supersample 2 --center 40 --u0 0 --u1 50 --v0 0 --v1 25 -o ')" \
       "PLANES, THICKNESS, SUPERSAMPLE, CENTER and WINDOW reach make_image_plane.py"
-# finding nothing to compute is a failure (2026-10-08): with the data drive unmounted, a mistyped SIMS or
-# a SNAPS matching no snapshot the pipeline printed ALL DONE and exited 0, which the launcher showed as a success
+# finding nothing to compute is a failure: with the data drive unmounted, a mistyped SIMS or a SNAPS
+# matching no snapshot, an ALL DONE with exit 0 would show in the launcher as a success
 mkdir -p "${TMP}/empty root"
-rc=0; DTFE_DATA_ROOT="${TMP}/empty root" scripts/run_ps_pipeline.sh >"${TMP}/g_pipe_none.log" 2>&1 || rc=$?
+rc=0; env -u SIMS DTFE_DATA_ROOT="${FAMROOT}" scripts/run_ps_pipeline.sh >"${TMP}/g_pipe_nosims.log" 2>&1 || rc=$?
+check "$([ "${rc}" = "2" ] && [ "$(has "${TMP}/g_pipe_nosims.log" 'no simulation given: set SIMS')" = 0 ] && echo 0 || echo 1)" \
+      "run_ps_pipeline.sh without SIMS refuses with exit 2: there is no default simulation (SIMS=all discovers) (${rc})"
+rc=0; SIMS=all DTFE_DATA_ROOT="${TMP}/empty root" scripts/run_ps_pipeline.sh >"${TMP}/g_pipe_none.log" 2>&1 || rc=$?
 check "$([ "${rc}" = "1" ] && echo 0 || echo 1)" "run_ps_pipeline.sh with no simulation under the data root exits 1 (${rc})"
 check "$(has "${TMP}/g_pipe_none.log" '^!! nothing to compute')" "... says there is nothing to compute"
 check "$(lacks "${TMP}/g_pipe_none.log" 'ALL DONE')" "... and not ALL DONE"
-rc=0; DTFE_DATA_ROOT="${TMP}/no such root" scripts/run_ps_pipeline.sh >"${TMP}/g_pipe_unmounted.log" 2>&1 || rc=$?
+rc=0; SIMS=all DTFE_DATA_ROOT="${TMP}/no such root" scripts/run_ps_pipeline.sh >"${TMP}/g_pipe_unmounted.log" 2>&1 || rc=$?
 check "$([ "${rc}" = "1" ] && echo 0 || echo 1)" "a data root that does not exist (the drive unplugged) exits 1 (${rc})"
 check "$(has "${TMP}/g_pipe_unmounted.log" 'is the data drive mounted')" "... and asks whether the drive is mounted"
 rc=0; DRY_RUN=1 SIMS=FAM-1-Drak DTFE_DATA_ROOT="${FAMROOT}" scripts/run_ps_pipeline.sh >"${TMP}/g_pipe_typo.log" 2>&1 || rc=$?
 check "$([ "${rc}" = "1" ] && echo 0 || echo 1)" "a mistyped SIMS exits 1 (${rc})"
 check "$(has "${TMP}/g_pipe_typo.log" '^!! nothing to compute: no combined snapshot of FAM-1-Drak ')" "... naming the simulation"
-rc=0; DRY_RUN=1 SNAPS="50 67" DTFE_DATA_ROOT="${FAMROOT}" scripts/run_ps_pipeline.sh >"${TMP}/g_pipe_snaps.log" 2>&1 || rc=$?
+rc=0; DRY_RUN=1 SNAPS="50 67" SIMS=all DTFE_DATA_ROOT="${FAMROOT}" scripts/run_ps_pipeline.sh >"${TMP}/g_pipe_snaps.log" 2>&1 || rc=$?
 check "$([ "${rc}" = "1" ] && echo 0 || echo 1)" "a SNAPS matching no snapshot exits 1 (${rc})"
 check "$(has "${TMP}/g_pipe_snaps.log" 'FAM-1-Dark: no combined snapshots numbered 50 67, skipping')" "... naming the numbers it looked for"
 rc=0; DRY_RUN=1 SIMS="FAM-1-Drak FAM-1-Dark" DTFE_DATA_ROOT="${FAMROOT}" scripts/run_ps_pipeline.sh >"${TMP}/g_pipe_half.log" 2>&1 || rc=$?
@@ -295,28 +292,28 @@ check "$([ "${rc}" = "0" ] && echo 0 || echo 1)" "one simulation of two without 
 "${PY}" python/tools/make_image_plane.py --combined "${FAMROOT}/FAM/FAM-1-Dark/snapdir_099/combined_099.hdf5" \
     --mpc-unit 1 --axis z --nu 8 --planes 1 -o "${FAMROOT}/FAM/FAM-1-Dark/hires_plane_z8" >/dev/null 2>&1 || true
 if [ -f "${FAMROOT}/FAM/FAM-1-Dark/hires_plane_z8.json" ]; then
-    DRY_RUN=1 NU=8 DTFE_DATA_ROOT="${FAMROOT}" scripts/run_ps_pipeline.sh >"${TMP}/g_pipeline3.log" 2>&1 || true
+    DRY_RUN=1 NU=8 SIMS=all DTFE_DATA_ROOT="${FAMROOT}" scripts/run_ps_pipeline.sh >"${TMP}/g_pipeline3.log" 2>&1 || true
     check "$(has "${TMP}/g_pipeline3.log" '^-- reusing .*hires_plane_z8.bin')" \
           "an existing plane of the requested geometry is reused"
-    DRY_RUN=1 NU=8 PLANES=16 DTFE_DATA_ROOT="${FAMROOT}" scripts/run_ps_pipeline.sh >"${TMP}/g_pipeline4.log" 2>&1 || true
+    DRY_RUN=1 NU=8 PLANES=16 SIMS=all DTFE_DATA_ROOT="${FAMROOT}" scripts/run_ps_pipeline.sh >"${TMP}/g_pipeline4.log" 2>&1 || true
     check "$(has "${TMP}/g_pipeline4.log" 'geometry .* differs; regenerating')" \
           "another plane count regenerates the plane (and so every snapshot)"
     check "$([ -f "${FAMROOT}/FAM/FAM-1-Dark/hires_plane_z8.bin" ] && echo 0 || echo 1)" \
           "... but a DRY_RUN removes nothing"
     # a comparison that FAILS (here: no python) is not 'differs': the plane stays, the sim is skipped with !!
-    rc5=0; PY=/nonexistent/python3 NU=8 DTFE_DATA_ROOT="${FAMROOT}" scripts/run_ps_pipeline.sh >"${TMP}/g_pipeline5.log" 2>&1 || rc5=$?
+    rc5=0; PY=/nonexistent/python3 NU=8 SIMS=all DTFE_DATA_ROOT="${FAMROOT}" scripts/run_ps_pipeline.sh >"${TMP}/g_pipeline5.log" 2>&1 || rc5=$?
     check "$(has "${TMP}/g_pipeline5.log" '^!! FAM-1-Dark: could not compare the plane')" \
           "a failing geometry check is reported, not read as 'differs'"
     check "$([ "${rc5}" != "0" ] && [ -f "${FAMROOT}/FAM/FAM-1-Dark/hires_plane_z8.json" ] && echo 0 || echo 1)" \
           "... the plane is kept and the pipeline exits non-zero (${rc5})"
-    # every snapshot up to date is a success, not 'nothing to compute' (2026-10-08); a slice of the 8^2 plane holds
-    # 64 points (the pipeline compares the count since 2026-10-11)
+    # every snapshot up to date is a success, not 'nothing to compute'; a slice of the 8^2 plane holds
+    # 64 points (the pipeline compares the count)
     head -c 512 /dev/zero > "${FAMROOT}/FAM/FAM-1-Dark/snapdir_099/ps_output.pts_den"
     touch -t 203001010000 "${FAMROOT}/FAM/FAM-1-Dark/snapdir_099/ps_output.pts_den" \
                           "${FAMROOT}/FAM/FAM-1-Dark/snapdir_099/ps_output.pts_velGrad"
-    # the settings of the (A)-style run that made these grids: since 2026-10-11 the pipeline compares them too (P)
+    # the settings of the (A)-style run that made these grids: the pipeline compares them too (P)
     rc6=0; DRY_RUN=1 NU=8 GRID_SIZE=24 FIELDS=density_a AVG_SUBSAMPLES=1 PS_VOLUME_WEIGHTED=1 PTS_VEL_GRAD=0 \
-        DTFE_DATA_ROOT="${FAMROOT}" scripts/run_ps_pipeline.sh >"${TMP}/g_pipeline6.log" 2>&1 || rc6=$?
+        SIMS=all DTFE_DATA_ROOT="${FAMROOT}" scripts/run_ps_pipeline.sh >"${TMP}/g_pipeline6.log" 2>&1 || rc6=$?
     check "$([ "${rc6}" = "0" ] && echo 0 || echo 1)" "every snapshot up to date still exits 0 (${rc6})"
     check "$(has "${TMP}/g_pipeline6.log" 'FAM-1-Dark: all snapshots up to date')" "... with nothing to recompute"
     rm -f "${FAMROOT}/FAM/FAM-1-Dark/snapdir_099/ps_output.pts_den" "${FAMROOT}/FAM/FAM-1-Dark/snapdir_099/ps_output.pts_velGrad"
@@ -334,7 +331,7 @@ if [ -x "${DTFE_BIN}" ]; then
         check "$(has "${TMP}/h_exact.log" 'RUNNING: .*DTFE-double ')" "DTFE_PRECISION=double: run_dtfe.sh ran ./DTFE-double"
     fi
     check "$(has "${TMP}/h_exact.log" 'EXACT cell-tetrahedron integration')" "... and reports the exact cell average"
-    # 2026-10-06 (survey rank 5): the wrapper run_ps_dtfe.sh has -- wall time, peak memory, a de-ANSI'd runlog
+    # what the wrapper run_ps_dtfe.sh has -- wall time, peak memory, a de-ANSI'd runlog
     check "$(has "${TMP}/h_exact.log" '^  Wall time: [0-9]+ min [0-9]+ s$')" "run_dtfe.sh reports the wall time per snapshot"
     if [ -x /usr/bin/time ]; then
         check "$(has "${TMP}/h_exact.log" '^  Peak memory: .*GB resident')" "... and the peak memory (through /usr/bin/time)"
@@ -352,7 +349,7 @@ if [ -x "${DTFE_BIN}" ]; then
           "... its log is output.runlog.failed: no output.runlog claims grids it never wrote (2026-10-08)"
     check "$([ -f "${TMP}/HASIC/snapdir_099/output.a_den" ] && echo 0 || echo 1)" "its density grid was written"
     DTFE_EXACT_AVERAGE=1 scripts/run_dtfe.sh -s HASIC -g 16 99 >"${TMP}/h_env.log" 2>&1 || true
-    # 2026-10-05: run_dtfe.sh reports failures in its exit status (it always exited 0 before), passes the
+    # run_dtfe.sh reports failures in its exit status, passes the
     # launcher's scratch folder and the scripts' lambda_th default, and the binaries refuse --redshiftSpace
     rc_none=0; scripts/run_dtfe.sh -s HASIC -g 16 123 >"${TMP}/h_none.log" 2>&1 || rc_none=$?
     check "$([ "${rc_none}" != "0" ] && echo 0 || echo 1)" "run_dtfe.sh exits non-zero when no snapshot was processed (${rc_none})"
@@ -362,7 +359,7 @@ if [ -x "${DTFE_BIN}" ]; then
     check "$([ "${rc_scr}" = "0" ] && echo 0 || echo 1)" "run_dtfe.sh with SCRATCH_DIR succeeds (exit ${rc_scr})"
     check "$(has "${TMP}/h_scratch.log" "RUNNING: .*--scratch-dir ${SCR_DIR}")" "... and hands the folder to the binary (--scratch-dir)"
     check "$(has "${TMP}/h_scratch.log" 'RUNNING: .*--lambda_th 0.3')" "run_dtfe.sh passes the scripts' lambda_th default (0.3, the binary's own is 0)"
-    # 2026-10-12: standard DTFE pads with 15 spacings by default (complete at z = 0 on TNG50/100/300), not config.sh's
+    # standard DTFE pads with 15 spacings by default (complete at z = 0 on TNG50/100/300), not config.sh's
     # 50, which stays the PS-DTFE scripts' value; a caller's PADDING or DTFE_PADDING still wins, PADDING first
     pad_of() { env -u PADDING -u DTFE_PADDING "$@" DRY_RUN=1 "${PAD_DRIVER}" -s HASIC -g 16 99 2>&1 \
                    | grep -oE -e '--padding +[0-9]+' | head -1 | grep -oE '[0-9]+$'; }
@@ -375,7 +372,7 @@ if [ -x "${DTFE_BIN}" ]; then
     check "$([ "${pad_ps}" = "50" ] && echo 0 || echo 1)" "... while run_ps_dtfe.sh keeps config.sh's 50 (${pad_ps:-none})"
     rm -rf "${SCR_DIR}"
     # FIELDS reaches the standard binary (the launcher's ticks: the T-web), a phase-space dispersion is left out;
-    # TESS_CACHE hands a (created) local folder to --tessellation-cache (2026-10-06)
+    # TESS_CACHE hands a (created) local folder to --tessellation-cache
     TC_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dtfe-tess-check.XXXXXX")/cache"
     rc_f=0; FIELDS="density_a tweb_a dispersion_a" TESS_CACHE="${TC_DIR}" scripts/run_dtfe.sh -s HASIC -g 16 99 \
         >"${TMP}/h_fields.log" 2>&1 || rc_f=$?
@@ -387,7 +384,7 @@ if [ -x "${DTFE_BIN}" ]; then
     check "$([ -f "${TMP}/HASIC/snapdir_099/output.a_tweb" ] || ls "${TMP}/HASIC/snapdir_099/"output.*tweb* >/dev/null 2>&1; echo $?)" \
         "... and the T-web grid is written"
     rm -rf "$(dirname "${TC_DIR}")"
-    # SAMPLE_POINTS: the standard DTFE interpolant at a points file too (the launcher's hi-res slice, 2026-10-06)
+    # SAMPLE_POINTS: the standard DTFE interpolant at a points file too (the launcher's hi-res slice)
     printf '1 1 1\n2 3 4\n5 5 5\n' > "${TMP}/h_pts.txt"
     rc_sp=0; SAMPLE_POINTS="${TMP}/h_pts.txt" PTS_VEL_GRAD=1 scripts/run_dtfe.sh -s HASIC -g 16 99 \
         >"${TMP}/h_pts.log" 2>&1 || rc_sp=$?
@@ -398,7 +395,7 @@ if [ -x "${DTFE_BIN}" ]; then
     # PS_LINEAR_DEPOSIT reaches the phase-space binary (a dry run: the command only)
     DRY_RUN=1 PS_LINEAR_DEPOSIT=1 PS_VOLUME_WEIGHTED=0 scripts/run_ps_dtfe.sh -s HASIC -g 16 99 >"${TMP}/h_lin.log" 2>&1 || true
     check "$(has "${TMP}/h_lin.log" '--ps-linear-deposit')" "run_ps_dtfe.sh: PS_LINEAR_DEPOSIT=1 passes --ps-linear-deposit"
-    # zero-padded snapshot numbers are decimal (bash's printf read '099' as octal: an error, then snapshot 000)
+    # zero-padded snapshot numbers are decimal (bash's printf reads '099' as octal: an error, then snapshot 000)
     rc_oct=0; scripts/run_dtfe.sh -s HASIC -g 16 099 >"${TMP}/h_oct.log" 2>&1 || rc_oct=$?
     check "$([ "${rc_oct}" = "0" ] && echo 0 || echo 1)" "run_dtfe.sh accepts a zero-padded snapshot number (099, exit ${rc_oct})"
     check "$(has "${TMP}/h_oct.log" 'Snapshot 099 processed successfully')" "... and runs snapshot 99, not 0 (octal)"
@@ -410,14 +407,14 @@ if [ -x "${DTFE_BIN}" ]; then
     check "$([ "${rc_rs}" != "0" ] && echo 0 || echo 1)" "--redshiftSpace is refused (it was a silent no-op), exit ${rc_rs}"
     check "$(has "${TMP}/h_rs.log" 'not implemented in this version')" "... with a message saying the transform is not implemented"
     check "$(has "${TMP}/h_env.log" 'RUNNING: .*--exact-average')" "DTFE_EXACT_AVERAGE=1 does the same"
-    # 2026-10-13: the exact average is the default (the production standard); DTFE_EXACT_AVERAGE=0 is the sampled one
+    # the exact average is the default (the production standard); DTFE_EXACT_AVERAGE=0 is the sampled one
     rc_pl=0; env -u DTFE_EXACT_AVERAGE scripts/run_dtfe.sh -s HASIC -g 16 99 >"${TMP}/h_plain.log" 2>&1 || rc_pl=$?
     check "$([ "${rc_pl}" = "0" ] && [ "$(has "${TMP}/h_plain.log" 'RUNNING: .*--exact-average')" = 0 ] \
              && [ "$(has "${TMP}/h_plain.log" 'RUNNING: .*--field density_a velocity_a gradient_a divergence_a shear_a vorticity_a tweb_a vweb_a ')" = 0 ] \
              && echo 0 || echo 1)" "a plain run passes --exact-average and the web fields (the production defaults since 2026-10-13; exit ${rc_pl})"
     DTFE_EXACT_AVERAGE=0 scripts/run_dtfe.sh -s HASIC -g 16 99 >"${TMP}/h_mc.log" 2>&1 || true
     check "$(lacks "${TMP}/h_mc.log" '--exact-average')" "DTFE_EXACT_AVERAGE=0 passes no --exact-average (the Monte-Carlo cell mean)"
-    # 2026-10-13: the standard binary's auto-tuner reports (it printed 'AUTO-TUNE-REPORT unsupported'), and the driver
+    # the standard binary's auto-tuner reports (not 'AUTO-TUNE-REPORT unsupported'), and the driver
     # asks it the way run_ps_dtfe.sh does: a report per snapshot, nothing computed, nothing written beside the data
     rm -rf "${TMP}/HASIC/snapdir_099/output."*        # (the grids, run logs and the superseded folder of the runs above)
     rc_rep=0; AUTO_TUNE_REPORT=1 scripts/run_dtfe.sh -s HASIC -g 16 99 >"${TMP}/h_report.log" 2>&1 || rc_rep=$?
@@ -565,6 +562,7 @@ cp "${TMP}/snap_099.2.keep" "${DL2}/snapdir_099/snap_099.0.hdf5"
 head -c 20000 "${TMP}/snap_099.2.keep" > "${DL2}/snapdir_099/snap_099.1.hdf5"
 touch -t 202001010000 "${DL2}/snapdir_099/snap_099.1.hdf5"
 head -c 20000 "${TMP}/snap_099.2.keep" > "${DL2}/snapdir_099/snap_099.2.hdf5"          # written just now
+touch -t 209901010000 "${DL2}/snapdir_099/snap_099.2.hdf5"   # ... and stays "just now" however loaded the machine (the guard keeps a chunk younger than 60 s; a slow run used to age it past that)
 cat > "${TMP}/fakebin/wget" <<'WEOF'
 #!/usr/bin/env bash
 # no network: records every argument, fails for snapshot-98, else leaves the product's first chunk
@@ -644,6 +642,11 @@ for scr in scripts/run_dtfe.sh scripts/run_ps_dtfe.sh scripts/run_ps_pipeline.sh
 done
 check "$(has "${TMP}/j_help_run_ps_pipeline.sh.log" 'COMPUTE ONLY')" "run_ps_pipeline.sh --help prints its header (it used to start the whole batch)"
 check "$(has "${TMP}/j_help_run_dtfe.sh.log" '^Usage: ')" "run_dtfe.sh --help ends with the usage line"
+for scr in scripts/run_dtfe.sh scripts/run_ps_dtfe.sh scripts/download_snapshots.sh; do
+    rc=0; env -u DTFE_SIM "${scr}" 99 >"${TMP}/j_nosim_${scr##*/}.log" 2>&1 || rc=$?
+    check "$([ "${rc}" = "2" ] && [ "$(has "${TMP}/j_nosim_${scr##*/}.log" 'no simulation given: pass -s SIMULATION')" = 0 ] && echo 0 || echo 1)" \
+          "${scr##*/} without -s or DTFE_SIM refuses with exit 2: there is no default simulation (${rc})"
+done
 rc=0; scripts/run_ps_pipeline.sh bogus >"${TMP}/j_bogus.log" 2>&1 || rc=$?
 check "$([ "${rc}" = "2" ] && echo 0 || echo 1)" "run_ps_pipeline.sh with an argument refuses with exit 2 (${rc})"
 check "$(has "${TMP}/j_bogus.log" 'takes no arguments')" "... and says why"
@@ -684,7 +687,7 @@ check "$(has "${TMP}/k_full_ps.log" "'MPC_UNIT'")" "... and names the Makefile's
 echo ""
 echo "(L) scripts/install_lib.sh: the binaries kept through a failed rebuild (2026-10-05, survey rank 24)."
 LREPO="${TMP}/fake_repo"; rm -rf "${LREPO}"; mkdir -p "${LREPO}"
-# the 2D double pair too (2026-10-08): install.sh rebuilds it, so a failed build must be able to bring it back
+# the 2D double pair too: install.sh rebuilds it, so a failed build must be able to bring it back
 ( cd "${LREPO}" && printf 'old DTFE\n' > DTFE && printf 'old PS-DTFE\n' > PS-DTFE && printf 'old 2d\n' > DTFE-2d \
       && printf 'old 2d double\n' > DTFE-2d-double && printf 'old PS 2d double\n' > PS-DTFE-2d-double \
       && chmod +x DTFE PS-DTFE DTFE-2d DTFE-2d-double PS-DTFE-2d-double
@@ -705,8 +708,8 @@ check "$([ "$(cat "${LREPO}/DTFE-2d-double")" = "old 2d double" ] && [ "$(cat "$
 check "$(has "${TMP}/l_hint.log" 'ld: symbol not found')" "build_failed_hint prints the log's tail"
 check "$(lacks "${TMP}/l_hint.log" '^line1$')" "... only the last N lines"
 check "$(has "${TMP}/l_hint.log" 'make deps-check')" "... and the usual causes"
-# install.sh rebuilds the double, 2D and 2D double sets it finds before 'make clean' (2026-10-08; a re-run threw
-# them away before). install.sh itself is never run here: its detection block, cut out between 'EXTRA_SETS=()'
+# install.sh rebuilds the double, 2D and 2D double sets it finds before 'make clean' (else a re-run would throw
+# them away). install.sh itself is never run here: its detection block, cut out between 'EXTRA_SETS=()'
 # and the 'also to be rebuilt' line, is sourced in fake folders with info() stubbed out
 sed -n '/^EXTRA_SETS=()/,/also to be rebuilt/p' scripts/install.sh > "${TMP}/l_extra_sets.sh"
 check "$(grep -q '^EXTRA_SETS=()' "${TMP}/l_extra_sets.sh" && grep -q 'DIM=2 DOUBLE=1' "${TMP}/l_extra_sets.sh" \
@@ -731,8 +734,8 @@ check "$([ "${got}" = "[ DOUBLE=1]" ] && echo 0 || echo 1)" "... --double with n
 
 echo ""
 echo "(M) the run-log contract: a failed, stopped or killed re-run keeps the .runlog of the grids on disk (2026-10-08)."
-# Both drivers tee'd straight into <prefix>.runlog, so a re-run that failed early, or was stopped or killed,
-# replaced the log of the grids still on disk (the Runs browser then showed them as a failed run with the
+# A driver that tees straight into <prefix>.runlog lets a re-run that fails early, or is stopped or killed,
+# replace the log of the grids still on disk (the Runs browser then shows them as a failed run with the
 # new settings). Copies of the drivers run here beside STAND-IN binaries (the drivers find theirs one level
 # above their own folder), so a success, a failure, a stop and a SIGKILL are all deterministic and need no build.
 MREPO="${TMP}/runlog_repo"; MDATA="${TMP}/runlog_data"; MPID="${TMP}/m_binary.pid"
@@ -815,7 +818,7 @@ for pair in "run_dtfe.sh output" "run_ps_dtfe.sh ps_output"; do
           "... the next good run: its log is the .runlog; the stale .runlog.failed and .runlog.partial are gone (${rc})"
 done
 # an auto-tune report writes nothing next to the data: not the .runlog, nor a .partial or .failed (run_dtfe.sh has
-# the knob since 2026-10-13)
+# the knob too)
 for pair in "run_dtfe.sh output" "run_ps_dtfe.sh ps_output"; do
     scr="${pair% *}"; pfx="${pair#* }"
     cp "${MDATA}/SIM/snapdir_099/${pfx}.runlog" "${TMP}/m_before_report.runlog"
@@ -832,8 +835,8 @@ done
 echo ""
 echo "(O) the single-instance lock and the preflight of run_dtfe.sh / run_ps_dtfe.sh (2026-10-11)."
 # Contract C1: '<prefix>.runlog.lock' is a directory holding the driver's pid while it runs that snapshot. A
-# second driver on the same snapshot is refused (two TNG runs together got both SIGKILLed for memory,
-# 2026-10-03); a lock whose driver is gone is stale and removed with a message; a stop releases it.
+# second driver on the same snapshot is refused (two TNG runs together get both SIGKILLed for memory);
+# a lock whose driver is gone is stale and removed with a message; a stop releases it.
 for pair in "run_dtfe.sh output" "run_ps_dtfe.sh ps_output"; do
     scr="${pair% *}"; pfx="${pair#* }"
     L="${MDATA}/SIM/snapdir_099/${pfx}.runlog"; K="${L}.lock"
@@ -854,8 +857,8 @@ for pair in "run_dtfe.sh output" "run_ps_dtfe.sh ps_output"; do
     kill -TERM "$(cat "${MPID}" 2>/dev/null)" 2>/dev/null || true
     rc=0; wait "${mpid}" 2>/dev/null || rc=$?
     check "$([ "${rc}" = "143" ] && [ ! -e "${K}" ] && echo 0 || echo 1)" "... a stop still exits 143 and releases the lock (${rc})"
-    # 2026-10-11: the driver alone SIGKILLed: its binary and tee keep running on the snapshot, so its lock is not
-    # stale (removing it started a second binary beside the orphan, the 2026-10-03 double launch)
+    # the driver alone SIGKILLed: its binary and tee keep running on the snapshot, so its lock is not
+    # stale (removing it would start a second binary beside the orphan)
     mhang "${scr}" "${TMP}/o_${pfx}_orphan.log" orphan
     kill -KILL "${mpid}" 2>/dev/null || true
     wait "${mpid}" 2>/dev/null || true
@@ -893,7 +896,7 @@ for pair in "run_dtfe.sh output" "run_ps_dtfe.sh ps_output"; do
     check "$(lacks "${TMP}/o_${pfx}_space.log" '^RUNNING:')" "... before the binary started"
     rc=0; env DTFE_DATA_ROOT="${MDATA}" FAKE_MODE=ok DTFE_SPACE_CHECK=0 "${MREPO}/scripts/${scr}" -s SIM -g 20000 99 >"${TMP}/o_${pfx}_nospace.log" 2>&1 || rc=$?
     check "$([ "${rc}" = "0" ] && echo 0 || echo 1)" "... DTFE_SPACE_CHECK=0 skips the space check (${rc})"
-    # the data disk unplugged: one clear message up front, exit 2 (it used to skip every snapshot under a wrong path)
+    # the data disk unplugged: one clear message up front, exit 2 (not a skip of every snapshot under a wrong path)
     rc=0; env DTFE_DATA_ROOT="${TMP}/no such disk/Illustris TNG" "${MREPO}/scripts/${scr}" -s SIM 99 >"${TMP}/o_${pfx}_root.log" 2>&1 || rc=$?
     check "$([ "${rc}" = "2" ] && echo 0 || echo 1)" "... a data root that does not exist: exit 2 (${rc})"
     check "$(has "${TMP}/o_${pfx}_root.log" 'does not exist: is the data disk mounted')" "... asking whether the disk is mounted"
@@ -929,7 +932,7 @@ RSD="${MDATA}/SIM/snapdir_099"; RCK="${RSD}/ps_output.runlog.checkpoint"
 rm -rf "${RCK}" "${RSD}/ps_output.runlog.lock"
 rc=$(mdrive run_ps_dtfe.sh "${TMP}/r_plain.log" FAKE_MODE=ok)
 check "$([ "${rc}" = "0" ] && grep -aq '^RUNNING: ' "${TMP}/r_plain.log" && echo 0 || echo 1)" "a plain run goes (${rc})"
-# 2026-10-14: the ordered (staged) merge is the default; the driver says it either way
+# the ordered (staged) merge is the default; the driver says it either way
 check "$([ "$(lacks "${TMP}/r_plain.log" '^RUNNING: .*--(completion-order-merge|resume)')" = 0 ] \
          && [ "$(has "${TMP}/r_plain.log" '^RUNNING: .*--ordered-merge')" = 0 ] && echo 0 || echo 1)" \
       "... with --ordered-merge (the default since 2026-10-14) and no --resume"
@@ -939,7 +942,7 @@ rc=$(mdrive run_ps_dtfe.sh "${TMP}/r_compl.log" FAKE_MODE=ok ORDERED_MERGE=0)
 check "$([ "$(has "${TMP}/r_compl.log" '^RUNNING: .*--completion-order-merge')" = 0 ] \
          && [ "$(lacks "${TMP}/r_compl.log" '^RUNNING: .*--ordered-merge')" = 0 ] && echo 0 || echo 1)" \
       "ORDERED_MERGE=0 passes --completion-order-merge, the merge as partitions finish (${rc})"
-# 2026-10-15: FIXED_POINT_MERGE=1 passes the opt-in order-free merge in place of the merge-order flag
+# FIXED_POINT_MERGE=1 passes the opt-in order-free merge in place of the merge-order flag
 rc=$(mdrive run_ps_dtfe.sh "${TMP}/r_fixed.log" FAKE_MODE=ok FIXED_POINT_MERGE=1)
 check "$([ "$(has "${TMP}/r_fixed.log" '^RUNNING: .*--fixed-point-merge')" = 0 ] \
          && [ "$(lacks "${TMP}/r_fixed.log" '^RUNNING: .*--(ordered-merge|completion-order-merge)')" = 0 ] && echo 0 || echo 1)" \
@@ -954,7 +957,7 @@ check "$(has "${TMP}/r_noresume.log" 'PS_RESUME=0, so this run starts over')" ".
 rc=$(mdrive run_ps_dtfe.sh "${TMP}/r_report.log" FAKE_MODE=report AUTO_TUNE_REPORT=1)
 check "$(lacks "${TMP}/r_report.log" '(--resume|Resuming)')" "an auto-tune report never resumes (${rc})"
 # a folder with no 'checkpoint' file (a run killed during its first write, or one that never had room) holds
-# nothing to resume: the binary refuses '--resume' there, and the folder made every rerun fail (2026-10-11)
+# nothing to resume: the binary refuses '--resume' there, so passing it would make every rerun fail
 rm -f "${RCK}/checkpoint"; : > "${RCK}/checkpoint.tmp.99999"
 rc=$(mdrive run_ps_dtfe.sh "${TMP}/r_emptyck.log" FAKE_MODE=ok)
 check "$(lacks "${TMP}/r_emptyck.log" '(^RUNNING: .*--resume|Resuming)')" "a checkpoint folder without a 'checkpoint' file: no --resume (${rc})"
@@ -969,7 +972,7 @@ mkdir -p "${SCK}"; : > "${SCK}/checkpoint"
 rc=$(mdrive run_ps_dtfe.sh "${TMP}/r_scr1.log" FAKE_MODE=ok SCRATCH_DIR="${RSCR}")
 check "$(has "${TMP}/r_scr1.log" '^RUNNING: .*--resume')" "... the checkpoint in the scratch folder: --resume is passed (${rc})"
 rm -rf "${SCK}"
-# the plane's conventions (2026-10-15): legacy only on request and only with points; the binary's default otherwise
+# the plane's conventions: legacy only on request and only with points; the binary's default otherwise
 : > "${TMP}/r_points.txt"
 rc=$(mdrive run_ps_dtfe.sh "${TMP}/r_pc_def.log" FAKE_MODE=ok SAMPLE_POINTS="${TMP}/r_points.txt")
 rc2=$(mdrive run_ps_dtfe.sh "${TMP}/r_pc_leg.log" FAKE_MODE=ok SAMPLE_POINTS="${TMP}/r_points.txt" PTS_CONVENTIONS=legacy)
@@ -985,7 +988,7 @@ check "$([ "${rc}" = "2" ] && [ "$(has "${TMP}/r_pc_bad.log" "PTS_CONVENTIONS mu
 
 echo ""
 echo "(P) run_ps_pipeline.sh's 'up to date' compares the run settings, not only the file times (2026-10-11)."
-# A changed grid or field list printed 'up to date, skipping compute' for every snapshot. The pipeline now asks
+# File times alone would call a changed grid or field list 'up to date, skipping compute'. The pipeline asks
 # run_ps_dtfe.sh (DRY_RUN=1) for the command it would run and compares its options with the RUNNING: line of the
 # snapshot's <prefix>.runlog. Against the stand-in binaries of (M), on a real snapshot so the plane can be made.
 PDATA="${TMP}/pipe_data"; rm -rf "${PDATA}"; mkdir -p "${PDATA}/SIM/snapdir_099"
@@ -1010,8 +1013,8 @@ rc=$(pdrive "${TMP}/p_same.log")
 check "$([ "${rc}" = "0" ] && echo 0 || echo 1)" "... a rerun with the same settings exits 0 (${rc})"
 check "$(has "${TMP}/p_same.log" 'snap 99: ps_output.pts_den up to date \(same settings\), skipping compute')" "... and skips the snapshot: same settings"
 check "$(lacks "${TMP}/p_same.log" 'run_ps_dtfe.sh -s SIM')" "... running nothing"
-# 2026-10-11: a slice newer than the plane but of ANOTHER plane size (a 16^2 one against the 8^2 plane: TNG100's
-# 4096^2 slices beside an older hires_plane_z8192) was 'up to date', so the compute was skipped and every render failed
+# a slice newer than the plane but of ANOTHER plane size (a 16^2 one against the 8^2 plane: TNG100's
+# 4096^2 slices beside an older hires_plane_z8192) is not 'up to date': skipping the compute would fail every render
 head -c 2048 /dev/zero > "${SD}/ps_output.pts_den"; touch -t 203001010000 "${SD}/ps_output.pts_den"
 rc=$(pdrive "${TMP}/p_size.log" DRY_RUN=1)
 check "$(has "${TMP}/p_size.log" 'snap 99: ps_output.pts_den holds 256 points, the plane 64: a slice of another plane, recomputing')" \
@@ -1030,7 +1033,7 @@ rc=$(pdrive "${TMP}/p_more.log" FIELDS="density_a velocity_a tweb_a" DRY_RUN=1)
 check "$(has "${TMP}/p_more.log" 'settings differ')" "... a field the grids lack: recomputed"
 rc=$(pdrive "${TMP}/p_gpu.log" PS_GPU=1 DRY_RUN=1)
 check "$(has "${TMP}/p_gpu.log" 'up to date \(same settings\)')" "the GPU/CPU choice alone does not make grids stale"
-# 2026-10-15: the plane's conventions are a setting of the slice; the pipeline hands them to run_ps_dtfe.sh
+# the plane's conventions are a setting of the slice; the pipeline hands them to run_ps_dtfe.sh
 rc=$(pdrive "${TMP}/p_pc.log" PTS_CONVENTIONS=legacy DRY_RUN=1)
 check "$([ "$(has "${TMP}/p_pc.log" 'snap 99: settings differ from its ps_output.runlog, recomputing')" = 0 ] \
          && grep -aq 'now: --pts-conventions legacy$' "${TMP}/p_pc.log" \
@@ -1133,9 +1136,8 @@ rm -rf "${SSD}/output."* "${SSD}/output.superseded"
 rc=$(sdrive run_dtfe.sh "${TMP}/s_supnone.log" FAKE_MODE=write)
 check "$([ "${rc}" = "0" ] && [ ! -e "${SSD}/output.superseded" ] && [ "$(lacks "${TMP}/s_supnone.log" 'Superseded')" = 0 ] && echo 0 || echo 1)" \
       "... and a first run into an empty prefix makes no superseded folder (${rc})"
-# run_ps_pipeline.sh's GPU default (2026-10-13, integration item 7): PS_GPU was 1 on every build, so a CPU-only build
-# was asked for the GPU on every snapshot; unset, it now follows the PS binary's stamp as run_ps_dtfe.sh does (the
-# copy (P) made, on SDATA's SIM: a dry run plans the plane and the snapshot)
+# run_ps_pipeline.sh's GPU default: PS_GPU unset follows the PS binary's stamp as run_ps_dtfe.sh does, so a CPU-only
+# build is never asked for the GPU (the copy (P) made, on SDATA's SIM: a dry run plans the plane and the snapshot)
 pgpu_of() {   # <stamp or none> [VAR=value ...]: 'gpu' / 'cpu' as the pipeline's planned run_ps_dtfe.sh call says
     local st="$1"; shift
     rm -rf "${MREPO}/o" "${MREPO}/o_ps" "${MREPO}/o_d" "${MREPO}/o_ps_d"
@@ -1178,7 +1180,7 @@ check "$(has "${TMP}/q_dry.log" 'PS-DTFE .*TNG50-3-Dark/snapdir_099/ps_output +-
       "... TNG50 099: 512^3, scratch, the nine thesis fields, GPU, volume-weighted, the 2048^2 plane with velocity gradients"
 check "$(has "${TMP}/q_dry.log" 'PS-DTFE .*TNG100-3-Dark/snapdir_099/ps_caustic +--grid +512 .*--field +density_a +tweb_a +--lambda_th.*--ps-caustics')" \
       "... TNG100 099 caustics: its own ps_caustic prefix, density + T-web, --ps-caustics"
-# 2026-10-13: the drivers' defaults changed (caustics and volume weighting on); the historical stages keep their own
+# the drivers' defaults (caustics and volume weighting on) do not reach the historical stages: they keep their own
 q_tng50="$(grep -aE -e 'PS-DTFE .*TNG50-3-Dark/snapdir_099/ps_output ' "${TMP}/q_dry.log" || true)"
 q_caus="$(grep -aE -e 'PS-DTFE .*/ps_caustic ' "${TMP}/q_dry.log" || true)"
 check "$([ -n "${q_tng50}" ] && [ -n "${q_caus}" ] && [[ "${q_tng50}" != *--ps-caustics* ]] && [[ "${q_caus}" != *--ps-volume-weighted* ]] \
@@ -1187,7 +1189,7 @@ check "$([ -n "${q_tng50}" ] && [ -n "${q_caus}" ] && [[ "${q_tng50}" != *--ps-c
 check "$(grep -aq 'budget 40 GB' "${TMP}/q_dry.log" && grep -aq 'budget 44 GB' "${TMP}/q_dry.log" && echo 0 || echo 1)" "... the budgets are named"
 check "$(has "${TMP}/q_dry.log" '^\+ .*plot_void_population\.py --sim TNG50-3-Dark --method ps --smooth-mpc 2\.1625$')" "... the figures are printed, not run"
 check "$(has "${TMP}/q_dry.log" '^\+ .*plot_caustic_skeleton\.py --sim TNG100-3-Dark --prefix ps_caustic --snaps 99 --voids$')" "... the caustic skeleton too"
-# a GPU build (the stamps of both PS binaries): the pipeline's GPU default follows the build since 2026-10-13
+# a GPU build (the stamps of both PS binaries): the pipeline's GPU default follows the build
 mkdir -p "${MREPO}/o_ps" "${MREPO}/o_ps_d"; : > "${MREPO}/o_ps/.gpu_mode_metal"; : > "${MREPO}/o_ps_d/.gpu_mode_metal"
 rc=0; env -u PS_GPU DTFE_DATA_ROOT="${TROOT}" DRY_RUN=1 HISTORICAL=1 "${MREPO}/scripts/thesis_runs.sh" production >"${TMP}/q_prod.log" 2>&1 || rc=$?
 rm -rf "${MREPO}/o_ps" "${MREPO}/o_ps_d"
@@ -1200,7 +1202,7 @@ check "$(has "${TMP}/q_prod.log" 'FIELDS=density_a velocity_a gradient_a diverge
 check "$(has "${TMP}/q_prod.log" 'make_image_plane.py .*--nu 2048 .*TNG50-3-Dark/hires_plane_z2048')" "... TNG50's plane is 2048^2"
 check "$(has "${TMP}/q_prod.log" 'make_image_plane.py .*--nu 4096 .*TNG300-3-Dark/hires_plane_z4096')" "... TNG300's 4096^2"
 check "$(has "${TMP}/q_prod.log" 'force: 1')" "... FORCE=1: everything recomputed"
-# 2026-10-13: the historical stages (their grids were replaced by ps27's) need HISTORICAL=1; 'all' no longer has them
+# the historical stages (ps27's grids replace theirs) need HISTORICAL=1; 'all' does not run them
 rc=0; env -u HISTORICAL DTFE_DATA_ROOT="${TROOT}" DRY_RUN=1 "${MREPO}/scripts/thesis_runs.sh" production >"${TMP}/q_hist1.log" 2>&1 || rc=$?
 rc2=0; env -u HISTORICAL DTFE_DATA_ROOT="${TROOT}" DRY_RUN=1 "${MREPO}/scripts/thesis_runs.sh" caustics tng50z0 >"${TMP}/q_hist2.log" 2>&1 || rc2=$?
 check "$([ "${rc}" = "2" ] && [ "${rc2}" = "2" ] && [ "$(has "${TMP}/q_hist1.log" "'production' is a historical stage.*HISTORICAL=1 runs it anyway|HISTORICAL=1 runs it anyway")" = 0 ] \
@@ -1211,7 +1213,7 @@ rc2=0; "${MREPO}/scripts/thesis_runs.sh" everything >"${TMP}/q_bad.log" 2>&1 || 
 check "$([ "${rc}" = "2" ] && [ "${rc2}" = "2" ] && echo 0 || echo 1)" "no stage, or an unknown one: exit 2, nothing run (${rc}, ${rc2})"
 rc=0; env DTFE_DATA_ROOT="${TMP}/no such disk" DRY_RUN=1 "${MREPO}/scripts/thesis_runs.sh" all >"${TMP}/q_root.log" 2>&1 || rc=$?
 check "$([ "${rc}" = "2" ] && echo 0 || echo 1)" "the data disk missing: exit 2 up front (${rc})"
-# The voids stage (2026-10-11): every void figure of each box, script by script, with the agreed definitions. PY is a
+# The voids stage: every void figure of each box, script by script, with the agreed definitions. PY is a
 # stand-in that logs the environment and arguments it was started with (and fails the fate census), so DRY_RUN is
 # seen to start nothing and a real run to hand each figure its gate and to go on after a failure. The caller's
 # DTFE_VOID_GATE=none must not reach the gated figures.
@@ -1246,17 +1248,16 @@ qall "... ... (the evolution)" \
      "env DTFE_SIM=@BOX@ DTFE_VOID_GATE=none ${QPY}/plot_void_profile_evolution\.py --sim @BOX@ --method ps --rv-definition crossing"
 qall "... environment ungated, the velocity criterion, the exclusive particle-tracking set" \
      "env DTFE_SIM=@BOX@ DTFE_VOID_GATE=none ${QPY}/plot_void_environment\.py --sim @BOX@ --method ps --criterion velocity --r-v-definition crossing --tracking-tag _particles_exclusive"
-# convergence ungated (2026-10-11 review: its rows are R_v statistics, and it reads the ungated cross-box files now)
+# convergence ungated (its rows are R_v statistics, and it reads the ungated cross-box files)
 qall "... convergence ungated, at the cross-box sigma" \
      "env DTFE_SIM=@BOX@ DTFE_VOID_GATE=none ${QPY}/plot_void_convergence\.py --sim @BOX@ --method ps --crossbox-smooth-mpc 2\.1625"
 check "$(lacks "${TMP}/q_voids.log" 'DTFE_VOID_GATE=ellipsoid .*plot_void_convergence')" "... ... and never gated"
 qall "... fate census --exclusive, ungated" "env DTFE_SIM=@BOX@ DTFE_VOID_GATE=none ${QPY}/plot_void_fate\.py --sim @BOX@ --method ps --exclusive"
 qall "... tracking by exclusive particle links, the census's gate" \
      "env DTFE_SIM=@BOX@ DTFE_VOID_GATE=none ${QPY}/plot_void_tracking\.py --sim @BOX@ --method ps --link particles --exclusive"
-# the size function at fixed R (2026-10-11): ungated, the default 10 / 5 / 3 cells for TNG50 and TNG100, TNG300 at
+# the size function at fixed R: ungated, the default 10 / 5 / 3 cells for TNG50 and TNG100, TNG300 at
 # 2.1625 Mpc and 3 / 2 cells (no common range at 10 / 5 / 3 cells there), and the cross-box sigma alone for TNG100 and
-# TNG300 only (TNG50 not measured there); 35 figure commands in all for the three boxes (27 before the fixed-R ones,
-# 32 before the environment's second call after the tracking, 2026-10-11)
+# TNG300 only (TNG50 not measured there); 35 figure commands in all for the three boxes
 QFR="${QPY}/plot_void_population\.py --sim"
 check "$([ "$(has "${TMP}/q_voids.log" "^\+ env DTFE_SIM=TNG50-3-Dark DTFE_VOID_GATE=none ${QFR} TNG50-3-Dark --method ps --size-fixed-r\$")" = 0 ] \
          && [ "$(has "${TMP}/q_voids.log" "^\+ env DTFE_SIM=TNG100-3-Dark DTFE_VOID_GATE=none ${QFR} TNG100-3-Dark --method ps --size-fixed-r\$")" = 0 ] \
@@ -1283,8 +1284,8 @@ check "$([ "$(qline 'plot_void_environment' '3p')" -lt "$(qline 'plot_void_cross
          && [ "$(qline 'plot_void_convergence' '$p')" -lt "$(qline 'plot_void_fate' '1p')" ] \
          && [ "$(qline 'plot_void_fate' '$p')" -lt "$(qline 'plot_void_tracking' '$p')" ] && echo 0 || echo 1)" \
       "... in the order cheap figures (fixed-R size function too) < cross-box < convergence < fate census + tracking"
-# 2026-10-11: the environment reads the tracking's files for its tracking panel, but was drawn only before the
-# tracking had run (a first run's figure lacked the panel): each box's is drawn again right after its tracking
+# the environment reads the tracking's files for its tracking panel, so a first run's figure drawn only before the
+# tracking would lack the panel: each box's is drawn again right after its tracking
 qenv() {
     local sim r=0 t e
     for sim in TNG50-3-Dark TNG100-3-Dark TNG300-3-Dark; do       # numbered among the printed commands only
@@ -1319,15 +1320,15 @@ check "$(grep -aqx 'failed void figure: TNG50-3-Dark fate census (exit 1)' "${TM
          && [ "$(grep -ac '^failed void figure' "${TMP}/q_voidsrun.log")" = "2" ] && echo 0 || echo 1)" \
       "... the failed figures listed at the end, exit 1"
 
-# The overnight stages (2026-10-12): dtfe (standard DTFE on TNG100 z = 0, 1, 5), caustics2 (ps_caustic at z = 1, 2 with
-# the z = 0 run's settings pinned, but the binary's default Lagrangian padding: since the padding fix it changes the
+# The overnight stages: dtfe (standard DTFE on TNG100 z = 0, 1, 5), caustics2 (ps_caustic at z = 1, 2 with
+# the z = 0 run's settings pinned, but the binary's default Lagrangian padding: it changes the
 # grids only at rounding, and it is ~6x faster), refresh (figure repairs; the old untagged skeleton files MOVED, never deleted),
 # prune. The caller's shell carries knobs that would change the recipe; none may reach the planned commands.
 for s in 050 033 017; do
     mkdir -p "${TROOT}/TNG100/TNG100-3-Dark/snapdir_${s}"; : > "${TROOT}/TNG100/TNG100-3-Dark/snapdir_${s}/combined_${s}.hdf5"
 done
 QFIG="${TMP}/q_figs/caustic_skeleton/TNG100-3-Dark"; QTH="${TMP}/q_thesis/caustic_skeleton/TNG100-3-Dark"
-# seed: the untagged set of 2026-10-08 (made with --prefix ps_caustic) beside the tagged one, on the figure root and in
+# seed: an untagged set (made with --prefix ps_caustic) beside the tagged one, on the figure root and in
 # the thesis tree (which mirrors the png only)
 q_seed() {
     rm -rf "${TMP}/q_figs" "${TMP}/q_thesis"; mkdir -p "${QFIG}" "${QTH}"
@@ -1389,7 +1390,7 @@ check "$([ "$(qon '^ +\./DTFE ' '$p')" -lt "$(qon '^ +\./PS-DTFE ' '1p')" ] \
 rc=0; qv "${QO[@]}" DRY_RUN=1 Q_PY_LOG="${TMP}/q_py_on.log" "${MREPO}/scripts/thesis_runs.sh" dtfe prune overnightx >"${TMP}/q_onbad.log" 2>&1 || rc=$?
 check "$([ "${rc}" = "2" ] && [ "$(lacks "${TMP}/q_onbad.log" 'DTFE processing')" = 0 ] && echo 0 || echo 1)" "an unknown stage beside the new ones: exit 2, nothing planned (${rc})"
 # finished snapshots are skipped (a morning restart), FORCE=1 reruns them; a run log alone is not a finished run, nor
-# (2026-10-13) grids made with other settings: the sampled 2026-10-12 set (padding 20, no --exact-average) is rerun
+# are grids made with other settings: a sampled set (padding 20, no --exact-average) is rerun
 T1="${TROOT}/TNG100/TNG100-3-Dark"
 : > "${T1}/snapdir_099/output.runlog"
 echo x > "${T1}/snapdir_050/output.a_den"
@@ -1472,9 +1473,9 @@ check "$([ "${rc}" = "1" ] && [ "$(lacks "${TMP}/q_busy.log" 'DTFE processing|\+
          && [ "$(has "${TMP}/q_busy.log" "^ +${qpid} .*q_bin/PS-DTFE 30")" = 0 ] \
          && [ "$(grep -ac '^failed step: .*not started, another DTFE / PS-DTFE run was going' "${TMP}/q_busy.log")" = "4" ] && echo 0 || echo 1)" \
       "dtfe / caustics2 / ps27 / dtfe27 while another PS-DTFE runs: refused (named), listed, nothing moved, exit 1 (${rc})"
-# 2026-10-13: the guard matches the EXECUTABLE, so a program whose path has a space after 'DTFE' (the launcher app,
+# the guard matches the EXECUTABLE, so a program whose path has a space after 'DTFE' (the launcher app,
 # '/Applications/DTFE Launcher.app/Contents/MacOS/DTFE Launcher') is not a DTFE run -- the first word of its command
-# line, '/Applications/DTFE', held dtfe27 for 30 min while the launcher was open; a real binary still is
+# line, '/Applications/DTFE', would hold dtfe27 while the launcher is open; a real binary still is
 mkdir -p "${TMP}/q_app/DTFE Launcher.app/Contents/MacOS"; ln -sf /bin/sleep "${TMP}/q_app/DTFE Launcher.app/Contents/MacOS/DTFE Launcher"
 "${TMP}/q_app/DTFE Launcher.app/Contents/MacOS/DTFE Launcher" 30 & qapp=$!
 "${TMP}/q_bin/PS-DTFE" 30 & qpid=$!
@@ -1484,7 +1485,7 @@ kill "${qapp}" "${qpid}" 2>/dev/null || true; wait "${qapp}" "${qpid}" 2>/dev/nu
 check "$( { printf '%s\n' "${qheavy}" | grep -qE "^ *${qpid} .*q_bin/PS-DTFE 30"; } && ! printf '%s\n' "${qheavy}" | grep -qE "^ *${qapp} " \
          && echo 0 || echo 1)" "... the guard goes by the executable: a 'DTFE Launcher.app' (a path with a space) is not a DTFE run, a PS-DTFE is"
 
-# ps27 and dtfe27 (2026-10-13): the two drivers of 2026-10-12 that made the grids on the data disk, as stages. Every box
+# ps27 and dtfe27: the two drivers that made the grids on the data disk, as stages. Every box
 # gets the nine snapshots; the caller's knobs (QO) must not reach a planned command.
 for b in TNG50/TNG50-3-Dark TNG100/TNG100-3-Dark TNG300/TNG300-3-Dark; do
     for s in 000 004 017 025 033 040 050 067 099; do
@@ -1496,8 +1497,8 @@ rc=0; qv "${QO[@]}" DRY_RUN=1 Q_PY_LOG="${TMP}/q_py_27.log" "${MREPO}/scripts/th
 check "$([ "${rc}" = "0" ] && [ ! -e "${TMP}/q_py_27.log" ] && [ ! -e "${TMP}/q_scratch" ] && [ ! -e "${TROOT}/../_backup" ] && [ ! -e "${TROOT}/_backup" ] \
          && [ "$(lacks "${TMP}/q_27.log" '^RUNNING:')" = 0 ] && echo 0 || echo 1)" "DRY_RUN=1 ps27 dtfe27 exits 0: no binary, no python, nothing made or moved (${rc})"
 q27() { grep -aE -e "^ +\./$1 " "${TMP}/q_27.log"; }
-# the PS line is the 2026-10-12 RUNNING line token for token (~/DTFE-rerun/psrerun-2026-10-12/*.log), with --ordered-merge
-# since 2026-10-14 (ORDERED_MERGE=1: the staged merge in index order, the new default)
+# the PS line is the RUNNING line of the 2026-10-12 runs that made the grids, token for token,
+# with --ordered-merge (ORDERED_MERGE=1: the staged merge in index order)
 QPS='ps_output +--grid +512 +--padding +50 +--periodic +--scratch-dir +.*q_scratch +--ordered-merge +--avg-subsamples +3 +--input +105 +--MpcUnit +1000 +--field +density_a +velocity_a +gradient_a +divergence_a +shear_a +vorticity_a +dispersion_a +tweb_a +vweb_a +--lambda_th +0\.3 +--ps-gpu +--ps-vertex-mass +--ps-volume-weighted +--sample-points +.*/hires_plane_z4096\.bin +--pts-vel-grad +--ps-caustics +--lagrangianInput +.*/combined_ics\.hdf5$'
 check "$([ "$(q27 PS-DTFE | grep -cE -e "${QPS}")" = "27" ] \
          && [ "$(q27 PS-DTFE | grep -oE 'TNG[0-9]+-3-Dark/snapdir_[0-9]{3}/ps_output' | tr '\n' ' ')" = "$(for b in TNG100 TNG300 TNG50; do for s in 000 004 017 025 033 040 050 067 099; do printf '%s-3-Dark/snapdir_%s/ps_output ' "${b}" "${s}"; done; done)" ] \
@@ -1516,7 +1517,7 @@ check "$([ "$(lacks "${TMP}/q_27.log" 'leaky|--partition +2 +2 +2|/no/such|--pad
 T3="${TROOT}/TNG300/TNG300-3-Dark/snapdir_099"
 echo x > "${T3}/ps_output.a_den"
 echo 'RUNNING: ./PS-DTFE in out --grid 512 --ordered-merge --field density_a --ps-gpu --sample-points /x/hires_plane_z4096.bin --pts-vel-grad --ps-caustics --lagrangianInput /x/ics ' > "${T3}/ps_output.runlog"
-# 2026-10-14: the 2026-10-12 set (caustics and plane, merged in completion order: no --ordered-merge) is rerun
+# a set merged in completion order (caustics and plane, no --ordered-merge) is rerun
 T6="${TROOT}/TNG300/TNG300-3-Dark/snapdir_050"
 echo x > "${T6}/ps_output.a_den"
 echo 'RUNNING: ./PS-DTFE in out --grid 512 --field density_a --ps-gpu --sample-points /x/hires_plane_z4096.bin --pts-vel-grad --ps-caustics --lagrangianInput /x/ics ' > "${T6}/ps_output.runlog"
@@ -1552,7 +1553,7 @@ check "$([ "${rc}" = "1" ] && [ "$(cat "${T1}/snapdir_050/output.a_den")" = "old
          && [ "$(has "${TMP}/q_27fail.log" 'dtfe27: FAILED \(exit 1\): 2 old output\.\* files moved back from ')" = 0 ] \
          && [ "$(grep -ac '^failed step: dtfe27: ' "${TMP}/q_27fail.log")" = "9" ] && echo 0 || echo 1)" \
       "... a FAILED run: the old files moved back (the snapshot as before, the attempt's log as .runlog.failed), listed, exit 1 (${rc})"
-# dtfe27planes (2026-10-14): the standard-DTFE 4096^2 planes of the same 27 snapshots, at dtfe27's splits and settings,
+# dtfe27planes: the standard-DTFE 4096^2 planes of the same 27 snapshots, at dtfe27's splits and settings,
 # under the prefix output_plane (density_a is the one grid field the binary needs); the caller's knobs (QO) ignored
 rm -rf "${TMP}/q_scratch"
 rc=0; qv "${QO[@]}" DRY_RUN=1 Q_PY_LOG="${TMP}/q_py_pl.log" "${MREPO}/scripts/thesis_runs.sh" dtfe27planes >"${TMP}/q_pl.log" 2>&1 || rc=$?
@@ -1602,11 +1603,11 @@ rm -rf "${TROOT}/_backup"
 
 echo ""
 echo "(N) the Makefile stamps BUILD_MODE, ARCH_FLAGS and EXTRA_FLAGS in the object dirs (2026-10-08)."
-# 'make DTFE BUILD_MODE=debug' after a release build found every object up to date and linked the -O3 objects
-# with the sanitizers (an ARCH_FLAGS / EXTRA_FLAGS change kept the old objects the same way). The stamp's name
-# carries the mode and a checksum of the three, so a switch wipes the objects. A dry run of the mode check alone
-# (make -n -p) prints the stamp and builds nothing; the PS-DTFE target would start its recursive make, which
-# make runs even under -n.
+# Without the stamp, 'make DTFE BUILD_MODE=debug' after a release build would find every object up to date and link
+# the -O3 objects with the sanitizers (an ARCH_FLAGS / EXTRA_FLAGS change would keep the old objects the same way).
+# The stamp's name carries the mode and a checksum of the three, so a switch wipes the objects. A dry run of the
+# mode check alone (make -n -p) prints the stamp and builds nothing; the PS-DTFE target would start its recursive
+# make, which make runs even under -n.
 stamp() { make -n -p ps_gpu_mode_check "$@" 2>/dev/null | sed -n 's/^FLAGS_STAMP := //p' | head -1 || true; }
 s_rel="$(stamp)"; s_dbg="$(stamp BUILD_MODE=debug)"
 s_ext="$(stamp EXTRA_FLAGS=-DDTFE_STAMP_PROBE)"; s_arch="$(stamp ARCH_FLAGS=-mtune=stamp-probe)"

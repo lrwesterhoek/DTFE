@@ -1,15 +1,15 @@
-"""Void-in-void versus void-in-cloud across cosmic time (2026-10-11): which voids sit in an overdense region and are
+"""Void-in-void versus void-in-cloud across cosmic time: which voids sit in an overdense region and are
 expected to shrink, and how their sizes, depths and shapes differ from the voids that keep expanding.
 
 Per snapshot of the ladder, every distinct well-resolved void of the pipeline catalogue (the profiles' sample) is
 classified by dtfelib.classify under one of its CRITERIA (--criterion): S-type, VOID-IN-CLOUD, being squeezed,
 R-type, VOID-IN-VOID, otherwise (the void-in-cloud process of Sheth & van de Weygaert 2004). R_v is the measured
 void radius (catalog.r_v_mpc).
-  velocity          (default, 2026-10-11) the shell between 2 and 3 R_v has net INFALL: its volume-weighted mean
+  velocity          (default) the shell between 2 and 3 R_v has net INFALL: its volume-weighted mean
                     peculiar radial velocity is negative. Its strength is drawn as v_r / (H(z) a R_v).
   density_smoothed  the smoothed density contrast enclosed within 3 R_v is positive (the large-scale environment).
   density_raw       the raw density contrast enclosed within 2 R_v is positive (Ceccarelli et al. 2013, MNRAS 434,
-                    1435): the first version, kept for comparison; the 1-2 R_v shell carries the walls' halos.
+                    1435): kept for comparison; the 1-2 R_v shell carries the walls' halos.
 The 3 R_v shell of the first two leaves out the voids with R_v > L/6 (the wrap rule), the largest and mostly
 void-in-void ones: their fractions hold for the voids below that size.
 Every criterion's measure is computed for every void in one pass; the figures and the npz carry the void-in-cloud
@@ -31,7 +31,7 @@ Outputs (config.figures_path('void_environment')/<sim>/; a default run's names e
                               each, agree_<a>__<b> per pair), and per void its catalogue row, every criterion's
                               measure and verdict, type, R_v, depth and shape
 Those names are for PS-DTFE's default grids and the density_raw criterion: the untagged names keep the meaning they
-had before the velocity became the default (2026-10-11), so EVERY other criterion adds '_<criterion>', the default
+had before the velocity became the default, so EVERY other criterion adds '_<criterion>', the default
 one too (environment_evolution_velocity.png, environment_stats_velocity.npz). Another estimator or --prefix adds
 '_<method>' / '_<prefix>', --keep-overlaps '_overlaps', a --factor other than 2 '_x<factor>' (the raw criterion's
 radius), and a non-default smoothing writes into its own folder (plot_void_population's rules).
@@ -78,9 +78,9 @@ TABLE_KEYS = ("index", "delta_enclosed", "vic", "r_v_mpc", "delta_c", "e", "p", 
               "vic_density_raw")
 # the per-void quantity each criterion thresholds at 0 (the velocity: its sign; shown in units of H a R_v)
 DECIDING = {"velocity": "v_shell_norm", "density_smoothed": "delta_smoothed_enclosed", "density_raw": "delta_enclosed"}
-# the criterion whose files carry no tag (2026-10-11): density_raw, the default until that day -- the untagged
+# the criterion whose files carry no tag: density_raw, the earlier default -- the untagged
 # environment_*.png / environment_stats.npz (and their thesis mirrors) hold its fraction, and a name must not change
-# meaning (plot_void_population's rule), so the new default velocity is tagged '_velocity' like the others
+# meaning (plot_void_population's rule), so the default velocity is tagged '_velocity' like the others
 UNTAGGED_CRITERION = "density_raw"
 CRIT_STYLE = {"velocity": "-", "density_smoothed": "--", "density_raw": ":"}
 
@@ -126,7 +126,7 @@ def name_tag(method_used, prefix_used, keep_overlaps, factor, definition="crossi
              criterion=classify.DEFAULT_CRITERION):
     """plot_void_population's rule (untagged for PS-DTFE's default grids), plus '_x<factor>' off the default,
     '_rv<definition>' for an R_v other than the crossing one and '_<criterion>' for every criterion but
-    UNTAGGED_CRITERION (density_raw), the default velocity included (2026-10-11)."""
+    UNTAGGED_CRITERION (density_raw), the default velocity included."""
     default_prefix = {"ps": "ps_output.", "dtfe": "output."}
     grids = "+".join(sorted({m if prefix_used[s] == default_prefix.get(m) else prefix_used[s].rstrip(".")
                              for s, m in method_used.items()}))
@@ -252,7 +252,7 @@ def plot_snapshot(envd, summ, z, sim, factor, path, criterion=classify.DEFAULT_C
 
 def default_tracking_dir(sim):
     """plot_void_tracking's folder for 'sim' at this smoothing: under the figure root, else on the T7's figure tree
-    (the tests and this wave's runs move the figure root, the tracking files stay where they were written)."""
+    (the tests and some runs move the figure root, the tracking files stay where they were written)."""
     for root in (Path(config.LOCAL_FIGURES_ROOT), cli._T7_DATA / "figures"):
         d = root / "void_tracking" / sim / pipeline.smoothing_tag()
         if any(d.glob("void*_track*.npz")):

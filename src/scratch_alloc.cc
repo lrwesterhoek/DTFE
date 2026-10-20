@@ -33,25 +33,19 @@ namespace
     std::atomic<long> g_liveBytes{0};
     std::atomic<long> g_totalAllocs{0};
 
-    // Registry of live scratch mappings. Full-grid vectors number in the tens, so a fixed
-    // table with linear scan is plenty -- and it never allocates. If it ever fills, the
-    // allocation falls back to the heap (correct, just not disk-backed).
+    // Registry of live scratch mappings: a fixed table with linear scan (full-grid vectors number in the tens),
+    // which never allocates. If it fills, the allocation falls back to the heap (correct, not disk-backed).
     //
-    // EVERYTHING here must be trivially destructible: operator delete keeps being called
-    // during exit-time static destruction of OTHER translation units, whose order relative
-    // to this one is unspecified. A std::mutex has a destructor -- locking it after that ran
-    // is UB (measured: SIGSEGV at exit teardown) -- so the lock is a pthread mutex with a
-    // static initializer, which is plain data and never dies.
+    // EVERYTHING here must be trivially destructible: operator delete is still called during the exit-time static
+    // destruction of OTHER translation units, in unspecified order, and locking a destroyed std::mutex is UB (a
+    // SIGSEGV at exit), so the lock is a statically initialized pthread mutex (plain data, never dies).
     //
-    // The delete path must NOT take the mutex for ordinary heap pointers: every delete in the
-    // process runs through here, and a global lock serialized all concurrent partitions -- the
-    // PS vertex-density pass (millions of small vector frees) went from 10 s to 191 s per
-    // partition at --max-concurrent 5. So each slot's pointer is an atomic, published with
-    // release ordering BEFORE the mapping is handed out, and freeImpl first rules a pointer out
-    // lock-free: outside [g_lo, g_hi) (the span of every mapping ever made) it cannot be ours,
-    // and otherwise a scan of the slots ever used finds it or not. The mutex is taken only to
-    // create or unmap a mapping -- tens of times per run. A pointer being deleted was returned
-    // by operator new earlier (happens-before), so the scan always sees its own slot.
+    // The delete path takes no lock for ordinary heap pointers: every delete in the process runs through here, and a
+    // global lock serialized concurrent partitions (19x slower PS vertex-density pass at --max-concurrent 5). Each
+    // slot's pointer is an atomic published with release ordering BEFORE the mapping is handed out; freeImpl rules a
+    // pointer out lock-free (outside [g_lo, g_hi), the span of every mapping ever made, it cannot be ours; else a scan
+    // of the slots ever used finds it or not). A pointer being deleted was returned by operator new earlier
+    // (happens-before), so the scan sees its own slot. The mutex is taken only to create or unmap a mapping.
     struct Slot { std::atomic<void*> p; std::size_t sz; };   // std::atomic<void*>: trivially destructible
     constexpr int kSlots = 512;
     Slot            g_slots[kSlots] = {};

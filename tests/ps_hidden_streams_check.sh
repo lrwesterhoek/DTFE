@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # PS-DTFE '.hidden_streams' bit 1 is EXACT: a cell it leaves clear, with '.streams' == 1, is
-# single-stream at every point -- and it no longer drops single-stream cells just because a
+# single-stream at every point -- and it does not drop single-stream cells just because a
 # tetrahedron of their own stream is too small to hold a sub-sample.
 #
 # The flag (quantities.h) is geometric: a folded (negatively oriented) tetrahedron overlaps the
@@ -10,8 +10,8 @@
 #
 #  X) DENSE EXACT POINT EVALUATION: 4^3 points per cell (--sample-points, the exact SoS
 #     inside test). Every point of a cell with streams==1 and no bit 1 must be single-stream
-#     (0 violations, nSub=1 and nSub=3 grids). The cells the old conservative mass flag
-#     dropped but bit 1 keeps are counted and must exist (else the test is vacuous).
+#     (0 violations, nSub=1 and nSub=3 grids). The cells a conservative mass flag would
+#     drop but bit 1 keeps are counted and must exist (else the test is vacuous).
 #  Y) THE EXACT DEPOSIT (--ps-exact-deposit): its '.streams' is the analytic cell-mean stream
 #     count (1/V_cell) sum V(tet ^ cell), which is 1 iff the cell is single-stream almost
 #     everywhere. Unflagged single-stream cells must read 1 (to float rounding); EVERY cell
@@ -19,13 +19,13 @@
 #     flagged cells must hold real multi-stream volume (exact deposit or a dense point).
 #  Z) SAME FLAG EVERYWHERE: serial vs --partition 2 2 2 and CPU vs GPU (a Metal build) give
 #     byte-identical '.hidden_streams' and '.streams' on both grids -- except the partitioned
-#     '.a_streams', a float sum of count/nSub^3 per partition (a few ulps, pre-existing).
+#     '.a_streams', a float sum of count/nSub^3 per partition (a few ulps).
 #
 # Two geometries just past shell crossing, where the walls are thinner than the sampling (the
 # case the flag exists for): the Zel'dovich pancake (plane folds, amplitude 1.05) and
 # --crossed-waves (3D folds, amplitude 1.3). 27 particles per axis on a 48^3 grid, so the
 # particle lattice and the sample lattices do not line up. On the crossed waves the samples miss
-# the walls of ~12k cells; the old mass flag caught only ~40% of them.
+# the walls of ~12k cells; a mass flag catches only ~40% of them.
 #
 # Usage:
 #   tests/ps_hidden_streams_check.sh              # build, run, check
@@ -35,8 +35,6 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PY="${PYTHON:-python3}"
-command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/python3.14
 ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT}"
 source "${SCRIPT_DIR}/precision.sh"     # DTFE_TEST_PRECISION=double: the double pair
@@ -54,11 +52,7 @@ echo "============================================================"
 echo " PS-DTFE exact '.hidden_streams' check   N=${N}^3  grid=${GRID}^3  ${K}^3 points/cell"
 echo "============================================================"
 
-if [ "${1:-}" != "--no-build" ] && ! precision_double; then
-    echo ">> building PS-DTFE ..."
-    BUILD_MODE="$(cat o_ps/.build_mode 2>/dev/null || true)"
-    make PS-DTFE ${BUILD_MODE:+"$BUILD_MODE"} >/dev/null
-fi
+build_target "${1:-}" PS-DTFE o_ps
 [ -x "${BIN}" ] || { echo "FAIL: ${BIN} not built"; exit 1; }
 GPU=0
 grep -q "METAL=1\|CUDA=1\|HIP=1" o_ps/.build_mode 2>/dev/null && GPU=1
@@ -89,11 +83,7 @@ run() {  # $1 = output root, $2 = snapshot, rest = options (files first: --parti
     "${BIN}" "${snap}" "${out}" --grid "${GRID}" --input 105 --MpcUnit 1 --verbose 1 --periodic "$@" > "$log" 2>&1
     local rc=$?
     set -e
-    if [ "$rc" -ne 0 ]; then
-        echo "   ERROR: PS-DTFE exited with code $rc -- last 25 lines of $log:"
-        tail -n 25 "$log" | sed 's/^/      | /'
-        exit 1
-    fi
+    die_on_failed_run "$rc" "$log"
 }
 
 for geo in pan crw; do
@@ -174,10 +164,8 @@ for geo, title in (("pan", "pancake"), ("crw", "crossed waves")):
         if gpu and _os.environ.get("DTFE_TEST_PRECISION") == "double" and ext in (".streams", ".a_streams"):
             # double build: the GPU gets float copies of the double tetrahedra (ps_double_check D5), so a
             # sample on a face may count differently; both flag grids stay exact. '.streams' (one sample per
-            # cell) too, since 2026-10-13: its exact match held by luck of the vertex labelling -- the
-            # 2026-10-12 binary already counts 2 streams instead of 3 in one crossed-wave cell with
-            # '--padding 20' (the CPU grids bit-identical), and the periodic-seam fix (which changes the
-            # padded point set, so CGAL's labelling) shows the same cell at the default padding
+            # cell) too: an exact match there depends on CGAL's vertex labelling (one crossed-wave cell can
+            # count 2 streams instead of 3 on the GPU while the CPU grids are bit-identical)
             g = load(f"{base}_gpu", ext)
             fr = float(np.mean(a != g)); d = float(np.abs(a.astype(np.float64) - g).max())
             check(f"Z CPU ~ GPU on {ext} (double build: float kernel geometry)", fr <= 1e-4,

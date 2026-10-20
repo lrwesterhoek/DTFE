@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for the void-population theory and figures (2026-10-11): dtfelib.theory (EH98 sigma(R), D(z), the SvdW /
+"""Tests for the void-population theory and figures: dtfelib.theory (EH98 sigma(R), D(z), the SvdW /
 Vdn size function, the BBKS shapes of Gaussian-field minima), plot_void_population's size function figure and its
 R_v-definition fallback, plot_void_crossbox's shape row, and analyze.py's void-script registration and void-gate
 refusal.
@@ -12,7 +12,6 @@ Two tiers:
 Usage:  python3 tests/py_population_test.py            (exit 0 = pass)
 """
 
-import atexit
 import io
 import math
 import os
@@ -25,39 +24,10 @@ from pathlib import Path
 
 import numpy as np
 
-REPO = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO / "python"))
-sys.path.insert(0, str(REPO / "python" / "plot"))
-# the figure root before config/dtfelib are imported: a temp folder, never the real root; and no thesis mirror
-_FIGS_TMP = tempfile.mkdtemp(prefix="population_figs_")
-os.environ["DTFE_FIGURES_ROOT"] = _FIGS_TMP
-os.environ["DTFE_NO_MIRROR"] = "1"
-os.environ.setdefault("MPLBACKEND", "Agg")
-atexit.register(shutil.rmtree, _FIGS_TMP, True)
+from _harness import REPO, Skip, check, setup, summary
 
-PASS, FAIL, SKIP = [], [], []
-
-
-class Skip(Exception):
-    pass
-
-
-def check(name, fn):
-    try:
-        fn()
-        PASS.append(name)
-        print(f"  PASS  {name}")
-    except Skip as e:
-        SKIP.append(name)
-        print(f"  SKIP  {name}  ({e})")
-    except AssertionError as e:
-        FAIL.append(name)
-        print(f"  FAIL  {name}: {e}")
-    except Exception as e:      # a crash is this test's failure, not the end of the run
-        import traceback
-        FAIL.append(name)
-        print(f"  FAIL  {name}: {type(e).__name__}: {e}")
-        print("".join("        " + line for line in traceback.format_exc().splitlines(True)[-6:]), end="")
+_FIGS_TMP = setup("population_figs_")
+os.environ.setdefault("DTFE_SIM", "TNG50-4-Dark")    # the box these synthetic tests stand for; a data-tier run sets its own
 
 
 _trapz = getattr(np, "trapezoid", None) or np.trapz
@@ -161,7 +131,7 @@ def t_size_rv_fallback():
     st = pop.snapshot_stats(cat, 512, keep_overlaps=True, size_rv="delta08")
     assert st["rv_sf_definition"] == "crossing" and st["n_rv_all"] == 40 and st["_r_v_sf"].size == 40, st["n_sf"]
     assert st["_delta_valid"].size == st["n_bbks"]
-    if "delta08" in getattr(catalog, "R_V_DEFINITIONS", ()):        # void-core's C3 in: the key is read
+    if "delta08" in getattr(catalog, "R_V_DEFINITIONS", ()):        # the definition exists: the key is read
         cat8 = _cat(with_delta08=True)
         r8, d8 = pop.r_v_definition(cat8, "delta08")
         assert d8 == "delta08" and np.allclose(r8[np.isfinite(r8)], 0.4), (d8, r8[:3])
@@ -205,7 +175,7 @@ def t_size_function_figure():
 
 
 def t_size_smooth():
-    """--size-smooth (2026-10-11): smoothing_cells sets the size function's catalogue smoothing (its own cache
+    """--size-smooth: smoothing_cells sets the size function's catalogue smoothing (its own cache
     namespace, the production footprint) and restores the process's even on an exception; the names are untagged at
     the default and '_ss<cells>' otherwise; snapshot_stats reports the fraction of the distinct voids whose
     size-function radius exists; the option is in the script's help."""
@@ -240,7 +210,7 @@ def t_size_smooth():
 
 # ---------------------------------------------------------------- the cross-box shape row
 def _crossbox_result(sim, box, seed):
-    """A worker result as measure() writes it, two snapshots, the 2026-10-11 shape keys included."""
+    """A worker result as measure() writes it, two snapshots, the shape keys included."""
     import plot_void_crossbox as xb
     from dtfelib import profiles, theory
     rng = np.random.default_rng(seed)
@@ -277,7 +247,7 @@ def _crossbox_result(sim, box, seed):
 
 def t_crossbox_shapes():
     """median_ci brackets the median; grf_shapes is NaN without a redshift and rounder for deeper minima; the figure
-    from two boxes' results gets its shape row and the table its e, p columns; a pre-2026-10-11 result (no shape
+    from two boxes' results gets its shape row and the table its e, p columns; a legacy result (no shape
     keys) still draws."""
     import plot_void_crossbox as xb
     x = np.random.default_rng(0).normal(0.2, 0.05, 400)
@@ -301,7 +271,7 @@ def t_crossbox_shapes():
 
 # ---------------------------------------------------------------- analyze.py
 def t_analyze_void_scripts():
-    """analyze.py registers the C5 scripts in VOID_SCRIPTS (PLOT_SCRIPTS, the launcher's checklist, unchanged) and
+    """analyze.py registers the void scripts in VOID_SCRIPTS (PLOT_SCRIPTS, the launcher's checklist, unchanged) and
     run_scripts skips a script that is not on disk with a note instead of failing."""
     import analyze
     for name in ("plot_void_population.py", "plot_void_profile_evolution.py", "plot_void_environment.py",
@@ -324,10 +294,10 @@ def t_analyze_void_scripts():
 
 def t_analyze_gate_refusal():
     """'analyze.py plot' under DTFE_VOID_GATE=none at the production smoothing is refused for the GATE, by name
-    (2026-10-11: smoothing_tag() carries 'gatenone', and the refusal blamed DTFE_SIGMA_MPC, which was not set)."""
+    (smoothing_tag() carries 'gatenone'; DTFE_SIGMA_MPC, which is not set, is not blamed)."""
     import subprocess
-    env = {k: v for k, v in os.environ.items() if k not in ("DTFE_SIGMA_MPC", "DTFE_SIM")}
-    env.update(DTFE_VOID_GATE="none", DTFE_CACHE_DIR=tempfile.mkdtemp(prefix="analyze_gate_cache_"))
+    env = {k: v for k, v in os.environ.items() if k != "DTFE_SIGMA_MPC"}
+    env.update(DTFE_SIM="TNG50-3-Dark", DTFE_VOID_GATE="none", DTFE_CACHE_DIR=tempfile.mkdtemp(prefix="analyze_gate_cache_"))
     try:
         pr = subprocess.run([sys.executable, str(REPO / "python" / "analyze.py"), "plot"], env=env,
                             capture_output=True, text=True, timeout=120)
@@ -359,7 +329,7 @@ def t_tng100_size_function():
         prod.release()
     st = pop.snapshot_stats(cat, n)
     rv = st["_r_v_sf"]
-    assert rv.size >= 10, rv.size                  # delta08 at z = 0: 25 distinct voids (2026-10-11)
+    assert rv.size >= 10, rv.size                  # delta08 at z = 0: 25 distinct voids
     ratio, err, cnt = pop.ratio_at(rv, box, float(np.median(rv)), 0.0)
     assert np.isfinite(ratio) and ratio > 0 and cnt > 0, (ratio, cnt)
     print(f"        TNG100 z=0: {rv.size} distinct voids ({st['rv_sf_definition']}), median R_v "
@@ -422,8 +392,7 @@ def main():
     check("TNG100-3-Dark z=0: size-function sample and measured/Vdn at the median R_v", t_tng100_size_function)
     check("TNG100-3-Dark z=0, 1: the --size-smooth catalogue's delta08 fraction and measured/Vdn", t_tng100_size_smooth)
     print("-" * 60)
-    print(f"RESULT: {len(PASS)} passed, {len(FAIL)} failed, {len(SKIP)} skipped")
-    return 1 if FAIL else 0
+    return summary()
 
 
 if __name__ == "__main__":

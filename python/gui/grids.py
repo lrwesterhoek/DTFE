@@ -10,7 +10,7 @@
   server_settings(out)     how to start a dtfelib.Estimator on the snapshot behind an output (the
                            Explore tab's click-to-query), from the TNG layout or the custom-snapshot
                            job's settings sidecar ('<prefix>.gui.json')
-  field_label(o, name, ..) a map's name for a field, the velocity derivatives' family said (2026-10-15: a phase-space
+  field_label(o, name, ..) a map's name for a field, the velocity derivatives' family said (a phase-space
                            output's divergence, shear, vorticity, gradient and V-web as the mean field grad<v>,
                            computed slice by slice from its velocity grid, or as its stored stream average <grad v>)
 """
@@ -60,10 +60,10 @@ FIELD_HELP = {
                "2026-10-13, whose stored caustic grid missed the folds thinner than the sampling.",
     "scalar": "The particles' own value (the run's scalar dataset, e.g. a potential), interpolated like the density.",
 }
-# The velocity derivatives (dtfelib.io.MEAN_FIELD_NAMES; 2026-10-15). Standard DTFE stores them as the derivatives of
+# The velocity derivatives (dtfelib.io.MEAN_FIELD_NAMES). Standard DTFE stores them as the derivatives of
 # its one velocity field, the mean field grad<v>; PS-DTFE stores, in a multi-stream cell, the stream average of each
 # stream's own gradient <grad v> (dtfelib/io.py, the note above FIELDS: a divergence whose box mean is not 0, a V-web
-# with almost no filaments) -- so a map of a PS divergence beside a standard one compared two quantities. Explore
+# with almost no filaments) -- so a map of a PS divergence beside a standard one compares two quantities. Explore
 # shows a phase-space output's as either ('PS velocity derivatives'): 'mean-field', computed from its velocity grid
 # one slice at a time (dtfelib.fields.mean_field_gradient_plane, the figure scripts' spectral derivative and their
 # default, '--ps-gradient' of dtfelib.cli), or 'stored'. Every map, title, colour bar and figure-grid panel says
@@ -162,12 +162,12 @@ def _ambiguous_dim(root: Path, plane: tuple[int, np.dtype], cube: tuple[int, np.
                 if as_plane != as_cube:
                     return 2 if as_plane else 3
                 break
-        return 3                        # no evidence: the 3D reading, as before 2D outputs existed
+        return 3                        # no evidence: the 3D reading
     # One precision (a 512^2 plane or a 64^3 cube): neighbouring cells of a real grid are alike. Read flat,
     # the cube's second axis steps m values and the plane's rows step n; in the wrong reading that stride
     # lands far away (m cells along a row of the plane, or sqrt(m) cells along the cube's second axis),
     # so the true neighbour stride shows clearly the smaller differences. A field without structure
-    # across them (constant, noise, one varying along the slowest axis only) cannot tell: 3D, as before.
+    # across them (constant, noise, one varying along the slowest axis only) cannot tell: 3D.
     # Reads the first 64 rows of the plane at most (1 MB for 4096^2 in float32).
     path = next((p for p in (root.parent / f"{root.name}.{sfx}" for sfx in ("a_den", "den")) if p.is_file()), None)
     n, m = int(plane[0]), int(cube[0])
@@ -202,9 +202,9 @@ class FieldFile:
 # whole fields up to this size are read into memory once (a strided z-plane read touches every
 # page of the file: 1.9 s for a 512^3 grid on an external disk, every time); bigger ones go
 # through a memmap per slice. The cache holds a quarter of the machine's memory, at most 16 GB
-# (DTFE_GUI_CUBE_GB overrides): the figure grid shows four or nine outputs at once, and at the old
-# 1.5 GB four 512^3 cubes evicted each other, so every slice step re-read them all (75 ms each
-# instead of 1 ms; measured 2026-10-06).
+# (DTFE_GUI_CUBE_GB overrides): the figure grid shows four or nine outputs at once, and at
+# 1.5 GB four 512^3 cubes evict each other, so every slice step re-reads them all (75 ms each
+# instead of 1 ms).
 
 
 def _cube_cache_bytes() -> int:
@@ -224,11 +224,11 @@ def _cube_cache_bytes() -> int:
 CUBE_CACHE_BYTES = _cube_cache_bytes()
 # A cube above this is read whole only when a slice runs along its last axis (a memmap touches every page
 # of the file for that one anyway) or once it is cached already: a single x or y plane of a 1024^3 field
-# must not cost the whole 4 GB read (the 16 GB cap alone would have made it so; review 2026-10-06).
+# must not cost the whole 4 GB read (the 16 GB cap alone would make it so).
 CUBE_EAGER_BYTES = min(int(2e9), CUBE_CACHE_BYTES)
 # module-wide, least recently used first; the key carries the file's mtime and size, so a grid written
-# again by a re-run is read again (keyed on the path alone, Explore kept showing the OLD run's values
-# until the launcher restarted -- found 2026-10-05). The slice worker and the GUI thread (Save figure...)
+# again by a re-run is read again (keyed on the path alone, Explore would keep showing the old run's values
+# until the launcher restarted). The slice worker and the GUI thread (Save figure...)
 # both come here: every look at the dict is under the lock, the disk read is not (drop_cubes() from the
 # Run button must never wait on the T7).
 _CUBES: dict[tuple, np.ndarray] = {}
@@ -269,7 +269,7 @@ def _cached_cube(path: Path, dtype, shape, axis: int | None = None, read: bool =
     larger than the cache, or larger than CUBE_EAGER_BYTES and not cached yet while 'axis' (the plane
     axis the caller slices next, 0 or 1 of a 3D grid) is one a memmap reads cheaply. axis None = the
     caller reads the whole array (a 2D grid) or slices along the last axis. read False = only a cube cached
-    already, never a new read (the fold map's planes, 2026-10-15)."""
+    already, never a new read (the fold map's planes)."""
     nbytes = int(np.prod(shape)) * np.dtype(dtype).itemsize
     budget = _cube_budget()
     if nbytes > budget:
@@ -345,7 +345,7 @@ def drop_cubes() -> int:
     return n
 
 
-# The mean-field velocity gradient of the planes shown lately (2026-10-15): (velocity file's _cube_key, axis, index,
+# The mean-field velocity gradient of the planes shown lately: (velocity file's _cube_key, axis, index,
 # box) -> float64 (N, N, 3, 3), least recently used first, under _CUBES_LOCK. A plane costs one pass over the velocity
 # grid (0.3-0.6 s at 512^3 from the cube cache, a read of its 1.6 GB file otherwise); every derivative of it (the
 # divergence, shear, vorticity, gradient, V-web) and every colour or range change then comes from here. At most a
@@ -450,8 +450,8 @@ class OutputSet:
         """The field's array -- the cached cube when _cached_cube() keeps one -- or, for a 3D grid, just the
         plane 'index' along 'axis', read from the file. NEVER a memmap: a mapped page of a drive unplugged
         meanwhile (the T7) kills the whole launcher with SIGBUS, which Python cannot catch; a read fails with
-        an OSError the slice worker reports (2026-10-06). A 2D grid is read whole. cache False: a cube cached
-        already, else the plane; no new cube read (2026-10-15)."""
+        an OSError the slice worker reports. A 2D grid is read whole. cache False: a cube cached
+        already, else the plane; no new cube read."""
         ff = self.files[name]
         shape = (self.n,) * self.dim + ((ff.ncomp,) if ff.ncomp > 1 else ())
         cube = _cached_cube(ff.path, self.dtype, shape, axis if self.dim == 3 else None, read=cache)
@@ -484,11 +484,11 @@ class OutputSet:
         return mm                           # already the plane (read from the file)
 
     def fold_exact(self) -> bool:
-        """The 'caustic' map is the exact fold flag (2026-10-13): a phase-space output with a streams grid, in a
+        """The 'caustic' map is the exact fold flag: a phase-space output with a streams grid, in a
         periodic box (every TNG run; a custom run's settings sidecar says). dtfelib.io.caustic_is_fold: streams > 1
-        or '.hidden_streams' bit 1 (OR the class mask's fold bits) -- what '.caustic' stores since the fix of
-        2026-10-13, while the grids made before then (every production PS grid of 2026-10-12/13) set it only where
-        a folded tetrahedron deposited a SAMPLE: 21.0% of the cells of TNG100-3-Dark z=1 against 33.6%. In a
+        or '.hidden_streams' bit 1 (OR the class mask's fold bits) -- what '.caustic' stores; computing it here also
+        covers the grids of older binaries, whose '.caustic' is set only where a folded tetrahedron deposited a
+        SAMPLE (21.0% of the cells of TNG100-3-Dark z=1 against 33.6%). In a
         non-periodic run the union over-flags (a sheet's edge overlaps without folding): the stored grid is shown."""
         if self._fold_exact is None:
             self._fold_exact = "streams" in self.files and bool((sidecar(self.root) or {}).get("periodic", True))
@@ -498,8 +498,8 @@ class OutputSet:
         """The exact fold flag on one plane, 0/1 float64 (fold_exact), from up to three fields (the class mask, the
         streams, the hidden streams). When the three cubes together do not fit in the cube cache -- while a job runs
         it keeps 1 GB, and three 512³ cubes are 1.5 GB -- only their planes are read (a cube cached already is still
-        used): until 2026-10-15 each was read whole, 0.5 GB, and they evicted each other, so every step of the slice
-        read 1.5 GB into memory beside the run the cap is there for."""
+        used): read whole, 0.5 GB each, they would evict each other, so every step of the slice would read 1.5 GB
+        into memory beside the run the cap is there for."""
         names = [n for n in ("caustic_class", "streams", "hidden_streams") if n in self.files]
         cache = sum(self._nbytes(n) for n in names) <= _cube_budget()
 
@@ -509,7 +509,7 @@ class OutputSet:
         return np.asarray(fold, dtype=np.float64)
 
     def mean_field_reason(self) -> str:
-        """'' when this output's velocity derivatives can be shown as the mean field grad<v> (2026-10-15), else why
+        """'' when this output's velocity derivatives can be shown as the mean field grad<v>, else why
         not, in plain words: a standard-DTFE output stores the mean field itself; a phase-space one needs its velocity
         grid, a 3D grid of a known cubic box, and a periodic one -- the spectral derivative wraps around the box, so
         not a non-periodic run nor a window of the grid (a custom run's settings sidecar says). Cached on the object
@@ -527,7 +527,7 @@ class OutputSet:
         return self._mf_reason
 
     def gradient_family(self, name: str, gradient: str = "stored") -> str:
-        """Which velocity derivative a map of 'name' shows (2026-10-15): '' none (another field); 'mean' the mean field
+        """Which velocity derivative a map of 'name' shows: '' none (another field); 'mean' the mean field
         grad<v> (a standard-DTFE output's stored grid, or with gradient 'mean-field' a phase-space output's computed
         from its velocity where mean_field_reason allows); 'stream' a phase-space output's stored stream average."""
         if name not in GRADIENT_FIELDS:
@@ -556,9 +556,9 @@ class OutputSet:
         (components()); 'norm' = |v|, 'trace ...' = the trace. The vorticity is the curl of the
         velocity: the binary stores the antisymmetric part of the gradient, W_ab = (dv_a/dx_b -
         dv_b/dx_a)/2 for a < b (xy, xz, yz), which this turns into the curl's x, y, z (a 2D grid: its
-        z, a single number); measured on a rigid rotation (curl = 2 Omega), 2026-10-03. The 'caustic'
-        map of a periodic phase-space run is the exact fold flag, not the stored grid (fold_exact, 2026-10-13).
-        gradient 'mean-field' (2026-10-15): a phase-space output's velocity derivatives as the mean field, computed
+        z, a single number); measured on a rigid rotation (curl = 2 Omega). The 'caustic'
+        map of a periodic phase-space run is the exact fold flag, not the stored grid (fold_exact).
+        gradient 'mean-field': a phase-space output's velocity derivatives as the mean field, computed
         from its velocity grid (gradient_family 'mean'); 'stored' (the default) or any other field: the file's grid."""
         index = self.n // 2 if index is None else int(index)
         if name == "caustic" and self.fold_exact():
@@ -684,7 +684,7 @@ def _mf_gradient_plane(o: OutputSet, axis: int, index: int) -> np.ndarray:
 
 def header_hubble(o) -> float | None:
     """HubbleParam of the snapshot an output was computed from, whatever unit its box is in (hubble() asks an h-free
-    box): the h the binary's V-web takes from the Gadget header (H0 = 100 h), for the mean-field V-web (2026-10-15).
+    box): the h the binary's V-web takes from the Gadget header (H0 = 100 h), for the mean-field V-web.
     The TNG layout's combined file, or a custom run's HDF5 input; None = not known (the binary's fallback, 1). Read once
     per output (a header only) and cached on it."""
     if hasattr(o, "_header_h"):
@@ -712,7 +712,7 @@ def header_hubble(o) -> float | None:
 
 
 def field_label(o, name: str, family: str = "", qualify: bool | None = None) -> str:
-    """A map's name for a field (FIELD_LABELS'), with the velocity derivatives' family said (2026-10-15): 'velocity
+    """A map's name for a field (FIELD_LABELS'), with the velocity derivatives' family said: 'velocity
     divergence (mean field ∇⟨v⟩)' or '(stream average ⟨∇v⟩)' (family: OutputSet.gradient_family) for a phase-space
     output -- or, with 'qualify', for every output: a comparison or a figure grid with a phase-space panel names the
     standard-DTFE panel's family too (its stored grid is the mean field). A standard-DTFE map alone keeps its name."""
@@ -895,7 +895,7 @@ def void_circles(centres, radii, box: float, axis: int, position: float, rest, l
 def void_circles_mpc(centres, radii, box: float, axis: int, position: float, rest, lo, hi,
                      periodic: bool = True) -> list[tuple[float, float, float, int]]:
     """void_circles in the DATA frame of a matplotlib imshow(extent=[lo0, hi0, lo1, hi1], origin='lower'):
-    [(u, v, radius, k)] in Mpc, for a saved figure's matplotlib Circle patches (2026-10-11). One pixel per Mpc
+    [(u, v, radius, k)] in Mpc, for a saved figure's matplotlib Circle patches. One pixel per Mpc
     and y measured down from hi1 make void_circles' image pixels the data offsets."""
     (u0, v0), (u1, v1) = (float(lo[0]), float(lo[1])), (float(hi[0]), float(hi[1]))
     return [(u0 + x, v1 - y, rx, k) for x, y, rx, _ry, k in
@@ -982,7 +982,7 @@ def _tng_box(snapdir: Path) -> tuple[tuple, float | None] | tuple[None, None]:
 
 
 def hubble(o) -> float | None:
-    """h of an output's box, for the saved figures' Mpc/h axes (2026-10-14), or None when it is not known: the
+    """h of an output's box, for the saved figures' Mpc/h axes, or None when it is not known: the
     HubbleParam of the snapshot the box was read from, when that box is in h-free Mpc. A TNG-layout output: its
     snapdir's combined file (merge_HDF5.py writes it h-free, the box Explore uses); a custom or opened run: its
     sidecar's HDF5 input when that file carries the 'HFreeUnits' mark (else its box may already be in Mpc/h).
@@ -1055,9 +1055,8 @@ def type_label(o) -> str:
 def type_order(o, pref=None) -> tuple:
     """Sort key of a snapshot's outputs for the Type menu and the composer's fills: the estimator (DTFE
     first), then that estimator's default prefix, then the user's preferred one ('pref'), then the rest
-    by prefix -- plain text order put ps_mw (an A/B run kept beside ps_output) before the production
-    run, so 'this snapshot across outputs' compared the standard DTFE with the wrong phase-space run
-    (review 2026-10-05)."""
+    by prefix -- plain text order would put ps_mw (an A/B run kept beside ps_output) before the production
+    run, so 'this snapshot across outputs' would compare the standard DTFE with the wrong phase-space run."""
     lab = estimator_label(o)
     default = PS_PREFIX if lab == "PS-DTFE" else DTFE_PREFIX
     return (lab, o.prefix != default, o.prefix != pref, o.prefix)
@@ -1086,10 +1085,10 @@ def custom_box(settings: dict) -> tuple | None:
 
 def custom_redshift(settings: dict) -> float | None:
     """The redshift of a custom-snapshot run's input, for the u-unit velocity scaling (sqrt(a), as FieldSet and the
-    TNG layout apply it): the sidecar's 'redshift' (the Custom tab records the Gadget header's since 2026-10-11), else
+    TNG layout apply it): the sidecar's 'redshift' (the Custom tab records the Gadget header's), else
     the header of its HDF5 input (input type 105) when it carries one; None = no scaling (no header, another input
-    type, no Redshift attribute: a non-cosmological snapshot has no defined a). 2026-10-11: custom outputs were
-    always None, so a z > 0 Gadget snapshot showed its velocities in u-units, 1/sqrt(a) too large (1.41x at z = 1)."""
+    type, no Redshift attribute: a non-cosmological snapshot has no defined a). Without it a z > 0 Gadget snapshot
+    would show its velocities in u-units, 1/sqrt(a) too large (1.41x at z = 1)."""
     if "redshift" in settings:          # recorded (None = the header has none): no need to open the snapshot
         try:
             return None if settings["redshift"] is None else float(settings["redshift"])
@@ -1171,8 +1170,8 @@ def server_cost(snapshot, phase_space: bool = True, ram_bytes: int | None = None
     ram = ram_bytes or machine_ram_bytes()
     budget = 0.6 * ram
     per_vertex = (658 if phase_space else 640) + 160
-    # the standard server's periodic copies: its '--padding' (dtfelib.estimator.STANDARD_PADDING mean spacings since
-    # 2026-10-13, the binary's 5 before) on each face -- 1.18x the particles of TNG50-3, 1.37x of TNG50-4 (was a flat 1.2)
+    # the standard server's periodic copies: its '--padding' (dtfelib.estimator.STANDARD_PADDING mean spacings) on
+    # each face -- 1.18x the particles of TNG50-3, 1.37x of TNG50-4
     from dtfelib.estimator import STANDARD_PADDING
     copies = 1.73 if phase_space else (1.0 + 2.0 * STANDARD_PADDING / max(n, 1) ** (1.0 / 3.0)) ** 3
     single = n * copies * per_vertex + n * 64
@@ -1216,7 +1215,7 @@ def _descriptor_fields(desc: str) -> dict:
 
 def _canonical(path) -> str:
     """The binary's canonical_path.h: realpath, so a symlinked or relative name matches the cache key
-    the binary wrote (it canonicalizes since 2026-10-02); an unresolvable path is kept as given."""
+    the binary wrote (it canonicalizes); an unresolvable path is kept as given."""
     try:
         return os.path.realpath(os.path.expanduser(str(path)))
     except OSError:
@@ -1279,7 +1278,7 @@ def cached_partition_sets(cache_dir, snapshot, lagrangian=None, periodic: bool |
 
 
 def tess_chunked(path) -> bool:
-    """A cached tessellation written with the chunked body (2026-10-02 on: inflated on several threads)."""
+    """A cached tessellation written with the chunked body (inflated on several threads)."""
     try:
         with open(path, "rb") as f:
             if _read_descriptor(f, _TESS_MAGIC) is None:

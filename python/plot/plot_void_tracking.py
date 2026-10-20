@@ -26,15 +26,16 @@ Works identically for --method dtfe and ps.  Examples:
 Outputs: figures/void_tracking/<sim>/void<K>_evolution.png, voids_summary.png and one .npz
 per void with every tracked quantity. Those names are PS-DTFE's default grids (ps_output.) from snapshot 99; another
 estimator or --prefix adds '_<method>' / '_<prefix>', another --snap '_snap<N>', --radius r_eff '_reff' to the
-figures (2026-10-08: a --method dtfe or --snap run replaced the default files), and the void<K> files of this set
-beyond the voids written now are removed (a smaller --n-voids, or a void skipped, left an earlier run's beside them).
---link particles adds '_particles', --exclusive (partitioned members, 2026-10-11) '_exclusive' after it.
+figures (else a --method dtfe or --snap run would replace the default files), and the void<K> files of this set
+beyond the voids written now are removed (a smaller --n-voids, or a void skipped, would leave an earlier run's beside
+them).
+--link particles adds '_particles', --exclusive (partitioned members) '_exclusive' after it.
 
 --link particles follows the void at each earlier snapshot that gave its successor the most member particles. With
 the default (overlapping) members a large R_v sphere at z >= 1 holds the matter of its neighbours too (member pairs
 are 1.5-2x the particles in TNG100 at z = 1.5-5), which favours the largest progenitor spheres; --exclusive
 partitions the matter (lagrangian.void_members) and reads the census's '_excl' links (plot_void_fate.py --exclusive
-builds them). TNG100-3-Dark, the 30 deepest z = 0 voids (2026-10-11): median progenitor R_v at z = 1 / 1.5 / 2 is
+builds them). TNG100-3-Dark, the 30 deepest z = 0 voids: median progenitor R_v at z = 1 / 1.5 / 2 is
 23.6 / 23.2 / 27.6 Mpc by default and 15.3 / 17.2 / 22.6 Mpc exclusive, the median share 0.95 against 0.73-0.82;
 the median BBKS e per snapshot agrees within 0.015.
 """
@@ -74,7 +75,7 @@ def unit_cos(v, w):
 def catalog_at(snap, args):
     """Pipeline void catalog, grid size and grids (method, prefix) for one snapshot; Nones if no fields on disk.
     A ValueError -- the snapshot's frame is not config's (DTFE_SIM is not --sim), or a bad grid -- is raised to the
-    caller, which says it: it used to read as 'no field grids' (2026-10-08)."""
+    caller, which says it rather than reading it as 'no field grids'."""
     prod = pipeline.products(snap, sim=args.sim, method=args.method, prefix=args.prefix, data_root=args.data_root)
     try:
         cat = prod.voids()
@@ -160,13 +161,13 @@ def read_void(t, i, cat, n, j, ref_axis):
 def track_voids_trees(cat0, n0, picked, catalogs, ts, pool_frac, pool_ids, box_ckpc_h, ztab, args):
     """Follow the reference voids 'picked' (rows of cat0, snapshot args.snap) along merger-tree tracers and read
     them from 'catalogs' ({snap: (cat, n)}) at every snapshot: [(k, track, r_eff0, extra npz fields)]. 'ts' is
-    anything with TreeSet.main_branch; split out of main (2026-10-11) so the tracker runs on synthetic trees."""
+    anything with TreeSet.main_branch; split out of main so the tracker runs on synthetic trees."""
     out = []
     for k, i0 in enumerate(picked):
         center0 = (cat0["coords"][i0] + 0.5) / n0
         semi0 = cat0["semi_axes"][i0]
         r_eff0 = float(np.prod(semi0) ** (1.0 / 3.0))
-        r_v0 = float(C.r_v_mpc(cat0)[i0])                 # NaN: no R_v (a catalogue older than 2026-10-07)
+        r_v0 = float(C.r_v_mpc(cat0)[i0])                 # NaN: no R_v (an older catalogue without it)
         ref_axis = cat0["orientations"][i0][:, 0]
         r_sel_frac = args.sel_factor * semi0.max() / config.BOX_SIZE
         idx = V.select_tracers(pool_frac, center0, r_sel_frac, args.max_tracers)
@@ -219,7 +220,7 @@ def track_voids_particles(vsnaps, n_voids, ztab, links=None):
     the most member particles (lagrangian.main_progenitor). 'links' = [Link a -> b per consecutive pair] (default:
     lagrangian.cached_link). The track's 'link_frac' is that progenitor's share of the successor's members (the
     identity quality, as n_tracers is for the trees); before a void without progenitor nothing is read.
-    The walk stays on FOLLOWED voids (2026-10-11): a link's progenitors are a's followed voids only, and its
+    The walk stays on FOLLOWED voids: a link's progenitors are a's followed voids only, and its
     descendants b's whole pool with the followed ones first (lagrangian.void_pool), so a followed void's sample index
     IS its pool index there and main_progenitor hands back a sample index of the earlier snapshot.
     Returns [(k, track, r_eff0, extra npz fields)] as track_voids_trees."""
@@ -229,7 +230,7 @@ def track_voids_particles(vsnaps, n_voids, ztab, links=None):
         links = []
         tag = L.link_tag(vsnaps[-1].method, vsnaps[-1].prefix)    # the census's link files (plot_void_fate)
         for a, b in zip(vsnaps[:-1], vsnaps[1:]):
-            # b's pool streamed, never held (2026-10-11); its followed members kept for b -> next, but not at the end
+            # b's pool streamed, never held; its followed members kept for b -> next, but not at the end
             links.append(L.cached_link(a, b, tag, keep_prog=b is not vsnaps[-1]))
             a.drop_members()
             b.drop_members(keep_prog=True)
@@ -282,7 +283,7 @@ def main(argv=None):
         raise SystemExit(f"snapshot {args.snap} of {args.sim}: REFUSED: {e}")
     if cat0 is None:
         raise SystemExit(f"no {args.method} field grids at snapshot {args.snap} of {args.sim}")
-    use_data_root(args.data_root)      # --data-root for the trees, group catalogues and ladder too (2026-10-05)
+    use_data_root(args.data_root)      # --data-root for the trees, group catalogues and ladder too
     ztab = gc.redshift_table(args.sim)
     ladder = sorted({int(d.name.split("_")[1]) for d in env.sim_dir(args.sim).glob("snapdir_*")})
     outdir = FIGURE_ROOT / args.sim / pipeline.smoothing_tag()     # a non-default sigma: its own folder
@@ -351,9 +352,9 @@ def main(argv=None):
 
 
 def _set_tag(args, grids):
-    """The name tag of this run's set (2026-10-08): '' for PS-DTFE's default grids from snapshot 99 (every file on the
-    T7); else '_<method>' or '_<prefix>', and '_snap<N>'; '_particles' for --link particles (2026-10-11), and
-    '_exclusive' after it for partitioned members (2026-10-11 afternoon). The radius has its own suffix on the figures."""
+    """The name tag of this run's set: '' for PS-DTFE's default grids from snapshot 99 (every file on the
+    T7); else '_<method>' or '_<prefix>', and '_snap<N>'; '_particles' for --link particles, and
+    '_exclusive' after it for partitioned members. The radius has its own suffix on the figures."""
     method, prefix = grids
     default_prefix = {"ps": "ps_output.", "dtfe": "output."}         # io's: an estimator's own grids
     g = method if prefix == default_prefix.get(method) else prefix.rstrip(".")
@@ -364,7 +365,7 @@ def _set_tag(args, grids):
 
 def _remove_stale(outdir, args, written):
     """Remove this set's void<K> files (same tag; the figures also the same radius) that this run did not write: a
-    smaller --n-voids, or a void skipped for too few tracers, left an earlier run's files beside the new ones. A run
+    smaller --n-voids, or a void skipped for too few tracers, leaves an earlier run's files beside the new ones. A run
     that tracked no void at all (a mis-set --sel-factor or --min-mass) leaves the earlier set alone, and says so."""
     if not written:
         print("  no void tracked: the earlier files of this set are left as they are")
@@ -402,7 +403,7 @@ def _radius_suffix(args):
 
 
 def _x_axis(t):
-    """The time axis: 1+z on a log scale (2026-10-11: 6 of the 9 ladder snapshots sit at z < 3, squeezed into the
+    """The time axis: 1+z on a log scale (6 of the 9 ladder snapshots sit at z < 3, squeezed into the
     right 15% of a linear z axis); the snapshot number when no redshift is known."""
     if np.isfinite(t["redshift"]).any():
         return 1.0 + np.asarray(t["redshift"], dtype=float), "1 + z"
@@ -510,7 +511,7 @@ def plot_summary(summary, args, outdir):
         plot_finite(ax2, x, t["e"], "o-", color=c, **kw)
         if not many:
             plot_finite(ax2, x, t["p"], "s--", ms=3, alpha=0.5, color=c)
-    if many and xlabel == "1 + z":         # tens of voids: their median and 16-84% band per snapshot (2026-10-11)
+    if many and xlabel == "1 + z":         # tens of voids: their median and 16-84% band per snapshot
         for ax, key, col, lab in ((ax1, args.radius, "tab:purple", "radius"), (ax2, "e", "tab:blue", "e"),
                                   (ax2, "p", "tab:orange", "p")):
             _s, x, pct = summary_bands(summary, key)

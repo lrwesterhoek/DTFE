@@ -7,7 +7,7 @@ metadata come from dtfelib.FieldSet.
     python3 plot/plot_cosmic_web.py --method dtfe
     python3 plot/plot_cosmic_web.py --sim TNG50-3-Dark --snap 50
 
-PS-DTFE grids (2026-10-13): the V-web is the MEAN-FIELD one by default -- classified from the FFT gradient of the
+PS-DTFE grids: the V-web is the MEAN-FIELD one by default -- classified from the FFT gradient of the
 PS velocity grid with the binary's normalisation and the run's lambda_th (FieldSet.mean_field), the V-web standard
 DTFE stores. The binary's PS V-web classifies the stream average of each stream's gradient <grad v> and finds
 almost no filaments or nodes (TNG100-3-Dark z=1: 1.8% filaments against standard DTFE's 6.6%; dtfelib/io.py, the
@@ -24,7 +24,7 @@ import matplotlib.pyplot as plt
 from dtfelib import make_parser, snapdir, FieldSet, add_ps_gradient_arg, mean_field_wanted
 from dtfelib import figures as style
 
-style.apply()                                   # the house style (serif, SHOW_TITLES, DPI): survey item 11, 2026-10-05
+style.apply()                                   # the house style (serif, SHOW_TITLES, DPI)
 
 FIGURE_ROOT = Path(config.LOCAL_FIGURES_ROOT)
 OUTPUT_DIR = FIGURE_ROOT / "cosmic_web"
@@ -62,7 +62,7 @@ def plot_classification(class_field, slice_dim, box_size, web_type,
 def plot_eigenvalues(eig_field, slice_dim, box_size, web_type,
                      redshift=None, save_path=None):
     """Triptych of the eigenvalue maps: the house rule for a signed field (figures.norm_signed_log at the
-    field's linthresh), the same as plot_PS_DTFE's triptych -- it was a linear (1, 99) percentile pair here."""
+    field's linthresh), the same as plot_PS_DTFE's triptych."""
     panels = []
     for i, label in enumerate((r'$\lambda_1$', r'$\lambda_2$', r'$\lambda_3$')):
         eig_slice = extract_slice(eig_field[..., i], slice_dim).T
@@ -166,8 +166,8 @@ def process_snapshot(fs, snapshot, mean_field=True):
         if web_type == 'V-web' and mean_field and fs.method == 'ps':
             # the classes and the eigenvalues of ONE mean-field computation (sharing its FFTs)
             if not fs.has('vweb', mean_field=True):
-                print(f"  Warning: V-web: no velocity grid to derive the mean-field V-web from (method 'ps'; "
-                      f"--ps-gradient stored plots the stored PS V-web)")
+                print("  Warning: V-web: no velocity grid to derive the mean-field V-web from (method 'ps'; "
+                      "--ps-gradient stored plots the stored PS V-web)")
                 continue
             try:
                 mf = fs.mean_field(('vweb', 'vweb_eigenvalues'))

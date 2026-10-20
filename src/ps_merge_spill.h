@@ -1,7 +1,7 @@
-/* The SPILL of the staged ordered merge (PS-DTFE partition loop, DTFE.cpp; 2026-10-15).
+/* The SPILL of the staged ordered merge (PS-DTFE partition loop, DTFE.cpp).
 
    A partition that finishes before its turn in the ordered merge parks its two sub-grid Quantities until the
-   partitions before it have merged. Parked in RAM they reached 16 GB on TNG100 and made TNG50 z=0 swap 5.7 GB. A
+   partitions before it have merged. Parked in RAM they reach 16 GB on TNG100. A
    SPILLED partition writes its accumulators to ONE unlinked file instead and frees them; at its turn they are read
    back into the very Quantities they came from and merged by the same addFromSubgrid as an in-memory one, so the
    merged grids are byte-identical whichever way a partition waited (the file holds the raw bytes, no conversion).
@@ -14,7 +14,7 @@
    each; the write happens outside the merge lock (DTFE.cpp), the read under it, beside the merge it feeds.
 
    A failed write (a full disk, an unwritable folder) leaves the sub-grids where they were and reports why: the
-   caller then parks them in RAM or waits for its turn, as before the spill existed. A failed READ cannot be undone
+   caller then parks them in RAM or waits for its turn. A failed READ cannot be undone
    (the sub-grids are gone), so the caller stops the run with the reason. */
 #ifndef PS_MERGE_SPILL_H
 #define PS_MERGE_SPILL_H
@@ -46,9 +46,9 @@ namespace PSMergeSpill
 
 // where the spill files go: '--scratch-dir' when set (validated at option parsing: local, existing), else the
 // system temporary folder ($TMPDIR, else /tmp). 'why' says why a folder cannot be used ("" = usable). Why a
-// default at all: without one a partition that does not fit in memory waits for its turn holding its thread, the
-// 35% loss the staged merge removed, or (under the memory gate) stays in RAM, where macOS swapped it to the same
-// internal disk anyway -- page by page and unasked. A spill writes it once, sequentially, and frees it for sure.
+// default at all: without one a partition that does not fit in memory waits for its turn holding its thread (up
+// to 35% of the run), or (under the memory gate) stays in RAM, where macOS swaps it to the same internal disk
+// anyway -- page by page and unasked. A spill writes it once, sequentially, and frees it for sure.
 // The disk room is checked before every spill (room()); a Linux tmpfs default is refused (it IS memory).
 inline std::string folder(std::string const &scratchDir, std::string &why)
 {
@@ -82,7 +82,7 @@ inline double diskFree(std::string const &dir)
 }
 
 // may 'bytes' be spilled there now? The same 2 GB margin as scratch_alloc.cc's grids: the disk must never fill up
-// under the outputs still to come. 'reserved' (review, 2026-10-15): bytes the free-space reading still shows as free
+// under the outputs still to come. 'reserved': bytes the free-space reading still shows as free
 // but that are spoken for -- the other spills being written right now (outside the merge lock, so a reading taken
 // for each alone would let k writers overshoot the margin together) and, in '--scratch-dir', the scratch mappings
 // (ftruncate'd sparse files: their unwritten pages are free to statvfs, and a spill that took them would make the
@@ -93,7 +93,7 @@ inline bool room(std::string const &dir, double const bytes, double const reserv
     return f < 0. or f - margin - reserved >= bytes;
 }
 
-// the free space a spill must leave on its disk (2026-10-15): 2 GB in '--scratch-dir' (scratch_alloc.cc's margin), but
+// the free space a spill must leave on its disk: 2 GB in '--scratch-dir' (scratch_alloc.cc's margin), but
 // 16 GB in the system temporary folder -- on a Mac that is the boot disk, where macOS grows its swap files under the
 // very memory pressure that makes a run spill, so the run must not take that room from it. DTFE_SPILL_MIN_GB=X sets
 // it for both (the tests' forced spills into the temp folder of a CI runner with less than 16 GB free)

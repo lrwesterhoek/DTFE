@@ -51,9 +51,8 @@ extern "C"
 
 
 // A particle dataset must hold one row per particle of 'cols' values (cols 0: a 1-D dataset). HDF5's read()
-// writes the WHOLE dataset into the buffer, so until 2026-10-11 a 3-column snapshot read by a 2D binary wrote 3N
-// values into a 2N buffer (a heap overflow: a segfault, or exit 0 with a garbage grid) and a 2-column one read
-// by a 3D binary was a misaligned short read of a wrong grid at exit 0.
+// writes the WHOLE dataset into the buffer, so a 3-column snapshot read by a 2D binary would write 3N values into
+// a 2N buffer (a heap overflow) and a 2-column one read by a 3D binary would be a misaligned short read.
 static void HDF5_checkParticleDataset(DataSet const &dataset, char const *group, char const *name,
                                       long long nParticles, int cols, char const *file)
 {
@@ -696,8 +695,8 @@ void HDF5_readGadgetFile_HI(std::string filename,
     // HI content is defined only for gas, so reject any other requested species
     bool otherSpecies = false;
     for (int i=1; i<6; ++i)
-        if ( userOptions->readParticleSpecies[i] )     // [i]: it tested [1] five times until 2026-10-11, so gas
-            otherSpecies = true;                        // plus stars/black holes passed with raw stellar masses
+        if ( userOptions->readParticleSpecies[i] )     // [i]: every species but gas (type 0)
+            otherSpecies = true;
     if ( otherSpecies )
         throwError( "You asked for the function that reads in the HI data yet you also asked for reading other particle species. This does not make sense." );
     if ( userOptions->additionalOptions.empty() )

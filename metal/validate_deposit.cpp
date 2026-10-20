@@ -13,7 +13,7 @@
 //        mass conservation, full-coverage, density & stream-count profiles vs ANALYTIC
 //        solution of z = q + A sin(kq), dispersion invariants (sigma_xx=sigma_yy=0 for
 //        z-only flow; single-stream sigma_zz ~ 0 at nSub=1, where single-stream means
-//        streams==1 AND not '.unresolved'), CPU vs GPU on all fields.
+//        streams==1 AND not '.hidden_streams' bit 1), CPU vs GPU on all fields.
 //    T9  analytic velocity-field checks: constant field reproduced exactly; linear field
 //        v = Gx recovers the gradient in every covered cell
 //    T10 partition sub-grid support (subOrigin/subDims deposit window)
@@ -147,7 +147,7 @@ static void cpuDeposit(const std::vector<float>& verts, const std::vector<float>
         for(int dd=0;dd<3;++dd){
             iMin[dd]=int(std::floor((lo[dd]-P.boxLo[dd])/P.dx[dd]));
             iMax[dd]=int(std::floor((hi[dd]-P.boxLo[dd])/P.dx[dd]))+1;
-            // no sample margin (2026-10-11, as the kernel): every sub-sample lies inside its own cell
+            // no sample margin (as the kernel): every sub-sample lies inside its own cell
             if(!P.periodic && (std::max(iMin[dd],0)>=P.nGrid[dd] || std::min(iMax[dd],P.nGrid[dd])<=0)) beyond=true;
         }
         if(beyond) continue;
@@ -242,16 +242,13 @@ struct Gpu {
         return psoFld!=nullptr;
     }
 
-    // Runs the production kernel (depositFields) on tets given as ABSOLUTE vertices (12 floats per
-    // tet, as the tests write them): builds each tet's record like the host does
-    // (ps_deposit_params.h psFillTetRecord, with the centroid-fallback cell computed as
-    // cpuDeposit does), dispatches, and deposits the tets the kernel DEFERRED (a sample within
-    // float rounding of a face) with cpuDeposit -- the production host deposits them with its
-    // CPU loop -- so the outputs are complete. The tests' vertices are written explicitly, not
-    // made as float-shifted periodic copies, so the record's frame is the plain grid frame.
-    // Without 'vels' the moment flags are off: a density-only run, as in production. Returns 1
-    // when the moment grids were filled (vels given), else 0. causticMask (fCaustic only): per-tet
-    // masks to hand the kernel; tets beyond its end get the parity bit from det(Ax).
+    // Runs the production kernel (depositFields) on tets given as ABSOLUTE vertices (12 floats per tet): builds each
+    // tet's record as the host does (ps_deposit_params.h psFillTetRecord; the centroid-fallback cell as cpuDeposit
+    // computes it), dispatches, and deposits the tets the kernel DEFERRED with cpuDeposit, as the production host
+    // does with its CPU loop, so the outputs are complete. The record's frame is the plain grid frame (the tests write
+    // no periodic copies). Without 'vels' the moment flags are off (density only). Returns 1 when the moment grids
+    // were filled, else 0. causticMask (fCaustic only): per-tet masks for the kernel; tets beyond its end get the
+    // parity bit from det(Ax).
     int run(const std::vector<float>& verts, const std::vector<float>& vels,
             const std::vector<float>& masses, const DepositParams& P, CpuOut& o,
             const std::vector<uint32_t>& causticMask = {}) {
@@ -259,8 +256,8 @@ struct Gpu {
         const bool fields = !vels.empty();
         DepositParams Pk=P;
         if (!fields) { Pk.fVel=0; Pk.fDisp=0; Pk.fGrad=0; }
-        {   // the mass grid as the exact fixed-point sum, set as ps_metal_host.cc sets it (2026-10-08);
-            // VALIDATE_FLOAT_MASS=1 tests the float grid of before instead
+        {   // the mass grid as the exact fixed-point sum, set as ps_metal_host.cc sets it;
+            // VALIDATE_FLOAT_MASS=1 tests the float grid instead
             double tm=0.; for(float x:masses) if(x>0.f) tm+=x;
             float sc=1.f;
             Pk.massFixed = (!getenv("VALIDATE_FLOAT_MASS") && psMassFixedScale(tm,sc)) ? 1 : 0;
@@ -338,7 +335,7 @@ struct Gpu {
             e->setBuffer(bSV,0,12); e->setBuffer(bDV,0,13); e->setBuffer(bDW,0,14);
             e->setBuffer(bSc,0,18); e->setBuffer(bScal,0,19); e->setBuffer(bSG,0,20);
             e->setBuffer(bMassFx,0,21);
-            // the moment grids' fixed-point views (2026-10-14; unused while P.fxMask is 0, bound like the kernel's host)
+            // the moment grids' fixed-point views (unused while P.fxMask is 0, bound like the kernel's host)
             e->setBuffer(bMom,0,22); e->setBuffer(bM2,0,23); e->setBuffer(bG,0,24); e->setBuffer(bW,0,25);
             e->setBuffer(bSV,0,26); e->setBuffer(bDV,0,27); e->setBuffer(bScal,0,28); e->setBuffer(bSG,0,29);
             if(bI){
@@ -449,7 +446,7 @@ static void makeParams(DepositParams& P,int n,float box,int nSub,int periodic){
     P.nSub=nSub;P.periodic=periodic;P.fVel=1;P.fDisp=1;P.fGrad=1;P.fLinear=0;P.fVolW=0;P.fCaustic=0;P.fExact=0;P.nTet=0;
     P.fScal=0;P.fSGrad=0;   // the scalar buffers (18-20) are bound as dummies: no scalar test here
     P.windowMode=0;         // the sub-grid tests are partition boxes, not windows
-    // the moment grids as float sums (2026-10-14: the kernel's fixed-point moment path, fxMask, is exercised by the
+    // the moment grids as float sums (the kernel's fixed-point moment path, fxMask, is exercised by the
     // binary's suites -- tests/ps_fixed_moments_check.sh; this harness compares the float grids with its CPU reference)
     P.fxMask=0; for(int g=0;g<PS_FX_N;++g) P.fxScale[g]=0.f;
 }
@@ -481,8 +478,8 @@ static void t2_centroid(Gpu& g){
     DepositParams P; makeParams(P,8,8.f,3,0); P.nTet=1;
     // Off the sample lattice: sub-samples of cell (3,4,5) sit at {3.1667,3.5,3.8333} etc., so a
     // tet of extent 0.02 at (3.62,4.57,5.43) contains NO sample point -> the N==0 centroid
-    // fallback MUST run. (A previous version centred the tet exactly on the middle sub-sample,
-    // which counted as inside and silently took the normal deposit path instead.)
+    // fallback MUST run. (A tet centred exactly on the middle sub-sample would count as inside
+    // and silently take the normal deposit path instead.)
     float cx=3.62f,cy=4.57f,cz=5.43f,e=0.02f;
     std::vector<float> v={cx,cy,cz, cx+e,cy,cz, cx,cy+e,cz, cx,cy,cz+e};
     std::vector<float> m={1.7f};

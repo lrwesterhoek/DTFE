@@ -11,11 +11,10 @@
 #       double build hands them float copies of its tetrahedra, so each must match ITS OWN CPU run the way the
 #       single build's GPU matches its CPU (means to 1e-5, per-cell to 5e-2 outside a 1e-3 fraction) and must
 #       conserve mass; skipped when the double pair was built without METAL=1. Its stream counts are IDENTICAL to
-#       the CPU's, as in the single build (2026-10-18; from 2026-10-13 up to 1e-4 of the cells were allowed to
-#       differ): the host used to round the double vertices to float before building the GPU's per-tet record, and
-#       the kernel's error bound covers the record's own roundings, not that shift, so a sub-sample within it of a
-#       face could be counted on the wrong side -- 0-2 cells of 48^3 on five of six seeds of this wave. The record
-#       is now built from the double vertices (ps_deposit_params.h psFillTetRecord).
+#       the CPU's, as in the single build: the host builds the GPU's per-tet record from the double vertices
+#       (ps_deposit_params.h psFillTetRecord). Rounding them to float first would shift them by more than the
+#       kernel's error bound covers (it covers the record's own roundings), so a sub-sample that close to a
+#       face could be counted on the wrong side -- 0-2 cells of 48^3 on five of six seeds of this wave.
 #   D6  the Python side reads float64 grids: python/gui/grids.py infers the dtype from the file size
 # Both pairs must be built (./DTFE ./PS-DTFE ./DTFE-double ./PS-DTFE-double); --no-build is accepted and ignored.
 set -uo pipefail
@@ -25,7 +24,7 @@ cd "$ROOT" || exit 1
 PY="${PYTHON:-python3}"
 command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/python3.14
 # a pair missing is a SKIP, or a FAILURE under DTFE_TEST_REQUIRED=1, which ci_suite.sh's double stage sets after
-# building both pairs (it used to exit 0 there too, 2026-10-08). precision.sh's skip_or_fail, inlined: sourcing
+# building both pairs. precision.sh's skip_or_fail, inlined: sourcing
 # precision.sh would announce one precision for a suite that runs both.
 skip_or_fail() {
     if [ "${DTFE_TEST_REQUIRED:-0}" = "1" ]; then echo "FAIL (required): $*" >&2; exit 1; fi

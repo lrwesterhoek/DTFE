@@ -1,6 +1,6 @@
 """The void profiles across cosmic time on ONE figure, and the universal-profile fits per R_v bin and redshift.
 
-For every snapshot on disk (2026-10-11): the shells of the DISTINCT well-resolved voids (dtfelib.profiles, as
+For every snapshot on disk: the shells of the DISTINCT well-resolved voids (dtfelib.profiles, as
 plot_void_profiles.py), and from them
   (a) the stacked RAW rho/rho_bar against r / R_v of the voids with R_v in --rv-range (in smoothing lengths, default
       2.5-5 sigma: the same voids in sigma units at every z), one curve per redshift, colour = z;

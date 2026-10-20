@@ -84,10 +84,10 @@ enum Collective { C_ANY, C_MINU, C_SUMF };
 // gpuemu_switch(&fromSp, toSp): saves the callee-saved registers on the current stack, stores the
 // stack pointer into *fromSp, switches to the stack toSp and restores the registers saved there --
 // a register-only coroutine switch (the libc routines cost a signal-mask syscall per switch, which
-// made a 32^3 test take ten minutes). A fresh stack is prepared so that the first switch "returns"
+// makes a 32^3 test take ten minutes). A fresh stack is prepared so that the first switch "returns"
 // into the lane trampoline (prepareStack). The arm64 switch is verified (Apple Silicon, and Linux arm64 with
-// GCC 13); the x86-64 one, written to the System V convention, ran for the first time on 2026-10-11 (Rosetta:
-// the PS deposit bit-identical in mass to arm64, and a collectives + __syncthreads kernel exact at warp 32 and
+// GCC 13); the x86-64 one, written to the System V convention, is verified under Rosetta (the PS deposit
+// bit-identical in mass to arm64, and a collectives + __syncthreads kernel exact at warp 32 and
 // 64). It must not run under a CET shadow stack (a 'ret' into another lane's stack): the Makefile builds the
 // emulated objects with -fcf-protection=none on x86-64 so the binary is never marked for one.
 extern "C" void gpuemu_switch(void** fromSp, void* toSp);
@@ -351,7 +351,7 @@ inline unsigned max(unsigned a, unsigned b) { return a > b ? a : b; }
 
 // ---- the runtime API (the gpu* names of gpu_cuda_compat.h)
 // the codes are CUDA's; nothing in the emulation raises a launch timeout, the PS host's retry policy only
-// needs the name (its test hook DTFE_GPU_FAULT_AT injects one, 2026-10-11)
+// needs the name (its test hook DTFE_GPU_FAULT_AT injects one)
 enum gpuError_t { gpuSuccess = 0, gpuErrorMemoryAllocation = 2, gpuErrorLaunchTimeout = 702 };
 inline const char* gpuGetErrorString(gpuError_t e)
 {

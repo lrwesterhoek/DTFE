@@ -16,7 +16,7 @@ Continuous fields are sampled trilinearly (periodic), categorical web labels by
 nearest-grid-point. Snapshots without fields on disk yield NaN with a note in env["missing"].
 
 The velocity-gradient family (vweb, divergence, ...) is the MEAN-FIELD one for both estimators by default
-(2026-10-13, mean_field=True): FieldSet.load(name, mean_field=True), i.e. standard DTFE's stored grids and, for
+(mean_field=True): FieldSet.load(name, mean_field=True), i.e. standard DTFE's stored grids and, for
 PS-DTFE, the same quantity derived from its velocity grid instead of its stored stream average <grad v> (dtfelib/
 io.py, the note above FIELDS). That costs a PS output an FFT computation per call (seconds to a minute at 512^3):
 sample every position of a snapshot in ONE sample_fields_at call. mean_field=False reads the stored PS grids.
@@ -28,7 +28,7 @@ from __future__ import annotations
 import h5py
 import numpy as np
 
-from .cli import DATA_ROOT, sim_dir
+from .cli import sim_dir
 from .io import FieldSet, MEAN_FIELD_NAMES
 
 # fields whose values are categorical labels: sample NGP, never interpolate
@@ -132,7 +132,7 @@ def branch_environment(sim: str, branch: dict, fields=("density", "tweb", "vweb"
     """Field environment along a SubLink branch (output of TreeSet.main_branch, which must
     include 'SubhaloPos'). One sampled value per branch snapshot; NaN where no field grids
     exist on disk. Returns {field: (n,) array, ..., "missing": [snap, ...], "method": {snap: m}}.
-    prefix: an alternate grid set, as sample_fields_at (2026-10-11: it could not be passed here).
+    prefix: an alternate grid set, as sample_fields_at.
     mean_field: as sample_fields_at; it samples one position per call, so a PS mean-field V-web is computed once
     per branch snapshot -- for many branches sample per snapshot instead (plot_halo_tracking.add_environment).
     """

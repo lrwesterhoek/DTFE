@@ -281,7 +281,7 @@ def process_snapshot(snapshot, redshift, args):
             '2saddle': (cp['saddle2']['values'] - mean) / std,
         }
 
-        print(f"  Creating visualizations")
+        print("  Creating visualizations")
         
         pdf_params = plot_pdfs(
             nu_values, redshift=redshift,
@@ -310,20 +310,20 @@ def process_snapshot(snapshot, redshift, args):
         volume = box_size**3
 
         with open(summary_file, 'w') as f:
-            f.write(f"Critical Point Analysis Summary\n")
+            f.write("Critical Point Analysis Summary\n")
             f.write(f"Snapshot: {snapshot}, Redshift: {redshift:.2f}\n")
             # what the numbers were made from: the folder is shared by every simulation and estimator
             f.write(f"Simulation: {args.sim}, estimator: {p.fs.method}, grids: {p.fs.prefix.rstrip('.')}*\n")
             f.write(f"{'='*50}\n\n")
-            f.write(f"Parameters:\n")
+            f.write("Parameters:\n")
             f.write(f"  Box size: {box_size:g} Mpc\n")
             f.write(f"  Grid resolution: {grid_n}³\n")
             f.write(f"  Smoothing sigma: {SMOOTHING_SIGMA}\n")
             f.write(f"  Gradient threshold (saddles): {config.GRADIENT_THRESHOLD}\n")
             f.write(f"  Footprint / dedup distance: {config.FOOTPRINT_SIZE}\n")
-            f.write(f"  Detection: unified pipeline catalog (extrema via footprint filters,\n")
-            f.write(f"             saddles via gradient candidates + eigenvalue signature)\n\n")
-            f.write(f"Critical Point Counts:\n")
+            f.write("  Detection: unified pipeline catalog (extrema via footprint filters,\n")
+            f.write("             saddles via gradient candidates + eigenvalue signature)\n\n")
+            f.write("Critical Point Counts:\n")
             for cp_type, count in total_counts.items():
                 percentage = 100.0 * count / total_count if total_count > 0 else 0.0
                 density = count / volume
@@ -331,18 +331,18 @@ def process_snapshot(snapshot, redshift, args):
             f.write(f"  Total: {total_count} ({total_count/volume:.6e} Mpc⁻³)\n\n")
             chi = (total_counts['minima'] - total_counts['1saddle']
                    + total_counts['2saddle'] - total_counts['maxima'])
-            f.write(f"Morse alternating sum "
-                    f"(minima - 1saddle + 2saddle - maxima):\n")
+            f.write("Morse alternating sum "
+                    "(minima - 1saddle + 2saddle - maxima):\n")
             f.write(f"  chi = {chi}   (expected ~ 0 on a periodic box; "
                     f"|chi|/total = {abs(chi)/total_count:.3f})\n\n" if total_count
                     else f"  chi = {chi}\n\n")
-            f.write(f"Data statistics of nu per type (non-parametric):\n")
+            f.write("Data statistics of nu per type (non-parametric):\n")
             for cp_type in ['minima', '1saddle', '2saddle', 'maxima']:
                 v = nu_values[cp_type]
                 if len(v):
                     f.write(f"  {cp_type.capitalize()}: mean={np.mean(v):.4f}, "
                             f"std={np.std(v):.4f}, median={np.median(v):.4f}\n")
-            f.write(f"\nGaussian Fit Parameters (PDF):\n")
+            f.write("\nGaussian Fit Parameters (PDF):\n")
             for cp_type in ['minima', '1saddle', '2saddle', 'maxima']:
                 if cp_type in pdf_params:
                     params = pdf_params[cp_type]
@@ -350,7 +350,7 @@ def process_snapshot(snapshot, redshift, args):
         
         print(f"  Found {total_count} critical points")
         # this snapshot's numbers for the evolution summary, at the precision its summary file carries (the
-        # summary was rebuilt from those files before 2026-10-11: the same figures for the same run)
+        # same figures as a summary rebuilt from those files)
         frac = {k: float(f"{100.0 * c / total_count if total_count > 0 else 0.0:.1f}") for k, c in total_counts.items()}
         return {"redshift": redshift, "total_density": float(f"{total_count / volume:.6e}"), **frac}
 
@@ -363,9 +363,9 @@ def process_snapshot(snapshot, redshift, args):
         return None
 
 def create_evolution_summary(results):
-    """The redshift evolution from THIS run's snapshots (process_snapshot's numbers). 2026-10-11: it re-read every
-    snapshot_*/critical_point_analysis_summary_z*.txt of the config ladder in a folder shared by all simulations
-    and estimators, so another simulation's older run filled in points of another box."""
+    """The redshift evolution from THIS run's snapshots (process_snapshot's numbers), not from the
+    snapshot_*/critical_point_analysis_summary_z*.txt files of a folder shared by all simulations and estimators,
+    where another simulation's older run would fill in points of another box."""
     print("\nCreating evolution summary")
 
     redshifts = [r["redshift"] for r in results]

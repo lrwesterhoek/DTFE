@@ -1,4 +1,4 @@
-"""Resolution and estimator convergence of the void statistics (2026-10-11; plot/plot_void_convergence.py draws it).
+"""Resolution and estimator convergence of the void statistics (plot/plot_void_convergence.py draws it).
 
 Are the R_v distribution, the distinct-void abundance and the stacked profiles a property of the voids, or of the
 grid / particle mass / field estimator they were measured with? Three comparisons, all at ONE physical smoothing
@@ -81,9 +81,9 @@ _VOLUME_FLAG = re.compile(r"(^|\s)--ps-volume-weighted(\s|$)", re.M)
 
 def velocity_weighting(products) -> tuple[str, str]:
     """How the velocity grid of 'products' (a SnapshotProducts) was deposited, and how that is known: ('volume' |
-    'mass', why). 2026-10-11: the coarse velocity must be the mean a coarser run of the SAME deposit gives -- the
+    'mass', why). The coarse velocity must be the mean a coarser run of the SAME deposit gives -- the
     plain block mean for a volume-weighted grid, sum rho v / sum rho for a mass-weighted one -- and the production
-    PS-DTFE grids are volume-weighted (runspec's default, the TNG runlogs), so mass-weighting them all compared
+    PS-DTFE grids are volume-weighted (runspec's default, the TNG runlogs), so mass-weighting them all would compare
     the native v_r stack with coarse ones built another way. Standard DTFE's cell-averaged velocity is the volume
     average. A PS-DTFE run says it in its run log ('<prefix>runlog', the binary's command line: the header does
     not record it); without the log the production convention (volume) is assumed, and said."""

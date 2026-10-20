@@ -17,7 +17,7 @@ Per tracked subhalo, walking back in time from --snap:
                 class at the halo position, sampled from the DTFE or PS-DTFE grids of
                 every snapshot on disk (--method ps|dtfe|auto via dtfelib.FieldSet, so it
                 works identically for both estimators). Grids are loaded once per snapshot
-                for all tracked halos. The V-web is the MEAN-FIELD one for both (2026-10-13):
+                for all tracked halos. The V-web is the MEAN-FIELD one for both:
                 a PS output's is derived from its velocity grid, the V-web standard DTFE
                 stores; '--ps-gradient stored' samples the stored PS grid (stream average).
 
@@ -136,9 +136,9 @@ def add_environment(tracks: dict, sim: str, method: str, prefix: str | None = No
     tracks: {subfind0: track dict}. Adds env_density / env_tweb / env_vweb arrays in place
     (NaN where no field grids exist on disk) and returns the set of sampled snapshots.
     prefix / averaged: the grid set (--prefix, e.g. ps_caustic) and the '_a' fields or not (--raw), as every
-    other script reads them (2026-10-11: both were dropped, so the default ps_output grids were sampled whatever
-    the launcher's Figures tab had chosen).
-    mean_field: a PS-DTFE output's V-web is the mean-field one, the V-web standard DTFE stores (2026-10-13; derived
+    other script reads them (else the default ps_output grids would be sampled whatever the launcher's Figures tab
+    chose).
+    mean_field: a PS-DTFE output's V-web is the mean-field one, the V-web standard DTFE stores (derived
     from the velocity grid once per snapshot, environment.sample_fields_at); False = the stored PS grid.
     """
     for t in tracks.values():
@@ -268,8 +268,7 @@ def main():
     extra(parser)
     add_ps_gradient_arg(parser)
     args = parser.parse_args()
-    # --data-root for the trees, group catalogues, headers and grids alike (2026-10-11: it was parsed and ignored,
-    # so a run with another root still read the default one, or failed with the data drive unplugged)
+    # --data-root for the trees, group catalogues, headers and grids alike
     use_data_root(args.data_root)
 
     ts = TreeSet(args.sim)

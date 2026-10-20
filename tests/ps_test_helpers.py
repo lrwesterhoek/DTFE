@@ -22,7 +22,7 @@ def binary(name="PS-DTFE"):
 
 def skip_or_fail(why):
     """A suite that cannot run exits 0 with a SKIP line -- unless the stage requires it (DTFE_TEST_REQUIRED=1,
-    ci_suite.sh's double and 2d stages after building the pair): then a FAILURE (survey rank 20, 2026-10-05)."""
+    ci_suite.sh's double and 2d stages after building the pair): then a FAILURE."""
     if os.environ.get("DTFE_TEST_REQUIRED") == "1":
         sys.exit(f"FAIL (required): {why}")
     print(f"SKIP: {why}")

@@ -93,8 +93,8 @@ static const double BYTES_PER_VERTEX = 176.;
    Level 6 buys 5% of file size for 24 extra seconds on every cache WRITE -- it would make the first
    run nearly 5x the uncached one, which defeats the point of a cache people are meant to leave on.
    Level 1 costs ~2.6 s over an uncompressed save and reads just as fast. (Judging this on size and
-   inflate time alone, as an earlier revision of this comment did, picks the wrong level: those two
-   axes both favour 6 and neither of them is the one that hurts.) */
+   inflate time alone picks the wrong level: those two axes both favour 6 and neither of them is the
+   one that hurts.) */
 static const int    DEFLATE_LEVEL    = 1;
 static const size_t ZBUF             = 256u * 1024u;
 
@@ -218,18 +218,18 @@ private:
 };
 
 
-/* The CHUNKED body (written since 2026-10-02; single-stream files still load). Loading a cached
+/* The CHUNKED body (single-stream files still load). Loading a cached
    partition is inflate + CGAL deserialization, and one zlib stream inflates on one core: ~3 s of the
    8.4 s a 6M-vertex TNG100-3 partition takes. The body is therefore written as independent gzip
    members of CHUNK_BYTES each (compressed in parallel on the write, which also shortens it), followed
    by an index of their sizes in a footer; a load inflates members AHEAD on a few threads into a bounded
    window while the parser drains them in order. Layout after the plaintext header (magic, length,
-   descriptor -- unchanged, so header checks, occupancy maps and every '.tess' name stay as they were):
+   descriptor -- as in a single-stream file, so header checks, occupancy maps and '.tess' names are shared):
        CHUNK_MARKER (8 bytes)   member_0 ... member_{n-1}   (each a complete gzip member)
        index: uint64 n, then n x (uint64 compressed size, uint64 uncompressed size)
        footer: uint64 index offset (from the file start), CHUNK_FOOTER (8 bytes)
-   The members concatenate to a valid multi-member gzip file. DTFE_TESS_CACHE_LEGACY=1 writes the old
-   single stream (tests); python/tools/upgrade_tess_cache.py converts old files, byte for byte. */
+   The members concatenate to a valid multi-member gzip file. DTFE_TESS_CACHE_LEGACY=1 writes the
+   single stream (tests); python/tools/upgrade_tess_cache.py converts single-stream files, byte for byte. */
 static const char   CHUNK_MARKER[8] = { 'D','T','F','E','C','H','K','1' };
 static const char   CHUNK_FOOTER[8] = { 'D','T','F','E','C','H','K','E' };
 static const size_t CHUNK_BYTES     = size_t(16) << 20;
@@ -484,8 +484,8 @@ private:
     bool ok_ = true;
 };
 
-// After the descriptor: a chunked body's member table (offsets from the file start), or false for an
-// old single-stream body (the stream is then left at the start of the body).
+// After the descriptor: a chunked body's member table (offsets from the file start), or false for a
+// single-stream body (the stream is then left at the start of the body).
 inline bool readChunkIndex(std::istream &is, std::vector<uint64_t> &off, std::vector<uint64_t> &csize,
                            std::vector<uint64_t> &usize)
 {
@@ -535,11 +535,11 @@ inline std::string makeDescriptor(User_options const &userOptions)
     d << cacheBuildLines();
     // the inputs themselves
     // canonical paths (canonical_path.h): a relative, symlinked or other-case name of the same file
-    // is the same key (it used to be a rebuild)
+    // is the same key
     d << "input="    << canonicalPath(userOptions.inputFilename) << ' ' << fileStamp(userOptions.inputFilename) << '\n';
     d << "type="     << userOptions.inputFileType << '\n';
     // the per-vertex scalar payload comes from this dataset. Written only when set, so the
-    // descriptors -- and the caches -- of every run without it stay what they were.
+    // descriptors -- and the caches -- of runs without it do not depend on the option.
     if ( not userOptions.scalarDataset.empty() )
         d << "scalarDataset=" << userOptions.scalarDataset << '\n';
 #ifdef PHASE_SPACE
@@ -549,9 +549,8 @@ inline std::string makeDescriptor(User_options const &userOptions)
     // geometry: box, region and padding all decide which particles enter this triangulation
     d << "MpcUnit="  << userOptions.MpcValue << '\n';
     // periodic data gets image copies in its padding (standard: Eulerian, PS: Lagrangian), so the
-    // same input with and without '--periodic' is a DIFFERENT tessellation. This line was missing
-    // until 2026-09-30 -- a cache written by one mode was loaded by the other. Its addition makes
-    // every older cache a (harmless) miss.
+    // same input with and without '--periodic' is a DIFFERENT tessellation: without this line a
+    // cache written by one mode would be loaded by the other.
     d << "periodic=" << (userOptions.periodicInput?1:0) << '\n';
     d << "box=";
     for (size_t i=0; i<userOptions.boxCoordinates.coords.size(); ++i) d << userOptions.boxCoordinates.coords[i] << ',';
@@ -580,21 +579,20 @@ inline std::string makeDescriptor(User_options const &userOptions)
         d << userOptions.lagrangianRegion.coords[i] << ',';
     d << " subgrid=" << (userOptions.psUseSubgrid?1:0)
       << " deferNorm=" << (userOptions.psDeferNormalization?1:0) << '\n';
-    // --ps-lag-padding (2026-10-11) sets the padded box instead of the Eulerian fraction recorded above. Written
+    // --ps-lag-padding sets the padded box instead of the Eulerian fraction recorded above. Written
     // only when it is in force -- k > 0 on a Lagrangian-partitioned run (PSPartitionPlan; a single triangulation
-    // has no partition padding): since k = 8 became the default (2026-10-12) every partition cache written
-    // before then (no such line: the Eulerian padding) misses and rebuilds once, while '--ps-lag-padding 0'
-    // writes no line and so still finds them
+    // has no partition padding): '--ps-lag-padding 0' (the Eulerian padding) writes no line, so its caches
+    // keep the descriptor they have without the option
     if ( userOptions.psLagPadding > Real(0.) and userOptions.partitionOn and userOptions.partNo < 0 )
         d << "lagPadding=" << userOptions.psLagPadding << '\n';
 #endif
-    /* (The standard binary's per-partition identity, 2026-10-15: written out, no line of its own.) A partitioned
+    /* (The standard binary's per-partition identity: written out, no line of its own.) A partitioned
        standard run caches one file per THREAD SUB-DOMAIN of every partition (DTFE_parallel: 'partNo' = the thread,
        'region' = its sub-box, 'partition' = the thread grid, and 'box' = its PARTITION's region, which DTFE_parallel
        makes the sub-domain's full box -- the box whose padded copy its particles are selected from), or one per
        partition when the partition is one tessellation ('--sample-points', one thread: 'partNo' = the partition,
        'region' = its box, as PS's lagRegion is). The lines above therefore name the partition already; a
-       'partitionRegion' line repeating 'box' was tried and left out, since it only made every existing cache miss. */
+       'partitionRegion' line repeating 'box' would only make every existing cache miss. */
     // anything that changes WHICH particles are triangulated, or their coordinates. The random
     // SEED belongs here only when '--randomSample' is on, because that is the one case where it
     // decides which particles enter the triangulation (random.cc); otherwise it merely seeds the
@@ -650,8 +648,8 @@ inline std::string cachePath(User_options const &userOptions)
  * those options, where 'partNo' is the partition or the thread (>= 0) and 'region' the box the
  * tessellation covers (plus, for a thread's sub-box, its partition's region as its 'box':
  * makeDescriptor). The refusal below is for an options set that names a split but no part of it (partitionOn with
- * partNo < 0), which never reaches a build -- the comment said until 2026-10-15 that a partitioned
- * standard run does not cache; tests/ps_tessellation_cache_check.sh (G2) shows that it does.
+ * partNo < 0), which never reaches a build; tests/ps_tessellation_cache_check.sh (G2) checks that a
+ * partitioned standard run caches.
  *
  * This must be checked HERE and not only at option parsing: the auto-tuner turns partitioning on
  * at RUNTIME (auto_tune.h), long after the flags are validated.
@@ -690,7 +688,7 @@ inline double freeBytes(std::string const &dir)
 
 // The temp files '<path>.part.<pid>' of writers of THIS cache file that no longer run (a crash or a
 // SIGKILL mid-write): removed before a new write, so a killed run does not strand GBs beside the cache.
-// A running writer's file is left alone (2026-10-08, with the per-writer temp names in save()).
+// A running writer's file is left alone (the per-writer temp names: save()).
 inline void removeStaleParts(std::string const &path)
 {
     std::string::size_type const slash = path.find_last_of( '/' );
@@ -719,8 +717,8 @@ inline void removeStaleParts(std::string const &path)
    (size_t), every cell's four vertex indices (size_t, 0 = the infinite vertex), every cell's four
    neighbour indices (size_t), and nothing per cell after that. Its reader pulls each of those numbers
    through its own istream::read -- a sentry, a mode lookup and a state update per 8 bytes -- which
-   made that parsing, not the decompression, most of a load (2.0 of 2.4 s for 3.65M vertices / 24M
-   cells; a 14.3M-vertex TNG100-3 partition took ~12 s). This reads the same bytes in blocks and
+   makes that parsing, not the decompression, most of a load (2.0 of 2.4 s for 3.65M vertices / 24M
+   cells). This reads the same bytes in blocks and
    builds the data structure through the same calls in the same order (create_vertex in file order,
    create_cell in file order, a vertex's cell = the LAST cell naming it, as CGAL's set_cell leaves
    it), so the loaded triangulation -- its iteration order included -- is CGAL's. Only dimension 3 is
@@ -1112,7 +1110,7 @@ inline bool tryLoad(DT &dt, User_options const &userOptions)
     }
 
     // Everything past the header is deflated: chunked (inflated ahead on a few threads) or one
-    // stream (older files); either way the tessellation and payload are parsed from the stream.
+    // stream (single-stream files); either way the tessellation and payload are parsed from the stream.
     struct LoadCount { LoadCount() { ++activeLoads(); } ~LoadCount() { --activeLoads(); } } loadCount;
     std::vector<uint64_t> off, csize, usize;
     bool const chunked = readChunkIndex( is, off, csize, usize );
@@ -1148,7 +1146,7 @@ inline bool tryLoad(DT &dt, User_options const &userOptions)
     // 2D: CGAL's Triangulation_data_structure_2 writes its counts with a formatted '<<' even in
     // binary mode ("n m dim" with no separators), so its binary files never read back; the 2D cache
     // uses CGAL's ASCII mode at 17 significant digits instead (an exact round trip for doubles; 2D
-    // tessellations are small). The descriptor's 'tds2d=ascii17' line keeps any older 2D file a miss.
+    // tessellations are small). The descriptor's 'tds2d=ascii17' line keeps any 2D file without it a miss.
     CGAL::IO::set_ascii_mode( zin );
     zin >> dt;
     // the ASCII text ends before its own trailing whitespace: read through the end marker the
@@ -1217,9 +1215,10 @@ inline void save(DT &dt, User_options const &userOptions)
     }
 
     std::string const path = cachePath( userOptions );
-    // write aside, rename: a crash leaves no half file. The temp name is this writer's own (2026-10-08): two
+    // write aside, rename: a crash leaves no half file. The temp name is this writer's own: two
     // processes saving one partition at once (a batch run beside the composite server, which shares the cache
-    // folder) both truncated one '<path>.part', and the first rename could publish a file with a zero-filled hole
+    // folder) would both truncate one shared '<path>.part', and the first rename could publish a file with a
+    // zero-filled hole
     std::string const tmp  = path + ".part." + std::to_string( long( ::getpid() ) );
     removeStaleParts( path );
     {
@@ -1238,7 +1237,7 @@ inline void save(DT &dt, User_options const &userOptions)
 
         // The header above stays uncompressed so a staleness check costs one small read; the
         // tessellation and payload go through zlib in independent chunks (ChunkDeflateBuf), or as
-        // one stream under DTFE_TESS_CACHE_LEGACY=1 (the format before 2026-10-02, for tests)
+        // one stream under DTFE_TESS_CACHE_LEGACY=1 (the single-stream format, for tests)
         bool const legacy = std::getenv("DTFE_TESS_CACHE_LEGACY") and std::atoi( std::getenv("DTFE_TESS_CACHE_LEGACY") ) != 0;
         if ( not legacy )
         {

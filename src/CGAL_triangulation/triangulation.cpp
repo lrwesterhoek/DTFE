@@ -172,7 +172,7 @@ void DTFE_interpolation(vector<Particle_data> *p,
 #ifdef PHASE_SPACE
     if ( not userOptions.psTessellationPrebuilt )   // the partition look-ahead built it already (below)
 #else
-    if ( not userOptions.stdTessellationPrebuilt )  // the standard loop's look-ahead built it already (2026-10-15, below)
+    if ( not userOptions.stdTessellationPrebuilt )  // the standard loop's look-ahead built it already (below)
 #endif
     buildTessellation( p, userOptions, dt );
 #ifdef PHASE_SPACE
@@ -377,7 +377,7 @@ void DTFE_interpolation(vector<Particle_data> *p,
 
 
 #ifdef PHASE_SPACE
-// The partition look-ahead (DTFE.cpp, 2026-10-11): partition k+1's tessellation and vertex densities are built
+// The partition look-ahead (DTFE.cpp): partition k+1's tessellation and vertex densities are built
 // here on a CPU thread while partition k deposits, and handed back as an opaque handle (DTFE.cpp does not see
 // CGAL). buildTessellation is the very call DTFE_interpolation makes, so the tessellation is the same.
 std::shared_ptr<void> psPrebuildTessellation(vector<Particle_data> *p, User_options &userOptions)
@@ -401,7 +401,7 @@ void psInterpolatePrebuilt(std::shared_ptr<void> &tessellation, vector<Sample_po
 }
 #endif
 #ifndef PHASE_SPACE
-// The standard partition loop's look-ahead (DTFE.cpp, 2026-10-15): the same pair for one THREAD SUB-DOMAIN of the
+// The standard partition loop's look-ahead (DTFE.cpp): the same pair for one THREAD SUB-DOMAIN of the
 // next partition (a standard partition is split into the threads' sub-boxes, each its own tessellation; under
 // '--sample-points' or on one thread it is one). buildTessellation is the very call DTFE_interpolation makes, cache
 // included, so the tessellation and its vertex densities are the ones it would have built.
@@ -431,7 +431,7 @@ void dtfeInterpolatePrebuilt(std::shared_ptr<void> &tessellation, vector<Sample_
 // The parallel insertion below shares the cores among min(concurrency, remaining) builds: a
 // PLANNED bound, not a live count of the builds already running -- the first partition to reach
 // its insert would otherwise see only itself and take every core on top of the other nine
-// sequential inserts (measured: the TNG region's 27-partition run slowed from 137 to 158 s).
+// sequential inserts (measured: the TNG region's 27-partition run slows from 137 to 158 s).
 std::atomic<int> dtfeTriangulationConcurrency{0};
 std::atomic<int> dtfeTriangulationsRemaining{0};
 
@@ -505,12 +505,12 @@ static void insertSequential(DT *dt, vector<Particle_data> *p, MESSAGE::Message 
 // (the partition loops), and capped by OMP_NUM_THREADS. OFF by default: the parallel insert's
 // vertex and cell order differ from run to run, so float outputs differ at rounding between two
 // identical runs (four test suites and the --serve == --sample-points contract need them bit-
-// identical); the sequential insert reproduces the old build bit for bit. The parallel
+// identical); the sequential insert is reproducible bit for bit. The parallel
 // insert sorts and inserts a COPY of the points (CGAL keeps a second one), so the particles are
 // freed as soon as that copy exists; auto_tune.h budgets the difference. A partition loop gets its
-// cores divided by its planned concurrency, so with every core already busy it inserts as before
+// cores divided by its planned concurrency, so with every core already busy it inserts sequentially
 // and only the loop's tail, with fewer partitions left than cores, inserts in parallel. The standard DTFE binary
-// keeps the sequential insert and its Fast_location hierarchy: its clustered Eulerian points made
+// keeps the sequential insert and its Fast_location hierarchy: its clustered Eulerian points make
 // the parallel insert 4.5x SLOWER (0.26M particles: 1.05 s -> 4.7 s), where the near-lattice
 // Lagrangian points of PS-DTFE build 2x faster on ten cores (1.44 s -> 0.74 s).
 void delaunayTriangulation(DT *dt,
@@ -573,11 +573,10 @@ void delaunayTriangulation(DT *dt,
 // Estimates the density at each vertex. Standard DTFE: (mass-conservation factor) / total volume of
 // incident Delaunay cells. PS-DTFE: avgDensity * V_Lagrangian / V_Eulerian for the incident cells.
 // The sums run over the CELLS, each adding its volume to its NO_DIM+1 vertices in double, instead of
-// over every vertex's incident cells -- a CGAL adjacency walk that recomputed each cell's volume
-// NO_DIM+1 times (0.63 s -> ~0.1 s for 0.26M particles, where it was a fifth of the whole run).
+// over every vertex's incident cells -- a CGAL adjacency walk that recomputes each cell's volume
+// NO_DIM+1 times (0.63 s vs ~0.1 s for 0.26M particles, a fifth of the whole run).
 // Convex-hull vertices (an incident infinite cell: density undefined) are marked first, from the
-// infinite cells, and stay out of the sums. A vertex sum now runs in cell order and in double, so a
-// density can differ from the old walk's in its last float bit.
+// infinite cells, and stay out of the sums. A vertex sum runs in cell order and in double.
 void vertexDensity(DT & dt,
                   User_options &userOptions)
 {

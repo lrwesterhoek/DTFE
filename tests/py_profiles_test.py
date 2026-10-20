@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for the void-profile evolution and the universal-profile fits (2026-10-11): dtfelib/profiles.py's
+"""Tests for the void-profile evolution and the universal-profile fits: dtfelib/profiles.py's
 interior_single_fraction, stack_scatter, hsw_delta / fit_hsw / fit_stack, r_v_by_definition, and
 python/plot/plot_void_profile_evolution.py end to end.
 
@@ -12,7 +12,6 @@ Two tiers:
 Usage:  python3 tests/py_profiles_test.py            (exit 0 = pass)
 """
 
-import atexit
 import io as _io
 import json
 import os
@@ -20,44 +19,15 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import types
 from contextlib import redirect_stdout
 from pathlib import Path
 
 import numpy as np
 
-REPO = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO / "python"))
-# the figure root before config/dtfelib are imported: a temp folder, never the real root (the T7 when mounted)
-_FIGS_TMP = tempfile.mkdtemp(prefix="profiles_figs_")
-os.environ["DTFE_FIGURES_ROOT"] = _FIGS_TMP
-os.environ["DTFE_NO_MIRROR"] = "1"
-os.environ.setdefault("MPLBACKEND", "Agg")
-atexit.register(shutil.rmtree, _FIGS_TMP, True)
+from _harness import FAIL, PASS, REPO, SKIP, Skip, check, setup
 
-PASS, FAIL, SKIP = [], [], []
-
-
-class Skip(Exception):
-    pass
-
-
-def check(name, fn):
-    try:
-        fn()
-        PASS.append(name)
-        print(f"  PASS  {name}")
-    except Skip as e:
-        SKIP.append(name)
-        print(f"  SKIP  {name}  ({e})")
-    except AssertionError as e:
-        FAIL.append(name)
-        print(f"  FAIL  {name}: {e}")
-    except Exception as e:      # a crash is this test's failure, not the end of the run
-        import traceback
-        FAIL.append(name)
-        print(f"  FAIL  {name}: {type(e).__name__}: {e}")
-        print("".join("        " + line for line in traceback.format_exc().splitlines(True)[-6:]), end="")
+_FIGS_TMP = setup("profiles_figs_", paths=("python",))
+os.environ.setdefault("DTFE_SIM", "TNG50-4-Dark")    # the box these synthetic tests stand for; a data-tier run sets its own
 
 
 # ---------------------------------------------------------------- synthetic: the pieces
@@ -85,7 +55,7 @@ def t_interior_fraction():
 
 
 def t_single_converted_once():
-    """2026-10-11: profile_grids converts the single-stream mask to float32 ONCE, not per radial bin (a 512 MB copy
+    """profile_grids converts the single-stream mask to float32 ONCE, not per radial bin (a 512 MB copy
     of a 512^3 mask per bin), and its 'single' profile is the per-bin conversion's, bit for bit."""
     from dtfelib import profiles
     n = 32
@@ -160,7 +130,7 @@ def t_definition_fallback():
     said = []
     r2, used2 = profiles.r_v_by_definition(cat, "ridge", say=said.append)
     assert used2 == "crossing" and np.allclose(r2, r, equal_nan=True) and len(said) == 1 and "--" not in said[0], said
-    if "ridge" in getattr(catalog, "R_V_DEFINITIONS", ()):          # contract C3 landed: the key is read
+    if "ridge" in getattr(catalog, "R_V_DEFINITIONS", ()):          # the definition exists: the key is read
         cat["r_v_ridge_cells"] = np.array([3.0, 3.0, np.nan])
         r3, used3 = profiles.r_v_by_definition(cat, "ridge", say=said.append)
         assert used3 == "ridge" and np.allclose(r3, [1.5, 1.5, np.nan], equal_nan=True), r3
@@ -171,7 +141,7 @@ def t_definition_fallback():
 
 # ---------------------------------------------------------------- synthetic: the script end to end
 def _pin_config(root, saved, n=64, box=64.0):
-    """tests/py_dtfelib_test.py's _void_pin_config: the synthetic ladder's frame and today's catalogue knobs."""
+    """tests/py_dtfelib_test.py's _void_pin_config: the synthetic ladder's frame and the current catalogue knobs."""
     import config
     pins = {"CACHE_DIR": Path(root) / "cache", "THESIS_FIGURES_DIR": Path(root) / "mirror",
             "LOCAL_FIGURES_ROOT": str(Path(root) / "figures"),
@@ -285,7 +255,7 @@ def t_script_synthetic():
         txt = (out / "profile_fits.txt").read_text()
         assert "f_ss(<0.5Rv)" in txt and txt.count("\n") > 8, txt[:400]
         assert "R_v 0-20 sigma" in txt and "$" not in txt, txt[:600]
-        # plot_void_profiles.py: the HSW fit per R_v bin in its npz (2026-10-11); none in r / R_eff
+        # plot_void_profiles.py: the HSW fit per R_v bin in its npz; none in r / R_eff
         try:
             sys.path.insert(0, plot_dir)
             import plot_void_profiles as pvp
@@ -303,7 +273,7 @@ def t_script_synthetic():
                         assert not e.code, e.code
         finally:
             sys.argv = argv0
-        with np.load(root / "pvp" / "void_profiles_ps_resolved_edges0-4-30_z0.00.npz") as f:    # --edges: tagged (2026-10-11)
+        with np.load(root / "pvp" / "void_profiles_ps_resolved_edges0-4-30_z0.00.npz") as f:    # --edges: tagged
             assert f["hsw_params"].shape == (2, 4) and f["hsw_errors"].shape == (2, 4), f["hsw_params"].shape
             assert len(f["hsw_ok"]) == 2 and len(f["hsw_constrained"]) == 2 and len(f["hsw_chi2_dof"]) == 2
             assert list(f["hsw_param_names"]) == list(profiles.HSW_PARAMS), f["hsw_param_names"]

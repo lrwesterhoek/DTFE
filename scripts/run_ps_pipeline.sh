@@ -6,10 +6,10 @@
 # only the point evaluation on top of the grid regen.
 #
 # This script does no plotting. Render the figures afterwards with:
-#     python3 python/plot/plot_pointeval.py            # all sims/snapshots, one file per field
+#     python3 python/plot/plot_pointeval.py --sims all # all sims/snapshots, one file per field
 # (the .pts_* files stay on disk, so figures can be restyled any time without recomputing).
 #
-#   ./run_ps_pipeline.sh                            # everything: all sims, all snapshots on disk
+#   SIMS=all ./run_ps_pipeline.sh                   # everything: all sims, all snapshots on disk
 #   SIMS="TNG100-3-Dark" ./run_ps_pipeline.sh       # one simulation
 #   DRY_RUN=1 ./run_ps_pipeline.sh                  # print the plan, run nothing
 #   ./run_ps_pipeline.sh --help                     # this header, nothing run (--version: the revision)
@@ -23,8 +23,8 @@
 # Interrupted batches continue where they stopped. FORCE=1 recomputes everything.
 #
 # Env knobs (all optional):
-#   SIMS          simulations to process (default: every simulation under $DATA_ROOT with
-#                 snapshots, in either layout -- flat <sim>/ or per-family <family>/<sim>/)
+#   SIMS          simulations to process -- REQUIRED, no default: names, or 'all' for every simulation under
+#                 $DATA_ROOT with snapshots, in either layout -- flat <sim>/ or per-family <family>/<sim>/)
 #   NU            image-plane pixels across the box (default 8192; ~13 kpc/px at TNG100-3)
 #   AXIS, CENTER  plane orientation/position (default z, box centre). Changing CENTER with an
 #                 existing plane file regenerates the plane -- which makes every snapshot's
@@ -38,17 +38,17 @@
 #                 (.pts_velGrad), which is what makes the velDiv/velShear/velVort maps
 #                 possible. A snapshot lacking it counts as STALE, so a rerun recomputes it.
 #   PTS_CONVENTIONS  grid (default) | legacy: the image plane's estimators (run_ps_dtfe.sh's knob, the binary's
-#                 --pts-conventions; 2026-10-15): 'grid' = the grids' vertex masses and volume weighting at the points,
-#                 'legacy' = the conventions before 2026-10-13, which reproduce a plane made before then. A snapshot
-#                 whose run log shows the other one is recomputed.
+#                 --pts-conventions): 'grid' = the grids' vertex masses and volume weighting at the points,
+#                 'legacy' = rho_bar*V_lag masses and density-weighted stream means, which reproduce a plane made
+#                 with them. A snapshot whose run log shows the other one is recomputed.
 #   PLANES, THICKNESS, SUPERSAMPLE, WINDOW
 #                 the plane's geometry, forwarded to make_image_plane.py: PLANES sampling planes
 #                 (default 1 = one crisp cross-section; a handful ghosts, use >= 16 with
 #                 plot_pointeval.py --project slab) across a slab of THICKNESS Mpc (default 2), KxK sub-samples per pixel
 #                 averaged into pixel-area means (default 1), and "u0 u1 v0 v1" in Mpc to image
 #                 only that part of the plane (default: the whole box).
-#   PS_GPU        1 = the deposit on the GPU (run_ps_dtfe.sh -m), 0 = the CPU; unset (auto, 2026-10-13; it was
-#                 1 on every build) = the GPU when the PS binary was built with one, as run_ps_dtfe.sh decides
+#   PS_GPU        1 = the deposit on the GPU (run_ps_dtfe.sh -m), 0 = the CPU; unset (auto) = the GPU when the
+#                 PS binary was built with one, as run_ps_dtfe.sh decides
 #                 (config.sh gpu_build_default: PS-DTFE, or PS-DTFE-double with DTFE_PRECISION=double)
 #   PS_VOLUME_WEIGHTED  1 (default) = volume-weighted velocity moments, the production convention
 # The other run options reach run_ps_dtfe.sh through the environment exactly as from a terminal:
@@ -68,8 +68,8 @@
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"   # python/ and the binaries live one level up
-# -h / --help print this header and run nothing (a '--help' used to START THE WHOLE BATCH: the script took no
-# arguments at all); --version the revision; anything else is an error -- the knobs are environment variables
+# -h / --help print this header and run nothing; --version the revision; anything else is an error (rather than
+# starting the whole batch) -- the knobs are environment variables
 case "${1:-}" in
     -h|--help) sed -n '2,/^$/p' "${BASH_SOURCE[0]}" | sed -e 's/^# \{0,1\}//'; exit 0 ;;
     --version) git -C "${REPO_ROOT}" describe --always --dirty 2>/dev/null || echo unknown; exit 0 ;;
@@ -106,9 +106,9 @@ if [ -n "${WINDOW}" ]; then
     fi
     plane_args+=(--u0 "${w_u0}" --u1 "${w_u1}" --v0 "${w_v0}" --v1 "${w_v1}")
 fi
-# PS_GPU=auto (the default, 2026-10-13): the GPU when the binary run_ps_dtfe.sh will run was built with one -- the
-# drivers' rule (config.sh gpu_build_default; DTFE_PRECISION picks the binary there too). It was 1 on every build,
-# so a CPU-only build was asked for the GPU (and fell back with a warning) on every snapshot.
+# PS_GPU=auto (the default): the GPU when the binary run_ps_dtfe.sh will run was built with one -- the
+# drivers' rule (config.sh gpu_build_default; DTFE_PRECISION picks the binary there too), so a CPU-only build is
+# not asked for the GPU (and a fallback warning) on every snapshot.
 gpu_auto=""
 if [ "${PS_GPU}" = "auto" ]; then
     case "${DTFE_PRECISION:-single}" in double) ps_bin="PS-DTFE-double" ;; *) ps_bin="PS-DTFE" ;; esac
@@ -118,6 +118,11 @@ fi
 gpu_args=(); [ "${PS_GPU}" = "1" ] && gpu_args=(-m)
 
 if [ -z "${SIMS:-}" ]; then
+    echo "Error: no simulation given: set SIMS to the simulations to process (e.g. SIMS=\"TNG100-3-Dark\"), or SIMS=all" \
+         "for every simulation under ${DATA_ROOT}." >&2
+    exit 2
+fi
+if [ "${SIMS}" = "all" ]; then
     SIMS=""
     for d in "${DATA_ROOT}"/*/ "${DATA_ROOT}"/*/*/; do
         compgen -G "${d}snapdir_*/combined_[0-9][0-9][0-9].hdf5" > /dev/null || continue
@@ -225,9 +230,9 @@ for sim in ${SIMS}; do
         echo "-- reusing ${plane}.bin"
     fi
     # The points a slice of THIS plane holds: planes x nv x nu x K^2 from its sidecar (K = 1 when the sidecar
-    # predates the option), else the plane file's own count (3 float64 per point). 2026-10-11: the file times
-    # alone took an older 4096^2 slice for current against an even older hires_plane_z8192 (TNG100, TNG300: the
-    # default NU 8192), so the compute was skipped and every render failed on the size mismatch.
+    # predates the option), else the plane file's own count (3 float64 per point). The file times alone would take
+    # an older 4096^2 slice for current against an even older hires_plane_z8192 (the default NU 8192), so the
+    # compute would be skipped and every render fail on the size mismatch.
     plane_pts=""
     if [ "${plane_new}" != "1" ]; then
         plane_pts="$("${PY}" -c 'import json, sys
@@ -243,8 +248,8 @@ print(int(s.get("planes", 1)) * int(s["nv"]) * int(s["nu"]) * int(s.get("supersa
               PTS_CONVENTIONS="${PTS_CONVENTIONS}" PS_METAL="${PS_GPU}")
     [ -n "${FIELDS:-}" ] && env_args+=(FIELDS="${FIELDS}")
     # The settings this batch would run each snapshot with, asked from run_ps_dtfe.sh itself (DRY_RUN=1: reads,
-    # runs and writes nothing), so the comparison below cannot drift from what it runs (2026-10-11: the check
-    # compared file times only, so a changed grid or field list printed 'up to date' for every snapshot).
+    # runs and writes nothing), so the comparison below cannot drift from what it runs (file times alone would
+    # print 'up to date' for every snapshot after a changed grid or field list).
     planned=""
     if [ "${FORCE}" != "1" ] && [ "${plane_new}" != "1" ]; then
         planned="$(env "${env_args[@]}" DRY_RUN=1 "${SCRIPT_DIR}/run_ps_dtfe.sh" -s "${sim}" -g "${GRID_SIZE}" \
@@ -304,9 +309,9 @@ print(int(s.get("planes", 1)) * int(s["nv"]) * int(s["nu"]) * int(s.get("supersa
 done
 
 echo ""
-# Finding NOTHING is a failure, as in run_ps_dtfe.sh (2026-10-08): with the data drive unmounted, a
-# mistyped SIMS or a SNAPS matching no snapshot, nothing ran and this still printed ALL DONE with exit 0,
-# which the launcher's Pipeline tab showed as a success. Every snapshot found is either computed, up to
+# Finding NOTHING is a failure, as in run_ps_dtfe.sh: with the data drive unmounted, a mistyped SIMS or a
+# SNAPS matching no snapshot, nothing runs, and ALL DONE with exit 0 would show as a success in the
+# launcher's Pipeline tab. Every snapshot found is either computed, up to
 # date, or in a simulation that failed with a '!!' line (overall_rc 1), so a partial skip stays exit 0.
 if [ "${n_found}" -eq 0 ]; then
     echo "!! nothing to compute: no combined snapshot${SNAPS:+ numbered ${SNAPS}} of $([ -n "${SIMS// }" ] && echo ${SIMS} || echo "any simulation") under '${DATA_ROOT}'"

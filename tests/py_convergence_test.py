@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for the resolution and estimator convergence of the void statistics (2026-10-11): dtfelib.convergence
+"""Tests for the resolution and estimator convergence of the void statistics: dtfelib.convergence
 (the frame context, block averages, catalogues of any grid, void-by-void matching) and plot_void_convergence.py
 (its panels, the estimator table, the panels it cannot draw).
 
@@ -11,7 +11,6 @@ Two tiers:
 Usage:  python3 tests/py_convergence_test.py            (exit 0 = pass)
 """
 
-import atexit
 import io
 import os
 import shutil
@@ -24,38 +23,10 @@ from pathlib import Path
 
 import numpy as np
 
-REPO = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO / "python"))
-sys.path.insert(0, str(REPO / "python" / "plot"))
-_FIGS_TMP = tempfile.mkdtemp(prefix="convergence_figs_")
-os.environ["DTFE_FIGURES_ROOT"] = _FIGS_TMP
-os.environ["DTFE_NO_MIRROR"] = "1"
-os.environ.setdefault("MPLBACKEND", "Agg")
-atexit.register(shutil.rmtree, _FIGS_TMP, True)
+from _harness import REPO, Skip, check, setup, summary
 
-PASS, FAIL, SKIP = [], [], []
-
-
-class Skip(Exception):
-    pass
-
-
-def check(name, fn):
-    try:
-        fn()
-        PASS.append(name)
-        print(f"  PASS  {name}")
-    except Skip as e:
-        SKIP.append(name)
-        print(f"  SKIP  {name}  ({e})")
-    except AssertionError as e:
-        FAIL.append(name)
-        print(f"  FAIL  {name}: {e}")
-    except Exception as e:      # a crash is this test's failure, not the end of the run
-        import traceback
-        FAIL.append(name)
-        print(f"  FAIL  {name}: {type(e).__name__}: {e}")
-        print("".join("        " + line for line in traceback.format_exc().splitlines(True)[-6:]), end="")
+_FIGS_TMP = setup("convergence_figs_")
+os.environ.setdefault("DTFE_SIM", "TNG50-4-Dark")    # the box these synthetic tests stand for; a data-tier run sets its own
 
 
 N, BOX, SIGMA = 64, 64.0, 2.0
@@ -123,7 +94,7 @@ def t_frame_and_blocks():
 
 
 def t_velocity_weighting():
-    """2026-10-11: the coarse velocity follows the run's deposit. 'volume' (the production PS-DTFE convention and
+    """The coarse velocity follows the run's deposit. 'volume' (the production PS-DTFE convention and
     standard DTFE) is the plain block mean, not sum rho v / sum rho; velocity_weighting reads it from the run log's
     command line (--ps-volume-weighted), 'mass' without it, 'volume' (said) without a log and for standard DTFE."""
     from types import SimpleNamespace
@@ -273,8 +244,8 @@ def t_crossbox_and_missing():
                         pz_count=np.array([5]))
     cross = pc.load_crossbox(args)
     assert len(cross) == 1 and cross[0]["sim"] == "SYN-1"
-    # 2026-10-11 (review): an UNGATED run reads the ungated per-box files (plot_void_crossbox.sigma_tag's
-    # '_gatenone'), never the gated one -- the glob wanted the gated name only, so row (b) was lost ungated
+    # an UNGATED run reads the ungated per-box files (plot_void_crossbox.sigma_tag's
+    # '_gatenone'), never the gated one -- a glob for the gated name only would lose row (b) ungated
     import config
     saved_gate = config.VOID_GATE
     try:
@@ -306,7 +277,7 @@ def t_crossbox_and_missing():
 
 
 def t_prefix_set():
-    """2026-10-11: a --prefix run's outputs carry its grid set (the default names unchanged), and row (c)'s side of
+    """A --prefix run's outputs carry its grid set (the default names unchanged), and row (c)'s side of
     --method reads that set (said when it is not there), its table header naming both sets."""
     import plot_void_convergence as pc
     assert pc.set_name("ps", None) == "ps" and pc.set_name("ps", "ps_output") == "ps"
@@ -340,7 +311,7 @@ def t_cli():
 # ---------------------------------------------------------------- data-backed
 def t_tng100_grid():
     """TNG100-3-Dark z = 0 (snapshot 99): the 256^3 block-mean catalogue at the production sigma keeps the distinct
-    voids (median R_v ratio within 3% of 1, >= 85% of the native voids matched; 2026-10-11: 0.997, 73 of 77)."""
+    voids (median R_v ratio within 3% of 1, >= 85% of the native voids matched; measured: 0.997, 73 of 77)."""
     from dtfelib import cli
     sim = "TNG100-3-Dark"
     if not (cli.sim_dir(sim) / "snapdir_099").is_dir():
@@ -387,8 +358,7 @@ def main():
     print("data-backed:")
     check("TNG100-3-Dark z=0: 256^3 block-mean catalogue against the native one", t_tng100_grid)
     print("-" * 60)
-    print(f"RESULT: {len(PASS)} passed, {len(FAIL)} failed, {len(SKIP)} skipped")
-    return 1 if FAIL else 0
+    return summary()
 
 
 if __name__ == "__main__":

@@ -27,16 +27,12 @@
    own simpler path). Each method supplies a kernel policy with: STENCIL (cells per dimension),
    PAD_CELLS (kernel reach in cells, sets the outer selection box), CELL_OFFSET (subtracted from the
    position in cells before the host cell is found), name(), interiorWeights() and boundaryCells().
-   Since 2026-10-11 every boundaryCells() is the interior stencil clipped to the grid (clipStencil
-   below). Until then CIC and TSC kept hand-written edge cases: CIC's extrapolated past the face
-   (cell 0 got 1-t and cell 1 t, negative, for a particle left of cell 0's centre: an offset lattice
-   read 1.4 / 0.8 in the face cells of a periodic box), and TSC's wrote cell 1 of a grid ONE cell
-   thick (a thread's slab of a small grid: a heap overflow, rc 133/139). TSC's are the clip for any
-   grid of >= 2 cells, so its grids are byte-identical.
+   Every boundaryCells() is the interior stencil clipped to the grid (clipStencil below): a
+   hand-written edge case that extrapolates past the face gives negative weights to a particle left
+   of cell 0's centre, and one that assumes >= 2 cells overflows a grid ONE cell thick (a thread's
+   slab of a small grid).
 
-   The engine preserves the original loop nesting and accumulation order exactly, so its
-   outputs are bit-identical to the previous per-method copies (validated by an A/B
-   byte-compare of the .a_den/.a_vel outputs and the regression suite). */
+   The loop nesting and accumulation order are part of the contract: they decide the outputs' last bits. */
 
 #include <vector>
 #include <list>

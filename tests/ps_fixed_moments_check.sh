@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Every PS-DTFE grid is an exact, order-independent sum (2026-10-14). The MASS grid has been a 64-bit fixed-point sum
-# since 2026-10-08 (GPU) / 2026-10-12 (CPU); the moment grids -- velocity, the dispersion's second moment, its own
+# Every PS-DTFE grid is an exact, order-independent sum. The MASS grid is a 64-bit fixed-point sum (GPU and
+# CPU), and so are the moment grids -- velocity, the dispersion's second moment, its own
 # mean and weight under --ps-volume-weighted, the velocity gradient, the moment weight, the scalar and its gradient,
-# the exact deposit's multiplicity, the released tets' multiplicity -- were float sums: GPU float atomics in whatever
-# order they landed (two runs differed in the last bits of ~30-50% of the cells), CPU thread-private copies summed
-# in thread order (the grids depended on the thread count). Now each is a set of int64 words in a power-of-two unit
+# the exact deposit's multiplicity, the released tets' multiplicity: float sums would depend on the order the GPU
+# atomics land in (two runs differ in the last bits of ~30-50% of the cells) and, on the CPU, on the thread count
+# (thread-private copies summed in thread order). Each is a set of int64 words in a power-of-two unit
 # from a bound of everything the pass deposits (ps_deposit_params.h PSFxGrid), converted to float once. Asserted on
 # 32^3 crossed waves (folds everywhere: deferred tets, multi-stream cells, large gradients):
 #   F1  two --ps-gpu runs with different opening chunk sizes (PS_METAL_CHUNK / PS_GPU_CHUNK 2000 and 25000: other
@@ -14,18 +14,17 @@
 #   F2  the CPU deposit on 1 thread, 6 threads in the copy mode (DTFE_DEPOSIT_SLABS=0: one set of words, atomic
 #       adds) and 6 in the slab mode writes byte-identical grids, for the same four variants. Single build only:
 #       the double build keeps its double CPU sums (agreeing to ~1e-15, not bit for bit), as for the mass.
-#   F3  the float sums of before (PS_METAL_FLOAT_MOMENTS=1, the A/B switch; PS_GPU_FLOAT_MOMENTS=1 is the CUDA/HIP
+#   F3  the float sums (PS_METAL_FLOAT_MOMENTS=1, the A/B switch; PS_GPU_FLOAT_MOMENTS=1 is the CUDA/HIP
 #       spelling, either works on either backend) agree with the exact ones to float rounding: peak-relative
 #       difference below 1e-5 per grid, GPU and CPU (a sum of the same float shares, in another order)
 #   F4  --partition 2 2 2 --max-concurrent 1 (partitions merge in index order): two GPU runs byte-identical, and
 #       1 vs 6 CPU threads byte-identical (single build) -- the whole run, not only one partition's sub-grid
-#   F5  the non-finite guard (2026-10-15, ps_deposit_params.h psFixedShareOk): DTFE_TEST_NAN_SHARE=50 gives about one
+#   F5  the non-finite guard (ps_deposit_params.h psFixedShareOk): DTFE_TEST_NAN_SHARE=50 gives about one
 #       tetrahedron in 50 a NaN mass, on the CPU and (GPU builds) in the kernel; each run says once how many shares
 #       it left out, by grid (the mass grid among them), its '.a_den' has no NaN or infinity, and a run without
 #       the hook says nothing of the kind. Single build only (the double build's CPU sums are doubles, no words).
-#       The binaries of before 2026-10-15 fail it (no count, no warning).
 # 2D (PS-DTFE-2d, when built): F2's thread independence for the sampled deposit.
-# ~1-2 min (M-series Mac, 10 cores). The binaries of before 2026-10-14 fail F1 (GPU) and F2.
+# ~1-2 min (M-series Mac, 10 cores).
 # Usage: tests/ps_fixed_moments_check.sh [--no-build]   (--no-build is accepted and ignored)
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -33,13 +32,11 @@ ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$ROOT" || exit 1
 source "${SCRIPT_DIR}/precision.sh"     # DTFE_TEST_PRECISION=double: the double pair
 precision_require "${PS_BIN}"
-PY="${PYTHON:-python3}"
-command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/python3.14
 [ -x "${PS_BIN}" ] || { echo "FAIL: ${PS_BIN} is not built"; exit 1; }
 OBJ=o_ps; precision_double && OBJ=o_ps_d
 GPU=0                                                     # any one GPU backend stamp will do (gpu_mass_check.sh)
 if [ -d "$OBJ" ] && [ ! -f "$OBJ/.gpu_mode_off" ]; then
-    for m in metal cudaemu cuda hip; do [ -f "$OBJ/.gpu_mode_$m" ] && GPU=1; done
+    [ -n "$(gpu_backend_of "$OBJ")" ] && GPU=1
 fi
 TMP="${DTFE_TEST_TMP}/ps_fixed_moments_check"
 mkdir -p "$TMP"

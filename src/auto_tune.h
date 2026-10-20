@@ -1,8 +1,7 @@
 /* Auto-selection of --partition and --max-concurrent from the simulation actually being
    processed (particle count, grid, requested fields) and the machine (physical RAM, cores).
    Called from DTFE_setup once the input is loaded and the options are finalized; it only
-   fills in values the user did NOT give -- explicit flags always win, so all existing
-   command lines behave exactly as before.
+   fills in values the user did NOT give -- explicit flags always win.
 
    The peak-memory model is calibrated against measured runs (TNG50-4 512^3 = 45 GB measured
    vs ~50 GB modeled; TNG300-3 5x5x5/mc2 target ~40 GB vs ~36 GB modeled) and deliberately
@@ -12,8 +11,8 @@
 
    Memory budget (autoTuneBudget): 60% of physical RAM, and never more than what the OTHER
    programs leave free at start-up minus 4 GB of headroom -- the machine stays usable while a
-   run goes (80% of RAM alone let a 64 GB Mac swap 19 GB and lag with a browser, the GUI and
-   the desktop open next to a 50 GB run).
+   run goes (80% of RAM alone makes a 64 GB Mac swap with a browser, the GUI and the desktop
+   open next to a 50 GB run).
 
    Environment overrides (for tests and unusual machines):
      DTFE_RAM_GB        physical-RAM override in GB (default: queried from the OS); simulates a
@@ -21,7 +20,7 @@
      DTFE_MEM_FRACTION  share of RAM the budget may take (default 0.60; 0.1 .. 0.95)
      DTFE_MEM_BUDGET_GB the budget itself, in GB -- overrides both rules above, but is still capped by what
                         the other programs leave free minus the headroom (unless DTFE_RAM_GB simulates a
-                        machine): 2026-10-07 a 52 GB budget on a 64 GB Mac got TNG50-3-Dark z=0 SIGKILLed
+                        machine): a budget above the free memory gets a run SIGKILLed
      DTFE_FREE_GB       test hook: the memory the other programs leave free, in GB (default: queried); the
                         partition memory gate and the budget cap read it instead of the OS
      DTFE_AUTO_MINN     minimum particle count before auto-partitioning engages (default 2e6;
@@ -48,6 +47,7 @@
 #include <set>
 #include <functional>  // the standard-DTFE split replay (stdTuneSplit)
 #include <sstream>
+#include <optional>    // the plan phases that may decide the split (AutoTunePSPlanner::choose)
 #include "cache_key_lines.h"
 
 
@@ -95,10 +95,10 @@ inline double autoTunePhysicalRAM()
 
 // The memory the PS-DTFE CPU deposit threads' private accumulator copies may take per partition:
 // 20% of physical RAM (at least 2 GB), or DTFE_DEPOSIT_MEM_GB. ps_interpolation.cc lowers its
-// thread count to fit (a 256^3 grid with density, velocity and dispersion was ~1 GB per copy, so
-// 2 GB allowed only 3 threads); the partition model below budgets the same amount. Since the
-// fixed-point grids (2026-10-12/14) and the shared counts and flags (2026-10-18) the single build
-// copies nothing by default: the budget binds only the float sums (double build, PS_METAL_FLOAT_*).
+// thread count to fit (a 256^3 grid with density, velocity and dispersion is ~1 GB per float copy);
+// the partition model below budgets the same amount. With the fixed-point grids and the shared counts
+// and flags the single build copies nothing by default: the budget binds only the float sums (double
+// build, PS_METAL_FLOAT_*).
 inline double psDepositThreadBytes()
 {
     if ( const char *env = std::getenv("DTFE_DEPOSIT_MEM_GB") )
@@ -184,9 +184,8 @@ inline double autoTuneBudget(double ramBytes, std::string &why)
             snprintf( buf, sizeof(buf), "%.3g GB set by DTFE_MEM_BUDGET_GB", v );
             why = buf;
             // ... but never more than the other programs leave free minus the headroom: the budget is a
-            // plan, the machine's free memory the fact (2026-10-07: 52 GB on a 64 GB Mac, SIGKILL at 82 min).
-            // Only a cut of more than 0.5 GB is one: 44 GB free less 4 against 40 asked is the same budget, and
-            // the reason line said "asks 40 GB, but ..." for it (2026-10-08)
+            // plan, the machine's free memory the fact. Only a cut of more than 0.5 GB is one: 44 GB free less 4
+            // against 40 asked is the same budget, and the reason line must not say "asks 40 GB, but ..." for it
             double const freeForRun = simulated ? -1. : autoTuneFreeForRun();
             if ( freeForRun > 0. and freeForRun - headroom < v * 1.e9 - 0.5e9 )
             {
@@ -235,11 +234,12 @@ inline int autoTuneCores()
 //             that coexists with partitionBytes(). Includes the PS weight grids.
 //   phase 1 = POST. What is resident afterwards, when the derived fields are computed. The
 //             weights have been freed by normalizePhaseSpace (swap-with-empty, quantities.cc)
-//             at DTFE.cpp:659 BEFORE computeDivergenceShearVorticity allocates div/shear/vort.
+//             in psNormalizeMoments (DTFE.cpp) BEFORE postProcessWebFields (web_fields.cc) allocates
+//             div/shear/vort.
 //
 // The two peaks are disjoint sets, so the caller takes max(deposit, post) rather than summing.
-// A single blended number used to bound the deposit only by luck: for a density+velocity+
-// dispersion volume-weighted run the model said 44 B/cell where the deposit really needs 64.
+// A single blended number would bound the deposit only by luck: for a density+velocity+
+// dispersion volume-weighted run it gives 44 B/cell where the deposit really needs 64.
 //
 // 'ps' carries the PS flags: they gate real full-grid accumulators and are all finalized before
 // the DTFE.cpp call site. Byte counts verified against quantities.cc / ps_interpolation.cc with
@@ -279,7 +279,7 @@ inline size_t autoTuneSamplePointCount(std::string const &file)
     return size_t( bytes / perLine );
 }
 
-// The Eulerian bounding box of the '--sample-points' (2026-10-11), for the stream estimate on the points' own slab
+// The Eulerian bounding box of the '--sample-points', for the stream estimate on the points' own slab
 // (psEstimateMeanStreams' region): binary files are sampled at up to 65536 evenly strided points (a plane's bounds
 // to a pixel), text files read whole. Periodic: wrapped into the box first, as the evaluation does. False when the
 // file cannot be read.
@@ -352,12 +352,12 @@ struct AutoTunePS
     bool exactDeposit = false;     // --ps-exact-deposit
     bool caustics     = false;     // --ps-caustics
     bool haloRelease  = false;     // --ps-halo-release (sampled deposit: the released-tet multiplicity grid)
-    bool fixedMerge   = false;     // --fixed-point-merge (2026-10-15): the summed full grids are 9 B integer words + carries
+    bool fixedMerge   = false;     // --fixed-point-merge: the summed full grids are 9 B integer words + carries
 };
 
-// The PS deposit's MOMENT grids as 64-bit fixed-point sums (2026-10-14, ps_deposit_params.h PSFxGrid): on by
+// The PS deposit's MOMENT grids as 64-bit fixed-point sums (ps_deposit_params.h PSFxGrid): on by
 // default on the GPU (both builds) and on the CPU of the single build; PS_METAL_FLOAT_MOMENTS=1 /
-// PS_GPU_FLOAT_MOMENTS=1 bring back the float sums (ps_interpolation.cc fxGpuWanted / fxMomWanted). Read here so the
+// PS_GPU_FLOAT_MOMENTS=1 select the float sums (ps_interpolation.cc fxGpuWanted / fxMomWanted). Read here so the
 // model follows an A/B run too.
 inline bool autoTunePSMomentsFixed()
 {
@@ -366,11 +366,11 @@ inline bool autoTunePSMomentsFixed()
     return true;
 }
 
-// One pass's MOMENT accumulators in the PS deposit, in Real bytes per sub-grid cell (2026-10-14): the grids
+// One pass's MOMENT accumulators in the PS deposit, in Real bytes per sub-grid cell: the grids
 // ps_interpolation.cc holds as fixed-point words while the pass deposits ('fxg' -- velocity, gradient,
 // dispersion, scalar and its gradient, the moment weight, the dispersion's own mean and weight, the exact and the
 // released multiplicities), with the same selection rules as autoTuneBytesPerCell's deposit phase below. In the
-// single build the words take 8 B per component where these floats took 4, and the deposit threads share ONE set
+// single build the words take 8 B per component where these floats take 4, and the deposit threads share ONE set
 // of them (no private copies). The dispersion weight is the density there when one is selected (not accumulated).
 inline double autoTuneFxMomentBytes(Field &f, AutoTunePS const &ps)
 {
@@ -396,7 +396,7 @@ inline double autoTuneFxMomentBytes(Field &f, AutoTunePS const &ps)
 }
 
 // The same grids ONE BY ONE, in the order the deposit converts them after its loop (ps_deposit_params.h PSFxGrid:
-// fxToReal walks g = 0, 1, ...), as Real bytes per sub-grid cell each (2026-10-18; their words take twice that, and
+// fxToReal walks g = 0, 1, ...), as Real bytes per sub-grid cell each (their words take twice that, and
 // the entries add up to autoTuneFxMomentBytes): the one-domain model below follows that conversion grid by grid.
 inline std::vector<double> autoTuneFxGrids(Field &f, AutoTunePS const &ps)
 {
@@ -427,7 +427,7 @@ inline std::vector<double> autoTuneFxGrids(Field &f, AutoTunePS const &ps)
 
 // One Quantities' PS COUNT, FLAG and MASK grids in bytes per sub-grid cell (part of autoTuneBytesPerCell): none of
 // them is a private copy of the deposit's copy mode -- the deposit's own int stream count, its two byte flags and
-// its caustic mask are shared by the threads (2026-10-18, ps_interpolation.cc psAddCount), and the others are
+// its caustic mask are shared by the threads (ps_interpolation.cc psAddCount), and the others are
 // DTFE.cpp's output grids -- so the partition model's copy term leaves them out.
 inline double autoTunePSCountBytes(Field &f, AutoTunePS const &ps, int const phase)
 {
@@ -437,8 +437,8 @@ inline double autoTunePSCountBytes(Field &f, AutoTunePS const &ps, int const pha
     b += R;                                                    // stream_count (both phases)
     b += R;                                                    // hidden_streams (both phases, DTFE.cpp)
     if ( phase == 0 )      b += 2.;                            // subSampleMassFlag + flippedFlag, the deposit's byte accumulators
-    if ( ps.caustics )     b += R;                             // caustic_bits (DTFE.cpp:512)
-    if ( ps.exactDeposit ) b += R;                             // tet_touch    (DTFE.cpp:519)
+    if ( ps.caustics )     b += R;                             // caustic_bits (psReserveGrids, DTFE.cpp)
+    if ( ps.exactDeposit ) b += R;                             // tet_touch    (psReserveGrids, DTFE.cpp)
     /* orientBits, the deposit's per-cell accumulator (ps_interpolation.cc): a CausticMask,
        not a byte, since the A4 indicator needs bit 8. Deposit phase only -- freed before the
        derived fields are allocated. Counted once per selected Quantities, like caustic_bits;
@@ -449,7 +449,7 @@ inline double autoTunePSCountBytes(Field &f, AutoTunePS const &ps, int const pha
 }
 
 // The grids only the POST phase allocates (autoTuneBytesPerCell's phase 1, below), in bytes per cell: the derived
-// fields, made after the deposit loop (DTFE.cpp:83, ~1238-1257), and the T-web tidal stage.
+// fields and the T-web tidal stage, both made after the deposit loop by postProcessWebFields (web_fields.cc).
 inline double autoTuneDerivedBytes(Field &f)
 {
     if ( not f.selected() ) return 0.;
@@ -461,7 +461,7 @@ inline double autoTuneDerivedBytes(Field &f)
     if ( f.velocity_std ) b += R;
     if ( f.velocity_tweb ) b += R + 3.*R;                      // web label + eigenvalues
     if ( f.velocity_vweb ) b += R + 3.*R;
-    // T-web tidal stage (computeTidalWebClassification, DTFE.cpp:1126-1200): all live at
+    // T-web tidal stage (computeTidalWebClassification, web_fields.cc): all live at
     // once -- work(N) 8 B + deltaK/tensK fftw_complex ~16.03 B + tens[0..5] 6*R. 48 B/cell
     // on top of every resident grid; invisible at the 256-512 sizes this was calibrated on
     // (6.5 GB at 512^3) but 51.6 GB at 1024^3.
@@ -476,8 +476,8 @@ inline double autoTuneBytesPerCell(Field &f, AutoTunePS const &ps, int const pha
     double b = 0.;
     bool const gradient = f.velocity_gradient or f.velocity_divergence or f.velocity_shear
                           or f.velocity_vorticity or f.velocity_vweb;
-    // 'density||tweb' mirrors the tweb->density folding at DTFE.cpp:187, which happens AFTER
-    // autoTunePartitioning is called -- so use this predicate anywhere the deposit sees
+    // 'density||tweb' mirrors the tweb->density folding in DTFE_setup (DTFE.cpp), which happens AFTER
+    // autoTunePartitioning is called there -- so use this predicate anywhere the deposit sees
     // field.density, not the raw f.density.
     bool const densityGrid = f.density or f.velocity_tweb;
     if ( densityGrid ) b += R;
@@ -494,7 +494,7 @@ inline double autoTuneBytesPerCell(Field &f, AutoTunePS const &ps, int const pha
         b += autoTuneDerivedBytes( f );   // derived fields: allocated only after the deposit loop (above)
     else if ( ps.phaseSpace )
     {
-        // ---- deposit-phase PS weight grids (freed at DTFE.cpp:659, before the derived fields) ----
+        // ---- deposit-phase PS weight grids (freed in psNormalizeMoments, before the derived fields) ----
         bool const needWeight = f.velocity or f.velocity_gradient or f.velocity_dispersion
                                 or f.velocity_divergence or f.velocity_shear or f.velocity_vorticity
                                 or f.velocity_vweb or f.scalar or f.scalar_gradient;
@@ -508,11 +508,11 @@ inline double autoTuneBytesPerCell(Field &f, AutoTunePS const &ps, int const pha
         if ( ps.volumeWeighted and f.velocity_dispersion ) b += R + 3.*R;           // disp_weight + disp_velocity
     }
 
-    // '--fixed-point-merge' (2026-10-15, ps_fixed_merge.h): during the loop every SUMMED full-grid component (counted
+    // '--fixed-point-merge' (ps_fixed_merge.h): during the loop every SUMMED full-grid component (counted
     // above at R: density, velocity, gradient, dispersion, scalar(s), mass_weight, disp_weight, disp_velocity; below:
     // stream_count, tet_touch) is an int64 word + an int8 carry, 9 B, and its Real grid does not exist; the masks
     // (hidden_streams, caustic_bits) stay Real. After the loop the grids convert one at a time, the largest one's Real
-    // grid briefly beside the integers. Nothing is staged or spilled in this mode (the model never counted that).
+    // grid briefly beside the integers. Nothing is staged or spilled in this mode (the model counts neither).
     if ( ps.phaseSpace and ps.fixedMerge and phase == 0 )
     {
         double const counts = 1. + ( ps.exactDeposit ? 1. : 0. );   // stream_count, tet_touch: R each below, + 9 - R here
@@ -546,7 +546,7 @@ struct AutoTuneReport
     std::string line() const
     {
         if ( not valid ) return "AUTO-TUNE-REPORT unsupported";
-        // (2026-10-15: + the GPU snapshot and the look-ahead, both in 'predicted', so a check can see each term; the
+        // (the GPU snapshot and the look-ahead are in 'predicted' too, listed so a check can see each term; the
         // parsers read key=value pairs, and over_budget stays last)
         char b[480];
         snprintf( b, sizeof(b), "AUTO-TUNE-REPORT partition=%d mc=%d predicted_gb=%.2f budget_gb=%.2f "
@@ -566,7 +566,7 @@ struct AutoTuneReport
    concurrent builds. Picks the smallest n (2..8) that leaves room for two partitions next to the
    particles, then as many concurrent builds as fit. A user-given --partition is never touched. */
 /* A Lagrangian partition's padding on one axis, in units of the partition's own width, for an n^3 split of N
-   particles (2026-10-11): with '--ps-lag-padding <k>' (the default since 2026-10-12, k = 8) k mean spacings -- k n /
+   particles: with '--ps-lag-padding <k>' (the default, k = 8) k mean spacings -- k n /
    N^(1/NO_DIM) partition widths, at most one period (n widths) on a periodic run -- and at least 4.2
    '--ps-alpha-shape' cuts on a non-periodic one, with no floor; with '--ps-lag-padding 0' the Eulerian '--padding'
    fraction floored at 'floorFrac' of a partition (DTFE.cpp's PSPartitionPlan). One definition for every model below. */
@@ -629,8 +629,8 @@ inline std::map<int,int> cachedServeSplits(User_options const &u)
             continue;
 #ifdef PHASE_SPACE
         if ( desc.find( wantLag ) == std::string::npos ) continue;
-        // the partition padding (2026-10-12): a split cached under another padding (the Eulerian rule before
-        // 2026-10-12 writes no line) would miss in the run, so it must not steer the split either
+        // the partition padding: a split cached under another padding (the Eulerian rule writes no line)
+        // would miss in the run, so it must not steer the split either
         if ( wantPad.empty() ? desc.find( "\nlagPadding=" ) != std::string::npos : desc.find( wantPad ) == std::string::npos )
             continue;
 #endif
@@ -704,10 +704,9 @@ inline void autoTuneServe(User_options &u, size_t const nParticles)
     while ( nMin < 8 and 2.*tessBytes(nMin) > budget - N*partBytes ) ++nMin;
     /* Which split. A split this snapshot already has in the cache is reused -- the finest complete one, else
        the one with the most cached partitions -- since any other means building (and storing) every
-       partition again: TNG100-3-Dark's 4^3 set took 469 s and 52 GB. With nothing cached, the split that
-       holds ~8 partitions in memory at once, the number a zoom touches: measured on TNG100-3-Dark z=0
-       (2026-10-03), 3^3 held 4 and a cold 512^2 zoom took 19.7 s, 4^3 held 10 and took 9.8 s (repeats
-       5.0 vs 4.6 s). Before then the server always took the coarsest split that fit. */
+       partition again (TNG100-3-Dark's 4^3 set: 469 s and 52 GB). With nothing cached, the split that
+       holds ~8 partitions in memory at once, the number a zoom touches (TNG100-3-Dark z=0: a cold 512^2 zoom
+       takes 19.7 s at 3^3, which holds 4, and 9.8 s at 4^3, which holds 10). */
     std::map<int,int> const cached = cachedServeSplits( u );
     int n = -1;
     char const *why = "";
@@ -745,10 +744,9 @@ inline void autoTuneServe(User_options &u, size_t const nParticles)
 }
 
 #ifndef PHASE_SPACE
-/* ---- Standard DTFE: what one partition's thread sub-triangulations hold, from the data (2026-10-13) ----------------
-   The 2026-10-13 audit measured the standard '--exact-average' run (the production default since that day) at a peak
-   footprint 25-30% above the sampled one: TNG100-3-Dark z=1 (3^3, 9 threads) 37.4 vs 30.0 GB, TNG50-3-Dark z=0 (4^3,
-   4 threads) 44.5 vs 34.1 GB, and asked for an exact-average term. What the code allocates says there is none:
+/* ---- Standard DTFE: what one partition's thread sub-triangulations hold, from the data --------------------------
+   The standard '--exact-average' run peaks 25-30% above the sampled one in footprint (TNG100-3-Dark z=1, 3^3,
+   9 threads: 37.4 vs 30.0 GB), yet what the code allocates has no exact-average term:
      - CPU (averaged_interpolation_1.cc): the exact loop clips each tetrahedron against its cell window with r3d on the
        stack -- no per-tetrahedron or per-cell storage that the Monte-Carlo loop does not have;
      - GPU (dtfe_metal_host.cc / dtfe_gpu_cuda.cu): BOTH averages extract the same flat arrays of the tetrahedra that
@@ -758,16 +756,15 @@ inline void autoTuneServe(User_options &u, size_t const nParticles)
        4 B per 32 items), which the sampled item kernel builds as well.
    What changes is WHEN memory is held. The exact kernel is several times slower, and the thread sub-domains of a
    partition queue on the ONE device (ctxMutex): every thread then waits with its triangulation and its uploaded
-   batch alive, so all of a partition's sub-triangulations coexist -- the worst case this model always assumed. In a
+   batch alive, so all of a partition's sub-triangulations coexist -- the worst case this model assumes. In a
    sampled run the GPU drains a batch in about a second, the small sub-domains finish and free theirs before the
-   largest one is built, and the peak stays below the worst case. So the model needs the worst case to be RIGHT, and
-   it was not: it took every sub-box to hold the box-average particle count, (N / P^3) x the padding factor. The
+   largest one is built, and the peak stays below the worst case. So the model needs the worst case to be RIGHT,
+   and the box-average particle count per sub-box, (N / P^3) x the padding factor, is not: the
    load-balanced split (optimalPartitionSplit) gives a dense partition a small VOLUME, while the padding is a fixed
-   length (k mean spacings), so on clustered data the padding shells hold most of the vertices: in that TNG50 z=0 run
-   one partition's 4 threads triangulated 35.4M particles (10.6M in one sub-box) where the model counted 7.8M -- it
-   predicted 39.9 GB, and the exact run peaked at 44.5. (TNG50 at z = 127 had 6.5M, and every snapshot's busiest
-   partition holds more as structure grows: 8.4 -> 35.4M from z = 127 to 0 at --padding 20.)
-   Now the plan replays the run's own split on the particles: a coarse count grid of the box (or, without periodic
+   length (k mean spacings), so on clustered data the padding shells hold most of the vertices (TNG50 z=0: one
+   partition's 4 threads triangulate 35.4M particles, 10.6M in one sub-box, where the box average gives 7.8M; the
+   busiest partition holds more as structure grows).
+   So the plan replays the run's own split on the particles: a coarse count grid of the box (or, without periodic
    wrap, of the box and its padding) with a summed-area table gives the particles in any box; the partition split
    (optimalSplit along x, then y per slab, then z per column -- optimalPartitionSplit's order, on bins of the run's
    grid cells), the thread grid of each partition (parallelGrid, as DTFE_parallel) and its split are replayed with
@@ -778,17 +775,14 @@ inline void autoTuneServe(User_options &u, size_t const nParticles)
        the flat arrays, one sort copy and the item table, which turn into the uploaded batch one array at a time;
      - its sub-grids: the threads' copies, the partition's own grids, and the GPU deposit's host and device grids;
      - its padded particle copy (a partition), or the periodic copies of the whole box (one domain);
-   and the plan is the busiest partition's sum, on top of the particles and the full-resolution grids ('fixed', as
-   before). Replayed on the logs of the audit's runs and of the 2026-10-12/13 production runs
-   (38 runs: TNG50/100/300, z = 127 .. 0, sampled and exact, from their 'Thread i had' lines) it bounds every measured
-   peak footprint, by 19-90%: TNG50 z=0 exact 44.5 GB -> 58.7 predicted, at --padding 15 40.8 -> 56.2 (the uniform
-   count: 39.9 and 37.3, the only two runs it put below their peak -- both exact, both z = 0), TNG100 z=1 exact 37.4
-   -> 47.2, TNG50 z=127 exact 31.6 -> 37.6, TNG300 z=2 sampled 33.4 -> 42.9. It stays high because 'fixed' holds the post-processing grids (168 B/cell for the production fields)
-   next to the triangulations, and the footprints need that sum: the peak is in the post-processing, where macOS still
-   counts much of the freed triangulation memory (TNG300 z=2: 33.4 GB against 22.6 GB of post grids and 27.4 GB for
-   the whole deposit phase). On sub-GB runs the same retention can put the footprint up to ~30% above the plan (a
-   0.9M-particle crossed-wave set at 4^3 partitions measured 0.71 GB against 0.54 predicted; the uniform count said
-   0.24): the footprint ratchets up over the partitions. The counted padded vertices agree with the run's own to ~5% on clustered test
+   and the plan is the busiest partition's sum, on top of the particles and the full-resolution grids ('fixed').
+   Replayed on the logs of 38 production runs (TNG50/100/300, z = 127 .. 0, sampled and exact, from their 'Thread
+   i had' lines) it bounds every measured peak footprint, by 19-90%. It stays high because 'fixed' holds the
+   post-processing grids (168 B/cell for the production fields) next to the triangulations, and the footprints
+   need that sum: the peak is in the post-processing, where macOS still counts much of the freed triangulation
+   memory. On sub-GB runs the same retention can put the footprint up to ~30% above the plan (a 0.9M-particle
+   crossed-wave set at 4^3 partitions: 0.71 GB against 0.54 predicted): the footprint ratchets up over the
+   partitions. The counted padded vertices agree with the run's own to ~5% on clustered test
    sets (tests/dtfe_auto_tune_check.sh). The count grid is one pass over the particles (128^NO_DIM cells: 0.07 s for
    1.7e7 particles); a full search is <= 60 plans (~0.5 s, independent of N); a run without particles in memory keeps
    the uniform count. DTFE_AUTO_TUNE_DEBUG=1 prints the busiest partition's predicted padded count per thread (for
@@ -1016,11 +1010,10 @@ inline std::vector< std::vector<double> > stdTuneSplit(StdTuneDensity const &den
 
 // Bytes per padded vertex of a standard sub-domain while its tessellation is built: the thread's particle copy (alive
 // while the triangulation grows) + the triangulation (96 B incl. the double volume accumulator + 6.77 cells x 72 B +
-// slack; the double build's vertex data in 8 B instead of 4: +50 B/vertex measured 2026-10-13, one triangulation of
-// 0.9M and 1.0M points: 609 vs 659 B per added vertex) + the TBB insert's sorted copies with
+// slack; the double build's vertex data in 8 B instead of 4: +50 B/vertex) + the TBB insert's sorted copies with
 // '--parallel-triangulation' (+203 B per vertex, measured on PS), and 6% for the dummy points the padding test adds on
 // the padded box's faces (3-5% of a sub-box at TNG scale). One definition for the plan below and the partition loop's
-// look-ahead (2026-10-15).
+// look-ahead.
 inline double stdBytesPerPaddedVertex(User_options const &u)
 {
     double const kDT = 648. + 10. * ( double(sizeof(Real)) - 4. );
@@ -1033,7 +1026,7 @@ inline double stdBytesPerPaddedVertex(User_options const &u)
     return 1.06 * ( double(sizeof(Particle_data)) + kDT + kParInsert );
 }
 
-/* What the standard partition loop's LOOK-AHEAD holds for one partition (DTFE.cpp, 2026-10-15): its padded particle
+/* What the standard partition loop's LOOK-AHEAD holds for one partition (DTFE.cpp): its padded particle
    copy and, built from it on a team of their own, the tessellations of its thread sub-domains (each padded again on
    its own sub-box). The UNIFORM count: 'nOwn' particles in the partition (the split balances them), its box lengths
    'len' and per-side padding 'pad' (the mean of the two sides), split 'tGrid' threads per axis. The plan below counts
@@ -1050,896 +1043,56 @@ inline double stdLookAheadBytes(User_options const &u, double const nOwn, double
     }
     return nOwn * fThreads * stdBytesPerPaddedVertex( u ) + nOwn * fPart * double(sizeof(Particle_data));
 }
-#endif
 
-inline AutoTuneReport autoTunePartitioning(User_options &u,
-                                 size_t const nParticles,
-                                 bool const userSampling,
-                                 bool const metalActive,
-                                 std::vector<Particle_data> const *particles = nullptr)
+// The busiest partition of a split (P per axis, or the user's own) with up to T threads in each: its bytes on top
+// of 'fixed', the padded vertices its sub-triangulations hold, and those per thread (DTFE_AUTO_TUNE_DEBUG)
+// (+ the GPU snapshot of its largest thread sub-grid, and the look-ahead's bytes: the tessellation stage
+// of the partition that needs the most, which may be any partition's turn to be prepared ahead)
+struct StdPlan { double bytes = 0., vertices = 0., snapshot = 0., aheadMax = 0.; int part = -1; size_t parts = 1;
+                 std::vector<double> perThread; };
+
+/* The standard-DTFE plan once its inputs are known (autoTunePartitioning): references to them, the memoised plan of a
+   split (planOf) and the phases that choose the split (chooseSplit) and state it (reportSplit). */
+struct AutoTuneStdPlanner
 {
-    if ( u.psServe )
-    {
-        autoTuneServe( u, nParticles );   // the grid/partition model below does not apply to a server
-        return AutoTuneReport();
-    }
-    // partitionGiven, not only partitionOn: '--partition 1 1 1' asks for one triangulation, which
-    // leaves partitionOn false -- reading that as "not given" used to split the data anyway
-    bool const autoPart = not (u.partitionOn or u.partitionGiven);
-    // ... and a user's split that is not one domain on every axis ('--partition 1 2 2': partition[0] is 1, but it
-    // runs the partition path): the model's n == 1 is the single-domain path only without it (partitionBytes)
-    bool const userPartitionOn = u.partitionOn;
-    bool const autoConc = not u.maxConcurrentOn;
-    AutoTuneReport report;
-    if ( (not autoPart and not autoConc and not u.autoTuneReport) or u.partNo>=0 or u.redshiftConeOn
-         or userSampling or u.psServe )
-        return report;  // nothing left to decide, or a mode where partitioning is unavailable
-                        // (--serve keeps its single triangulation alive for every request)
+    User_options &u;
+    bool const &metalActive;
+    bool const &autoPart;
+    bool const &autoConc;
+    AutoTuneReport &report;
+    double const &N;
+    double const &ramBytes;
+    std::string &budgetWhy;
+    double const &budget;
+    int const &cores;
+    double &gridTotal;
+    double const &bCellDeposit;
+    double (&padFrac)[NO_DIM];
+    MESSAGE::Message &message;
+    char (&buf)[512];
+    double const &partBytes;
+    size_t &nPts;
+    double const &ptsBytes;
+    double const &ptsWalkBytes;
+    double const &fixed;
+    double const &perVertex;
+    double &bGpuCell;
+    double const &perTet;
+    double const &tetsPerOwn;
+    double const &snapWordFactor;
+    bool const &lookAheadPossible;
+    std::chrono::steady_clock::time_point const &tuneStart;
+    StdTuneDensity &dens;
+    double const &countSec;
+    bool const &oneTessellation;
+    double (&origin)[NO_DIM];
+    double (&dxGrid)[NO_DIM];
+    std::vector<size_t> const &userSplit;
+    std::map< std::pair<int,int>, StdPlan > &plans;
+    User_options &pgOptions;
 
-    double minN = 2.e6;
-    if ( const char *env = std::getenv("DTFE_AUTO_MINN") )
-    {
-        double v = std::atof(env);
-        if ( v > 0. ) minN = v;
-    }
-
-    double const N = double(nParticles);
-    double const ramBytes = autoTunePhysicalRAM();
-    std::string budgetWhy;
-    double const budget = autoTuneBudget( ramBytes, budgetWhy );   // see the header comment
-    int const cores = autoTuneCores();
-
-    // the cells actually allocated and written: with --ps-window its cells, not the (virtual) full grid
-    size_t outGrid[NO_DIM];
-    u.outputGridSize( outGrid );
-    double gridTotal = 1.;
-    for (int d=0; d<NO_DIM; ++d)
-        gridTotal *= double(outGrid[d]);
-
-    AutoTunePS ps;
-#ifdef PHASE_SPACE
-    ps.phaseSpace     = true;
-    ps.volumeWeighted = u.psVolumeWeighted;
-    ps.exactDeposit   = u.psExactDeposit;
-    ps.caustics       = u.psCaustics;
-    ps.haloRelease    = u.psHaloRelease > Real(0.);
-    ps.fixedMerge     = u.psFixedPointMerge;
-#endif
-    // uField and aField each allocate their OWN full grids and coexist (DTFE.cpp:497-508), so
-    // summing both is right. The deposit and post phases are disjoint peaks -> max, not sum.
-    double const bCellDeposit = autoTuneBytesPerCell(u.uField, ps, 0) + autoTuneBytesPerCell(u.aField, ps, 0);
-    double const bCellPost    = autoTuneBytesPerCell(u.uField, ps, 1) + autoTuneBytesPerCell(u.aField, ps, 1);
-    double const bCell        = std::max( bCellDeposit, bCellPost );
-    // said on the AUTO-TUNE line (2026-10-15): this run's merge keeps integer grids during the loop (ps_fixed_merge.h)
-    std::string const fxNote = ps.fixedMerge ? " [--fixed-point-merge: the summed full grids counted at 9 B per component "
-                                               "and cell during the loop; nothing staged or spilled]" : "";
-
-    // padding fraction of the box per axis (paddingLength was resolved to Mpc by updateEntries)
-    double padFrac[NO_DIM];
-    for (int d=0; d<NO_DIM; ++d)
-    {
-        double const boxLen = double(u.boxCoordinates[2*d+1] - u.boxCoordinates[2*d]);
-        padFrac[d] = boxLen>0. ? double(u.paddingLength[2*d] + u.paddingLength[2*d+1]) / (2.*boxLen) : 0.;
-    }
-
-    MESSAGE::Message message( u.verboseLevel );
-    char buf[512];
-
-#ifdef PHASE_SPACE
-    // ---- PS-DTFE: Lagrangian partitions run in PARALLEL; concurrency is the throughput knob
-    // and each concurrent partition holds a full padded triangulation (the dominant cost). ----
-    double const kDT = 666.;                        // bytes/vertex: 112 (incl. the uint64 ParticleID and the double volume accumulator) + 6.77 cells x 72 B + allocator slack
-    double const partBytes = double(sizeof(Particle_data));
-    // '--parallel-triangulation' (TBB): the sorted point+payload copy and CGAL's own copy of it outlive the particle
-    // copy during the insert. MEASURED 2026-10-11 (4.1M particles, 2^3 partitions of 5.83M vertices at mc 3, A B A B):
-    // peak footprint 14.88/14.95 -> 18.46/18.48 GB, +203 B per vertex in flight; it was not in this model
-    // (autoTuneServe's kBuild 330 holds it there). Counted whenever asked for: with fewer than 2 threads per
-    // partition the insert runs sequentially and this errs high.
-#if defined(PARALLEL_TRIANGULATION) && NO_DIM==3
-    double const kParInsert = u.psParallelTriangulation ? 210. : 0.;
-#else
-    double const kParInsert = 0.;
-#endif
-    // --scratch-dir (already armed by DTFE_setup when set): the full-grid accumulators live in
-    // mmap'ed files, so they leave the RAM model -- the kernel pages them against the disk and
-    // RSS stays bounded. The RAM check then covers only the particles + per-partition terms,
-    // and the grid term is checked against the scratch volume's FREE SPACE instead.
-    bool const scratchOn = not u.scratchDir.empty();
-
-    // ---- '--sample-points' point evaluation (ps_point_eval.cc) ---------------------------
-    // Also IRREDUCIBLE: the query points and their per-point stream records are GLOBAL
-    // structures shared by every partition (each partition appends its hits), so --partition
-    // does not shrink them. Omitting this was how a points-only run (tiny --grid, so the grid
-    // term vanishes) could pick a coarse split against a budget that ignored tens of GB.
-    size_t nPts = autoTuneSamplePointCount( u.psSamplePointsFile );
-    if ( const char *env = std::getenv("DTFE_AUTO_PTS_N") )      // a plane that does not exist yet
-    {
-        double const v = std::atof(env);
-        if ( v >= 0. ) nPts = size_t(v);
-    }
-    bool const ptsVelGrad = u.psPtsVelGrad
-                            or (std::getenv("DTFE_AUTO_PTS_VELGRAD") and std::string(std::getenv("DTFE_AUTO_PTS_VELGRAD")) == "1");
-    // Mean streams (containing tetrahedra) per point. The old fixed 2 (TNG300-3-Dark measured
-    // 1.899 at z=0) was far too low for finer mass resolution: TNG100-3-Dark measured 4.25 at
-    // z=0 (2.30 at z=1), so a z=0 run with an 8192^2 plane needed 90 GB where the model said ~50.
-    // Now ESTIMATED from the particles themselves (psEstimateMeanStreams: Eulerian over Lagrangian
-    // volume of the tessellation, on random Lagrangian patches) and budgeted at TWICE the
-    // multi-stream excess, 1 + 2 (est - 1): the estimate is the box mean, while one plane varies
-    // around it (the z=0 plane's strips range 1.45 .. 22.8). DTFE_AUTO_PTS_STREAMS overrides.
-    double ptsMeanStreams = 2.0;
-    char ptsStreamsWhy[200] = "2 streams/point assumed";
-    if ( const char *env = std::getenv("DTFE_AUTO_PTS_STREAMS") )
-    {
-        double const v = std::atof(env);
-        if ( v >= 1. )
-        {
-            ptsMeanStreams = v;
-            snprintf( ptsStreamsWhy, sizeof(ptsStreamsWhy), "%.3g streams/point from DTFE_AUTO_PTS_STREAMS", v );
-        }
-    }
-    else if ( nPts > 0 and particles != nullptr )
-    {
-        double boxLo[3], boxLen[3];
-        for (int d=0; d<3; ++d)
-        {
-            boxLo[d]  = double( u.boxCoordinates[2*d] );
-            boxLen[d] = double( u.boxCoordinates[2*d+1] ) - boxLo[d];
-        }
-        int patches = 0;
-        // 2026-10-11: the estimate is made on the points' own slab -- their bounding box, widened by one mean
-        // particle spacing per side -- not the whole box. The box mean (17.98 on TNG50-3-Dark z=0) budgeted
-        // 19.3 GB for a z2048 plane whose written '.pts_streams' average 5.38: the heavy tail sits in a few
-        // haloes the plane misses, and the over-reserve pushed the tuner to 5^3 at mc 1. A points set that
-        // fills the box gets the box mean as before. DTFE_AUTO_PTS_BOXMEAN=1 restores the box-wide estimate.
-        double rLo[3], rHi[3];
-        bool haveRegion = false;
-        char const *boxMean = std::getenv( "DTFE_AUTO_PTS_BOXMEAN" );
-        if ( not ( boxMean and std::string(boxMean) == "1" ) and NO_DIM == 3 )
-        {
-            double pLo[NO_DIM], pHi[NO_DIM], bLo[NO_DIM], bLen[NO_DIM];
-            for (int d=0; d<NO_DIM; ++d) { bLo[d] = boxLo[d]; bLen[d] = boxLen[d]; }
-            if ( autoTuneSamplePointBounds( u.psSamplePointsFile, bLo, bLen, u.periodic, pLo, pHi ) )
-            {
-                double const spacing = std::cbrt( boxLen[0]*boxLen[1]*boxLen[2] / std::max( 1., N ) );
-                double vol = 1.;
-                for (int d=0; d<NO_DIM; ++d)
-                {
-                    rLo[d] = pLo[d] - spacing;
-                    rHi[d] = pHi[d] + spacing;
-                    if ( u.periodic and rHi[d] - rLo[d] >= boxLen[d] ) { rLo[d] = boxLo[d]; rHi[d] = boxLo[d] + boxLen[d]; }
-                    vol *= (rHi[d] - rLo[d]) / boxLen[d];
-                }
-                haveRegion = vol < 0.999;   // a points set that fills the box: the box mean is its slab's
-            }
-        }
-        double const est = psEstimateMeanStreams( *particles, boxLo, boxLen, u.periodic, &patches,
-                                                  haveRegion ? rLo : nullptr, haveRegion ? rHi : nullptr );
-        if ( est > 0. )
-        {
-            ptsMeanStreams = std::max( 1., 1. + 2.*(est - 1.) );
-            report.streamsEstimate = est;
-            snprintf( ptsStreamsWhy, sizeof(ptsStreamsWhy),
-                      "%.2f streams/point estimated from %d Lagrangian patches%s, budgeted as %.2f", est, patches,
-                      haveRegion ? " on the points' slab" : "", ptsMeanStreams );
-        }
-    }
-    // The STORED per-stream record is packed (ps_point_eval.cc RecLayout): denGeo + denDtfe +
-    // vel[3] doubles + the 2-B caustic mask = 42 B, plus grad[3] / vgrad[9] doubles / ids[4]
-    // uint64 only with --pts-den-grad / --pts-vel-grad / --per-stream-ids. KEEP IN SYNC.
-    double bStreamRec = 5. * double(sizeof(double)) + 2.;
-    if ( u.psPtsDenGrad )   bStreamRec += 3. * double(sizeof(double));
-    if ( ptsVelGrad )       bStreamRec += 9. * double(sizeof(double));
-    if ( u.psPerStreamIds ) bStreamRec += 4. * 8.;
-    if ( u.psPtsScalar )    bStreamRec += double(noScalarComp) * double(sizeof(double));
-    if ( u.psPtsLagrangian ) bStreamRec += 3. * double(sizeof(double));
-    // ... stored as uint32 point index + the packed record in blocks, and grouped at finalize by
-    // one uint64 locator per record (ps_point_eval.cc HitSink / psPointEvalFinalize)
-    bStreamRec += 4. + 8.;
-    // per-point: pos (3 doubles) + bucketPts (uint32) + finalize's offsets and cursor (2 uint64)
-    double const bPerPoint = 3. * double(sizeof(double)) + 4. + 2. * 8.;
-    // finalized outputs, allocated while the records are still being drained
-    double bPtsOut = double(sizeof(double))            // outDen
-                   + 3. * double(sizeof(double))       // outVel
-                   + 6. * double(sizeof(double))       // outDisp
-                   + 4.;                               // outStreams (int32)
-    if ( u.psPtsDenGrad ) bPtsOut += 3. * double(sizeof(double));
-    if ( ptsVelGrad ) bPtsOut += 9. * double(sizeof(double));
-    if ( u.psPerStream )  bPtsOut += ptsMeanStreams * 4. * double(sizeof(double));   // ragged records
-    if ( u.psPtsScalar )  bPtsOut += double(noScalarComp) * double(sizeof(double))
-                                     * (1. + (u.psPerStream ? ptsMeanStreams : 0.));   // point + per-stream scalars
-    if ( u.psPtsLagrangian ) bPtsOut += ptsMeanStreams * 3. * double(sizeof(double));  // per-stream q(x)
-    double const ptsBytes = double(nPts) * (bPerPoint + bPtsOut + ptsMeanStreams * bStreamRec);
-
-    // IRREDUCIBLE in RAM unless scratch-backed: originals + the full-grid accumulators
-    // + the point-evaluation structures.
-    // --partition does NOT reduce this -- partitions sum into the SHARED full grid.
-    // a --ps-window run that started without its particles (ps_globals_record.h) holds none: only
-    // cached partitions are loaded, so their memory goes to more partitions at once. (A late read, when
-    // a needed partition turns out uncached, adds them back: at most the particles' bytes over budget.)
-    double const particleBytes = u.psParticlesDeferred ? 0. : partBytes*N;
-    double const fixed = particleBytes + (scratchOn ? 0. : gridTotal*bCell) + ptsBytes;
-    report.fixed = fixed;
-    report.budget = budget;
-    report.pts = ptsBytes;
-    report.streamsBudgeted = nPts > 0 ? ptsMeanStreams : 0.;
-    // NOTE: the over-budget check below must run BEFORE the small-N early return -- the grid
-    // term does not depend on N, so a small snapshot on a huge --grid is exactly the case
-    // that must not slip through to a silent 60+ GB allocation.
-
-    if ( scratchOn )
-    {
-        struct statvfs vfs;
-        if ( statvfs(u.scratchDir.c_str(), &vfs) == 0 )
-        {
-            double const freeBytes = double(vfs.f_bavail) * double(vfs.f_frsize);
-            double const need = gridTotal*bCell;
-            if ( need * 1.05 + 2.e9 > freeBytes )
-            {
-                MESSAGE::Warning warning( u.verboseLevel );
-                warning << "AUTO-TUNE: the scratch volume cannot hold this run's grids: '"
-                        << u.scratchDir << "' has " << freeBytes/1.e9 << " GB free but the "
-                        << "full-resolution accumulators need ~" << need/1.e9 << " GB ("
-                        << MESSAGE::printElements( u.gridSize, "x" ) << " cells x " << bCell
-                        << " B/cell). The allocator will fall back to the heap when the disk "
-                        << "runs out -- expect swapping. Free up space, use a bigger volume, or "
-                        << "reduce --grid / --field.\n" << MESSAGE::EndWarning;
-            }
-        }
-    }
-
-    // ---- Is the IRREDUCIBLE term alone over budget? --------------------------------------
-    // If so, no --partition value can help: partitions are summed into the shared full grid.
-    // The old code fell through to the search, where (budget-fixed) went negative, cMem was
-    // negative for every n, bestN stayed at the loop's first candidate (2 -- the COARSEST split,
-    // i.e. the LARGEST per-partition triangulation, exactly backwards) and it warned "even a
-    // single 2^3-split partition is predicted to exceed the memory budget ... consider a smaller
-    // grid or fewer fields" -- blaming the split and prescribing a remedy that cannot work.
-    // which per-tet/per-cell GPU-deposit pieces this field selection actually needs
-    // (unselected moment grids are not allocated, and the tet velocity array is only
-    // extracted when a velocity-derived grid is requested). The velocity derivatives
-    // (divergence etc.) are folded into the gradient AFTER auto-tune runs, so count
-    // them here as gradient requests.
-    // dispersion implies the velocity/mom grids only when NOT volume-weighted (5d gating)
-    bool const psVel  = u.uField.velocity or u.aField.velocity
-                        or ((u.uField.velocity_dispersion or u.aField.velocity_dispersion)
-                            and not ps.volumeWeighted);
-    bool const psDisp = u.uField.velocity_dispersion or u.aField.velocity_dispersion;
-    bool const psGrad = u.uField.velocity_gradient or u.uField.selectedVelocityDerivatives()
-                        or u.aField.velocity_gradient or u.aField.selectedVelocityDerivatives();
-    // flags gating the remaining GPU buffers (ps_metal_host.cc)
-    bool const psVolW  = ps.volumeWeighted;
-    bool const psCaust = ps.caustics;
-    bool const psExact = ps.exactDeposit;
-
-    // Every buffer in PSGpuGrids, per cell and copy (the GPU deposit's host and device grids). mass 4 + streams 4
-    // = the 8; the fVolW/fCaustic/fExact terms were missing and fVolW is the PRODUCTION default -- 20 B/cell/copy =
-    // 40 after the x2 in partitionBytes(), i.e. 6.7 GB per partition at 1024^3/n=2.
-    // The moment grids are 64-bit fixed-point sums since 2026-10-14 (ps_metal_host.cc, fxUnits): 8 B per component
-    // on the device and in the host's copy where the float took 4 (mB = 2), and dispw is not deposited (the mass
-    // grid stands for it); PS_METAL_FLOAT_MOMENTS=1 keeps the floats (mB = 1).
-    bool const momFx = autoTunePSMomentsFixed();
-    double const mB = momFx ? 2. : 1.;
-    double const gridB  = 8. + mB * ( (psVel ? 12. : 0.) + (psDisp ? 24. : 0.) + (psGrad ? 36. : 0.)
-                                    + (psVolW ? 4. : 0.)                  // momw
-                                    + (psExact ? 4. : 0.)                 // streamvol
-                                    + ((psVolW and psDisp) ? 12. : 0.) )  // dispvel
-                        + (psCaust ? 4. : 0.)                             // caustic
-                        + ((psVolW and psDisp and not momFx) ? 4. : 0.);  // dispw
-
-    // The single build's fixed-point MASS grid (2026-10-12, ps_interpolation.cc 'massFx'): a pass whose density is
-    // selected accumulates its mass as 8 B words per sub-grid cell in place of the 4 B float density, shared by the
-    // deposit threads (atomics; no private density copies), and converts them to the float density once after the
-    // loop -- when the 8 B words and the 4 B grid coexist for a moment. The double build keeps its double sums.
-    // fxCell = the extra bytes per sub-grid cell while the words live (the passes run one after the other: one grid).
-    bool const psDensity = u.uField.density or u.uField.velocity_tweb or u.aField.density or u.aField.velocity_tweb;
-    double const fxCell  = ( ps.phaseSpace and sizeof(Real) == 4 and psDensity ) ? 4. : 0.;
-    // ... and the moment grids the same way (2026-10-14): fxMom = the extra bytes per sub-grid cell while one pass's
-    // words live (as many again as its Real moment grids: the larger pass), which also leave the private copies
-    double const fxMom   = ( ps.phaseSpace and sizeof(Real) == 4 and momFx )
-                         ? std::max( autoTuneFxMomentBytes(u.uField, ps), autoTuneFxMomentBytes(u.aField, ps) ) : 0.;
-    // ... and the counts, flags and masks, which the deposit threads share in every build (2026-10-18)
-    double const countCell = autoTunePSCountBytes(u.uField, ps, 0) + autoTunePSCountBytes(u.aField, ps, 0);
-    // One private copy of the CPU deposit's copy mode, per sub-grid cell (2026-10-18): the Real accumulators of ONE
-    // pass -- the passes deposit one after the other, each copying only its own grids that are not fixed-point
-    // sums (ps_interpolation.cc accBytes, of the 'quantities' it fills). The model took both passes' grids less one
-    // pass's words (bCellDeposit - fxCell - fxMom - countCell): with u and a fields both selected, 16 B/cell of
-    // copies in the single build, which copies nothing (384^3: 13.8 GB predicted, 5.1 measured), and twice the
-    // double build's 32 B/cell -- so few threads that it predicted SLAB mode while the run took 8 threads in the copy
-    // mode (384^3: 12.4 GB predicted, 18.0 measured). One pass alone is the same number as before.
-    double copyCell = 0.;
-    for (Field *f : { &u.uField, &u.aField })
-    {
-        if ( not f->selected() ) continue;
-        double const R = double(sizeof(Real));
-        bool const massFx = ps.phaseSpace and sizeof(Real) == 4 and ( f->density or f->velocity_tweb );   // as fxCell
-        double const fxPass = ( ps.phaseSpace and sizeof(Real) == 4 and momFx ) ? autoTuneFxMomentBytes(*f, ps) : 0.;
-        copyCell = std::max( copyCell, autoTuneBytesPerCell(*f, ps, 0) - autoTunePSCountBytes(*f, ps, 0)
-                                       - ( massFx ? R : 0. ) - fxPass );
-    }
-
-    // ONE DOMAIN on the CPU (2026-10-18). '--partition 1 1 1', or one domain picked here, leaves partitionOn false:
-    // the single triangulation deposits straight into the run's own grids (DTFE_interpolation: no reserveMemory, no
-    // partition sub-grid, no addFromSubgrid), so the grids 'fixed' books are the deposit's own -- partitionBytes(1)
-    // added them a second time (copyOne) and booked every grid's conversion at once: 38.8 GB predicted for a 768^3
-    // run measured at 22.9. What the run holds instead, per pass (u, then a), in the deposit's own order
-    // (ps_interpolation.cc): during the loop the fixed-point words (the density's 8 B, each moment grid's 2 x its Real
-    // bytes), the int stream count, the flags and every Real accumulator that is not a fixed-point sum; after it each
-    // moment grid's Real grid is made beside the words and the words freed, grid by grid (psFxToReal), then the
-    // density from the mass words; then the export grids ('.streams' or '.tetTouch', '.hidden_streams', the caustic
-    // bits, the volume-weighted dispersion's copy of the density). AND what is freed stays in the footprint: macOS's
-    // allocator keeps a freed block under 4 GiB (2^32 B) for reuse (measured with a malloc/free probe: 0.1 .. 4.29 GB
-    // all kept, 4.30 GB and up returned; kept blocks serve later requests of at least half their size), so the export
-    // grids pile on top of the freed words unless those were 4 GiB or more: 62 B/cell for density + velocity at
-    // 256^3 .. 512^3 (8.59 GB measured at 512^3 where the live peak is 6.7), but the 50 B/cell live conversion peak at
-    // 768^3, whose 10.9 GB velocity words go back. The next pass's own temporaries reuse what the previous one freed
-    // (the same sizes) as far as they go; the derived fields come after it all. Bytes, for 'cells' sub-grid cells.
-    auto oneDomainPeak = [&](double const cells) -> double
-    {
-        double const B4 = 4294967296.;          // the allocator returns a freed block of this size or more
-        double const R = double(sizeof(Real));
-        bool const fxOn = ps.phaseSpace and sizeof(Real) == 4 and momFx;
-        double live = 0., kept = 0., peak = 0.;
-        auto alloc = [&](double const b) { live += b*cells; peak = std::max( peak, live + kept ); };
-        auto release = [&](double const b) { live -= b*cells; if ( b*cells < B4 ) kept += b*cells; };
-        for (Field *f : { &u.uField, &u.aField })
-        {
-            if ( not f->selected() ) continue;
-            bool const massFx = ps.phaseSpace and sizeof(Real) == 4 and ( f->density or f->velocity_tweb );   // fxCell
-            std::vector<double> const G = fxOn ? autoTuneFxGrids(*f, ps) : std::vector<double>();
-            double sumG = 0.;
-            for (double const g : G) sumG += g;
-            double const mask = ps.caustics ? double(sizeof(PSCausticClass::CausticMask)) : 0.;
-            double const E = R + R + ( ps.caustics ? R : 0. )                                    // the export grids
-                           + ( ( ps.volumeWeighted and f->velocity_dispersion and massFx ) ? R : 0. );
-            // the loop's temporaries: the pass's slots, less the grids made after it, plus the words and the int count
-            double const pre = autoTuneBytesPerCell(*f, ps, 0) - E - sumG - ( massFx ? R : 0. )
-                             + 2.*sumG + ( massFx ? 8. : 0. ) + double(sizeof(int));
-            double const reuse = std::min( kept, pre*cells );   // ... in what the previous pass freed
-            kept -= reuse;
-            live += pre*cells;
-            peak = std::max( peak, live + kept );
-            for (double const g : G) { alloc( g ); release( 2.*g ); }
-            if ( massFx ) { alloc( R ); release( 8. ); }
-            alloc( E );
-            release( double(sizeof(int)) + 2. + mask );   // the int count, the flags, the caustic mask (pass end)
-        }
-        // the derived fields and the T-web stage come on top of what the passes left
-        alloc( autoTuneDerivedBytes(u.uField) + autoTuneDerivedBytes(u.aField) );
-        return peak;
-    };
-    // ... and each deposit thread's per-tetrahedron sample lists (DepositThread insideFlat/insideRel/insideW, 16 B
-    // per sample of the largest tetrahedron it meets), which a very fine grid over few particles makes visible:
-    // ~33 MB per thread at 512^3 over 8^3 particles: ~50x the samples of a mean owned tetrahedron of a single-stream
-    // sheet, grid x nSub^3 / 6 N (crossed waves, 256^3 .. 512^3; which tetrahedra a thread meets depends on the
-    // scheduling). Booked at 128x that mean; negligible at production densities (768^3 over 0.26M: 6 MB in all).
-    int const nSubScratch = std::max( 1, psExact ? 3 : int(u.psAvgSubsamples) );
-    double const sampleCube = ( u.aField.selected() or psExact ) ? std::pow( double(nSubScratch), double(NO_DIM) ) : 1.;
-    double const threadScratch = double(cores) * 16. * 128. * gridTotal * sampleCube / ( 6. * std::max( 1., N ) );
-
-    // per-partition bytes for an n^3 Lagrangian split
-    auto partitionBytes = [&](int n) -> double
-    {
-        double const nOwn = N / double(n)/double(n)/double(n);
-        double fPad = 1.;
-        for (int d=0; d<NO_DIM; ++d)
-            fPad *= 1. + 2.*autoTunePadWidths( u, padFrac[d], n, N, 0.3 );   // k spacings, or the Eulerian rule's 0.3-cell floor (DTFE.cpp)
-        double const nPad = nOwn * fPad;
-        double m = nPad * (partBytes + kDT + kParInsert);   // particle copy coexists with the growing triangulation
-        // '--sample-points': each worker fills a LOCAL hits buffer (pair<uint32,StreamRec>,
-        // padded to 176 B) and merges it under the mutex at the end, so this part DOES scale
-        // down with a finer split -- roughly this partition's share of the total records.
-        if ( nPts > 0 )
-            m += double(std::thread::hardware_concurrency()) * double(16 << 20);   // one HitSink block per thread
-        // Eulerian sub-grid this partition allocates (psUseSubgrid). A Lagrangian sub-box maps to
-        // a DISPLACED, distorted Eulerian region, so the crop is the touched span + slop -- valid
-        // on both periodic and non-periodic runs since ps_interpolation.cc now crops a periodic
-        // axis to its WRAPPED span instead of keeping the whole axis. (Before that fix every
-        // boundary-touching slab kept the full axis, making this term ~n^3 optimistic.)
-        double subCells = 1.;
-        for (int d=0; d<NO_DIM; ++d)
-            subCells *= std::min( double(outGrid[d]),
-                                  double(u.gridSize[d])/double(n) + 40. );   // crop + slop, never above the axis (nor the window)
-        if ( metalActive )
-        {
-            // flat tet arrays (the 16-float record 64 + masses 4 + the finite-cell ordinal 4 B/tet,
-            // + vels 48 when velocity-derived grids are requested; the cost-sort permutes IN PLACE,
-            // so no gather copy) + the PSGpuGrids host and device copies of the selected grids
-            double const perTet = (72. + (psVel or psDisp or psGrad ? 48. : 0.)) * 1.3;   // + allocator slack
-            // gridB (above): every buffer in PSGpuGrids, mirrored host+device (the x2 below)
-            // + 4 B/cell: the device's mass grid is a 64-bit fixed-point sum (ps_metal_host.cc, 2026-10-08)
-            // + 4 B/cell more on the host since 2026-10-12, which receives those 8 B words instead of a 4 B float
-            //   grid (PSGpuGrids::massFx) -- unless a density is selected: the caller then allocates its density
-            //   sub-grid (4 B; 8 in the double build) only after the call, from the words, so the peak (the
-            //   copy-back) is the same as before or lower
-            double const hostFx = ( ps.phaseSpace and not psDensity ) ? 4. : 0.;
-            m += perTet*6.77*nOwn + 2.*gridB*subCells + (4. + hostFx)*subCells;
-            // --ps-exact-deposit runs depositExactItems (ps_metal_host.cc): a per-tet weight total
-            // (4 B) + the item list, 8 B per 16 cells of a tet's bbox window -- ~20x the tet's
-            // volume in cells on the crossed-waves benchmark, at least one item -- capped at 32M items
-            if ( psExact )
-            {
-                double const nTet = 6.77*nOwn;
-                // --ps-window: items cover only the window's cells (the hull of each tet's bbox with
-                // the window), so the window's cell count sets the items, not the virtual full grid
-                double gridCells = 1.;
-                for (int d=0; d<NO_DIM; ++d) gridCells *= double(outGrid[d]);
-                double const cellsPerTet = gridCells / (6.*double(N));
-                // (the weight totals are two 4 B words per tet since 2026-10-14: an exact per-tet sum)
-                m += (momFx ? 8. : 4.)*nTet + 8.*std::min( 32.e6, nTet*(1. + 20.*cellsPerTet/16.) );
-            }
-        }
-        else
-        {
-            // CPU deposit sub-grids (was a hardcoded 52) + the deposit threads' private copies, as many
-            // as the copy budget allows -- unless that leaves fewer than half the threads: the deposit
-            // then runs in SLAB mode (ps_interpolation.cc, the same rule) with no copies, holding a cell
-            // handle, a first-slab byte and ~2 slab-list entries per tetrahedron (+ the binning arrays).
-            // With the fixed-point mass grid (fxCell, 2026-10-12): +4 B/cell for the words during the deposit, a
-            // private copy without the 4 B density, and +4 B/cell more at the conversion after the loop -- the
-            // copies and slab lists are freed by then, so that moment only counts when it exceeds them.
-            // The moment grids' words (fxMom, 2026-10-14) likewise: +fxMom during the deposit, no private copy of
-            // them, and their conversion after the loop takes them grid by grid (under the same max).
-            // The counts, flags and masks (countCell) are not copied either (2026-10-18: the threads share them), so
-            // the default single build has copyPriv = 0 and every core in the copy mode, as ps_interpolation.cc
-            // (its accBytes) -- only the float sums (double build, PS_METAL_FLOAT_MOMENTS=1) still book copies.
-            double const copyOne = bCellDeposit*subCells;
-            double const copyPriv = std::max( 0., copyCell )*subCells;   // (copyCell above: one pass's copy)
-            int const copyThreads = copyPriv > 0.
-                ? std::min( cores, 1 + int( std::min( double(cores), psDepositThreadBytes() / copyPriv ) ) ) : cores;
-            double const slabBytes = 6.77 * nPad * ( 8. + 1. + 2.*4. + 20. );
-            double const helpers = 2 * copyThreads < cores ? slabBytes : double(copyThreads - 1) * copyPriv;
-            // One domain (oneDomainPeak above): its grids are 'fixed''s, so only what the deposit holds beyond them
-            // counts here, with the copies or slab lists and the threads' sample lists, all kept by the allocator
-            // once freed. A user's split such as '--partition 1 2 2' runs the partition path (userPartitionOn), and
-            // with --scratch-dir 'fixed' has no grid term: both keep the partition formula.
-            if ( n == 1 and not userPartitionOn and not scratchOn )
-                m += helpers + threadScratch + std::max( 0., oneDomainPeak( subCells ) - bCell*subCells );
-            else
-                m += copyOne + (fxCell + fxMom)*subCells + std::max( helpers, (fxCell + fxMom)*subCells );
-        }
-        return m;
-    };
-
-    // The GPU deposit's host snapshot (ps_metal_host.cc GpuSnapshot, 2026-10-11): to resume a failed command buffer
-    // the deposit keeps a host copy of every buffer its kernel writes -- the device grids (gridB, with the 8 B
-    // fixed-point mass for the 4 B float one: +4 B/cell), the per-tet masses (4 B/tet) and the exact items' weight
-    // totals (4 B/tet) -- taken at each pass's start and every ~10 s of GPU work. Left out it was ~4.7 GB per
-    // partition at 1024^3 split 2^3 (volume-weighted velocity), past the gate's 4 GB headroom. Not in
-    // partitionBytes(): the deposits run one at a time (ctxMutex), so whatever the concurrency there is ONE such
-    // copy, added once to every plan below. (The CUDA port keeps none yet: there it is slack; the model errs high.)
-    auto snapshotBytes = [&](int n) -> double
-    {
-        if ( not metalActive ) return 0.;
-        double subCells = 1.;   // the same crop + slop as partitionBytes()
-        for (int d=0; d<NO_DIM; ++d)
-            subCells *= std::min( double(outGrid[d]), double(u.gridSize[d])/double(n) + 40. );
-        double const nTet = 6.77 * N / double(n)/double(n)/double(n);
-        return (gridB + 4.)*subCells + (psExact ? (momFx ? 12. : 8.) : 4.)*nTet;
-    };
-
-    // The partition look-ahead (DTFE.cpp, 2026-10-11): at one partition in flight with the GPU deposit, the NEXT
-    // partition's particle copy + tessellation are built during the deposit -- one more partition's
-    // triangulation stage on top of the peak (the run skips a look-ahead the free memory cannot hold)
-    auto lookAheadBytes = [&](int n, int c) -> double
-    {
-        if ( not metalActive or u.psNoOverlap or u.psLookAheadOffBudget or c != 1 or n <= 1 ) return 0.;
-        double fPad = 1.;
-        for (int d=0; d<NO_DIM; ++d)
-            fPad *= 1. + 2.*autoTunePadWidths( u, padFrac[d], n, N, 0.3 );
-        return N / double(n)/double(n)/double(n) * fPad * (partBytes + kDT + kParInsert);
-    };
-
-    // what a given split and concurrency cost; the concurrency the run WILL use (0 = all cores)
-    auto finishReport = [&](int n, int c) -> AutoTuneReport
-    {
-        report.valid = true;
-        report.partition = std::max( n, 1 );
-        report.maxConcurrent = std::max( c, 1 );
-        // partitions in flight: never more than there are (one domain x 10 threads is ONE domain --
-        // the old product put a 0.26M-particle run at 52 GB and the GUI's memory check believed it)
-        int const inFlight = std::min( report.maxConcurrent, report.partition*report.partition*report.partition );
-        report.perPartition = partitionBytes( report.partition );
-        report.gpuSnapshot = snapshotBytes( report.partition );   // once: the GPU deposits run one at a time
-        double const base = fixed + report.gpuSnapshot + double(inFlight) * report.perPartition;
-        report.lookAhead = lookAheadBytes( report.partition, inFlight );
-        // 2026-10-11: the split above is chosen without the look-ahead, which used to be added here anyway --
-        // a plan that fitted then reported over_budget=1 (the launcher's memory check halved a plane that
-        // fits) and the run went past a budget set on purpose. Every return passes here, so this is where the
-        // plan, its prediction and the run are made to agree: a look-ahead that does not fit beside one
-        // partition is switched off for this run (DTFE.cpp reads psLookAheadOffBudget), and the prediction
-        // is then the grids + particles + one partition. Over budget anyway, the look-ahead only adds to it.
-        if ( report.lookAhead > 0. and base + report.lookAhead > budget )
-        {
-            message << MESSAGE::cBold() << "AUTO-TUNE:" << MESSAGE::cReset() << " look-ahead off for this run: one "
-                    << "partition (~" << report.perPartition/1.e9 << " GB) plus the next one's tessellation (~"
-                    << report.lookAhead/1.e9 << " GB) does not fit the " << (budget - fixed)/1.e9 << " GB the "
-                    << "memory budget leaves beside the grids and particles; partitions are prepared in turn.\n"
-                    << MESSAGE::Flush;
-            u.psLookAheadOffBudget = true;
-            report.lookAhead = 0.;
-        }
-        report.predicted = base + report.lookAhead;
-        return report;
-    };
-    int const userC = u.maxConcurrent > 0 ? u.maxConcurrent : cores;
-    int const userN = u.partition.empty() ? 1 : int(u.partition[0]);
-
-    // The GPU kernels number a partition's sub-grid cells with 32 bits: a sub-grid above 2^32 cells
-    // (1626^3 unsplit) falls back to the CPU deposit (ps_interpolation.cc, averaged_interpolation_1.cc).
-    // With the GPU on, every split chosen below keeps the sub-grid under that cap -- the same crop +
-    // slop estimate as partitionBytes() -- so a very fine grid keeps its GPU deposit; a user's own
-    // split that does not is told which one would.
-    auto gpuSubCells = [&](int n) -> double
-    {
-        double c = 1.;
-        for (int d=0; d<NO_DIM; ++d)
-            c *= std::min( double(outGrid[d]), double(u.gridSize[d])/double(n) + 40. );
-        return c;
-    };
-    double const gpuCellCap = 4294967295.;            // UINT32_MAX
-    int nGpuMin = 1;
-    if ( metalActive )
-        while ( nGpuMin < 64 and gpuSubCells(nGpuMin) > gpuCellCap ) ++nGpuMin;
-    if ( metalActive and not autoPart and gpuSubCells(userN) > gpuCellCap )
-    {
-        MESSAGE::Warning warning( u.verboseLevel );
-        warning << "AUTO-TUNE: with --partition " << userN << " each partition's sub-grid holds ~" << gpuSubCells(userN)
-                << " cells, above the 2^32 the GPU kernels number: the deposit will run on the CPU. "
-                << "--partition " << nGpuMin << " (or finer) keeps it on the GPU.\n" << MESSAGE::EndWarning;
-    }
-
-    bool overBudget = false;   // set below; the split is then chosen once partitionBytes() exists
-    if ( fixed > budget )
-    {
-        double const gridBytes = scratchOn ? 0. : gridTotal*bCell;
-        // largest cubic grid whose accumulators still leave room for the particles and points
-        double const room = budget - particleBytes - ptsBytes;
-        long   const maxGrid = room > 0. ? long( std::cbrt( room / bCell ) ) : 0L;
-        MESSAGE::Warning warning( u.verboseLevel );
-        warning << "AUTO-TUNE: this run does not fit in memory, and --partition cannot fix it.\n  ";
-        if ( not scratchOn )
-            warning << "The full-resolution output grids need " << gridBytes/1.e9 << " GB ("
-                    << MESSAGE::printElements( u.gridSize, "x" ) << " cells x " << bCell << " B/cell for the "
-                    << "selected fields), plus ";
-        else
-            warning << "With the grids on scratch disk, ";
-        warning << (partBytes*N)/1.e9 << " GB of particles";
-        if ( nPts > 0 )
-            warning << " and " << ptsBytes/1.e9 << " GB for the " << double(nPts) << " --sample-points ("
-                    << ptsStreamsWhy << "; DTFE_AUTO_PTS_STREAMS overrides)";
-        warning << " = " << fixed/1.e9 << " GB, against a memory budget of " << budgetWhy << ".\n"
-                << "  --partition splits the TRIANGULATION only: every Lagrangian partition deposits into "
-                << "the same shared full-resolution grid and point set, so that part is irreducible.\n"
-                << "  Options: ";
-        if ( not scratchOn )
-            warning << "(a) '--scratch-dir <local dir>' backs the grids with disk instead of RAM "
-                    << "(needs ~" << gridBytes/1.e9 << " GB free on a local, non-synced volume, e.g. "
-                    << "/private/tmp/dtfe-scratch); ";
-        if ( maxGrid > 0 )
-            warning << "(b) a smaller --grid -- in RAM, the largest that fits at these fields is about "
-                    << maxGrid << "^3; ";
-        else
-            warning << "(b) a smaller --grid cannot help: the particles" << (nPts > 0 ? " and sample points" : "")
-                    << " alone exceed the budget; ";
-        warning << "(c) fewer --field entries (the gradient family costs 36 B/cell, "
-                << "dispersion 24 B/cell); ";
-        if ( nPts > 0 )
-            warning << "(d) fewer --sample-points (a smaller image plane) or no --pts-vel-grad; ";
-        warning << "(e) more RAM. NOTE: '--partNo'/'--region' are NOT a way out -- they crop particles by "
-                << "Eulerian position and are rejected by this binary because the PS tessellation is Lagrangian.\n"
-                << "  Running anyway with --max-concurrent 1 and the split with the smallest per-partition "
-                << "triangulation; expect swapping.\n" << MESSAGE::EndWarning;
-        if ( autoConc ) u.maxConcurrent = 1;
-        // A small particle set triangulates cheaply in one piece; otherwise fall through to the
-        // split choice below -- the old fallback, one UNPARTITIONED triangulation, put the whole
-        // tessellation (~100 GB for 94M particles) on top of an already over-budget run.
-        if ( N < minN or not autoPart )
-        {
-            int const nOne = autoPart ? nGpuMin : userN;      // one domain, or the GPU cap's split
-            if ( autoPart ) { u.partition.assign( NO_DIM, size_t(nOne) ); u.partitionOn = ( nOne > 1 ); }
-            return finishReport( nOne, autoConc ? 1 : userC );
-        }
-        overBudget = true;
-    }
-
-    // A small particle set triangulates cheaply in one piece -- unless that piece's DEPOSIT does not fit:
-    // on a very fine grid (1700^3 from 0.26M particles) one domain's sub-grid accumulators and the
-    // deposit threads' private copies are tens of GB, and only a split shrinks them. Such a run takes
-    // the memory-driven split below instead (it predicted 83 GB unsplit, over budget, before 2026-10-02).
-    bool const smallFits = not autoPart or fixed + snapshotBytes( std::max( 1, nGpuMin ) )
-                                           + partitionBytes( std::max( 1, nGpuMin ) ) <= budget;
-    if ( N < minN and smallFits )     // small particle set AND the grid fits: one domain, or a split for SPEED
-    {
-        if ( not autoPart )
-        {   // the user's split at the concurrency the report states: left unset, a hand-set '--partition 4 4 4'
-            // started all 64 partitions on a 10-core machine while the report said mc=10 (2026-10-08)
-            if ( autoConc ) u.maxConcurrent = cores;
-            return finishReport( userN, autoConc ? cores : userC );
-        }
-        // The one stage a split parallelises is the sequential triangulation (+ vertex densities):
-        // the deposit and the point evaluation already use every core inside one domain. A
-        // triangulation-bound run (a slice of a small box: 1.5 s of 3 s) therefore gains from
-        // 2^3 partitions, each triangulating a padded eighth on its own core; a deposit-bound one
-        // (a 256^3 grid at 0.26M particles: 1.5 s of 18 s) does not, and loses the padding.
-        // Predicted wall time per split, from per-unit costs measured on a 10-core Apple Silicon
-        // (single-thread seconds; DTFE_AUTO_T_VERTEX/_SAMPLE/_POINT override):
-        double tVertex = 3.6e-6, tSample = 3.5e-7, tPoint = 7.5e-7;
-        if ( const char *e = std::getenv("DTFE_AUTO_T_VERTEX") ) { double v = std::atof(e); if ( v > 0. ) tVertex = v; }
-        if ( const char *e = std::getenv("DTFE_AUTO_T_SAMPLE") ) { double v = std::atof(e); if ( v > 0. ) tSample = v; }
-        if ( const char *e = std::getenv("DTFE_AUTO_T_POINT") )  { double v = std::atof(e); if ( v > 0. ) tPoint = v; }
-        double fCopy = 1.;                              // the single domain's periodic copies (none without --periodic)
-        if ( u.periodic )
-            for (int d=0; d<NO_DIM; ++d) fCopy *= 1. + 2.*padFrac[d];
-        double const nSubCube = ( u.aField.selected() or psExact )
-                              ? std::pow( double(std::max( 1, psExact ? 3 : int(u.psAvgSubsamples) )), double(NO_DIM) ) : 1.;
-        double const depositWork = gridTotal * nSubCube * tSample + double(nPts) * tPoint;
-        auto predictedWall = [&](int n, int c) -> double
-        {
-            double const parts = double(n)*double(n)*double(n);
-            double fPad = 1.;
-            for (int d=0; d<NO_DIM; ++d) fPad *= 1. + 2.*autoTunePadWidths( u, padFrac[d], n, N, 0.3 );
-            double const rounds = std::ceil( parts / double(c) );
-            double const triangulate = ( n == 1 ? fCopy * N : fPad * N / parts ) * tVertex;
-            double const threads = ( n == 1 ) ? double(cores) : double(std::max( 1, cores / c ));
-            // a GPU deposit serialises on the one command queue: the split leaves it unchanged
-            // and adds each partition's buffer setup, extraction and leftover passes
-            double const deposit = metalActive ? depositWork / double(cores) : depositWork / parts / threads;
-            double const overhead = ( n == 1 ) ? 0. : parts * ( N * 5.e-9 + 0.02 + ( metalActive ? 0.1 : 0. ) );
-            return rounds * ( triangulate + deposit ) + overhead;
-        };
-        int bestN = 1, bestC = autoConc ? cores : userC;
-        double const single = predictedWall( 1, cores );
-        double bestT = single;
-        if ( nGpuMin > 1 )                  // the GPU's sub-grid cap rules out one domain
-        {
-            bestN = nGpuMin;
-            bestC = std::max( 1, std::min( { nGpuMin*nGpuMin*nGpuMin, cores,
-                                               int( std::floor( (budget - fixed - snapshotBytes(nGpuMin)) / partitionBytes(nGpuMin) ) ) } ) );
-            if ( not autoConc ) bestC = std::min( bestC, userC > 0 ? userC : cores );
-            bestT = predictedWall( nGpuMin, bestC );
-        }
-        for (int n = std::max( 2, nGpuMin ); n <= std::max( 3, nGpuMin ); ++n)
-        {
-            int c = std::min( n*n*n, cores );
-            int const cMem = int( std::floor( (budget - fixed - snapshotBytes(n)) / partitionBytes(n) ) );
-            if ( cMem < 1 ) continue;
-            c = std::min( c, cMem );
-            if ( not autoConc ) c = std::min( c, userC > 0 ? userC : cores );
-            double const t = predictedWall( n, c );
-            if ( t < 0.85 * bestT or ( bestN < nGpuMin ) ) { bestN = n; bestC = c; bestT = t; }   // a clear gain only
-        }
-        if ( bestN > 1 )
-        {
-            u.partition.assign( NO_DIM, size_t(bestN) );
-            u.partitionOn = true;
-            u.psOrderedMerge = true;   // uniform small partitions: merge in order, bit-reproducible at no cost
-            u.psSpeedSplit = true;     // ... and no memory gate (DTFE.cpp; 2026-10-14: its own flag, the ordered merge
-                                       // being every split's default now)
-            if ( autoConc ) u.maxConcurrent = bestC;
-            if ( bestN == nGpuMin and nGpuMin > 1 )
-                snprintf( buf, sizeof(buf),
-                          "%s grid on the GPU: --partition %d %d %d --max-concurrent %d keeps each partition's "
-                          "sub-grid under the 2^32 cells the GPU kernels number (~%.3g cells; predicted peak ~%.3g GB)",
-                          MESSAGE::printElements( u.gridSize, "x" ).c_str(), bestN, bestN, bestN, u.maxConcurrent,
-                          gpuSubCells(bestN), (fixed + snapshotBytes(bestN) + double(bestC)*partitionBytes(bestN))/1.e9 );
-            else
-                snprintf( buf, sizeof(buf),
-                          "%.3g particles: triangulation-bound, so --partition %d %d %d --max-concurrent %d "
-                          "(predicted %.2g s against %.2g s for one triangulation; predicted peak ~%.3g GB)",
-                          N, bestN, bestN, bestN, u.maxConcurrent, bestT, single,
-                          (fixed + snapshotBytes(bestN) + double(bestC)*partitionBytes(bestN))/1.e9 );
-            message << "\n" << MESSAGE::cBold() << "AUTO-TUNE:" << MESSAGE::cReset() << " " << buf << fxNote
-                    << ". Pass --partition 1 1 1 for one triangulation.\n" << MESSAGE::Flush;
-            return finishReport( bestN, autoConc ? bestC : userC );
-        }
-        return finishReport( 1, autoConc ? cores : userC );
-    }
-
-
-    if ( overBudget )
-    {
-        // over budget whatever we do (warned above): one partition at a time, split so that the
-        // partition in flight is as small as the padding allows -- partitionBytes() stops falling
-        // once the padding shells dominate, so take its minimum over the validated range
-        int bestN = std::max( 2, nGpuMin );
-        for (int n = bestN + 1; n <= std::max( 6, nGpuMin ); ++n)
-            if ( partitionBytes(n) < partitionBytes(bestN) ) bestN = n;
-        u.partition.assign( NO_DIM, size_t(bestN) );
-        u.partitionOn = true;
-        snprintf( buf, sizeof(buf),
-                  "%.3g particles, %s grid, %.3g GB RAM (budget %.3g GB) -> OVER BUDGET: --partition %d %d %d "
-                  "--max-concurrent %d (smallest partition, ~%.3g GB; predicted peak ~%.3g GB%s)",
-                  N, MESSAGE::printElements( u.gridSize, "x" ).c_str(), ramBytes/1.e9, budget/1.e9,
-                  bestN, bestN, bestN, u.maxConcurrent, partitionBytes(bestN)/1.e9,
-                  (fixed + snapshotBytes(bestN) + partitionBytes(bestN))/1.e9, metalActive ? ", GPU deposit" : "" );
-        message << "\n" << MESSAGE::cBold() << "AUTO-TUNE:" << MESSAGE::cReset() << " " << buf << fxNote
-                << ". Pass --partition/--max-concurrent to override.\n           memory budget: "
-                << budgetWhy << "\n" << MESSAGE::Flush;
-        return finishReport( bestN, autoConc ? 1 : userC );
-    }
-
-    // Concurrency target = the core count, GPU or not. The GPU deposits do serialize on one
-    // queue (ps_metal_host.cc ctxMutex), but the dominant per-partition cost is the CPU work
-    // AROUND them -- Lagrangian triangulation + vertex densities, ~7 s of an ~8 s partition at
-    // 2.1M particles / 256^3 -- which runs fully in parallel. A cap of 3 (the old rule) ran 8
-    // partitions in three waves: 21 s on the GPU vs 9.5 s on the CPU. Memory still bounds it:
-    // partitionBytes() counts the GPU buffers a waiting partition holds, and cMem caps c.
-    int const targetC = cores;
-
-    int bestN = -1, bestC = 0;
-    int const nLo = autoPart ? std::max( 2, nGpuMin ) : int(u.partition[0]);
-    int const nHi = autoPart ? std::max( 6, nGpuMin ) : int(u.partition[0]);   // <=6^3 keeps auto within validated territory (unless the GPU cap needs more)
-    for (int n=nLo; n<=nHi; ++n)
-    {
-        double const m = partitionBytes(n);
-        int cMem = int( std::floor( (budget - fixed - snapshotBytes(n)) / m ) );
-        int c = std::min( { targetC, n*n*n, cMem } );
-        if ( c > bestC or bestN<0 )
-        {
-            bestN = n;
-            bestC = c;
-        }
-        if ( c >= std::min(targetC, n*n*n) )
-            break;      // memory is not the binding constraint; smallest such n wins (fewest seams)
-    }
-    if ( bestC < 1 )
-    {
-        // 'fixed' fits (checked above), so this is the triangulation genuinely not fitting in
-        // what is left -- here the split IS the right lever, and the finest one is the best try.
-        bestC = 1;
-        bestN = nHi;
-        MESSAGE::Warning warning( u.verboseLevel );
-        warning << "AUTO-TUNE: even a single " << bestN << "^3-split partition's triangulation is predicted to "
-                << "exceed the " << (budget - fixed)/1.e9 << " GB left after the full-grid accumulators ("
-                << (gridTotal*bCell)/1.e9 << " GB) and particles (" << (partBytes*N)/1.e9 << " GB); running with "
-                << "--max-concurrent 1 at the finest split. Expect swapping; a finer --partition than "
-                << nHi << "^3 may still help.\n" << MESSAGE::EndWarning;
-    }
-
-    if ( autoPart )
-    {
-        u.partition.assign( NO_DIM, size_t(bestN) );
-        u.partitionOn = (bestN > 1);
-    }
-    if ( autoConc )
-        u.maxConcurrent = bestC;
-
-    // the concurrency the run WILL use: the tuner's, or the user's own (0 = all cores)
-    int const effC = autoConc ? bestC : userC;
-    // the report first: it decides whether the look-ahead fits the budget, and the message states its prediction
-    AutoTuneReport const decided = finishReport( bestN, effC );
-    double const predicted = decided.predicted;
-    char scratchNote[256] = "";
-    if ( scratchOn )
-        snprintf( scratchNote, sizeof(scratchNote), "; grid accumulators (%.3g GB) on scratch disk",
-                  gridTotal*bCell/1.e9 );
-    char ptsNote[320] = "";
-    if ( nPts > 0 )
-        snprintf( ptsNote, sizeof(ptsNote), "; %.3g sample points (%.3g GB: %s)",
-                  double(nPts), ptsBytes/1.e9, ptsStreamsWhy );
-    snprintf( buf, sizeof(buf),
-              "%.3g particles, %s grid, %.3g GB RAM (budget %.3g GB) -> --partition %d %d %d --max-concurrent %d "
-              "(predicted peak ~%.3g GB%s%s%s)",
-              N, MESSAGE::printElements( u.gridSize, "x" ).c_str(), ramBytes/1.e9, budget/1.e9,
-              int(u.partition[0]), int(u.partition[1]), int(u.partition[2]), u.maxConcurrent,
-              predicted/1.e9, metalActive ? ", GPU deposit" : "", scratchNote, ptsNote );
-    message << "\n" << MESSAGE::cBold() << "AUTO-TUNE:" << MESSAGE::cReset() << " " << buf << fxNote
-            << ". Pass --partition/--max-concurrent to override.\n           memory budget: "
-            << budgetWhy << "\n" << MESSAGE::Flush;
-    return decided;
-
-#else
-    // ---- standard DTFE: partitions are processed SERIALLY (memory knob); inside one partition
-    // the box is split across up to --max-concurrent threads (throughput knob). ----
-    // A '--region'/'--regionMpc' run is planned as what it triangulates (2026-10-13): DTFE_setup crops the region
-    // first and passes a copy of the options whose box IS the region, with N = the particles inside it (unpadded),
-    // so 'padFrac' above is the padding over the region's length -- the pairing a whole-box run has. (It was the
-    // whole snapshot's N and box: a launcher zoom of TNG50-3-Dark, 88k particles in its padded region, came out
-    // '--partition 3 3 3, 10 thread(s)' from 1.57e8.) The padded copies the crop holds are left out of 'fixed':
-    // 36 B each next to the ~700 B per vertex of the triangulation term, which counts them.
-    double const partBytes = double(sizeof(Particle_data));
-
-    /* '--sample-points' (2026-10-15; the PS model's term above, for the standard point evaluation): the query points
-       and their records are GLOBAL -- every partition appends the answers of the points in the tetrahedra it owns
-       (ps_point_eval.cc), and a '--partition' run keeps them all until psPointEvalFinalize, the checkpoint's
-       'points.<i>' files being copies on disk -- so a split does not shrink them: they are 'fixed'. Standard DTFE
-       answers each point ONCE (its one tetrahedron of the Eulerian tessellation, 0/1 coverage), so one record per point
-       where PS budgets its streams. The STORED record is packed (RecLayout): both densities + the velocity in doubles +
-       the 2-B caustic mask (40 + 2), + the density gradient (24) / velocity gradient (72) / scalars with
-       --pts-den-grad / --pts-vel-grad / --pts-scalar, + its uint32 point index and the uint64 locator finalize() groups
-       it by; per point its position (3 doubles), its bucket entry and finalize's offset and cursor; and the finalized
-       outputs (density, velocity, dispersion, stream count, + the gradients and scalars), allocated while the records
-       are still held. KEEP IN SYNC with ps_point_eval.cc and the PS term. DTFE_AUTO_PTS_N / DTFE_AUTO_PTS_VELGRAD=1
-       size a plane that does not exist yet (the launcher's memory check). Before this date the standard plan counted
-       no plane: a 4096^2 plane with '--pts-vel-grad' (scripts/thesis_runs.sh dtfe27planes) holds ~4.7 GB of it. */
-    size_t nPts = autoTuneSamplePointCount( u.psSamplePointsFile );
-    if ( const char *env = std::getenv("DTFE_AUTO_PTS_N") )
-    {
-        double const v = std::atof( env );
-        if ( v >= 0. ) nPts = size_t( v );
-    }
-    bool const ptsVelGrad = u.psPtsVelGrad
-                            or ( std::getenv("DTFE_AUTO_PTS_VELGRAD") and std::string( std::getenv("DTFE_AUTO_PTS_VELGRAD") ) == "1" );
-    double bPtsVar = ( u.psPtsDenGrad ? 3. * double(sizeof(double)) : 0. ) + ( ptsVelGrad ? 9. * double(sizeof(double)) : 0. )
-                   + ( u.psPtsScalar ? double(noScalarComp) * double(sizeof(double)) : 0. );
-    double const bStreamRec = 5. * double(sizeof(double)) + 2. + bPtsVar + 4. + 8.;
-    double const bPerPoint  = 3. * double(sizeof(double)) + 4. + 2. * 8.;
-    double const bPtsOut    = double(sizeof(double)) + 3. * double(sizeof(double)) + 6. * double(sizeof(double)) + 4. + bPtsVar;
-    double const ptsBytes   = double(nPts) * ( bPerPoint + bPtsOut + bStreamRec );
-    // ... and each point-walk thread fills one 16 MB block of records before it hands it over (HitSink), per partition
-    double const ptsWalkBytes = nPts > 0 ? double(std::thread::hardware_concurrency()) * double(16 << 20) : 0.;
-
-    // --scratch-dir: the full-grid accumulators are mmap-backed and leave the RAM model. (The process itself -- code,
-    // libraries, the GPU runtime: 66 MB of footprint, 84 MB with --gpu -- is left out, as in the PS model: it matters on
-    // sub-GB runs only, where it would make the tests' simulated small machines plan around it.)
-    double const fixed = partBytes*N + (u.scratchDir.empty() ? gridTotal*bCell : 0.) + ptsBytes;
-    // per padded vertex: the thread's particle copy (alive while its triangulation grows) + the triangulation, and 6%
-    // for the dummy points the padding test adds (stdBytesPerPaddedVertex, shared with the partition loop's look-ahead)
-    double const perVertex = stdBytesPerPaddedVertex( u );
-
-    /* The GPU deposit of the '_a' pass (averaged_interpolation_1.cc -> dtfe_metal_host.cc / dtfe_gpu_cuda.cu), the
-       same for the sampled and the exact average (see StdTuneDensity's comment): per tetrahedron of a thread's own box
-       the flat arrays (vertices 48, densities 16, velocities 48 when a velocity-derived '_a' grid is asked, the scalar
-       16, volume, sample count, flat index and Morton key 4 each), the Morton order pairs (8), one array's sort copy
-       (<= 48) and the work-item table (4) -- the arrays become the uploaded batch one at a time -- and per sub-grid
-       cell the per-call deposit's device grid and its host copy (bGpuCell each). The model before 2026-10-13 charged
-       6.77 x 120 B per PADDED vertex, i.e. as if every tetrahedron of the padding were extracted: only the ones
-       touching the thread's own box are. */
-    bool gpuVel = false, gpuScal = false;
-    double bGpuCell = 0.;
-    if ( metalActive and u.aField.selected() )
-    {
-        bool const den  = u.aField.density or u.aField.velocity_tweb;
-        bool const grad = u.aField.velocity_gradient or u.aField.selectedVelocityDerivatives();
-        gpuVel  = u.aField.velocity or grad;
-        gpuScal = u.aField.scalar or u.aField.scalar_gradient;
-        bGpuCell = ( den ? 4. : 0. ) + ( u.aField.velocity ? 12. : 0. ) + ( grad ? 36. : 0. )
-                 + ( u.aField.scalar ? 4. : 0. ) + ( u.aField.scalar_gradient ? 12. : 0. );
-    }
-    double const perTet = bGpuCell > 0. ? 80. + ( gpuVel ? 48. : 0. ) + ( gpuScal ? 16. : 0. ) + 8. + 48. + 4. : 0.;
-    double const tetsPerOwn = 6.77 * 1.3;           // per particle of the thread's own box, + the ones crossing its faces
-    /* The GPU deposit's host SNAPSHOT (2026-10-15; PS's snapshotBytes above). Since 2026-10-13 the standard deposit
-       resumes a failed command buffer from a checkpoint (dtfe_metal_host.cc runBatch, gpu_metal_retry.h GpuSnapshot):
-       it keeps a host copy of the batch's device grids, taken every ~10 s of GPU work, which the plan did not count.
-       Those grids are one thread sub-domain's (the per-call path: allocated under the device mutex, one batch at a
-       time), in 8-B fixed-point words per 4-B component since the exact sums of 2026-10-13 (4 B under
-       DTFE_METAL_FLOAT_GRIDS=1 / DTFE_GPU_FLOAT_GRIDS=1), so the run holds ONE such copy, of the largest sub-grid:
-       added once to the busiest partition's bytes (StdPlan::snapshot). (The partition CHECKPOINT itself,
-       partition_checkpoint.h, writes the full grids from where they are, allocating nothing; the partition's own
-       sub-grids are still alive then and already in its bytes.) */
-    auto envOn = [](char const *n) { char const *e = std::getenv( n ); return e and std::atoi( e ) != 0; };
-    double const snapWordFactor = ( envOn( "DTFE_METAL_FLOAT_GRIDS" ) or envOn( "DTFE_GPU_FLOAT_GRIDS" ) ) ? 1. : 2.;
-    // the look-ahead (DTFE.cpp, 2026-10-15) runs with the GPU deposit when more than one partition is computed
-    bool const lookAheadPossible = metalActive and bGpuCell > 0. and u.DTFE and u.method == 1
-                                   and not u.stdNoOverlap and not u.redshiftConeOn;
-
-    // the count grid of the particles (StdTuneDensity: one pass); without particles in memory, the uniform count
-    auto const tuneStart = std::chrono::steady_clock::now();
-    StdTuneDensity dens;
-    if ( particles != nullptr and not particles->empty() )
-        dens.build( *particles, u );
-    double const countSec = std::chrono::duration<double>( std::chrono::steady_clock::now() - tuneStart ).count();
-    // '--sample-points' evaluates ONE tessellation per partition (DTFE_parallel runs no thread split for it)
-    bool const oneTessellation = not u.psSamplePointsFile.empty();
-    double origin[NO_DIM], dxGrid[NO_DIM];
-    for (int d=0; d<NO_DIM; ++d)
-    {
-        origin[d] = double( u.boxCoordinates[2*d] );
-        dxGrid[d] = ( double( u.boxCoordinates[2*d+1] ) - origin[d] ) / double( u.gridSize[d] );
-    }
-    std::vector<size_t> const userSplit = ( not autoPart and u.partition.size() == size_t(NO_DIM) )
-                                        ? u.partition : std::vector<size_t>( NO_DIM, 1 );
-
-    // The busiest partition of a split (P per axis, or the user's own) with up to T threads in each: its bytes on top
-    // of 'fixed', the padded vertices its sub-triangulations hold, and those per thread (DTFE_AUTO_TUNE_DEBUG)
-    // (2026-10-15: + the GPU snapshot of its largest thread sub-grid, and the look-ahead's bytes: the tessellation stage
-    // of the partition that needs the most, which may be any partition's turn to be prepared ahead)
-    struct StdPlan { double bytes = 0., vertices = 0., snapshot = 0., aheadMax = 0.; int part = -1; size_t parts = 1;
-                     std::vector<double> perThread; };
-    std::map< std::pair<int,int>, StdPlan > plans;
-    User_options pgOptions = u;                     // parallelGrid reads the partition's own grid from it
-    pgOptions.verboseLevel = 0;                     // (and would say so for every plan)
-    auto planOf = [&](int P, int T) -> StdPlan const &
+    // the plan of P partitions per axis (or the user's split) with up to T threads each, computed once per pair
+    StdPlan const &planOf(int P, int T) const
     {
         int const threads = ( oneTessellation or T <= 1 ) ? 1 : std::min( T, cores );
         std::pair<int,int> const key( P, threads );
@@ -1956,7 +1109,7 @@ inline AutoTuneReport autoTunePartitioning(User_options &u,
             return ( nParts > 1. ? cells * bCellDeposit : 0. ) + ( nThreads > 1 ? cells * bCellDeposit : 0. )
                    + 2. * cells * bGpuCell; };
         if ( not dens.ok )
-        {   // every sub-box holds the box average (the model before 2026-10-13)
+        {   // every sub-box holds the box average (the uniform count)
             double const tSplit = std::pow( double(threads), 1. / double(NO_DIM) );
             double f = 1.;
             for (int d=0; d<NO_DIM; ++d) f *= 1. + 2.*padFrac[d]*double(partsP[d])*tSplit;
@@ -2032,25 +1185,29 @@ inline AutoTuneReport autoTunePartitioning(User_options &u,
             }
         }
         return plans.emplace( key, plan ).first->second;
-    };
+    }
 
+    AutoTuneReport chooseSplit();
+    AutoTuneReport reportSplit(int const bestP, int const bestT, bool const nothingFits);
+};
+
+// Searches the splits for the coarsest one that fits with the most threads (or, when none fits, the least demanding).
+inline AutoTuneReport AutoTuneStdPlanner::chooseSplit()
+{
     int const pLo = autoPart ? 1 : int(userSplit[0]);
     int const pHi = autoPart ? 6 : int(userSplit[0]);
     // the threads a partition may use: every core, or the user's --max-concurrent (0 = all threads)
     int const userT = u.maxConcurrent > 0 ? std::min( u.maxConcurrent, cores ) : cores;
     int const tMax = autoConc ? cores : userT;
-    /* Only a split that FITS competes (2026-10-12). The old rule let a T=1 split that did not fit win the
-       'T==bestT and P<bestP' tie, so whenever one thread was all any split allowed it returned the COARSEST split,
-       the one needing the most memory: TNG300-3-Dark z=0 at --padding 50 under a 36-38 GB budget printed
-       '--partition 1 1 1, 1 thread(s) (predicted peak ~591 GB)' with no warning, where --partition 6 6 6 with one
-       thread was predicted to fit. Every choice whose prediction fitted is unchanged (a T>1 split fits by
-       construction, and among fitting T=1 splits the coarsest still wins); when no split fits at all, the one
-       predicted to need the least memory is taken and a warning says so. A user's --max-concurrent is the thread
-       count a split is checked at (2026-10-13; it started at every core whatever the user gave). */
+    /* Only a split that FITS competes: a T=1 split that does not fit must not win the 'T==bestT and P<bestP' tie, or
+       whenever one thread is all any split allows the COARSEST split, the one needing the most memory, would be
+       returned. A T>1 split fits by construction, and among fitting T=1 splits the coarsest wins; when no split fits
+       at all, the one predicted to need the least memory is taken and a warning says so. A user's --max-concurrent is
+       the thread count a split is checked at. */
     int bestP = pHi, bestT = 0;
     int leastP = pHi;                      // the split with the smallest predicted peak, for the nothing-fits case
     int const tLeast = autoConc ? 1 : tMax;
-    // a plan's bytes on top of 'fixed': the busiest partition and the GPU snapshot (2026-10-15); the look-ahead is
+    // a plan's bytes on top of 'fixed': the busiest partition and the GPU snapshot; the look-ahead is
     // added once the split is chosen, as PS-DTFE's, and switched off when it does not fit (below)
     auto need = [&](int P, int T) { StdPlan const &pl = planOf( P, T ); return pl.bytes + pl.snapshot; };
     for (int P=pLo; P<=pHi; ++P)
@@ -2079,8 +1236,13 @@ inline AutoTuneReport autoTunePartitioning(User_options &u,
         bestP = leastP;
         bestT = tLeast;
     }
+    return reportSplit( bestP, bestT, nothingFits );
+}
 
-    /* The report (2026-10-13; it was PS-only, 'AUTO-TUNE-REPORT unsupported' here): the same line PS prints, so the
+// Fills the report of the chosen split, turns off a look-ahead that does not fit, and states the choice.
+inline AutoTuneReport AutoTuneStdPlanner::reportSplit(int const bestP, int const bestT, bool const nothingFits)
+{
+    /* The report: the same line PS prints, so the
        launcher's 'Check memory', run_dtfe.sh AUTO_TUNE_REPORT=1 and the SUMMARY's predicted-vs-measured line work for
        standard runs too. mc = the threads of a partition (its concurrent sub-triangulations); the partitions run one
        after the other. perPartition = the busiest partition's bytes on top of 'fixed'. */
@@ -2094,7 +1256,7 @@ inline AutoTuneReport autoTunePartitioning(User_options &u,
     report.streamsBudgeted = nPts > 0 ? 1. : 0.;
     report.perPartition = chosen.bytes;
     report.gpuSnapshot = chosen.snapshot;
-    // the look-ahead (DTFE.cpp, 2026-10-15): with the GPU deposit and more than one partition, the next partition's
+    // the look-ahead (DTFE.cpp): with the GPU deposit and more than one partition, the next partition's
     // particle copy and tessellations on top of the peak. A plan that fits without it but not with it runs without it
     // (stdLookAheadOffBudget, as PS-DTFE's psLookAheadOffBudget), and the prediction is then the plan's alone.
     report.lookAhead = ( lookAheadPossible and chosen.parts > 1 ) ? chosen.aheadMax : 0.;
@@ -2122,7 +1284,7 @@ inline AutoTuneReport autoTunePartitioning(User_options &u,
             std::fprintf( stderr, "\n" );
         }
 
-    // single domain with all threads fits: keep today's defaults (and stay silent)
+    // single domain with all threads fits: keep the defaults (and stay silent)
     if ( bestP==1 and bestT==cores )
         return report;
 
@@ -2160,27 +1322,1024 @@ inline AutoTuneReport autoTunePartitioning(User_options &u,
                 << "or --grid, or pass a finer --partition.\n" << MESSAGE::EndWarning;
     }
     return report;
+}
+#endif
+
+#ifdef PHASE_SPACE
+// The mean streams per sample point the plan budgets, and why: DTFE_AUTO_PTS_STREAMS, or estimated from the particles.
+inline void autoTunePSPointStreams(User_options &u, double const N, size_t const nPts,
+                                   std::vector<Particle_data> const *particles, AutoTuneReport &report,
+                                   double &ptsMeanStreams, char (&ptsStreamsWhy)[200])
+{
+    if ( const char *env = std::getenv("DTFE_AUTO_PTS_STREAMS") )
+    {
+        double const v = std::atof(env);
+        if ( v >= 1. )
+        {
+            ptsMeanStreams = v;
+            snprintf( ptsStreamsWhy, sizeof(ptsStreamsWhy), "%.3g streams/point from DTFE_AUTO_PTS_STREAMS", v );
+        }
+    }
+    else if ( nPts > 0 and particles != nullptr )
+    {
+        double boxLo[3], boxLen[3];
+        for (int d=0; d<3; ++d)
+        {
+            boxLo[d]  = double( u.boxCoordinates[2*d] );
+            boxLen[d] = double( u.boxCoordinates[2*d+1] ) - boxLo[d];
+        }
+        int patches = 0;
+        // the estimate is made on the points' own slab -- their bounding box, widened by one mean particle
+        // spacing per side -- not the whole box: the heavy tail sits in a few haloes a plane misses (TNG50-3-Dark
+        // z=0: box mean 17.98, a z2048 plane's '.pts_streams' 5.38). A points set that fills the box gets the box
+        // mean. DTFE_AUTO_PTS_BOXMEAN=1 forces the box-wide estimate.
+        double rLo[3], rHi[3];
+        bool haveRegion = false;
+        char const *boxMean = std::getenv( "DTFE_AUTO_PTS_BOXMEAN" );
+        if ( not ( boxMean and std::string(boxMean) == "1" ) and NO_DIM == 3 )
+        {
+            double pLo[NO_DIM], pHi[NO_DIM], bLo[NO_DIM], bLen[NO_DIM];
+            for (int d=0; d<NO_DIM; ++d) { bLo[d] = boxLo[d]; bLen[d] = boxLen[d]; }
+            if ( autoTuneSamplePointBounds( u.psSamplePointsFile, bLo, bLen, u.periodic, pLo, pHi ) )
+            {
+                double const spacing = std::cbrt( boxLen[0]*boxLen[1]*boxLen[2] / std::max( 1., N ) );
+                double vol = 1.;
+                for (int d=0; d<NO_DIM; ++d)
+                {
+                    rLo[d] = pLo[d] - spacing;
+                    rHi[d] = pHi[d] + spacing;
+                    if ( u.periodic and rHi[d] - rLo[d] >= boxLen[d] ) { rLo[d] = boxLo[d]; rHi[d] = boxLo[d] + boxLen[d]; }
+                    vol *= (rHi[d] - rLo[d]) / boxLen[d];
+                }
+                haveRegion = vol < 0.999;   // a points set that fills the box: the box mean is its slab's
+            }
+        }
+        double const est = psEstimateMeanStreams( *particles, boxLo, boxLen, u.periodic, &patches,
+                                                  haveRegion ? rLo : nullptr, haveRegion ? rHi : nullptr );
+        if ( est > 0. )
+        {
+            ptsMeanStreams = std::max( 1., 1. + 2.*(est - 1.) );
+            report.streamsEstimate = est;
+            snprintf( ptsStreamsWhy, sizeof(ptsStreamsWhy),
+                      "%.2f streams/point estimated from %d Lagrangian patches%s, budgeted as %.2f", est, patches,
+                      haveRegion ? " on the points' slab" : "", ptsMeanStreams );
+        }
+    }
+}
+
+// The bytes the '--sample-points' structures hold: per point its position and outputs, and its per-stream records.
+inline double autoTunePSPointBytes(User_options &u, size_t const nPts, bool const ptsVelGrad,
+                                   double const ptsMeanStreams)
+{
+    // The STORED per-stream record is packed (ps_point_eval.cc RecLayout): denGeo + denDtfe +
+    // vel[3] doubles + the 2-B caustic mask = 42 B, plus grad[3] / vgrad[9] doubles / ids[4]
+    // uint64 only with --pts-den-grad / --pts-vel-grad / --per-stream-ids. KEEP IN SYNC.
+    double bStreamRec = 5. * double(sizeof(double)) + 2.;
+    if ( u.psPtsDenGrad )   bStreamRec += 3. * double(sizeof(double));
+    if ( ptsVelGrad )       bStreamRec += 9. * double(sizeof(double));
+    if ( u.psPerStreamIds ) bStreamRec += 4. * 8.;
+    if ( u.psPtsScalar )    bStreamRec += double(noScalarComp) * double(sizeof(double));
+    if ( u.psPtsLagrangian ) bStreamRec += 3. * double(sizeof(double));
+    // ... stored as uint32 point index + the packed record in blocks, and grouped at finalize by
+    // one uint64 locator per record (ps_point_eval.cc HitSink / psPointEvalFinalize)
+    bStreamRec += 4. + 8.;
+    // per-point: pos (3 doubles) + bucketPts (uint32) + finalize's offsets and cursor (2 uint64)
+    double const bPerPoint = 3. * double(sizeof(double)) + 4. + 2. * 8.;
+    // finalized outputs, allocated while the records are still being drained
+    double bPtsOut = double(sizeof(double))            // outDen
+                   + 3. * double(sizeof(double))       // outVel
+                   + 6. * double(sizeof(double))       // outDisp
+                   + 4.;                               // outStreams (int32)
+    if ( u.psPtsDenGrad ) bPtsOut += 3. * double(sizeof(double));
+    if ( ptsVelGrad ) bPtsOut += 9. * double(sizeof(double));
+    if ( u.psPerStream )  bPtsOut += ptsMeanStreams * 4. * double(sizeof(double));   // ragged records
+    if ( u.psPtsScalar )  bPtsOut += double(noScalarComp) * double(sizeof(double))
+                                     * (1. + (u.psPerStream ? ptsMeanStreams : 0.));   // point + per-stream scalars
+    if ( u.psPtsLagrangian ) bPtsOut += ptsMeanStreams * 3. * double(sizeof(double));  // per-stream q(x)
+    return double(nPts) * (bPerPoint + bPtsOut + ptsMeanStreams * bStreamRec);
+}
+
+// Warns when the '--scratch-dir' volume cannot hold the full-grid accumulators.
+inline void autoTuneScratchSpaceCheck(User_options &u, bool const scratchOn, double const gridTotal, double const bCell)
+{
+    if ( scratchOn )
+    {
+        struct statvfs vfs;
+        if ( statvfs(u.scratchDir.c_str(), &vfs) == 0 )
+        {
+            double const freeBytes = double(vfs.f_bavail) * double(vfs.f_frsize);
+            double const need = gridTotal*bCell;
+            if ( need * 1.05 + 2.e9 > freeBytes )
+            {
+                MESSAGE::Warning warning( u.verboseLevel );
+                warning << "AUTO-TUNE: the scratch volume cannot hold this run's grids: '"
+                        << u.scratchDir << "' has " << freeBytes/1.e9 << " GB free but the "
+                        << "full-resolution accumulators need ~" << need/1.e9 << " GB ("
+                        << MESSAGE::printElements( u.gridSize, "x" ) << " cells x " << bCell
+                        << " B/cell). The allocator will fall back to the heap when the disk "
+                        << "runs out -- expect swapping. Free up space, use a bigger volume, or "
+                        << "reduce --grid / --field.\n" << MESSAGE::EndWarning;
+            }
+        }
+    }
+}
+
+// The bytes per sub-grid cell of one CPU deposit thread's private copy: the larger pass's grids that are not
+// fixed-point sums.
+inline double autoTunePSCopyCell(User_options &u, AutoTunePS &ps, bool const momFx)
+{
+    double copyCell = 0.;
+    for (Field *f : { &u.uField, &u.aField })
+    {
+        if ( not f->selected() ) continue;
+        double const R = double(sizeof(Real));
+        bool const massFx = ps.phaseSpace and sizeof(Real) == 4 and ( f->density or f->velocity_tweb );   // as fxCell
+        double const fxPass = ( ps.phaseSpace and sizeof(Real) == 4 and momFx ) ? autoTuneFxMomentBytes(*f, ps) : 0.;
+        copyCell = std::max( copyCell, autoTuneBytesPerCell(*f, ps, 0) - autoTunePSCountBytes(*f, ps, 0)
+                                       - ( massFx ? R : 0. ) - fxPass );
+    }
+    return copyCell;
+}
+
+/* The PS-DTFE plan once its inputs are known (autoTunePartitioning): references to them, the memory model of a split
+   (partitionBytes, oneDomainPeak, snapshotBytes, lookAheadBytes), the report of a choice (finishReport) and the
+   phases that choose the split (choose). */
+struct AutoTunePSPlanner
+{
+    User_options &u;
+    bool const &metalActive;
+    bool const &autoPart;
+    bool const &userPartitionOn;
+    bool const &autoConc;
+    AutoTuneReport &report;
+    double &minN;
+    double const &N;
+    double const &ramBytes;
+    std::string &budgetWhy;
+    double const &budget;
+    int const &cores;
+    size_t (&outGrid)[NO_DIM];
+    double &gridTotal;
+    AutoTunePS &ps;
+    double const &bCellDeposit;
+    double const &bCell;
+    std::string const &fxNote;
+    double (&padFrac)[NO_DIM];
+    MESSAGE::Message &message;
+    char (&buf)[512];
+    double const &kDT;
+    double const &partBytes;
+    double const &kParInsert;
+    bool const &scratchOn;
+    size_t &nPts;
+    char (&ptsStreamsWhy)[200];
+    double const &ptsBytes;
+    double const &particleBytes;
+    double const &fixed;
+    bool const &psVel;
+    bool const &psDisp;
+    bool const &psGrad;
+    bool const &psExact;
+    bool const &momFx;
+    double const &gridB;
+    bool const &psDensity;
+    double const &fxCell;
+    double const &fxMom;
+    double &copyCell;
+    double const &threadScratch;
+
+    // ONE DOMAIN on the CPU ('--partition 1 1 1', or one domain picked here: partitionOn false): the triangulation
+    // deposits straight into the run's own grids (DTFE_interpolation: no reserveMemory, sub-grid or addFromSubgrid),
+    // so the grids 'fixed' books are the deposit's own; partitionBytes(1) would book them twice (copyOne) and every
+    // grid's conversion at once (38.8 GB for a 768^3 run that peaks at 22.9). Modelled per pass (u, then a), in
+    // ps_interpolation.cc's order: during the loop the fixed-point words (the density's 8 B, each moment grid's 2 x
+    // its Real bytes), the int stream count, the flags and the Real accumulators that are not fixed-point sums; after
+    // it each moment grid's Real grid beside its words, the words freed grid by grid (psFxToReal), then the density
+    // from the mass words; then the export grids ('.streams' or '.tetTouch', '.hidden_streams', the caustic bits, the
+    // volume-weighted dispersion's density copy).
+    // A freed block under 4 GiB stays in the footprint (macOS's allocator keeps it, serving later requests of at
+    // least half its size), so the export grids pile on top of freed words smaller than that; the next pass reuses
+    // what the previous one freed, and the derived fields come last. Bytes, for 'cells' sub-grid cells.
+    double oneDomainPeak(double const cells) const
+    {
+        double const B4 = 4294967296.;          // the allocator returns a freed block of this size or more
+        double const R = double(sizeof(Real));
+        bool const fxOn = ps.phaseSpace and sizeof(Real) == 4 and momFx;
+        double live = 0., kept = 0., peak = 0.;
+        auto alloc = [&](double const b) { live += b*cells; peak = std::max( peak, live + kept ); };
+        auto release = [&](double const b) { live -= b*cells; if ( b*cells < B4 ) kept += b*cells; };
+        for (Field *f : { &u.uField, &u.aField })
+        {
+            if ( not f->selected() ) continue;
+            bool const massFx = ps.phaseSpace and sizeof(Real) == 4 and ( f->density or f->velocity_tweb );   // fxCell
+            std::vector<double> const G = fxOn ? autoTuneFxGrids(*f, ps) : std::vector<double>();
+            double sumG = 0.;
+            for (double const g : G) sumG += g;
+            double const mask = ps.caustics ? double(sizeof(PSCausticClass::CausticMask)) : 0.;
+            double const E = R + R + ( ps.caustics ? R : 0. )                                    // the export grids
+                           + ( ( ps.volumeWeighted and f->velocity_dispersion and massFx ) ? R : 0. );
+            // the loop's temporaries: the pass's slots, less the grids made after it, plus the words and the int count
+            double const pre = autoTuneBytesPerCell(*f, ps, 0) - E - sumG - ( massFx ? R : 0. )
+                             + 2.*sumG + ( massFx ? 8. : 0. ) + double(sizeof(int));
+            double const reuse = std::min( kept, pre*cells );   // ... in what the previous pass freed
+            kept -= reuse;
+            live += pre*cells;
+            peak = std::max( peak, live + kept );
+            for (double const g : G) { alloc( g ); release( 2.*g ); }
+            if ( massFx ) { alloc( R ); release( 8. ); }
+            alloc( E );
+            release( double(sizeof(int)) + 2. + mask );   // the int count, the flags, the caustic mask (pass end)
+        }
+        // the derived fields and the T-web stage come on top of what the passes left
+        alloc( autoTuneDerivedBytes(u.uField) + autoTuneDerivedBytes(u.aField) );
+        return peak;
+    }
+
+    // per-partition bytes for an n^3 Lagrangian split
+    double partitionBytes(int n) const
+    {
+        double const nOwn = N / double(n)/double(n)/double(n);
+        double fPad = 1.;
+        for (int d=0; d<NO_DIM; ++d)
+            fPad *= 1. + 2.*autoTunePadWidths( u, padFrac[d], n, N, 0.3 );   // k spacings, or the Eulerian rule's 0.3-cell floor (DTFE.cpp)
+        double const nPad = nOwn * fPad;
+        double m = nPad * (partBytes + kDT + kParInsert);   // particle copy coexists with the growing triangulation
+        // '--sample-points': each worker fills a LOCAL hits buffer (pair<uint32,StreamRec>,
+        // padded to 176 B) and merges it under the mutex at the end, so this part DOES scale
+        // down with a finer split -- roughly this partition's share of the total records.
+        if ( nPts > 0 )
+            m += double(std::thread::hardware_concurrency()) * double(16 << 20);   // one HitSink block per thread
+        // Eulerian sub-grid this partition allocates (psUseSubgrid). A Lagrangian sub-box maps to
+        // a DISPLACED, distorted Eulerian region, so the crop is the touched span + slop -- valid
+        // on both periodic and non-periodic runs since ps_interpolation.cc crops a periodic
+        // axis to its WRAPPED span instead of keeping the whole axis.
+        double subCells = 1.;
+        for (int d=0; d<NO_DIM; ++d)
+            subCells *= std::min( double(outGrid[d]),
+                                  double(u.gridSize[d])/double(n) + 40. );   // crop + slop, never above the axis (nor the window)
+        if ( metalActive )
+        {
+            // flat tet arrays (the 16-float record 64 + masses 4 + the finite-cell ordinal 4 B/tet,
+            // + vels 48 when velocity-derived grids are requested; the cost-sort permutes IN PLACE,
+            // so no gather copy) + the PSGpuGrids host and device copies of the selected grids
+            double const perTet = (72. + (psVel or psDisp or psGrad ? 48. : 0.)) * 1.3;   // + allocator slack
+            // gridB (above): every buffer in PSGpuGrids, mirrored host+device (the x2 below)
+            // + 4 B/cell: the device's mass grid is a 64-bit fixed-point sum (ps_metal_host.cc)
+            // + 4 B/cell more on the host, which receives those 8 B words instead of a 4 B float
+            //   grid (PSGpuGrids::massFx) -- unless a density is selected: the caller then allocates its density
+            //   sub-grid (4 B; 8 in the double build) only after the call, from the words, so the peak (the
+            //   copy-back) is no higher than a float grid's
+            double const hostFx = ( ps.phaseSpace and not psDensity ) ? 4. : 0.;
+            m += perTet*6.77*nOwn + 2.*gridB*subCells + (4. + hostFx)*subCells;
+            // --ps-exact-deposit runs depositExactItems (ps_metal_host.cc): a per-tet weight total
+            // (4 B) + the item list, 8 B per 16 cells of a tet's bbox window -- ~20x the tet's
+            // volume in cells on the crossed-waves benchmark, at least one item -- capped at 32M items
+            if ( psExact )
+            {
+                double const nTet = 6.77*nOwn;
+                // --ps-window: items cover only the window's cells (the hull of each tet's bbox with
+                // the window), so the window's cell count sets the items, not the virtual full grid
+                double gridCells = 1.;
+                for (int d=0; d<NO_DIM; ++d) gridCells *= double(outGrid[d]);
+                double const cellsPerTet = gridCells / (6.*double(N));
+                // (the weight totals are two 4 B words per tet: an exact per-tet sum)
+                m += (momFx ? 8. : 4.)*nTet + 8.*std::min( 32.e6, nTet*(1. + 20.*cellsPerTet/16.) );
+            }
+        }
+        else
+        {
+            // CPU deposit sub-grids + the deposit threads' private copies, as many as the copy budget allows, unless
+            // that leaves fewer than half the threads: the deposit then runs in SLAB mode (ps_interpolation.cc, the
+            // same rule) with no copies, holding a cell handle, a first-slab byte and ~2 slab-list entries per tet
+            // (+ the binning arrays). The fixed-point words (fxCell, fxMom) count during the deposit, and again at
+            // their conversion after the loop only where that exceeds the copies or slab lists, freed by then. A
+            // private copy holds neither the words nor the shared counts, flags and masks (countCell), so the default
+            // single build has copyPriv = 0 and every core in the copy mode, as ps_interpolation.cc's accBytes; only
+            // the float sums (double build, PS_METAL_FLOAT_MOMENTS=1) book copies.
+            double const copyOne = bCellDeposit*subCells;
+            double const copyPriv = std::max( 0., copyCell )*subCells;   // (copyCell above: one pass's copy)
+            int const copyThreads = copyPriv > 0.
+                ? std::min( cores, 1 + int( std::min( double(cores), psDepositThreadBytes() / copyPriv ) ) ) : cores;
+            double const slabBytes = 6.77 * nPad * ( 8. + 1. + 2.*4. + 20. );
+            double const helpers = 2 * copyThreads < cores ? slabBytes : double(copyThreads - 1) * copyPriv;
+            // One domain (oneDomainPeak above): its grids are 'fixed''s, so only what the deposit holds beyond them
+            // counts here, with the copies or slab lists and the threads' sample lists, all kept by the allocator
+            // once freed. A user's split such as '--partition 1 2 2' runs the partition path (userPartitionOn), and
+            // with --scratch-dir 'fixed' has no grid term: both keep the partition formula.
+            if ( n == 1 and not userPartitionOn and not scratchOn )
+                m += helpers + threadScratch + std::max( 0., oneDomainPeak( subCells ) - bCell*subCells );
+            else
+                m += copyOne + (fxCell + fxMom)*subCells + std::max( helpers, (fxCell + fxMom)*subCells );
+        }
+        return m;
+    }
+
+    // The GPU deposit's host snapshot (ps_metal_host.cc GpuSnapshot): to resume a failed command buffer
+    // the deposit keeps a host copy of every buffer its kernel writes -- the device grids (gridB, with the 8 B
+    // fixed-point mass for the 4 B float one: +4 B/cell), the per-tet masses (4 B/tet) and the exact items' weight
+    // totals (4 B/tet) -- taken at each pass's start and every ~10 s of GPU work. It is ~4.7 GB per
+    // partition at 1024^3 split 2^3 (volume-weighted velocity), past the gate's 4 GB headroom. Not in
+    // partitionBytes(): the deposits run one at a time (ctxMutex), so whatever the concurrency there is ONE such
+    // copy, added once to every plan below. (The CUDA port keeps none yet: there it is slack; the model errs high.)
+    double snapshotBytes(int n) const
+    {
+        if ( not metalActive ) return 0.;
+        double subCells = 1.;   // the same crop + slop as partitionBytes()
+        for (int d=0; d<NO_DIM; ++d)
+            subCells *= std::min( double(outGrid[d]), double(u.gridSize[d])/double(n) + 40. );
+        double const nTet = 6.77 * N / double(n)/double(n)/double(n);
+        return (gridB + 4.)*subCells + (psExact ? (momFx ? 12. : 8.) : 4.)*nTet;
+    }
+
+    // The partition look-ahead (DTFE.cpp): at one partition in flight with the GPU deposit, the NEXT
+    // partition's particle copy + tessellation are built during the deposit -- one more partition's
+    // triangulation stage on top of the peak (the run skips a look-ahead the free memory cannot hold)
+    double lookAheadBytes(int n, int c) const
+    {
+        if ( not metalActive or u.psNoOverlap or u.psLookAheadOffBudget or c != 1 or n <= 1 ) return 0.;
+        double fPad = 1.;
+        for (int d=0; d<NO_DIM; ++d)
+            fPad *= 1. + 2.*autoTunePadWidths( u, padFrac[d], n, N, 0.3 );
+        return N / double(n)/double(n)/double(n) * fPad * (partBytes + kDT + kParInsert);
+    }
+
+    // what a given split and concurrency cost; the concurrency the run WILL use (0 = all cores)
+    AutoTuneReport finishReport(int n, int c)
+    {
+        report.valid = true;
+        report.partition = std::max( n, 1 );
+        report.maxConcurrent = std::max( c, 1 );
+        // partitions in flight: never more than there are (one domain x 10 threads is ONE domain, not ten)
+        int const inFlight = std::min( report.maxConcurrent, report.partition*report.partition*report.partition );
+        report.perPartition = partitionBytes( report.partition );
+        report.gpuSnapshot = snapshotBytes( report.partition );   // once: the GPU deposits run one at a time
+        double const base = fixed + report.gpuSnapshot + double(inFlight) * report.perPartition;
+        report.lookAhead = lookAheadBytes( report.partition, inFlight );
+        // the split above is chosen without the look-ahead; adding it here anyway would make a plan that fits
+        // report over_budget=1 (the launcher's memory check would halve a plane that fits) and run past a
+        // budget set on purpose. Every return passes here, so this is where the
+        // plan, its prediction and the run are made to agree: a look-ahead that does not fit beside one
+        // partition is switched off for this run (DTFE.cpp reads psLookAheadOffBudget), and the prediction
+        // is then the grids + particles + one partition. Over budget anyway, the look-ahead only adds to it.
+        if ( report.lookAhead > 0. and base + report.lookAhead > budget )
+        {
+            message << MESSAGE::cBold() << "AUTO-TUNE:" << MESSAGE::cReset() << " look-ahead off for this run: one "
+                    << "partition (~" << report.perPartition/1.e9 << " GB) plus the next one's tessellation (~"
+                    << report.lookAhead/1.e9 << " GB) does not fit the " << (budget - fixed)/1.e9 << " GB the "
+                    << "memory budget leaves beside the grids and particles; partitions are prepared in turn.\n"
+                    << MESSAGE::Flush;
+            u.psLookAheadOffBudget = true;
+            report.lookAhead = 0.;
+        }
+        report.predicted = base + report.lookAhead;
+        return report;
+    }
+
+    // the cells of a partition's sub-grid in an n^3 split (the crop + slop of partitionBytes())
+    double gpuSubCells(int n) const
+    {
+        double c = 1.;
+        for (int d=0; d<NO_DIM; ++d)
+            c *= std::min( double(outGrid[d]), double(u.gridSize[d])/double(n) + 40. );
+        return c;
+    }
+
+    AutoTuneReport choose();
+    std::optional<AutoTuneReport> irreducibleCase(int const userC, int const userN, int const nGpuMin,
+                                                  bool &overBudget);
+    std::optional<AutoTuneReport> smallSetCase(int const userC, int const userN, int const nGpuMin);
+    std::optional<AutoTuneReport> overBudgetCase(int const userC, int const nGpuMin, bool const overBudget);
+    AutoTuneReport memorySplit(int const userC, int const nGpuMin);
+};
+
+// Chooses the split and the concurrency: the GPU's sub-grid cap, then the first case that decides -- the irreducible
+// term over budget, a small particle set, over budget at any split, else the memory-driven split.
+inline AutoTuneReport AutoTunePSPlanner::choose()
+{
+    int const userC = u.maxConcurrent > 0 ? u.maxConcurrent : cores;
+    int const userN = u.partition.empty() ? 1 : int(u.partition[0]);
+
+    // The GPU kernels number a partition's sub-grid cells with 32 bits: a sub-grid above 2^32 cells
+    // (1626^3 unsplit) falls back to the CPU deposit (ps_interpolation.cc, averaged_interpolation_1.cc).
+    // With the GPU on, every split chosen below keeps the sub-grid under that cap -- the same crop +
+    // slop estimate as partitionBytes() -- so a very fine grid keeps its GPU deposit; a user's own
+    // split that does not is told which one would.
+    double const gpuCellCap = 4294967295.;            // UINT32_MAX
+    int nGpuMin = 1;
+    if ( metalActive )
+        while ( nGpuMin < 64 and gpuSubCells(nGpuMin) > gpuCellCap ) ++nGpuMin;
+    if ( metalActive and not autoPart and gpuSubCells(userN) > gpuCellCap )
+    {
+        MESSAGE::Warning warning( u.verboseLevel );
+        warning << "AUTO-TUNE: with --partition " << userN << " each partition's sub-grid holds ~" << gpuSubCells(userN)
+                << " cells, above the 2^32 the GPU kernels number: the deposit will run on the CPU. "
+                << "--partition " << nGpuMin << " (or finer) keeps it on the GPU.\n" << MESSAGE::EndWarning;
+    }
+
+    bool overBudget = false;   // set below; the split is then chosen once partitionBytes() exists
+    if ( auto const r = irreducibleCase( userC, userN, nGpuMin, overBudget ) ) return *r;
+    if ( auto const r = smallSetCase( userC, userN, nGpuMin ) ) return *r;
+    if ( auto const r = overBudgetCase( userC, nGpuMin, overBudget ) ) return *r;
+    return memorySplit( userC, nGpuMin );
+}
+
+// The irreducible term (grids + particles + points) over budget: warns, and decides for a small set or a user's split.
+inline std::optional<AutoTuneReport> AutoTunePSPlanner::irreducibleCase(int const userC, int const userN,
+                                                                         int const nGpuMin, bool &overBudget)
+{
+    if ( fixed > budget )
+    {
+        double const gridBytes = scratchOn ? 0. : gridTotal*bCell;
+        // largest cubic grid whose accumulators still leave room for the particles and points
+        double const room = budget - particleBytes - ptsBytes;
+        long   const maxGrid = room > 0. ? long( std::cbrt( room / bCell ) ) : 0L;
+        MESSAGE::Warning warning( u.verboseLevel );
+        warning << "AUTO-TUNE: this run does not fit in memory, and --partition cannot fix it.\n  ";
+        if ( not scratchOn )
+            warning << "The full-resolution output grids need " << gridBytes/1.e9 << " GB ("
+                    << MESSAGE::printElements( u.gridSize, "x" ) << " cells x " << bCell << " B/cell for the "
+                    << "selected fields), plus ";
+        else
+            warning << "With the grids on scratch disk, ";
+        warning << (partBytes*N)/1.e9 << " GB of particles";
+        if ( nPts > 0 )
+            warning << " and " << ptsBytes/1.e9 << " GB for the " << double(nPts) << " --sample-points ("
+                    << ptsStreamsWhy << "; DTFE_AUTO_PTS_STREAMS overrides)";
+        warning << " = " << fixed/1.e9 << " GB, against a memory budget of " << budgetWhy << ".\n"
+                << "  --partition splits the TRIANGULATION only: every Lagrangian partition deposits into "
+                << "the same shared full-resolution grid and point set, so that part is irreducible.\n"
+                << "  Options: ";
+        if ( not scratchOn )
+            warning << "(a) '--scratch-dir <local dir>' backs the grids with disk instead of RAM "
+                    << "(needs ~" << gridBytes/1.e9 << " GB free on a local, non-synced volume, e.g. "
+                    << "/private/tmp/dtfe-scratch); ";
+        if ( maxGrid > 0 )
+            warning << "(b) a smaller --grid -- in RAM, the largest that fits at these fields is about "
+                    << maxGrid << "^3; ";
+        else
+            warning << "(b) a smaller --grid cannot help: the particles" << (nPts > 0 ? " and sample points" : "")
+                    << " alone exceed the budget; ";
+        warning << "(c) fewer --field entries (the gradient family costs 36 B/cell, "
+                << "dispersion 24 B/cell); ";
+        if ( nPts > 0 )
+            warning << "(d) fewer --sample-points (a smaller image plane) or no --pts-vel-grad; ";
+        warning << "(e) more RAM. NOTE: '--partNo'/'--region' are NOT a way out -- they crop particles by "
+                << "Eulerian position and are rejected by this binary because the PS tessellation is Lagrangian.\n"
+                << "  Running anyway with --max-concurrent 1 and the split with the smallest per-partition "
+                << "triangulation; expect swapping.\n" << MESSAGE::EndWarning;
+        if ( autoConc ) u.maxConcurrent = 1;
+        // A small particle set triangulates cheaply in one piece; otherwise fall through to the
+        // split choice below -- one UNPARTITIONED triangulation would put the whole
+        // tessellation (~100 GB for 94M particles) on top of an already over-budget run.
+        if ( N < minN or not autoPart )
+        {
+            int const nOne = autoPart ? nGpuMin : userN;      // one domain, or the GPU cap's split
+            if ( autoPart ) { u.partition.assign( NO_DIM, size_t(nOne) ); u.partitionOn = ( nOne > 1 ); }
+            return finishReport( nOne, autoConc ? 1 : userC );
+        }
+        overBudget = true;
+    }
+    return std::nullopt;
+}
+
+// A small particle set that fits: the user's split, one domain, or a split for speed from the time model.
+inline std::optional<AutoTuneReport> AutoTunePSPlanner::smallSetCase(int const userC, int const userN,
+                                                                      int const nGpuMin)
+{
+    // A small particle set triangulates cheaply in one piece -- unless that piece's DEPOSIT does not fit:
+    // on a very fine grid (1700^3 from 0.26M particles) one domain's sub-grid accumulators and the
+    // deposit threads' private copies are tens of GB, and only a split shrinks them. Such a run takes
+    // the memory-driven split below instead (unsplit it is predicted at 83 GB, over budget).
+    bool const smallFits = not autoPart or fixed + snapshotBytes( std::max( 1, nGpuMin ) )
+                                           + partitionBytes( std::max( 1, nGpuMin ) ) <= budget;
+    if ( N < minN and smallFits )     // small particle set AND the grid fits: one domain, or a split for SPEED
+    {
+        if ( not autoPart )
+        {   // the user's split at the concurrency the report states: left unset, a hand-set '--partition 4 4 4'
+            // would start all 64 partitions on a 10-core machine while the report says mc=10
+            if ( autoConc ) u.maxConcurrent = cores;
+            return finishReport( userN, autoConc ? cores : userC );
+        }
+        // The one stage a split parallelises is the sequential triangulation (+ vertex densities):
+        // the deposit and the point evaluation already use every core inside one domain. A
+        // triangulation-bound run (a slice of a small box: 1.5 s of 3 s) therefore gains from
+        // 2^3 partitions, each triangulating a padded eighth on its own core; a deposit-bound one
+        // (a 256^3 grid at 0.26M particles: 1.5 s of 18 s) does not, and loses the padding.
+        // Predicted wall time per split, from per-unit costs measured on a 10-core Apple Silicon
+        // (single-thread seconds; DTFE_AUTO_T_VERTEX/_SAMPLE/_POINT override):
+        double tVertex = 3.6e-6, tSample = 3.5e-7, tPoint = 7.5e-7;
+        if ( const char *e = std::getenv("DTFE_AUTO_T_VERTEX") ) { double v = std::atof(e); if ( v > 0. ) tVertex = v; }
+        if ( const char *e = std::getenv("DTFE_AUTO_T_SAMPLE") ) { double v = std::atof(e); if ( v > 0. ) tSample = v; }
+        if ( const char *e = std::getenv("DTFE_AUTO_T_POINT") )  { double v = std::atof(e); if ( v > 0. ) tPoint = v; }
+        double fCopy = 1.;                              // the single domain's periodic copies (none without --periodic)
+        if ( u.periodic )
+            for (int d=0; d<NO_DIM; ++d) fCopy *= 1. + 2.*padFrac[d];
+        double const nSubCube = ( u.aField.selected() or psExact )
+                              ? std::pow( double(std::max( 1, psExact ? 3 : int(u.psAvgSubsamples) )), double(NO_DIM) ) : 1.;
+        double const depositWork = gridTotal * nSubCube * tSample + double(nPts) * tPoint;
+        auto predictedWall = [&](int n, int c) -> double
+        {
+            double const parts = double(n)*double(n)*double(n);
+            double fPad = 1.;
+            for (int d=0; d<NO_DIM; ++d) fPad *= 1. + 2.*autoTunePadWidths( u, padFrac[d], n, N, 0.3 );
+            double const rounds = std::ceil( parts / double(c) );
+            double const triangulate = ( n == 1 ? fCopy * N : fPad * N / parts ) * tVertex;
+            double const threads = ( n == 1 ) ? double(cores) : double(std::max( 1, cores / c ));
+            // a GPU deposit serialises on the one command queue: the split leaves it unchanged
+            // and adds each partition's buffer setup, extraction and leftover passes
+            double const deposit = metalActive ? depositWork / double(cores) : depositWork / parts / threads;
+            double const overhead = ( n == 1 ) ? 0. : parts * ( N * 5.e-9 + 0.02 + ( metalActive ? 0.1 : 0. ) );
+            return rounds * ( triangulate + deposit ) + overhead;
+        };
+        int bestN = 1, bestC = autoConc ? cores : userC;
+        double const single = predictedWall( 1, cores );
+        double bestT = single;
+        if ( nGpuMin > 1 )                  // the GPU's sub-grid cap rules out one domain
+        {
+            bestN = nGpuMin;
+            bestC = std::max( 1, std::min( { nGpuMin*nGpuMin*nGpuMin, cores,
+                                               int( std::floor( (budget - fixed - snapshotBytes(nGpuMin)) / partitionBytes(nGpuMin) ) ) } ) );
+            if ( not autoConc ) bestC = std::min( bestC, userC > 0 ? userC : cores );
+            bestT = predictedWall( nGpuMin, bestC );
+        }
+        for (int n = std::max( 2, nGpuMin ); n <= std::max( 3, nGpuMin ); ++n)
+        {
+            int c = std::min( n*n*n, cores );
+            int const cMem = int( std::floor( (budget - fixed - snapshotBytes(n)) / partitionBytes(n) ) );
+            if ( cMem < 1 ) continue;
+            c = std::min( c, cMem );
+            if ( not autoConc ) c = std::min( c, userC > 0 ? userC : cores );
+            double const t = predictedWall( n, c );
+            if ( t < 0.85 * bestT or ( bestN < nGpuMin ) ) { bestN = n; bestC = c; bestT = t; }   // a clear gain only
+        }
+        if ( bestN > 1 )
+        {
+            u.partition.assign( NO_DIM, size_t(bestN) );
+            u.partitionOn = true;
+            u.psOrderedMerge = true;   // uniform small partitions: merge in order, bit-reproducible at no cost
+            u.psSpeedSplit = true;     // ... and no memory gate (DTFE.cpp; its own flag, the ordered merge
+                                       // being every split's default)
+            if ( autoConc ) u.maxConcurrent = bestC;
+            if ( bestN == nGpuMin and nGpuMin > 1 )
+                snprintf( buf, sizeof(buf),
+                          "%s grid on the GPU: --partition %d %d %d --max-concurrent %d keeps each partition's "
+                          "sub-grid under the 2^32 cells the GPU kernels number (~%.3g cells; predicted peak ~%.3g GB)",
+                          MESSAGE::printElements( u.gridSize, "x" ).c_str(), bestN, bestN, bestN, u.maxConcurrent,
+                          gpuSubCells(bestN), (fixed + snapshotBytes(bestN) + double(bestC)*partitionBytes(bestN))/1.e9 );
+            else
+                snprintf( buf, sizeof(buf),
+                          "%.3g particles: triangulation-bound, so --partition %d %d %d --max-concurrent %d "
+                          "(predicted %.2g s against %.2g s for one triangulation; predicted peak ~%.3g GB)",
+                          N, bestN, bestN, bestN, u.maxConcurrent, bestT, single,
+                          (fixed + snapshotBytes(bestN) + double(bestC)*partitionBytes(bestN))/1.e9 );
+            message << "\n" << MESSAGE::cBold() << "AUTO-TUNE:" << MESSAGE::cReset() << " " << buf << fxNote
+                    << ". Pass --partition 1 1 1 for one triangulation.\n" << MESSAGE::Flush;
+            return finishReport( bestN, autoConc ? bestC : userC );
+        }
+        return finishReport( 1, autoConc ? cores : userC );
+    }
+    return std::nullopt;
+}
+
+// Over budget at any split: the split whose partition needs the least, one partition at a time.
+inline std::optional<AutoTuneReport> AutoTunePSPlanner::overBudgetCase(int const userC, int const nGpuMin,
+                                                                        bool const overBudget)
+{
+    if ( overBudget )
+    {
+        // over budget whatever we do (warned above): one partition at a time, split so that the
+        // partition in flight is as small as the padding allows -- partitionBytes() stops falling
+        // once the padding shells dominate, so take its minimum over the validated range
+        int bestN = std::max( 2, nGpuMin );
+        for (int n = bestN + 1; n <= std::max( 6, nGpuMin ); ++n)
+            if ( partitionBytes(n) < partitionBytes(bestN) ) bestN = n;
+        u.partition.assign( NO_DIM, size_t(bestN) );
+        u.partitionOn = true;
+        snprintf( buf, sizeof(buf),
+                  "%.3g particles, %s grid, %.3g GB RAM (budget %.3g GB) -> OVER BUDGET: --partition %d %d %d "
+                  "--max-concurrent %d (smallest partition, ~%.3g GB; predicted peak ~%.3g GB%s)",
+                  N, MESSAGE::printElements( u.gridSize, "x" ).c_str(), ramBytes/1.e9, budget/1.e9,
+                  bestN, bestN, bestN, u.maxConcurrent, partitionBytes(bestN)/1.e9,
+                  (fixed + snapshotBytes(bestN) + partitionBytes(bestN))/1.e9, metalActive ? ", GPU deposit" : "" );
+        message << "\n" << MESSAGE::cBold() << "AUTO-TUNE:" << MESSAGE::cReset() << " " << buf << fxNote
+                << ". Pass --partition/--max-concurrent to override.\n           memory budget: "
+                << budgetWhy << "\n" << MESSAGE::Flush;
+        return finishReport( bestN, autoConc ? 1 : userC );
+    }
+    return std::nullopt;
+}
+
+// The memory-driven split: the coarsest split whose concurrency the budget allows, and the AUTO-TUNE line stating it.
+inline AutoTuneReport AutoTunePSPlanner::memorySplit(int const userC, int const nGpuMin)
+{
+    // Concurrency target = the core count, GPU or not. The GPU deposits do serialize on one
+    // queue (ps_metal_host.cc ctxMutex), but the dominant per-partition cost is the CPU work
+    // AROUND them -- Lagrangian triangulation + vertex densities, ~7 s of an ~8 s partition at
+    // 2.1M particles / 256^3 -- which runs fully in parallel. A cap of 3 would run 8
+    // partitions in three waves: 21 s on the GPU vs 9.5 s on the CPU. Memory still bounds it:
+    // partitionBytes() counts the GPU buffers a waiting partition holds, and cMem caps c.
+    int const targetC = cores;
+
+    int bestN = -1, bestC = 0;
+    int const nLo = autoPart ? std::max( 2, nGpuMin ) : int(u.partition[0]);
+    int const nHi = autoPart ? std::max( 6, nGpuMin ) : int(u.partition[0]);   // <=6^3 keeps auto within validated territory (unless the GPU cap needs more)
+    for (int n=nLo; n<=nHi; ++n)
+    {
+        double const m = partitionBytes(n);
+        int cMem = int( std::floor( (budget - fixed - snapshotBytes(n)) / m ) );
+        int c = std::min( { targetC, n*n*n, cMem } );
+        if ( c > bestC or bestN<0 )
+        {
+            bestN = n;
+            bestC = c;
+        }
+        if ( c >= std::min(targetC, n*n*n) )
+            break;      // memory is not the binding constraint; smallest such n wins (fewest seams)
+    }
+    if ( bestC < 1 )
+    {
+        // 'fixed' fits (checked above), so this is the triangulation genuinely not fitting in
+        // what is left -- here the split IS the right lever, and the finest one is the best try.
+        bestC = 1;
+        bestN = nHi;
+        MESSAGE::Warning warning( u.verboseLevel );
+        warning << "AUTO-TUNE: even a single " << bestN << "^3-split partition's triangulation is predicted to "
+                << "exceed the " << (budget - fixed)/1.e9 << " GB left after the full-grid accumulators ("
+                << (gridTotal*bCell)/1.e9 << " GB) and particles (" << (partBytes*N)/1.e9 << " GB); running with "
+                << "--max-concurrent 1 at the finest split. Expect swapping; a finer --partition than "
+                << nHi << "^3 may still help.\n" << MESSAGE::EndWarning;
+    }
+
+    if ( autoPart )
+    {
+        u.partition.assign( NO_DIM, size_t(bestN) );
+        u.partitionOn = (bestN > 1);
+    }
+    if ( autoConc )
+        u.maxConcurrent = bestC;
+
+    // the concurrency the run WILL use: the tuner's, or the user's own (0 = all cores)
+    int const effC = autoConc ? bestC : userC;
+    // the report first: it decides whether the look-ahead fits the budget, and the message states its prediction
+    AutoTuneReport const decided = finishReport( bestN, effC );
+    double const predicted = decided.predicted;
+    char scratchNote[256] = "";
+    if ( scratchOn )
+        snprintf( scratchNote, sizeof(scratchNote), "; grid accumulators (%.3g GB) on scratch disk",
+                  gridTotal*bCell/1.e9 );
+    char ptsNote[320] = "";
+    if ( nPts > 0 )
+        snprintf( ptsNote, sizeof(ptsNote), "; %.3g sample points (%.3g GB: %s)",
+                  double(nPts), ptsBytes/1.e9, ptsStreamsWhy );
+    snprintf( buf, sizeof(buf),
+              "%.3g particles, %s grid, %.3g GB RAM (budget %.3g GB) -> --partition %s --max-concurrent %d "
+              "(predicted peak ~%.3g GB%s%s%s)",
+              N, MESSAGE::printElements( u.gridSize, "x" ).c_str(), ramBytes/1.e9, budget/1.e9,
+              MESSAGE::printElements( u.partition, " " ).c_str(), u.maxConcurrent,     // NO_DIM numbers
+              predicted/1.e9, metalActive ? ", GPU deposit" : "", scratchNote, ptsNote );
+    message << "\n" << MESSAGE::cBold() << "AUTO-TUNE:" << MESSAGE::cReset() << " " << buf << fxNote
+            << ". Pass --partition/--max-concurrent to override.\n           memory budget: "
+            << budgetWhy << "\n" << MESSAGE::Flush;
+    return decided;
+}
+#endif
+
+inline AutoTuneReport autoTunePartitioning(User_options &u,
+                                 size_t const nParticles,
+                                 bool const userSampling,
+                                 bool const metalActive,
+                                 std::vector<Particle_data> const *particles = nullptr)
+{
+    if ( u.psServe )
+    {
+        autoTuneServe( u, nParticles );   // the grid/partition model below does not apply to a server
+        return AutoTuneReport();
+    }
+    // partitionGiven, not only partitionOn: '--partition 1 1 1' asks for one triangulation, which
+    // leaves partitionOn false -- reading that as "not given" would split the data anyway
+    bool const autoPart = not (u.partitionOn or u.partitionGiven);
+    // ... and a user's split that is not one domain on every axis ('--partition 1 2 2': partition[0] is 1, but it
+    // runs the partition path): the model's n == 1 is the single-domain path only without it (partitionBytes)
+    bool const userPartitionOn = u.partitionOn;
+    bool const autoConc = not u.maxConcurrentOn;
+    AutoTuneReport report;
+    if ( (not autoPart and not autoConc and not u.autoTuneReport) or u.partNo>=0 or u.redshiftConeOn
+         or userSampling or u.psServe )
+        return report;  // nothing left to decide, or a mode where partitioning is unavailable
+                        // (--serve keeps its single triangulation alive for every request)
+
+    double minN = 2.e6;
+    if ( const char *env = std::getenv("DTFE_AUTO_MINN") )
+    {
+        double v = std::atof(env);
+        if ( v > 0. ) minN = v;
+    }
+
+    double const N = double(nParticles);
+    double const ramBytes = autoTunePhysicalRAM();
+    std::string budgetWhy;
+    double const budget = autoTuneBudget( ramBytes, budgetWhy );   // see the header comment
+    int const cores = autoTuneCores();
+
+    // the cells actually allocated and written: with --ps-window its cells, not the (virtual) full grid
+    size_t outGrid[NO_DIM];
+    u.outputGridSize( outGrid );
+    double gridTotal = 1.;
+    for (int d=0; d<NO_DIM; ++d)
+        gridTotal *= double(outGrid[d]);
+
+    AutoTunePS ps;
+#ifdef PHASE_SPACE
+    ps.phaseSpace     = true;
+    ps.volumeWeighted = u.psVolumeWeighted;
+    ps.exactDeposit   = u.psExactDeposit;
+    ps.caustics       = u.psCaustics;
+    ps.haloRelease    = u.psHaloRelease > Real(0.);
+    ps.fixedMerge     = u.psFixedPointMerge;
+#endif
+    // uField and aField each allocate their OWN full grids and coexist (two reserveMemory calls in DTFE.cpp), so
+    // summing both is right. The deposit and post phases are disjoint peaks -> max, not sum.
+    double const bCellDeposit = autoTuneBytesPerCell(u.uField, ps, 0) + autoTuneBytesPerCell(u.aField, ps, 0);
+    double const bCellPost    = autoTuneBytesPerCell(u.uField, ps, 1) + autoTuneBytesPerCell(u.aField, ps, 1);
+    double const bCell        = std::max( bCellDeposit, bCellPost );
+    // said on the AUTO-TUNE line: this run's merge keeps integer grids during the loop (ps_fixed_merge.h)
+    std::string const fxNote = ps.fixedMerge ? " [--fixed-point-merge: the summed full grids counted at 9 B per component "
+                                               "and cell during the loop; nothing staged or spilled]" : "";
+
+    // padding fraction of the box per axis (paddingLength was resolved to Mpc by updateEntries)
+    double padFrac[NO_DIM];
+    for (int d=0; d<NO_DIM; ++d)
+    {
+        double const boxLen = double(u.boxCoordinates[2*d+1] - u.boxCoordinates[2*d]);
+        padFrac[d] = boxLen>0. ? double(u.paddingLength[2*d] + u.paddingLength[2*d+1]) / (2.*boxLen) : 0.;
+    }
+
+    MESSAGE::Message message( u.verboseLevel );
+    char buf[512];
+
+#ifdef PHASE_SPACE
+    // ---- PS-DTFE: Lagrangian partitions run in PARALLEL; concurrency is the throughput knob
+    // and each concurrent partition holds a full padded triangulation (the dominant cost). ----
+    double const kDT = 666.;                        // bytes/vertex: 112 (incl. the uint64 ParticleID and the double volume accumulator) + 6.77 cells x 72 B + allocator slack
+    double const partBytes = double(sizeof(Particle_data));
+    // '--parallel-triangulation' (TBB): the sorted point+payload copy and CGAL's own copy of it outlive the particle
+    // copy during the insert: +203 B per vertex in flight, measured (autoTuneServe's kBuild 330 holds it there).
+    // Counted whenever asked for: with fewer than 2 threads per partition the insert runs sequentially and this
+    // errs high.
+#if defined(PARALLEL_TRIANGULATION) && NO_DIM==3
+    double const kParInsert = u.psParallelTriangulation ? 210. : 0.;
+#else
+    double const kParInsert = 0.;
+#endif
+    // --scratch-dir (already armed by DTFE_setup when set): the full-grid accumulators live in
+    // mmap'ed files, so they leave the RAM model -- the kernel pages them against the disk and
+    // RSS stays bounded. The RAM check then covers only the particles + per-partition terms,
+    // and the grid term is checked against the scratch volume's FREE SPACE instead.
+    bool const scratchOn = not u.scratchDir.empty();
+
+    // ---- '--sample-points' point evaluation (ps_point_eval.cc) ---------------------------
+    // Also IRREDUCIBLE: the query points and their per-point stream records are GLOBAL
+    // structures shared by every partition (each partition appends its hits), so --partition
+    // does not shrink them. Without this a points-only run (tiny --grid, so the grid term
+    // vanishes) could pick a coarse split against a budget that ignores tens of GB.
+    size_t nPts = autoTuneSamplePointCount( u.psSamplePointsFile );
+    if ( const char *env = std::getenv("DTFE_AUTO_PTS_N") )      // a plane that does not exist yet
+    {
+        double const v = std::atof(env);
+        if ( v >= 0. ) nPts = size_t(v);
+    }
+    bool const ptsVelGrad = u.psPtsVelGrad
+                            or (std::getenv("DTFE_AUTO_PTS_VELGRAD") and std::string(std::getenv("DTFE_AUTO_PTS_VELGRAD")) == "1");
+    // Mean streams (containing tetrahedra) per point. No fixed number fits: it grows with the mass
+    // resolution (TNG300-3-Dark 1.899 at z=0, TNG100-3-Dark 4.25 at z=0 and 2.30 at z=1). So it is
+    // ESTIMATED from the particles themselves (psEstimateMeanStreams: Eulerian over Lagrangian
+    // volume of the tessellation, on random Lagrangian patches) and budgeted at TWICE the
+    // multi-stream excess, 1 + 2 (est - 1): the estimate is the box mean, while one plane varies
+    // around it (the z=0 plane's strips range 1.45 .. 22.8). DTFE_AUTO_PTS_STREAMS overrides.
+    double ptsMeanStreams = 2.0;
+    char ptsStreamsWhy[200] = "2 streams/point assumed";
+    autoTunePSPointStreams( u, N, nPts, particles, report, ptsMeanStreams, ptsStreamsWhy );
+    double const ptsBytes = autoTunePSPointBytes( u, nPts, ptsVelGrad, ptsMeanStreams );
+
+    // IRREDUCIBLE in RAM unless scratch-backed: originals + the full-grid accumulators
+    // + the point-evaluation structures.
+    // --partition does NOT reduce this -- partitions sum into the SHARED full grid.
+    // a --ps-window run that started without its particles (ps_globals_record.h) holds none: only
+    // cached partitions are loaded, so their memory goes to more partitions at once. (A late read, when
+    // a needed partition turns out uncached, adds them back: at most the particles' bytes over budget.)
+    double const particleBytes = u.psParticlesDeferred ? 0. : partBytes*N;
+    double const fixed = particleBytes + (scratchOn ? 0. : gridTotal*bCell) + ptsBytes;
+    report.fixed = fixed;
+    report.budget = budget;
+    report.pts = ptsBytes;
+    report.streamsBudgeted = nPts > 0 ? ptsMeanStreams : 0.;
+    // NOTE: the over-budget check below must run BEFORE the small-N early return -- the grid
+    // term does not depend on N, so a small snapshot on a huge --grid is exactly the case
+    // that must not slip through to a silent 60+ GB allocation.
+
+    autoTuneScratchSpaceCheck( u, scratchOn, gridTotal, bCell );
+
+    // ---- Is the IRREDUCIBLE term alone over budget? --------------------------------------
+    // If so ('fixed > budget' below), no --partition value can help: partitions are summed into the shared full
+    // grid, and the search would end at its first candidate (2, the COARSEST split), blaming the split.
+    // The per-tet/per-cell GPU-deposit pieces this field selection needs (unselected moment grids are not
+    // allocated; the tet velocities are extracted only for a velocity-derived grid). The velocity derivatives are
+    // folded into the gradient after auto-tune runs, so they count here as gradient requests.
+    // dispersion implies the velocity/mom grids only when NOT volume-weighted (5d gating)
+    bool const psVel  = u.uField.velocity or u.aField.velocity
+                        or ((u.uField.velocity_dispersion or u.aField.velocity_dispersion)
+                            and not ps.volumeWeighted);
+    bool const psDisp = u.uField.velocity_dispersion or u.aField.velocity_dispersion;
+    bool const psGrad = u.uField.velocity_gradient or u.uField.selectedVelocityDerivatives()
+                        or u.aField.velocity_gradient or u.aField.selectedVelocityDerivatives();
+    // flags gating the remaining GPU buffers (ps_metal_host.cc)
+    bool const psVolW  = ps.volumeWeighted;
+    bool const psCaust = ps.caustics;
+    bool const psExact = ps.exactDeposit;
+
+    // Every buffer in PSGpuGrids, per cell and copy (the GPU deposit's host and device grids). mass 4 + streams 4
+    // = the 8; the fVolW/fCaustic/fExact terms count too, and fVolW is the PRODUCTION default -- 20 B/cell/copy =
+    // 40 after the x2 in partitionBytes(), i.e. 6.7 GB per partition at 1024^3/n=2.
+    // The moment grids are 64-bit fixed-point sums (ps_metal_host.cc, fxUnits): 8 B per component
+    // on the device and in the host's copy where a float takes 4 (mB = 2), and dispw is not deposited (the mass
+    // grid stands for it); PS_METAL_FLOAT_MOMENTS=1 keeps the floats (mB = 1).
+    bool const momFx = autoTunePSMomentsFixed();
+    double const mB = momFx ? 2. : 1.;
+    double const gridB  = 8. + mB * ( (psVel ? 12. : 0.) + (psDisp ? 24. : 0.) + (psGrad ? 36. : 0.)
+                                    + (psVolW ? 4. : 0.)                  // momw
+                                    + (psExact ? 4. : 0.)                 // streamvol
+                                    + ((psVolW and psDisp) ? 12. : 0.) )  // dispvel
+                        + (psCaust ? 4. : 0.)                             // caustic
+                        + ((psVolW and psDisp and not momFx) ? 4. : 0.);  // dispw
+
+    // The single build's fixed-point MASS grid (ps_interpolation.cc 'massFx'): a pass whose density is
+    // selected accumulates its mass as 8 B words per sub-grid cell in place of the 4 B float density, shared by the
+    // deposit threads (atomics; no private density copies), and converts them to the float density once after the
+    // loop -- when the 8 B words and the 4 B grid coexist for a moment. The double build keeps its double sums.
+    // fxCell = the extra bytes per sub-grid cell while the words live (the passes run one after the other: one grid).
+    bool const psDensity = u.uField.density or u.uField.velocity_tweb or u.aField.density or u.aField.velocity_tweb;
+    double const fxCell  = ( ps.phaseSpace and sizeof(Real) == 4 and psDensity ) ? 4. : 0.;
+    // ... and the moment grids the same way: fxMom = the extra bytes per sub-grid cell while one pass's
+    // words live (as many again as its Real moment grids: the larger pass), which also leave the private copies
+    double const fxMom   = ( ps.phaseSpace and sizeof(Real) == 4 and momFx )
+                         ? std::max( autoTuneFxMomentBytes(u.uField, ps), autoTuneFxMomentBytes(u.aField, ps) ) : 0.;
+    // ... and the counts, flags and masks, which the deposit threads share in every build
+    double const countCell = autoTunePSCountBytes(u.uField, ps, 0) + autoTunePSCountBytes(u.aField, ps, 0);
+    // One private copy of the CPU deposit's copy mode, per sub-grid cell: the Real accumulators of ONE
+    // pass -- the passes deposit one after the other, each copying only its own grids that are not fixed-point
+    // sums (ps_interpolation.cc accBytes, of the 'quantities' it fills). Both passes' grids less one pass's words
+    // (bCellDeposit - fxCell - fxMom - countCell) would be wrong both ways with u and a fields selected: 16 B/cell
+    // of copies in the single build, which copies nothing, and twice the double build's 32 B/cell, so few threads
+    // that the model would predict SLAB mode where the run uses the copy mode.
+    double copyCell = autoTunePSCopyCell( u, ps, momFx );
+
+    // ... and each deposit thread's per-tetrahedron sample lists (DepositThread insideFlat/insideRel/insideW, 16 B
+    // per sample of the largest tetrahedron it meets), which a very fine grid over few particles makes visible:
+    // ~33 MB per thread at 512^3 over 8^3 particles: ~50x the samples of a mean owned tetrahedron of a single-stream
+    // sheet, grid x nSub^3 / 6 N (crossed waves, 256^3 .. 512^3; which tetrahedra a thread meets depends on the
+    // scheduling). Booked at 128x that mean; negligible at production densities (768^3 over 0.26M: 6 MB in all).
+    int const nSubScratch = std::max( 1, psExact ? 3 : int(u.psAvgSubsamples) );
+    double const sampleCube = ( u.aField.selected() or psExact ) ? std::pow( double(nSubScratch), double(NO_DIM) ) : 1.;
+    double const threadScratch = double(cores) * 16. * 128. * gridTotal * sampleCube / ( 6. * std::max( 1., N ) );
+
+    AutoTunePSPlanner planner{ u, metalActive, autoPart, userPartitionOn, autoConc, report, minN, N, ramBytes,
+                               budgetWhy, budget, cores, outGrid, gridTotal, ps, bCellDeposit, bCell, fxNote, padFrac,
+                               message, buf, kDT, partBytes, kParInsert, scratchOn, nPts, ptsStreamsWhy, ptsBytes,
+                               particleBytes, fixed, psVel, psDisp, psGrad, psExact, momFx, gridB, psDensity, fxCell,
+                               fxMom, copyCell, threadScratch };
+    return planner.choose();
+
+#else
+    // ---- standard DTFE: partitions are processed SERIALLY (memory knob); inside one partition
+    // the box is split across up to --max-concurrent threads (throughput knob). ----
+    // A '--region'/'--regionMpc' run is planned as what it triangulates: DTFE_setup crops the region
+    // first and passes a copy of the options whose box IS the region, with N = the particles inside it (unpadded),
+    // so 'padFrac' above is the padding over the region's length -- the pairing a whole-box run has. The padded
+    // copies the crop holds are left out of 'fixed': 36 B each next to the ~700 B per vertex of the triangulation
+    // term, which counts them.
+    double const partBytes = double(sizeof(Particle_data));
+
+    /* '--sample-points' (the PS model's term above, for the standard point evaluation): the query points
+       and their records are GLOBAL -- every partition appends the answers of the points in the tetrahedra it owns
+       (ps_point_eval.cc), and a '--partition' run keeps them all until psPointEvalFinalize, the checkpoint's
+       'points.<i>' files being copies on disk -- so a split does not shrink them: they are 'fixed'. Standard DTFE
+       answers each point ONCE (its one tetrahedron of the Eulerian tessellation, 0/1 coverage), so one record per point
+       where PS budgets its streams. The STORED record is packed (RecLayout): both densities + the velocity in doubles +
+       the 2-B caustic mask (40 + 2), + the density gradient (24) / velocity gradient (72) / scalars with
+       --pts-den-grad / --pts-vel-grad / --pts-scalar, + its uint32 point index and the uint64 locator finalize() groups
+       it by; per point its position (3 doubles), its bucket entry and finalize's offset and cursor; and the finalized
+       outputs (density, velocity, dispersion, stream count, + the gradients and scalars), allocated while the records
+       are still held. KEEP IN SYNC with ps_point_eval.cc and the PS term. DTFE_AUTO_PTS_N / DTFE_AUTO_PTS_VELGRAD=1
+       size a plane that does not exist yet (the launcher's memory check). A 4096^2 plane with '--pts-vel-grad'
+       (scripts/thesis_runs.sh dtfe27planes) holds ~4.7 GB of it. */
+    size_t nPts = autoTuneSamplePointCount( u.psSamplePointsFile );
+    if ( const char *env = std::getenv("DTFE_AUTO_PTS_N") )
+    {
+        double const v = std::atof( env );
+        if ( v >= 0. ) nPts = size_t( v );
+    }
+    bool const ptsVelGrad = u.psPtsVelGrad
+                            or ( std::getenv("DTFE_AUTO_PTS_VELGRAD") and std::string( std::getenv("DTFE_AUTO_PTS_VELGRAD") ) == "1" );
+    double bPtsVar = ( u.psPtsDenGrad ? 3. * double(sizeof(double)) : 0. ) + ( ptsVelGrad ? 9. * double(sizeof(double)) : 0. )
+                   + ( u.psPtsScalar ? double(noScalarComp) * double(sizeof(double)) : 0. );
+    double const bStreamRec = 5. * double(sizeof(double)) + 2. + bPtsVar + 4. + 8.;
+    double const bPerPoint  = 3. * double(sizeof(double)) + 4. + 2. * 8.;
+    double const bPtsOut    = double(sizeof(double)) + 3. * double(sizeof(double)) + 6. * double(sizeof(double)) + 4. + bPtsVar;
+    double const ptsBytes   = double(nPts) * ( bPerPoint + bPtsOut + bStreamRec );
+    // ... and each point-walk thread fills one 16 MB block of records before it hands it over (HitSink), per partition
+    double const ptsWalkBytes = nPts > 0 ? double(std::thread::hardware_concurrency()) * double(16 << 20) : 0.;
+
+    // --scratch-dir: the full-grid accumulators are mmap-backed and leave the RAM model. (The process itself -- code,
+    // libraries, the GPU runtime: 66 MB of footprint, 84 MB with --gpu -- is left out, as in the PS model: it matters on
+    // sub-GB runs only, where it would make the tests' simulated small machines plan around it.)
+    double const fixed = partBytes*N + (u.scratchDir.empty() ? gridTotal*bCell : 0.) + ptsBytes;
+    // per padded vertex: the thread's particle copy (alive while its triangulation grows) + the triangulation, and 6%
+    // for the dummy points the padding test adds (stdBytesPerPaddedVertex, shared with the partition loop's look-ahead)
+    double const perVertex = stdBytesPerPaddedVertex( u );
+
+    /* The GPU deposit of the '_a' pass (averaged_interpolation_1.cc -> dtfe_metal_host.cc / dtfe_gpu_cuda.cu), the
+       same for the sampled and the exact average (see StdTuneDensity's comment): per tetrahedron of a thread's own box
+       the flat arrays (vertices 48, densities 16, velocities 48 when a velocity-derived '_a' grid is asked, the scalar
+       16, volume, sample count, flat index and Morton key 4 each), the Morton order pairs (8), one array's sort copy
+       (<= 48) and the work-item table (4) -- the arrays become the uploaded batch one at a time -- and per sub-grid
+       cell the per-call deposit's device grid and its host copy (bGpuCell each). Charging 6.77 x 120 B per PADDED
+       vertex would count every tetrahedron of the padding as extracted: only the ones touching the thread's own
+       box are. */
+    bool gpuVel = false, gpuScal = false;
+    double bGpuCell = 0.;
+    if ( metalActive and u.aField.selected() )
+    {
+        bool const den  = u.aField.density or u.aField.velocity_tweb;
+        bool const grad = u.aField.velocity_gradient or u.aField.selectedVelocityDerivatives();
+        gpuVel  = u.aField.velocity or grad;
+        gpuScal = u.aField.scalar or u.aField.scalar_gradient;
+        bGpuCell = ( den ? 4. : 0. ) + ( u.aField.velocity ? 12. : 0. ) + ( grad ? 36. : 0. )
+                 + ( u.aField.scalar ? 4. : 0. ) + ( u.aField.scalar_gradient ? 12. : 0. );
+    }
+    double const perTet = bGpuCell > 0. ? 80. + ( gpuVel ? 48. : 0. ) + ( gpuScal ? 16. : 0. ) + 8. + 48. + 4. : 0.;
+    double const tetsPerOwn = 6.77 * 1.3;           // per particle of the thread's own box, + the ones crossing its faces
+    /* The GPU deposit's host SNAPSHOT (PS's snapshotBytes above). The standard deposit
+       resumes a failed command buffer from a checkpoint (dtfe_metal_host.cc runBatch, gpu_metal_retry.h GpuSnapshot):
+       it keeps a host copy of the batch's device grids, taken every ~10 s of GPU work.
+       Those grids are one thread sub-domain's (the per-call path: allocated under the device mutex, one batch at a
+       time), in 8-B fixed-point words per 4-B component (4 B under
+       DTFE_METAL_FLOAT_GRIDS=1 / DTFE_GPU_FLOAT_GRIDS=1), so the run holds ONE such copy, of the largest sub-grid:
+       added once to the busiest partition's bytes (StdPlan::snapshot). (The partition CHECKPOINT itself,
+       partition_checkpoint.h, writes the full grids from where they are, allocating nothing; the partition's own
+       sub-grids are still alive then and already in its bytes.) */
+    auto envOn = [](char const *n) { char const *e = std::getenv( n ); return e and std::atoi( e ) != 0; };
+    double const snapWordFactor = ( envOn( "DTFE_METAL_FLOAT_GRIDS" ) or envOn( "DTFE_GPU_FLOAT_GRIDS" ) ) ? 1. : 2.;
+    // the look-ahead (DTFE.cpp) runs with the GPU deposit when more than one partition is computed
+    bool const lookAheadPossible = metalActive and bGpuCell > 0. and u.DTFE and u.method == 1
+                                   and not u.stdNoOverlap and not u.redshiftConeOn;
+
+    // the count grid of the particles (StdTuneDensity: one pass); without particles in memory, the uniform count
+    auto const tuneStart = std::chrono::steady_clock::now();
+    StdTuneDensity dens;
+    if ( particles != nullptr and not particles->empty() )
+        dens.build( *particles, u );
+    double const countSec = std::chrono::duration<double>( std::chrono::steady_clock::now() - tuneStart ).count();
+    // '--sample-points' evaluates ONE tessellation per partition (DTFE_parallel runs no thread split for it)
+    bool const oneTessellation = not u.psSamplePointsFile.empty();
+    double origin[NO_DIM], dxGrid[NO_DIM];
+    for (int d=0; d<NO_DIM; ++d)
+    {
+        origin[d] = double( u.boxCoordinates[2*d] );
+        dxGrid[d] = ( double( u.boxCoordinates[2*d+1] ) - origin[d] ) / double( u.gridSize[d] );
+    }
+    std::vector<size_t> const userSplit = ( not autoPart and u.partition.size() == size_t(NO_DIM) )
+                                        ? u.partition : std::vector<size_t>( NO_DIM, 1 );
+
+    std::map< std::pair<int,int>, StdPlan > plans;
+    User_options pgOptions = u;                     // parallelGrid reads the partition's own grid from it
+    pgOptions.verboseLevel = 0;                     // (and would say so for every plan)
+    AutoTuneStdPlanner planner{ u, metalActive, autoPart, autoConc, report, N, ramBytes, budgetWhy, budget, cores,
+                                gridTotal, bCellDeposit, padFrac, message, buf, partBytes, nPts, ptsBytes, ptsWalkBytes,
+                                fixed, perVertex, bGpuCell, perTet, tetsPerOwn, snapWordFactor, lookAheadPossible,
+                                tuneStart, dens, countSec, oneTessellation, origin, dxGrid, userSplit, plans,
+                                pgOptions };
+    return planner.chooseSplit();
 #endif
 }
 
-/* The partition MEMORY GATE (2026-10-07). The auto-tuner plans a peak from a model; the machine's free memory
-   is the fact, and other programs change it during a run (TNG50-3-Dark z=0: planned 47 GB under a 52 GB budget,
-   SIGKILLed by macOS after 82 min with a browser and the launcher open). Before a partition starts, it waits
+/* The partition MEMORY GATE. The auto-tuner plans a peak from a model; the machine's free memory
+   is the fact, and other programs change it during a run (a browser and the launcher opened beside a run
+   planned within its budget can still get it SIGKILLed by macOS). Before a partition starts, it waits
    -- in 2 s steps -- while the memory the system leaves free, minus the headroom, is below what one partition
    adds (AutoTuneReport::perPartition) AND another partition is in flight (whose finishing frees memory). With
    none in flight it always starts, saying so: the gate can delay, never deadlock. A skipped partition and the
    speed split's ordered merge never pass it; a cache-only one does (its loaded tessellation holds the same
    memory). need = 0 (no auto-tune estimate: a user-given --partition) disables it.
-   ORDERED (--ordered-merge, 2026-10-11; the default since 2026-10-14): a finished partition can wait for every
-   lower-numbered one to merge while it still holds its memory (since 2026-10-14 only when the staging room is full:
+   ORDERED (the default): a finished partition can wait for every
+   lower-numbered one to merge while it still holds its memory (only when the staging room is full:
    DTFE.cpp's staged ordered merge), so a partition waiting here for a HIGHER-numbered one to free memory could wait
    forever; in that mode a partition waits only while a lower-numbered one is in flight (those never wait for it).
    The partition entering is always the highest index handed out so far (the loop's dynamic schedule hands them
    out in order), so every partition in flight is lower-numbered and the two modes wait alike. A STAGED partition
    (finished, its sub-grids parked until its turn) has left the gate: its memory shows in the free-memory reading,
-   and it was staged only while that reading left room for one more partition. Since 2026-10-15 that holds for the
+   and it was staged only while that reading left room for one more partition. That holds for the
    partitions the gate guards too: one whose sub-grids the free memory cannot hold beside one more partition (need)
-   is SPILLED to disk (DTFE.cpp, ps_merge_spill.h) rather than parked in RAM, so parked sub-grids no longer starve
+   is SPILLED to disk (DTFE.cpp, ps_merge_spill.h) rather than parked in RAM, so parked sub-grids do not starve
    the gate down to one partition at a time (nor, with one in flight regardless, push the machine into swap). */
 struct PartitionMemoryGate
 {

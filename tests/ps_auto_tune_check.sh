@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Auto-tune (src/auto_tune.h) behaviour checks -- the first coverage this header has ever had.
+# Auto-tune (src/auto_tune.h) behaviour checks.
 # Drives the REAL binary through the documented env overrides (DTFE_RAM_GB simulates the
 # machine's RAM, DTFE_AUTO_MINN lowers the particle-count gate) so every scenario is fast,
 # deterministic and allocation-safe. Verified here:
@@ -7,29 +7,28 @@
 #  A) OVER-BUDGET REFUSAL. When the irreducible full-grid accumulators alone exceed the
 #     budget, auto-tune must say so BEFORE the search -- naming the grid term, stating that
 #     --partition cannot reduce it, suggesting the largest grid that WOULD fit, and forcing
-#     --max-concurrent 1 -- instead of the old behaviour (pick '--partition 2 2 2', blame the
-#     split, and advise "a smaller grid or fewer fields" while predicting a bogus peak).
+#     --max-concurrent 1 -- not pick '--partition 2 2 2', blame the split, and advise "a smaller
+#     grid or fewer fields" while predicting a bogus peak.
 #     This fires even when N < the small-N gate: the grid term does not depend on N.
 #  B) NORMAL TUNING. With RAM to spare it picks a partition and concurrency and prints a
 #     predicted peak.
 #  C) CONSERVATIVE CONTRACT. The header promises the model "deliberately errs HIGH so the
 #     tuner never picks a configuration that measured tighter than predicted": on a real
-#     partitioned 256^3 run (volume-weighted, dispersion -- the fields whose grids the old
-#     model missed), predicted peak >= measured peak RSS.
+#     partitioned 256^3 run (volume-weighted, dispersion -- fields whose extra grids the model
+#     must count), predicted peak >= measured peak RSS.
 #  D) EXPLICIT FLAGS WIN. --partition/--max-concurrent given by the user are never overridden --
 #     including '--partition 1 1 1', which asks for a single triangulation.
-#  E) THE MEMORY BUDGET. 60% of RAM by default (80% let a 64 GB Mac swap 19 GB with a desktop
+#  E) THE MEMORY BUDGET. 60% of RAM by default (80% lets a 64 GB Mac swap 19 GB with a desktop
 #     open next to the run); DTFE_MEM_FRACTION and DTFE_MEM_BUDGET_GB override it; a simulated
 #     machine (DTFE_RAM_GB) skips the live "what do other programs leave free" term, and the live
 #     run states its budget.
 #  G) the stream estimate of a non-periodic cloud larger than its output region stays physical.
-#  H) the TIME-AWARE split of a small set (2026-10-01): a run whose time is the sequential
+#  H) the TIME-AWARE split of a small set: a run whose time is the sequential
 #     triangulation (a slice of 0.26M particles) is split 2^3 for speed; a deposit-bound run
 #     (a 256^3 grid) and a GPU run (its deposit serialises on the GPU) keep one domain, and so
-#     does a non-periodic cloud that makes no periodic copies (the model charged it 1.7x: fixed);
-#     the single-domain report predicts a sane peak (it said 52 GB for a 0.26M run: the GUI's
-#     memory check believed it); and two auto-split runs give bit-identical grids (the split
-#     merges its partitions in index order).
+#     does a non-periodic cloud that makes no periodic copies (the model must not charge it 1.7x);
+#     the single-domain report predicts a sane peak (the GUI's memory check believes it); and two
+#     auto-split runs give bit-identical grids (the split merges its partitions in index order).
 #  I) Very fine grids: GPU sub-grids kept under 2^32 cells by the split; a small set on a huge grid
 #     splits for memory instead of staying in one domain over budget.
 #  F) --auto-tune-report (the GUI's memory check): ONE machine-readable line, exit 0, nothing
@@ -37,31 +36,31 @@
 #     the concurrency the run will use); DTFE_AUTO_PTS_N sizes a plane that does not exist yet.
 #  J) the machine's free memory over a plan: an explicit budget capped by it, the partition memory gate.
 #  M) the GPU deposit's host snapshot (ps_metal_host.cc GpuSnapshot) is in the prediction, ONCE (the deposits serialise).
-#  N) the '--sample-points' stream estimate is made on the points' own slab (2026-10-11): on a 1-D pancake
+#  N) the '--sample-points' stream estimate is made on the points' own slab: on a 1-D pancake
 #     (80^3, A k = 1.8; the 3-stream band covers ~16% of the box, box mean 1.33) a plane outside the band
 #     estimates ~1 stream/point and one through it ~3 (both measured exactly in '.pts_streams'), each within
-#     10%; the box-wide estimate (DTFE_AUTO_PTS_BOXMEAN=1, the old rule) gives ~1.3 for both. The TNG50-3-Dark
-#     z=0 z2048 plane budgeted 34.95 streams/point (19.3 GB) from the box mean 17.98 while its points averaged 5.38.
-#  O) '--parallel-triangulation' (TBB builds) is costed (2026-10-11): its insert copies (+203 B per vertex in flight,
-#     measured) raise the predicted peak; they were missing from the batch model. SKIP without TBB.
-#  P) the tessellation model pads a partition by the binary's DEFAULT Lagrangian padding (2026-10-12: '--ps-lag-padding
-#     8' spacings; before, the Eulerian '--padding' fraction floored at 0.3 of a partition): the default predicts what
-#     an explicit '--ps-lag-padding 8' does, and '--ps-lag-padding 0' (the old rule) predicts something else.
-#  K) partitions in flight never outnumber the threads (2026-10-08): a hand-set split with the
-#     concurrency left to the tuner, and '--max-concurrent 0' ("all threads"), each started every
+#     10%; the box-wide estimate (DTFE_AUTO_PTS_BOXMEAN=1) gives ~1.3 for both. On the TNG50-3-Dark
+#     z=0 z2048 plane the box mean 17.98 budgets 34.95 streams/point (19.3 GB) while its points average 5.38.
+#  O) '--parallel-triangulation' (TBB builds) is costed: its insert copies (+203 B per vertex in flight,
+#     measured) raise the predicted peak. SKIP without TBB.
+#  P) the tessellation model pads a partition by the binary's DEFAULT Lagrangian padding ('--ps-lag-padding
+#     8' spacings, not the Eulerian '--padding' fraction floored at 0.3 of a partition): the default predicts what
+#     an explicit '--ps-lag-padding 8' does, and '--ps-lag-padding 0' (the Eulerian rule) predicts something else.
+#  K) partitions in flight never outnumber the threads: neither a hand-set split with the
+#     concurrency left to the tuner nor '--max-concurrent 0' ("all threads") starts every
 #     partition at once (64 threads for '--partition 4 4 4').
-#  R) STANDARD DTFE '--region' / '--regionMpc' (2026-10-13): the tuner plans the region's particles, not the whole
-#     snapshot's (the launcher's exact zoom of a 20^3-cell TNG50 region was split 3x3x3 with 10 threads: ~21 min
-#     instead of ~1). Uses the standard binary (built here too); SKIP when it is not built.
-#  S) ONE DOMAIN (2026-10-18): '--partition 1 1 1' deposits into the run's own grids, so the prediction counts them
-#     once -- the 768^3 crossed-waves report sits between the measured peak and 15% above it (it said 38.8 for 22.9) --
+#  R) STANDARD DTFE '--region' / '--regionMpc': the tuner plans the region's particles, not the whole
+#     snapshot's (planning the snapshot splits the launcher's exact zoom of a 20^3-cell TNG50 region 3x3x3 with
+#     10 threads: ~21 min instead of ~1). Uses the standard binary (built here too); SKIP when it is not built.
+#  S) ONE DOMAIN: '--partition 1 1 1' deposits into the run's own grids, so the prediction counts them
+#     once -- the 768^3 crossed-waves report sits between the measured peak and 15% above it --
 #     and a real one-domain run's peak stays under its prediction.
 #
 # The 2^32 GPU sub-grid guard (ps_interpolation.cc) is NOT exercised here: it needs a real
 # >4.29e9-cell partition sub-grid, i.e. >32 GB of buffers. It mirrors the validated guard in
 # averaged_interpolation_1.cc line-for-line.
 #
-# Portable (2026-10-11): runs on Linux too (tests/ci_suite.sh core) -- the peak RSS from getrusage, no macOS-only
+# Portable: runs on Linux too (tests/ci_suite.sh core) -- the peak RSS from getrusage, no macOS-only
 # command; the GPU-only parts (H3, I2/I3, L, M) SKIP on a CPU build.
 #
 # Usage: tests/ps_auto_tune_check.sh [--no-build]
@@ -69,8 +68,6 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PY="${PYTHON:-python3}"
-command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/python3.14
 ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT}"
 source "${SCRIPT_DIR}/precision.sh"     # DTFE_TEST_PRECISION=double: the double pair
@@ -118,7 +115,7 @@ agrep "A quantifies the irreducible grid term"  "full-resolution output grids ne
 agrep "A suggests --scratch-dir as the way out" "--scratch-dir <local dir>"                             "${LOG_A}"
 agrep "A suggests the max feasible in-RAM grid" "largest that fits at these fields is about"            "${LOG_A}"
 agrep "A warns off the broken escape hatches"   "--partNo'/'--region' are NOT a way out"                "${LOG_A}"
-# the old misleading message must be gone
+# the misleading blame-the-split message must not appear
 if grep -q "even a single .*-split partition is predicted to exceed the memory budget" "${LOG_A}"; then
     check "A old blame-the-split warning is gone" 0
 else
@@ -127,7 +124,7 @@ fi
 # Over budget with a LARGE particle set (DTFE_AUTO_MINN=1000 makes this one count as large): the
 # fallback must still SPLIT -- one partition at a time, the smallest per-partition triangulation --
 # rather than build one unpartitioned triangulation on top of an already over-budget run (for
-# 94M particles that was ~100 GB; seen on TNG100-3 with an 8192^2 --sample-points slice).
+# 94M particles that is ~100 GB, e.g. TNG100-3 with an 8192^2 --sample-points slice).
 LOG_A2="${TMP}/at_a2.log"
 DTFE_RAM_GB=0.05 DTFE_AUTO_MINN=1000 "${BIN}" "${SNAP}" "${TMP}/at_a2" --grid 64 \
     --field density_a velocity_a gradient_a divergence_a shear_a vorticity_a dispersion_a \
@@ -150,7 +147,7 @@ echo ">> C: predicted >= measured (256^3, volume-weighted dispersion, real run)"
 LOG_C="${TMP}/at_c.log"
 # The peak RSS comes from getrusage(RUSAGE_CHILDREN) in a python parent, not '/usr/bin/time -l' (macOS
 # only; GNU time spells it -v and is not even installed on a bare Ubuntu): ru_maxrss is in BYTES on macOS
-# and in KILOBYTES on Linux (2026-10-11, the Linux port of this suite).
+# and in KILOBYTES on Linux.
 peak_rss_run() {  # $1 = log; the rest = the command. Appends 'PEAK_RSS_BYTES <n>' to the log; exits as the command
     "${PY}" - "$@" <<'PYEOF'
 import resource, subprocess, sys
@@ -194,7 +191,7 @@ else
     check "D auto-tune stays silent when both flags are given" 1
 fi
 # '--partition 1 1 1' asks for ONE triangulation. It leaves partitionOn false (nothing is split),
-# which the auto-tuner used to read as "not given" -- and then split the data anyway. Same
+# which the auto-tuner must not read as "not given" (and then split the data anyway). Same
 # settings as B, where the tuner does pick a split.
 LOG_D1="${TMP}/at_d1.log"
 DTFE_RAM_GB=64 DTFE_AUTO_MINN=1000 "${BIN}" "${SNAP}" "${TMP}/at_d1" --grid 128 \
@@ -253,11 +250,11 @@ check "F DTFE_AUTO_PTS_N sizes a plane that is not on disk (pts ${p0} -> ${p1} G
       "$(awk -v a="${p0:-x}" -v b="${p1:-0}" 'BEGIN{print (a == 0 && b > 0.5) ? 1 : 0}')"
 
 # ---------- (G) the stream estimate of a NON-periodic cloud with a smaller output region ----------
-# The estimate used to tile the OUTPUT region (--box) and wrap initial positions into it: a cloud
-# larger than the region folded far-apart particles into one patch, whose Delaunay tetrahedra then
-# spanned the cloud in Eulerian space -- 8.1 million "streams" per point on a TNG100-3 Lagrangian
-# sub-cube, so the tuner ran every point evaluation serially on the smallest split (222 s instead
-# of seconds). It must tile the cloud's own Lagrangian bounding box.
+# The estimate tiles the cloud's own Lagrangian bounding box. Tiling the OUTPUT region (--box) and
+# wrapping initial positions into it folds far-apart particles of a cloud larger than the region into
+# one patch, whose Delaunay tetrahedra then span the cloud in Eulerian space -- 8.1 million "streams"
+# per point on a TNG100-3 Lagrangian sub-cube, so the tuner would run every point evaluation serially
+# on the smallest split (222 s instead of seconds).
 echo ">> G: non-periodic stream estimate with a region smaller than the cloud"
 SNAP_G="${TMP}/at_input_clump.hdf5"
 "${PY}" "${SCRIPT_DIR}/generate_ps_test_data.py" --out "${SNAP_G}" --n 48 --box "${BOX}" \
@@ -266,8 +263,7 @@ env DTFE_RAM_GB=64 DTFE_AUTO_PTS_N=1000000 "${BIN}" "${SNAP_G}" "${TMP}/at_g" --
     --input 105 --MpcUnit 1 --verbose 2 --box 40 60 40 60 40 60 --auto-tune-report > "${TMP}/at_g.log" 2>&1
 sg=$(sed -n 's/.* streams_est=\([0-9.]*\) .*/\1/p' "${TMP}/at_g.log")
 # (below 1 is fine: for a non-periodic cloud the Eulerian/Lagrangian volume ratio is its mean
-# compression -- this clump's is ~0.5 -- and the budget clamps the estimate at 1 stream per point;
-# the old code gave 75593 here)
+# compression -- this clump's is ~0.5 -- and the budget clamps the estimate at 1 stream per point)
 check "G the estimate stays physical: 0 < ${sg:-none} < 20 streams/point" \
       "$(awk -v s="${sg:-0}" 'BEGIN{print (s > 0 && s < 20) ? 1 : 0}')"
 
@@ -276,7 +272,7 @@ echo ">> H: time-aware split for small sets (speed, not memory)"
 GPU_H=0; grep -Eq "METAL=1|CUDA=1|HIP=1" o_ps/.build_mode 2>/dev/null && GPU_H=1   # (-E: GNU and BSD grep alike)
 COMMON_H=(--input 105 --MpcUnit 1 --verbose 2 --auto-tune-report)
 # H1: a slice of the 64^3 box (4.2M points, 16^3 grid) is triangulation-bound -> 2^3 partitions. The split pays
-# only with enough threads (on 4 it rightly stays one domain: CI's runner failed this, 2026-10-11), so the thread
+# only with enough threads (on 4 it rightly stays one domain), so the thread
 # count is pinned to a 10-core machine's: the report path only plans, it runs nothing
 env OMP_NUM_THREADS=10 DTFE_RAM_GB=64 DTFE_AUTO_PTS_N=4194304 "${BIN}" "${SNAP}" "${TMP}/at_h1" --grid 16 --field density --periodic \
     "${COMMON_H[@]}" > "${TMP}/at_h1.log" 2>&1
@@ -316,9 +312,9 @@ rm -f "${TMP}"/at_h*.den "${TMP}"/at_h*.streams "${TMP}"/at_h*.hidden_streams
 
 # ---------- (I) very fine grids: the GPU's 2^32-cell sub-grid cap, and a small set's memory ----------
 # The GPU kernels number a partition's sub-grid cells with 32 bits: above 2^32 the deposit falls back to
-# the CPU. The tuner now splits to keep every GPU sub-grid under the cap (a 1700^3 grid: 2^3) and warns
-# about a user split that does not. And a small particle set on such a grid no longer stays in one
-# domain when that domain's deposit buffers do not fit (it predicted 83 GB unsplit): it splits for memory.
+# the CPU. The tuner splits to keep every GPU sub-grid under the cap (a 1700^3 grid: 2^3) and warns
+# about a user split that does not. And a small particle set on such a grid does not stay in one
+# domain when that domain's deposit buffers do not fit (83 GB unsplit): it splits for memory.
 echo ">> I: very fine grids (1700^3, grids on scratch)"
 ISCR="${TMPDIR:-/tmp}/dtfe-at-scratch"; mkdir -p "${ISCR}"
 COMMON_I=(--grid 1700 --periodic --field density_a --input 105 --MpcUnit 1 --verbose 2 --scratch-dir "${ISCR}" --auto-tune-report)
@@ -339,9 +335,9 @@ else
 fi
 rm -rf "${ISCR}"
 
-# ---------- (J) the machine's free memory over a plan (2026-10-07) ----------
-# TNG50-3-Dark z=0 was SIGKILLed by macOS after 82 min: DTFE_MEM_BUDGET_GB=52 on a 64 GB Mac skipped the
-# free-memory rule, and nothing reacted while other programs took memory. DTFE_FREE_GB simulates what the
+# ---------- (J) the machine's free memory over a plan ----------
+# An explicit budget must not skip the free-memory rule: DTFE_MEM_BUDGET_GB=52 on a 64 GB Mac gets a TNG50-3-Dark
+# z=0 run SIGKILLed by macOS once other programs take memory. DTFE_FREE_GB simulates what the
 # other programs leave free (the OS query's test hook).
 echo ">> J: an explicit budget capped by the free memory; the partition memory gate"
 run_e DTFE_FREE_GB=10 DTFE_MEM_BUDGET_GB=40
@@ -394,10 +390,10 @@ else
     echo "   SKIP  J4-J6 (the tuner ran this split one partition at a time: nothing to gate)"
 fi
 
-# ---------- (K) partitions in flight never outnumber the threads (2026-10-08) ----------
+# ---------- (K) partitions in flight never outnumber the threads ----------
 # OMP_NUM_THREADS=2 makes the thread count the machine's own; '--partition 4 4 4' has 64 partitions. A small set
 # with the split hand-set and the concurrency left to the tuner (K1), and '--max-concurrent 0' = all threads (K2),
-# each used to start all 64 at once.
+# would each start all 64 at once.
 echo ">> K: partitions in flight are capped at the threads"
 run_k() {
     env "$@" OMP_NUM_THREADS=2 DTFE_RAM_GB=64 DTFE_FREE_GB=1000 "${BIN}" "${SNAP}" "${TMP}/at_k" --grid 16 --field density \
@@ -414,11 +410,11 @@ done
 K_ARGS=()
 rm -f "${TMP}"/at_k.*
 
-# ---------- (L) the look-ahead and the budget agree (2026-10-11) ----------
-# At --max-concurrent 1 with the GPU deposit the run prepares the next partition during the deposit. Its bytes were
-# added to the prediction AFTER the split was chosen without them, so a plan that fitted reported over_budget=1 and
-# the launcher's memory check halved a plane that fits. A budget between 'one partition' and 'one partition + the
-# look-ahead' must now switch the look-ahead off and report a prediction within the budget.
+# ---------- (L) the look-ahead and the budget agree ----------
+# At --max-concurrent 1 with the GPU deposit the run prepares the next partition during the deposit. Its bytes
+# belong in the prediction the split is chosen by: added after it, a plan that fits reports over_budget=1 and
+# the launcher's memory check halves a plane that fits. A budget between 'one partition' and 'one partition + the
+# look-ahead' must switch the look-ahead off and report a prediction within the budget.
 echo ">> L: the look-ahead is counted against the budget"
 run_l() {  # $1 = budget in GB, $2 = log
     env DTFE_RAM_GB=64 DTFE_FREE_GB=1000 DTFE_AUTO_MINN=1000 DTFE_MEM_BUDGET_GB="$1" "${BIN}" "${SNAP}" "${TMP}/at_l" \
@@ -442,9 +438,9 @@ else
 fi
 rm -f "${TMP}"/at_l*
 
-# ---------- (M) the GPU deposit's host snapshot is in the prediction, once (2026-10-11) ----------
+# ---------- (M) the GPU deposit's host snapshot is in the prediction, once ----------
 # The Metal deposit keeps a host copy of its accumulator buffers (ps_metal_host.cc GpuSnapshot: the grids, the
-# 8 B fixed-point mass, the per-tet masses) to resume a failed command buffer. The model did not count it: ~4.7 GB
+# 8 B fixed-point mass, the per-tet masses) to resume a failed command buffer: ~4.7 GB
 # per partition at 1024^3 split 2^3. The deposits run one at a time, so the copy is counted ONCE whatever the
 # concurrency: predicted(c) = fixed + c x per-partition + snapshot, i.e. snapshot = p(2) - fixed - 2 (p(3) - p(2)).
 echo ">> M: the GPU deposit's snapshot is counted once"
@@ -459,8 +455,8 @@ if grep -q "GPU (--ps-gpu)" "${TMP}/at_m2.log"; then
     gb() { sed -n "s/^AUTO-TUNE-REPORT .*$1=\([0-9.]*\) .*/\1/p" "$2" | head -1; }
     p2=$(gb predicted_gb "${TMP}/at_m2.log"); p3=$(gb predicted_gb "${TMP}/at_m3.log"); f2=$(gb fixed_gb "${TMP}/at_m2.log")
     # expected: (24 B of selected grids + 4 B of the 64-bit mass) x the (256/2 + 40)^3 sub-grid cells = 0.133 GB
-    # (+ the per-tet masses; measured 0.114 GB) -- and since 2026-10-14 the velocity moment and its weight (16 B)
-    # are 64-bit words, 16 B more: 0.209 GB (measured 0.190 GB). PS_METAL_FLOAT_MOMENTS=1 keeps the floats.
+    # (+ the per-tet masses; measured 0.114 GB) -- with the velocity moment and its weight (16 B) as
+    # 64-bit words, 16 B more: 0.209 GB (measured 0.190 GB). PS_METAL_FLOAT_MOMENTS=1 keeps the floats.
     sm=$(awk -v a="${p2:-0}" -v b="${p3:-0}" -v f="${f2:-0}" 'BEGIN{printf "%.3f", a - f - 2*(b - a)}')
     if [ "${PS_METAL_FLOAT_MOMENTS:-0}" != "0" ] || [ "${PS_GPU_FLOAT_MOMENTS:-0}" != "0" ]; then lo=0.10; hi=0.17; ex=0.13
     else lo=0.16; hi=0.25; ex=0.21; fi
@@ -527,14 +523,14 @@ check "P the default predicts like '--ps-lag-padding 8' (${pd:-none} = ${p8:-non
       "$(awk -v d="${pd:-x}" -v e="${p8:-y}" -v z="${p0:-x}" 'BEGIN{print (d != "x" && d == e && d != z) ? 1 : 0}')"
 
 # ---------- (R) standard DTFE --region: the tuner plans the region, not the snapshot ----------
-# 2026-10-13 (audit finding 8). A '--region'/'--regionMpc' run triangulates only the region plus its padding, but the
-# standard binary's tuner was handed the whole snapshot's particle count and box: the launcher's exact zoom of a
-# 20^3-cell TNG50 region came out '--partition 3 3 3, 10 thread(s)' -- 27 x 10 sub-triangulations, each padded again
+# A '--region'/'--regionMpc' run triangulates only the region plus its padding, so the standard binary's tuner
+# plans the region's particle count and box; planning the whole snapshot's turns the launcher's exact zoom of a
+# 20^3-cell TNG50 region into '--partition 3 3 3, 10 thread(s)' -- 27 x 10 sub-triangulations, each padded again
 # around its tiny sub-box. On a simulated 0.2 GB machine (the standard tuner has no small-N gate): the whole 64^3 box
-# needs a split (the control, so the machine is tight enough to show the bug); a 10 x 10 x 2 Mpc region of 264
-# particles keeps one domain with every thread (the tuner stays silent); a region that IS the box plans exactly like
-# the box; and a real region run left to the tuner is byte-identical to one with '--partition 1 1 1' -- the old
-# tuner, planning the snapshot, cut that one to ONE thread (with a bogus 'no split fits' warning) and split the other.
+# needs a split (the control, so the machine is tight enough to show the difference); a 10 x 10 x 2 Mpc region of
+# 264 particles keeps one domain with every thread (the tuner stays silent); a region that IS the box plans exactly
+# like the box; and a real region run left to the tuner is byte-identical to one with '--partition 1 1 1' (a tuner
+# planning the snapshot cuts that one to ONE thread, with a bogus 'no split fits' warning, and splits the other).
 echo ">> R: standard DTFE --region plans the region's particles (${DTFE_BIN})"
 if [ -x "${DTFE_BIN}" ]; then
     std_r() {  # $1 = log, rest = extra args (report mode: nothing is written)
@@ -570,10 +566,10 @@ else
     echo "   SKIP  R (${DTFE_BIN} is not built)"
 fi
 
-# ---------- (S) one domain: its grids are counted once (2026-10-18) ----------
+# ---------- (S) one domain: its grids are counted once ----------
 # '--partition 1 1 1' (and one domain picked by the tuner) deposits straight into the run's own grids, which 'fixed'
-# books; the partition term added them again, plus every fixed-point grid's conversion at once: 38.84 GB predicted for
-# the 64^3 crossed waves on a 768^3 grid, measured at 22.9 GB peak footprint (24.87 GB in the double build, whose peak
+# books, so the partition term must not add them again (nor every fixed-point grid's conversion at once). The 64^3
+# crossed waves on a 768^3 grid measure 22.9 GB peak footprint (24.87 GB in the double build, whose peak
 # is the export). S1 pins that report (the run itself takes 23 GB): at or above the measurement, within 15% of it; the
 # threads and the machine are pinned (the copy budget and the threads' sample lists follow both). S2 runs one domain
 # for real and its peak must stay under the prediction -- the model's contract; no upper bound there: the model follows

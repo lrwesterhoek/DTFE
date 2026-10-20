@@ -1,12 +1,13 @@
-"""The FATE of the voids: a census over every snapshot of a box (2026-10-11).
+"""The FATE of the voids: a census over every snapshot of a box.
 
 Each distinct well-resolved void (the profile / abundance sample, catalog.distinct_mask: the FOLLOWED voids) of
 every snapshot of the ladder is linked to the voids of the next one by its MATTER (dtfelib.lagrangian): its member
-particles -- those within R_v of its centre, at most lagrangian.FATE_MAX_SIGMA (15) smoothing lengths (2026-10-11:
-the R_v search reaches 24 since, the membership spheres stay at the 15 the census was made with) -- are found again
-by ParticleID, and the voids holding them there are its descendants. The descendants are drawn from EVERY minimum of the next catalogue with a usable radius (2026-10-11,
-lagrangian.void_pool; the followed ones with their R_v), not from the followed ones alone: at z = 0 those are a fifth
-of the minima, and the morning's census counted a void whose matter sat in an unfollowed minimum as vanished.
+particles -- those within R_v of its centre, at most lagrangian.FATE_MAX_SIGMA (15) smoothing lengths (the R_v
+search reaches 24; the membership spheres stay at the 15 the census is made with) -- are found again
+by ParticleID, and the voids holding them there are its descendants. The descendants are drawn from EVERY minimum of the
+next catalogue with a usable radius (lagrangian.void_pool; the followed ones with their R_v), not from the followed ones
+alone: at z = 0 those are a fifth of the minima, and a void whose matter sits in an unfollowed minimum would count as
+vanished.
 Classes (Lagrangian linking, lagrangian.py's constants): SURVIVE (>= 50% of the members in one followed descendant),
 MERGE (two or more progenitors pass >= 50% to the same followed descendant), UNRESOLVED (survive or merge, but into
 a minimum that is not followed: not distinct, not well resolved or without R_v -- the void lives on, out of the
@@ -27,7 +28,7 @@ Outputs (figures/void_fate/<sim>/):
   fate_census.npz   the per-interval class counts, the chained survival and the direct --ref-snap -> last link
 The per-interval links (shared-particle contingency tables) are cached in the pipeline cache
 (<sim>_<method>_fate_<a>_<b>.npz, rebuilt when either catalogue's voids or R_v settings changed -- the catalogue's
-own r_v_settings record, 2026-10-11 -- and once for the descendant pool: lagrangian.LINK_VERSION); the classes are
+own r_v_settings record -- and once for the descendant pool: lagrangian.LINK_VERSION); the classes are
 taken at plot
 time, so a changed lagrangian.SURVIVE_FRAC / SPLIT_FRAC needs no particle read. Those names are PS-DTFE's default
 grids; another estimator or --prefix adds '_<method>' / '_<prefix>', --exclusive '_exclusive' (each particle in one
@@ -49,7 +50,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 import config
-from dtfelib import pipeline, catalog
+from dtfelib import pipeline
 from dtfelib import lagrangian as L
 from dtfelib import make_parser, use_data_root
 from dtfelib import environment as env
@@ -80,7 +81,7 @@ def name_tag(method, prefix) -> str:
 
 def _vanish_note(fate) -> str:
     """How the vanished voids vanished: the median largest share of their matter that is still in ONE void of the
-    next snapshot (any minimum: since 2026-10-11 a void living on in an unfollowed minimum is 'unresolved', not a
+    next snapshot (any minimum: a void living on in an unfollowed minimum is 'unresolved', not a
     vanish), and how many have none in any."""
     v = fate["cls"] == L.CLASS_CODE["vanish"]
     if not v.any():
@@ -119,7 +120,7 @@ def census(snaps, args, tag):
     direct = None
     for a, b in zip(snaps[:-1], snaps[1:]):
         last = b is snaps[-1]
-        # the last snapshot's pool is streamed ONCE for both of its links (2026-10-11: the pool is no longer held
+        # the last snapshot's pool is streamed ONCE for both of its links (the pool is not held
         # between them); its own followed members are never needed (no next interval)
         progs = [a] + ([ref] if last and direct_wanted and ref is not a else [])
         print(f"  link snap {a.snap} -> {b.snap}" + (f" (and the direct link {ref.snap} -> {b.snap})"
@@ -139,7 +140,7 @@ def census(snaps, args, tag):
 
 def r_v_mpc(a):
     """The followed voids' MEASURED R_v in Mpc (the catalogue's), for the table and the figure: a.radii are the
-    membership spheres, capped at lagrangian.FATE_MAX_SIGMA smoothing lengths (2026-10-11), not the void's size."""
+    membership spheres, capped at lagrangian.FATE_MAX_SIGMA smoothing lengths, not the void's size."""
     return np.asarray(a.cat["r_v_cells"], dtype=np.float64)[a.rows] * float(a.cell)
 
 
@@ -189,7 +190,7 @@ def plot_census(intervals, direct, chain, ztab, args, path):
     ax.set_xticklabels(labels, rotation=35, ha="right", fontsize=9)
     ax.set_xlabel("interval (redshift)")
     ax.set_ylabel("distinct resolved voids (progenitors)")
-    # above the bars: 'best' put it over the middle intervals (TNG100 --exclusive, 2026-10-11), the late ones are short
+    # above the bars: 'best' puts it over the middle intervals (TNG100 --exclusive), the late ones are short
     ax.set_ylim(0, bottom.max() * 1.45 if bottom.size and bottom.max() > 0 else 1.0)
     ax.legend(fontsize=8, loc="upper right", ncol=2)
 

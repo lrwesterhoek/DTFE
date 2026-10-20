@@ -8,7 +8,6 @@ outputs, time estimates and failure advice (results.py), presets and the binary'
 Usage: python3 tests/py_gui_runspec_test.py
 """
 
-import atexit
 import os
 import shutil
 import subprocess
@@ -17,20 +16,11 @@ import tempfile
 import time
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "python" / "gui"))
-FIGS_TMP = tempfile.mkdtemp(prefix="runspec_figs_")
-os.environ["DTFE_FIGURES_ROOT"] = FIGS_TMP      # BEFORE runspec is imported: never the real root (the T7)
-atexit.register(shutil.rmtree, FIGS_TMP, True)
+from _harness import REPO as ROOT, check_ok as check, setup, summary
+
+FIGS_TMP = setup("runspec_figs_", paths=("python/gui",), no_mirror=False, mpl_agg=False)    # BEFORE runspec is imported
 
 import runspec as rs  # noqa: E402
-
-PASS, FAIL = [], []
-
-
-def check(name, ok, detail=""):
-    (PASS if ok else FAIL).append(name)
-    print(f"   {'PASS' if ok else 'FAIL'}  {name}" + (f"  ({detail})" if detail and not ok else ""))
 
 
 def levels(spec):
@@ -93,11 +83,11 @@ def main():
         check("standard DTFE with the exact choice: run_dtfe.sh -e (the exact cell average), named in the queue",
               dte.command()[0] == [str(rs.DTFE_SCRIPT), "-s", "TNG100-3-Dark", "-g", "512", "-e", "4"]
               and rs.job_summary("grids", dte).endswith(", exact"), str(dte.command()[0]))
-        # 2026-10-13: run_dtfe.sh's default is the exact average, and -e only switches it on: the job pins the knob
+        # run_dtfe.sh's default is the exact average, and -e only switches it on: the job pins the knob
         check("... the cell average is pinned both ways (DTFE_EXACT_AVERAGE=0 for 'sampled', 1 for 'exact')",
               dt.command()[1].get("DTFE_EXACT_AVERAGE") == "0" and dte.command()[1].get("DTFE_EXACT_AVERAGE") == "1",
               f"{dt.command()[1]} {dte.command()[1]}")
-        # 2026-10-13 (integration item 8): a standard-DTFE job STARTS at the exact cell average, run_dtfe.sh's and the
+        # a standard-DTFE job STARTS at the exact cell average, run_dtfe.sh's and the
         # production setting; a PS-DTFE job at the sampled deposit; a choice saved in a settings dict is kept
         dflt = rs.RunSpec(data_root=str(tmp), sim="TNG100-3-Dark", snapshots=[4], estimator="dtfe", gpu=False)
         check("a standard-DTFE job starts at the exact cell average (-e, DTFE_EXACT_AVERAGE=1), a PS-DTFE one at the "
@@ -177,13 +167,13 @@ def main():
         pipe.plan_only = False
         check("stale(): no slices yet -> every snapshot", pipe.stale("TNG100-3-Dark") == ([4, 99], 2))
         (sim / "hires_plane_z64.bin").touch()
-        # a sidecar as make_image_plane.py writes it (an unreadable one counts as 'differs' since 2026-10-04)
+        # a sidecar as make_image_plane.py writes it (an unreadable one counts as 'differs')
         (sim / "hires_plane_z64.json").write_text('{"box": 100.0, "center": 50.0, "planes": 1, "thickness": 2.0, '
                                                    '"nu": 64, "nv": 64, "u0": 0.0, "u1": 100.0, "v0": 0.0, "v1": 100.0}')
         for n in (4, 99):
             for ext in ("pts_den", "pts_velGrad"):
                 (sim / f"snapdir_{n:03d}" / f"ps_output.{ext}").touch()
-            # a slice OF this plane: 64 x 64 float64 (the count is compared since 2026-10-11)
+            # a slice OF this plane: 64 x 64 float64 (the count is compared)
             (sim / f"snapdir_{n:03d}" / "ps_output.pts_den").write_bytes(b"\0" * 8 * 64 * 64)
         # explicit times: "newer" is STRICT (the script's -nt), and Linux stamps files from a
         # coarse clock, so files made milliseconds apart can share one mtime (failed on Ubuntu)
@@ -200,8 +190,8 @@ def main():
         pipe.force = True
         check("stale(): FORCE recomputes everything", pipe.stale("TNG100-3-Dark") == ([4, 99], 2))
         pipe.force = False
-        # 2026-10-11: a slice newer than the plane but of ANOTHER plane size (TNG100's 4096^2 slices beside an
-        # older hires_plane_z8192) read as current: the script skipped the compute and every render failed
+        # a slice newer than the plane but of ANOTHER plane size (TNG100's 4096^2 slices beside an older
+        # hires_plane_z8192) is stale: read as current, the script would skip the compute and every render fail
         den4 = sim / "snapdir_004" / "ps_output.pts_den"
         den4.write_bytes(b"\0" * 8 * 32 * 32)
         os.utime(den4, (now, now))
@@ -421,7 +411,7 @@ def main():
         st = grids.check_step()
         check("a grids check is the SAME run_ps_dtfe.sh call plus AUTO_TUNE_REPORT=1",
               st.argv == grids.command()[0] and st.env == dict(grids.command()[1], AUTO_TUNE_REPORT="1"))
-        # 2026-10-13: the standard binary's tuner reports too, through run_dtfe.sh's own AUTO_TUNE_REPORT
+        # the standard binary's tuner reports too, through run_dtfe.sh's own AUTO_TUNE_REPORT
         sgrids = rs.RunSpec(data_root=str(tmp), sim="TNG100-3-Dark", snapshots=[99, 4], estimator="dtfe")
         sst = sgrids.check_step()
         check("... and a standard-DTFE grids check is the same run_dtfe.sh call plus AUTO_TUNE_REPORT=1",
@@ -460,7 +450,7 @@ def main():
               [(g[1], g[2]) for g in got if g[1]] == [("64", "4"), ("32", "99")]
               and [st.argv[st.argv.index("--plane") + 1].endswith(f"hires_plane_z{nu}.json")
                    for st, nu in zip(pm.steps()[1::2], (64, 32))] == [True, True], str(got))
-        # 2026-10-08: run_ps_pipeline.sh exits 1 when it computed nothing, and the render after it must not run then
+        # run_ps_pipeline.sh exits 1 when it computed nothing, and the render after it must not run then
         check("... each render waits for its own pipeline call (after = that call's label; the calls wait for nothing)",
               [st.after for st in pm.steps()[1::2]] == [st.label for st in pm.steps()[0::2]]
               and all(st.after == "" for st in pm.steps()[0::2]), str([(st.label, st.after) for st in pm.steps()]))
@@ -511,15 +501,13 @@ def main():
     finally:
         shutil.rmtree(tmp.parent)
     print("-" * 60)
-    print(f"RESULT: {len(PASS)} passed, {len(FAIL)} failed")
-    return 1 if FAIL else 0
+    return summary(show_zero_skips=False)
 
 
 def estimator_per_snapshot(tmp: Path):
-    """2026-10-11: the void catalogue build resolves estimator 'auto' per snapshot (it turned 'auto' into 'ps' while
-    its check accepted a snapdir with standard-DTFE grids only, so the job failed there), and the point-evaluated
-    sets read the estimator's own slice (they assumed ps_output, so a standard-DTFE slice beside PS-DTFE grids could
-    not be rendered)."""
+    """The void catalogue build resolves estimator 'auto' per snapshot (never 'ps' for a snapdir with standard-DTFE
+    grids only), and the point-evaluated sets read the estimator's own slice (not ps_output, so a standard-DTFE slice
+    beside PS-DTFE grids can be rendered)."""
     import json
     print("estimator per snapshot:")
     root = tmp.parent / "est_root"
@@ -564,7 +552,7 @@ def estimator_per_snapshot(tmp: Path):
     (sd / "ps_output.pts_den").write_bytes(b"\0" * 8 * 16 * 16)
     check("... auto with both slices: PS-DTFE first, as before",
           pts() == ("auto", str(sd / "ps_output"), False), str(pts()))
-    # 2026-10-15: standard DTFE's grids are 'output.*' exactly; 'output*.a_den' matched the plane run's one-field
+    # standard DTFE's grids are 'output.*' exactly; 'output*.a_den' would match the plane run's one-field
     # grid 'output_plane.a_den' (thesis_runs.sh dtfe27planes) and any other 'output_<variant>' beside them
     pl = sp / "snapdir_050"
     pl.mkdir()
@@ -596,7 +584,7 @@ def gpu_branches(tmp: Path, snap: Path):
             check(f"the faked stamp is what the build checks read ({built})",
                   rs.gpu_built("ps") is built and rs.gpu_built("dtfe") is built
                   and rs.gpu_backend("ps") == ("Metal" if built else ""))
-            # 2026-10-15: a fresh job's GPU tick is the build's (it was on for a CPU-only build too); a saved one stays
+            # a fresh job's GPU tick is the build's; a saved one stays
             check(f"a fresh job's GPU tick is the build's ({built}): the Grids job (both estimators, double too), the "
                   "pipeline; a saved tick is kept either way",
                   rs.RunSpec().gpu is built and rs.RunSpec(estimator="dtfe").gpu is built
@@ -660,7 +648,7 @@ def _gpu_advice_checks(tmp: Path, snap: Path):
           and "--exact-average" not in rs.CustomSpec(input_file=str(snap), estimator="dtfe", deposit="sampled").command()
           and (any("6.6x" in m for _, m in dex.problems()) and any("6.6x" in m for _, m in cex.problems())) == dt_gpu,
           str(cex.problems()))
-    # 2026-10-13 (integration items 6 and 8): the Custom tab's standard run starts at the exact cell average and pads
+    # the Custom tab's standard run starts at the exact cell average and pads
     # with 15 mean spacings (dtfelib.estimator.STANDARD_PADDING, run_dtfe.sh's and the standard server's value) instead
     # of the binary's 5, which leaves wrong values within a few spacings of a box face; PS-DTFE keeps its own padding
     cd0, cd2 = (rs.CustomSpec(input_file=str(snap), estimator="dtfe").command(),
@@ -674,7 +662,7 @@ def _gpu_advice_checks(tmp: Path, snap: Path):
 
 
 def tick_helpers():
-    """The Explore map's axes and colour bar (survey items 12, 13): round ticks, their labels, the scale bar."""
+    """The Explore map's axes and colour bar: round ticks, their labels, the scale bar."""
     import numpy as np
     import grids as G
     t = G.nice_ticks(0, 51.67)
@@ -706,7 +694,7 @@ def tick_helpers():
 
 
 def thesis_grids_warning():
-    """Review 2026-10-05 [37]: the Thesis analysis set warns when a snapshot has no standard-DTFE grids in the modes
+    """The Thesis analysis set warns when a snapshot has no standard-DTFE grids in the modes
     that READ them -- all, compute and export (analyze.export builds its FieldSet from the grids, like compute) --
     and not in plot / check (they read python/cache). Phase-space grids do not count: compute reads the standard
     DTFE. Its own data root: an empty snapdir_099, then PS grids only, then a standard-DTFE run. The estimator and
@@ -829,7 +817,6 @@ def new_features(tmp: Path, sim: Path):
     # ---- every binary flag the GUI can emit exists in the built binary's own --full_help, and
     # every script knob it sets is one the script reads: a renamed option can never ship silently
     import re as _re
-    import presets as P
     ps_help, dt_help = P.flag_help("PS-DTFE"), P.flag_help("DTFE")
     if ps_help and dt_help:
         emitted = set()
@@ -853,8 +840,8 @@ def new_features(tmp: Path, sim: Path):
     else:
         check("flags-exist check skipped: a binary is not built", True)
 
-    # ---- GPU advice: where the deposit pays (measured 2026-10-01), one warning per condition; asserted for BOTH
-    # builds by faking the Makefile's GPU stamp (2026-10-11: on CPU-only CI the GPU branches were never asserted)
+    # ---- GPU advice: where the deposit pays, one warning per condition; asserted for BOTH builds by faking
+    # the Makefile's GPU stamp (on CPU-only CI the GPU branches would otherwise never be asserted)
     gpu_branches(tmp, snap)
     # ---- precision: the double pair is a setting, picked per job; the knob and binary names
     both_double = rs.binary_built("ps", "double") and rs.binary_built("dtfe", "double")
@@ -887,8 +874,8 @@ def new_features(tmp: Path, sim: Path):
     st = c1.check_step()
     check("custom check step: the run's own command in report mode, named after the file",
           st.argv[:-1] == c1.command() and st.argv[-1] == "--auto-tune-report" and "cloud.hdf5" in st.label, st.label)
-    # 2026-10-13: the standard binary answers the same report-mode call (it printed 'AUTO-TUNE-REPORT unsupported'),
-    # here on a real (synthetic) snapshot: the fixture above has no velocities
+    # the standard binary answers the same report-mode call, here on a real (synthetic) snapshot: the fixture
+    # above has no velocities
     import subprocess as sp              # (a plain 'subprocess' is a local of this function, imported further down)
     std_in = work / "std_in.hdf5"
     sp.run([sys.executable, str(ROOT / "tests" / "generate_ps_test_data.py"), "--out", str(std_in), "--n", "16"],
@@ -979,7 +966,7 @@ def new_features(tmp: Path, sim: Path):
     check("stale: a TNG PS run without --ps-vertex-mass is flagged", any("tetrahedron masses" in m for _, m in reasons))
     (snapdir / "ps_output.a_unresolved").write_bytes(b"\0" * 32)       # the old name of '.hidden_streams'
     _write_log(log, head.replace("2026-09-01", "2026-09-30").replace("--ps-gpu", "--ps-gpu --ps-vertex-mass"))
-    reasons = R.stale_reasons(R.scan_runs(tmp)[0])            # built 2026-09-30 10:00, before the exact flag
+    reasons = R.stale_reasons(R.scan_runs(tmp)[0])            # a build from before the exact flag
     check("stale: an old '.unresolved' (before the exact hidden-streams flag) is flagged, and nothing else",
           len(reasons) == 1 and reasons[0][0] == "warning" and "hidden-streams flag" in reasons[0][1], str(reasons))
     (snapdir / "ps_output.a_unresolved").unlink()                    # a current build writes the new name
@@ -1072,8 +1059,8 @@ def new_features(tmp: Path, sim: Path):
     cc = rs.CustomSpec()
     P.apply_preset(cc, P.BUILTIN_PRESETS["Publication"][1], planes)
     check("a preset applies to a custom-snapshot job too (fields it lacks are skipped)", cc.grid == 512 and cc.caustics)
-    # 2026-10-13: the thesis presets give a standard-DTFE job its production cell average (the exact one; they set the
-    # Monte-Carlo one before), a PS-DTFE job the sampled deposit; 'Quick look' samples both
+    # the thesis presets give a standard-DTFE job its production cell average (the exact one), a PS-DTFE job the
+    # sampled deposit; 'Quick look' samples both
     sd, sp, ql, cd = (rs.RunSpec(estimator="dtfe", deposit="sampled"), rs.RunSpec(deposit="exact"),
                       rs.RunSpec(estimator="dtfe"), rs.CustomSpec(estimator="dtfe", deposit="sampled"))
     ch = P.apply_preset(sd, P.BUILTIN_PRESETS["Standard"][1], planes)
@@ -1138,9 +1125,9 @@ def new_features(tmp: Path, sim: Path):
           np.allclose(o.slice("velocity", 2, 0, "norm"), np.linalg.norm(vel[:, :, 0], axis=-1), rtol=1e-6)
           and np.allclose(o.slice("velocity", 2, 0, "y"), vel[:, :, 0, 1]))
     check("value(): one cell", abs(o.value("density", (2, 3, 4)) - float(den[2, 3, 4])) < 1e-6)
-    # 2026-10-13 (integration item 9): the 'caustic' map of a periodic PS run is the EXACT fold flag,
-    # dtfelib.io.caustic_is_fold(class mask, streams=, hidden=), not the stored '.caustic' -- which the grids made before
-    # 2026-10-13 set only where a folded tetrahedron deposited a sample (21.0% of TNG100-3-Dark z=1 against 33.6%). A
+    # the 'caustic' map of a periodic PS run is the EXACT fold flag,
+    # dtfelib.io.caustic_is_fold(class mask, streams=, hidden=), not the stored '.caustic' -- which older grids
+    # set only where a folded tetrahedron deposited a sample (21.0% of TNG100-3-Dark z=1 against 33.6%). A
     # non-periodic run (its sidecar) and an output without a streams grid show the stored grid; 'caustic_class' stays raw
     from dtfelib.io import caustic_is_fold
     fd = work / "fold"
@@ -1294,7 +1281,7 @@ def two_d(tmp: Path):
     check("custom 2D: the sidecar records the dimension and a 4-number box in Mpc",
           side["dim"] == 2 and side["box_mpc"] == [0.0, 100.0, 0.0, 100.0], str(side))
     demo = rs.CustomSpec(input_file=str(work / "demo" / "d.hdf5"), dim=2, demo_n=32, output_dir=str(work / "out"),
-                         demo_file=str(work / "demo" / "d.hdf5"))      # generated only at the demo's own path (B5)
+                         demo_file=str(work / "demo" / "d.hdf5"))      # generated only at the demo's own path
     gen = [st.argv for st in demo.steps() if "generate" in st.label]
     check("custom 2D demo: the generator writes a 2D snapshot", gen and gen[0][-2:] == ["--dim", "2"], str(gen))
     texts = [rs.DIM_TEXT[2]] + [m for _, m in c.problems() + bad.problems() + wrong.problems()]
@@ -1337,7 +1324,7 @@ def two_d(tmp: Path):
     check("OutputSet 2D: a two-corner box; lo / length keep a third, zero-thickness entry",
           list(o.lo) == [0.0, 0.0, 0.0] and list(o.length) == [60.0, 30.0, 0.0])
     # scalar-only outputs: 32^2 float32 is also 8^3 float64, 256^2 float32 also 32^3 float64; 64^2 float32
-    # is also 16^3 float32. A phase-space run's stream counts tell the precision; else 3D, as before
+    # is also 16^3 float32. A phase-space run's stream counts tell the precision; else 3D
     (od / "s32.a_den").write_bytes(np.ones((32, 32), np.float32).tobytes())
     (od / "s32.a_streams").write_bytes(np.ones((32, 32), np.float32).tobytes())
     (od / "c32.a_den").write_bytes(np.ones((32, 32, 32), np.float64).tobytes())
@@ -1437,7 +1424,7 @@ def two_d(tmp: Path):
     _write_log(log, "Build: DTFE 3e0c1a65fd-dirty (built 2026-10-01T10:00:00Z)\n"
                "RUNNING: /x/DTFE in.hdf5 r2 --grid 64 --periodic --CIC --interlace\n")
     old = R.stale_reasons(R.parse_runlog(log))
-    # built after the 2026-10-11 interlace-pass2 / cic-faces fixes too (cpp_fix_flags_2026_10_11 has the window)
+    # built after the interlace-pass2 / cic-faces fixes too (cpp_fix_flags_2026_10_11 has the window)
     _write_log(log, "Build: DTFE 3e0c1a65fd-dirty (built 2026-10-12T08:00:00Z)\n"
                "RUNNING: /x/DTFE in.hdf5 r2 --grid 64 --periodic --CIC --interlace\n")
     new = R.stale_reasons(R.parse_runlog(log))
@@ -1479,8 +1466,7 @@ def run_outputs_not_inputs():
 
 
 def point_window_linear(tmp: Path):
-    """Sample points for Custom and standard-DTFE runs, the PS window, the linear deposit (audit items 14 + the
-    binary options, 2026-10-06)."""
+    """Sample points for Custom and standard-DTFE runs, the PS window, the linear deposit (the binary options)."""
     pts = tmp / "pts.txt"
     pts.write_text("1 2 3\n4 5 6\n")
     snap = tmp / "TNG100" / "TNG100-3-Dark" / "snapdir_099" / "combined_099.hdf5"
@@ -1524,7 +1510,7 @@ def point_window_linear(tmp: Path):
 
 def plot_options(tmp: Path):
     """The Plots tab: the thesis scripts as a checklist (= analyze.py's PLOT_SCRIPTS + the synthesis figure),
-    the point-eval gradient smoothing, the publication panels' range, dpi and pixel-exact images (2026-10-06)."""
+    the point-eval gradient smoothing, the publication panels' range, dpi and pixel-exact images."""
     import ast
     import re
     repo = Path(__file__).resolve().parents[1]
@@ -1542,7 +1528,6 @@ def plot_options(tmp: Path):
                        options={"thesis": {"mode": "plot", "only": "plot_DTFE.py,plot_conclusions_synthesis.py"},
                                 "pointeval": {"smooth_deriv": 4.0},
                                 "panels": {"plane": plane, "vmin": 0.05, "vmax": 300.0, "dpi": 150, "image": True}})
-    argv = {st.label.split()[0]: st.argv for st in spec.steps()}
     a_th = next(st.argv for st in spec.steps() if "analyze.py" in st.label)
     a_pe = next(st.argv for st in spec.steps() if "plot_pointeval.py" in " ".join(st.argv))
     a_pa = next(st.argv for st in spec.steps() if "plot_pointeval_panels.py" in " ".join(st.argv))
@@ -1559,7 +1544,7 @@ def plot_options(tmp: Path):
 
 
 def plot_void_sets(tmp: Path):
-    """The Plots tab's void and phase-space sets (2026-10-07): void profiles, streams by web environment, P(k) and the
+    """The Plots tab's void and phase-space sets: void profiles, streams by web environment, P(k) and the
     caustic skeleton, with the void radius, overlapping voids and the smoothing in Mpc; every flag one the script's own
     parser knows; the thesis set stays last (the app test picks it as the list's last item)."""
     import subprocess as _sp
@@ -1605,7 +1590,7 @@ def plot_void_sets(tmp: Path):
           f"{both.problems()} | {sk.problems()}")
 
 
-# (set key, option key) -> (script, the script's constant that is its default, or a literal) (2026-10-11)
+# (set key, option key) -> (script, the script's constant that is its default, or a literal)
 _VOID_SCRIPT_DEFAULTS = {
     ("voidpop", "size_smooth"): ("plot_void_population", "SIZE_SMOOTH_CELLS"),
     ("voidpop", "size_rv"): ("plot_void_population", "SIZE_FUNCTION_RV"),
@@ -1617,7 +1602,7 @@ _VOID_SCRIPT_DEFAULTS = {
 
 
 def plot_void_script_options(tmp: Path):
-    """The void scripts' own options on the Plots tab (2026-10-11): population size function, tracking link,
+    """The void scripts' own options on the Plots tab: population size function, tracking link,
     fate links, convergence factors, environment factor and R_v definition, profile-evolution R_v definition,
     skeleton null and wall cuts. Defaults equal the scripts' own and add no flag; every set value reaches its
     flag, each one the script's parser knows; a malformed list is an error, not a crash in the script."""
@@ -1714,7 +1699,7 @@ def plot_void_script_options(tmp: Path):
 
 
 def fixed_r_size_function(tmp: Path):
-    """The Void population set's 'size function at fixed R' tick (2026-10-11): a step of its own with the script's
+    """The Void population set's 'size function at fixed R' tick: a step of its own with the script's
     fixed-R flag and its smoothings, run with DTFE_VOID_GATE=none in ITS environment (the script refuses it gated)
     and shown in the exported command; the population step and the job's other steps keep the caller's gate."""
     import subprocess as _sp
@@ -1774,8 +1759,8 @@ def fixed_r_size_function(tmp: Path):
 
 
 def crossbox_smoothing_constant():
-    """G2 (2026-10-11): the cross-box smoothing is python/config.py's CROSSBOX_SMOOTHING_MPC (2.1625 when an older
-    config lacks it): a changed config value is the launcher's default and its unchanged-default test."""
+    """The cross-box smoothing is python/config.py's CROSSBOX_SMOOTHING_MPC (2.1625 when a config lacks it): a
+    changed config value is the launcher's default and its unchanged-default test."""
     code = ("import sys; sys.path[:0] = ['python', 'python/gui']; import config; "
             "config.CROSSBOX_SMOOTHING_MPC = 3.25; import runspec as rs; "
             "print(rs.CROSSBOX_SMOOTH_MPC, rs.FIGURE_SET['crossbox'].opts[1].default, "
@@ -1793,7 +1778,7 @@ def crossbox_smoothing_constant():
 
 
 def gpu_retry_causes(tmp: Path):
-    """G1 (2026-10-11): the GPU deposit retries by cause, from the run log's closing line ('GPU deposit retries: N
+    """The GPU deposit retries by cause, from the run log's closing line ('GPU deposit retries: N
     (innocent a, timeout b, oom c, other d)') and from the progress sidecar's 'gpu_retries_by_cause'."""
     import results as R
     d = Path(tempfile.mkdtemp(prefix="gui_retries_"))
@@ -1826,7 +1811,7 @@ def gpu_retry_causes(tmp: Path):
 
 def explore_extras(tmp: Path):
     """The hi-res slices an output offers, a snapshot chosen by hand for the server, the scalar field, the Custom
-    tab's research options (2026-10-06)."""
+    tab's research options."""
     import json
     import numpy as np
     import grids as G
@@ -1930,8 +1915,7 @@ def cube_cap():
 
 
 def audit_claims():
-    """Two of the 2026-10-05 audit's confirmed claims: an output name with a dot is listed; time estimates
-    compare runs of one precision."""
+    """An output name with a dot is listed; time estimates compare runs of one precision."""
     import numpy as np
     import results as R
     import grids as G
@@ -1954,13 +1938,13 @@ def audit_claims():
     got = (R.time_estimate(recs, **kw), R.time_estimate(recs, precision="double", **kw))
     check("time estimates: a double-precision run (2x slower) never predicts a single one, nor a 2D run a 3D one",
           got == ((100, 1), (1000, 1)), str(got))
-    # a run under a second ('total wall time : 0s') still has a time (2026-10-12: it was dropped as if it had none)
+    # a run under a second ('total wall time : 0s') still has a time (not one dropped as if it had none)
     fast = R.time_estimate([rec(0.0, "PS-DTFE"), rec(0.0, "PS-DTFE")], **kw)
     check("... and runs under a second ('0s') still give an estimate", fast == (0.0, 2), str(fast))
 
 
 def run_options(tmp: Path):
-    """The memory budget, the tessellation cache and the standard-DTFE field ticks (audit items 3, 9, 15)."""
+    """The memory budget, the tessellation cache and the standard-DTFE field ticks."""
     base = dict(data_root=str(tmp), sim="TNG100-3-Dark", snapshots=[99])
     env0 = rs.RunSpec(estimator="dtfe", **base).command()[1]
     web = rs.RunSpec(estimator="dtfe", fields=["density_a", "tweb_a", "dispersion_a"], mem_budget_gb=40,
@@ -1988,7 +1972,7 @@ def run_options(tmp: Path):
 
 
 def pipeline_options(tmp: Path, sim: Path):
-    """2026-10-04: the Pipeline tab's run options (deposit, sub-samples, GPU, vertex mass, volume weighting,
+    """The Pipeline tab's run options (deposit, sub-samples, GPU, vertex mass, volume weighting,
     caustics, cusps, parallel triangulation), the plane's geometry (planes, thickness, sub-samples, window)
     and the render step's options reach the scripts, and the memory check follows every one of them."""
     import json
@@ -1998,8 +1982,8 @@ def pipeline_options(tmp: Path, sim: Path):
     run_keys = ("PS_EXACT", "AVG_SUBSAMPLES", "PS_GPU", "PS_VERTEX_MASS", "PS_VOLUME_WEIGHTED", "PS_CAUSTICS",
                 "PS_CAUSTIC_CUSPS", "PS_PARALLEL_TRI", "PLANES", "SUPERSAMPLE")
     env = rs.PipelineSpec(**base).command()[1]
-    # 2026-10-13: the caustic classes are on by default (run_ps_dtfe.sh's default and the production runs'); the GPU
-    # since 2026-10-15 when the PS pair was built with one (rs.gpu_build_default, scripts/config.sh's rule)
+    # the caustic classes are on by default (run_ps_dtfe.sh's default and the production runs'); the GPU
+    # when the PS pair was built with one (rs.gpu_build_default, scripts/config.sh's rule)
     gpu = "1" if rs.gpu_build_default("ps") else "0"
     check("defaults: every run option is spelled out for run_ps_dtfe.sh (a stray PS_* in the login shell cannot leak in)",
           [env[k] for k in run_keys] == ["0", "3", gpu, "1", "1", "1", "0", "0", "1", "1"]
@@ -2130,14 +2114,14 @@ def pipeline_options(tmp: Path, sim: Path):
 
 
 def bug_fixes_2026_10_05(tmp: Path, sim: Path):
-    """The bugs of the 2026-10-05 audit: the Explore cube cache follows the file, a standard-DTFE run gets its
+    """The Explore cube cache follows the file, a standard-DTFE run gets its
     scratch folder, the demo is generated only at its own path, one lambda_th default, every products() caller
     passes --data-root."""
     import tempfile as tf
     import numpy as np
     import grids as G
     print("bug fixes 2026-10-05:")
-    # B1: a grid written again is read again (the cache was keyed on the path alone)
+    # a grid written again is read again (a cache keyed on the path alone would not)
     od = Path(tf.mkdtemp(prefix="gui_cube_"))
     try:
         n = 8
@@ -2153,11 +2137,11 @@ def bug_fixes_2026_10_05(tmp: Path, sim: Path):
               before != 7.0 and after == 7.0 and len(keys) == 1, f"{before} {after} {len(keys)}")
     finally:
         shutil.rmtree(od)
-    # B4: the standard-DTFE Grids run carries its scratch folder (the command returned before setting it)
+    # the standard-DTFE Grids run carries its scratch folder
     sd = tmp.parent
     env = rs.RunSpec(data_root=str(tmp), sim="TNG100-3-Dark", snapshots=[99], estimator="dtfe", scratch_dir=str(sd)).command()[1]
     check("a standard-DTFE Grids run passes SCRATCH_DIR (run_dtfe.sh has the hook now)", env.get("SCRATCH_DIR") == str(sd), str(env))
-    # B5: the demo is generated only at the demo's own path
+    # the demo is generated only at the demo's own path
     demo = rs.demo_spec(output_dir=str(tmp / "demo"))
     other = rs.CustomSpec.from_dict(dict(demo.to_dict(), input_file=str(tmp / "elsewhere" / "missing.hdf5")))
     check("the demo generates its snapshot at its own path only; another missing path is 'file not found'",
@@ -2167,7 +2151,7 @@ def bug_fixes_2026_10_05(tmp: Path, sim: Path):
           str([st.label for st in other.steps()]))
     legacy = rs.CustomSpec.from_dict({"input_file": str(tmp / "gone.hdf5"), "demo_n": 32})   # saved before demo_file
     check("a saved demo_n without demo_file (older settings) generates nothing", not legacy.demo_pending())
-    # B13: one lambda_th default across the tabs
+    # one lambda_th default across the tabs
     cs = rs.CustomSpec(input_file=str(sim / "snapdir_099" / "combined_099.hdf5"), fields=["density_a", "tweb_a"])
     cs0 = rs.CustomSpec(input_file=str(sim / "snapdir_099" / "combined_099.hdf5"), fields=["density_a"])
     a, a0 = cs.command(), cs0.command()
@@ -2180,7 +2164,7 @@ def bug_fixes_2026_10_05(tmp: Path, sim: Path):
           and rs.RunSpec(sim="TNG100-3-Dark", snapshots=[99], data_root=str(tmp), lambda_th=0.2).memory_key()
           == rs.RunSpec(sim="TNG100-3-Dark", snapshots=[99], data_root=str(tmp)).memory_key()
           and rs.CustomSpec(input_file="x.hdf5", lambda_th=0.2).memory_key() == rs.CustomSpec(input_file="x.hdf5").memory_key())
-    # B14: no plot script asks pipeline.products() without the root it was given
+    # no plot script asks pipeline.products() without the root it was given
     import re
     bad = sorted(f.name for f in (ROOT / "python" / "plot").glob("*.py")
                  if re.search(r"pipeline\.products\((?![^)]*data_root)", f.read_text().replace("\n", " ")))
@@ -2196,7 +2180,7 @@ def bug_fixes_2026_10_05(tmp: Path, sim: Path):
 
 
 def cube_cache_2026_10_06():
-    """The fast-grid review (2026-10-06): the cube cache is thread-safe and droppable, a big cube is read
+    """The cube cache is thread-safe and droppable, a big cube is read
     whole only along its strided axis, a short file does not leave the lock held."""
     import tempfile as tf
     import threading
@@ -2305,7 +2289,7 @@ def type_labels_2026_10_06():
 
 
 def launcher_fixes():
-    """2026-10-04: running_jobs() classifies by command line and parent, and no plot script builds
+    """running_jobs() classifies by command line and parent, and no plot script builds
     the flat <root>/<sim> path by hand (the T7 keeps simulations per family)."""
     import subprocess
     print("running jobs:")
@@ -2314,7 +2298,7 @@ def launcher_fixes():
     # child), its exact zoom (a direct child writing into a 'dtfe-zoom-' folder), a run from another terminal
     # (bash -> binary: a grandchild), a run whose OUTPUT PATH contains '--serve' (the token rule), a memory check
     # from a terminal (--auto-tune-report, never counted), someone else's query server (listed apart, with its
-    # memory) and a Custom-tab run (2026-10-11: a direct child too, with a --ps-window of its own, but a run)
+    # memory) and a Custom-tab run (a direct child too, with a --ps-window of its own, but a run)
     pgrep_out = "100 PS-DTFE\n200 PS-DTFE\n300 DTFE-double\n400 PS-DTFE\n500 PS-DTFE\n600 PS-DTFE\n700 PS-DTFE\n"
     ps_out = (f"  100 {me} 24000000 /Users/x/Mobile Documents/DTFE/PS-DTFE /Volumes/T7/snap.hdf5 /tmp/s/serve --serve "
               f"--input 105 --verbose 0 --serve-resident 4 --serve-progress\n"
@@ -2397,8 +2381,8 @@ def launcher_fixes():
 
 
 def figures_root_rule():
-    """Every figure on the T7 (2026-10-06): DTFE_FIGURES_ROOT, else the T7 while mounted, else python/figures --
-    one rule for the launcher and its scripts; saved specs holding the old default read as today's."""
+    """Every figure on the T7: DTFE_FIGURES_ROOT, else the T7 while mounted, else python/figures --
+    one rule for the launcher and its scripts; saved specs holding the former default read as the current one."""
     check("this suite's figures go to its temp folder (DTFE_FIGURES_ROOT, set before runspec is imported)",
           rs.FIGURES_ROOT == Path(FIGS_TMP), str(rs.FIGURES_ROOT))
     env = {k: v for k, v in os.environ.items() if k != "DTFE_FIGURES_ROOT"}
@@ -2448,11 +2432,11 @@ def void_outline_geometry():
 
 
 def run_log_contract():
-    """The run-log contract (2026-10-08): a run writes '<prefix>.runlog.partial'; exit 0 renames it onto
+    """The run-log contract: a run writes '<prefix>.runlog.partial'; exit 0 renames it onto
     '<prefix>.runlog' (the log of the grids on disk), a failure or stop onto '<prefix>.runlog.failed' (the old
     '.runlog' untouched). The Runs browser reads the three names as ONE output set: the log of record, and a
-    newer failed, running or killed attempt noted on it (results.py). Plus the deposit and GPU-retry fixes of
-    the same round, and the Pipeline job's render chained to its pipeline call."""
+    newer failed, running or killed attempt noted on it (results.py). Plus the deposit settings and the GPU-retry
+    wording a log is read for, and the Pipeline job's render chained to its pipeline call."""
     import results as R
     print("run-log contract 2026-10-08:")
     base = Path(tempfile.mkdtemp(prefix="gui_runlogs_"))
@@ -2560,7 +2544,7 @@ def run_log_contract():
               lin.settings().get("linear_deposit") is True and std.settings().get("linear_deposit") is False
               and "linear deposit" in lin.options_text() and "linear deposit" not in std.options_text(),
               f"{lin.settings()} {std.settings()} {lin.options_text()!r}")
-        # 2026-10-13: a standard-DTFE run's cell average reaches 'Load settings' both ways (it was left as it was)
+        # a standard-DTFE run's cell average reaches 'Load settings' both ways
         _write_log(d / "dx.runlog", "RUNNING: /x/DTFE in.hdf5 dx --grid 64 --periodic --exact-average --padding 15\n")
         _write_log(d / "dm.runlog", "RUNNING: /x/DTFE in.hdf5 dm --grid 64 --periodic --padding 15\n")
         dx, dm = R.parse_runlog(d / "dx.runlog"), R.parse_runlog(d / "dm.runlog")
@@ -2593,8 +2577,8 @@ def run_log_contract():
 
 
 def launcher_2026_10_11():
-    """The launcher's part of the 2026-10-11 afternoon wave: the ordered merge (K1) from every tab into its run
-    and back through 'Load settings', and a killed run's checkpoint directory (K2) in the Runs browser."""
+    """The ordered merge from every tab into its run and back through 'Load settings', and a killed run's
+    checkpoint directory in the Runs browser."""
     import results as R
     print("launcher 2026-10-11 (ordered merge, checkpoints):")
     base = Path(tempfile.mkdtemp(prefix="gui_wave2_"))
@@ -2603,8 +2587,8 @@ def launcher_2026_10_11():
         on = rs.RunSpec(sim="TNG50-4", snapshots=[99], ordered_merge=True).command()[1]
         off = rs.RunSpec(sim="TNG50-4", snapshots=[99], ordered_merge=False).command()[1]
         pon = rs.PipelineSpec(sims=["TNG50-4"], ordered_merge=True)
-        # 2026-10-14: ON by default (the staged merge in index order: run_ps_dtfe.sh's and the binary's default); off
-        # is the old merge as partitions finish (ORDERED_MERGE=0 / --completion-order-merge)
+        # ON by default (the staged merge in index order: run_ps_dtfe.sh's and the binary's default); off
+        # is the merge as partitions finish (ORDERED_MERGE=0 / --completion-order-merge)
         check("ordered merge: Grids and Pipeline jobs set ORDERED_MERGE for run_ps_dtfe.sh (spelled out when off, so a "
               "stray export cannot leak in), the Pipeline's memory check too; the Custom tab passes the flag (PS only); "
               "on by default since 2026-10-14, off = --completion-order-merge",
@@ -2630,7 +2614,7 @@ def launcher_2026_10_11():
                    "   total wall time   : 12s\n")
         om, plain = R.parse_runlog(d / "om.runlog"), R.parse_runlog(d / "plain.runlog")
         co = R.parse_runlog(d / "co.runlog")
-        # 2026-10-14: a run without either flag loads today's default (on); only '--completion-order-merge' turns it off
+        # a run without either flag loads the default (on); only '--completion-order-merge' turns it off
         check("ordered merge: settings() carries it (ON for a run without a flag, today's default; OFF for a "
               "--completion-order-merge run), the Options column says which, and the settings load into a RunSpec",
               om.settings().get("ordered_merge") is True and plain.settings().get("ordered_merge") is True
@@ -2642,9 +2626,9 @@ def launcher_2026_10_11():
         check("ordered merge: the tick's label has no '--', and names the option it stands for",
               "--" not in P.label("ordered_merge") and P.OPTION_TEXT["ordered_merge"][1] == "--ordered-merge")
 
-        # K2: a killed partitioned run leaves '<prefix>.runlog.checkpoint/' (a directory); it is a run file, never an
+        # a killed partitioned run leaves '<prefix>.runlog.checkpoint/' (a directory); it is a run file, never an
         # output or a log, and with no live process the run is 'resumable' -- when run_ps_dtfe.sh ran it (a Grids or
-        # Pipeline job: under the data root's snapdir_*, 2026-10-11), and its attempt did not fail on a refused resume
+        # Pipeline job: under the data root's snapdir_*), and its attempt did not fail on a refused resume
         t0 = time.time() - 600.0
         sd = base / "root" / "TNGK-1-Dark" / "snapdir_099"           # where run_ps_dtfe.sh writes
         sd.mkdir(parents=True)
@@ -2677,7 +2661,7 @@ def launcher_2026_10_11():
                    "~~~ ERROR ~~~\n", t0)
         (d / "cu.runlog.checkpoint").mkdir()
         _write_log(d / "gone.runlog.partial", "RUNNING: /x/PS-DTFE in.hdf5 gone --grid 64\n", t0)
-        # 2026-10-13: a killed partitioned STANDARD run (run_dtfe.sh resumes it too, DTFE_RESUME) is 'resumable' alike
+        # a killed partitioned STANDARD run (run_dtfe.sh resumes it too, DTFE_RESUME) is 'resumable' alike
         _write_log(sd / "output.runlog.partial", "RUNNING: /x/DTFE in.hdf5 output --grid 64 --partition 2 2 2\n"
                    "DTFE: checkpoints of the merged grids go to 'output.runlog.checkpoint' (at most ~5% of the run; "
                    "removed when the outputs are written; '--resume' continues a killed run from it).\n", t0)
@@ -2707,7 +2691,7 @@ def launcher_2026_10_11():
         else:
             check("without ps a '.runlog.partial' stays 'partial' (its process cannot be ruled out), checkpoint or not",
                   ck is not None and ck.attempt == "partial")
-        # 2026-10-11: a refused resume is never 'resumable' (rerunning fails again), nor is a Custom run's checkpoint
+        # a refused resume is never 'resumable' (rerunning fails again), nor is a Custom run's checkpoint
         nr, nr0 = (R.attempt_note(r) if r is not None else None for r in (rf, rf0))
         check("a resume the binary refused (other settings; nothing to resume) stays 'failed', its note and cause name "
               "'Start over' (PS_RESUME=0, no '--'); a Custom run's checkpoint is never 'resumable'",
@@ -2741,10 +2725,10 @@ def launcher_2026_10_11():
 
 
 def cpp_fix_flags_2026_10_11():
-    """results.KNOWN_FIXES for the cpp-bug fixes of 2026-10-11: an interlaced grid without a region (pass 2 gridded
+    """results.KNOWN_FIXES for the C++ fixes of an interlaced grid without a region (pass 2 gridded
     the same cells), PCS (no padding, half-cell shift), CIC (extrapolated face and seam cells), and a fractional
-    region or padding on a box whose axes differ (the [i%2] axis indexing). Grids built between the interlace-phase
-    fix (2026-10-02) and 2026-10-11T23:00 are flagged at their level, the same commands built after it are not."""
+    region or padding on a box whose axes differ (the [i%2] axis indexing). Grids built inside the fixes' window
+    (after the interlace-phase fix, before these) are flagged at their level, the same commands built after are not."""
     import results as R
     print("stale outputs: the cpp-bug fixes of 2026-10-11:")
     work = Path(tempfile.mkdtemp(prefix="gui_cppfix_"))
@@ -2787,7 +2771,7 @@ def cpp_fix_flags_2026_10_11():
 
 
 def pts_conventions_flag_2026_10_13():
-    """results.KNOWN_FIXES 'pts-grid-conventions' (the parity batch of 2026-10-13): a PS image plane built before the
+    """results.KNOWN_FIXES 'pts-grid-conventions': a PS image plane built before the
     points followed the grids' --ps-vertex-mass / --ps-volume-weighted is flagged (warning); the same command built
     after it is not, nor a plane without the two grid options, one asked for '--pts-conventions legacy', a PS run
     without a plane, or a standard plane."""
@@ -2821,10 +2805,10 @@ def pts_conventions_flag_2026_10_13():
 
 
 def pts_conventions_choice_2026_10_15():
-    """The plane conventions' choice (PS-DTFE '--pts-conventions grid|legacy', 2026-10-15) where the launcher makes a
+    """The plane conventions' choice (PS-DTFE '--pts-conventions grid|legacy') where the launcher makes a
     phase-space image plane: a Grids job with a slice and a Pipeline job set PTS_CONVENTIONS for run_ps_dtfe.sh /
     run_ps_pipeline.sh, spelled out both ways; a Custom run passes '--pts-conventions legacy' to the binary only for
-    legacy (grid is its default, the run log as before); standard DTFE and a run without points get nothing. Legacy
+    legacy (grid is its default); standard DTFE and a run without points get nothing. Legacy
     is said (info, no '--'), an unknown value refused; the memory check ignores it; 'Load settings' of a run reads it
     back from the run log, the Runs tab names it, and a saved job without it opens at the grids' conventions."""
     import results as R

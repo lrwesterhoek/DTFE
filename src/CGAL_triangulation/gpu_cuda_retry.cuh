@@ -1,10 +1,9 @@
-/* The CUDA/HIP GPU hosts' chunk-level checkpoints and cause-aware retry policy (2026-10-11 in ps_gpu_cuda.cu,
-   ported from ps_metal_host.cc; moved here 2026-10-13 so the standard-DTFE host, dtfe_gpu_cuda.cu, runs the SAME
-   policy -- the code below is ps_gpu_cuda.cu's, unchanged but for the counter split noted at gpuRetryCause).
-   The Metal twin is gpu_metal_retry.h, whose header comment tells the story.
+/* The CUDA/HIP GPU hosts' chunk-level checkpoints and cause-aware retry policy (ported from ps_metal_host.cc),
+   shared so the standard-DTFE host, dtfe_gpu_cuda.cu, runs the SAME policy as ps_gpu_cuda.cu.
+   The Metal twin is gpu_metal_retry.h.
 
-   A failed kernel used to redo the WHOLE deposit (a PS partition, or a standard-DTFE sub-domain batch: three
-   times, from re-zeroed grids). Now every pass keeps a host-side snapshot of the device buffers its kernel writes
+   A failed kernel does not redo the WHOLE deposit (a PS partition, or a standard-DTFE sub-domain batch, from
+   re-zeroed grids): every pass keeps a host-side snapshot of the device buffers its kernel writes
    (the accumulator grids; PS also the exact items' sumW and the per-tet masses the kernel negates when it defers
    a tet), taken at the pass's start and every DTFE_GPU_CHECKPOINT_CHUNKS kernels; a failed kernel (which may have
    deposited part or all of its atomics) restores the last snapshot and continues from its chunk. The snapshot is
@@ -37,8 +36,8 @@ constexpr gpuError_t kGpuErrOom     = cudaErrorMemoryAllocation;
 //   Resource  out of memory and any other non-sticky error: escalate as for the watchdog, settle 2 s first
 //   Fatal     a STICKY error -- the context is lost (CUDA: a launch timeout, an illegal address, a launch
 //             failure; detected by the probe after the failure), so no restore can run: straight to the CPU.
-//             On real CUDA a watchdog kill is sticky, so it still ends on the CPU (as before); the
-//             checkpoints pay off for the non-sticky ones.
+//             On real CUDA a watchdog kill is sticky, so it ends on the CPU; the checkpoints pay off for
+//             the non-sticky ones.
 enum class GpuFault { Victim, Watchdog, Resource, Fatal };
 
 char const* gpuFaultName(GpuFault f)
@@ -52,10 +51,10 @@ char const* gpuFaultName(GpuFault f)
     }
 }
 
-// G1 (2026-10-11): the run's retry counters (run_progress.h: the sidecar's gpu_retries and
+// The run's retry counters (run_progress.h: the sidecar's gpu_retries and
 // gpu_retries_by_cause, DTFE.cpp's closing 'GPU deposit retries:' line): 0 innocent victim, 1 timeout,
 // 2 out of memory, 3 anything else. Counted by the error itself, BEFORE the sticky probe: a real CUDA
-// timeout is a timeout even though it ends on the CPU. The index only (2026-10-13): each host bumps its own
+// timeout is a timeout even though it ends on the CPU. Only the index: each host bumps its own
 // binary's counters with it (countGpuRetry in the host).
 int gpuRetryCause(GpuFault f, gpuError_t code)
 {
@@ -64,7 +63,7 @@ int gpuRetryCause(GpuFault f, gpuError_t code)
 
 // The dispatch pace, kept across partitions once escalated (as the Metal host's): a machine whose display load
 // killed one partition's kernels will kill the next one's at the same pace. No idle gap until then (the Metal
-// host needs one for the window server from the start). Not for the rest of the PROCESS (2026-10-11, the
+// host needs one for the window server from the start). Not for the rest of the PROCESS (the
 // Metal host's rule, ps_metal_host.cc GpuPace): the pace steps back one notch -- kernels x4 toward 0.25 s,
 // gaps /3, and no gap once below 8 ms, this host's default of none -- after every DTFE_GPU_PACE_RECOVER_SEC
 // (default 90) seconds of GPU work (kernels + gaps) without a fault of ours; counted in GPU work, not wall

@@ -1,5 +1,5 @@
-/*  Resume for a killed partitioned PS-DTFE run (2026-10-11). The TNG50 z=0 GPU run takes 8 h; a kill at 7 h
-    (a restart, the T7 dropping off, an out-of-memory SIGKILL) threw every merged partition away. Now the
+/*  Resume for a killed partitioned PS-DTFE run: a large run takes hours, and a kill late in it (a restart, a
+    disk dropping off, an out-of-memory SIGKILL) must not throw every merged partition away. The
     partition loop CHECKPOINTS its merged accumulators: after a partition has been added into the full grids
     (DTFE.cpp, under the merge mutex, so the grids are not changing), the grids and the list of merged
     partitions go to
@@ -20,7 +20,7 @@
     CHEAP: a checkpoint is written after a merge unless the previous one took more than 5% of the time since
     it was written (the write time is measured), so the overhead stays near 5% at worst whatever the grid
     and partition sizes: a 1024^3 run's multi-GB write happens every few partitions, a small run's after
-    every partition. Measured on the 64-partition synthetic run of tests/ps_resume_check.sh: see notes.
+    every partition.
 
     SAFE: the manifest carries the run's SETTINGS KEY: the build configuration and the binary (its revision and
     link time: a rebuilt binary does not resume), the command line minus the
@@ -30,13 +30,13 @@
     It over-refuses rather than under-refuses (a reordered command line is a different key).
 
     MERGE ORDER: the manifest lists the merged partitions as a SET, so a run merging in completion order
-    ('--completion-order-merge'; the default memory-driven split's until 2026-10-14) can be resumed too. '--resume'
-    merges in index order for the rest of the run; when the killed run merged in index order too (the default
-    since 2026-10-14, '--ordered-merge' before, or '--max-concurrent 1'), the resumed grids are byte-identical to an
+    ('--completion-order-merge') can be resumed too. '--resume'
+    merges in index order for the rest of the run; when the killed run merged in index order too (the default,
+    or '--max-concurrent 1'), the resumed grids are byte-identical to an
     uninterrupted ordered run (tests/ps_resume_check.sh) -- at the
     same '--max-concurrent' and thread count: the CPU deposit inside a partition splits its sums over the
-    threads a partition gets, so another count changes the grids at float rounding (measured: '--ordered-merge'
-    at --max-concurrent 2 and 4 differ in '.den' by ~1e-7 relative, 2026-10-11). The key leaves the two out on
+    threads a partition gets, so another count changes the grids at float rounding (--max-concurrent 2 and 4
+    differ in '.den' by ~1e-7 relative). The key leaves the two out on
     purpose: a resume at a lower --max-concurrent (the run was killed for memory) must stay possible.
 
     ROOM: a write needs the grids' bytes + 1 GB free while it goes (the new file beside the old one), and,
@@ -44,16 +44,15 @@
     to be written: on the T7 the checkpoint must never be what makes their write fail);
     short of that the write is skipped with a warning (once) and the previous checkpoint stays.
 
-    POINTS (2026-10-13): a '--sample-points' run is checkpointed too. Its per-point stream records (ps_point_eval.cc)
+    POINTS: a '--sample-points' run is checkpointed too. Its per-point stream records (ps_point_eval.cc)
     are kept per partition, and a write saves the merged partitions' records not saved yet as 'points.<i>' files
     in the same folder BEFORE the manifest is renamed into place, so a manifest never lists a partition whose
     records are not on disk; '--resume' reads them back with the grids. Each partition's records are written once
     (they do not change after its merge), and they count in the room rule and the 5% throttle like the grids.
-    The settings key then also names the sample-point file (size + mtime). Before that date every production run
-    log said 'no checkpoints: a --sample-points run cannot be resumed'.
+    The settings key then also names the sample-point file (size + mtime).
 
     NOT CHECKPOINTED: '--interlace' runs (two passes, the second on a half-cell-shifted grid, would share one
-    folder and key: 2026-10-11), and with DTFE_PS_CHECKPOINT=0. The scratch-backed grids are written to the
+    folder and key), and with DTFE_PS_CHECKPOINT=0. The scratch-backed grids are written to the
     checkpoint file like any other: their mmap files are unlinked at creation (scratch_alloc.cc) and are modified in place by the next merge,
     so they cannot serve as an atomic checkpoint themselves.
 
@@ -61,7 +60,7 @@
     process and then SIGKILLs the process, which leaves exactly what a kill leaves. DTFE_TEST_CHECKPOINT_FREE_BYTES
     replaces the volume's free bytes in the room rule.
 
-    STANDARD DTFE TOO (2026-10-13). The standard binary's partition loop (DTFE.cpp: serial, one partition at a time
+    STANDARD DTFE TOO. The standard binary's partition loop (DTFE.cpp: serial, one partition at a time
     with its threads inside) checkpoints through this same code -- beginLoop() before the loop, afterMerge() after
     each partition, reportWrites() at its end; the PS loop calls the same three. There each partition ASSIGNS its
     own disjoint sub-grid of the full grids (copySubgridResultsToMain), so the full grids after k partitions plus
@@ -72,23 +71,22 @@
     ('--max-concurrent' is the thread split inside each partition there, and each thread's sub-box carries its own
     padding: left out of the key as for PS, so a run killed for memory can resume with fewer threads, at float
     rounding where the padding is ample -- 2.8e-2 of the peak on the z = 0 demo at padding 5, 1 against 2 threads);
-    a '--gpu' run's too, since its sums are exact (64-bit fixed point, the same date; with DTFE_METAL_FLOAT_GRIDS=1 /
+    a '--gpu' run's too, since its sums are exact (64-bit fixed point; with DTFE_METAL_FLOAT_GRIDS=1 /
     DTFE_GPU_FLOAT_GRIDS=1 within the float atomics' run-to-run rounding). The same file layout, key, room rule,
     5% throttle, refusals and test hooks; what differs is named per build below (BUILD): the file's first line,
     the off switch (DTFE_CHECKPOINT=0 for standard), the driver knob a refusal names (run_dtfe.sh DTFE_RESUME=0)
     and the messages' 'DTFE:' label; standard implies no ordered merge (its loop is serial anyway). The progress
     sidecar of a resumed standard run counts the restored partitions as done (DTFE.cpp). '--interlace' runs write no
-    checkpoint, as for PS. A standard '--sample-points' run (with '--partition' since the same date) is checkpointed
-    too since 2026-10-14, exactly as PS-DTFE's (POINTS above): the standard loop tags each partition's point records
+    checkpoint, as for PS. A standard '--sample-points' run (with '--partition') is checkpointed
+    too, exactly as PS-DTFE's (POINTS above): the standard loop tags each partition's point records
     with psPointEvalSetPartition around its DTFE_parallel call -- under '--sample-points' that call triangulates the
     partition once, on the loop's own thread (DTFE_parallel's single-triangulation branch), so the thread-local tag
     reaches the point walk's sinks (ps_point_eval.cc forEachCellParallel) -- and each point is answered by the one
-    partition owning its tetrahedron, so a partition's records are complete once it is in the grids. Before that date
-    such a run wrote no checkpoint and '--resume' refused it ("its point accumulators are not checkpointed"); the
+    partition owning its tetrahedron, so a partition's records are complete once it is in the grids; the
     4096^2 standard planes of scripts/thesis_runs.sh dtfe27planes are such runs. tests/dtfe_resume_check.sh (D13). */
 #ifndef PARTITION_CHECKPOINT_H
 #define PARTITION_CHECKPOINT_H
-// both binaries' partition loops since 2026-10-13 (PS-DTFE's since 2026-10-11); the library compiles it too
+// both binaries' partition loops; the library compiles it too
 
 #include <algorithm>
 #include <cctype>
@@ -116,21 +114,21 @@
 #include "message.h"
 #include "cache_key_lines.h"
 #include "output_staging.h"
-#include "ps_point_eval.h"   // the '--sample-points' records of the merged partitions (2026-10-13)
+#include "ps_point_eval.h"   // the '--sample-points' records of the merged partitions
 
-// the binary's provenance (src/build_info.cc, linked into DTFE / PS-DTFE). WEAK fallbacks (2026-10-13): libDTFE links
-// no build_info.cc but compiles DTFE.cpp, whose standard partition loop now includes this header; the binaries'
-// strong definitions in build_info.o replace these at link time, so their keys are unchanged
+// the binary's provenance (src/build_info.cc, linked into DTFE / PS-DTFE). WEAK fallbacks: libDTFE links
+// no build_info.cc but compiles DTFE.cpp, whose standard partition loop includes this header; the binaries'
+// strong definitions in build_info.o replace these at link time
 __attribute__((weak)) char const *dtfeBuildRevision() { return "unknown"; }
 __attribute__((weak)) char const *dtfeBuildTime()     { return "unknown"; }
 // ... and whether this is one of the programs (build_info.cc: true): libDTFE writes no checkpoints, since nothing
-// there commits the outputs through output_staging.h, which is what removes the folder (2026-10-13)
+// there commits the outputs through output_staging.h, which is what removes the folder
 __attribute__((weak)) bool dtfeIsProgram() { return false; }
 
 namespace PartitionCheckpoint
 {
 
-// BUILD (2026-10-13): what differs between the two binaries' checkpoints -- the file's first line (a PS checkpoint is
+// BUILD: what differs between the two binaries' checkpoints -- the file's first line (a PS checkpoint is
 // not a standard one and the other way round; their settings keys differ too, 'build=PS' / 'build=std'), the label of
 // the messages, the environment switch that writes none, and the driver knob a refusal names to start over
 #ifdef PHASE_SPACE
@@ -202,11 +200,11 @@ inline std::string directoryFor(User_options const &u)
 // grid value; positional arguments (the input and output names) keep their own lines
 inline std::string commandKeyLines(std::vector<std::string> const &tokens)
 {
-    // '--completion-order-merge' (2026-10-14) like '--ordered-merge': the merge order moves the grids at float rounding
+    // '--completion-order-merge' like '--ordered-merge': the merge order moves the grids at float rounding
     // only, and a run killed under one order must resume under the other (--resume merges in index order)
-    // '--fixed-point-merge' (2026-10-15) is dropped here because the key's own 'merge=fixed-point' line carries it
+    // '--fixed-point-merge' is dropped here because the key's own 'merge=fixed-point' line carries it
     static char const *const dropFlag[]  = { "--resume", "--ordered-merge", "--completion-order-merge", "--ps-no-overlap",
-                                             "--no-overlap",   // (the standard look-ahead switch, 2026-10-15)
+                                             "--no-overlap",   // (the standard look-ahead switch)
                                              "--fixed-point-merge" };
     static char const *const dropValue[] = { "--verbose", "-v", "--max-concurrent", "--scratch-dir", "--tessellation-cache" };
     auto isOption = [](std::string const &t)
@@ -239,7 +237,7 @@ inline std::string settingsKey(User_options const &u)
 {
     std::ostringstream k;
     k << cacheBuildLines();
-    // the BINARY too (2026-10-11): a resume after a rebuild combined partitions deposited by the old code with the
+    // the BINARY too: a resume after a rebuild would combine partitions deposited by the old code with the
     // new code's, while the run log names only the new 'Build:' -- which the launcher's fix registry reads to tell a
     // grid made before an output-changing fix. The link time as well: every uncommitted rebuild has the same
     // '<hash>-dirty' revision. Over-refusal is the design; the refusal names PS_RESUME=0.
@@ -253,12 +251,12 @@ inline std::string settingsKey(User_options const &u)
 #endif
     if ( not u.configFilename.empty() )
         k << cacheFileLine( "config", u.configFilename ) << '\n';
-    // the points the saved records were evaluated at (2026-10-13): the file's identity, not only its name on the
-    // command line -- a plane rewritten in place would otherwise pass. Runs without points keep their old key.
+    // the points the saved records were evaluated at: the file's identity, not only its name on the
+    // command line -- a plane rewritten in place would otherwise pass. Runs without points get no such line.
     if ( not u.psSamplePointsFile.empty() )
         k << cacheFileLine( "sample-points", u.psSamplePointsFile ) << '\n';
 #ifdef PHASE_SPACE
-    // the merge mode (2026-10-15): a '--fixed-point-merge' checkpoint holds integer words instead of the summed Real
+    // the merge mode: a '--fixed-point-merge' checkpoint holds integer words instead of the summed Real
     // grids, so neither mode can resume the other's (beginLoop refuses it by name)
     if ( u.psFixedPointMerge )
         k << "merge=fixed-point\n";
@@ -381,7 +379,7 @@ inline void removeStaleTemps(std::string const &dir)
     for ( auto const &s : stale ) std::remove( s.c_str() );
 }
 
-// A raw array kept beside the grids (2026-10-15): the fixed-point merge's integer words, carries and state
+// A raw array kept beside the grids: the fixed-point merge's integer words, carries and state
 // (ps_fixed_merge.h), whose Real grids do not exist during its loop. Listed as 'field x.<name> <elemSize> <count>'
 // after the u and a fields (none with count 0); a load calls 'resize' for the listed ones and reads into its bytes.
 struct Blob
@@ -408,11 +406,11 @@ struct Checkpointer
     int exitAfter = -1;               // DTFE_TEST_EXIT_AFTER_PARTITIONS
     int written = 0;                  // checkpoints written by this process (reported at the end)
     double writeSecTotal = 0.;
-    // '--sample-points' (2026-10-13): the merged partitions' records go beside the grids ('points.<i>')
+    // '--sample-points': the merged partitions' records go beside the grids ('points.<i>')
     bool points = false;              // this run evaluates points: save their records with every checkpoint
     std::vector<char> pointsSaved;    // per partition: its 'points.<i>' is this run's (written, or read on resume)
     bool pointsCleaned = false;       // an earlier run's unlisted 'points.<i>' files removed (after the first write)
-    std::vector<Blob> blobs;          // '--fixed-point-merge' (2026-10-15): its integer grids, beside the Real ones
+    std::vector<Blob> blobs;          // '--fixed-point-merge': its integer grids, beside the Real ones
 };
 
 inline Checkpointer &state()
@@ -423,9 +421,9 @@ inline Checkpointer &state()
 
 // After a successful run (the outputs renamed into place, output_staging.h) the checkpoint has done its job.
 // An exit before that keeps it: an error in the write phase, a rescue to the temp folder, a throwError, and a
-// commit whose renames failed (exit 3, the outputs left as '.part.<pid>' files: 2026-10-11, the old test of
-// 'begun cleared, no rescue' passed it and deleted the checkpoint). main.cpp is not changed: this runs from
-// atexit, and output_staging's committedOk is set only where outputStageCommit returns 0 with the set in place.
+// commit whose renames failed (exit 3, the outputs left as '.part.<pid>' files: a test of 'begun cleared, no
+// rescue' would pass it and delete the checkpoint). This runs from atexit, and output_staging's committedOk is set only
+// where outputStageCommit returns 0 with the set in place.
 inline void removeOnSuccessAtExit()
 {
     Checkpointer &c = state();
@@ -487,8 +485,8 @@ inline bool write(Quantities &u, Quantities &a, std::string &why)
     // '--sample-points': the records of the partitions merged since the last write (each partition's once)
     if ( c.points )
         bytes += psPointEvalUnsavedBytes( c.merged, c.pointsSaved );
-    // the folder is made only once a write really happens (2026-10-11): it was made first, so a run that never had
-    // room, or was killed during its first write, left an empty one, and run_ps_dtfe.sh resumed from it -- refused
+    // the folder is made only once a write really happens: made first, a run that never had room, or was killed
+    // during its first write, would leave an empty one, and run_ps_dtfe.sh would resume from it -- refused
     // ('nothing to resume') on every rerun. Until it exists, the room is the volume's of the folder it goes in.
     struct stat dirSt;
     bool const dirExists = ::stat( c.dir.c_str(), &dirSt ) == 0;
@@ -512,7 +510,7 @@ inline bool write(Quantities &u, Quantities &a, std::string &why)
         why = "cannot create '" + c.dir + "': " + std::strerror( errno );
         return false;
     }
-    // the point records FIRST (2026-10-13): the manifest renamed below lists their partitions as merged, so they
+    // the point records FIRST: the manifest renamed below lists their partitions as merged, so they
     // must be on disk before it is. A failure leaves the previous manifest, whose partitions' files are older.
     if ( c.points and not psPointEvalSavePartitions( c.dir, hexOf( fnv1a( c.key ) ), c.merged, c.pointsSaved, why ) )
     {
@@ -633,8 +631,7 @@ inline bool load(std::string const &dir, Manifest const &m, Quantities &u, Quant
     return ok;
 }
 
-/* The three steps of a checkpointed partition loop (2026-10-13: moved here from the PS loop in DTFE.cpp, word for
-   word, so the standard loop runs the same code; the PS messages and refusals are unchanged).
+/* The three steps of a checkpointed partition loop, shared by the PS and the standard loops.
 
    beginLoop: after the full grids are reserved (sized: a resume reads into them) and before the first partition.
    Sets up state() for this run (folder, key, split, test hook), removes a dead writer's temp file, and under
@@ -650,11 +647,10 @@ inline int beginLoop(User_options const &options, int const totalPartitions, Qua
     MESSAGE::Message message( verboseLevel );
     char const *env = std::getenv( OFF_ENV );
     bool const off = env and env[0] == '0';
-    // '--sample-points' (2026-10-13, integration of the parity batch): PS-DTFE checkpoints the per-point records of
-    // every merged partition beside the grids ('points.<i>', the header comment's POINTS); its loop tags them with
-    // psPointEvalSetPartition. The standard loop tags them too since 2026-10-14 (DTFE.cpp, around its DTFE_parallel
-    // call), so both binaries keep them; until then a standard '--sample-points' run (with '--partition' since
-    // 2026-10-13) wrote no checkpoint and '--resume' refused it. pointsLost stays for a loop that would not tag them.
+    // '--sample-points': PS-DTFE checkpoints the per-point records of every merged partition beside the grids
+    // ('points.<i>', the header comment's POINTS); its loop tags them with psPointEvalSetPartition. The standard
+    // loop tags them too (DTFE.cpp, around its DTFE_parallel call), so both binaries keep them. pointsLost stays
+    // for a loop that would not tag them.
     bool const pointsKept = pointEval;
     bool const pointsLost = pointEval and not pointsKept;   // a points run whose records a checkpoint would miss
     std::string const dir = directoryFor( options );
@@ -684,7 +680,7 @@ inline int beginLoop(User_options const &options, int const totalPartitions, Qua
         if ( not readManifest( dir, m, why ) )
             throwError( "'--resume': nothing to resume -- ", why, ". Run without '--resume' to start the run." );
 #ifdef PHASE_SPACE
-        // the merge mode first (2026-10-15): the other mode's grids are not this mode's (Real sums / integer words)
+        // the merge mode first: the other mode's grids are not this mode's (Real sums / integer words)
         bool const savedFx = m.key.find( "\nmerge=fixed-point\n" ) != std::string::npos;
         if ( savedFx != options.psFixedPointMerge )
             throwError( "'--resume' refused: the checkpoint '", dir, std::string( "' was written by a run " )

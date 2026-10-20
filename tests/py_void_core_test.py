@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Tests for the void-catalogue core of 2026-10-11 (dtfelib.pipeline / catalog, config):
+"""Tests for the void-catalogue core (dtfelib.pipeline / catalog, config):
 
   * the three R_v definitions (catalog.R_V_DEFINITIONS: crossing, delta08, ridge) from one shell matrix
-    (pipeline.void_radii_cells) on an analytic compensated void, the crossing bit for bit the old one;
-  * catalog.r_v_cells / r_v_mpc per definition (NaN without the key), the export's new columns and provenance;
+    (pipeline.void_radii_cells) on an analytic compensated void, the crossing bit for bit void_radius_cells';
+  * catalog.r_v_cells / r_v_mpc per definition (NaN without the key), the export's radius columns and provenance;
   * the R_v settings in the cache identity: a catalogue without them, or with other ones, is re-measured once
     (the smoothed field read, the Hessian not), then served silently;
   * DTFE_CACHE_DIR and DTFE_VOID_GATE (config at import; the gate applied to the served dict, never to the cache,
     and tagged through pipeline.smoothing_tag).
-  * config.CROSSBOX_SMOOTHING_MPC, the one cross-box smoothing (G2), and the R_v search cap of 24 sigma.
-  * (evening) the R_v search's half-box margin with the reach recorded (3c); the cache folder setting, 'analyze.py cache
-    --move' and the setup's offer to keep the caches out of iCloud Drive (3d).
+  * config.CROSSBOX_SMOOTHING_MPC, the one cross-box smoothing, and the R_v search cap of 24 sigma.
+  * the R_v search's half-box margin with the reach recorded; the cache folder setting, 'analyze.py cache
+    --move' and the setup's offer to keep the caches out of iCloud Drive.
 
 SYNTHETIC tests always run (CI: no T7); the DATA-BACKED one (TNG100-3-Dark z = 0 on the T7) is skipped when the
 snapshot is not on disk.
@@ -31,35 +31,17 @@ from pathlib import Path
 
 import numpy as np
 
-_PY = Path(__file__).resolve().parents[1] / "python"
-sys.path.insert(0, str(_PY))
-# the figure root before config/dtfelib are imported: a temp folder, never the real root (the T7 when it is mounted)
-_FIGS_TMP = tempfile.mkdtemp(prefix="void_core_figs_")
-os.environ["DTFE_FIGURES_ROOT"] = _FIGS_TMP
+from _harness import REPO, Skip, check as _check, setup, summary
+
+setup("void_core_figs_", paths=("python",), no_mirror=False, mpl_agg=False)
+os.environ.setdefault("DTFE_SIM", "TNG50-4-Dark")    # the box these synthetic tests stand for; a data-tier run sets its own
 os.environ.pop("DTFE_VOID_GATE", None)          # this process tests the default gate; the subprocesses set their own
-atexit.register(shutil.rmtree, _FIGS_TMP, True)
-
-PASS, FAIL, SKIP = [], [], []
-
-
-class Skip(Exception):
-    pass
+_PY = REPO / "python"
 
 
 def check(name, fn):
-    try:
-        fn()
-        PASS.append(name)
-        print(f"  PASS  {name}")
-    except Skip as e:
-        SKIP.append(name)
-        print(f"  SKIP  {name}  ({e})")
-    except AssertionError as e:
-        FAIL.append(name)
-        print(f"  FAIL  {name}: {e}")
-    except Exception as e:                      # a crash is a failure, named
-        FAIL.append(name)
-        print(f"  FAIL  {name}: {type(e).__name__}: {e}")
+    """A crash is a failure, named, without its traceback."""
+    _check(name, fn, crash_traceback=False)
 
 
 # ------------------------------------------------------------------ fixtures
@@ -127,7 +109,7 @@ def t_r_v_accessors():
     assert catalog.R_V_DEFINITIONS == ("crossing", "delta08", "ridge")
     cat = {"coords": np.zeros((3, 3), int), "cell_mpc": np.float64(0.5),
            "r_v_cells": np.array([2.0, np.nan, 4.0]), "r_v_ridge_cells": np.array([5.0, 6.0, np.nan])}
-    assert np.allclose(catalog.r_v_mpc(cat), [1.0, np.nan, 2.0], equal_nan=True)            # the old call: crossing
+    assert np.allclose(catalog.r_v_mpc(cat), [1.0, np.nan, 2.0], equal_nan=True)            # no definition: crossing
     assert np.allclose(catalog.r_v_mpc(cat, "crossing"), catalog.r_v_mpc(cat), equal_nan=True)
     assert np.allclose(catalog.r_v_mpc(cat, "ridge"), [2.5, 3.0, np.nan], equal_nan=True)
     d08 = catalog.r_v_mpc(cat, "delta08")                       # the key absent: NaN of the catalogue's length
@@ -212,7 +194,7 @@ def t_r_v_cache_identity():
         assert np.isfinite(cat["r_v_cells"]).any() and np.isfinite(cat["r_v_ridge_cells"]).any()
         _, said, wrote, rd = load()
         assert said == "" and wrote == 0 and rd == [], (said, wrote, rd)  # fresh: read silently, nothing re-measured
-        # a catalogue from before 2026-10-11: no settings, no delta08 / ridge -> re-measured ONCE, the Hessian not read
+        # a legacy catalogue: no settings, no delta08 / ridge -> re-measured ONCE, the Hessian not read
         path = P("099", 0.0, sim="SYN")._cpath("voids")
         with np.load(path) as z:
             old = {k: z[k] for k in z.files if k not in ("r_v_settings", "r_v_delta08_cells", "r_v_ridge_cells")}
@@ -268,7 +250,7 @@ def t_void_gate_and_export():
         config.SMOOTHING_SIGMA_CELLS = old[1]                      # the production smoothing: the gate tag alone
         assert pipeline.smoothing_tag() == "gatenone", pipeline.smoothing_tag()
         config.SMOOTHING_SIGMA_CELLS = 1.0
-        # the export: the two new radius columns (cells x cell) and the R_v settings + gate in the provenance
+        # the export: the delta08 / ridge radius columns (cells x cell) and the R_v settings + gate in the provenance
         out = catalog.export_voids(P("099", 0.0, sim="SYN"), root / "out")
         for table, prov in (catalog.read_hdf5(out[1]), catalog.read_csv(out[0])):
             for col, key in (("r_v_mpc", "r_v_cells"), ("r_v_delta08_mpc", "r_v_delta08_cells"),
@@ -294,7 +276,7 @@ def t_void_gate_and_export():
         shutil.rmtree(root, ignore_errors=True)
 
 
-_NO_SETTING = tempfile.mkdtemp(prefix="void_core_xdg_")      # an empty config home: no cache setting (2026-10-11)
+_NO_SETTING = tempfile.mkdtemp(prefix="void_core_xdg_")      # an empty config home: no cache setting
 atexit.register(shutil.rmtree, _NO_SETTING, True)
 
 
@@ -331,8 +313,8 @@ def t_env_overrides():
 
 
 def t_real_tng100_z0():
-    """TNG100-3-Dark z = 0 (T7): the served catalogue carries today's R_v settings and all three radii; the crossing
-    median of the distinct voids is 7.42 Mpc (6.94 under the 15-sigma cap, before 2026-10-11's 24). A fresh
+    """TNG100-3-Dark z = 0 (T7): the served catalogue carries the current R_v settings and all three radii; the crossing
+    median of the distinct voids is 7.42 Mpc (6.94 under a 15-sigma cap). A fresh
     interpreter (DTFE_SIM decides config's frame); the shared cache is read, or re-measured once if stale."""
     from dtfelib.cli import sim_dir
     if not (sim_dir("TNG100-3-Dark") / "snapdir_099").is_dir():
@@ -350,13 +332,13 @@ def t_real_tng100_z0():
     r = subprocess.run([sys.executable, "-c", code], cwd=str(_PY), env=env, capture_output=True, text=True, timeout=600)
     assert r.returncode == 0, r.stderr[-600:]
     nd, cr, d08, ridge = r.stdout.strip().splitlines()[-1].split()
-    # 83 / 7.419 Mpc at the 24-sigma cap (2026-10-11; 77 / 6.938 at 15 sigma, where 88 minima had no crossing)
+    # 83 / 7.419 Mpc at the 24-sigma cap (77 / 6.938 at 15 sigma, where 88 minima have no crossing)
     assert int(nd) == 83 and abs(float(cr) - 7.419) < 0.01, r.stdout
     assert float(d08) < float(cr) < float(ridge), r.stdout       # inner sphere < first crossing < compensation ridge
 
 
 def t_crossbox_constant():
-    """G2 (2026-10-11): config.CROSSBOX_SMOOTHING_MPC = 2.1625 is the ONE cross-box smoothing: plot_void_crossbox's
+    """config.CROSSBOX_SMOOTHING_MPC = 2.1625 is the ONE cross-box smoothing: plot_void_crossbox's
     default and analyze.py's cache inventory import it (an assignment that names it, not an equal literal), and
     scripts/thesis_runs.sh's literal (a recipe, kept on purpose) equals it."""
     import re
@@ -380,10 +362,10 @@ def t_crossbox_constant():
 
 
 def t_r_v_cap():
-    """The R_v search cap (2026-10-11): 24 sigma, raised from 15 (17-25% of the underdense minima had no crossing within
+    """The R_v search cap: 24 sigma, not 15 (17-25% of the underdense minima have no crossing within
     15 sigma), never above half the production box minus a sigma. A void negative out to 20 sigma (40 cells at sigma
-    = 2, in a 128^3 box whose L/2 = 64 cells is not what binds): its crossing is measured, ~40 cells; under the old
-    15-sigma cap (30 cells) it was NaN."""
+    = 2, in a 128^3 box whose L/2 = 64 cells is not what binds): its crossing is measured, ~40 cells; under a
+    15-sigma cap (30 cells) it would be NaN."""
     import config
     from dtfelib import pipeline
     n, sig = 128, 2.0
@@ -400,11 +382,11 @@ def t_r_v_cap():
 
 
 def t_r_v_half_box_margin():
-    """3c (2026-10-11 evening): the R_v search's half-box clause has a sigma's margin, min(cap sigma, L/2 - sigma), and
-    the catalogue records the reach it searched (r_v_settings' sixth element) instead of a new algorithm number. A
-    catalogue recorded WITHOUT a reach (every cache before today's evening) is served as it is where the margin changes
+    """The R_v search's half-box clause has a sigma's margin, min(cap sigma, L/2 - sigma), and
+    the catalogue records the reach it searched (r_v_settings' sixth element) rather than an algorithm number. A
+    catalogue recorded WITHOUT a reach (a legacy cache) is served as it is where the margin changes
     nothing (cap sigma <= L/2 - sigma: the production 10 cells at 512^3) and re-measured, once, where it binds (a large
-    sigma). The fixture: 48^3, sigma = 1 cell; cap 24 reaches L/2 = 24 (old rule) but not L/2 - sigma = 23 (new); a
+    sigma). The fixture: 48^3, sigma = 1 cell; cap 24 reaches L/2 = 24 (no margin) but not L/2 - sigma = 23; a
     cap of 10 is short of both."""
     import config
     from dtfelib import pipeline
@@ -414,7 +396,7 @@ def t_r_v_half_box_margin():
     assert abs(pipeline.r_v_reach_cells(21.4043, 512) - (256.0 - 21.4043)) < 1e-9
     assert pipeline.r_v_reach_cells(400.0, 512) == 0.0                         # never negative radii
     # the search stops a sigma short of L/2: a void negative out to 30 cells on a 48^3 grid at sigma 1 has no
-    # crossing within 23 cells (it had one within 24 under the old clause only if it crossed in the last cell)
+    # crossing within 23 cells (it would have one within 24 without the margin only if it crossed in the last cell)
     fx = _FieldFixture()
     root = Path(tempfile.mkdtemp(prefix="void_core_margin_"))
     old = (config.CACHE_DIR, config.SMOOTHING_SIGMA_CELLS, pipeline.R_V_MAX_SIGMA)
@@ -433,7 +415,7 @@ def t_r_v_half_box_margin():
             return cat, buf.getvalue(), reads[rmark:]
 
         def legacy():
-            """The cached catalogue as the code before the margin wrote it: five settings, no reach."""
+            """A legacy cached catalogue, as written without the margin: five settings, no reach."""
             path = P("099", 0.0, sim="SYN")._cpath("voids")
             with np.load(path) as z:
                 arrays = {k: z[k] for k in z.files}
@@ -449,7 +431,7 @@ def t_r_v_half_box_margin():
         assert said == "" and rd == [], (said, rd)                                # served: no field read, nothing said
         assert served["r_v_settings"].shape == (5,)
         assert pipeline.catalog_r_v_ok(served, 1.0, fx.n) and pipeline.catalog_r_v_ok(served, 10.0, 512)
-        # the default cap 24: 24 cells under the old clause, 23 under the new -> a legacy record is re-measured once
+        # the default cap 24: 24 cells without the margin, 23 with it -> a legacy record is re-measured once
         pipeline.R_V_MAX_SIGMA = old[2]
         cat, said, rd = load()                                                    # the settings changed (cap 10 -> 24)
         assert "not today's" in said and float(cat["r_v_settings"][5]) == 23.0, (said, cat["r_v_settings"])
@@ -478,11 +460,11 @@ def _synthetic_cache(root):
 
 
 def t_cache_move():
-    """3d (2026-10-11 evening): 'analyze.py cache --move DIR' on a synthetic cache: a dry run by default (nothing
+    """'analyze.py cache --move DIR' on a synthetic cache: a dry run by default (nothing
     moved, no setting); refused while a cache user runs, into a folder holding a namespace of the same name, or when a
     copy does not verify (the old cache untouched, no partial copy left); with --yes every entry moved byte for byte,
-    the source removed, the setting recorded -- and a NEW interpreter's config.CACHE_DIR is the moved folder (the
-    check that fails on the old code), with DTFE_CACHE_DIR still first. cache_users: an analysis python counts, an
+    the source removed, the setting recorded -- and a NEW interpreter's config.CACHE_DIR is the moved folder,
+    with DTFE_CACHE_DIR still first. cache_users: an analysis python counts, an
     editor on analyze.py does not, nor this process and its ancestors; a DTFE binary does."""
     import config
     import analyze
@@ -514,7 +496,7 @@ def t_cache_move():
         code, said = run(yes=True, users=[])
         assert code == 1 and "evicted to iCloud" in said and not list(dest.iterdir()), said
         stub.unlink()
-        # current macOS evicts in place: the real name, SF_DATALESS in st_flags (no stub at all; 2026-10-11 review),
+        # current macOS evicts in place: the real name, SF_DATALESS in st_flags (no stub at all),
         # and the download it forces lands on the source's disk: its bytes count in the room needed there
         dataless = src / "r512_s10_f11_trace_g0.1_v2" / "099_voids.npz"
         assert dataless.is_file()
@@ -563,7 +545,7 @@ def t_cache_move():
                  71: (1, "vim analyze.py"), 72: (1, "/x/Python /repo/python/gui/app.py"),
                  73: (1, "python3 -m pytest tests/py_analyze_helpers.py"),
                  # the launcher as scripts/gui.sh starts it on macOS (the host bundle), and a job run by its
-                 # interpreter (2026-10-11 review: both were missed, so --move went ahead with the launcher open)
+                 # interpreter (missing either would let --move go ahead with the launcher open)
                  74: (1, "/Users/x/.venvs/dtfe-gui/DTFE Launcher.app/Contents/MacOS/DTFE Launcher "
                          "/Users/x/Mobile Documents/DTFE/python/gui/app.py"),
                  75: (74, "/Users/x/.venvs/dtfe-gui/DTFE Launcher.app/Contents/MacOS/DTFE Launcher "
@@ -577,7 +559,7 @@ def t_cache_move():
 
 
 def t_setup_wizard_cache_offer():
-    """3d(iii) (2026-10-11 evening): the setup's first page offers to keep the caches outside iCloud Drive only while
+    """The setup's first page offers to keep the caches outside iCloud Drive only while
     the repository is synced AND the caches are inside it (config.icloud_cache_offer: ~/Library/Caches/DTFE on macOS,
     ~/.cache/dtfe elsewhere), and its button runs analyze.py's own move (cache_move_command), here on a synthetic
     cache: moved, the setting recorded, this process pointed at the new folder. Needs PySide6 (skipped without)."""
@@ -672,8 +654,7 @@ def main():
     print("data-backed:")
     check("2026-10-11: TNG100-3-Dark z = 0 served with today's R_v settings; distinct median radii in order", t_real_tng100_z0)
     print("=" * 60)
-    print(f"RESULT: {len(PASS)} passed, {len(FAIL)} failed, {len(SKIP)} skipped")
-    return 1 if FAIL else 0
+    return summary()
 
 
 if __name__ == "__main__":

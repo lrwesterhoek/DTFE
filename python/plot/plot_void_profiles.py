@@ -4,19 +4,19 @@ For every snapshot: the shells of every DISTINCT well-resolved void of the pipel
 the RAW rho/rho_bar, v_r positive = outflow, the single-stream fraction on phase-space grids), stacked in
 bins of R with 16-84% bootstrap bands, as a two- or three-panel figure plus an npz of the stacked curves. R is the
 measured void radius R_v (where the smoothed density contrast around the minimum rises to 0) by default -- so the
-stacked density reaching the mean near 1.0 R_v is R_v's own definition (2026-10-11), a check of the smoothing against
+stacked density reaching the mean near 1.0 R_v is R_v's own definition, a check of the smoothing against
 the raw density, not a finding; the infall radius, the ridge and the single-stream fraction are -- the
-ellipsoid's R_eff with --radius r_eff (with --keep-overlaps --edges 0,2,4,8,16: the figures before 2026-10-07);
+ellipsoid's R_eff with --radius r_eff (with --keep-overlaps --edges 0,2,4,8,16: the earlier figures);
 --keep-overlaps stacks every resolved void,
 neighbouring minima of one void included; --smooth-mpc smooths at the same physical scale in every box. The dashed lines on the v_r panel are linear theory from the stacked density itself
 (profiles.linear_v_r): what the voids would do if they expanded linearly. With --radius r_v (the default) every
 radius bin's stacked density is also fitted with the universal profile of Hamaus, Sutter & Wandelt (2014),
-profiles.fit_stack (2026-10-11): the fitted curves dotted on the density panel (constrained fits only), the parameters
+profiles.fit_stack: the fitted curves dotted on the density panel (constrained fits only), the parameters
 in the npz as hsw_params / hsw_errors (nbin, 4: delta_c, r_s / R_v, alpha, beta), hsw_ok, hsw_constrained, hsw_chi2_dof.
 plot_void_profile_evolution.py draws them against redshift.
 
 Files: void_profiles_<method|prefix>_<sample>[_reff][_overlaps][_edges<e0>-<e1>-...][_<smoothing tag>]_z<z>.npz/.png;
-'_edges...' (2026-10-11) only for --edges other than the default bins, so a rerun with other bins never replaces them.
+'_edges...' only for --edges other than the default bins, so a rerun with other bins never replaces them.
 
     python3 plot/plot_void_profiles.py --sim TNG100-3-Dark --snaps 99 50
     python3 plot/plot_void_profiles.py --sim TNG100-3-Dark --snaps 99 --out ~/profiles   (no thesis-tree copy)
@@ -90,8 +90,8 @@ def plot_stack(st, prof, title, path, z, linear=True, fits=None):
 
 def edges_tag(edges, default_edges) -> str:
     """'' for the default radius bins (profiles.default_edges_mpc, as given or spelled out to 4 digits), else
-    '_edges<e0>-<e1>-...' in Mpc (4 significant digits, '.' kept) -- 2026-10-11, as the 2026-10-08 round's tags: a
-    rerun with other --edges overwrote the default stack under the same name."""
+    '_edges<e0>-<e1>-...' in Mpc (4 significant digits, '.' kept), so a
+    rerun with other --edges never overwrites the default stack under the same name."""
     if [f"{float(e):.4g}" for e in edges] == [f"{float(e):.4g}" for e in default_edges]:
         return ""                               # the defaults as computed (L/6 = 10.6667) or as the help spells them
     return "_edges" + "-".join(f"{float(e):.4g}" for e in edges)

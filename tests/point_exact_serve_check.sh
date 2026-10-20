@@ -5,12 +5,12 @@
 #  X) EXACT, TIE-CONSISTENT STREAM COUNTING (PS-DTFE --sample-points). On crossed waves every
 #     point off a caustic has an ODD number of streams (a folded sheet covers it 1, 3, 9 or 27
 #     times), so any even count is a double-count or a gap -- the bound is exactly zero:
-#       X1  grid cell centres: no even count. (The old +-1e-6 barycentric tolerance counted a
+#       X1  grid cell centres: no even count. (A +-1e-6 barycentric tolerance would count a
 #           point within 1e-6 of a shared face twice: ~50 even counts per 2.1M points.)
 #       X2  AT PARTICLE POSITIONS -- every query sits ON a vertex shared by ~25 tetrahedra:
-#           no even count, mean streams < 12. (The tolerance counted the whole vertex star:
+#           no even count, mean streams < 12. (A tolerance counts the whole vertex star:
 #           mean ~27, 69% even.)
-#       (The single-tessellation runs below pass --partition 1 1 1: since 2026-10-01 the auto-tuner
+#       (The single-tessellation runs below pass --partition 1 1 1: the auto-tuner
 #       splits a small set for SPEED, and a split's sums differ from one tessellation's at float
 #       rounding; serve == sample-points holds for the SAME partitioning.)
 #       X3  --partition 2 2 2 gives byte-identical stream counts at both point sets (every
@@ -19,18 +19,18 @@
 #       X4  1 thread vs the default pool: byte-identical outputs.
 #  D) THE GRID DEPOSIT uses the same exact test for its sub-samples, and at nSub=1 its samples
 #     are the cell centres, so its '.streams' IS the exact count there:
-#       D1  '.streams' == the X1 point counts in every cell. (With the old +-1e-6 tolerance
+#       D1  '.streams' == the X1 point counts in every cell. (With a +-1e-6 tolerance
 #           ~67 of 2.1M cells read one stream too many -- a sample near a shared face counted
 #           by both tetrahedra.)
-#       D2  --partition 2 2 2 gives a byte-identical '.streams'. (The tolerance tripped
-#           differently on each run's periodic copies: 2 of 2.1M cells differed.)
+#       D2  --partition 2 2 2 gives a byte-identical '.streams'. (A tolerance trips
+#           differently on each run's periodic copies: 2 of 2.1M cells differ.)
 #       D3  (GPU builds) the --ps-gpu deposit reaches the SAME decisions: '.streams' and
 #           '.hidden_streams' byte-identical to the CPU's. The kernel classifies in float with a
 #           rigorous error bound and defers the undecidable tets to the CPU's exact test.
 #       D4  (GPU builds) the same with --partition 2 2 2 -- whose periodic sub-grids WRAP the
-#           seam, which the GPU's sampled path once skipped (most of each partition's cells).
+#           seam (a sampled path that skips the wrap misses most of each partition's cells).
 #  S) STANDARD DTFE --sample-points: coverage is exactly 1 at every cell centre AND every
-#     particle position (tiny/flat tetrahedra are no longer dropped, and a query at a vertex
+#     particle position (tiny/flat tetrahedra are not dropped, and a query at a vertex
 #     lands in exactly one tetrahedron).
 #  V) --serve through dtfelib.Estimator, both binaries: answers are BIT-IDENTICAL to a
 #     --sample-points run on the same points (same code, same reduction) -- for a request
@@ -62,8 +62,8 @@
 #  A) Estimator.from_arrays: numpy arrays in, bit-identical to the snapshot-file server (PS);
 #     a non-periodic standard cloud with negative coordinates reproduces a linear field.
 #  T) the tessellation cache keys on --periodic: a non-periodic run never loads the cache a
-#     periodic run wrote (it did until 2026-09-30).
-#  P) THE STANDARD SERVER'S PADDING (2026-10-13): dtfelib.Estimator passes '--padding 15' to the standard binary
+#     periodic run wrote.
+#  P) THE STANDARD SERVER'S PADDING: dtfelib.Estimator passes '--padding 15' to the standard binary
 #     (dtfelib.estimator.STANDARD_PADDING, run_dtfe.sh's value) unless the caller gives one; the phase-space server
 #     keeps the binary's own. On demo/z0_64 (z = 0), at two 200^2-point planes 0.05 Mpc inside the box faces, the
 #     default server is bit-identical to '--sample-points --padding 15' and within 1e-10 of '--padding 30', while the
@@ -132,11 +132,7 @@ run() {  # $1 = binary, $2 = output root, rest = extra args
         --verbose 1 "$@" > "$log" 2>&1
     local rc=$?
     set -e
-    if [ "$rc" -ne 0 ]; then
-        echo "   ERROR: ${bin} exited with code $rc -- last 25 lines of $log:"
-        tail -n 25 "$log" | sed 's/^/      | /'
-        exit 1
-    fi
+    die_on_failed_run "$rc" "$log" "${bin}"
 }
 
 echo ">> PS-DTFE runs: serial, --partition 2 2 2, 1 thread; standard DTFE runs"

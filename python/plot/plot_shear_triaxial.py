@@ -6,7 +6,7 @@ Method-, snapshot- and simulation-agnostic via the shared dtfelib.FieldSet layer
     python3 plot/plot_shear_triaxial.py --method dtfe
     python3 plot/plot_shear_triaxial.py --snap 99          # single snapshot only
 
-PS-DTFE grids (2026-10-13): the shear is the MEAN-FIELD one by default -- the traceless symmetric FFT gradient of
+PS-DTFE grids: the shear is the MEAN-FIELD one by default -- the traceless symmetric FFT gradient of
 the PS velocity grid (FieldSet.load('shear', mean_field=True)), the tensor standard DTFE stores; the binary's PS
 grids hold the stream average of each stream's gradient <grad v> (dtfelib/io.py, the note above FIELDS) and
 '--ps-gradient stored' uses them. The summary's 'Data source' line says which.
@@ -148,7 +148,7 @@ def compute_snapshot_slices(fs, mean_field=True):
         print("  No velocity shear/gradient fields found")
         return None
 
-    # u-units -> peculiar km/s/Mpc is applied centrally by FieldSet.load() now
+    # u-units -> peculiar km/s/Mpc is applied centrally by FieldSet.load()
     # (dtfelib.io._VELOCITY_SCALE_EXP) -- no per-script correction needed.
 
     def plane_products(smoothed_field):

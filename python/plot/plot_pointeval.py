@@ -13,11 +13,11 @@ Fields come from whatever the run wrote: density, streams, speed, dispTrace, dis
 for runs with PTS_VEL_GRAD=1 -- velDiv, velShear, velVort (plus denGradMag with
 --pts-den-grad). Snapshots and simulations are auto-discovered; nothing is recomputed here.
 
-    python3 plot/plot_pointeval.py                          # every sim, every snapshot
+    python3 plot/plot_pointeval.py --sims all               # every sim, every snapshot
     python3 plot/plot_pointeval.py --sims TNG300-3-Dark      # one simulation
-    python3 plot/plot_pointeval.py --snaps 0,4,17,33         # selected snapshots
-    python3 plot/plot_pointeval.py --fields density,velDiv --force
-    python3 plot/plot_pointeval.py --method dtfe             # the standard-DTFE slice (output.pts_*)
+    python3 plot/plot_pointeval.py --sims TNG300-3-Dark --snaps 0,4,17,33   # selected snapshots
+    python3 plot/plot_pointeval.py --sims all --fields density,velDiv --force
+    python3 plot/plot_pointeval.py --sims all --method dtfe  # the standard-DTFE slice (output.pts_*)
 """
 
 import _bootstrap  # noqa: F401  (puts python/ on sys.path)
@@ -53,8 +53,8 @@ def main() -> int:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--data-root", type=Path, default=DATA_ROOT,
                    help=f"simulation output root (default {DATA_ROOT})")
-    p.add_argument("--sims", default=None,
-                   help="comma-separated simulations (default: all with snapshots on disk)")
+    p.add_argument("--sims", required=True,
+                   help="comma-separated simulations, or 'all' for every one with snapshots on disk (required)")
     p.add_argument("--snaps", default=None,
                    help="comma-separated snapshot numbers (default: all present)")
     p.add_argument("--fields", default=None,
@@ -96,7 +96,7 @@ def main() -> int:
     if bad:
         sys.exit(f"unknown field(s) {sorted(bad)}; choose from {', '.join(pointeval.STYLES)}")
     fields = [f for f in (args.fields or "").split(",") if f] or None
-    sims = [s for s in (args.sims or "").split(",") if s] or discover_sims(args.data_root)
+    sims = discover_sims(args.data_root) if args.sims == "all" else [s for s in args.sims.split(",") if s]
     want = {int(n) for n in (args.snaps or "").replace(" ", "").split(",") if n} or None
 
     total, failed, skipped = 0, 0, 0
@@ -113,8 +113,8 @@ def main() -> int:
         print(f"\n== {sim}: snapshots {' '.join(map(str, snaps))}")
         for n in snaps:
             snapdir = simdir / f"snapdir_{n:03d}"
-            # 'auto' follows the SLICE on disk, PS-DTFE first (2026-10-11): FieldSet's own auto-detection follows
-            # the grids, so a standard-DTFE slice beside PS-DTFE grids was never found
+            # 'auto' follows the SLICE on disk, PS-DTFE first: FieldSet's own auto-detection follows
+            # the grids, so it would never find a standard-DTFE slice beside PS-DTFE grids
             method = args.method
             if method == "auto" and args.prefix is None:
                 method = next((m for m, pre in (("ps", "ps_output"), ("dtfe", "output"))

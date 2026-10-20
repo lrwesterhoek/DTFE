@@ -1,15 +1,13 @@
 #!/usr/bin/env bash
-# The standard-DTFE GPU deposit ('--gpu', ./DTFE) since 2026-10-13: the PS deposit's chunk checkpoints and
+# The standard-DTFE GPU deposit ('--gpu', ./DTFE): the PS deposit's chunk checkpoints and
 # cause-aware retry (src/CGAL_triangulation/gpu_metal_retry.h / gpu_cuda_retry.cuh, shared with the PS hosts;
 # the pass loop is runBatch in dtfe_metal_host.cc / dtfe_gpu_cuda.cu), and its exact sums -- the '_a' grids as
-# 64-bit fixed-point sums, metal/dtfe_deposit.metal's header -- which make two runs byte-identical. Before, a
-# failed command buffer re-zeroed its sub-domain's box and redid the whole batch, three times, with no cause in
-# the log and no count in the run's retry counters, and two fault-free runs differed in 26-49% of the cells
-# (float atomics, up to 1e-6; the 2026-10-13 audit). tests/gpu_retry_check.sh is the PS twin of this suite and
-# its fault hook is the same: DTFE_GPU_FAULT_AT=<k>[:innocent|timeout|oom|persist] lets the k-th command buffer
-# of the process (a CUDA/HIP kernel) run to completion -- its atomics ARE in the grids -- and then reports it as
-# failed, so only a correct restore keeps the grids exact. Asserted on a synthetic snapshot with pinned opening
-# chunks (DTFE_METAL_CHUNK / DTFE_GPU_CHUNK 4096) and a checkpoint every 2 buffers:
+# 64-bit fixed-point sums, metal/dtfe_deposit.metal's header -- which make two runs byte-identical (with float
+# atomics two fault-free runs differ in 26-49% of the cells, up to 1e-6). tests/gpu_retry_check.sh is the PS twin of
+# this suite and its fault hook is the same: DTFE_GPU_FAULT_AT=<k>[:innocent|timeout|oom|persist] lets the k-th command
+# buffer of the process (a CUDA/HIP kernel) run to completion -- its atomics ARE in the grids -- and then reports it as
+# failed, so only a correct restore keeps the grids exact. Asserted on a synthetic snapshot with pinned opening chunks
+# (DTFE_METAL_CHUNK / DTFE_GPU_CHUNK 4096) and a checkpoint every 2 buffers:
 #   E1  exact sums: two fault-free runs with different opening chunks (4096 and 65536 work items) write
 #       byte-identical '.a_den', '.a_vel', '.a_velGrad' -- the item kernel over 9 sub-domains whose batches race
 #       for the device, the per-tetrahedron kernel (DTFE_GPU_ITEMS=0), and --exact-average
@@ -33,12 +31,12 @@
 #   S1  the opt-in shared full grid (DTFE_GPU_SHARED=1; float sums, no periodic checkpoints): an innocent fault
 #       re-zeroes the batch's owner box and resumes from its start; the grids agree with a fault-free shared run
 #       to 1e-5 of the peak
-#   R8  (2026-10-15) the image-plane shape of the recipe's dtfe27planes stage: '--sample-points' with
+#   R8  the image-plane shape of the recipe's dtfe27planes stage: '--sample-points' with
 #       '--exact-average' under --partition 2 2 2 (one triangulation per partition, DTFE_parallel's single-
 #       triangulation branch) and a 'persist' fault, so every partition's grid falls back to the CPU: the fallback
-#       runs the THREADED exact average (DTFE_DEPOSIT_THREADS=4: the log says so once per partition; it ran on one
-#       thread before), and its '.a_*' grids and '.pts_*' answers are byte-identical to a one-thread CPU run
-#   N1  (2026-10-15) the non-finite guard of the exact sums (ps_deposit_params.h psFixedShareOk): DTFE_TEST_NAN_SHARE=50
+#       runs the THREADED exact average (DTFE_DEPOSIT_THREADS=4: the log says so once per partition), and its
+#       '.a_*' grids and '.pts_*' answers are byte-identical to a one-thread CPU run
+#   N1  the non-finite guard of the exact sums (ps_deposit_params.h psFixedShareOk): DTFE_TEST_NAN_SHARE=50
 #       makes about one tetrahedron in 50 hand the kernel NaN vertex densities; the run reports once how many density
 #       shares it left out, and its '.a_den' has no NaN or infinity
 # GPU builds only: Metal, or the CUDA/HIP port (CUDAEMU=1 runs it on the CPU emulation, tests/cudaemu_check.sh);
@@ -51,14 +49,9 @@ ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$ROOT" || exit 1
 source "${SCRIPT_DIR}/precision.sh"     # DTFE_TEST_PRECISION=double: the double pair
 precision_require "${DTFE_BIN}"
-PY="${PYTHON:-python3}"
-command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/python3.14
 [ -x "${DTFE_BIN}" ] || { echo "FAIL: ${DTFE_BIN} is not built"; exit 1; }
 OBJ=o; precision_double && OBJ=o_d
-if [ ! -d "$OBJ" ] || [ -f "$OBJ/.gpu_mode_off" ]; then echo "SKIP: $OBJ carries no GPU stamp (build with METAL=1)"; exit 0; fi
-gpu_stamp=""                                              # any one GPU backend stamp will do
-for m in metal cudaemu cuda hip; do [ -f "$OBJ/.gpu_mode_$m" ] && gpu_stamp="$m"; done
-if [ -z "$gpu_stamp" ]; then echo "SKIP: $OBJ is neither a Metal nor a CUDA/HIP (or CUDAEMU) build"; exit 0; fi
+require_gpu_backend "$OBJ"                                # sets gpu_stamp (tests/lib.sh)
 TMP="${DTFE_TEST_TMP:-${TMPDIR:-/tmp}/dtfe-tests}/dtfe_gpu_retry_check"
 mkdir -p "$TMP"
 SNAP="$TMP/waves.hdf5"

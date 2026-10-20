@@ -208,7 +208,7 @@ OPTIONS_COMMON += -DOPEN_MP
 # enable to check if the padding gives a complete Delaunay Tesselation of the region of interest
 OPTIONS_COMMON += -DTEST_PADDING
 # keeps the '--redshiftSpace' option registered; the shift itself is NOT implemented in this version (the option
-# refuses the run with a clear error since 2026-10-05 -- before, it was accepted and silently skipped)
+# refuses the run with a clear error rather than silently skipping the shift)
 OPTIONS_COMMON += -DREDSHIFT_SPACE
 
 # Standard DTFE build: no PHASE_SPACE flag (triangulates in Eulerian space, standard density)
@@ -305,7 +305,7 @@ endif
 ifeq ($(GPU_MODE),cudaemu)
 GPUXX = $(CC)
 GPUXX_FLAGS = -x c++ -std=c++20 -O2 -fPIC -DGPU_EMU -Wno-unused-function -Wno-deprecated-declarations $(MACOS_ISYSROOT)
-# x86-64 (2026-10-11): the emulation's lanes switch stacks by hand (gpu_cuda_emu.h gpuemu_switch), which a
+# x86-64: the emulation's lanes switch stacks by hand (gpu_cuda_emu.h gpuemu_switch), which a
 # CET shadow stack would kill at the first 'ret' into another lane. Ubuntu's GCC marks every object
 # shadow-stack compatible by default (-fcf-protection); leaving this one unmarked keeps the linked binary
 # unmarked, so the loader never turns the shadow stack on. arm64 has no such flag.
@@ -478,8 +478,8 @@ endif
 COMPILE_FLAGS = $(BASE_CFLAGS) -std=c++17 -Wno-psabi -Wno-cpp -Wno-deprecated-declarations -frounding-math -MMD -MP $(DEBUG_FLAGS) $(EXTRA_FLAGS) $(MACOS_ISYSROOT)
 COMPILE_FLAGS_PS = $(BASE_CFLAGS_PS) -std=c++17 -Wno-psabi -Wno-cpp -Wno-deprecated-declarations -frounding-math -MMD -MP $(DEBUG_FLAGS) $(EXTRA_FLAGS) $(MACOS_ISYSROOT)
 LINK_FLAGS =
-# NOTE: -lboost_system was dropped: Boost.System is header-only since Boost 1.69,
-# so recent Homebrew/Boost no longer ship libboost_system ("library not found").
+# NOTE: no -lboost_system: Boost.System is header-only since Boost 1.69,
+# and recent Homebrew/Boost do not ship libboost_system ("library not found").
 BASE_LIBS = -lboost_thread -lboost_filesystem -lboost_program_options -lgsl -lgslcblas -lm -lgmp -lmpfr -lfftw3f -lfftw3
 HDF5_LIBS = -lhdf5 -lhdf5_cpp
 # zlib: the tessellation cache deflates its body (CGAL_triangulation/tessellation_cache.h). A system
@@ -520,7 +520,7 @@ endif
 # DTFE_TBB_THREADS -- the default insert stays sequential and bit-reproducible). 'auto': compiled in when the tbb package is installed
 # (macOS: `brew install tbb`; Debian/Ubuntu: libtbb-dev); TBB=0 forces it off, TBB=1 requires it.
 # PS-DTFE only: the standard DTFE binary keeps its sequential insert and Fast_location hierarchy
-# (its clustered Eulerian points built 4.5x SLOWER in parallel, where PS-DTFE's near-lattice
+# (its clustered Eulerian points build 4.5x SLOWER in parallel, where PS-DTFE's near-lattice
 # Lagrangian points build 2x faster). The DT type changes with it, so o_ps/ is stamped and wiped
 # on a toggle like the GPU mode. Override the TBB location with TBB_PATH_OVERRIDE=/path.
 TBB ?= auto
@@ -578,22 +578,22 @@ COMPILE_FLAGS_PS += $(ARCH_FLAGS)
 # GCC fuses a*b + c into one rounding (FMA) ACROSS statements by default (-ffp-contract=fast)
 # wherever the target has FMA -- every arm64 machine, and x86 under -march=native -- so two code
 # paths written to do the same arithmetic round differently: on Linux arm64 the dispersion of a
-# --ps-volume-weighted run was no longer bit-identical to a mass-weighted run's
-# (tests/ps_volume_weighted_check.sh, 2026-10-02). Clang (the macOS build) only fuses within one
+# --ps-volume-weighted run would not be bit-identical to a mass-weighted run's
+# (tests/ps_volume_weighted_check.sh). Clang (the macOS build) only fuses within one
 # expression, which both paths do alike, and is left as it is.
 CC_IS_GCC := $(shell $(CC) --version 2>/dev/null | grep -qi 'free software foundation' && echo 1)
 ifeq ($(CC_IS_GCC),1)
     COMPILE_FLAGS    += -ffp-contract=off
     COMPILE_FLAGS_PS += -ffp-contract=off
 endif
-# stamped in the object dirs (the mode checks above): objects compiled before the flag existed are
-# wiped once instead of being linked with the new ones. Clang builds carry no stamp (nothing changed).
+# stamped in the object dirs (the mode checks above): objects compiled without the flag are
+# wiped once instead of being linked with the new ones. Clang builds carry no stamp (no flag added).
 FPC_STAMP := $(if $(filter 1,$(CC_IS_GCC)),.fpc_off,)
 comma := ,
 # BUILD_MODE, ARCH_FLAGS and EXTRA_FLAGS change every object as well: stamped in the object dirs (the mode
-# and a checksum of the three), so a switch wipes the objects like a GPU-mode switch. Until 2026-10-08
-# 'make DTFE BUILD_MODE=debug' after a release build found every object up to date and linked the -O3
-# objects with the sanitizers; an ARCH_FLAGS / EXTRA_FLAGS change kept the old objects the same way.
+# and a checksum of the three), so a switch wipes the objects like a GPU-mode switch (otherwise
+# 'make DTFE BUILD_MODE=debug' after a release build would find every object up to date and link the -O3
+# objects with the sanitizers).
 FLAGS_SUM := $(shell printf '%s' '$(subst ',,$(BUILD_MODE)|$(ARCH_FLAGS)|$(EXTRA_FLAGS))' | cksum | cut -d' ' -f1)
 FLAGS_STAMP := .flags_$(BUILD_MODE)_$(FLAGS_SUM)
 
@@ -617,8 +617,10 @@ BUILD_REV  := $(shell git describe --always --dirty --abbrev=10 2>/dev/null || e
 BUILD_TIME := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 BUILD_INFO_FLAGS = -DDTFE_BUILD_REV='"$(BUILD_REV)"' -DDTFE_BUILD_TIME='"$(BUILD_TIME)"'
 IO_CC_SOURCES = input_output.cc $(IO_SOURCES) user_options.h define.h quantities.h message.h particle_data.h box.h ps_point_eval.h
-DTFE_SOURCES = DTFE.cpp define.h particle_data.h user_options.h box.h quantities.h subpartition.h interpolations.h kdtree/kdtree2.hpp Pvector.h message.h miscellaneous.h auto_tune.h ps_point_eval.h
-DTFE_CC_SOURCES = user_options.cc quantities.cc NGP_interpolation.cc CIC_interpolation.cc TSC_interpolation.cc PCS_interpolation.cc SPH_interpolation.cc interlacing.cc random.cc
+DTFE_SOURCES = DTFE.cpp define.h particle_data.h user_options.h box.h quantities.h subpartition.h interpolations.h kdtree/kdtree2.hpp Pvector.h message.h miscellaneous.h auto_tune.h ps_point_eval.h web_fields.h
+# the derived velocity fields and the V-web / T-web (moved out of DTFE.cpp)
+WEB_FIELDS_SOURCES = web_fields.cc web_fields.h define.h user_options.h quantities.h message.h fftw_plans64.h
+DTFE_CC_SOURCES = user_options.cc quantities.cc NGP_interpolation.cc CIC_interpolation.cc TSC_interpolation.cc PCS_interpolation.cc SPH_interpolation.cc interlacing.cc random.cc web_fields.cc
 TRIANG_HEADERS = $(addprefix CGAL_triangulation/, triangulation_common.h triangulation_miscellaneous.h field_computation.h padding_test.h my_function.h CGAL_include_2D.h CGAL_include_3D.h vertexData.h particle_data_traits.h) define.h particle_data.h user_options.h box.h quantities.h Pvector.h message.h math_functions.h miscellaneous.h ps_point_eval.h
 TRIANG_SOURCES = $(addprefix CGAL_triangulation/, triangulation.cpp) $(TRIANG_HEADERS)
 TRIANG_CC_SOURCES = $(addprefix CGAL_triangulation/, unaveraged_interpolation.cc averaged_interpolation_1.cc averaged_interpolation_2.cc ps_interpolation.cc ps_point_eval.cc)
@@ -641,7 +643,7 @@ HEADERS_2 = $(addprefix CGAL_triangulation/, CGAL_include_2D.h CGAL_include_3D.h
 ############################# Standard DTFE build (no PHASE_SPACE) ##################################
 # Produces DTFE binary that uses Eulerian-space triangulation (standard DTFE)
 
-DTFE_CC_OBJS = $(OBJ_DIR)/user_options$(OBJ_EXT) $(OBJ_DIR)/quantities$(OBJ_EXT) $(OBJ_DIR)/NGP_interpolation$(OBJ_EXT) $(OBJ_DIR)/CIC_interpolation$(OBJ_EXT) $(OBJ_DIR)/TSC_interpolation$(OBJ_EXT) $(OBJ_DIR)/PCS_interpolation$(OBJ_EXT) $(OBJ_DIR)/SPH_interpolation$(OBJ_EXT) $(OBJ_DIR)/interlacing$(OBJ_EXT) $(OBJ_DIR)/random$(OBJ_EXT) $(OBJ_DIR)/scratch_alloc$(OBJ_EXT)
+DTFE_CC_OBJS = $(OBJ_DIR)/user_options$(OBJ_EXT) $(OBJ_DIR)/quantities$(OBJ_EXT) $(OBJ_DIR)/NGP_interpolation$(OBJ_EXT) $(OBJ_DIR)/CIC_interpolation$(OBJ_EXT) $(OBJ_DIR)/TSC_interpolation$(OBJ_EXT) $(OBJ_DIR)/PCS_interpolation$(OBJ_EXT) $(OBJ_DIR)/SPH_interpolation$(OBJ_EXT) $(OBJ_DIR)/interlacing$(OBJ_EXT) $(OBJ_DIR)/random$(OBJ_EXT) $(OBJ_DIR)/web_fields$(OBJ_EXT) $(OBJ_DIR)/scratch_alloc$(OBJ_EXT)
 IO_CC_OBJS = $(OBJ_DIR)/input_output$(OBJ_EXT)
 TRIANG_CC_OBJS = $(OBJ_DIR)/unaveraged_interpolation$(OBJ_EXT) $(OBJ_DIR)/averaged_interpolation_1$(OBJ_EXT) $(OBJ_DIR)/averaged_interpolation_2$(OBJ_EXT) $(OBJ_DIR)/ps_interpolation$(OBJ_EXT) $(OBJ_DIR)/ps_point_eval$(OBJ_EXT)
 
@@ -693,6 +695,9 @@ $(OBJ_DIR)/SPH_interpolation$(OBJ_EXT): $(SRC)/SPH_interpolation.cc $(SRC)/inter
 $(OBJ_DIR)/random$(OBJ_EXT): $(SRC)/random.cc $(SRC)/define.h $(SRC)/user_options.h Makefile
 	$(CC) $(COMPILE_FLAGS) $(DTFE_INC) -o $@ -c $(SRC)/random.cc
 
+$(OBJ_DIR)/web_fields$(OBJ_EXT): $(addprefix $(SRC)/, $(WEB_FIELDS_SOURCES)) Makefile
+	$(CC) $(COMPILE_FLAGS) $(DTFE_INC) -o $@ -c $(SRC)/web_fields.cc
+
 # --scratch-dir out-of-core backing: replaces the global operator new/delete, so it goes into
 # the BINARIES only -- the library links scratch_alloc_stub.cc instead (see library-build).
 $(OBJ_DIR)/scratch_alloc$(OBJ_EXT): $(SRC)/scratch_alloc.cc $(SRC)/scratch_alloc.h Makefile
@@ -737,7 +742,7 @@ $(OBJ_DIR)/ps_point_eval$(OBJ_EXT): $(SRC)/CGAL_triangulation/ps_point_eval.cc $
 # Produces PS-DTFE binary that uses Lagrangian-space triangulation (phase-space DTFE)
 # Object files are placed in $(OBJ_DIR_PS) to avoid conflicts with the standard DTFE build
 
-PS_DTFE_CC_OBJS = $(OBJ_DIR_PS)/user_options$(OBJ_EXT) $(OBJ_DIR_PS)/quantities$(OBJ_EXT) $(OBJ_DIR_PS)/NGP_interpolation$(OBJ_EXT) $(OBJ_DIR_PS)/CIC_interpolation$(OBJ_EXT) $(OBJ_DIR_PS)/TSC_interpolation$(OBJ_EXT) $(OBJ_DIR_PS)/PCS_interpolation$(OBJ_EXT) $(OBJ_DIR_PS)/SPH_interpolation$(OBJ_EXT) $(OBJ_DIR_PS)/interlacing$(OBJ_EXT) $(OBJ_DIR_PS)/random$(OBJ_EXT) $(OBJ_DIR_PS)/scratch_alloc$(OBJ_EXT)
+PS_DTFE_CC_OBJS = $(OBJ_DIR_PS)/user_options$(OBJ_EXT) $(OBJ_DIR_PS)/quantities$(OBJ_EXT) $(OBJ_DIR_PS)/NGP_interpolation$(OBJ_EXT) $(OBJ_DIR_PS)/CIC_interpolation$(OBJ_EXT) $(OBJ_DIR_PS)/TSC_interpolation$(OBJ_EXT) $(OBJ_DIR_PS)/PCS_interpolation$(OBJ_EXT) $(OBJ_DIR_PS)/SPH_interpolation$(OBJ_EXT) $(OBJ_DIR_PS)/interlacing$(OBJ_EXT) $(OBJ_DIR_PS)/random$(OBJ_EXT) $(OBJ_DIR_PS)/web_fields$(OBJ_EXT) $(OBJ_DIR_PS)/scratch_alloc$(OBJ_EXT)
 PS_DTFE_IO_OBJS = $(OBJ_DIR_PS)/input_output$(OBJ_EXT)
 PS_DTFE_TRIANG_OBJS = $(OBJ_DIR_PS)/unaveraged_interpolation$(OBJ_EXT) $(OBJ_DIR_PS)/averaged_interpolation_1$(OBJ_EXT) $(OBJ_DIR_PS)/averaged_interpolation_2$(OBJ_EXT) $(OBJ_DIR_PS)/ps_interpolation$(OBJ_EXT) $(OBJ_DIR_PS)/ps_point_eval$(OBJ_EXT)
 
@@ -787,6 +792,9 @@ $(OBJ_DIR_PS)/SPH_interpolation$(OBJ_EXT): $(SRC)/SPH_interpolation.cc $(SRC)/in
 
 $(OBJ_DIR_PS)/random$(OBJ_EXT): $(SRC)/random.cc $(SRC)/define.h $(SRC)/user_options.h Makefile
 	$(CC) $(COMPILE_FLAGS_PS) $(DTFE_INC) -o $@ -c $(SRC)/random.cc
+
+$(OBJ_DIR_PS)/web_fields$(OBJ_EXT): $(addprefix $(SRC)/, $(WEB_FIELDS_SOURCES)) Makefile
+	$(CC) $(COMPILE_FLAGS_PS) $(DTFE_INC) -o $@ -c $(SRC)/web_fields.cc
 
 $(OBJ_DIR_PS)/scratch_alloc$(OBJ_EXT): $(SRC)/scratch_alloc.cc $(SRC)/scratch_alloc.h Makefile
 	$(CC) $(COMPILE_FLAGS_PS) $(DTFE_INC) -o $@ -c $(SRC)/scratch_alloc.cc
@@ -848,7 +856,7 @@ $(OBJ_DIR)/dtfe_gpu_cuda$(OBJ_EXT): $(SRC)/CGAL_triangulation/dtfe_gpu_cuda.cu $
 
 ############################# Shared library build ##################################
 
-DTFE_CC_LIB_OBJS = $(OBJ_DIR)/user_options_l$(OBJ_EXT) $(OBJ_DIR)/quantities_l$(OBJ_EXT) $(OBJ_DIR)/NGP_interpolation_l$(OBJ_EXT) $(OBJ_DIR)/CIC_interpolation_l$(OBJ_EXT) $(OBJ_DIR)/TSC_interpolation_l$(OBJ_EXT) $(OBJ_DIR)/PCS_interpolation_l$(OBJ_EXT) $(OBJ_DIR)/SPH_interpolation_l$(OBJ_EXT) $(OBJ_DIR)/interlacing_l$(OBJ_EXT) $(OBJ_DIR)/random_l$(OBJ_EXT)
+DTFE_CC_LIB_OBJS = $(OBJ_DIR)/user_options_l$(OBJ_EXT) $(OBJ_DIR)/quantities_l$(OBJ_EXT) $(OBJ_DIR)/NGP_interpolation_l$(OBJ_EXT) $(OBJ_DIR)/CIC_interpolation_l$(OBJ_EXT) $(OBJ_DIR)/TSC_interpolation_l$(OBJ_EXT) $(OBJ_DIR)/PCS_interpolation_l$(OBJ_EXT) $(OBJ_DIR)/SPH_interpolation_l$(OBJ_EXT) $(OBJ_DIR)/interlacing_l$(OBJ_EXT) $(OBJ_DIR)/random_l$(OBJ_EXT) $(OBJ_DIR)/web_fields_l$(OBJ_EXT)
 IO_CC_LIB_OBJS = $(OBJ_DIR)/input_output_l$(OBJ_EXT)
 TRIANG_CC_LIB_OBJS = $(OBJ_DIR)/unaveraged_interpolation_l$(OBJ_EXT) $(OBJ_DIR)/averaged_interpolation_1_l$(OBJ_EXT) $(OBJ_DIR)/averaged_interpolation_2_l$(OBJ_EXT) $(OBJ_DIR)/ps_interpolation_l$(OBJ_EXT) $(OBJ_DIR)/ps_point_eval_l$(OBJ_EXT)
 
@@ -875,6 +883,7 @@ library-build: set_directories set_directories_2 $(addprefix $(SRC)/, $(LIB_FILE
 	$(CC) $(COMPILE_FLAGS) -fPIC $(DTFE_INC) -o $(OBJ_DIR)/SPH_interpolation_l$(OBJ_EXT) -c $(SRC)/SPH_interpolation.cc
 	$(CC) $(COMPILE_FLAGS) -fPIC $(DTFE_INC) -o $(OBJ_DIR)/interlacing_l$(OBJ_EXT) -c $(SRC)/interlacing.cc
 	$(CC) $(COMPILE_FLAGS) -fPIC $(DTFE_INC) -o $(OBJ_DIR)/random_l$(OBJ_EXT) -c $(SRC)/random.cc
+	$(CC) $(COMPILE_FLAGS) -fPIC $(DTFE_INC) -o $(OBJ_DIR)/web_fields_l$(OBJ_EXT) -c $(SRC)/web_fields.cc
 	$(CC) $(COMPILE_FLAGS) -fPIC $(DTFE_INC) -o $(OBJ_DIR)/scratch_alloc_stub_l$(OBJ_EXT) -c $(SRC)/scratch_alloc_stub.cc
 	$(CC) $(COMPILE_FLAGS) -shared $(OBJ_DIR)/DTFE_l$(OBJ_EXT) $(OBJ_DIR)/triangulation_l$(OBJ_EXT) $(OBJ_DIR)/kdtree2_l$(OBJ_EXT) $(OBJ_DIR)/r3d$(OBJ_EXT) $(OBJ_DIR)/scratch_alloc_stub_l$(OBJ_EXT) $(DTFE_CC_LIB_OBJS) $(IO_CC_LIB_OBJS) $(TRIANG_CC_LIB_OBJS) $(DTFE_GPU_L_OBJS) $(DTFE_LIB) $(DTFE_GPU_LIBS) -o $(LIB_DIR)/libDTFE$(SHARED_EXT)
 
@@ -953,8 +962,9 @@ endif
 	@echo "Include flags: $(INCLUDES)"
 	@echo "Libraries: $(DTFE_LIB)"
 
-# the folders are made here too (2026-10-15): under 'make -j' this rule can run before set_directories_2, and on a
-# fresh checkout (CI) './DTFE_include' did not exist yet -- 'make library' failed with 'cp: target ... No such file'
+# the folders are made here too: under 'make -j' this rule can run before set_directories_2, and on a
+# fresh checkout (CI) './DTFE_include' does not exist yet -- 'make library' would fail with 'cp: target ... No such
+# file'
 copy_headers:
 	@$(MKDIR_P) $(INC_DIR)/CGAL_triangulation
 	cp $(addprefix $(SRC)/, $(HEADERS_1)) $(INC_DIR)

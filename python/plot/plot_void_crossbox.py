@@ -1,7 +1,7 @@
 """The void population of several boxes (TNG50 / TNG100 / TNG300) side by side at ONE physical smoothing length.
 
 At the production smoothing (10 cells) every box smooths on its own scale, and the cross-box differences of the void
-statistics were that scale (2026-10-07: at sigma = 2.1625 Mpc TNG100 and TNG300 agree on the distinct-void density to
+statistics are that scale (at sigma = 2.1625 Mpc TNG100 and TNG300 agree on the distinct-void density to
 0.3% and on R_v to 3% at z = 0, 7-11% at z = 0.5-1, the resolved fraction to 2 points). This figure makes
 the comparison at a common sigma in Mpc (--smooth-mpc, default 2.1625: 10.0002 TNG100-3-Dark cells, a hair above
 its production 10 cells = 2.16245 Mpc, kept because the earlier results use it; the minima footprint follows it in
@@ -16,7 +16,7 @@ each box, pipeline.set_smoothing). The definitions are the per-box scripts':
                     against the minima of a Gaussian random field with the same smoothed linear spectrum
                     (dtfelib.theory, BBKS 1986 eqs 7.6, A14, A15): at each void's own height nu = -delta_min /
                     sigma_0(z) (gamma and sigma_0 of the linear EH98 spectrum smoothed with this sigma), and over all
-                    minima (the same for any spectrum) -- added 2026-10-11
+                    minima (the same for any spectrum)
   * profiles      : profiles.void_profiles of the distinct resolved voids in r / R_v, stacked over ONE common R_v
                     range in Mpc (--rv-range, in smoothing lengths: 2.5-5 sigma by default); the wrap rule
                     (3 R_v <= L/2) leaves a small box only its smaller voids, said in the legend
@@ -56,10 +56,9 @@ import config
 from dtfelib.cli import DATA_ROOT
 from dtfelib import figures as style
 
-DEFAULT_SIMS = ("TNG50-3-Dark", "TNG100-3-Dark", "TNG300-3-Dark")
 DEFAULT_SIGMA_MPC = config.CROSSBOX_SMOOTHING_MPC   # 2.1625 = 10.0002 cells of TNG100-3-Dark (110.7 Mpc / 512;
-                                      # production 10 cells = 2.16245 Mpc): the 2026-10-07 comparison's, kept so its
-                                      # results stay comparable; from config since 2026-10-11 (G2: one number everywhere)
+                                      # production 10 cells = 2.16245 Mpc): the first comparison's, kept so its
+                                      # results stay comparable; from config (one number everywhere)
 DEFAULT_Z = (0.0, 0.5, 1.0)
 DEFAULT_RV_RANGE = (2.5, 5.0)         # the common R_v range of the stacks, in smoothing lengths (profiles' upper bins)
 Z_TOLERANCE = 0.05                    # a box's snapshot counts as 'at z' within this
@@ -95,7 +94,7 @@ def grf_shapes(delta_min, z, sigma_mpc):
 def sigma_tag(sigma_mpc: float) -> str:
     """'s2.1625Mpc': the sigma in file names, six significant digits as pipeline.smoothing_tag (whose footprint part
     differs per box: it is in each box's .npz instead). A non-default void gate (DTFE_VOID_GATE, inherited by the per-box
-    workers) adds '_gatenone', as pipeline.smoothing_tag does, so it never overwrites the gated products (2026-10-11)."""
+    workers) adds '_gatenone', as pipeline.smoothing_tag does, so it never overwrites the gated products."""
     gate = str(getattr(config, "VOID_GATE", "ellipsoid") or "ellipsoid").strip().lower()
     return f"s{float(sigma_mpc):.6g}Mpc" + ("" if gate == "ellipsoid" else f"_gate{gate}")
 
@@ -159,7 +158,7 @@ def measure(sim, method="ps", prefix=None, data_root=None, zs=DEFAULT_Z, rv_rang
            "r_v_count": np.array([r["_r_v"].size for r in rows])}
     for k in ("n_total", "n_resolved", "n_deep", "n_counted", "n_no_rv", "n_overlapping", "n_rv_all", "n_bbks"):
         out[k] = np.array([r[k] for r in rows])
-    # the shapes (2026-10-11): medians with their bootstrap interval, the percentiles, the Gaussian-field null at the
+    # the shapes: medians with their bootstrap interval, the percentiles, the Gaussian-field null at the
     # sample's own heights and over all minima, and the raw e, p (ragged, as r_v) for the distributions
     from dtfelib import theory
     grf_all = theory.minima_shape_percentiles(None)
@@ -285,7 +284,7 @@ def summary_lines(results) -> list:
                      f"sigma {float(r['sigma_mpc']):.6g} Mpc = {float(r['sigma_cells']):.4g} cells, footprint "
                      f"{int(r['footprint'])} ({str(r['cache_namespace'])})")
         vol = float(r["box_mpc"]) ** 3
-        shapes = "e_med" in r                    # 2026-10-11: the BBKS e, p medians and the Gaussian-field null
+        shapes = "e_med" in r                    # the BBKS e, p medians and the Gaussian-field null
         lines.append("   snap      z   minima  resolved  frac   distinct  per(100Mpc)^3  R_v 16/50/84 [Mpc]"
                      + ("   e (68% CI)            p (68% CI)            GRF e    GRF p" if shapes else ""))
         for j, s in enumerate(r["snaps"]):
@@ -309,7 +308,7 @@ def draw(results, z_target, args, out_dir) -> Path:
     from dtfelib import catalog
     sigma = float(args.smooth_mpc)
     colors = dict(zip([r["sim"] for r in results], plt.cm.tab10(np.arange(len(results)))))
-    shapes = all("e_med" in r for r in results)   # a worker .npz from before 2026-10-11 has no shapes
+    shapes = all("e_med" in r for r in results)   # an older worker .npz has no shapes
     fig, axes = plt.subplots(3 if shapes else 2, 3, figsize=(16, 14 if shapes else 9.5))
     # ---- top: against redshift
     for r in results:
@@ -321,7 +320,7 @@ def draw(results, z_target, args, out_dir) -> Path:
         axes[0, 0].plot(z[ok], (nr / np.maximum(nt, 1))[ok], "o-", ms=4, color=c, label=lab)
         axes[0, 1].errorbar(z[ok], (nc / vol * PER_VOLUME)[ok], yerr=(np.sqrt(nc) / vol * PER_VOLUME)[ok], fmt="o-",
                             ms=4, capsize=2, color=c, label=f"{lab} ({float(r['box_mpc']):.0f} Mpc box)")
-        # the caveat (survey GAP, 2026-10-11): the minima, and those with an R_v, are nearly flat in z, so the rise
+        # the caveat: the minima, and those with an R_v, are nearly flat in z, so the rise
         # and fall of the distinct count is the ellipsoid gate (the 10 sigma max axis) turning on, not formation
         axes[0, 1].plot(z[ok], (nt / vol * PER_VOLUME)[ok], ":", lw=1.0, color=c)
         if "n_rv_all" in r:
@@ -394,7 +393,7 @@ def draw(results, z_target, args, out_dir) -> Path:
                             f"footprint follows sigma in each box)")
     fig.tight_layout()
     path = out_dir / f"crossbox_{args.method}_{sigma_tag(sigma)}_z{z_target:.2f}.png"
-    # the house style (2026-10-11), never mirrored: a common sigma is not the thesis's production smoothing
+    # the house style, never mirrored: a common sigma is not the thesis's production smoothing
     style.save_plot_to_multiple_paths(fig, path, dpi=config.DPI, mirror=False)
     plt.close(fig)
     return path
@@ -451,7 +450,8 @@ def main(argv=None):
         return worker_main(argv)
     p = argparse.ArgumentParser(description="Void statistics of several boxes side by side at one smoothing length "
                                             "in Mpc (resolved fraction, distinct-void density, R_v, stacked profiles).")
-    p.add_argument("--sims", nargs="+", default=list(DEFAULT_SIMS), help=f"the boxes (default {' '.join(DEFAULT_SIMS)})")
+    p.add_argument("--sims", nargs="+", required=True,
+                   help="the boxes to compare, e.g. --sims TNG50-3-Dark TNG100-3-Dark TNG300-3-Dark (required)")
     p.add_argument("--method", choices=("ps", "dtfe"), default="ps", help="the field estimator (default ps)")
     p.add_argument("--prefix", default=None, help="a grid set's output prefix (default the method's)")
     p.add_argument("--data-root", type=Path, default=None, help=f"the data root (default {DATA_ROOT})")

@@ -45,12 +45,12 @@ import numpy as np
 
 __all__ = ["Estimator", "PointFields", "find_binary", "STANDARD_PADDING"]
 
-# The standard (Eulerian) server's '--padding', in mean particle spacings, when the caller gives none (2026-10-13).
+# The standard (Eulerian) server's '--padding', in mean particle spacings, when the caller gives none.
 # The binary's own default of 5 is too thin near the box faces: on demo/z0_64 (z = 0) 0.5-0.9% of the points of a
 # plane 0.05 Mpc inside a face are off by up to ~4% against padding 30-40, computed from the wrong hull tetrahedra
 # (they still report coverage 1, so nothing flags them), while 10 to 40 agree to float rounding (1e-14;
-# tests/point_exact_serve_check.sh P2). 15 is scripts/run_dtfe.sh's default since 2026-10-12, complete (no
-# '*.badGridPoints*' file) on the z = 0 grids of TNG50/100/300-3-Dark, where 10 was not. The
+# tests/point_exact_serve_check.sh P2). 15 is scripts/run_dtfe.sh's default, complete (no
+# '*.badGridPoints*' file) on the z = 0 grids of TNG50/100/300-3-Dark, where 10 is not. The
 # phase-space server pads in Lagrangian space by its own rules and keeps the binary's default. The launcher's
 # standard exact zoom (gui/explore.py) passes the same value to its '--regionMpc' run.
 STANDARD_PADDING = 15.0

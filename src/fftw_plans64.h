@@ -5,7 +5,7 @@
    "64-bit Guru Interface") describes the same row-major transform -- real (nx, ny, nz) to
    half-complex (nx, ny, nz/2+1) and back -- with ptrdiff_t sizes and strides. For grids the
    ordinary planners accept it is the same problem, planned the same way. Used by the T-web
-   (DTFE.cpp) and the interlacing (interlacing.cc), in double and in float. */
+   (web_fields.cc) and the interlacing (interlacing.cc), in double and in float. */
 
 #ifndef DTFE_FFTW_PLANS64_HEADER
 #define DTFE_FFTW_PLANS64_HEADER

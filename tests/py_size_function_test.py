@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for the size function's raw-density radius (2026-10-11): dtfelib.raw_radius (the enclosed -0.8 radius on
+"""Tests for the size function's raw-density radius: dtfelib.raw_radius (the enclosed -0.8 radius on
 the RAW rho/rho_bar about the catalogue's centres, its cache) and plot_void_population's '--size-rv delta08raw'.
 
 Two tiers:
@@ -14,9 +14,7 @@ Two tiers:
 Usage:  python3 tests/py_size_function_test.py            (exit 0 = pass)
 """
 
-import atexit
 import io
-import os
 import shutil
 import sys
 import tempfile
@@ -27,39 +25,11 @@ from types import SimpleNamespace
 
 import numpy as np
 
-REPO = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO / "python"))
-sys.path.insert(0, str(REPO / "python" / "plot"))
-# the figure root before config/dtfelib are imported: a temp folder, never the real root; and no thesis mirror
-_FIGS_TMP = tempfile.mkdtemp(prefix="size_function_figs_")
-os.environ["DTFE_FIGURES_ROOT"] = _FIGS_TMP
-os.environ["DTFE_NO_MIRROR"] = "1"
-os.environ.setdefault("MPLBACKEND", "Agg")
-atexit.register(shutil.rmtree, _FIGS_TMP, True)
+import os
+from _harness import FAIL, PASS, REPO, SKIP, Skip, check, setup
 
-PASS, FAIL, SKIP = [], [], []
-
-
-class Skip(Exception):
-    pass
-
-
-def check(name, fn):
-    try:
-        fn()
-        PASS.append(name)
-        print(f"  PASS  {name}")
-    except Skip as e:
-        SKIP.append(name)
-        print(f"  SKIP  {name}  ({e})")
-    except AssertionError as e:
-        FAIL.append(name)
-        print(f"  FAIL  {name}: {e}")
-    except Exception as e:      # a crash is this test's failure, not the end of the run
-        import traceback
-        FAIL.append(name)
-        print(f"  FAIL  {name}: {type(e).__name__}: {e}")
-        print("".join("        " + line for line in traceback.format_exc().splitlines(True)[-6:]), end="")
+_FIGS_TMP = setup("size_function_figs_")
+os.environ.setdefault("DTFE_SIM", "TNG50-4-Dark")    # the box these synthetic tests stand for; a data-tier run sets its own
 
 
 N = 64
@@ -102,7 +72,7 @@ def t_analytic():
 def t_centre_wisp():
     """A wisp ON the centre cell (rho/rho_bar 3: the raw centre above -0.8) does not undefine the void: the
     enclosed contrast dips below -0.8 a cell out and the radius is the void's (the rule: first up-crossing after
-    the first point below, not 'the centre must be below' as the smoothed delta08). The old rule would give NaN."""
+    the first point below, not 'the centre must be below' as the smoothed delta08, which would give NaN)."""
     from dtfelib import raw_radius as rr
     g = _tophat([[32, 32, 32]])
     g[32, 32, 32] = 3.0
@@ -195,7 +165,7 @@ def t_cache():
 
 
 def t_held_grid():
-    """2026-10-11: raw_radii measures on the density grid the products already hold (a fresh voids() build's
+    """raw_radii measures on the density grid the products already hold (a fresh voids() build's
     density_raw) instead of reading it again, with the same radii; a products without it still reads once, and the
     read grid is not left in the products (no _ram entry made)."""
     from dtfelib import raw_radius as rr
@@ -230,10 +200,10 @@ def _bowl(centre, r0=R0, n=N):
 
 
 def t_recentre():
-    """2026-10-12, raw_radius RE-CENTRING: a catalogue centre 5-6 cells off a void's raw centre gives a raw -0.8
+    """raw_radius RE-CENTRING: a catalogue centre 5-6 cells off a void's raw centre gives a raw -0.8
     radius well below the void's (the off-centre sphere takes in the wall early); re-centred, the centre walks back to
     within a cell of the raw minimum (also across the periodic edge) and the radius is the one about the true centre.
-    A centre already on the minimum does not move. FAILS on the old code: there was no re-centring."""
+    A centre already on the minimum does not move."""
     from dtfelib import raw_radius as rr
     true = np.array([62, 20, 30])                          # straddles the x edge (r0 = 8 > 64 - 62)
     g = _bowl(true)
@@ -257,7 +227,7 @@ def t_recentre():
 
 
 def t_recentre_cache():
-    """2026-10-12: raw_radii(recentre=True) caches beside the uncentred file under its own name (voids_raw08rc),
+    """raw_radii(recentre=True) caches beside the uncentred file under its own name (voids_raw08rc),
     leaves the uncentred radii as they were, is reused without a grid read, re-measures when a re-centring setting
     changes, and returns the re-centred cells, the offsets and R0."""
     import config
@@ -294,7 +264,7 @@ def t_recentre_cache():
 
 
 def t_same_centre():
-    """2026-10-12: two catalogue minima re-centred onto one raw minimum count once in the fixed-R sample (the deeper
+    """Two catalogue minima re-centred onto one raw minimum count once in the fixed-R sample (the deeper
     row kept); rows outside the sample are never dropped or added. And the switch is offered."""
     import plot_void_population as pop
     sel = np.array([True, True, True, False, True])
@@ -309,9 +279,9 @@ def t_same_centre():
 
 
 def t_raw_distinct():
-    """2026-10-12, --fixed-r-distinct raw: the largest raw sphere first, a sphere OVERLAPPING a kept one dropped
+    """--fixed-r-distinct raw: the largest raw sphere first, a sphere OVERLAPPING a kept one dropped
     (periodic), a row outside the sample or without a radius never kept -- where the catalogue rule keeps the
-    DEEPEST minimum and drops the large sphere beside it. FAILS on the old code (no raw_sphere_distinct)."""
+    DEEPEST minimum and drops the large sphere beside it."""
     import plot_void_population as pop
     n = 64
     centres = np.array([[10, 10, 10], [14, 10, 10], [62, 10, 10], [40, 40, 40], [40, 44, 40], [30, 30, 30]])
@@ -447,7 +417,7 @@ def _vdn_sample(rng, box, lo, hi, z=0.0, scale=1.0):
 
 
 def t_fixed_r():
-    """--size-fixed-r (2026-10-11, sizefn): the theory's bin average and range integral; the smoothings (default,
+    """--size-fixed-r: the theory's bin average and range integral; the smoothings (default,
     Mpc ones, a duplicate scale dropped); the common range (3 x the largest sigma .. the scarcest smoothing's 5th
     largest radius, empty when too few); a population drawn from Vdn gives ratio ~1 and 'consistent' at every
     smoothing, one at 0.4 of it does not; the sub-cube bootstrap's draws; the figure, the npz arrays and the verdicts;
@@ -551,11 +521,11 @@ def _fixed_r_entries(r_all, pos_all, keeps, sig, rng, snap=99):
 
 
 def t_fixed_r_half_open():
-    """(review-science 1, 2026-10-11) Every fixed-R count is half-open [lo, hi): r_hi is an exact sample radius
-    (the scarcest smoothing's 5th largest), and the closed last bin of np.histogram counted that void in dn/dlnR
-    and in the bootstrap's bins while n_total, the bootstrap's 'tot' and Vdn's number left it out."""
+    """Every fixed-R count is half-open [lo, hi): r_hi is an exact sample radius
+    (the scarcest smoothing's 5th largest), and the closed last bin of np.histogram would count that void in dn/dlnR
+    and in the bootstrap's bins while n_total, the bootstrap's 'tot' and Vdn's number leave it out."""
     import plot_void_population as pop
-    # the review's probe: edges[-1] == 9.5 is a sample value
+    # the probe: edges[-1] == 9.5 is a sample value
     r = np.array([6.6, 7.0, 7.5, 8.0, 9.0, 9.5, 10.0, 11.2, 12.0, 13.0])
     pos = np.random.default_rng(1).uniform(0, 400.0, size=(r.size, 3))
     edges = np.geomspace(6.49, 9.5, 7)
@@ -572,10 +542,10 @@ def t_fixed_r_half_open():
 
 
 def t_fixed_r_paired():
-    """(review-science 3, 2026-10-11) The smoothings' agreement is tested on the PAIRED sub-cube bootstrap (identical
+    """The smoothings' agreement is tested on the PAIRED sub-cube bootstrap (identical
     resamples for every smoothing), not on independent errors: two catalogues of one population, the second missing
     a random 10% of its voids, differ by ~sqrt(0.1 N) voids in the paired draws but by ~sqrt(2 N) with independent
-    errors, so the old chi^2 (kept for reference) says 'agree' while the paired test finds the 10% deficit."""
+    errors, so the independent-error chi^2 (kept for reference) says 'agree' while the paired test finds the 10% deficit."""
     import plot_void_population as pop
     rng = np.random.default_rng(11)
     box = 200.0                                    # a few hundred voids: the independent errors (~5%) hide 10%
@@ -585,7 +555,7 @@ def t_fixed_r_paired():
     n = [p["n_total"] for p in st["per"]]
     assert 200 < n[0] < 1000 and n[1] < n[0], n
     assert st["chi2"] <= st["chi2_95"], (st["chi2"], st["chi2_95"])      # independent errors: no difference seen
-    assert not st["converged"], (st["chi2"], st["chi2_95"])                # the old code said 'agree' here
+    assert not st["converged"], (st["chi2"], st["chi2_95"])                # the paired test finds the deficit
     assert st["paired_chi2"] > st["chi2_95"], (st["paired_chi2"], st["paired_max_sigma"])
     assert "smoothings disagree" in pop.fixed_r_verdict(st) and "paired" in pop.fixed_r_verdict(st)
     # identical catalogues: zero difference with zero paired spread is agreement (0/0 -> 0), not NaN

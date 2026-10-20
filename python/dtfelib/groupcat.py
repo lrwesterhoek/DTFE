@@ -22,7 +22,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-from .cli import DATA_ROOT, sim_dir
+from .cli import sim_dir
 
 DM = 1   # PartType1 (the only species in the -Dark runs)
 

@@ -1,4 +1,4 @@
-"""Void catalogue export (survey item 7, 2026-10-05): one row per void of
+"""Void catalogue export: one row per void of
 pipeline.SnapshotProducts.voids(), as CSV and HDF5, with units and the parameters it was built with.
 
     from dtfelib import catalog, pipeline
@@ -16,7 +16,7 @@ eigenvalue order -- the effective radius (a b c)^(1/3), the fit's ellipticity 1 
 the major and minor axis directions) and the two sample flags (well_resolved: passes
 pipeline.ellipsoid_cuts_mpc() from config.ELLIPSOID_CUT_RULES; deep: central delta below config.DEEP_VOID_THRESHOLD). Fit columns are NaN for a
 void that is not well resolved, as plot_void_population treats them. R_eff is r_eff_mpc(), the one
-definition in the code base (plot_void_population.snapshot_stats uses it). The measured radii (2026-10-11) come
+definition in the code base (plot_void_population.snapshot_stats uses it). The measured radii come
 in three definitions (R_V_DEFINITIONS: r_v_mpc, r_v_delta08_mpc, r_v_ridge_mpc), the settings they were measured
 with in the provenance (r_v_*), as is the void gate (void_gate: DTFE_VOID_GATE).
 
@@ -88,8 +88,7 @@ def r_eff_mpc(cat) -> np.ndarray:
 
 def void_abundance(r_eff_mpc, box_mpc: float, radii_mpc) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """The cumulative void abundance n(> R) per Mpc^3 (comoving) at every radius of 'radii_mpc', with its
-    Poisson error sqrt(N) / V and the counts N: (n, err, N). NaN radii (unresolved voids) are left out.
-    Survey item 10 (2026-10-05)."""
+    Poisson error sqrt(N) / V and the counts N: (n, err, N). NaN radii (unresolved voids) are left out."""
     r = np.asarray(r_eff_mpc, dtype=np.float64)
     r = r[np.isfinite(r)]
     radii = np.asarray(radii_mpc, dtype=np.float64)
@@ -119,7 +118,7 @@ def void_table(cat, n_grid: int | None = None) -> dict:
     resolved = np.asarray(cat["well_resolved"]).astype(bool)
     nanfit = np.where(resolved, 1.0, np.nan)                   # NaN in every fit column of an unresolved void
     cell = pipeline.catalog_cell_mpc(cat) or 1.0                # the Hessian is in cell^-2 (k in radians per cell)
-    # the cell CENTRES (2026-10-08): positions_mpc holds the corners i x cell, half a cell off the (i + 0.5) x cell
+    # the cell CENTRES: positions_mpc holds the corners i x cell, half a cell off the (i + 0.5) x cell
     # that R_v, the profiles, the tracking and the outlines centre every void on
     pos = (coords.astype(np.float64) + 0.5) * cell
     ev = np.asarray(cat["eigenvalues"], dtype=np.float64).reshape(n, 3) / cell ** 2
@@ -169,8 +168,8 @@ def assert_frame(cat, cell_mpc: float) -> None:
                          f"which re-derives its fits in this frame")
 
 
-# The measured void radii (2026-10-11), all from ONE shell loop (pipeline.void_radii_cells) on the smoothed delta:
-#   'crossing' the first up-crossing of the mean (0) of the shell-averaged delta: THE R_v since 2026-10-07
+# The measured void radii, all from ONE shell loop (pipeline.void_radii_cells) on the smoothed delta:
+#   'crossing' the first up-crossing of the mean (0) of the shell-averaged delta: THE R_v
 #   'delta08'  where the ENCLOSED contrast Delta(<R) first reaches pipeline.R_V_DELTA08 (-0.8, the nonlinear
 #              shell-crossing value of the spherical model; Sheth & van de Weygaert 2004) going outward
 #   'ridge'    the maximum of the shell-averaged delta (the compensation ridge) inside the R_v search range
@@ -192,8 +191,7 @@ def r_v_cells(cat, definition: str = "crossing") -> np.ndarray:
 def r_v_mpc(cat, definition: str = "crossing") -> np.ndarray:
     """The measured void radius R_v in Mpc per catalogue row (r_v_cells x the catalogue's own cell): by default the
     'crossing' radius (where the spherically averaged smoothed density contrast around the minimum first rises to 0);
-    NaN where it has none -- and for a catalogue built before that definition existed (crossing: 2026-10-07, delta08
-    and ridge: 2026-10-11)."""
+    NaN where it has none -- and for a catalogue built before that definition existed."""
     cells = r_v_cells(cat, definition)
     if not len(cells):
         return cells
@@ -205,10 +203,11 @@ def distinct_mask(cat, sample, n_grid: int) -> np.ndarray:
     """The DISTINCT voids among those where 'sample' (bool per row) is True: pipeline.distinct_voids over EVERY
     well-resolved void (deepest first, none whose centre lies inside the region a deeper kept one claims: the sphere
     of min(R_v, R_eff), of its R_eff when it has no R_v), then narrowed to 'sample'. The claims come from all the
-    resolved voids whatever the sample (2026-10-08): the callers pass the resolved voids WITH an R_v, so a void without
-    one (the larger, deeper 10-17%) claimed nothing and the minima inside it were counted, stacked and drawn as voids
-    of their own (TNG300 z=0 at sigma 3.66 cells: 1639 distinct instead of 1585). A sample narrower by depth (the deep
-    voids) gets what a de-duplication within it would give, as nothing shallower can block a deeper void; a row that
+    resolved voids whatever the sample: the callers pass the resolved voids WITH an R_v, so with the sample's claims
+    alone a void without one (the larger, deeper 10-17%) would claim nothing and the minima inside it would be counted,
+    stacked and drawn as voids of their own (TNG300 z=0 at sigma 3.66 cells: 1639 distinct instead of 1585). A sample
+    narrower by depth (the deep voids) gets what a de-duplication within it would give, as nothing shallower can block a
+    deeper void; a row that
     is not well resolved is never distinct. Made when the sample is (so it follows the cuts); nothing of it is cached."""
     sample = np.asarray(sample, dtype=bool)
     out = np.zeros(len(sample), dtype=bool)
@@ -227,7 +226,7 @@ def distinct_mask(cat, sample, n_grid: int) -> np.ndarray:
 
 def provenance(products, n_voids: int, frame, cat=None) -> dict:
     """What the catalogue was built from and with: the HDF5 root attributes, the CSV's '#' lines. The R_v settings
-    (2026-10-11) are the catalogue's own record when 'cat' is given and has one, else today's (pipeline.r_v_settings,
+    are the catalogue's own record when 'cat' is given and has one, else the current ones (pipeline.r_v_settings,
     which SnapshotProducts.voids() guarantees a served catalogue was measured with); the cuts are the ones its
     well_resolved was taken with under the void gate (pipeline.gate_cuts_mpc: max axis inf under 'none')."""
     cell, box, n, source = frame

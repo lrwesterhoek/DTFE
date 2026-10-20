@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# '--fixed-point-merge' (2026-10-15, opt-in; src/ps_fixed_merge.h): every partition is added AS IT FINISHES into exact
+# '--fixed-point-merge' (opt-in; src/ps_fixed_merge.h): every partition is added AS IT FINISHES into exact
 # integer full grids (int64 words + int8 carries in units fixed before the loop), on small synthetic snapshots:
 #   X1  the CPU deposit, two field sets (the moments with a scalar; and volume-weighted + exact deposit + caustics, which
 #       fill mass_weight, disp_weight, disp_velocity, tet_touch and the OR-merged caustic mask): --max-concurrent 1, 2
@@ -11,7 +11,7 @@
 #       the float sums round at every add)
 #   X3  '--scratch-dir' with a tiny threshold (DTFE_SCRATCH_MIN_GB): the integer grids are scratch-backed, the outputs
 #       byte-identical to X1's
-#   X4  overflow, FATAL and order-free: DTFE_TEST_FXMERGE_SHIFT=24 (units 2^24 finer: densities above 8 no longer fit
+#   X4  overflow, FATAL and order-free: DTFE_TEST_FXMERGE_SHIFT=24 (units 2^24 finer: densities above 8 do not fit
 #       2^63 units) stops the run at --max-concurrent 1 and at 4 with partition 0 held back, naming the accumulator,
 #       with no output written; DTFE_TEST_FXMERGE_SUM_LIMIT=40 (the sum bound's limit lowered) stops it with the sum
 #       message
@@ -29,8 +29,6 @@ ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$ROOT" || exit 1
 source "${SCRIPT_DIR}/precision.sh"     # DTFE_TEST_PRECISION=double: the double pair (which refuses the flag: X5 only)
 precision_require "${PS_BIN}"
-PY="${PYTHON:-python3}"
-command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/python3.14
 [ -x "${PS_BIN}" ] || { echo "FAIL: ${PS_BIN} is not built"; exit 1; }
 BIN="$(cd "$(dirname "${PS_BIN}")" && pwd)/$(basename "${PS_BIN}")"
 TMP="${DTFE_TEST_TMP}/ps_fixed_merge_check"
@@ -47,16 +45,7 @@ with h5py.File(sys.argv[1], "a") as f:
 PYEOF
 PASS=0; FAILS=0
 check() { if [ "$2" = 0 ]; then PASS=$((PASS+1)); echo "  PASS $1"; else FAILS=$((FAILS+1)); echo "  FAIL $1"; fi; }
-# same <a> <b>: every output of run a has a byte-identical twin in run b (and there is at least one)
-same() {
-    local n=0 f
-    for f in "$1".*; do
-        case "$f" in *.log|*.runlog*|*.part.*) continue ;; esac
-        cmp -s "$f" "$2${f#"$1"}" || { echo "    differs: ${f#"$1"}"; return 1; }
-        n=$((n+1))
-    done
-    [ "$n" -gt 0 ]
-}
+# same <a> <b>: tests/lib.sh
 # table <a> <b> <limit>: the largest |a - b| of every output grid relative to its peak; fails above the limit
 table() {
     "$PY" - "$1" "$2" "$3" <<'PYEOF'
