@@ -71,8 +71,8 @@
     ('--max-concurrent' is the thread split inside each partition there, and each thread's sub-box carries its own
     padding: left out of the key as for PS, so a run killed for memory can resume with fewer threads, at float
     rounding where the padding is ample -- 2.8e-2 of the peak on the z = 0 demo at padding 5, 1 against 2 threads);
-    a '--gpu' run's too, since its sums are exact (64-bit fixed point; with DTFE_METAL_FLOAT_GRIDS=1 /
-    DTFE_GPU_FLOAT_GRIDS=1 within the float atomics' run-to-run rounding). The same file layout, key, room rule,
+    a '--gpu' run's too, since its sums are exact (64-bit fixed point; with DTFE_GPU_FLOAT_GRIDS=1 within the
+    float atomics' run-to-run rounding). The same file layout, key, room rule,
     5% throttle, refusals and test hooks; what differs is named per build below (BUILD): the file's first line,
     the off switch (DTFE_CHECKPOINT=0 for standard), the driver knob a refusal names (run_dtfe.sh DTFE_RESUME=0)
     and the messages' 'DTFE:' label; standard implies no ordered merge (its loop is serial anyway). The progress
@@ -82,8 +82,8 @@
     with psPointEvalSetPartition around its DTFE_parallel call -- under '--sample-points' that call triangulates the
     partition once, on the loop's own thread (DTFE_parallel's single-triangulation branch), so the thread-local tag
     reaches the point walk's sinks (ps_point_eval.cc forEachCellParallel) -- and each point is answered by the one
-    partition owning its tetrahedron, so a partition's records are complete once it is in the grids; the
-    4096^2 standard planes of scripts/thesis_runs.sh dtfe27planes are such runs. tests/dtfe_resume_check.sh (D13). */
+    partition owning its tetrahedron, so a partition's records are complete once it is in the grids; a standard
+    run that also writes a 4096^2 image plane is such a run. tests/dtfe_resume_check.sh (D13). */
 #ifndef PARTITION_CHECKPOINT_H
 #define PARTITION_CHECKPOINT_H
 // both binaries' partition loops; the library compiles it too
@@ -112,6 +112,7 @@
 #include "user_options.h"
 #include "quantities.h"
 #include "message.h"
+#include "env_knobs.h"
 #include "cache_key_lines.h"
 #include "output_staging.h"
 #include "ps_point_eval.h"   // the '--sample-points' records of the merged partitions
@@ -494,7 +495,7 @@ inline bool write(Quantities &u, Quantities &a, std::string &why)
     if ( ::statvfs( ( dirExists ? c.dir : outputStageDirOf( c.dir ) ).c_str(), &vs ) == 0 )
     {
         double freeBytes = double( vs.f_bavail ) * double( vs.f_frsize );
-        if ( char const *t = std::getenv( "DTFE_TEST_CHECKPOINT_FREE_BYTES" ) ) freeBytes = std::atof( t );   // test hook
+        freeBytes = Env::real( "DTFE_TEST_CHECKPOINT_FREE_BYTES", freeBytes );   // test hook
         // the old checkpoint's bytes come back once the new one is renamed over it
         struct stat old;
         double const oldBytes = ::stat( ( c.dir + "/checkpoint" ).c_str(), &old ) == 0 ? double( old.st_size ) : 0.;
@@ -645,8 +646,7 @@ inline int beginLoop(User_options const &options, int const totalPartitions, Qua
 {
     Checkpointer &checkpoint = state();
     MESSAGE::Message message( verboseLevel );
-    char const *env = std::getenv( OFF_ENV );
-    bool const off = env and env[0] == '0';
+    bool const off = not Env::flag( OFF_ENV, true );
     // '--sample-points': PS-DTFE checkpoints the per-point records of every merged partition beside the grids
     // ('points.<i>', the header comment's POINTS); its loop tags them with psPointEvalSetPartition. The standard
     // loop tags them too (DTFE.cpp, around its DTFE_parallel call), so both binaries keep them. pointsLost stays
@@ -662,8 +662,7 @@ inline int beginLoop(User_options const &options, int const totalPartitions, Qua
     checkpoint.merged.assign( size_t(totalPartitions), 0 );
     checkpoint.points = pointsKept;
     checkpoint.pointsSaved.assign( size_t(totalPartitions), 0 );
-    if ( char const *hook = std::getenv( "DTFE_TEST_EXIT_AFTER_PARTITIONS" ) )
-        checkpoint.exitAfter = std::atoi( hook );
+    checkpoint.exitAfter = int( Env::integer( "DTFE_TEST_EXIT_AFTER_PARTITIONS", checkpoint.exitAfter ) );
     struct stat st;
     bool const exists = ::stat( ( dir + "/checkpoint" ).c_str(), &st ) == 0;
     int nDone = 0;

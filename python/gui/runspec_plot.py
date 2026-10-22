@@ -10,13 +10,13 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import runspec as _rs
-from dtfelib.cli import DATA_ROOT, FIGURES_ROOT, sim_dir
+from dtfelib.cli import FIGURES_ROOT
 
 
 @dataclass
 class PlotSpec:
     """The figure scripts: one Step per script call (per snapshot for the per-snapshot sets)."""
-    data_root: str = str(DATA_ROOT)
+    data_root: str = field(default_factory=lambda: _rs.default_data_root())
     sim: str = ""
     snapshots: list[int] = field(default_factory=list)
     sets: list[str] = field(default_factory=lambda: ["fields"])
@@ -31,7 +31,7 @@ class PlotSpec:
         return self.options.get(set_key, {}).get(key, default)
 
     def sim_path(self) -> Path:
-        return sim_dir(self.sim, self.data_root)
+        return _rs.sim_dir(self.sim, self.data_root)
 
     def _common(self) -> list[str]:
         a = []
@@ -288,7 +288,7 @@ class PlotSpec:
                 if float(self.opt(key, "min_ratio")) != 0.1:
                     a += ["--min-ratio", f"{float(self.opt(key, 'min_ratio')):g}"]
                 out.append(_rs.Step(name, a, env))
-            elif key == "thesis":
+            elif key == "core":
                 mode = str(self.opt(key, "mode"))
                 a = base + [mode]
                 if mode in ("all", "compute", "export"):
@@ -313,7 +313,7 @@ class PlotSpec:
         snaps = sorted(self.snapshots)
         need_snaps = [k for k in self.sets
                       if _rs.FIGURE_SET[k].per in ("snapshot", "series")
-                      and not (k == "thesis" and self.opt(k, "mode") in ("plot", "check"))
+                      and not (k == "core" and self.opt(k, "mode") in ("plot", "check"))
                       and not (k == "skeleton" and self.opt(k, "all_caustic"))]
         if need_snaps and not snaps:
             out.append(("error", "no snapshots selected (needed by: "
@@ -360,10 +360,10 @@ class PlotSpec:
             if not (sp / "Merger Trees").is_dir() and not any(sp.glob("trees*")):
                 out.append(("warning", f"no merger trees under {sp}; the tracking figures need them "
                                        "(Data tab: merger trees)"))
-        if "thesis" in self.sets and self.opt("thesis", "mode") in ("all", "compute", "export"):
+        if "core" in self.sets and self.opt("core", "mode") in ("all", "compute", "export"):
             missing = [n for n in snaps if not _rs.has_grids(sp / f"snapdir_{n:03d}", "dtfe", "")]
             if missing:
-                out.append(("warning", "Thesis analysis set: no standard-DTFE grids for "
+                out.append(("warning", "Core analysis set: no standard-DTFE grids for "
                                        + " ".join(f"{n:03d}" for n in missing)))
         if self.smooth < 0:
             out.append(("error", "smoothing must be >= 0"))

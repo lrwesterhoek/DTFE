@@ -24,7 +24,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 DOCS = ("README.md", "demo/COMMANDS.md")
 DRIVERS = ("scripts/config.sh", "scripts/run_ps_dtfe.sh", "scripts/run_dtfe.sh")   # the README table's defaults
-KNOB_SCRIPTS = DRIVERS + ("scripts/run_ps_pipeline.sh", "scripts/thesis_runs.sh")
+KNOB_SCRIPTS = DRIVERS + ("scripts/run_ps_pipeline.sh",)
 SKIP_PARTS = {"tmp", "cache", "__pycache__", "figures", "reference"}
 
 # a flag: '--' right after a non-word character and right before a letter. The README uses ' -- ' as a dash

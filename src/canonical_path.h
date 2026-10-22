@@ -3,10 +3,10 @@
 
    Those keys hold the input files' paths, so the same snapshot named two ways -- a relative path, a
    path through a symlink ('/tmp' is '/private/tmp' on macOS), or other letter case on a
-   case-insensitive volume -- used to be two different keys: a cache written through one name was
-   rebuilt through the other. realpath() gives every name of a file the same string. A path that
-   does not resolve (a missing file) is kept as given; that run fails on reading it anyway. Paths
-   that were already canonical keep their keys, so existing caches stay valid. */
+   case-insensitive volume -- would otherwise be two different keys, and a cache written through one
+   name would be rebuilt through the other. realpath() gives every name of a file the same string. A
+   path that does not resolve (a missing file) is kept as given; that run fails on reading it anyway.
+   A canonical path is its own canonical form, so a key made from one stays the same. */
 
 #ifndef DTFE_CANONICAL_PATH_HEADER
 #define DTFE_CANONICAL_PATH_HEADER

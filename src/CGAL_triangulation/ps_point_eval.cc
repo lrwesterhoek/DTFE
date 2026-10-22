@@ -80,6 +80,7 @@
 #include "ps_exact_inside.h"    // exact, tie-consistent containment (shared with the grid deposit)
 #include "tessellation_cache.h" // composite --serve: partitions reloaded from '--tessellation-cache'
 #include "../auto_tune.h"       // composite --serve: the memory budget that sizes the resident set
+#include "../env_knobs.h"
 
 // the triangulation's finite simplices: CGAL calls them faces in 2D, cells in 3D
 #if NO_DIM == 2
@@ -459,11 +460,8 @@ inline bool pointInTet(uint32_t p, Real const eulerPos[NO_DIM+1][NO_DIM],
 // oversubscribe. std::thread rather than a nested OpenMP region, which is disabled by default.
 inline int pointEvalThreads()
 {
-    if ( const char *env = std::getenv("DTFE_PTS_THREADS") )   // explicit override (benchmarks, tests)
-    {
-        int const v = std::atoi(env);
-        if ( v > 0 ) return v;
-    }
+    if ( long const v = Env::integer( "DTFE_PTS_THREADS", 0 ); v > 0 )   // explicit override (benchmarks, tests)
+        return int( v );
     int cores = int( std::thread::hardware_concurrency() );
 #ifdef OPEN_MP
     cores = omp_get_max_threads();
@@ -816,7 +814,7 @@ void setQueryRecords()
     std::vector< std::vector<unsigned char> >().swap( g_ctx.recBlocks );
     std::vector<int>().swap( g_ctx.recBlockPart );
     g_ctx.nRecs = 0;
-    if ( std::getenv("DTFE_PTS_FULL_RECORDS") )     // test switch: store every member, unpacked
+    if ( Env::flag( "DTFE_PTS_FULL_RECORDS" ) )     // test switch: store every member, unpacked
         g_ctx.layout.init( true, true, true, true, true );   // packing (tests/ps_point_eval_check.sh compares)
     else
         g_ctx.layout.init( g_ctx.ptsDenGrad, g_ctx.ptsVelGrad, g_ctx.perStreamIds, g_ctx.ptsScalar, g_ctx.ptsLagrangian );
@@ -2311,8 +2309,8 @@ template <typename Evaluate>
         }
 
         bool useIndex = n * 64 < uint64_t(indexCells);
-        if ( const char *env = std::getenv("DTFE_SERVE_INDEX") )   // 0 / 1: force the walk / the cell index
-            useIndex = std::atoi( env ) != 0;
+        if ( int const forced = Env::tristate( "DTFE_SERVE_INDEX" ); forced >= 0 )   // 0 / 1: force the walk / the cell index
+            useIndex = forced == 1;
         setQueryPoints( std::move(pts), useIndex ? 1 : bucketFloor );
         std::string const failure = evaluate( useIndex );
         g_cellList = nullptr;
@@ -2864,8 +2862,8 @@ void psServeCompositeAddPartition(int const index, User_options &partOptions,
     {
         std::string why;
         double budget = autoTuneBudget( autoTunePhysicalRAM(), why );
-        if ( char const *e = std::getenv( "DTFE_SERVE_BUDGET_GB" ) )
-            if ( std::atof( e ) > 0. ) budget = std::atof( e ) * 1.e9;
+        if ( double const v = Env::real( "DTFE_SERVE_BUDGET_GB", 0. ); v > 0. )
+            budget = v * 1.e9;
         g_comp.byBytes = true;
         g_comp.budgetBytes = budget;
         double const perPart = SERVE_TRI_BYTES_PER_VERTEX * double( std::max<uint64_t>( nVertMax, 1 ) );
@@ -3026,7 +3024,7 @@ void psServeCompositeAddPartition(int const index, User_options &partOptions,
             g_cellList = nullptr;
             // the index for a small request only once this partition has earned it (INDEX_AFTER_WALKS),
             // or when it exists already; else the walk (DTFE_SERVE_INDEX=1 forces the index)
-            bool const forceIndex = std::getenv("DTFE_SERVE_INDEX") and std::atoi( std::getenv("DTFE_SERVE_INDEX") ) != 0;
+            bool const forceIndex = Env::tristate( "DTFE_SERVE_INDEX" ) == 1;
             // ... and, under the automatic resident set, only when the index fits next to the resident
             // partitions WITHOUT evicting one (a reload costs more than the index saves); else walk
             bool const indexFits = P.index or forceIndex or not g_comp.byBytes or not P.cached

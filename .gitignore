@@ -39,6 +39,7 @@ output/
 #  Python bytecode and pipeline outputs
 __pycache__/
 *.pyc
+*.egg-info/
 python/figures/
 python/cache/
 

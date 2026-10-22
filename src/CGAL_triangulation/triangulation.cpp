@@ -57,6 +57,7 @@ void interpolateGrid_phaseSpace(DT &dt, User_options &userOptions, Quantities *q
 // per folded tetrahedron; standard build = the Eulerian DTFE interpolant, 0/1 coverage.
 #include "../ps_point_eval.h"
 #include "tessellation_cache.h"   // '--tessellation-cache': reuse the tessellation across runs
+#include "../env_knobs.h"
 #ifdef PHASE_SPACE
 void interpolatePoints_phaseSpace(DT &dt, User_options &userOptions);   // ps_point_eval.cc
 #else
@@ -120,7 +121,7 @@ bool buildTessellation(vector<Particle_data> *p,
     t.start();
     delaunayTriangulation( &dt, p, userOptions.verboseLevel,
 #ifdef PHASE_SPACE
-                           userOptions.psParallelTriangulation || std::getenv("DTFE_TBB_THREADS") != nullptr
+                           userOptions.psParallelTriangulation || Env::isSet( "DTFE_TBB_THREADS" )
 #else
                            false
 #endif
@@ -443,11 +444,8 @@ std::atomic<int> dtfeTriangulationsRemaining{0};
 // 0.45-0.85 s, 6 threads 0.51-0.63 s, 4 threads 0.52-0.53 s. DTFE_TBB_THREADS overrides the cap.
 static int parallelInsertCores()
 {
-    if ( const char *env = std::getenv("DTFE_TBB_THREADS") )
-    {
-        int const v = std::atoi( env );
-        if ( v > 0 ) return v;
-    }
+    if ( long const v = Env::integer( "DTFE_TBB_THREADS", 0 ); v > 0 )
+        return int( v );
     int cores = int( std::thread::hardware_concurrency() );
 #ifdef __APPLE__
     int perf = 0;

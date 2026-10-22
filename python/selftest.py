@@ -31,8 +31,8 @@ SIM = 'TNG50-3-Dark'
 BOX_CKPC = 51668.142899320934   # matches config.SIMULATION_BOX_MPC[SIM] (h-free ckpc)
 
 # The compute phase first (produces the caches the plots read); then the core figure
-# scripts. The tracking/synthesis scripts (plot_PS_DTFE, plot_cosmic_web,
-# plot_halo_tracking, plot_void_*, plot_conclusions_synthesis) need PS grids and/or
+# scripts. The tracking scripts (plot_PS_DTFE, plot_cosmic_web,
+# plot_halo_tracking, plot_void_*) need PS grids and/or
 # merger trees and are exercised by tests/py_dtfelib_test.py instead.
 # 'module:arg' runs the module's main() with that single CLI argument.
 TARGETS = [
@@ -88,9 +88,9 @@ def run_one(target, tmp):
     matplotlib.use('Agg')
 
     # The data-root/simulation sandbox comes from the DTFE_DATA_ROOT / DTFE_SIM env vars
-    # set by the parent (dtfelib.cli and config read them at import, so pipeline paths,
-    # BASE_DATA_DIR and the --sim defaults all resolve inside tmp). Patch here only what
-    # has no environment hook.
+    # set by the parent (config reads DTFE_SIM at import, dtfelib.cli reads DTFE_DATA_ROOT
+    # where data is needed, so pipeline paths and the --sim defaults all resolve inside
+    # tmp). Patch here only what has no environment hook.
     import config
     assert config.SIMULATION == SIM, "selftest child must run with DTFE_SIM set"
     config.FIELD_RESOLUTION = N
@@ -98,11 +98,10 @@ def run_one(target, tmp):
     config.SMOOTHING_SIGMA_CELLS = 3.0
     config.SMOOTHING_SIGMA_MPC = 3.0 * config.CELL_SIZE
     config.FOOTPRINT_SIZE = 5
-    config.PRODUCTION_SMOOTHING = (3.0, 5)       # the sandbox's smoothing IS its production: untagged names, the mirror
+    config.PRODUCTION_SMOOTHING = (3.0, 5)       # the sandbox's smoothing IS its production: untagged names
     config.SNAPSHOT_TO_REDSHIFT = dict(REDSHIFTS)
     config.PANEL_SNAPSHOTS = SNAPS
     config.CACHE_DIR = tmp / 'cache'
-    config.THESIS_FIGURES_DIR = tmp / 'Figures'
     config.LOCAL_FIGURES_ROOT = str(tmp / 'python' / 'figures')
 
     # config is patched BEFORE the target module is imported, so module-level constants
@@ -157,10 +156,10 @@ def main():
             else:
                 failures.append((target, f'exit {r.returncode}'))
 
-        n_pngs = len(list((tmp / 'Figures').rglob('*.png')))
-        print(f"\nMirrored figures produced: {n_pngs}")
+        n_pngs = len(list((tmp / 'python' / 'figures').rglob('*.png')))
+        print(f"\nFigures produced: {n_pngs}")
         if n_pngs == 0:
-            failures.append(('mirror', 'no figures in thesis mirror'))
+            failures.append(('figures', 'no figures under the figure root'))
 
         print('\n' + '=' * 60)
         if failures:

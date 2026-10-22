@@ -5,7 +5,7 @@
 
 Two tiers:
   * SYNTHETIC (always run, CI): particles and catalogues built here, a SubLink-like tree object.
-  * DATA-BACKED (the T7 mounted, else skipped): one chunk of the real TNG50-3-Dark combined snapshot.
+  * DATA-BACKED (DTFE_DATA_ROOT, else skipped): one chunk of the real TNG50-3-Dark combined snapshot.
 
 Usage:  python3 tests/py_fate_test.py            (exit 0 = pass)
 """
@@ -17,7 +17,7 @@ from types import SimpleNamespace
 import numpy as np
 
 import os
-from _harness import REPO as ROOT, Skip, check, setup, summary
+from _harness import REPO as ROOT, Skip, check, data_root, setup, summary
 
 _TMP = setup("fate_test_", figures_sub="figs")
 os.environ.setdefault("DTFE_SIM", "TNG50-4-Dark")    # the box these synthetic tests stand for; a data-tier run sets its own
@@ -765,7 +765,7 @@ def t_help_and_flags():
 def t_real_combined_chunk():
     from dtfelib import lagrangian as L
     try:
-        p = L.combined_path("TNG50-3-Dark", 99)
+        p = L.combined_path("TNG50-3-Dark", 99, data_root())
     except FileNotFoundError as e:
         raise Skip(f"no TNG50-3-Dark combined snapshot: {e}")
     ids, frac = next(L.iter_particles(p, chunk=200_000))
@@ -780,30 +780,30 @@ def main():
           "main progenitor, chain, thresholds", t_link_classes)
     check("lagrangian: exclusive members (a partition: nearest centre in R_v units, across chunks and the wrap)",
           t_exclusive_members)
-    check("2026-10-11: exclusive members by a running per-particle best == the lexsort of every pair (ties: the lower "
+    check("exclusive members by a running per-particle best == the lexsort of every pair (ties: the lower "
           "sphere; the pool rule; the chunk index), no lexsort", t_exclusive_running_best)
     check("lagrangian: the combined-snapshot reader (chunks, fractions, members from file == in memory)", t_combined_reader)
     check("plot_void_fate: census classes, the link cache (reuse, rebuild on other voids), chained survival, "
           "figure, table", t_fate_census_script)
     check("lagrangian.void_pool: followed first with R_v, then min(R_v, R_eff) / R_eff / R_v, none left out",
           t_void_pool)
-    check("2026-10-11: membership spheres capped at FATE_MAX_SIGMA smoothing lengths (followed and pool; config's sigma "
+    check("membership spheres capped at FATE_MAX_SIGMA smoothing lengths (followed and pool; config's sigma "
           "by default; R_v untouched; no members beyond the cap; uncapped link caches relinked)", t_membership_cap)
-    check("descendant pool (2026-10-11): matter in an unfollowed minimum is 'unresolved', not 'vanish'; matter in no "
+    check("descendant pool: matter in an unfollowed minimum is 'unresolved', not 'vanish'; matter in no "
           "void vanishes; the followed void preferred; chains end at unfollowed voids; table; version-1 cache "
           "rebuilt", t_pool_unresolved)
-    check("2026-10-11: the streamed link (pool never held) == link(a, void_members(pool)) for two progenitor sets, "
+    check("the streamed link (pool never held) == link(a, void_members(pool)) for two progenitor sets, "
           "exclusive or not, in worker threads or not; kept followed members == .sample(); "
           "far lower peak allocation", t_stream_identical)
-    check("2026-10-11 (G3): link caches keyed on both catalogues' R_v settings (changed -> relinked, unrecorded -> "
+    check("link caches keyed on both catalogues' R_v settings (changed -> relinked, unrecorded -> "
           "relinked once, unchanged -> served)", t_link_cache_r_v_key)
     check("plot_void_tracking: tracker on synthetic merger trees (select_tracers, tracer_branches, frozen identity, "
           "the right void per snapshot, skip), figures + bands on log(1+z)", t_tracker_trees)
     check("plot_void_tracking --link particles: the main-progenitor walk, link share, the _particles tag, --exclusive "
           "(its tag, refused with the trees)", t_tracker_particles)
-    check("2026-10-11: plot_void_tracking --link particles shares the census's link tag (a --prefix set's own link "
+    check("plot_void_tracking --link particles shares the census's link tag (a --prefix set's own link "
           "files, the census then reads them without a particle read)", t_tracker_link_tag)
-    check("the new flags in the scripts' help", t_help_and_flags)
+    check("the fate flags in each script's help", t_help_and_flags)
     print("data-backed:")
     check("lagrangian.iter_particles on the real TNG50-3-Dark combined snapshot (one chunk)", t_real_combined_chunk)
     print("-" * 60)

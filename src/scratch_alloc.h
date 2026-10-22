@@ -21,8 +21,8 @@
  * scratch_alloc_stub.o instead, whose scratchArm() refuses -- a library must never hijack its
  * host program's global allocator.
  *
- * The scratch directory must be on a LOCAL volume. This repo lives in iCloud Drive: an mmap
- * scratch file there would sync-upload ~146 GB, so user_options.cc refuses such paths.
+ * The scratch directory must be on a LOCAL volume: an mmap scratch file on a cloud-synced one (iCloud
+ * Drive) would be uploaded, ~146 GB for a large run, so user_options.cc refuses such paths.
  */
 
 #ifndef SCRATCH_ALLOC_HEADER

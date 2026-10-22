@@ -100,7 +100,7 @@ if [ "${HAVE_EXACT}" -eq 1 ]; then
     if [ "${GPU_BUILT}" -eq 1 ]; then
         echo ">> runs 12-13: exact deposit + dispersion, CPU vs --ps-gpu (float32 r3d port parity)"
         # dedicated pair (with the dispersion field run() does not request): the GPU exact
-        # deposit is a hand-written float32 r3d port and had NO parity coverage in the suite
+        # deposit is a hand-written float32 r3d port, and this pair is its parity coverage in the suite
         for tag in exd exg; do
             GPUFLAG=""; [ "${tag}" = "exg" ] && GPUFLAG="--ps-gpu"
             rm -f "${TMP}/pld_pan_${tag}".*
@@ -195,7 +195,7 @@ if have_exact:
     check("D .den == .a_den (nSub-independent)",
           np.array_equal(ex, exa), "the exact deposit is the nSub->infinity limit")
     # '.tetTouch': the RAW INTEGER count of tetrahedra with a nonzero cell intersection.
-    # This is the field that carries the old integer-'.streams' contract -- quantities.cc
+    # This is the field that carries the integer stream-count contract -- quantities.cc
     # sums it linearly across partitions, so it stays bit-exact under any thread order.
     tx = np.fromfile(f"{tmp}/pld_pan_ex.tetTouch", dtype=REAL).astype(np.float64)
     # 'integer-valued' alone is vacuous -- any int < 2^24 casts exactly, so an all-zero or
@@ -210,8 +210,8 @@ if have_exact:
     check("D partitioned tetTouch thread-invariant (bit-exact)", np.array_equal(t1, tN),
           "same split, 1 vs all threads (integer counts merge order-independently)")
 
-    # '.streams' is now the VOLUME-WEIGHTED multiplicity (1/V_cell) sum V_int -- a float, so
-    # neither integer-valued nor bit-exact (float shares sum order-dependently). What the new
+    # '.streams' is the VOLUME-WEIGHTED multiplicity (1/V_cell) sum V_int -- a float, so
+    # neither integer-valued nor bit-exact (float shares sum order-dependently). What this
     # definition buys is that it is the ANALYTIC nSub->infinity limit, so the two properties
     # below are exact statements about the Zel'dovich pancake rather than sampling artefacts.
     sx = np.fromfile(f"{tmp}/pld_pan_ex.streams", dtype=REAL).astype(np.float64)

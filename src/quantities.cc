@@ -52,6 +52,10 @@ void copyField(T const &subgridResults,
     
     size_t totalSubgrid = 1;
     for (size_t d=0; d<NO_DIM; ++d) totalSubgrid *= subgrid[d];
+    // a selected field that the interpolation did not compute leaves an empty grid, which the copy would read past
+    if ( subgridResults.size() != totalSubgrid )
+        throwError( "A selected field holds ", subgridResults.size(), " values for a sub-grid of ", totalSubgrid,
+                    " cells: the chosen interpolation method does not compute it (see '--field' in the help)." );
 
     for (size_t flatIdx=0; flatIdx<totalSubgrid; ++flatIdx)
     {

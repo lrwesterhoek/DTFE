@@ -66,6 +66,7 @@
 #include "particle_data.h"
 #include "ps_point_eval.h"   // psEstimateMeanStreams: the sample-point stream count, from the data
 #include "message.h"
+#include "env_knobs.h"
 // for PSCausticClass::CausticMask, so the --ps-caustics per-cell accumulator is budgeted at its
 // real width rather than a literal that would drift the next time a bit is added
 #include "CGAL_triangulation/ps_caustic_class.h"
@@ -74,11 +75,8 @@
 // Physical RAM in bytes (DTFE_RAM_GB env overrides; 8 GB fallback if the query fails).
 inline double autoTunePhysicalRAM()
 {
-    if ( const char *env = std::getenv("DTFE_RAM_GB") )
-    {
-        double v = std::atof(env);
-        if ( v > 0. ) return v * 1.e9;
-    }
+    if ( double const v = Env::real( "DTFE_RAM_GB", 0. ); v > 0. )
+        return v * 1.e9;
 #ifdef __APPLE__
     int64_t mem = 0;
     size_t len = sizeof(mem);
@@ -98,14 +96,11 @@ inline double autoTunePhysicalRAM()
 // thread count to fit (a 256^3 grid with density, velocity and dispersion is ~1 GB per float copy);
 // the partition model below budgets the same amount. With the fixed-point grids and the shared counts
 // and flags the single build copies nothing by default: the budget binds only the float sums (double
-// build, PS_METAL_FLOAT_*).
+// build, PS_GPU_FLOAT_*).
 inline double psDepositThreadBytes()
 {
-    if ( const char *env = std::getenv("DTFE_DEPOSIT_MEM_GB") )
-    {
-        double const v = std::atof(env);
-        if ( v >= 0. ) return v * 1.e9;
-    }
+    if ( double const v = Env::real( "DTFE_DEPOSIT_MEM_GB", -1. ); v >= 0. )
+        return v * 1.e9;
     return std::max( 2.e9, 0.2 * autoTunePhysicalRAM() );
 }
 
@@ -115,10 +110,10 @@ inline double psDepositThreadBytes()
 //          + wired + compressed); Linux: MemAvailable. File cache counts as free: it is dropped.
 inline double autoTuneSystemFree(double *ownBytes = nullptr)
 {
-    if ( const char *env = std::getenv("DTFE_FREE_GB") )
+    if ( double const v = Env::real( "DTFE_FREE_GB", 0. ); v > 0. )
     {
-        double const v = std::atof(env);
-        if ( v > 0. ) { if ( ownBytes ) *ownBytes = 0.; return v * 1.e9; }
+        if ( ownBytes ) *ownBytes = 0.;
+        return v * 1.e9;
     }
 #ifdef __APPLE__
     int64_t mem = 0;
@@ -174,11 +169,10 @@ inline double autoTuneFreeForRun()
 inline double autoTuneBudget(double ramBytes, std::string &why)
 {
     char buf[256];
-    bool const simulated = std::getenv("DTFE_RAM_GB") != NULL and std::atof(std::getenv("DTFE_RAM_GB")) > 0.;
+    bool const simulated = Env::real( "DTFE_RAM_GB", 0. ) > 0.;
     double const headroom = 4.e9;
-    if ( const char *env = std::getenv("DTFE_MEM_BUDGET_GB") )
     {
-        double v = std::atof(env);
+        double const v = Env::real( "DTFE_MEM_BUDGET_GB", 0. );
         if ( v > 0. )
         {
             snprintf( buf, sizeof(buf), "%.3g GB set by DTFE_MEM_BUDGET_GB", v );
@@ -199,11 +193,8 @@ inline double autoTuneBudget(double ramBytes, std::string &why)
         }
     }
     double frac = 0.60;
-    if ( const char *env = std::getenv("DTFE_MEM_FRACTION") )
-    {
-        double v = std::atof(env);
-        if ( v >= 0.1 and v <= 0.95 ) frac = v;
-    }
+    if ( double const v = Env::real( "DTFE_MEM_FRACTION", frac ); v >= 0.1 and v <= 0.95 )
+        frac = v;
     double budget = frac * ramBytes;
     snprintf( buf, sizeof(buf), "%.3g GB = %.0f%% of %.3g GB RAM", budget/1.e9, 100.*frac, ramBytes/1.e9 );
     why = buf;
@@ -356,14 +347,11 @@ struct AutoTunePS
 };
 
 // The PS deposit's MOMENT grids as 64-bit fixed-point sums (ps_deposit_params.h PSFxGrid): on by
-// default on the GPU (both builds) and on the CPU of the single build; PS_METAL_FLOAT_MOMENTS=1 /
-// PS_GPU_FLOAT_MOMENTS=1 select the float sums (ps_interpolation.cc fxGpuWanted / fxMomWanted). Read here so the
-// model follows an A/B run too.
+// default on the GPU (both builds) and on the CPU of the single build; PS_GPU_FLOAT_MOMENTS=1 selects the float
+// sums (ps_interpolation.cc fxGpuWanted / fxMomWanted). Read here so the model follows an A/B run too.
 inline bool autoTunePSMomentsFixed()
 {
-    for (char const *n : { "PS_METAL_FLOAT_MOMENTS", "PS_GPU_FLOAT_MOMENTS" })
-        if ( char const *e = std::getenv(n) ) if ( std::atoi(e) != 0 ) return false;
-    return true;
+    return not Env::flag( { "PS_GPU_FLOAT_MOMENTS", "PS_METAL_FLOAT_MOMENTS" } );
 }
 
 // One pass's MOMENT accumulators in the PS deposit, in Real bytes per sub-grid cell: the grids
@@ -1272,17 +1260,16 @@ inline AutoTuneReport AutoTuneStdPlanner::reportSplit(int const bestP, int const
     }
     double const predicted = fixed + chosen.bytes + chosen.snapshot + report.lookAhead;
     report.predicted = predicted;
-    if ( const char *dbg = std::getenv("DTFE_AUTO_TUNE_DEBUG") )
-        if ( std::atoi( dbg ) != 0 )
-        {
-            std::fprintf( stderr, "AUTO-TUNE-DEBUG standard: %s (count grid %.3f s, %zu plans %.3f s); busiest partition "
-                          "%d of %zu: %.0f padded vertices, %.3f GB on top of %.3f GB; per thread:",
-                          dens.ok ? "counted from the particles" : "uniform", countSec, plans.size(),
-                          std::chrono::duration<double>( std::chrono::steady_clock::now() - tuneStart ).count() - countSec,
-                          chosen.part + 1, chosen.parts, chosen.vertices, chosen.bytes/1.e9, fixed/1.e9 );
-            for (double v : chosen.perThread) std::fprintf( stderr, " %.0f", v );
-            std::fprintf( stderr, "\n" );
-        }
+    if ( Env::flag( "DTFE_AUTO_TUNE_DEBUG" ) )
+    {
+        std::fprintf( stderr, "AUTO-TUNE-DEBUG standard: %s (count grid %.3f s, %zu plans %.3f s); busiest partition "
+                      "%d of %zu: %.0f padded vertices, %.3f GB on top of %.3f GB; per thread:",
+                      dens.ok ? "counted from the particles" : "uniform", countSec, plans.size(),
+                      std::chrono::duration<double>( std::chrono::steady_clock::now() - tuneStart ).count() - countSec,
+                      chosen.part + 1, chosen.parts, chosen.vertices, chosen.bytes/1.e9, fixed/1.e9 );
+        for (double v : chosen.perThread) std::fprintf( stderr, " %.0f", v );
+        std::fprintf( stderr, "\n" );
+    }
 
     // single domain with all threads fits: keep the defaults (and stay silent)
     if ( bestP==1 and bestT==cores )
@@ -1331,9 +1318,9 @@ inline void autoTunePSPointStreams(User_options &u, double const N, size_t const
                                    std::vector<Particle_data> const *particles, AutoTuneReport &report,
                                    double &ptsMeanStreams, char (&ptsStreamsWhy)[200])
 {
-    if ( const char *env = std::getenv("DTFE_AUTO_PTS_STREAMS") )
+    if ( Env::isSet( "DTFE_AUTO_PTS_STREAMS" ) )
     {
-        double const v = std::atof(env);
+        double const v = Env::real( "DTFE_AUTO_PTS_STREAMS", 0. );
         if ( v >= 1. )
         {
             ptsMeanStreams = v;
@@ -1355,8 +1342,7 @@ inline void autoTunePSPointStreams(User_options &u, double const N, size_t const
         // mean. DTFE_AUTO_PTS_BOXMEAN=1 forces the box-wide estimate.
         double rLo[3], rHi[3];
         bool haveRegion = false;
-        char const *boxMean = std::getenv( "DTFE_AUTO_PTS_BOXMEAN" );
-        if ( not ( boxMean and std::string(boxMean) == "1" ) and NO_DIM == 3 )
+        if ( not Env::flag( "DTFE_AUTO_PTS_BOXMEAN" ) and NO_DIM == 3 )
         {
             double pLo[NO_DIM], pHi[NO_DIM], bLo[NO_DIM], bLen[NO_DIM];
             for (int d=0; d<NO_DIM; ++d) { bLo[d] = boxLo[d]; bLen[d] = boxLen[d]; }
@@ -1615,7 +1601,7 @@ struct AutoTunePSPlanner
             // their conversion after the loop only where that exceeds the copies or slab lists, freed by then. A
             // private copy holds neither the words nor the shared counts, flags and masks (countCell), so the default
             // single build has copyPriv = 0 and every core in the copy mode, as ps_interpolation.cc's accBytes; only
-            // the float sums (double build, PS_METAL_FLOAT_MOMENTS=1) book copies.
+            // the float sums (double build, PS_GPU_FLOAT_MOMENTS=1) book copies.
             double const copyOne = bCellDeposit*subCells;
             double const copyPriv = std::max( 0., copyCell )*subCells;   // (copyCell above: one pass's copy)
             int const copyThreads = copyPriv > 0.
@@ -1828,9 +1814,9 @@ inline std::optional<AutoTuneReport> AutoTunePSPlanner::smallSetCase(int const u
         // Predicted wall time per split, from per-unit costs measured on a 10-core Apple Silicon
         // (single-thread seconds; DTFE_AUTO_T_VERTEX/_SAMPLE/_POINT override):
         double tVertex = 3.6e-6, tSample = 3.5e-7, tPoint = 7.5e-7;
-        if ( const char *e = std::getenv("DTFE_AUTO_T_VERTEX") ) { double v = std::atof(e); if ( v > 0. ) tVertex = v; }
-        if ( const char *e = std::getenv("DTFE_AUTO_T_SAMPLE") ) { double v = std::atof(e); if ( v > 0. ) tSample = v; }
-        if ( const char *e = std::getenv("DTFE_AUTO_T_POINT") )  { double v = std::atof(e); if ( v > 0. ) tPoint = v; }
+        if ( double const v = Env::real( "DTFE_AUTO_T_VERTEX", 0. ); v > 0. ) tVertex = v;
+        if ( double const v = Env::real( "DTFE_AUTO_T_SAMPLE", 0. ); v > 0. ) tSample = v;
+        if ( double const v = Env::real( "DTFE_AUTO_T_POINT", 0. );  v > 0. ) tPoint = v;
         double fCopy = 1.;                              // the single domain's periodic copies (none without --periodic)
         if ( u.periodic )
             for (int d=0; d<NO_DIM; ++d) fCopy *= 1. + 2.*padFrac[d];
@@ -2029,11 +2015,8 @@ inline AutoTuneReport autoTunePartitioning(User_options &u,
                         // (--serve keeps its single triangulation alive for every request)
 
     double minN = 2.e6;
-    if ( const char *env = std::getenv("DTFE_AUTO_MINN") )
-    {
-        double v = std::atof(env);
-        if ( v > 0. ) minN = v;
-    }
+    if ( double const v = Env::real( "DTFE_AUTO_MINN", 0. ); v > 0. )
+        minN = v;
 
     double const N = double(nParticles);
     double const ramBytes = autoTunePhysicalRAM();
@@ -2103,13 +2086,9 @@ inline AutoTuneReport autoTunePartitioning(User_options &u,
     // does not shrink them. Without this a points-only run (tiny --grid, so the grid term
     // vanishes) could pick a coarse split against a budget that ignores tens of GB.
     size_t nPts = autoTuneSamplePointCount( u.psSamplePointsFile );
-    if ( const char *env = std::getenv("DTFE_AUTO_PTS_N") )      // a plane that does not exist yet
-    {
-        double const v = std::atof(env);
-        if ( v >= 0. ) nPts = size_t(v);
-    }
-    bool const ptsVelGrad = u.psPtsVelGrad
-                            or (std::getenv("DTFE_AUTO_PTS_VELGRAD") and std::string(std::getenv("DTFE_AUTO_PTS_VELGRAD")) == "1");
+    if ( double const v = Env::real( "DTFE_AUTO_PTS_N", -1. ); v >= 0. )      // a plane that does not exist yet
+        nPts = size_t(v);
+    bool const ptsVelGrad = u.psPtsVelGrad or Env::flag( "DTFE_AUTO_PTS_VELGRAD" );
     // Mean streams (containing tetrahedra) per point. No fixed number fits: it grows with the mass
     // resolution (TNG300-3-Dark 1.899 at z=0, TNG100-3-Dark 4.25 at z=0 and 2.30 at z=1). So it is
     // ESTIMATED from the particles themselves (psEstimateMeanStreams: Eulerian over Lagrangian
@@ -2162,7 +2141,7 @@ inline AutoTuneReport autoTunePartitioning(User_options &u,
     // 40 after the x2 in partitionBytes(), i.e. 6.7 GB per partition at 1024^3/n=2.
     // The moment grids are 64-bit fixed-point sums (ps_metal_host.cc, fxUnits): 8 B per component
     // on the device and in the host's copy where a float takes 4 (mB = 2), and dispw is not deposited (the mass
-    // grid stands for it); PS_METAL_FLOAT_MOMENTS=1 keeps the floats (mB = 1).
+    // grid stands for it); PS_GPU_FLOAT_MOMENTS=1 keeps the floats (mB = 1).
     bool const momFx = autoTunePSMomentsFixed();
     double const mB = momFx ? 2. : 1.;
     double const gridB  = 8. + mB * ( (psVel ? 12. : 0.) + (psDisp ? 24. : 0.) + (psGrad ? 36. : 0.)
@@ -2231,15 +2210,11 @@ inline AutoTuneReport autoTunePartitioning(User_options &u,
        outputs (density, velocity, dispersion, stream count, + the gradients and scalars), allocated while the records
        are still held. KEEP IN SYNC with ps_point_eval.cc and the PS term. DTFE_AUTO_PTS_N / DTFE_AUTO_PTS_VELGRAD=1
        size a plane that does not exist yet (the launcher's memory check). A 4096^2 plane with '--pts-vel-grad'
-       (scripts/thesis_runs.sh dtfe27planes) holds ~4.7 GB of it. */
+       holds ~4.7 GB of it. */
     size_t nPts = autoTuneSamplePointCount( u.psSamplePointsFile );
-    if ( const char *env = std::getenv("DTFE_AUTO_PTS_N") )
-    {
-        double const v = std::atof( env );
-        if ( v >= 0. ) nPts = size_t( v );
-    }
-    bool const ptsVelGrad = u.psPtsVelGrad
-                            or ( std::getenv("DTFE_AUTO_PTS_VELGRAD") and std::string( std::getenv("DTFE_AUTO_PTS_VELGRAD") ) == "1" );
+    if ( double const v = Env::real( "DTFE_AUTO_PTS_N", -1. ); v >= 0. )
+        nPts = size_t( v );
+    bool const ptsVelGrad = u.psPtsVelGrad or Env::flag( "DTFE_AUTO_PTS_VELGRAD" );
     double bPtsVar = ( u.psPtsDenGrad ? 3. * double(sizeof(double)) : 0. ) + ( ptsVelGrad ? 9. * double(sizeof(double)) : 0. )
                    + ( u.psPtsScalar ? double(noScalarComp) * double(sizeof(double)) : 0. );
     double const bStreamRec = 5. * double(sizeof(double)) + 2. + bPtsVar + 4. + 8.;
@@ -2283,12 +2258,11 @@ inline AutoTuneReport autoTunePartitioning(User_options &u,
        it keeps a host copy of the batch's device grids, taken every ~10 s of GPU work.
        Those grids are one thread sub-domain's (the per-call path: allocated under the device mutex, one batch at a
        time), in 8-B fixed-point words per 4-B component (4 B under
-       DTFE_METAL_FLOAT_GRIDS=1 / DTFE_GPU_FLOAT_GRIDS=1), so the run holds ONE such copy, of the largest sub-grid:
+       DTFE_GPU_FLOAT_GRIDS=1), so the run holds ONE such copy, of the largest sub-grid:
        added once to the busiest partition's bytes (StdPlan::snapshot). (The partition CHECKPOINT itself,
        partition_checkpoint.h, writes the full grids from where they are, allocating nothing; the partition's own
        sub-grids are still alive then and already in its bytes.) */
-    auto envOn = [](char const *n) { char const *e = std::getenv( n ); return e and std::atoi( e ) != 0; };
-    double const snapWordFactor = ( envOn( "DTFE_METAL_FLOAT_GRIDS" ) or envOn( "DTFE_GPU_FLOAT_GRIDS" ) ) ? 1. : 2.;
+    double const snapWordFactor = Env::flag( { "DTFE_GPU_FLOAT_GRIDS", "DTFE_METAL_FLOAT_GRIDS" } ) ? 1. : 2.;
     // the look-ahead (DTFE.cpp) runs with the GPU deposit when more than one partition is computed
     bool const lookAheadPossible = metalActive and bGpuCell > 0. and u.DTFE and u.method == 1
                                    and not u.stdNoOverlap and not u.redshiftConeOn;

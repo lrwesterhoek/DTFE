@@ -199,7 +199,7 @@ def main(argv=None):
     p.add_argument("--data-root", type=Path, default=None, help="the data root (default DTFE_DATA_ROOT's)")
     p.add_argument("--cache-dir", type=Path, default=None, help="the catalogue cache (default config.CACHE_DIR)")
     p.add_argument("--sigma-mpc", type=float, default=0.0,
-                   help="the smoothing in Mpc (default 0: the production smoothing, the thesis's catalogue)")
+                   help="the smoothing in Mpc (default 0: the production smoothing and its catalogue)")
     p.add_argument("--csv", type=Path, default=None, help="also write the table of all voids (write_csv) here")
     a = p.parse_args(argv)
     if os.environ.get("DTFE_SIM") != a.sim:

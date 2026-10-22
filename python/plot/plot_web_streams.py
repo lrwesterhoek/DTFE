@@ -5,7 +5,7 @@ For every snapshot: the table of dtfelib.webstreams for the T-web and the V-web 
 class the stream-multiplicity bins in both weightings -- as JSON + text, and a stacked-bar figure;
 with several snapshots, the single-stream fraction of each class against redshift.
 
-NOT in analyze.py's PLOT_SCRIPTS: that series is the standard-DTFE thesis pipeline, this needs the
+NOT in analyze.py's PLOT_SCRIPTS: that series is the standard-DTFE core set, this needs the
 phase-space grids (streams, hidden_streams; caustic_class is optional).
 
 Names: web_streams_<web>_z<z>.* and single_stream_vs_z_<web>.png for the default grids (ps_output.,
@@ -41,7 +41,6 @@ from dtfelib import webstreams as ws
 OUTPUT_DIR = Path(config.LOCAL_FIGURES_ROOT) / "web_streams"
 WEBS = {"tweb": ("T-web", "tweb"), "vweb": ("V-web", "vweb")}
 BIN_COLORS = ["#bbbbbb", "#1f5fa8", "#7fb2e5", "#f2b134", "#e4572e", "#7b1e3b"]
-MIRROR = True                   # into the thesis Figures tree too; off under --out (main sets it)
 
 
 def plot_table(table, title, path):
@@ -66,7 +65,7 @@ def plot_table(table, title, path):
     axes[0][-1].legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), title="multiplicity s")
     style.set_suptitle(fig, title)
     fig.tight_layout()
-    style.save_plot_to_multiple_paths(fig, path, mirror=MIRROR)
+    style.save_figure(fig, path)
     plt.close(fig)
 
 
@@ -90,7 +89,7 @@ def plot_vs_redshift(rows, web_name, path):
     ax.legend(title="solid: volume, dashed: mass", loc="upper left", bbox_to_anchor=(1.02, 1.0), fontsize=8)
     style.set_title(ax, f"{web_name}: single-stream fraction by environment")
     fig.tight_layout()
-    style.save_plot_to_multiple_paths(fig, path, mirror=MIRROR)
+    style.save_figure(fig, path)
     plt.close(fig)
 
 
@@ -153,7 +152,6 @@ def process(fs, sim, snap, webs, series, problems, out_dir, mean_field=True):
 
 
 def main():
-    global MIRROR
     parser = make_parser("Stream multiplicity and caustic class by T-web / V-web environment (PS-DTFE grids).")
     parser.add_argument("--snaps", type=int, nargs="*", default=None, help="snapshots (default: --snap)")
     parser.add_argument("--web", choices=("both", "tweb", "vweb"), default="both")
@@ -162,7 +160,6 @@ def main():
     args = parser.parse_args()
     style.apply()
     out_dir = Path(args.out).expanduser() if args.out else OUTPUT_DIR / args.sim
-    MIRROR = args.out is None               # an --out folder is the user's: nothing goes into the thesis tree
     snaps = args.snaps if args.snaps else [args.snap]
     webs = ["tweb", "vweb"] if args.web == "both" else [args.web]
     method = "ps" if args.method == "auto" else args.method

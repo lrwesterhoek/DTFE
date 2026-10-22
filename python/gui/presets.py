@@ -21,16 +21,14 @@ _SEVEN = ["density_a", "velocity_a", "gradient_a", "divergence_a", "shear_a", "v
 # name -> (one-line description, settings). The settings are RunSpec / CustomSpec fields; a
 # preset leaves every field it does not name as it was. 'slice_plane': "largest" = the largest
 # image plane found for the simulation (none: no slice). 'deposit' is PS-DTFE's; 'deposit_dtfe', when
-# given, is the cell average a standard-DTFE job gets instead (the thesis settings: the exact one, standard DTFE's
-# production setting).
+# given, is the cell average a standard-DTFE job gets instead (the exact one, standard DTFE's production setting).
 BUILTIN_PRESETS: dict[str, tuple[str, dict]] = {
     "Quick look": ("128³ grid, density and velocity only: about a minute on a laptop-sized "
                    "snapshot, for checking that everything works",
                    {"grid": 128, "nsub": 1, "deposit": "sampled", "fields": ["density_a", "velocity_a"],
                     "vertex_mass": True, "volume_weighted": True, "caustics": False,
                     "caustic_cusps": False, "slice_plane": ""}),
-    "Standard": ("512³ grid, the seven production fields with the literature-standard weighting "
-                 "(the setting of the thesis grids)",
+    "Standard": ("512³ grid, the seven production fields with the literature-standard weighting",
                  {"grid": 512, "nsub": 3, "deposit": "sampled", "deposit_dtfe": "exact", "fields": list(_SEVEN),
                   "vertex_mass": True, "volume_weighted": True, "caustics": False,
                   "caustic_cusps": False, "slice_plane": ""}),

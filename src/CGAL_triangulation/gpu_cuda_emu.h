@@ -41,6 +41,8 @@
 #include <unistd.h>
 #endif
 
+#include "../env_knobs.h"
+
 #define __global__
 #define __device__
 #define __host__
@@ -63,9 +65,7 @@ inline unsigned gGridDim  = 1;
 inline unsigned warpWidth()
 {
     static unsigned w = [] {
-        const char* e = getenv("GPU_EMU_WARP");
-        long v = e ? atol(e) : 32;
-        return unsigned((v == 64) ? 64 : 32);
+        return unsigned(Env::integer("GPU_EMU_WARP", 32) == 64 ? 64 : 32);
     }();
     return w;
 }

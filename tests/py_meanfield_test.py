@@ -305,7 +305,7 @@ def t_fieldset_api():
 
 
 def _run_py(args, env_extra=None, timeout=600):
-    env = dict(os.environ, MPLBACKEND="Agg", DTFE_NO_MIRROR="1", **(env_extra or {}))
+    env = dict(os.environ, MPLBACKEND="Agg", **(env_extra or {}))
     res = subprocess.run([sys.executable] + [str(a) for a in args], capture_output=True, text=True, env=env, timeout=timeout)
     return res.returncode, res.stdout + res.stderr
 
@@ -502,7 +502,7 @@ def main():
     check("V-web: eigenvalues of -sqrt(a)/(2*100h)(g + g^T), descending, labels above lambda_th, the a/h fallbacks", t_vweb_normalisation)
     check("symmetric_eigenvalues3 (the binary's Cardano) against numpy: random, isotropic, the pancake; classify_web", t_cardano)
     check("the spectra plan, the peak estimate, a memmap input, the shape refusals", t_plan_and_memmap)
-    check("mean_field_plane (Explore, 2026-10-15): one plane in slabs == the cube's result cut there, six names, every "
+    check("mean_field_plane (Explore): one plane in slabs == the cube's result cut there, six names, every "
           "axis, faces and slab boundaries, float32 / float64, even / odd size, a minimal slab reader", t_plane)
     check("FieldSet: PS mean field == analytic x sqrt(a), standard DTFE's stored grid kept, has(), the run log's lambda_th, refusals, the memory gate", t_fieldset_api)
     check("figure scripts: plot_web_streams / plot_cosmic_web / plot_shear_triaxial read PS's mean field by default, '--ps-gradient stored' the grids", t_scripts_default)

@@ -8,8 +8,9 @@ Two tiers:
     -0.8 radius is R0 (0.9/0.8)^(1/3)), the periodic wrap, a wisp on the centre, never-below and capped voids, the outward blocks,
     the cache (round trip, keyed on the catalogue's minima, the grid stamp and the settings; only missing rows
     measured), snapshot_stats / size_function_figure with the raw radii, --help.
-  * DATA-BACKED (the T7's TNG100-3-Dark z = 0 grids and production catalogue): the raw radius is defined for most
-    distinct voids and is not the smoothing length; skipped with a note when the data or the catalogue is not there.
+  * DATA-BACKED (TNG100-3-Dark z = 0's grids and production catalogue under DTFE_DATA_ROOT): the raw radius is defined
+    for most distinct voids and is not the smoothing length; skipped with a note when DTFE_DATA_ROOT is unset or the
+    data or the catalogue is not there.
 
 Usage:  python3 tests/py_size_function_test.py            (exit 0 = pass)
 """
@@ -26,7 +27,7 @@ from types import SimpleNamespace
 import numpy as np
 
 import os
-from _harness import FAIL, PASS, REPO, SKIP, Skip, check, setup
+from _harness import FAIL, PASS, REPO, SKIP, Skip, check, data_root, setup
 
 _FIGS_TMP = setup("size_function_figs_")
 os.environ.setdefault("DTFE_SIM", "TNG50-4-Dark")    # the box these synthetic tests stand for; a data-tier run sets its own
@@ -380,12 +381,13 @@ def t_help():
 
 
 def t_tng100_raw():
-    """T7: TNG100-3-Dark z = 0, production catalogue: the raw radius is defined for >= 90% of the distinct voids
-    (the smoothed delta08: 30%) and its median is 1.5-3 sigma (the smoothed delta08's 0.72 sigma follows the
+    """TNG100-3-Dark z = 0 (DTFE_DATA_ROOT), production catalogue: the raw radius is defined for >= 90% of the
+    distinct voids (the smoothed delta08: 30%) and its median is 1.5-3 sigma (the smoothed delta08's 0.72 sigma follows the
     smoothing). Reads the 512^3 density once (cached afterwards)."""
     import config
     if config.SIMULATION != "TNG100-3-Dark":
         raise Skip("needs DTFE_SIM=TNG100-3-Dark")
+    data_root()                                     # a Skip without one
     from dtfelib import pipeline, catalog, raw_radius as rr
     import plot_void_population as pop
     prod = pipeline.products(99, sim="TNG100-3-Dark")
@@ -566,17 +568,17 @@ def t_fixed_r_paired():
 
 
 def main():
-    print("size function raw radius tests (2026-10-11)")
+    print("size function raw radius tests")
     for name, fn in (("analytic top-hat void: radius, wrap, blocks, never-below, capped", t_analytic),
                      ("a wisp on the centre does not undefine the void", t_centre_wisp),
                      ("the raw radius does not follow the smoothing (the smoothed delta08 does)", t_not_smoothing),
                      ("raw radii cache: rows, reuse, identity, stamp, settings, atomic", t_cache),
-                     ("2026-10-11: the products' held density grid used, not read again", t_held_grid),
-                     ("2026-10-12: re-centring on the raw minimum restores an off-centre void's radius", t_recentre),
-                     ("2026-10-12: re-centred radii cached apart, reused, re-measured on new settings",
+                     ("the products' held density grid used, not read again", t_held_grid),
+                     ("re-centring on the raw minimum restores an off-centre void's radius", t_recentre),
+                     ("re-centred radii cached apart, reused, re-measured on new settings",
                       t_recentre_cache),
-                     ("2026-10-12: one re-centred centre counted once; the switch offered", t_same_centre),
-                     ("2026-10-12: distinct by the raw spheres, largest first, no overlap", t_raw_distinct),
+                     ("one re-centred centre counted once; the switch offered", t_same_centre),
+                     ("distinct by the raw spheres, largest first, no overlap", t_raw_distinct),
                      ("snapshot_stats with delta08raw", t_snapshot_stats),
                      ("size_function_figure with delta08raw", t_figure),
                      ("--help offers delta08raw", t_help),
@@ -584,7 +586,7 @@ def main():
                      ("fixed R: every count half-open [lo, hi), the void at r_hi in none", t_fixed_r_half_open),
                      ("fixed R: smoothings compared on the paired bootstrap, not independent errors",
                       t_fixed_r_paired),
-                     ("T7: TNG100 z = 0 raw radius defined and not the smoothing length", t_tng100_raw)):
+                     ("TNG100 z = 0 (DTFE_DATA_ROOT): raw radius defined and not the smoothing length", t_tng100_raw)):
         check(name, fn)
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed, {len(SKIP)} skipped")
     return 1 if FAIL else 0

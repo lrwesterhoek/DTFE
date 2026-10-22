@@ -696,8 +696,8 @@ def main():
     ap.add_argument("snapshots", type=int, nargs="*", default=None,
                     help=f"snapshot numbers to merge (default: {SNAPSHOT_NUMBERS})")
     ap.add_argument("-d", "--data-dir", required=True,
-                    help="the simulation's directory holding snapdir_NNN/, e.g. '/Volumes/Samsung T7/Illustris "
-                         "TNG/TNG100/TNG100-3-Dark' (required: there is no default simulation)")
+                    help="the simulation's directory holding snapdir_NNN/, e.g. '~/IllustrisTNG/TNG100/TNG100-3-Dark' "
+                         "(required: there is no default simulation)")
     ap.add_argument("-n", "--num-subfiles", type=int, default=None,
                     help="chunk files per snapshot (default: auto-detected by globbing)")
     ap.add_argument("--hubble", type=float, default=H_VALUE,

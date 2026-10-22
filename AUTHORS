@@ -13,3 +13,17 @@ Author of DTFE:
         The Netherlands
 
 
+Author of the phase-space DTFE (PS-DTFE, after Feldbrugge 2024) and the later work (Lamina):
+
+        Luuk Westerhoek
+
+        Kapteyn Astronomical Institute
+        University of Groningen
+        Landleven 12
+        9747 AD Groningen
+        The Netherlands
+
+        The phase-space DTFE, the exact / point evaluation methods, automatic memory
+        management, the GPU backends (Metal, and its CUDA/HIP port) and the analysis pipeline.
+
+

@@ -22,7 +22,7 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as colors
 from scipy.stats import pearsonr
 from dtfelib import fields as dtfe
-from dtfelib.figures import save_plot_to_multiple_paths
+from dtfelib.figures import save_figure
 from dtfelib import FieldSet, make_parser, sim_dir, add_ps_gradient_arg, mean_field_wanted
 import config
 from dtfelib import figures as style
@@ -122,7 +122,7 @@ def create_density_plot(delta_slice, slice_dim, box_size, delta_norm, redshift, 
 
     plane_name = plane_info['name']
     filepath = output_path / f"density_contrast_{plane_name}_z{redshift:.2f}.png"
-    save_plot_to_multiple_paths(fig, filepath, dpi=DPI, bbox_inches='tight', facecolor='white')
+    save_figure(fig, filepath, dpi=DPI, bbox_inches='tight', facecolor='white')
     plt.close(fig)
 
 def create_velocity_divergence_plot(velDiv_slice, slice_dim, box_size, velDiv_norm, redshift, output_path):
@@ -148,7 +148,7 @@ def create_velocity_divergence_plot(velDiv_slice, slice_dim, box_size, velDiv_no
 
     plane_name = plane_info['name']
     filepath = output_path / f"velocity_divergence_{plane_name}_z{redshift:.2f}.png"
-    save_plot_to_multiple_paths(fig, filepath, dpi=DPI, bbox_inches='tight', facecolor='white')
+    save_figure(fig, filepath, dpi=DPI, bbox_inches='tight', facecolor='white')
     plt.close(fig)
 
 def create_linear_fit_plot(delta_sample, velDiv_sample, slope_reg, slope_theory, 
@@ -184,7 +184,7 @@ def create_linear_fit_plot(delta_sample, velDiv_sample, slope_reg, slope_theory,
     
     plt.tight_layout()
     filepath = output_path / f"linear_fit_z{redshift:.2f}.png"
-    save_plot_to_multiple_paths(fig, filepath, dpi=DPI, bbox_inches='tight', facecolor='white')
+    save_figure(fig, filepath, dpi=DPI, bbox_inches='tight', facecolor='white')
     plt.close(fig)
 
 def create_residual_plot(residual_slice, slice_dim, box_size, residual_norm, redshift, output_path):
@@ -209,7 +209,7 @@ def create_residual_plot(residual_slice, slice_dim, box_size, residual_norm, red
 
     plane_name = plane_info['name']
     filepath = output_path / f"residual_field_{plane_name}_z{redshift:.2f}.png"
-    save_plot_to_multiple_paths(fig, filepath, dpi=DPI, bbox_inches='tight', facecolor='white')
+    save_figure(fig, filepath, dpi=DPI, bbox_inches='tight', facecolor='white')
     plt.close(fig)
 
 def _ps_divergence_source(args):
@@ -234,7 +234,6 @@ def process_snapshot(snapshot, redshift, args):
             # default (standard DTFE) so a plain run reproduces previous behavior
             print("  both PS and DTFE fields present; using --method dtfe")
             fs = FieldSet(snapdir, method='dtfe', averaged=not args.raw)
-        style.note_source(fs)                       # the thesis mirror takes the thesis box's standard DTFE only
         print("Loading fields")
         density_field = fs.density(units='mean')   # rho/rho_bar for BOTH methods
         # the mean-field div<v> for BOTH methods by default: standard DTFE's stored grid, PS's computed from its
@@ -395,8 +394,8 @@ def create_evolution_summary(results):
         ax1.legend()
         ax1.grid(True, alpha=0.3)
         plt.tight_layout()
-        save_plot_to_multiple_paths(fig, output_path / 'slope_evolution.png',
-                                    dpi=DPI, bbox_inches='tight')
+        save_figure(fig, output_path / 'slope_evolution.png',
+                    dpi=DPI, bbox_inches='tight')
         plt.close(fig)
 
         fig, ax2 = plt.subplots(figsize=style.FIGSIZE['single'])
@@ -407,8 +406,8 @@ def create_evolution_summary(results):
         style.set_title(ax2, 'Relative Difference: (Measured - Theory) / Theory × 100%')
         ax2.grid(True, alpha=0.3)
         plt.tight_layout()
-        save_plot_to_multiple_paths(fig, output_path / 'slope_deviation_evolution.png',
-                                    dpi=DPI, bbox_inches='tight')
+        save_figure(fig, output_path / 'slope_deviation_evolution.png',
+                    dpi=DPI, bbox_inches='tight')
         plt.close(fig)
 
         evolution_data_file = output_path / 'evolution_data.txt'

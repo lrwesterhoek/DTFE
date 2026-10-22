@@ -390,35 +390,37 @@ OPTIONS_COMMON += -DBOOST_ALLOW_DEPRECATED_HEADERS
 ###############  DO NOT MODIFY BELOW THIS LINE  ###########################
 # do not modify below this line
 SRC = ./src
+# third-party headers come in by -isystem: their own warnings (Boost's under recent LLVM) stay out of
+# the build log, while every warning in this code is still reported
 INCLUDES =
 LIBRARIES =
 
 # Library path setup
 ifneq ($(strip $(GSL_PATH)),)
-    INCLUDES += -I $(strip $(GSL_PATH))/include
+    INCLUDES += -isystem $(strip $(GSL_PATH))/include
     LIBRARIES += -L$(strip $(GSL_PATH))/lib
 endif
 ifneq ($(strip $(BOOST_PATH)),)
-    INCLUDES += -I $(strip $(BOOST_PATH))/include
+    INCLUDES += -isystem $(strip $(BOOST_PATH))/include
     LIBRARIES += -L$(strip $(BOOST_PATH))/lib
 endif
 ifneq ($(strip $(CGAL_PATH)),)
-    INCLUDES += -I $(strip $(CGAL_PATH))/include
+    INCLUDES += -isystem $(strip $(CGAL_PATH))/include
     LIBRARIES += -L$(strip $(CGAL_PATH))/lib
 endif
 ifneq ($(strip $(GMP_PATH)),)
-    INCLUDES += -I $(strip $(GMP_PATH))/include
+    INCLUDES += -isystem $(strip $(GMP_PATH))/include
     LIBRARIES += -L$(strip $(GMP_PATH))/lib
 endif
 ifneq ($(strip $(MPFR_PATH)),)
-    INCLUDES += -I $(strip $(MPFR_PATH))/include
+    INCLUDES += -isystem $(strip $(MPFR_PATH))/include
     LIBRARIES += -L$(strip $(MPFR_PATH))/lib
 endif
 ifneq ($(strip $(HDF5_PATH)),)
-    INCLUDES += -I $(strip $(HDF5_PATH))/include
+    INCLUDES += -isystem $(strip $(HDF5_PATH))/include
     LIBRARIES += -L$(strip $(HDF5_PATH))/lib   # -lhdf5/-lhdf5_cpp added once via HDF5_LIBS (avoid duplicate-library linker warning)
     ifneq ($(strip $(HDF5_EXTRA_INC)),)
-        INCLUDES += -I $(strip $(HDF5_EXTRA_INC))
+        INCLUDES += -isystem $(strip $(HDF5_EXTRA_INC))
     endif
     ifneq ($(strip $(HDF5_EXTRA_LIB)),)
         LIBRARIES += -L$(strip $(HDF5_EXTRA_LIB))
@@ -427,7 +429,7 @@ ifneq ($(strip $(HDF5_PATH)),)
     OPTIONS_PS += -DHDF5
 endif
 ifneq ($(strip $(FFTW_PATH)),)
-    INCLUDES += -I $(strip $(FFTW_PATH))/include
+    INCLUDES += -isystem $(strip $(FFTW_PATH))/include
     LIBRARIES += -L$(strip $(FFTW_PATH))/lib
 endif
 
@@ -509,7 +511,7 @@ endif
 ifeq ($(HAVE_LIBDEFLATE),1)
     OPTIONS_COMMON += -DDTFE_HAVE_LIBDEFLATE
     ifneq ($(LIBDEFLATE_PATH),/usr)
-        INCLUDES  += -I $(LIBDEFLATE_PATH)/include
+        INCLUDES  += -isystem $(LIBDEFLATE_PATH)/include
         BASE_LIBS += -L$(LIBDEFLATE_PATH)/lib
     endif
     BASE_LIBS += -ldeflate
@@ -540,7 +542,7 @@ ifeq ($(TBB),auto)
 endif
 ifeq ($(TBB_PS),1)
     OPTIONS_PS   += -DPARALLEL_TRIANGULATION -DCGAL_LINKED_WITH_TBB
-    INCLUDES     += -I $(TBB_PATH)/include
+    INCLUDES     += -isystem $(TBB_PATH)/include
     PS_TBB_LIBS  := -L$(TBB_PATH)/lib -ltbb -ltbbmalloc
     TBB_BUILD_ARG := $(if $(filter 1,$(TBB)),TBB=1,)
 else
@@ -828,7 +830,7 @@ $(OBJ_DIR_PS)/ps_deposit_msl.h: metal/ps_deposit.metal metal/exact_clip.metal.in
 	mv $@.tmp $@
 
 $(OBJ_DIR_PS)/ps_metal_host$(OBJ_EXT): $(SRC)/CGAL_triangulation/ps_metal_host.cc $(SRC)/CGAL_triangulation/gpu_host.h $(SRC)/CGAL_triangulation/gpu_metal_retry.h $(SRC)/CGAL_triangulation/ps_deposit_params.h $(OBJ_DIR_PS)/ps_deposit_msl.h Makefile
-	$(CC) $(COMPILE_FLAGS_PS) -I third_party/metal-cpp -I $(OBJ_DIR_PS) -o $@ -c $(SRC)/CGAL_triangulation/ps_metal_host.cc
+	$(CC) $(COMPILE_FLAGS_PS) -isystem third_party/metal-cpp -I $(OBJ_DIR_PS) -o $@ -c $(SRC)/CGAL_triangulation/ps_metal_host.cc
 
 # Standard-DTFE Metal deposit host (METAL=1 only), same embedding scheme in $(OBJ_DIR).
 $(OBJ_DIR)/dtfe_deposit_msl.h: metal/dtfe_deposit.metal metal/exact_clip.metal.inc Makefile
@@ -837,19 +839,19 @@ $(OBJ_DIR)/dtfe_deposit_msl.h: metal/dtfe_deposit.metal metal/exact_clip.metal.i
 	mv $@.tmp $@
 
 $(OBJ_DIR)/dtfe_metal_host$(OBJ_EXT): $(SRC)/CGAL_triangulation/dtfe_metal_host.cc $(SRC)/CGAL_triangulation/gpu_host.h $(SRC)/CGAL_triangulation/gpu_metal_retry.h $(SRC)/CGAL_triangulation/dtfe_gpu_fixed.h $(SRC)/CGAL_triangulation/ps_deposit_params.h $(OBJ_DIR)/dtfe_deposit_msl.h Makefile
-	$(CC) $(COMPILE_FLAGS) -I third_party/metal-cpp -I $(OBJ_DIR) -o $@ -c $(SRC)/CGAL_triangulation/dtfe_metal_host.cc
+	$(CC) $(COMPILE_FLAGS) -isystem third_party/metal-cpp -I $(OBJ_DIR) -o $@ -c $(SRC)/CGAL_triangulation/dtfe_metal_host.cc
 
 $(OBJ_DIR)/dtfe_metal_host_l$(OBJ_EXT): $(SRC)/CGAL_triangulation/dtfe_metal_host.cc $(SRC)/CGAL_triangulation/gpu_host.h $(SRC)/CGAL_triangulation/gpu_metal_retry.h $(SRC)/CGAL_triangulation/dtfe_gpu_fixed.h $(SRC)/CGAL_triangulation/ps_deposit_params.h $(OBJ_DIR)/dtfe_deposit_msl.h Makefile
-	$(CC) $(COMPILE_FLAGS) -fPIC -I third_party/metal-cpp -I $(OBJ_DIR) -o $@ -c $(SRC)/CGAL_triangulation/dtfe_metal_host.cc
+	$(CC) $(COMPILE_FLAGS) -fPIC -isystem third_party/metal-cpp -I $(OBJ_DIR) -o $@ -c $(SRC)/CGAL_triangulation/dtfe_metal_host.cc
 
 # CUDA/HIP GPU deposit hosts (CUDA=1 via nvcc, HIP=1 via hipcc): single-source .cu files, kernels
 # compiled ahead of time (no vendored SDK -- the CUDA toolkit / ROCm provide the headers). Ports of
 # the Metal kernels; keep them in step with metal/*.metal.
-$(OBJ_DIR_PS)/ps_gpu_cuda$(OBJ_EXT): $(SRC)/CGAL_triangulation/ps_gpu_cuda.cu $(SRC)/CGAL_triangulation/gpu_host.h $(SRC)/CGAL_triangulation/gpu_cuda_compat.h $(SRC)/CGAL_triangulation/gpu_cuda_emu.h $(SRC)/CGAL_triangulation/gpu_exact_clip.cuh $(SRC)/CGAL_triangulation/gpu_cuda_retry.cuh $(SRC)/CGAL_triangulation/ps_deposit_params.h Makefile
+$(OBJ_DIR_PS)/ps_gpu_cuda$(OBJ_EXT): $(SRC)/CGAL_triangulation/ps_gpu_cuda.cu $(SRC)/CGAL_triangulation/gpu_host.h $(SRC)/CGAL_triangulation/gpu_cuda_compat.h $(SRC)/CGAL_triangulation/gpu_cuda_emu.h $(SRC)/CGAL_triangulation/gpu_exact_clip.cuh $(SRC)/CGAL_triangulation/gpu_cuda_retry.cuh $(SRC)/CGAL_triangulation/ps_deposit_params.h $(SRC)/CGAL_triangulation/ps_mass_audit.h $(SRC)/message.h $(SRC)/env_knobs.h Makefile
 	@$(MKDIR_P) $(OBJ_DIR_PS)
 	$(GPUXX) $(GPUXX_FLAGS) -o $@ -c $(SRC)/CGAL_triangulation/ps_gpu_cuda.cu
 
-$(OBJ_DIR)/dtfe_gpu_cuda$(OBJ_EXT): $(SRC)/CGAL_triangulation/dtfe_gpu_cuda.cu $(SRC)/CGAL_triangulation/gpu_host.h $(SRC)/CGAL_triangulation/gpu_cuda_compat.h $(SRC)/CGAL_triangulation/gpu_cuda_emu.h $(SRC)/CGAL_triangulation/gpu_exact_clip.cuh $(SRC)/CGAL_triangulation/gpu_cuda_retry.cuh $(SRC)/CGAL_triangulation/dtfe_gpu_fixed.h $(SRC)/CGAL_triangulation/ps_deposit_params.h Makefile
+$(OBJ_DIR)/dtfe_gpu_cuda$(OBJ_EXT): $(SRC)/CGAL_triangulation/dtfe_gpu_cuda.cu $(SRC)/CGAL_triangulation/gpu_host.h $(SRC)/CGAL_triangulation/gpu_cuda_compat.h $(SRC)/CGAL_triangulation/gpu_cuda_emu.h $(SRC)/CGAL_triangulation/gpu_exact_clip.cuh $(SRC)/CGAL_triangulation/gpu_cuda_retry.cuh $(SRC)/CGAL_triangulation/dtfe_gpu_fixed.h $(SRC)/CGAL_triangulation/ps_deposit_params.h $(SRC)/message.h $(SRC)/env_knobs.h Makefile
 	@$(MKDIR_P) $(OBJ_DIR)
 	$(GPUXX) $(GPUXX_FLAGS) -o $@ -c $(SRC)/CGAL_triangulation/dtfe_gpu_cuda.cu
 

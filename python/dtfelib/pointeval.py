@@ -30,7 +30,7 @@ from .io import PointPlane
 #: Styling matches the grid slice maps of plot/plot_PS_DTFE.py and plot/plot_DTFE.py -- same
 #: colormaps, colorbar geometry, title/axis conventions and font sizes -- so a point-evaluated
 #: map and a grid map of the same field are visually interchangeable (only the resolution
-#: differs). COLORMAPS ARE THE THESIS ONES, not free choices:
+#: differs). The colormaps are the grid maps' ones, not free choices:
 #:   density  plasma   dtfelib.figures.CMAP['density'], plot_DTFE.py, plot_PS_DTFE.py
 #:   shear    plasma   CMAP['shear'], plot_DTFE.plot_shear
 #:   velDiv   RdBu_r   CMAP['divergence'], plot_DTFE.plot_divergence
@@ -98,7 +98,7 @@ def starts_near_black(cmap, thresh=0.15):
 def lift_cmap(cmap, lo):
     """The colormap with its darkest `lo` fraction removed, so nothing renders as black.
     A no-op unless the map actually starts near black -- trimming plasma/viridis would
-    move them off the thesis look for no benefit."""
+    move them off the grid maps' look for no benefit."""
     if lo <= 0. or not starts_near_black(cmap):
         return cmap
     return colors.LinearSegmentedColormap.from_list(

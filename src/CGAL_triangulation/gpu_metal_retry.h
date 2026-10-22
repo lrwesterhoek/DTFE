@@ -8,8 +8,9 @@
    DTFE_GPU_CHECKPOINT_CHUNKS chunks; a failed buffer (which may have deposited part or all of its atomics)
    restores the last snapshot and continues from its chunk, at a pace that depends on the cause (GpuFault).
 
-   Included by the two Metal hosts INSIDE their anonymous namespace, after <Metal/Metal.hpp> and the std headers
-   (<algorithm> <chrono> <cstdlib> <cstring> <memory> <new> <string> <vector> <unistd.h>), like
+   Included by the two Metal hosts INSIDE their anonymous namespace, after <Metal/Metal.hpp>, "../message.h" (which
+   brings env_knobs.h) and the std headers (<algorithm> <chrono> <cstdlib> <cstring> <memory> <new> <string> <vector>
+   <unistd.h>), like
    gpu_exact_clip.cuh in the CUDA hosts. A binary links ONE Metal host (PS-DTFE: ps_metal_host.cc, DTFE and
    libDTFE: dtfe_metal_host.cc), so the process-wide statics below (the pace, the fault hook) are that binary's.
    The CUDA/HIP twin is gpu_cuda_retry.cuh. */
@@ -89,7 +90,7 @@ GpuFaultHook& gpuFaultHook()
 {
     static GpuFaultHook h = [] {
         GpuFaultHook r;
-        if (const char* env = getenv("DTFE_GPU_FAULT_AT"))
+        if (const char* env = Env::value("DTFE_GPU_FAULT_AT"))
         {
             r.at = atol(env);
             if (const char* colon = strchr(env, ':')) r.kind = colon + 1;

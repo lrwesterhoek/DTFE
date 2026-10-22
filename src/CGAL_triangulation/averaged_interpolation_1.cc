@@ -24,6 +24,7 @@
 /* Volume-averaged grid interpolation, method 1 (= sample points chosen inside the
    Delaunay cell, proportional to cell volume). */
 #include "triangulation_common.h"
+#include "../env_knobs.h"
 #include <typeinfo>
 #include <stdio.h>
 #include <atomic>
@@ -329,11 +330,8 @@ inline Pvector<Real,noScalarComp> averageScalar(Cell &cell)
 // psDepositThreads rule). DTFE_DEPOSIT_THREADS pins it, as for the PS deposit.
 static int exactAverageThreads()
 {
-    if ( const char *env = std::getenv("DTFE_DEPOSIT_THREADS") )
-    {
-        int const v = std::atoi(env);
-        if ( v > 0 ) return v;
-    }
+    if ( long const v = Env::integer( "DTFE_DEPOSIT_THREADS", 0 ); v > 0 )
+        return int( v );
     int cores = int( std::thread::hardware_concurrency() );
 #ifdef OPEN_MP
     cores = omp_get_max_threads();
@@ -341,6 +339,319 @@ static int exactAverageThreads()
         return std::max( 1, cores / std::max( 1, omp_get_num_threads() ) );
 #endif
     return std::max( 1, cores );
+}
+
+// The output grids of the '_a' fields (pointers into Quantities), for the phases that zero, fill and normalize them.
+struct Avg1Grids
+{
+    std::vector<Real>                             *density;
+    std::vector< Pvector<Real,noVelComp> >        *velocity;
+    std::vector< Pvector<Real,noGradComp> >       *velocity_gradient;
+    std::vector< Pvector<Real,noScalarComp> >     *scalar;
+    std::vector< Pvector<Real,noScalarGradComp> > *scalar_gradient;
+};
+
+// Prints the opening line: the grid, the region and how the volume average is done (Monte Carlo or exact).
+static inline void avg1Announce(MESSAGE::Message &message, size_t *nGrid, Box &boxCoordinates, size_t const NN,
+                                bool const exactAvg)
+{
+    if ( exactAvg )
+        message << "\nComputing interpolation of the fields volume averaged over the sampling cell on a regular "
+                << MESSAGE::printElements( nGrid, NO_DIM, "*" ) << " grid in the region "
+                << boxCoordinates.print()
+                << ". The volume average integrates the linear interpolant EXACTLY over every grid-cell/tetrahedron intersection (--exact-average, r3d; '--samples' is ignored).\n"
+                << "\t Done: " << MESSAGE::Flush;
+    else
+        message << "\nComputing interpolation of the fields volume averaged over the sampling cell on a regular "
+            << MESSAGE::printElements( nGrid, NO_DIM, "*" ) << " grid in the region "
+            << boxCoordinates.print()
+            << ". The volume average is done using Monte Carlo sampling in each of the triangles/tetrahedra of the Delaunay triangulation. "
+            << "There are " << NN << " random sampling points on average in each grid cell of the output fields (the random samples in the Delaunay triangulation's triangles/tetrahedra are proportional to the area/volume of the cell).\n"
+            << "\t Done: " << MESSAGE::Flush;
+}
+
+// Zeroes the selected output grids; warns that method 1 does not give the velocity standard deviation.
+static inline void avg1ZeroGrids(User_options &userOptions, Field &field, size_t const gridSize, Avg1Grids const &grids)
+{
+    std::vector<Real>                         *density = grids.density;
+    std::vector< Pvector<Real,noVelComp> >    *velocity = grids.velocity;
+    std::vector< Pvector<Real,noGradComp> >   *velocity_gradient = grids.velocity_gradient;
+    std::vector< Pvector<Real,noScalarComp> > *scalar = grids.scalar;
+    std::vector< Pvector<Real,noScalarGradComp> > *scalar_gradient = grids.scalar_gradient;
+    if ( field.density ) assingZeroValues<Real>( density, gridSize );
+    if ( field.velocity ) assingZeroValues< Pvector<Real,noVelComp> >( velocity, gridSize );
+    if ( field.velocity_gradient ) assingZeroValues< Pvector<Real,noGradComp> >( velocity_gradient, gridSize );
+    if ( field.scalar ) assingZeroValues< Pvector<Real,noScalarComp> >( scalar, gridSize );
+    if ( field.scalar_gradient ) assingZeroValues< Pvector<Real,noScalarGradComp> >( scalar_gradient, gridSize );
+    if ( field.velocity_std )
+    {
+        MESSAGE::Warning warning(userOptions.verboseLevel);
+        warning << "You cannot use the averaging method 1 (Monte Carlo sampling inside the Delaunay cell) to compute the velocity standard deviation inside the grid cell. Please use the averaging method 2 '--method 2' (Monte Carlo sampling inside the grid cell) to compute the velocity standard deviation.\n" << MESSAGE::EndWarning;
+    }
+}
+
+#ifdef DTFE_GPU_ACTIVE
+// Whether this pass may use the GPU deposit: --gpu, at most one scalar component and at most 2^32 grid cells.
+static inline bool avg1GpuUsable(User_options &userOptions, Field &field, size_t const gridSize)
+{
+    bool tryMetal = userOptions.useMetal;   // (--exact-average runs on the GPU too: depositExactAverage)
+#ifdef SCALAR
+    if ( tryMetal and (field.scalar or field.scalar_gradient) and noScalarComp != 1 )
+    {
+        MESSAGE::Warning warning( userOptions.verboseLevel );
+        warning << "--gpu supports ONE scalar component (this build has NO_SCALARS=" << noScalarComp << "); using the CPU interpolation for this pass.\n" << MESSAGE::EndWarning;
+        tryMetal = false;
+        ++dtfeGpuFallbacks;
+    }
+#endif
+    // the single-cell fast path ships 32-bit flat grid indices to the GPU
+    if ( tryMetal and gridSize > size_t(UINT32_MAX) )
+    {
+        MESSAGE::Warning warning( userOptions.verboseLevel );
+        warning << "--gpu does not support more than 2^32 grid cells; using the CPU interpolation.\n" << MESSAGE::EndWarning;
+        tryMetal = false;
+        ++dtfeGpuFallbacks;
+    }
+    return tryMetal;
+}
+
+// The GPU pass's options, grid geometry, field flags and per-tetrahedron arrays, as references, for the phases
+// after the extraction walk.
+struct Avg1GpuCtx
+{
+    User_options &userOptions;
+    MESSAGE::Message &message;
+    size_t *nGrid;
+    Real (&dx)[NO_DIM];
+    size_t gridSize;
+    bool exactAvg, fDen, fVel, fGrad, fScal, fSGrad, needVel, needScal;
+    int mortonShift;
+    std::vector<float> &tetVerts, &tetDens, &tetVels, &tetScal, &tetVols;
+    std::vector<uint32_t> &tetCnts, &tetFlats, &tetKeys;
+};
+
+// Orders the tetrahedra along a Morton curve of their base cell before dispatch, so the
+// threads running together deposit into neighbouring cells: the deposit is bound by its
+// atomics, and random cells across a 2 GB grid cost 3x the throughput of local ones (TLB
+// and cache reach), measured on the shared full grid of a 512^3 run. No cost sort (by
+// sample count, so that a chunk's threads are uniformly sized) is needed: the
+// work items bound every thread to itemSamples samples (the per-tet A/B kernel,
+// DTFE_GPU_ITEMS=0, pays for that with its imbalance). The permutation is applied one
+// array at a time so only a single extra copy is alive at once.
+static inline void avg1MortonOrder(Avg1GpuCtx &c)
+{
+    std::vector<float> &tetVerts = c.tetVerts, &tetDens = c.tetDens, &tetVels = c.tetVels, &tetScal = c.tetScal,
+                       &tetVols = c.tetVols;
+    std::vector<uint32_t> &tetCnts = c.tetCnts, &tetFlats = c.tetFlats, &tetKeys = c.tetKeys;
+    bool const needVel = c.needVel, needScal = c.needScal;
+    int const mortonShift = c.mortonShift;
+    size_t const nT = tetCnts.size();
+    std::vector< std::pair<uint32_t,uint32_t> > order(nT);
+    for (size_t t=0; t<nT; ++t)
+        order[t] = std::make_pair( tetKeys[t], uint32_t(t) );
+    std::vector<uint32_t>().swap( tetKeys );
+    std::sort( order.begin(), order.end() );
+    if ( Env::flag( { "DTFE_GPU_TIMING", "DTFE_METAL_TIMING" } ) )
+    {   // how many distinct base cells the 32 consecutive work items of a SIMD group touch
+        // (16-sample items; a lower bound on the cell sharing a SIMD-group reduction could use)
+        size_t lane = 0, distinct = 0, groups = 0, sumDistinct = 0; uint32_t last = ~0u;
+        for (size_t i=0; i<nT; ++i)
+        {
+            uint32_t const n = tetCnts[order[i].second];
+            size_t const items = n ? (n + 15) / 16 : 1;
+            for (size_t k=0; k<items; ++k)
+            {
+                if ( lane==0 ) { distinct = 0; last = ~0u; }
+                if ( order[i].first != last ) { ++distinct; last = order[i].first; }
+                if ( ++lane == 32 ) { lane = 0; ++groups; sumDistinct += distinct; }
+            }
+        }
+        fprintf( stderr, "DTFE Metal order: %zu tetrahedra, %zu SIMD groups of 32 items, %.1f distinct base cells per group (Morton shift %d)\n",
+                 nT, groups, groups ? double(sumDistinct)/double(groups) : 0., mortonShift );
+    }
+    {
+        std::vector<float> sv(nT*12);
+        for (size_t i=0; i<nT; ++i)
+        { size_t const src = order[i].second; for (int k=0; k<12; ++k) sv[i*12+k] = tetVerts[src*12+k]; }
+        tetVerts.swap(sv);
+    }
+    {
+        std::vector<float> sd(nT*4);
+        for (size_t i=0; i<nT; ++i)
+        { size_t const src = order[i].second; for (int k=0; k<4; ++k) sd[i*4+k] = tetDens[src*4+k]; }
+        tetDens.swap(sd);
+    }
+    if ( needVel )
+    {
+        std::vector<float> su(nT*12);
+        for (size_t i=0; i<nT; ++i)
+        { size_t const src = order[i].second; for (int k=0; k<12; ++k) su[i*12+k] = tetVels[src*12+k]; }
+        tetVels.swap(su);
+    }
+    if ( needScal )
+    {
+        std::vector<float> ss(nT*4);
+        for (size_t i=0; i<nT; ++i)
+        { size_t const src = order[i].second; for (int k=0; k<4; ++k) ss[i*4+k] = tetScal[src*4+k]; }
+        tetScal.swap(ss);
+    }
+    {
+        std::vector<float> so(nT);
+        for (size_t i=0; i<nT; ++i) so[i] = tetVols[order[i].second];
+        tetVols.swap(so);
+    }
+    {
+        std::vector<uint32_t> sc(nT);
+        for (size_t i=0; i<nT; ++i) sc[i] = tetCnts[order[i].second];
+        tetCnts.swap(sc);
+    }
+    {
+        std::vector<uint32_t> sf(nT);
+        for (size_t i=0; i<nT; ++i) sf[i] = tetFlats[order[i].second];
+        tetFlats.swap(sf);
+    }
+}
+
+// Deposits the extracted tetrahedra on the GPU: into the shared full grid of a DTFE_parallel call, else into a grid
+// of its own that is copied into the output. False: the CPU loop interpolates this pass.
+static inline bool avg1GpuDispatch(Avg1GpuCtx &c, Avg1Grids const &grids, std::vector<Real> &quasiRandomNumbers_buf)
+{
+    User_options &userOptions = c.userOptions;
+    MESSAGE::Message &message = c.message;
+    size_t *nGrid = c.nGrid;
+    Real (&dx)[NO_DIM] = c.dx;
+    size_t const gridSize = c.gridSize;
+    bool const exactAvg = c.exactAvg, fDen = c.fDen, fVel = c.fVel, fGrad = c.fGrad, fScal = c.fScal, fSGrad = c.fSGrad;
+    std::vector<float> &tetVerts = c.tetVerts, &tetDens = c.tetDens, &tetVels = c.tetVels, &tetScal = c.tetScal,
+                       &tetVols = c.tetVols;
+    std::vector<uint32_t> &tetCnts = c.tetCnts, &tetFlats = c.tetFlats;
+    std::vector<Real>                         *density = grids.density;
+    std::vector< Pvector<Real,noVelComp> >    *velocity = grids.velocity;
+    std::vector< Pvector<Real,noGradComp> >   *velocity_gradient = grids.velocity_gradient;
+    std::vector< Pvector<Real,noScalarComp> > *scalar = grids.scalar;
+    std::vector< Pvector<Real,noScalarGradComp> > *scalar_gradient = grids.scalar_gradient;
+    bool metalDeposited = false;
+    std::vector<float> sobolTable( quasiRandomNumbers_buf.begin(), quasiRandomNumbers_buf.end() );
+    double dxv[3] = { double(dx[0]), double(dx[1]), double(dx[2]) };
+    size_t const nTetsDeposited = tetCnts.size();   // the deposit call consumes (frees) the arrays
+    DTFEGpuGrids gpuOut;
+    std::string metalErr;
+    message << gpuBackendName() << " GPU (" << gpuDeviceName() << ", " << nTetsDeposited << " tetrahedra) ... " << MESSAGE::Flush;
+
+    // The shared full grid of this DTFE_parallel call (dtfeGpuSharedBegin in DTFE.cpp): this
+    // sub-domain's samples land at full-grid cells subgridOffset + cell, and the main thread adds
+    // the grid into the output afterwards -- so this thread's own sub-grid stays ZERO. A batch the
+    // device hands back (allocation, watchdog) leaves its owner box zeroed and falls through to the
+    // per-call path below, then to the CPU loop.
+    bool sharedDone = false, sharedFailed = false;
+    if ( dtfeGpuSharedActive() and userOptions.subgridOffset.size()==size_t(NO_DIM) )
+    {
+        size_t subOff[3] = { userOptions.subgridOffset[0], userOptions.subgridOffset[1], userOptions.subgridOffset[2] };
+        if ( dtfeGpuSharedDeposit( tetVerts, tetDens, tetVels, tetScal, tetVols, tetCnts, tetFlats,
+                                   sobolTable, dxv, nGrid, subOff, metalErr ) )
+            sharedDone = true;
+        else if ( not tetCnts.empty() )     // the arrays survive only when the upload itself failed
+        {
+            MESSAGE::Warning warning( userOptions.verboseLevel );
+            warning << "DTFE " << gpuBackendName() << " shared grid handed this sub-domain back (" << metalErr << "); depositing it on its own.\n" << MESSAGE::EndWarning;
+        }
+        else if ( nTetsDeposited > 0 )
+        {   // consumed by the upload but the dispatch failed: nothing left for the per-call path
+            MESSAGE::Warning warning( userOptions.verboseLevel );
+            warning << "DTFE " << gpuBackendName() << " shared grid failed for this sub-domain (" << metalErr << "); using the CPU interpolation.\n" << MESSAGE::EndWarning;
+            ++dtfeGpuFallbacks;
+            sharedFailed = true;
+        }
+    }
+    // The per-call path. A deposit that fails AFTER its upload consumed the arrays (the retry policy gave up)
+    // warns too, so a runtime fallback to the CPU loop below is never silent -- the suites' 'using the CPU
+    // interpolation' check relies on it.
+    bool perCallOk = false, perCallFailed = false;
+    if ( not sharedDone and not sharedFailed and not tetCnts.empty() )
+    {
+        perCallOk = dtfeGpuDepositAveraged1( tetVerts, tetDens, tetVels, tetScal, tetVols, tetCnts, tetFlats,
+                                             sobolTable, dxv, nGrid, fDen, fVel, fGrad, fScal, fSGrad, exactAvg, gpuOut, metalErr );
+        perCallFailed = not perCallOk;
+    }
+    if ( sharedDone )
+        metalDeposited = true;
+    else if ( perCallOk )
+    {
+        for (size_t i=0; i<gridSize; ++i)
+        {
+            if (fDen) (*density)[i] = Real(gpuOut.density[i]);
+#ifdef VELOCITY
+            if (fVel)
+                for (size_t j=0; j<noVelComp; ++j)
+                    (*velocity)[i][j] = Real(gpuOut.velocity[i*3+j]);
+            if (fGrad)
+                for (size_t q=0; q<noGradComp; ++q)
+                    (*velocity_gradient)[i][q] = Real(gpuOut.grad[i*9+q]);
+#endif
+#ifdef SCALAR
+            if (fScal)  (*scalar)[i][0] = Real(gpuOut.scalar[i]);
+            if (fSGrad) for (int q=0; q<NO_DIM; ++q) (*scalar_gradient)[i][q] = Real(gpuOut.scalar_grad[i*3+q]);
+#endif
+        }
+        metalDeposited = true;
+    }
+    else if ( perCallFailed )
+    {
+        MESSAGE::Warning warning( userOptions.verboseLevel );
+        warning << "DTFE " << gpuBackendName() << " deposit unavailable (" << metalErr << "); using the CPU interpolation.\n" << MESSAGE::EndWarning;
+        ++dtfeGpuFallbacks;
+    }
+    else if ( nTetsDeposited == 0 )
+        metalDeposited = true;              // no tetrahedra in the region: nothing to deposit either way
+    return metalDeposited;
+}
+#else
+// Warns once that --gpu needs a GPU build of this binary; the pass runs on the CPU.
+static inline void avg1NoGpuWarning(User_options &userOptions)
+{
+    if ( userOptions.useMetal )
+    {
+#ifndef PHASE_SPACE
+        ++dtfeGpuFallbacks;
+#endif
+        static bool warned = false;
+        if ( !warned )
+        {
+            warned = true;
+            MESSAGE::Warning warning( userOptions.verboseLevel );
+            warning << "--gpu requested but this binary was built without GPU support (rebuild with METAL=1 on a Mac, CUDA=1 or HIP=1 on Linux; or NO_DIM!=3 / MY_SCALAR); using the CPU interpolation.\n" << MESSAGE::EndWarning;
+        }
+    }
+}
+#endif // DTFE_GPU_ACTIVE
+
+// Divides the accumulated contributions by the grid-cell volume, which turns them into volume averages.
+static inline void avg1Normalize(Field &field, Avg1Grids const &grids, Real const gridCellVolume)
+{
+    std::vector<Real>                         *density = grids.density;
+    std::vector< Pvector<Real,noVelComp> >    *velocity = grids.velocity;
+    std::vector< Pvector<Real,noGradComp> >   *velocity_gradient = grids.velocity_gradient;
+    std::vector< Pvector<Real,noScalarComp> > *scalar = grids.scalar;
+    std::vector< Pvector<Real,noScalarGradComp> > *scalar_gradient = grids.scalar_gradient;
+    if (field.density)
+        for (vector<Real>::iterator it=density->begin(); it!=density->end(); ++it)
+            *it /= gridCellVolume;
+#ifdef VELOCITY
+    if (field.velocity)
+        for (vector< Pvector<Real,noVelComp> >::iterator it=velocity->begin(); it!=velocity->end(); ++it)
+            *it /= gridCellVolume;
+    if (field.velocity_gradient)
+        for (vector< Pvector<Real,noGradComp> >::iterator it=velocity_gradient->begin(); it!=velocity_gradient->end(); ++it)
+            *it /= gridCellVolume;
+#endif
+#ifdef SCALAR
+    if (field.scalar)
+        for (vector< Pvector<Real,noScalarComp> >::iterator it=scalar->begin(); it!=scalar->end(); ++it)
+            *it /= gridCellVolume;
+    if (field.scalar_gradient)
+        for (vector< Pvector<Real,noScalarGradComp> >::iterator it=scalar_gradient->begin(); it!=scalar_gradient->end(); ++it)
+            *it /= gridCellVolume;
+#endif
 }
 
 // Volume-averaged grid interpolation (method 1): quasi-Monte-Carlo sampling inside each Delaunay cell,
@@ -375,35 +686,15 @@ void interpolateGrid_averaged_1(DT &dt,
     std::vector< Pvector<Real,noGradComp> >   *velocity_gradient = &(quantities->velocity_gradient);
     std::vector< Pvector<Real,noScalarComp> > *scalar = &(quantities->scalar);
     std::vector< Pvector<Real,noScalarGradComp> > *scalar_gradient = &(quantities->scalar_gradient);
+    Avg1Grids const grids{ density, velocity, velocity_gradient, scalar, scalar_gradient };
 
 
     MESSAGE::Message message( userOptions.verboseLevel );
-    if ( exactAvg )
-        message << "\nComputing interpolation of the fields volume averaged over the sampling cell on a regular "
-                << MESSAGE::printElements( nGrid, NO_DIM, "*" ) << " grid in the region "
-                << boxCoordinates.print()
-                << ". The volume average integrates the linear interpolant EXACTLY over every grid-cell/tetrahedron intersection (--exact-average, r3d; '--samples' is ignored).\n"
-                << "\t Done: " << MESSAGE::Flush;
-    else
-        message << "\nComputing interpolation of the fields volume averaged over the sampling cell on a regular "
-            << MESSAGE::printElements( nGrid, NO_DIM, "*" ) << " grid in the region "
-            << boxCoordinates.print()
-            << ". The volume average is done using Monte Carlo sampling in each of the triangles/tetrahedra of the Delaunay triangulation. "
-            << "There are " << NN << " random sampling points on average in each grid cell of the output fields (the random samples in the Delaunay triangulation's triangles/tetrahedra are proportional to the area/volume of the cell).\n"
-            << "\t Done: " << MESSAGE::Flush;
+    avg1Announce( message, nGrid, boxCoordinates, NN, exactAvg );
     
     // zero-initialize all grid fields
     size_t const gridSize = (NO_DIM==2) ? nGrid[0]*nGrid[1] : nGrid[0]*nGrid[1]*nGrid[2];
-    if ( field.density ) assingZeroValues<Real>( density, gridSize );
-    if ( field.velocity ) assingZeroValues< Pvector<Real,noVelComp> >( velocity, gridSize );
-    if ( field.velocity_gradient ) assingZeroValues< Pvector<Real,noGradComp> >( velocity_gradient, gridSize );
-    if ( field.scalar ) assingZeroValues< Pvector<Real,noScalarComp> >( scalar, gridSize );
-    if ( field.scalar_gradient ) assingZeroValues< Pvector<Real,noScalarGradComp> >( scalar_gradient, gridSize );
-    if ( field.velocity_std )
-    {
-        MESSAGE::Warning warning(userOptions.verboseLevel);
-        warning << "You cannot use the averaging method 1 (Monte Carlo sampling inside the Delaunay cell) to compute the velocity standard deviation inside the grid cell. Please use the averaging method 2 '--method 2' (Monte Carlo sampling inside the grid cell) to compute the velocity standard deviation.\n" << MESSAGE::EndWarning;
-    }
+    avg1ZeroGrids( userOptions, field, gridSize, grids );
     // without cells there is nothing to interpolate
     if ( dt.number_of_vertices()<NO_DIM+1 )
     {
@@ -438,13 +729,13 @@ void interpolateGrid_averaged_1(DT &dt,
     // tests/dtfe_mc_average_check.sh checks the mass, the momentum and the split invariance. --exact-average keeps
     // CGAL's order. DTFE_MC_LEGACY=1 selects the uncentred CGAL-order realization (A/B, and to reproduce grids
     // made with it).
-    bool const mcLegacy = getenv("DTFE_MC_LEGACY") != nullptr and atoi( getenv("DTFE_MC_LEGACY") ) != 0;
+    bool const mcLegacy = Env::flag( "DTFE_MC_LEGACY" );
     bool const legacyOrder = exactAvg or mcLegacy;
     bool const centreMC = not exactAvg and not mcLegacy;
     if ( mcLegacy and not exactAvg )
     {
         MESSAGE::Warning warning( userOptions.verboseLevel );
-        warning << "DTFE_MC_LEGACY=1: the Monte-Carlo '_a' average uses the pre-2026-10-13 realization (CGAL vertex order, no centring), which loses ~0.2-0.3% of the mass and depends on the partition/thread split.\n" << MESSAGE::EndWarning;
+        warning << "DTFE_MC_LEGACY=1: the Monte-Carlo '_a' average uses the uncentred CGAL-order realization (vertex(0) as the base), which loses ~0.2-0.3% of the mass and depends on the partition/thread split.\n" << MESSAGE::EndWarning;
     }
     // samples in a multi-cell tetrahedron: proportional to its volume, at least minNN and at most maxNN
     auto sampleCount = [&](Real const cellVolume) -> size_t {
@@ -476,24 +767,7 @@ void interpolateGrid_averaged_1(DT &dt,
     // Any failure (no device, kernel compile, buffer alloc) falls back to the CPU loop below.
     bool metalDeposited = false;
 #ifdef DTFE_GPU_ACTIVE
-    bool tryMetal = userOptions.useMetal;   // (--exact-average runs on the GPU too: depositExactAverage)
-#ifdef SCALAR
-    if ( tryMetal and (field.scalar or field.scalar_gradient) and noScalarComp != 1 )
-    {
-        MESSAGE::Warning warning( userOptions.verboseLevel );
-        warning << "--gpu supports ONE scalar component (this build has NO_SCALARS=" << noScalarComp << "); using the CPU interpolation for this pass.\n" << MESSAGE::EndWarning;
-        tryMetal = false;
-        ++dtfeGpuFallbacks;
-    }
-#endif
-    // the single-cell fast path ships 32-bit flat grid indices to the GPU
-    if ( tryMetal and gridSize > size_t(UINT32_MAX) )
-    {
-        MESSAGE::Warning warning( userOptions.verboseLevel );
-        warning << "--gpu does not support more than 2^32 grid cells; using the CPU interpolation.\n" << MESSAGE::EndWarning;
-        tryMetal = false;
-        ++dtfeGpuFallbacks;
-    }
+    bool tryMetal = avg1GpuUsable( userOptions, field, gridSize );
     if ( tryMetal )
     {
         bool const fDen = field.density;
@@ -655,169 +929,13 @@ void interpolateGrid_averaged_1(DT &dt,
 #endif
         }
 
-        // Order the tetrahedra along a Morton curve of their base cell before dispatch, so the
-        // threads running together deposit into neighbouring cells: the deposit is bound by its
-        // atomics, and random cells across a 2 GB grid cost 3x the throughput of local ones (TLB
-        // and cache reach), measured on the shared full grid of a 512^3 run. No cost sort (by
-        // sample count, so that a chunk's threads are uniformly sized) is needed: the
-        // work items bound every thread to itemSamples samples (the per-tet A/B kernel,
-        // DTFE_GPU_ITEMS=0, pays for that with its imbalance). The permutation is applied one
-        // array at a time so only a single extra copy is alive at once.
-        {
-            size_t const nT = tetCnts.size();
-            std::vector< std::pair<uint32_t,uint32_t> > order(nT);
-            for (size_t t=0; t<nT; ++t)
-                order[t] = std::make_pair( tetKeys[t], uint32_t(t) );
-            std::vector<uint32_t>().swap( tetKeys );
-            std::sort( order.begin(), order.end() );
-            if ( getenv("DTFE_METAL_TIMING") )
-            {   // how many distinct base cells the 32 consecutive work items of a SIMD group touch
-                // (16-sample items; a lower bound on the cell sharing a SIMD-group reduction could use)
-                size_t lane = 0, distinct = 0, groups = 0, sumDistinct = 0; uint32_t last = ~0u;
-                for (size_t i=0; i<nT; ++i)
-                {
-                    uint32_t const n = tetCnts[order[i].second];
-                    size_t const items = n ? (n + 15) / 16 : 1;
-                    for (size_t k=0; k<items; ++k)
-                    {
-                        if ( lane==0 ) { distinct = 0; last = ~0u; }
-                        if ( order[i].first != last ) { ++distinct; last = order[i].first; }
-                        if ( ++lane == 32 ) { lane = 0; ++groups; sumDistinct += distinct; }
-                    }
-                }
-                fprintf( stderr, "DTFE Metal order: %zu tetrahedra, %zu SIMD groups of 32 items, %.1f distinct base cells per group (Morton shift %d)\n",
-                         nT, groups, groups ? double(sumDistinct)/double(groups) : 0., mortonShift );
-            }
-            {
-                std::vector<float> sv(nT*12);
-                for (size_t i=0; i<nT; ++i)
-                { size_t const src = order[i].second; for (int k=0; k<12; ++k) sv[i*12+k] = tetVerts[src*12+k]; }
-                tetVerts.swap(sv);
-            }
-            {
-                std::vector<float> sd(nT*4);
-                for (size_t i=0; i<nT; ++i)
-                { size_t const src = order[i].second; for (int k=0; k<4; ++k) sd[i*4+k] = tetDens[src*4+k]; }
-                tetDens.swap(sd);
-            }
-            if ( needVel )
-            {
-                std::vector<float> su(nT*12);
-                for (size_t i=0; i<nT; ++i)
-                { size_t const src = order[i].second; for (int k=0; k<12; ++k) su[i*12+k] = tetVels[src*12+k]; }
-                tetVels.swap(su);
-            }
-            if ( needScal )
-            {
-                std::vector<float> ss(nT*4);
-                for (size_t i=0; i<nT; ++i)
-                { size_t const src = order[i].second; for (int k=0; k<4; ++k) ss[i*4+k] = tetScal[src*4+k]; }
-                tetScal.swap(ss);
-            }
-            {
-                std::vector<float> so(nT);
-                for (size_t i=0; i<nT; ++i) so[i] = tetVols[order[i].second];
-                tetVols.swap(so);
-            }
-            {
-                std::vector<uint32_t> sc(nT);
-                for (size_t i=0; i<nT; ++i) sc[i] = tetCnts[order[i].second];
-                tetCnts.swap(sc);
-            }
-            {
-                std::vector<uint32_t> sf(nT);
-                for (size_t i=0; i<nT; ++i) sf[i] = tetFlats[order[i].second];
-                tetFlats.swap(sf);
-            }
-        }
-
-        std::vector<float> sobolTable( quasiRandomNumbers_buf.begin(), quasiRandomNumbers_buf.end() );
-        double dxv[3] = { double(dx[0]), double(dx[1]), double(dx[2]) };
-        size_t const nTetsDeposited = tetCnts.size();   // the deposit call consumes (frees) the arrays
-        DTFEGpuGrids gpuOut;
-        std::string metalErr;
-        message << gpuBackendName() << " GPU (" << gpuDeviceName() << ", " << nTetsDeposited << " tetrahedra) ... " << MESSAGE::Flush;
-
-        // The shared full grid of this DTFE_parallel call (dtfeGpuSharedBegin in DTFE.cpp): this
-        // sub-domain's samples land at full-grid cells subgridOffset + cell, and the main thread adds
-        // the grid into the output afterwards -- so this thread's own sub-grid stays ZERO. A batch the
-        // device hands back (allocation, watchdog) leaves its owner box zeroed and falls through to the
-        // per-call path below, then to the CPU loop.
-        bool sharedDone = false, sharedFailed = false;
-        if ( dtfeGpuSharedActive() and userOptions.subgridOffset.size()==size_t(NO_DIM) )
-        {
-            size_t subOff[3] = { userOptions.subgridOffset[0], userOptions.subgridOffset[1], userOptions.subgridOffset[2] };
-            if ( dtfeGpuSharedDeposit( tetVerts, tetDens, tetVels, tetScal, tetVols, tetCnts, tetFlats,
-                                       sobolTable, dxv, nGrid, subOff, metalErr ) )
-                sharedDone = true;
-            else if ( not tetCnts.empty() )     // the arrays survive only when the upload itself failed
-            {
-                MESSAGE::Warning warning( userOptions.verboseLevel );
-                warning << "DTFE " << gpuBackendName() << " shared grid handed this sub-domain back (" << metalErr << "); depositing it on its own.\n" << MESSAGE::EndWarning;
-            }
-            else if ( nTetsDeposited > 0 )
-            {   // consumed by the upload but the dispatch failed: nothing left for the per-call path
-                MESSAGE::Warning warning( userOptions.verboseLevel );
-                warning << "DTFE " << gpuBackendName() << " shared grid failed for this sub-domain (" << metalErr << "); using the CPU interpolation.\n" << MESSAGE::EndWarning;
-                ++dtfeGpuFallbacks;
-                sharedFailed = true;
-            }
-        }
-        // The per-call path. A deposit that fails AFTER its upload consumed the arrays (the retry policy gave up)
-        // warns too, so a runtime fallback to the CPU loop below is never silent -- the suites' 'using the CPU
-        // interpolation' check relies on it.
-        bool perCallOk = false, perCallFailed = false;
-        if ( not sharedDone and not sharedFailed and not tetCnts.empty() )
-        {
-            perCallOk = dtfeGpuDepositAveraged1( tetVerts, tetDens, tetVels, tetScal, tetVols, tetCnts, tetFlats,
-                                                 sobolTable, dxv, nGrid, fDen, fVel, fGrad, fScal, fSGrad, exactAvg, gpuOut, metalErr );
-            perCallFailed = not perCallOk;
-        }
-        if ( sharedDone )
-            metalDeposited = true;
-        else if ( perCallOk )
-        {
-            for (size_t i=0; i<gridSize; ++i)
-            {
-                if (fDen) (*density)[i] = Real(gpuOut.density[i]);
-#ifdef VELOCITY
-                if (fVel)
-                    for (size_t j=0; j<noVelComp; ++j)
-                        (*velocity)[i][j] = Real(gpuOut.velocity[i*3+j]);
-                if (fGrad)
-                    for (size_t q=0; q<noGradComp; ++q)
-                        (*velocity_gradient)[i][q] = Real(gpuOut.grad[i*9+q]);
-#endif
-#ifdef SCALAR
-                if (fScal)  (*scalar)[i][0] = Real(gpuOut.scalar[i]);
-                if (fSGrad) for (int q=0; q<NO_DIM; ++q) (*scalar_gradient)[i][q] = Real(gpuOut.scalar_grad[i*3+q]);
-#endif
-            }
-            metalDeposited = true;
-        }
-        else if ( perCallFailed )
-        {
-            MESSAGE::Warning warning( userOptions.verboseLevel );
-            warning << "DTFE " << gpuBackendName() << " deposit unavailable (" << metalErr << "); using the CPU interpolation.\n" << MESSAGE::EndWarning;
-            ++dtfeGpuFallbacks;
-        }
-        else if ( nTetsDeposited == 0 )
-            metalDeposited = true;              // no tetrahedra in the region: nothing to deposit either way
+        Avg1GpuCtx gpu{ userOptions, message, nGrid, dx, gridSize, exactAvg, fDen, fVel, fGrad, fScal, fSGrad, needVel,
+                        needScal, mortonShift, tetVerts, tetDens, tetVels, tetScal, tetVols, tetCnts, tetFlats, tetKeys };
+        avg1MortonOrder( gpu );
+        metalDeposited = avg1GpuDispatch( gpu, grids, quasiRandomNumbers_buf );
     }
 #else
-    if ( userOptions.useMetal )
-    {
-#ifndef PHASE_SPACE
-        ++dtfeGpuFallbacks;
-#endif
-        static bool warned = false;
-        if ( !warned )
-        {
-            warned = true;
-            MESSAGE::Warning warning( userOptions.verboseLevel );
-            warning << "--gpu requested but this binary was built without GPU support (rebuild with METAL=1 on a Mac, CUDA=1 or HIP=1 on Linux; or NO_DIM!=3 / MY_SCALAR); using the CPU interpolation.\n" << MESSAGE::EndWarning;
-        }
-    }
+    avg1NoGpuWarning( userOptions );
 #endif // DTFE_GPU_ACTIVE
 
 
@@ -1182,26 +1300,7 @@ void interpolateGrid_averaged_1(DT &dt,
 
 
 
-    // divide by grid-cell volume to turn accumulated contributions into volume averages
-    if (field.density)
-        for (vector<Real>::iterator it=density->begin(); it!=density->end(); ++it)
-            *it /= gridCellVolume;
-#ifdef VELOCITY
-    if (field.velocity)
-        for (vector< Pvector<Real,noVelComp> >::iterator it=velocity->begin(); it!=velocity->end(); ++it)
-            *it /= gridCellVolume;
-    if (field.velocity_gradient)
-        for (vector< Pvector<Real,noGradComp> >::iterator it=velocity_gradient->begin(); it!=velocity_gradient->end(); ++it)
-            *it /= gridCellVolume;
-#endif
-#ifdef SCALAR
-    if (field.scalar)
-        for (vector< Pvector<Real,noScalarComp> >::iterator it=scalar->begin(); it!=scalar->end(); ++it)
-            *it /= gridCellVolume;
-    if (field.scalar_gradient)
-        for (vector< Pvector<Real,noScalarGradComp> >::iterator it=scalar_gradient->begin(); it!=scalar_gradient->end(); ++it)
-            *it /= gridCellVolume;
-#endif
+    avg1Normalize( field, grids, gridCellVolume );
     
     message << "100%\n" << MESSAGE::Flush;
     

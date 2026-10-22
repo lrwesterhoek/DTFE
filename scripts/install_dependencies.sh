@@ -1,12 +1,10 @@
+#!/usr/bin/env bash
 # Install DTFE build dependencies on macOS, Ubuntu/Debian, Fedora/RHEL/CentOS, Arch, openSUSE.
 
 set -e
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
+source "$(dirname "${BASH_SOURCE[0]}")/install_lib.sh"   # term_colours
+term_colours
 
 print_info() {
     echo -e "${BLUE}[INFO]${NC} $1"

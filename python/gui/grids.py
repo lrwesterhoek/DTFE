@@ -230,7 +230,7 @@ CUBE_EAGER_BYTES = min(int(2e9), CUBE_CACHE_BYTES)
 # again by a re-run is read again (keyed on the path alone, Explore would keep showing the old run's values
 # until the launcher restarted). The slice worker and the GUI thread (Save figure...)
 # both come here: every look at the dict is under the lock, the disk read is not (drop_cubes() from the
-# Run button must never wait on the T7).
+# Run button must never wait on a slow external disk).
 _CUBES: dict[tuple, np.ndarray] = {}
 _CUBES_LOCK = threading.Lock()
 # While the launcher runs a job the cache keeps at most RUN_CUBE_BYTES: the binary's auto-tuner budgets from the
@@ -449,7 +449,7 @@ class OutputSet:
     def _memmap(self, name: str, axis: int | None = None, index: int = 0, cache: bool = True) -> np.ndarray:
         """The field's array -- the cached cube when _cached_cube() keeps one -- or, for a 3D grid, just the
         plane 'index' along 'axis', read from the file. NEVER a memmap: a mapped page of a drive unplugged
-        meanwhile (the T7) kills the whole launcher with SIGBUS, which Python cannot catch; a read fails with
+        meanwhile (an external disk) kills the whole launcher with SIGBUS, which Python cannot catch; a read fails with
         an OSError the slice worker reports. A 2D grid is read whole. cache False: a cube cached
         already, else the plane; no new cube read."""
         ff = self.files[name]
@@ -1116,9 +1116,9 @@ def find_outputs(data_root, extra_dirs=()) -> list[tuple[str, OutputSet]]:
     """(menu title, OutputSet) for every run with grids: the TNG layout under the data root, then
     the custom-snapshot output directories."""
     out = []
-    root = Path(data_root)
+    root = Path(data_root).expanduser()
     seen = set()
-    if root.is_dir():
+    if str(data_root).strip() and root.is_dir():         # an empty root is none, not the working directory
         for pattern in ("*/snapdir_*/*.a_den", "*/*/snapdir_*/*.a_den", "*/snapdir_*/*.den", "*/*/snapdir_*/*.den"):
             for f in sorted(root.glob(pattern)):
                 prefix = f.stem                 # 'snap_z0.5.a_den' -> 'snap_z0.5' (no grid suffix has a dot)

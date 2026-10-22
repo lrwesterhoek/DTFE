@@ -23,7 +23,9 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-TMP = os.path.join(HERE, "tmp")
+# the suites' temp root, as the shell suites use it: $DTFE_TEST_TMP, else ${TMPDIR:-/tmp}/dtfe-tests
+TMP = os.path.join(os.environ.get("DTFE_TEST_TMP") or os.path.join(os.environ.get("TMPDIR") or "/tmp", "dtfe-tests"),
+                   "ps_3d_test")
 
 N = 48
 GRID = 96

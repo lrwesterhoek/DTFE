@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
 from scipy.stats import norm
 import warnings
-from dtfelib.figures import save_plot_to_multiple_paths
+from dtfelib.figures import save_figure
 from dtfelib import make_parser, sim_dir
 import config
 from dtfelib import figures as style
@@ -147,7 +147,7 @@ def plot_pdfs(nu_values, redshift=None, output_path=None):
     plt.tight_layout()
     
     if output_path:
-        save_plot_to_multiple_paths(plt.gcf(), output_path, dpi=DPI, bbox_inches='tight')
+        save_figure(plt.gcf(), output_path, dpi=DPI, bbox_inches='tight')
         plt.close()
     else:
         plt.show()
@@ -198,7 +198,7 @@ def plot_cdfs(nu_values, redshift=None, output_path=None):
     plt.tight_layout()
     
     if output_path:
-        save_plot_to_multiple_paths(plt.gcf(), output_path, dpi=DPI, bbox_inches='tight')
+        save_figure(plt.gcf(), output_path, dpi=DPI, bbox_inches='tight')
         plt.close()
     else:
         plt.show()
@@ -252,7 +252,7 @@ def plot_number_density_vs_threshold(nu_values, box_size_mpc, redshift=None, out
     plt.tight_layout()
     
     if output_path:
-        save_plot_to_multiple_paths(plt.gcf(), output_path, dpi=DPI, bbox_inches='tight')
+        save_figure(plt.gcf(), output_path, dpi=DPI, bbox_inches='tight')
         plt.close()
     else:
         plt.show()
@@ -268,7 +268,6 @@ def process_snapshot(snapshot, redshift, args):
         p = pipeline.products(snapshot, redshift, sim=args.sim, method=args.method, prefix=args.prefix,
                               data_root=args.data_root)
         cp = p.critical_points()
-        style.note_source(p.fs)                     # the thesis mirror takes the thesis box's standard DTFE only
         box_size = p.fs.meta.box_mpc
         grid_n = p.fs.grid_n
         p.release()
@@ -400,7 +399,7 @@ def create_evolution_summary(results):
         style.set_title(ax1, 'Evolution of Critical Point Number Density')
         ax1.grid(True, alpha=0.3)
         plt.tight_layout()
-        save_plot_to_multiple_paths(
+        save_figure(
             fig, Path(OUTPUT_DIR) / 'critical_point_density_evolution.png',
             dpi=DPI, bbox_inches='tight')
         plt.close(fig)
@@ -416,7 +415,7 @@ def create_evolution_summary(results):
         ax2.legend()
         ax2.grid(True, alpha=0.3)
         plt.tight_layout()
-        save_plot_to_multiple_paths(
+        save_figure(
             fig, Path(OUTPUT_DIR) / 'critical_point_fractions_evolution.png',
             dpi=DPI, bbox_inches='tight')
         plt.close(fig)

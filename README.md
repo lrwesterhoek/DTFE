@@ -1,21 +1,33 @@
-# The DTFE public software
+# Lamina
 
-The DTFE public code is a C++ implementation of the **Delaunay Tessellation Field Interpolation (DTFE)** method. Its purpose is to interpolate quantities stored at the location of an unstructured set of points to a regular grid using the maximum of information contained in the input points set. In particular, the code can calculate the following cosmological quantities:
-* the density field - this is calculated directly from the point distribution,
-* the velocity field and derivatives (e.g. gradient, divergence, vorticity) - uses the velocity at each particle position, and
-* general vector quantities and their derivatives - these quantities must be given as input for each point in the set.
+**Lamina** (Linear Adaptive Multi-stream Interpolation for N-body Analysis) turns the particles of a cosmological
+simulation into continuous density and velocity fields with two estimators built on Delaunay tessellations, in two and
+three dimensions:
 
-The code was written with the purpose of analysing cosmological simulations and galaxy redshift survey. Even though the code was designed with astrophysics in mind, it can be used for problems in a wide range of fields where one needs to interpolate from a discrete set of points to a grid.
+* **DTFE**, the Delaunay Tessellation Field Estimator ([Schaap & van de Weygaert 2000](https://ui.adsabs.harvard.edu/abs/2000A%26A...363L..29S/abstract)), run by the program
+  `DTFE`: the particles are tessellated where they are and every field is linear inside each tetrahedron, so the
+  resolution follows the particles from voids to clusters. Lamina extends the DTFE public software of
+  [Cautun & van de Weygaert (2011)](https://ui.adsabs.harvard.edu/abs/2011arXiv1105.0370C/abstract).
+* **PS-DTFE**, the phase-space DTFE ([Feldbrugge 2024](https://arxiv.org/abs/2402.16234)), run by the program `PS-DTFE`: the particles are
+  tessellated at their initial (Lagrangian) positions, before any shell crossing, and each tetrahedron is followed to
+  where the simulation moved it. Where the dark-matter sheet has folded, a point lies in several streams: PS-DTFE
+  resolves each of them, where DTFE averages them into one.
 
-The code was designed using a modular philosophy and with a wide set of features that can easily be selected using the different program options. The DTFE code is also written using OpenMP directives which allow it to run in parallel on shared-memory architectures.
+A *lamina* is a thin sheet: the dark-matter sheet in phase space that PS-DTFE tessellates, and the walls of the cosmic
+web that both estimators resolve without smoothing them away.
 
-The code comes with a complete [documentation](docs/DTFE_user_guide.pdf) and with a multitude of examples that detail the program features. A test dataset and analysis of the code output is given in the [demo directory](demo): `./DTFE demo/z0_64.gadget out --grid 64 --field density --periodic --padding 12` works out of the box (the box is periodic, and its voids are wider than the default padding of 5 particle spacings: with it about 1% of the cells would lie outside the tessellation, which the run reports). [demo/COMMANDS.md](demo/COMMANDS.md) is a cheat sheet of every script and binary with its useful flag combinations.
+Around the two programs: GPU deposits (Metal on Apple Silicon, CUDA and HIP on NVIDIA and AMD), exact cell averages and
+evaluation at any point, a domain decomposition chosen from the machine's memory, resumable runs, a Python package
+(`dtfelib`), batch drivers for IllustrisTNG snapshots and a graphical launcher. The programs run in parallel on
+shared-memory machines (OpenMP). Although they were written for cosmological simulations and galaxy surveys, they
+interpolate any quantity known at a set of points onto a grid or at other points.
 
-The public release of the code is summarised in the arxiv publication [Cautun et al. (2011)](https://ui.adsabs.harvard.edu/abs/2011arXiv1105.0370C/abstract) and it is based on the method paper [Schaap and van de Weygaert (2000)](https://ui.adsabs.harvard.edu/abs/2000A%26A...363L..29S/abstract).
-
+The [user guide](docs/DTFE_user_guide.pdf) of the DTFE public software documents the original program and its paper,
+[Cautun & van de Weygaert (2011), arXiv:1105.0370](https://arxiv.org/abs/1105.0370), the method; this README and
+each program's `--full_help` document the rest. A test dataset and analysis of the code output is given in the [demo directory](demo): `./DTFE demo/z0_64.gadget out --grid 64 --field density --periodic --padding 12` works out of the box (the box is periodic, and its voids are wider than the default padding of 5 particle spacings: with it about 1% of the cells would lie outside the tessellation, which the run reports). [demo/COMMANDS.md](demo/COMMANDS.md) is a cheat sheet of every script and binary with its useful flag combinations.
 
 ## The DTFE method
-The Delaunay Tessellation Field Interpolation (DTFE) method represents the natural way of going from discrete samples/measurements to values on a periodic grid and it is especially suitable for astronomical data due to the following reasons:
+The Delaunay Tessellation Field Estimator (DTFE) method represents the natural way of going from discrete samples/measurements to values on a periodic grid and it is especially suitable for astronomical data due to the following reasons:
 * Preserves the multi-scale character of the point distribution. This is the case in numerical simulations of large scale structure where the density varies over more than 6 orders of magnitude.
 * Preserves the local geometry of the point distribution. This is important in recovering sharp features like the different components of the cosmic web (i.e. clusters, filaments, walls and voids).
 * The method does not depend on user defined parameters or choices.
@@ -163,8 +175,8 @@ grids (`dtfelib` and the launcher read either), at about twice the memory. The r
 `DTFE_PRECISION=double`, the launcher with its Precision setting. The GPU kernels are single precision: a double build
 hands the GPU float copies of its tetrahedra, so its GPU stream counts and caustic flags may differ from its CPU's in up
 to 1e-4 of the cells (identical in the single build). The PS-DTFE grids are exact 64-bit fixed-point sums on the GPU
-and the CPU (single build: identical from run to run at any thread count; `PS_METAL_FLOAT_MASS=1` /
-`PS_GPU_FLOAT_MASS=1` and `PS_METAL_FLOAT_MOMENTS=1` / `PS_GPU_FLOAT_MOMENTS=1` bring back float sums for comparison).
+and the CPU (single build: identical from run to run at any thread count; `PS_GPU_FLOAT_MASS=1` and
+`PS_GPU_FLOAT_MOMENTS=1` bring back float sums for comparison).
 A share without a 64-bit integer value (NaN, infinity, beyond 2^63 units) is left out and counted, and the run ends
 with a warning naming the grid.
 
@@ -190,13 +202,27 @@ the binary is refused with the name of the binary to use.
 | `variants` | `TBB=0 LIBDEFLATE=0`, `make library` and `demo/examples` linked against it |
 | `all` | `build core double 2d` |
 
-CI runs six jobs: build-and-test (build, core, gui, double, 2d), old-python, compile-variants, cudaemu (the GPU suites
+CI runs six jobs: build-and-test (build, core, gui, double, 2d), old-python (every .py parses under Python 3.10, and
+ruff's pyflakes rules pass), compile-variants, cudaemu (the GPU suites
 through the emulation at warp width 32 and 64), cuda-compile and hip-compile. The GPU suites need a GPU build and run
 by hand: `tests/dtfe_metal_check.sh`, `tests/gpu_scalar_check.sh`, `tests/gpu_mass_check.sh`,
 `tests/gpu_retry_check.sh`, `tests/dtfe_gpu_retry_check.sh` (and `tests/cudaemu_check.sh` on a `CUDAEMU=1` build).
-`DTFE_TEST_PRECISION=double tests/<suite>` runs a suite against the double pair. The standard-DTFE regression
+`DTFE_TEST_PRECISION=double tests/<suite>` runs a suite against the double pair. The suites run `PYTHON` when set, else the
+first python3 that imports numpy and h5py (`scripts/h5py_python.sh`). The standard-DTFE regression
 (`tests/run_tests.py`) compares a periodic 1000-particle run with `tests/reference/regression_periodic.txt` to 3e-4
 relative; after an intended change of the estimator regenerate it with `python3 tests/run_tests.py --update-ref`.
+
+Two development tools in `tests/dev/` (not run by CI; macOS):
+
+* `tests/dev/battery.sh <scratch dir>` runs everything above that a Mac can run, in 31 stages (about 1.5-2 h): the three
+  builds, the `core`, `double`, `2d` and `gui` stages, the GPU suites in single and double precision, and the Python
+  suites under CI's package versions with no simulation data. `tests/dev/make_ci_venv.sh` makes that Python (python
+  3.11, numpy 1.26.4, scipy 1.11.4, matplotlib 3.6.3; by default in `~/.venvs/dtfe-ci`). `--list` names the stages,
+  `--only` picks some, and `<scratch dir>/battery/SUMMARY.txt` records the commit and whether the tree changed
+  during the run.
+* `tests/dev/bytecmp.sh <reference binaries> <output dir>` checks that a change moves no output: ten runs of both
+  programs (single, double, 2D, CPU and GPU, one domain and partitioned) compared byte for byte with a copy of the six
+  binaries taken before the change.
 
 
 ## Running the binaries
@@ -242,6 +268,61 @@ exits with status 3.
 density grids in Fourier space (any method, PS-DTFE included); without `--periodic` it needs a `--region` at least half
 a cell inside the box. Only the density is interlaced. The CIC/TSC/PCS/NGP kernels get periodic images of their reach
 and are clipped at a face or partition seam.
+
+### Environment variables of the binaries
+
+`./DTFE` and `./PS-DTFE` read these besides their options (the drivers' knobs are under *Running on TNG snapshots*, the
+GPU knobs in [metal/README.md](metal/README.md), *Knobs*). One rule holds for all of them: an empty value is the same as
+an unset one; a switch is off when set to `0`, `false`, `no` or `off` (in any case) and on when set to anything else;
+a three-way one (on forces, off forbids) is automatic while unset or set to `auto`. A GPU knob's
+`*_METAL_*` spelling is an alias of its `*_GPU_*` name, read when that is unset.
+
+| variable | effect | default |
+|---|---|---|
+| `DTFE_RAM_GB` | the physical RAM the auto-tuner plans with, in GB (also skips its free-memory cap) | the machine's |
+| `DTFE_FREE_GB` | the memory the other programs leave free, in GB, as the auto-tuner and the memory gates see it | the system's figure |
+| `DTFE_MEM_FRACTION` | the auto-tuner's budget as a fraction of the RAM (0.1-0.95) | 0.60 |
+| `DTFE_MEM_BUDGET_GB` | the budget outright, in GB (still capped by the free memory less 4 GB) | unset: the fraction |
+| `DTFE_AUTO_MINN` | particles below which a run stays in one domain unless a split is predicted clearly faster | 2e6 |
+| `DTFE_AUTO_T_VERTEX`, `DTFE_AUTO_T_SAMPLE`, `DTFE_AUTO_T_POINT` | the speed split's single-thread seconds per vertex, per sample, per point | 3.6e-6, 3.5e-7, 7.5e-7 |
+| `DTFE_AUTO_PTS_N` | the number of points the auto-tuner budgets (a `--sample-points` file not written yet) | the file's count |
+| `DTFE_AUTO_PTS_STREAMS` | the mean streams per point it budgets (at least 1) | estimated from the particles |
+| `DTFE_AUTO_PTS_VELGRAD` | budgets the points' velocity gradients, as `--pts-vel-grad` does | off |
+| `DTFE_AUTO_PTS_BOXMEAN` | estimates the streams per point over the whole box instead of the points' own slab | off |
+| `DTFE_DEPOSIT_MEM_GB` | PS-DTFE CPU deposit: the memory its threads' private accumulator copies may take, in GB | 20% of the RAM, at least 2 |
+| `DTFE_DEPOSIT_THREADS` | threads of one partition's CPU deposit (PS-DTFE) and of the `--exact-average` deposit | the cores left per partition |
+| `DTFE_DEPOSIT_SLABS` | PS-DTFE CPU deposit in slabs along x: 1 forces, 0 forbids (the GPU-deferred tetrahedra's too) | automatic |
+| `DTFE_DEPOSIT_NSLABS` | the number of slabs (at most 64) | from the cost per plane |
+| `DTFE_PTS_THREADS` | threads of the point evaluation | the cores left per partition |
+| `DTFE_TBB_THREADS` | PS-DTFE: switches the parallel insert on (as `--parallel-triangulation`) with this many threads | off (the flag alone: the performance cores, at most 6) |
+| `DTFE_TESS_CACHE_THREADS` | threads per tessellation-cache load or save | up to 4 |
+| `DTFE_OVERLAP`, `DTFE_PS_OVERLAP` | the look-ahead of standard DTFE / PS-DTFE: 1 forces it (on the CPU too), 0 forbids it | with a GPU deposit |
+| `DTFE_MERGE_STAGE_GB` | PS-DTFE: a fixed cap on the partitions parked for the ordered merge, in GB (0: none parked) | the free-memory rule |
+| `DTFE_MERGE_SPILL` | PS-DTFE: 1 spills every parked partition to disk, 0 none | the free-memory rule |
+| `DTFE_SPILL_MIN_GB` | the free space a spill leaves on its disk, in GB | 16 in `$TMPDIR`, 2 in `--scratch-dir` |
+| `DTFE_SCRATCH_MIN_GB` | the smallest allocation `--scratch-dir` backs with a file, in GB | 1 |
+| `DTFE_CHECKPOINT`, `DTFE_PS_CHECKPOINT` | `0` writes no partition checkpoints (standard DTFE / PS-DTFE) | on |
+| `DTFE_NO_PROGRESS` | writes no `<prefix>.runlog.progress` | off |
+| `DTFE_OUTPUT_WAIT` | seconds to wait for a missing output folder before the rescue copy | 300 |
+| `DTFE_SERVE_INDEX` | `--serve`: 1 forces the cell index, 0 the walk (a composite server ignores 0) | automatic |
+| `DTFE_SERVE_BUDGET_GB` | composite `--serve`: the memory for the resident partitions, in GB | the auto-tuner's budget |
+| `DTFE_MC_LEGACY` | standard DTFE `--method 1`: the uncentred CGAL-order Monte-Carlo realization (A/B) | off |
+| `PS_MASS_AUDIT` | 1 prints each pass's mass bookkeeping, 2 adds the per-particle closure (one domain) | 0 |
+| `TMPDIR` | the rescue folder and the merge spills without `--scratch-dir` | `/tmp` |
+| `NO_COLOR` | no colours, for any non-empty value (the no-color.org convention, so `0` too) | colours on a terminal only |
+| `CLICOLOR_FORCE` | a switch: colours also through a pipe | off |
+
+For testing and debugging only: `DTFE_TEST_CHECKPOINT_FREE_BYTES` (the free bytes the checkpoint's room rule sees),
+`DTFE_TEST_EXIT_AFTER_PARTITIONS=k` (exits after the k-th merged partition: a killed run to resume),
+`DTFE_TEST_DELAY_PARTITION=i:s` (partition i starts s seconds late, which forces the staging),
+`DTFE_TEST_PARK_ROOM_GB` (the RAM parking's budget room), `DTFE_TEST_FXMERGE_SHIFT=n` (the `--fixed-point-merge`
+units n bits finer) and `DTFE_TEST_FXMERGE_SUM_LIMIT=n` (its sums capped at 2^n), for the overflow checks,
+`DTFE_TEST_NAN_SHARE=k` (every k-th share NaN: the exact sums' guard), `DTFE_AUTO_TUNE_DEBUG` (prints the
+standard auto-tuner's busiest partition per thread), `PS_DEBUG_DEGREES` (checks the lazy vertex degrees after a GPU
+deposit against a full pass), `DTFE_PTS_FULL_RECORDS` (keeps every point record member, unpacked: the packing test),
+`DTFE_TESS_CACHE_FINGERPRINT` (prints a loaded tessellation's structure fingerprint), `DTFE_TESS_CACHE_LEGACY` (writes
+the single-stream cache format), `DTFE_TESS_CACHE_ZLIB` (zlib instead of libdeflate) and `DTFE_TESS_CACHE_CGAL_IO`
+(CGAL's own tessellation reader and writer), the last two for comparisons.
 
 
 ## Phase-Space DTFE
@@ -334,9 +415,10 @@ A cell's value is either the field at the cell centre (`density`, ...) or its av
 * **Monte Carlo average** (standard DTFE `--method 1`, the binary's default; `--samples`, default an average of 100
   per cell). A tetrahedron is sampled at the first n points of a shared Sobol table, centred on its centroid and in a
   vertex order hashed from its positions, so the average is unbiased (the demo's box mean 1.00002) and the
-  realization does not depend on `--partition`, the thread count or the padding (cells agree to 4-6e-6). `DTFE_MC_LEGACY=1` reproduces the
-  older uncentred average, which lost 0.17-0.29% of the mass at z <= 2. `--seed` seeds method 2 (`--method 2`, random
-  points per cell, which also gives `velocityStd_a`), `--randomSample` and `--poisson`.
+  realization does not depend on `--partition`, the thread count or the padding (cells agree to 4-6e-6). `DTFE_MC_LEGACY=1` selects the
+  uncentred CGAL-order average, which loses 0.17-0.29% of the mass at z <= 2. `--seed` seeds method 2 (`--method 2`, random
+  points per cell; the only standard-DTFE path that computes `velocityStd_a`, which every other method and
+  `--exact-average` reject with an error), `--randomSample` and `--poisson`.
 * **Exact average** (`--exact-average`, standard DTFE) integrates the linear interpolant over every cell/tetrahedron
   intersection (the vendored [r3d](third_party/r3d/README.md) library, Powell & Abel 2015): no sampling noise, box mean
   1 to 3e-8 on TNG100-3-Dark. With `--gpu` the clipping runs on the GPU (6.6x the CPU on 0.26M particles at 256^3).
@@ -451,7 +533,7 @@ which eases back after a clean stretch (`DTFE_GPU_PACE_RECOVER_SEC`). Three fail
 or a lost device send that partition (standard DTFE: that sub-domain) to the CPU. The run log ends with
 `GPU deposit retries: N (innocent a, timeout b, oom c, other d)`. `DTFE_GPU_FAULT_AT=<k>[:innocent|timeout|oom|persist]`
 is the test hook. Standard DTFE's GPU `_a` grids are exact 64-bit fixed-point sums, so two `--gpu` runs are
-byte-identical (`DTFE_METAL_FLOAT_GRIDS=1` / `DTFE_GPU_FLOAT_GRIDS=1`: float atomics, for comparison).
+byte-identical (`DTFE_GPU_FLOAT_GRIDS=1`: float atomics, for comparison).
 
 **Tessellation cache.** Building the tessellation and its vertex densities is the dominant fixed cost (81% of a run on
 884736 particles). `--tessellation-cache DIR` (a local, non-synced folder) writes it once and later runs on the same
@@ -484,14 +566,17 @@ particles.
 
 ## Running on TNG snapshots
 
-The thesis workflow has three steps, run from the repository root and driven by `DTFE_DATA_ROOT` (where the
-simulations live; default `/Volumes/Samsung T7/Illustris TNG`) and `DTFE_SIM` (which one). `scripts/config.sh` holds
-the defaults and resolves either data layout: per family (`$DATA_ROOT/TNG100/TNG100-3-Dark/snapdir_099/`, the family
-being the name up to its first `-`) or flat (`$DATA_ROOT/TNG100-3-Dark/snapdir_099/`); `dtfelib` and
-`python/config.py` read the same variables. There is **no default simulation**: every run names it, with `-s` (the
-drivers), `--sim` (the plot scripts), `SIMS` (`run_ps_pipeline.sh`, `SIMS=all` for every simulation on disk) or
-`DTFE_SIM`; without one a script stops with "no simulation given". Each snapshot is one folder `snapdir_NNN` holding its merged, h-free
+The workflow has three steps, run from the repository root and driven by `DTFE_DATA_ROOT` (the folder that holds the
+simulations) and `DTFE_SIM` (which one). Neither has a default: `DTFE_DATA_ROOT` must be set (e.g.
+`export DTFE_DATA_ROOT=~/IllustrisTNG`; without it the drivers stop with "no data root"), and every run names the
+simulation, with `-s` (the drivers), `--sim` (the plot scripts), `SIMS` (`run_ps_pipeline.sh`, `SIMS=all` for every
+simulation on disk) or `DTFE_SIM` (without one a script stops with "no simulation given"). `scripts/config.sh` holds
+the defaults and resolves either data layout: per family (`$DTFE_DATA_ROOT/TNG100/TNG100-3-Dark/snapdir_099/`, the
+family being the name up to its first `-`) or flat (`$DTFE_DATA_ROOT/TNG100-3-Dark/snapdir_099/`); `dtfelib` and
+`python/config.py` read the same variables. Each snapshot is one folder `snapdir_NNN` holding its merged, h-free
 `combined_NNN.hdf5` and, after a run, `ps_output.*` (PS-DTFE) or `output.*` (standard DTFE) beside their `.runlog`.
+The files and fields of the TNG data are described in the
+[TNG data specifications](https://www.tng-project.org/data/docs/specifications/).
 
 1. **Download and merge** (a TNG API key in `~/.tng_api_key`, `TNG_API_KEY` or `-k`):
    `DTFE_SIM=TNG100-3-Dark scripts/download_snapshots.sh 50 99` fetches the raw chunks (`-c` the group catalogues,
@@ -508,13 +593,16 @@ drivers), `--sim` (the plot scripts), `SIMS` (`run_ps_pipeline.sh`, `SIMS=all` f
 **Run logs and safety.** A driver writes `<prefix>.runlog.partial` while it runs and renames it to `.runlog` on success
 or `.runlog.failed` on failure, so `.runlog` always belongs to the grids on disk. After a successful rerun the files of
 the earlier run that this one did not write move to `<prefix>.superseded/<date_time>/` (never deleted). A driver holds
-`<prefix>.runlog.lock` while it runs a snapshot (a second driver is refused), stops with exit 2 when the data disk is
-missing, and skips a snapshot whose folder is not writable or lacks room (`DTFE_SPACE_CHECK=0` skips the space check).
+`<prefix>.runlog.lock` while it runs a snapshot (a second driver is refused), stops with exit 2 when `DTFE_DATA_ROOT`
+is unset or the data disk is missing, and skips a snapshot whose folder is not writable or lacks room
+(`DTFE_SPACE_CHECK=0` skips the space check).
 
 | knob (environment) | meaning | default |
 |---|---|---|
-| `DTFE_DATA_ROOT`, `DTFE_SIM` | the data root and the simulation | root: `/Volumes/Samsung T7/Illustris TNG`; simulation: none, required |
-| `DTFE_FIGURES_ROOT` | where every figure goes (the plot scripts, `analyze.py`, the launcher) | `/Volumes/Samsung T7/Illustris TNG/figures` while that drive is mounted, else `python/figures` |
+| `DTFE_DATA_ROOT` | the folder that holds the simulations | none: required (a driver's `-d` names a simulation's folder instead) |
+| `DTFE_SIM` (or `-s`) | the simulation | none: required |
+| `DTFE_FIGURES_ROOT` | where every figure goes (the plot scripts, `analyze.py`, the launcher) | `python/figures` (git-ignored) |
+| `PYTHON` | the python the scripts (and the test suites) run for numpy and h5py; the launcher passes its own as `PY` | the first of `python3` on `PATH`, Homebrew's and `/usr/local`'s that imports both (`scripts/h5py_python.sh`) |
 | `DTFE_SIGMA_MPC` | the void catalogue's smoothing in Mpc, the same in every box (for the void scripts and `analyze.py export`) | unset: 10 cells |
 | `GRID_SIZE` (or `-g`) | cells per axis of the grids | 512 (`config.sh`; `DTFE_GRID_SIZE` too; the production grids of both estimators) |
 | `PADDING` | the padding of each partition (and in standard DTFE of each thread's sub-box) in mean particle spacings; `DTFE_PADDING` too | standard DTFE 15 (`run_dtfe.sh`), PS-DTFE 50 (`config.sh`; it matters only for an unsplit tessellation or `PS_LAG_PADDING=0`) |
@@ -540,40 +628,17 @@ The rest (`THREADS`, `PS_LINEAR_DEPOSIT`, `PS_CAUSTIC_CUSPS`, `PS_PARALLEL_TRI`,
 and the pipeline's `SIMS`, `SNAPS`, `NU`, `AXIS`, `CENTER`, `PLANES`, `THICKNESS`, `SUPERSAMPLE`, `WINDOW`, `PS_GPU`,
 `FORCE`) is listed in each script's `--help`.
 
-### The thesis runs
-
-`scripts/thesis_runs.sh STAGE ...` is the recipe of the grids on the data disk (`--help` gives each stage's settings,
-`DRY_RUN=1` prints every command). Times on the 64 GB / 10-core M1 Max:
-
-| stage | what | time, memory |
-|---|---|---|
-| `ps27` | PS-DTFE on the 27 snapshots (TNG100/300/50-3-Dark, z = 20 ... 0): 512^3, nine fields, GPU, a 52 GB budget, `SCRATCH_DIR` (default `~/DTFE-scratch`), the caustics and a 4096^2 image plane | 8.5 h; 34.5-44.9 GB resident |
-| `dtfe27` | standard DTFE on the same 27: exact cell average, padding 15, TNG50 4x4x4 four at a time, TNG300 5x5x5 and TNG100 3x3x3 ten at a time | 7.6 h |
-| `dtfe27planes` | standard-DTFE 4096^2 planes of the 27 under the prefix `output_plane` | ~9 h (an estimate), 15-25 GB |
-| `caustics`, `caustics2` | the caustic classes of TNG100-3-Dark z = 0, and z = 1 and 2, under the prefix `ps_caustic` | caustics2: ~10 min, ~41 GB per snapshot |
-| `voids` | every void figure of the three boxes (`SIMS=` limits them) | a few hours; the TNG300 fate census is the memory peak |
-| `overnight` | `dtfe` (TNG100 z = 0, 1, 5), `caustics2`, `refresh` (figure repairs), `prune` (the cache) | about 1-1.5 h |
-
-`all` runs ps27 dtfe27 dtfe27planes caustics caustics2 voids. Before each snapshot ps27, dtfe27, dtfe27planes and dtfe
-move its old files to `<data root>/_backup/<prefix>_<date>/...` (back after a failed run); a snapshot whose run log
-already shows the stage's settings is skipped (`FORCE=1` reruns it). Run one stage at a time with nothing else heavy
-beside it: the recipe holds `SCRATCH_DIR/thesis_runs.lock`, and the heavy stages wait up to `HEAVY_WAIT_SEC` (30 min)
-for another DTFE run to end.
-The memory budget is a cap: the auto-tuner also caps it by the memory free at the start, so the split depends on what
-else is open (each run log records it).
-
 ### Analysis
 
-`python3 python/analyze.py [check|compute|plot|all|export|voids|cache]` (default `all`) is the standard-DTFE thesis
-set: `compute` caches the smoothed density, Hessian and void catalogue, `plot` draws from the cache, `export` writes
-the void catalogues as CSV + HDF5, `voids` runs the void scripts, `cache` lists the cache namespaces (`--prune`
-lists what is unreachable, `--prune --yes` deletes it; `--move DIR [--yes]` moves the cache, e.g. out of iCloud
-Drive, and records the folder in `~/.config/dtfe/cache_dir`; `DTFE_CACHE_DIR` overrides it). The thesis `Figures/` tree
-takes the core figures only from `config.THESIS_SIMULATION` (TNG50-3-Dark) and standard DTFE; `--no-mirror` (or
-`DTFE_NO_MIRROR`) copies nothing there.
+`python3 python/analyze.py [check|compute|plot|all|export|voids|cache]` (default `all`) runs the core standard-DTFE
+analysis of `DTFE_SIM`: `compute` caches the smoothed density, Hessian and void catalogue, `plot` draws from the cache,
+`export` writes the void catalogues as CSV + HDF5, `voids` runs the void scripts, `cache` lists the cache namespaces
+(`--prune` lists what is unreachable, `--prune --yes` deletes it; `--move DIR [--yes]` moves the cache, e.g. out of a
+cloud-synced folder, and records the folder in `~/.config/dtfe/cache_dir`; `DTFE_CACHE_DIR` overrides it). Every
+figure goes under `DTFE_FIGURES_ROOT` (default `python/figures`).
 
-The plot scripts share `--data-root`, `--sim`, `--snap`, `--method auto|ps|dtfe`, `--prefix` (another grid set),
-`--raw` (cell-centre grids) and `--smooth` (cells). Field maps: plot_PS_DTFE.py, plot_DTFE.py, plot_cosmic_web.py,
+The plot scripts share `--data-root` (else `DTFE_DATA_ROOT`), `--sim`, `--snap`, `--method auto|ps|dtfe`, `--prefix`
+(another grid set), `--raw` (cell-centre grids) and `--smooth` (cells). Field maps: plot_PS_DTFE.py, plot_DTFE.py, plot_cosmic_web.py,
 plot_web_streams.py, plot_velDiv_den.py, plot_PDF_CDF.py, plot_shear_triaxial.py, plot_eigenvalues.py,
 plot_pk_compare.py; point-evaluated planes: plot_pointeval.py, plot_pointeval_panels.py; caustics:
 plot_caustic_skeleton.py (needs `.causticClass`; `--prefix ps_caustic` for the separate caustic runs); haloes:
@@ -590,7 +655,7 @@ first rises back to the mean (about 0.57 R_eff, searched out to min(24 sigma, L/
 also gives `delta08` (enclosed contrast -0.8) and `ridge` (the compensation ridge): `catalog.r_v_mpc(cat, 'delta08')`.
 The scripts use R_v and the *distinct* voids by default (a void centred inside a deeper one is left out;
 `--keep-overlaps` keeps them, plot_void_profiles.py `--radius r_eff` stacks in R_eff). `DTFE_VOID_GATE=none` drops the
-ellipsoid cut from the sample (outputs tagged `gatenone`, no thesis mirror). The radius settings are part of a
+ellipsoid cut from the sample (outputs tagged `gatenone`). The radius settings are part of a
 catalogue's identity: a cache made with others is re-measured on first load (about 15 s per 512^3 snapshot).
 Caveat: the -0.8 radius of a smoothed-field minimum follows the smoothing length, so a size function from it is not a
 test of the void abundance theory; `--size-rv delta08raw` measures it on the raw density instead.
@@ -617,21 +682,23 @@ particles per read). `python/tools/void_outlines.py` writes a snapshot's void ta
 `scripts/gui.sh` opens a PySide6 window for the things normally typed in a terminal (`--setup` reopens the first-run
 dialog, `--smoke` builds the window, prints what its jobs would use and quits). `scripts/install.sh` sets it up in its
 own environment (`~/.venvs/dtfe-gui`, about 1 GB, seeing the main Python's numpy and h5py; `DTFE_GUI_VENV` /
-`DTFE_GUI_PYTHON` override) and makes it launchable as an app (macOS: **DTFE Launcher** in Applications, which needs
+`DTFE_GUI_PYTHON` override) and makes it launchable as an app (macOS: **Lamina** in Applications, which needs
 Full Disk Access once for iCloud Drive and external disks; Linux: a menu entry). By hand:
 ```bash
 python3 -m venv ~/.venvs/dtfe-gui --system-site-packages
 ~/.venvs/dtfe-gui/bin/pip install PySide6
 ```
 
-The first start walks through the data folder, building the programs, the TNG API key and a **demo** (a synthetic
-crossed-wave simulation run in seconds and opened in Explore). The tabs:
+The first start walks through the data folder (the folder that holds the simulations, which the launcher keeps and
+hands to every job as `DTFE_DATA_ROOT`; it starts without one), building the programs, the TNG API key and a **demo**
+(a synthetic crossed-wave simulation run in seconds and opened in Explore). The tabs:
 - **Data**: what is on disk per snapshot; downloads (snapshots, group catalogues, merger trees, initial conditions) and
   merges them, with the size against the free disk.
 - **Grids**: one run of either estimator (`run_ps_dtfe.sh` / `run_dtfe.sh`): deposit, grid, fields, phase-space
   options, a hi-res slice, memory and merge settings, precision, presets.
 - **Custom snapshot**: either binary on any Gadget (HDF5 or binary) snapshot or text file, with its units, box,
-  periodicity and initial positions stated; 2D files run on the 2D binaries.
+  periodicity and initial positions stated; 2D files run on the 2D binaries. Its *Extra options* line passes any
+  program option the tab has no control for (typed as on a command line, after the tab's own).
 - **Pipeline**: `run_ps_pipeline.sh` for the chosen simulations, with the plane's geometry and the render options.
 - **Plots**: the scripts of `python/plot` and `analyze.py`, each with its own options.
 - **Explore**: maps of any run's grids (a slice read from disk), field, component, axis, scale and smoothing; a query
@@ -658,10 +725,17 @@ and `grids.py`, `presets.py`, `results.py`, `runs_view.py`, `setup_wizard.py`, `
 Import `app`, `explore` or `runspec` before any of their mixin modules.
 
 
+## Citing
+
+If you use Lamina, cite the methods you use, [Schaap & van de Weygaert (2000)](https://ui.adsabs.harvard.edu/abs/2000A%26A...363L..29S/abstract) for DTFE and
+[Feldbrugge (2024)](https://arxiv.org/abs/2402.16234) for PS-DTFE, and the DTFE public software it builds on,
+[Cautun & van de Weygaert (2011)](https://ui.adsabs.harvard.edu/abs/2011arXiv1105.0370C/abstract). [CITATION.cff](CITATION.cff) lists them with Lamina itself in a
+machine-readable form (GitHub's *Cite this repository*).
+
 ## Contributors
 * **Marius Cautun (Kapteyn Astronomical Institute, Durham University, Leiden University)** - *code and documentation.*
 * **Rien van de Weygaert (Kapteyn Astronomical Institute)** - *various discussions about the method and implementation.*
-* **Luuk Westerhoek (Kapteyn Astronomical Institute, University of Groningen)** - *phase-space DTFE, the exact / point evaluation methods, automatic memory management, the GPU backends (Metal, and its CUDA/HIP port) and the analysis pipeline (bachelor research project "Fate of Cosmic Voids").*
+* **Luuk Westerhoek (Kapteyn Astronomical Institute, University of Groningen)** - *phase-space DTFE, the exact / point evaluation methods, automatic memory management, the GPU backends (Metal, and its CUDA/HIP port) and the analysis pipeline.*
 
 
 ## License

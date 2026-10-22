@@ -61,8 +61,8 @@ Outputs (figures/void_population/<sim>/):
                               distinct voids by their raw spheres (largest first, no overlap), tagged '_draw'. Neither
                               is the default (measured below FIXED_R_SNAPS: re-centring removes most of TNG300's
                               smoothing dependence but halves the z = 0 count and breaks TNG100 z = 0)
-The figures are in the house style (dtfelib.figures: serif, config.DPI, titles only with config.SHOW_TITLES) and
-mirrored like the thesis figures. The counts of resolved and distinct voids against z are set by the
+The figures are in the house style (dtfelib.figures: serif, config.DPI, titles only with config.SHOW_TITLES).
+The counts of resolved and distinct voids against z are set by the
 ellipsoid gate (the 10 sigma max-axis cut turns on as the voids grow): the evolution figure draws the minima with an
 R_v (no gate) beside them and says so.
 Those names are PS-DTFE's default grids (ps_output.); another estimator or --prefix adds '_<method>' / '_<prefix>',
@@ -129,7 +129,6 @@ SIZE_SMOOTH_CELLS = 5.0          # the size function's catalogue smoothing in ce
                                  # MEASURED (TNG100, 10/5/3/2 cells): the median delta08 radius follows sigma (0.7,
                                  # 1.06, 1.03, 0.91 sigma) and measured/Vdn stays 1e-3-1e-2: the -0.8 sphere of a
                                  # minimum is a smoothing length, not a converged void size
-MIRROR = True                    # into the thesis Figures/ tree as well (dtfelib.figures; DTFE_NO_MIRROR turns it off)
 # The size function at FIXED radius (--size-fixed-r): the raw -0.8 radius (dtfelib.raw_radius) of
 # the distinct UNGATED voids from catalogues at several smoothings, compared only where every smoothing is complete.
 # Ungated, the abundance at fixed R above ~3 sigma converges with the smoothing (measured/Vdn at 8 Mpc, z = 0:
@@ -398,7 +397,7 @@ def size_function_figure(stats, panel, ztab, box, args, methods, path) -> dict:
                             f"against {SIZE_FUNCTION_MODEL.upper()} (delta_v = {theory.DELTA_V_LINEAR}, "
                             f"delta_c = {theory.DELTA_C})")
     fig.tight_layout(rect=(0, 0.07 if caveat else 0, 1, 1))
-    style.save_plot_to_multiple_paths(fig, path, dpi=config.DPI, mirror=MIRROR)
+    style.save_figure(fig, path, dpi=config.DPI)
     plt.close(fig)
     return out
 
@@ -872,7 +871,7 @@ def fixed_r_figure(fstats, snaps, sim, methods, path, model=SIZE_FUNCTION_MODEL,
                             f"{' about re-centred centres' if recentre else ''}, ungated ({'/'.join(methods)}) "
                             f"against {model.upper()}")
     fig.tight_layout(rect=(0, 0.035 * (len(verdicts) + 2) / max(len(rows), 1), 1, 1))
-    style.save_plot_to_multiple_paths(fig, path, dpi=config.DPI, mirror=MIRROR)
+    style.save_figure(fig, path, dpi=config.DPI)
     plt.close(fig)
     out["fixed_r_verdicts"] = np.array(verdicts)
     return out
@@ -1028,7 +1027,6 @@ def main():
             continue
         finally:
             prod.release()
-        style.note_source(prod.fs)                     # the thesis mirror's guard reads which grids these are
         stats[s] = snapshot_stats(cat, _n, args.keep_overlaps, args.size_rv, raw)
         if args.other_estimator and s in panel_want:   # only the panel snapshots are drawn: no catalogue for the rest
             oth = pipeline.products(s, sim=args.sim, method="dtfe" if method_used[s] == "ps" else "ps",
@@ -1057,7 +1055,7 @@ def main():
 
     outdir = FIGURE_ROOT / args.sim / pipeline.smoothing_tag()     # a non-default sigma: its own folder
     outdir.mkdir(parents=True, exist_ok=True)
-    # the names say what they hold: untagged for PS-DTFE's default grids, as every file on the T7 is; another
+    # the names say what they hold: untagged for PS-DTFE's default grids; another
     # estimator, a --prefix or --keep-overlaps is tagged so it never overwrites those (as the pk / profile files are)
     default_prefix = {"ps": "ps_output.", "dtfe": "output."}         # io's: an estimator's own grids
     grids = "+".join(sorted({m if prefix_used[s] == default_prefix.get(m) else prefix_used[s].rstrip(".")
@@ -1112,7 +1110,7 @@ def main():
         ax.grid(alpha=0.3)
     axes[-1].invert_xaxis()
     fig.tight_layout()
-    style.save_plot_to_multiple_paths(fig, outdir / f"population_evolution{name_tag}.png", dpi=config.DPI, mirror=MIRROR)
+    style.save_figure(fig, outdir / f"population_evolution{name_tag}.png", dpi=config.DPI)
     plt.close(fig)
 
     # ---- distribution figure ------------------------------------------------------------
@@ -1132,8 +1130,7 @@ def main():
         ax.set_xlabel(lab); ax.set_ylabel("pdf"); ax.legend(fontsize=8); ax.grid(alpha=0.3)
     style.set_suptitle(fig, f"{args.sim}: void population distributions ({'/'.join(methods)})")
     fig.tight_layout()
-    style.save_plot_to_multiple_paths(fig, outdir / f"population_distributions{name_tag}.png", dpi=config.DPI,
-                                      mirror=MIRROR)
+    style.save_figure(fig, outdir / f"population_distributions{name_tag}.png", dpi=config.DPI)
     plt.close(fig)
 
     # ---- abundance figure: n(> R_eff), dn/dlnR per Mpc^3, R_eff against the central delta
@@ -1176,7 +1173,7 @@ def main():
     style.set_suptitle(fig, f"{args.sim}: void abundance in R_v ({'/'.join(methods)}, "
                             f"{'' if args.keep_overlaps else 'distinct '}well-resolved voids, box {box[snaps[-1]]:.0f} Mpc)")
     fig.tight_layout()
-    style.save_plot_to_multiple_paths(fig, outdir / f"population_abundance{name_tag}.png", dpi=config.DPI, mirror=MIRROR)
+    style.save_figure(fig, outdir / f"population_abundance{name_tag}.png", dpi=config.DPI)
     plt.close(fig)
 
     sf_tag = "" if args.size_rv == SIZE_FUNCTION_RV else f"_{args.size_rv}"     # a non-default R_v: its own npz

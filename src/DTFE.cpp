@@ -49,6 +49,7 @@
 #include <limits>
 
 #include "message.h"
+#include "env_knobs.h"
 #include "auto_tune.h"
 #include "scratch_alloc.h"
 #include "ps_point_eval.h"
@@ -473,11 +474,8 @@ DTFE_State DTFE_setup(vector<Particle_data> *allParticles,
     if ( not userOptions.scratchDir.empty() )
     {
         double thresholdGB = 1.0;
-        if ( const char *env = std::getenv("DTFE_SCRATCH_MIN_GB") )
-        {
-            double v = std::atof(env);
-            if ( v > 0. ) thresholdGB = v;
-        }
+        if ( double const v = Env::real( "DTFE_SCRATCH_MIN_GB", 0. ); v > 0. )
+            thresholdGB = v;
         if ( ScratchAlloc::scratchArm( userOptions.scratchDir.c_str(), size_t(thresholdGB*1.e9) ) )
         {
             MESSAGE::Message message( userOptions.verboseLevel );
@@ -603,8 +601,8 @@ DTFE_State DTFE_setup(vector<Particle_data> *allParticles,
             // 64 GB machine). DTFE_TEST_PARK_ROOM_GB sets it (tests).
             userOptions.psParkRoom = report.budget - report.predicted;
         }
-        if ( char const *room = std::getenv( "DTFE_TEST_PARK_ROOM_GB" ) )
-            if ( room[0] != '\0' ) userOptions.psParkRoom = std::max( 0., std::atof( room ) ) * 1.e9;
+        if ( Env::isSet( "DTFE_TEST_PARK_ROOM_GB" ) )
+            userOptions.psParkRoom = std::max( 0., Env::real( "DTFE_TEST_PARK_ROOM_GB", 0. ) ) * 1.e9;
 #endif
         if ( userOptions.autoTuneReport )   // the memory check: the decision and prediction, nothing else
         {
@@ -1648,11 +1646,11 @@ static void psRunPartitionLoop(PSLoopCtx &c, PartitionMemoryGate &memoryGate, Pr
     // byte-identity check on a build without a GPU), DTFE_PS_OVERLAP=0 switches it off.
     bool gpuDeposit = false;
 #if defined(PS_GPU) && NO_DIM==3
-    gpuDeposit = state.options.psUseMetal and not state.options.psLinearDeposit;
+    gpuDeposit = state.options.psUseMetal;
 #endif
-    char const *overlapEnv = std::getenv( "DTFE_PS_OVERLAP" );
-    bool const overlapForced = overlapEnv and overlapEnv[0] == '1';
-    bool const overlapBanned = overlapEnv and overlapEnv[0] == '0';
+    int const overlapEnv = Env::tristate( "DTFE_PS_OVERLAP" );   // 1 forces the look-ahead, 0 bans it
+    bool const overlapForced = overlapEnv == 1;
+    bool const overlapBanned = overlapEnv == 0;
     bool overlap = psConcurrency == 1 and toProcess > 1 and not state.options.psNoOverlap
                    and not state.options.psLookAheadOffBudget   // the auto-tuner's: it does not fit the budget
                    and not overlapBanned and ( gpuDeposit or overlapForced );
@@ -2082,8 +2080,8 @@ static void psPartitionedRun(DTFE_State &state, vector<Sample_point> &samples, U
     size_t stagedPeakCount = 0, stagedRamCount = 0;   // parked in RAM: at most / now
     int nStaged = 0, nWaitedTurn = 0;                  // parked (RAM or disk); waited for their turn instead
     double stageCapBytes = -1.;                 // DTFE_MERGE_STAGE_GB: a fixed cap; < 0 = the free-memory rule
-    if ( char const *cap = std::getenv( "DTFE_MERGE_STAGE_GB" ) )
-        if ( cap[0] != '\0' ) stageCapBytes = std::max( 0., std::atof( cap ) ) * 1.e9;
+    if ( Env::isSet( "DTFE_MERGE_STAGE_GB" ) )
+        stageCapBytes = std::max( 0., Env::real( "DTFE_MERGE_STAGE_GB", 0. ) ) * 1.e9;
     bool const staging = orderedMerge and psConcurrency > 1 and stageCapBytes != 0.;
     // the bytes a partition's sub-grids hold (every accumulator, as the checkpoint counts them)
     auto subgridBytes = [](Quantities &q)
@@ -2096,10 +2094,9 @@ static void psPartitionedRun(DTFE_State &state, vector<Sample_point> &samples, U
     // estimate and the partitions are gated (the omp loop below: not the speed split, unless asked for)
     bool const gateGuards = psConcurrency > 1 and state.options.psPartitionBytes > 0.
                             and ( not state.options.psSpeedSplit or state.options.psOrderedMergeFlag );
-    // the spill (the comment above): DTFE_MERGE_SPILL=0 off, =1 every parked partition, else the rule
-    int spillMode = 0;
-    if ( char const *sp = std::getenv( "DTFE_MERGE_SPILL" ) )
-        spillMode = sp[0] == '0' ? -1 : sp[0] == '1' ? 1 : 0;
+    // the spill (the comment above): DTFE_MERGE_SPILL=0 off, =1 every parked partition, unset the rule
+    int const spillEnv = Env::tristate( "DTFE_MERGE_SPILL" );
+    int spillMode = spillEnv == 0 ? -1 : spillEnv == 1 ? 1 : 0;
     std::string spillWhy;
     std::string const spillDir = PSMergeSpill::folder( state.options.scratchDir, spillWhy );
     bool spillUsable = staging and spillMode >= 0 and spillWhy.empty();
@@ -2142,7 +2139,7 @@ static void psPartitionedRun(DTFE_State &state, vector<Sample_point> &samples, U
     // after it finish first and the staging is certain to happen (tests/ps_runtime_check.sh R7)
     int delayPartition = -1;
     double delaySeconds = 0.;
-    if ( char const *hook = std::getenv( "DTFE_TEST_DELAY_PARTITION" ) )
+    if ( char const *hook = Env::value( "DTFE_TEST_DELAY_PARTITION" ) )
         if ( std::sscanf( hook, "%d:%lf", &delayPartition, &delaySeconds ) != 2 ) delayPartition = -1;
     std::string parkRoomText;   // the RAM parking's budget room (psParkRoom), when one is known
     PSLoopCtx loop{ state, userOptions, uQuantities, aQuantities, message, totalPartitions, plan, psConcurrency,
@@ -2315,7 +2312,7 @@ static void dtfePartitionedRun(DTFE_State &state, vector<Sample_point> &samples,
        of the particles and the options (both in the settings key), nothing else carries from one partition to the
        next, and the T-web / V-web are made after the loop from the density / gradient grids saved here. So a
        resumed CPU run's outputs are byte-identical to an uninterrupted run's at the same thread count; '--gpu'
-       ones too (its sums are exact; within rounding under DTFE_METAL_FLOAT_GRIDS=1). The
+       ones too (its sums are exact; within rounding under DTFE_GPU_FLOAT_GRIDS=1). The
        progress counts the restored partitions as done (the sidecar's done/total and the '[partitions k/N]' line:
        N is every partition) and the ETA from this process's own rate. */
     PartitionCheckpoint::Checkpointer &checkpoint = PartitionCheckpoint::state();
@@ -2445,9 +2442,9 @@ static void dtfePartitionedRun(DTFE_State &state, vector<Sample_point> &samples,
     std::function<double(int)> aheadBytes = [](int) { return 0.; };
 #ifndef PHASE_SPACE
     {
-        char const *overlapEnv = std::getenv( "DTFE_OVERLAP" );
-        bool const overlapForced = overlapEnv and overlapEnv[0] == '1';
-        bool const overlapBanned = overlapEnv and overlapEnv[0] == '0';
+        int const overlapEnv = Env::tristate( "DTFE_OVERLAP" );   // 1 forces the look-ahead, 0 bans it
+        bool const overlapForced = overlapEnv == 1;
+        bool const overlapBanned = overlapEnv == 0;
         overlap = toCompute.size() > 1 and state.options.DTFE and not state.options.stdNoOverlap
                   and not state.options.stdLookAheadOffBudget and not overlapBanned and ( gpuDeposit or overlapForced );
     }

@@ -83,6 +83,7 @@
 
 #include "define.h"
 #include "message.h"
+#include "env_knobs.h"
 #include "particle_data.h"
 #include "quantities.h"
 #include "user_options.h"
@@ -182,14 +183,13 @@ struct Merge
             fullCells *= double( opt.gridSize[d] );
         }
         cellMass = totalMass / fullCells;
-        if ( char const *e = std::getenv( "DTFE_TEST_FXMERGE_SHIFT" ) )
-            if ( e[0] != '\0' ) shift = std::atoi( e );
-        if ( char const *e = std::getenv( "DTFE_TEST_FXMERGE_SUM_LIMIT" ) )
-            if ( e[0] != '\0' and std::atoi( e ) > 0 and std::atoi( e ) < 71 )
-            {
-                sumLimitLog2 = std::atoi( e );
-                sumLimit = (unsigned __int128)1 << sumLimitLog2;
-            }
+        shift = int( Env::integer( "DTFE_TEST_FXMERGE_SHIFT", shift ) );
+        long const limitLog2 = Env::integer( "DTFE_TEST_FXMERGE_SUM_LIMIT", 0 );
+        if ( limitLog2 > 0 and limitLog2 < 71 )
+        {
+            sumLimitLog2 = int( limitLog2 );
+            sumLimit = (unsigned __int128)1 << sumLimitLog2;
+        }
         double const sw = opt.psVolumeWeighted ? cellVol : cellMass;
         auto scaleOf = [&](int const kind) -> double
         {

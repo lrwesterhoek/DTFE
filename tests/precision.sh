@@ -20,8 +20,8 @@ case "${DTFE_TEST_PRECISION:-single}" in
         echo "DTFE_TEST_PRECISION must be 'single' or 'double' (got '${DTFE_TEST_PRECISION}')" >&2; exit 2 ;;
 esac
 export DTFE_TEST_PRECISION="${DTFE_TEST_PRECISION:-single}"
-# Where the suites put their grids: OUTSIDE the repository by default (the repository sits in iCloud Drive, which
-# would upload GBs of throwaway grids). DTFE_TEST_TMP overrides.
+# Where the suites put their grids: OUTSIDE the repository by default (a repository in a cloud-synced folder would
+# upload GBs of throwaway grids). DTFE_TEST_TMP overrides.
 export DTFE_TEST_TMP="${DTFE_TEST_TMP:-${TMPDIR:-/tmp}/dtfe-tests}"
 mkdir -p "${DTFE_TEST_TMP}"
 # A suite that cannot run (a binary or a feature missing) exits 0 with a SKIP line -- unless the stage says the

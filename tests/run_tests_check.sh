@@ -26,8 +26,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$ROOT" || exit 1
-PY="${PYTHON:-python3}"
-command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/python3.14
+source "${SCRIPT_DIR}/lib.sh"   # PY: the python with numpy and h5py
 # (no precision.sh: the cases set the precision themselves) a missing ./DTFE is a skip, or a failure when required
 skip_or_fail() { if [ "${DTFE_TEST_REQUIRED:-0}" = "1" ]; then echo "FAIL (required): $*" >&2; exit 1; fi; echo "SKIP: $*"; exit 0; }
 [ -x ./DTFE ] || skip_or_fail "./DTFE is not built (make DTFE)"

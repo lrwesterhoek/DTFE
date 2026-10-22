@@ -30,7 +30,7 @@ matplotlib.use("Agg")
 
 import config
 from dtfelib import pointeval
-from dtfelib.cli import DATA_ROOT, find_sims, sim_dir
+from dtfelib.cli import NoDataRoot, find_sims, require_data_root, sim_dir
 from dtfelib.io import FieldSet
 
 
@@ -51,8 +51,8 @@ def discover_snaps(simdir: Path):
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--data-root", type=Path, default=DATA_ROOT,
-                   help=f"simulation output root (default {DATA_ROOT})")
+    p.add_argument("--data-root", type=Path, default=None,
+                   help="the folder that holds the simulations (default: DTFE_DATA_ROOT; one of the two is needed)")
     p.add_argument("--sims", required=True,
                    help="comma-separated simulations, or 'all' for every one with snapshots on disk (required)")
     p.add_argument("--snaps", default=None,
@@ -91,6 +91,10 @@ def main() -> int:
                         "comparison with them. Default is a percentile stretch: the fixed "
                         "range clips ~26%% of a z=0 point-eval image to the darkest colour")
     args = p.parse_args()
+    try:
+        args.data_root = require_data_root(args.data_root)
+    except NoDataRoot as e:
+        p.error(str(e))
 
     bad = set((args.fields or "").split(",")) - set(pointeval.STYLES) - {""}
     if bad:

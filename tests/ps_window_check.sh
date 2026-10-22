@@ -99,7 +99,7 @@ if [ $GPU = 1 ]; then
     done
 fi
 echo ">> the tessellation cache + occupancy maps: a window run skips the partitions that never reach the window"
-# the cache must live on a local, non-synced volume (the option refuses iCloud Drive, where the repo is)
+# the cache must live on a local, non-synced volume (the option refuses iCloud Drive)
 CACHE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/dtfe-window-check.XXXXXX")" || { echo "FAIL: no temp dir"; exit 1; }
 trap 'rm -rf "$CACHE_ROOT"' EXIT
 CACHE="$CACHE_ROOT/serve"; mkdir -p "$CACHE"

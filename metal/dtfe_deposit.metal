@@ -28,7 +28,7 @@
 //  CPU with the CPU loop's own helpers, so both paths use the same classification and
 //  sample counts; the shared Sobol table gives them the same barycentric coordinates.
 //  Remaining CPU/GPU differences are float rounding (double vertex differences on the
-//  CPU) and, with DTFE_METAL_FLOAT_GRIDS=1 only, atomic summation order.
+//  CPU) and, with DTFE_GPU_FLOAT_GRIDS=1 only, atomic summation order.
 //
 //  Exact sums. The grids are 64-bit FIXED-POINT sums by default (DepositParams.fixedSum,
 //  the phase-space mass grid's scheme, metal/ps_deposit.metal depositMass): every share becomes the
@@ -43,7 +43,7 @@
 //  leaves a thread or a SIMD group (the leader's sums, an eviction, a per-sample or per-piece deposit),
 //  and the threadgroup table holds integers too. The scale per grid is 2^k from a bound of the batch's
 //  sum of |share| that the host computes before the upload, so no cell can overflow
-//  (src/CGAL_triangulation/dtfe_gpu_fixed.h batchFixedScales). DTFE_METAL_FLOAT_GRIDS=1
+//  (src/CGAL_triangulation/dtfe_gpu_fixed.h batchFixedScales). DTFE_GPU_FLOAT_GRIDS=1
 //  (DTFE_GPU_FLOAT_GRIDS=1) keeps the float atomics for A/B, as does the opt-in shared full grid
 //  (DTFE_GPU_SHARED=1). Measured cost (0.26M particles at 256^3 on a GPU shared with another
 //  run, so indicative): the exact-average kernel none; the item kernel 1.6-1.9x for density + velocity

@@ -475,8 +475,8 @@ class Estimator:
 
     def grid(self, xs, ys, zs=None) -> PointFields:
         """Fields on the tensor-product grid xs x ys x zs (1D coordinate arrays; a 2D server takes xs
-        and ys only), returned with per-point arrays shaped (nx, ny[, nz][, k]) -- the analogue of
-        CosmoDTFE's estimator((xs, ys, zs)). Ragged per-stream arrays stay flat (C order over the grid)."""
+        and ys only), returned with per-point arrays shaped (nx, ny[, nz][, k]). Ragged per-stream arrays stay
+        flat (C order over the grid)."""
         axes = (xs, ys) if self.dim == 2 else (xs, ys, zs)
         if self.dim == 2 and zs is not None:
             raise ValueError("a 2D server takes grid(xs, ys)")
@@ -561,10 +561,9 @@ class Estimator:
     def from_arrays(cls, positions, *, velocities=None, masses=None, lagrangian=None, values=None,
                     ids=None, box=None, periodic: bool | None = None, phase_space: bool | None = None,
                     tmpdir=None, **kwargs) -> "Estimator":
-        """An Estimator over particles held in numpy arrays -- CosmoDTFE's
-        DensityEstimator(points, weights) / PhaseSpaceEstimator(source, warped, values) -- instead
-        of a snapshot file. The arrays are written to a temporary Gadget-HDF5 file that the server
-        reads (deleted again by close()), so every option of the constructor applies.
+        """An Estimator over particles held in numpy arrays (positions, optional weights, Lagrangian
+        coordinates and values) instead of a snapshot file. The arrays are written to a temporary Gadget-HDF5 file
+        that the server reads (deleted again by close()), so every option of the constructor applies.
 
         positions   (N, 3) Eulerian positions, in Mpc (any consistent length unit: the box and
                     the query points use the same one; MpcUnit is 1). (N, 2) builds a 2D Estimator

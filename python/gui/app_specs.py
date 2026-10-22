@@ -162,6 +162,7 @@ class SpecsMixin:
         self.o_halo.setValue(c.halo_release)
         for name, cb in self.o_fields.items():
             cb.setChecked(name in c.fields)
+        self.o_extra.setText(c.extra_args)
         self.o_outdir.setText(c.output_dir)
         self.o_name.setText(c.output_name)
         self.o_part.setValue(c.partition)
@@ -310,6 +311,7 @@ class SpecsMixin:
         except ValueError:
             c.window = [float("nan")]               # unreadable: problems() says so (not silently 'no window')
         c.fields = [n for n, _ in rs.PS_FIELDS if self.o_fields[n].isChecked()]
+        c.extra_args = self.o_extra.text().strip()
         c.output_dir = self.o_outdir.text().strip()
         c.output_name = self.o_name.text().strip()
         c.partition = self.o_part.value()

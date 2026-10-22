@@ -1,9 +1,10 @@
-# Sourced by tests/precision.sh (so by every shell suite that sources it): the python the suites run and the
-# helpers several suites share. Prints nothing and runs nothing when sourced; the suite's own set -e / -u apply.
+# Sourced by tests/precision.sh (so by every shell suite that sources it) and by the suites that skip it: the python
+# the suites run and the helpers several suites share. Prints nothing when sourced and runs only the python probe;
+# the suite's own set -e / -u apply.
 
-# A python with a WORKING h5py: plain python3 resolves to a broken x86_64 h5py on the dev machine.
-PY="${PYTHON:-python3}"
-if command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1; then PY=/opt/homebrew/bin/python3.14; fi
+# A python with numpy and a WORKING h5py: $PYTHON, else the probe in scripts/h5py_python.sh.
+source "$(dirname "${BASH_SOURCE[0]}")/../scripts/h5py_python.sh"
+PY="$(h5py_python)"
 
 # build_target <the suite's first argument> <make target> <object folder>: unless the argument is --no-build or the
 # suite runs the double pair (built by 'make ... DOUBLE=1', never here), 'make <target>' in the build mode that

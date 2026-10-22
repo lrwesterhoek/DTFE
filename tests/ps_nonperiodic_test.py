@@ -11,7 +11,9 @@ from ps_test_helpers import binary as test_binary, require, REAL, DOUBLE, PRECIS
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-TMP = os.path.join(HERE, "tmp")
+# the suites' temp root, as the shell suites use it: $DTFE_TEST_TMP, else ${TMPDIR:-/tmp}/dtfe-tests
+TMP = os.path.join(os.environ.get("DTFE_TEST_TMP") or os.path.join(os.environ.get("TMPDIR") or "/tmp", "dtfe-tests"),
+                   "ps_nonperiodic_test")
 
 N = 48
 BOX = 100.0
@@ -192,7 +194,7 @@ def partition_split(binary):
     h = subprocess.run([binary, "--full_help"], capture_output=True, text=True)
     if "--ps-alpha-shape" not in h.stdout + h.stderr:
         os.remove(snap)
-        return [f"'{binary}' has no --ps-alpha-shape (built before 2026-10-01?): non-periodic splits differ at the hull"]
+        return [f"'{binary}' has no --ps-alpha-shape (an older build?): non-periodic splits differ at the hull"]
     common = ["--input", "105", "--MpcUnit", "1", "--verbose", "0", "--avg-subsamples", "3",
               "--grid", str(FULL_GRID), "--box"] + [str(x) for x in FULL_BOX * 3] + \
              ["--field", "density", "velocity", "density_a", "velocity_a"]

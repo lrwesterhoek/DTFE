@@ -105,6 +105,9 @@ jobs:
           update-environment: false
       - name: Every .py parses under Python 3.10
         run: OLD_PYTHON="${{ steps.py310.outputs.python-path }}" tests/ci_suite.sh oldpy
+      # unused imports and locals, undefined names (ruff's pyflakes rules); third_party/ is vendored code
+      - name: Python static check (ruff, pyflakes rules)
+        run: pipx run ruff==0.17.1 check --select F --extend-exclude third_party .
 
   compile-variants:
     runs-on: ubuntu-24.04
@@ -136,9 +139,6 @@ jobs:
 
   cudaemu:
     runs-on: ubuntu-24.04
-    # non-blocking until its first green run on the runners' x86-64 (the emulation's context switch has run there
-    # only under Rosetta)
-    continue-on-error: true
     timeout-minutes: 75
     strategy:
       fail-fast: false

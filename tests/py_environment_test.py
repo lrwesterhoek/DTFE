@@ -6,7 +6,7 @@
     script plot_void_environment.py end to end on a stubbed pipeline (its files, the tracking panel by type);
     skeleton.filter_components (size and mass thresholds), the random-sphere null and its z-scores;
     plot_caustic_skeleton's null text and option tags.
-  * DATA-BACKED (the T7; skipped with a note without it): TNG100-3-Dark z = 0 classified in a fresh interpreter
+  * DATA-BACKED (DTFE_DATA_ROOT; skipped with a note without it): TNG100-3-Dark z = 0 classified in a fresh interpreter
     (DTFE_SIM sets the frame), a void-in-cloud fraction strictly between 0 and 1.
 
 Usage:  python3 tests/py_environment_test.py            (exit 0 = pass)
@@ -24,7 +24,7 @@ from pathlib import Path
 
 import numpy as np
 
-from _harness import REPO, check as _check, setup, summary
+from _harness import REPO, check as _check, data_root, setup, summary
 
 setup("env_figs_", mpl_agg=False)
 DATA_BACKED = False
@@ -117,7 +117,7 @@ def t_environment_script():
     n, cell = 64, 1.5
     root = Path(tempfile.mkdtemp(prefix="env_run_"))
     from dtfelib import cli
-    saved = (pev.pipeline, pev.catalog, pev.classify, pev.style.note_source, cli.DATA_ROOT)
+    saved = (pev.pipeline, pev.catalog, pev.classify, cli._data_root_override)
     try:
         data = root / "data" / "SYN"
         for s in (50, 99):
@@ -149,7 +149,6 @@ def t_environment_script():
             return out
         pev.classify = types.SimpleNamespace(**{k: getattr(classify, k) for k in dir(classify) if not k.startswith("__")})
         pev.classify.classify_voids = classify_voids
-        pev.style.note_source = lambda fs: None
         # a tracking set: void 0 at the void-in-cloud, void 1 at the void-in-void, void 2 without R_v anywhere
         tdir = root / "tracking"
         tdir.mkdir()
@@ -189,7 +188,7 @@ def t_environment_script():
         assert pev.name_tag({99: "ps"}, {99: "ps_caustic."}, False, 2.0, criterion="density_raw") == "_ps_caustic"
         assert pev.name_tag({99: "ps"}, {99: "ps_caustic."}, False, 2.0) == "_ps_caustic_velocity"
     finally:
-        pev.pipeline, pev.catalog, pev.classify, pev.style.note_source, _root = saved
+        pev.pipeline, pev.catalog, pev.classify, _root = saved
         cli.use_data_root(_root)                    # main()'s --data-root is process-wide
         shutil.rmtree(root, ignore_errors=True)
 
@@ -306,7 +305,7 @@ def t_caustic_snapshots():
 # ---------------------------------------------------------------- data-backed: TNG100-3-Dark
 def t_tng100_vic():
     from dtfelib import cli
-    sd = cli.sim_dir("TNG100-3-Dark", os.environ.get("DTFE_DATA_ROOT", str(cli._T7_DATA))) / "snapdir_099"
+    sd = cli.sim_dir("TNG100-3-Dark", data_root()) / "snapdir_099"
     if not any(sd.glob("ps_output.*den*")):
         raise FileNotFoundError(f"no PS-DTFE density in {sd}")
     code = ("import sys; sys.path.insert(0, 'python'); from dtfelib import pipeline, classify; "
@@ -331,7 +330,7 @@ def main():
     check("plot_void_environment.py end to end (stubbed pipeline): files, f_vic, per-void npz, tracking by type, tags", t_environment_script)
     check("skeleton.filter_components: size threshold, mass threshold, none, no density refused", t_filter_components)
     check("skeleton random-sphere null: seeded, the same metrics, z-scores with sign, NaN without spread", t_random_sphere_null)
-    check("plot_caustic_skeleton: the null table and filter line in the text, the new option tags", t_caustic_script_null_text)
+    check("plot_caustic_skeleton: the null table and filter line in the text, the option tags", t_caustic_script_null_text)
     check("plot_caustic_skeleton --all-caustic: the snapshots with a caustic_class grid under the prefix", t_caustic_snapshots)
     DATA_BACKED = True
     print("data-backed")

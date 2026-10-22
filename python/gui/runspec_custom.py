@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import re
+import shlex
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -64,6 +65,7 @@ class CustomSpec:
     stream_density: str = "dtfe"    # --ps-stream-density for the sample points: 'dtfe' (interpolated) | 'geometric'
     per_stream: bool = False        # --per-stream: the sample points' values stream by stream (ragged '.pts_*')
     per_stream_ids: bool = False    # --per-stream-ids: ... with each stream's tetrahedron particle IDs
+    extra_args: str = ""            # more program options as on a command line, appended after the tab's own
     demo_n: int = 0                 # > 0: first generate the synthetic demo snapshot (crossed waves, n^3) ...
     demo_file: str = ""             # ... but only at THIS path (demo_spec sets it): the setting is persisted, and
                                     # without the path any later missing input would quietly become a demo
@@ -94,6 +96,10 @@ class CustomSpec:
         return _rs.REPO_ROOT / _rs.binary_name(self.estimator, self.precision, self.dim)
 
     def command(self) -> list[str]:
+        return self._own_command() + _extra_options(self.extra_args)
+
+    def _own_command(self) -> list[str]:
+        """The command the tab's own controls make (command() appends the extra options)."""
         ps = self.estimator == "ps"
         three = self.dim != 2           # a 2D run: no GPU, no parallel insertion (both 3D only)
         out = self.output_root()
@@ -337,6 +343,17 @@ class CustomSpec:
                                  "velocities by volume: untick one (the binary refuses both)"))
         if (self.output_root().parent / (self.name() + ".a_den")).exists():
             out.append(("info", f"'{name}' already has outputs in this folder: they will be overwritten"))
+        if self.extra_args.strip():
+            try:
+                extra = shlex.split(self.extra_args)
+            except ValueError as e:
+                out.append(("error", f"the extra options do not parse ({e}): close the quotes"))
+            else:
+                twice = sorted({t for t in extra if t.startswith("--")}
+                               & {t for t in self._own_command() if t.startswith("--")})
+                if twice:
+                    out.append(("error", f"the extra options repeat {', '.join(twice)}, which the tab sets already "
+                                         "(the program takes each option once): change it on the tab"))
         out += _rs._busy_problems()
         return out
 
@@ -346,6 +363,14 @@ class CustomSpec:
     @classmethod
     def from_dict(cls, d: dict) -> "CustomSpec":
         return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+def _extra_options(text: str) -> list[str]:
+    """The extra-options line split as a shell splits it; [] when its quotes do not close (problems() says so)."""
+    try:
+        return shlex.split(text)
+    except ValueError:
+        return []
 
 
 def snapshot_dim(path, input_type: int = 105) -> int | None:

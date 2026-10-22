@@ -48,14 +48,13 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 import config
-from dtfelib import make_parser, use_data_root, pipeline, profiles, catalog
+from dtfelib import make_parser, use_data_root, require_data_root, pipeline, profiles, catalog
 from dtfelib import environment as env
 from dtfelib import figures as style
 from dtfelib import fields as dtfe
 
 FOLDER = "void_profile_evolution"
 OUTPUT_DIR = Path(config.figures_path(FOLDER))
-MIRROR = True                              # --out: the user's folder, nothing goes into the thesis tree
 DEFAULT_RV_RANGE = (2.5, 5.0)              # the overlay's R_v bin in smoothing lengths (the middle of DEFAULT_EDGES_SIGMA)
 RATIO_X = (0.5, 1.0)                       # panel (d): v_r / v_lin at these r / R_v
 DEFINITIONS = tuple(getattr(catalog, "R_V_DEFINITIONS", ("crossing", "delta08", "ridge")))
@@ -253,7 +252,7 @@ def plot_evolution(ev: dict, title: str, path: Path, rv_label: str, min_count: i
     cb.set_ticklabels([f"{z:.2g}" if z >= 0.005 else "0" for z in sorted(set(zs))])   # z = 0 is 2e-16 in the header
     cb.set_label("z")
     style.set_suptitle(fig, title)
-    style.save_plot_to_multiple_paths(fig, path, dpi=config.DPI, mirror=MIRROR, bbox_inches="tight")
+    style.save_figure(fig, path, dpi=config.DPI, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -290,7 +289,7 @@ def plot_fits(rows: list, edges: list, sigma_mpc: float, title: str, path: Path)
                         transform=axes[1, 1].transAxes, fontsize=7, color="0.3")
     style.set_suptitle(fig, title)
     fig.tight_layout()
-    style.save_plot_to_multiple_paths(fig, path, dpi=config.DPI, mirror=MIRROR)
+    style.save_figure(fig, path, dpi=config.DPI)
     plt.close(fig)
 
 
@@ -380,8 +379,6 @@ def main(argv=None):
     parser.add_argument("--out", default=None, help=f"output folder (default {OUTPUT_DIR}/<sim>)")
     pipeline.add_smoothing_mpc_arg(parser)
     args = parser.parse_args(argv)
-    global MIRROR
-    MIRROR = args.out is None
     style.apply()
     pipeline.apply_smoothing_args(args, "void-profile-evolution")
     use_data_root(args.data_root)
@@ -400,7 +397,7 @@ def main(argv=None):
                          if d.name.split("_")[1].isdigit()})
         snaps = args.snaps if args.snaps else ladder
         if not snaps:
-            raise SystemExit(f"no snapdir_* of {args.sim} under {args.data_root}")
+            raise SystemExit(f"no snapdir_* of {args.sim} under {require_data_root(args.data_root)}")
         for snap in snaps:
             p = pipeline.products(snap, sim=args.sim, method=args.method, prefix=args.prefix, data_root=args.data_root)
             try:
@@ -408,7 +405,6 @@ def main(argv=None):
                 prof = profiles.void_profiles(p, m=args.points, sample=args.sample, radius="r_v",
                                               distinct=not args.keep_overlaps, definition=args.rv_definition)
                 z = float(p.redshift)
-                style.note_source(p.fs)
                 method, prefix = p.fs.method, p.fs.prefix
             except (FileNotFoundError, ValueError, MemoryError, OSError) as e:
                 print(f"  snapshot {snap:03d}: {e}")

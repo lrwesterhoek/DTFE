@@ -68,6 +68,7 @@
 #include "../canonical_path.h"
 #include "../cache_key_lines.h"   // the build lines and file stamps of the key (shared with auto_tune.h)
 #include "../define.h"
+#include "../env_knobs.h"
 #include "../message.h"
 #include "../user_options.h"
 
@@ -240,11 +241,8 @@ inline std::atomic<int> &activeLoads() { static std::atomic<int> n{ 0 }; return 
 // loads up to 8 partitions at once); DTFE_TESS_CACHE_THREADS pins it
 inline size_t chunkThreads()
 {
-    if ( const char *env = std::getenv("DTFE_TESS_CACHE_THREADS") )
-    {
-        long const v = std::atol( env );
-        if ( v > 0 ) return size_t( v );
-    }
+    if ( long const v = Env::integer( "DTFE_TESS_CACHE_THREADS", 0 ); v > 0 )
+        return size_t( v );
     unsigned const hw = std::max( 1u, std::thread::hardware_concurrency() );
     int const others = std::max( 0, activeLoads().load() - 1 );
     return std::max<size_t>( 1, std::min<size_t>( 4, size_t(hw) / size_t(1 + others) / 2 ) );
@@ -259,7 +257,7 @@ inline size_t chunkThreads()
 inline bool useLibdeflate()
 {
 #ifdef DTFE_HAVE_LIBDEFLATE
-    static bool const v = not ( std::getenv("DTFE_TESS_CACHE_ZLIB") and std::atoi( std::getenv("DTFE_TESS_CACHE_ZLIB") ) != 0 );
+    static bool const v = not Env::flag( "DTFE_TESS_CACHE_ZLIB" );
     return v;
 #else
     return false;
@@ -730,7 +728,7 @@ template <class Tr> using Tds_of = typename Tr::Triangulation_data_structure;
 
 inline bool useCgalIO()
 {
-    static bool const v = std::getenv("DTFE_TESS_CACHE_CGAL_IO") and std::atoi( std::getenv("DTFE_TESS_CACHE_CGAL_IO") ) != 0;
+    static bool const v = Env::flag( "DTFE_TESS_CACHE_CGAL_IO" );
     return v;
 }
 
@@ -1160,7 +1158,7 @@ inline bool tryLoad(DT &dt, User_options const &userOptions)
 #endif
     if ( not structureOk or dt.number_of_vertices() == 0 ) { dt.clear(); return false; }
 #if NO_DIM == 3
-    if ( std::getenv("DTFE_TESS_CACHE_FINGERPRINT") ) printStructureFingerprint( dt );
+    if ( Env::flag( "DTFE_TESS_CACHE_FINGERPRINT" ) ) printStructureFingerprint( dt );
 #endif
     if ( not readPayload( zin, dt ) )           { dt.clear(); return false; }
     return true;
@@ -1238,7 +1236,7 @@ inline void save(DT &dt, User_options const &userOptions)
         // The header above stays uncompressed so a staleness check costs one small read; the
         // tessellation and payload go through zlib in independent chunks (ChunkDeflateBuf), or as
         // one stream under DTFE_TESS_CACHE_LEGACY=1 (the single-stream format, for tests)
-        bool const legacy = std::getenv("DTFE_TESS_CACHE_LEGACY") and std::atoi( std::getenv("DTFE_TESS_CACHE_LEGACY") ) != 0;
+        bool const legacy = Env::flag( "DTFE_TESS_CACHE_LEGACY" );
         if ( not legacy )
         {
             os.write( CHUNK_MARKER, 8 );

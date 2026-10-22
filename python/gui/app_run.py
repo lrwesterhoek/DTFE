@@ -661,7 +661,7 @@ class RunMixin:
     def _notify(self, title: str, text: str):
         if os.environ.get("DTFE_GUI_NO_NOTIFY") == "1" or not self.q_notify.isChecked():
             return
-        cmd = R.notify_command(f"DTFE launcher: {title}", text)
+        cmd = R.notify_command(f"Lamina: {title}", text)
         if cmd:
             QProcess.startDetached(cmd[0], cmd[1:])
 

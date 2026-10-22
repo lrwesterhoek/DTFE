@@ -13,8 +13,8 @@ collapse bits) is refused. THE FOLD is FieldSet.fold_mask() -- streams > 1 or '.
 the geometric 'a folded tetrahedron overlaps the cell' -- for the fractions, the void shells, the null and the
 outline alike: older caustic_class grids set their fold bits per deposited sample and miss
 every fold thinner than the sampling (TNG100-3-Dark z=1: 21.0% of the cells against 33.6%); the collapse classes
-(bits 2-5) are per sample. On the T7 only TNG100-3-Dark z = 0 carries one (its ps_caustic.* grids,
-read with --prefix ps_caustic); the other boxes and snapshots need a caustics rerun.
+(bits 2-5) are per sample. Only a run with --ps-caustics writes the grid (e.g. a ps_caustic.* set, read with
+--prefix ps_caustic).
 
 Names: caustic_skeleton_z<z>.* for the defaults; a non-default option adds its tag, so a rerun with
 another one never overwrites them: '_<prefix>' (not ps_output), '_c6' / '_c18' (--connectivity), and with
@@ -52,7 +52,6 @@ from dtfelib import figures as style
 
 OUTPUT_DIR = Path(config.LOCAL_FIGURES_ROOT) / "caustic_skeleton"
 CLASS_COLORS = ["#f2f2f2", "#d9e6f2", "#f2b134", "#e4572e", "#7b1e3b"]   # none, k=0, k=1, k=2, k=3
-MIRROR = True                   # into the thesis Figures tree too; off under --out (main sets it)
 
 
 def summary_text(summ, title=""):
@@ -192,7 +191,7 @@ def plot_skeleton(cc, summ, fold, voids, title, path):
                             f"({int((~ok).sum())} beyond the cut-out)")
     style.set_suptitle(fig, title)
     fig.tight_layout()
-    style.save_plot_to_multiple_paths(fig, path, mirror=MIRROR)
+    style.save_figure(fig, path)
     plt.close(fig)
 
 
@@ -210,7 +209,7 @@ def caustic_snapshots(sim, data_root, method, prefix):
 
 def skeleton_tag(args, prefix, default_shells):
     """The file-name tag of the non-default options, so that another --connectivity, --prefix, --radius, --shells,
-    --keep-overlaps or --cutout never overwrites the default set, the mirrored PNG included. The void options count
+    --keep-overlaps or --cutout never overwrites the default set. The void options count
     only with --voids."""
     tag = "" if prefix.rstrip(".") == "ps_output" else f"_{prefix.rstrip('.')}"
     tag += "" if args.connectivity == 26 else f"_c{args.connectivity}"
@@ -231,7 +230,6 @@ def skeleton_tag(args, prefix, default_shells):
 
 
 def main():
-    global MIRROR
     parser = make_parser("The caustic skeleton (walls, filaments, nodes) from the caustic_class grid of a --ps-caustics run.")
     parser.add_argument("--snaps", type=int, nargs="*", default=None, help="snapshots (default: --snap)")
     parser.add_argument("--connectivity", type=int, choices=(6, 18, 26), default=26)
@@ -273,7 +271,6 @@ def main():
     if args.shells is None:
         args.shells = default_shells
     out_dir = Path(args.out).expanduser() if args.out else OUTPUT_DIR / args.sim
-    MIRROR = args.out is None
     method = "ps" if args.method == "auto" else args.method
     snaps = args.snaps if args.snaps else [args.snap]
     if args.all_caustic:

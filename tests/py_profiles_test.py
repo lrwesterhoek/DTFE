@@ -7,7 +7,8 @@ Two tiers:
   * SYNTHETIC (always run, CI): exact cell counts on hand-built masks (periodic), a known HSW profile recovered
     within its errors, the normalised linear-theory identity, the R_v-definition fallback, and the script on two
     synthetic 64^3 snapshots (per-snapshot caches, strict JSON, --replot reproduces the tables without a grid).
-  * DATA-BACKED (the T7's TNG100-3-Dark z = 0; skipped when it is not on disk): the script on the real snapshot.
+  * DATA-BACKED (TNG100-3-Dark z = 0 under DTFE_DATA_ROOT; skipped when it is unset or the snapshot is not on disk):
+    the script on the real snapshot.
 
 Usage:  python3 tests/py_profiles_test.py            (exit 0 = pass)
 """
@@ -24,7 +25,7 @@ from pathlib import Path
 
 import numpy as np
 
-from _harness import FAIL, PASS, REPO, SKIP, Skip, check, setup
+from _harness import FAIL, PASS, REPO, SKIP, Skip, check, data_root, setup
 
 _FIGS_TMP = setup("profiles_figs_", paths=("python",))
 os.environ.setdefault("DTFE_SIM", "TNG50-4-Dark")    # the box these synthetic tests stand for; a data-tier run sets its own
@@ -143,8 +144,7 @@ def t_definition_fallback():
 def _pin_config(root, saved, n=64, box=64.0):
     """tests/py_dtfelib_test.py's _void_pin_config: the synthetic ladder's frame and the current catalogue knobs."""
     import config
-    pins = {"CACHE_DIR": Path(root) / "cache", "THESIS_FIGURES_DIR": Path(root) / "mirror",
-            "LOCAL_FIGURES_ROOT": str(Path(root) / "figures"),
+    pins = {"CACHE_DIR": Path(root) / "cache", "LOCAL_FIGURES_ROOT": str(Path(root) / "figures"),
             "CELL_SIZE": box / n, "BOX_SIZE": box, "FIELD_RESOLUTION": n, "SMOOTHING_SIGMA_CELLS": 1.5,
             "PRODUCTION_SMOOTHING": (1.5, 11),
             "ELLIPSOID_CUT_RULES": {"min_axis_cells": 0.1, "max_axis_sigma": 10.0 / 1.5, "max_axis_box_frac": 0.5,
@@ -195,7 +195,7 @@ def t_script_synthetic():
     finally:
         sys.path.remove(plot_dir)
     root = Path(tempfile.mkdtemp(prefix="profiles_run_"))
-    saved, old_root = {}, cli.DATA_ROOT
+    saved, old_root = {}, cli._data_root_override
     data, out = root / "data", root / "out"
 
     def run(args):
@@ -294,7 +294,7 @@ def t_script_synthetic():
     finally:
         for k, v in saved.items():
             setattr(config, k, v)
-        cli.DATA_ROOT = old_root
+        cli.use_data_root(old_root)
         shutil.rmtree(root, ignore_errors=True)
 
 
@@ -309,16 +309,16 @@ def t_help_text():
 
 # ---------------------------------------------------------------- data-backed
 def t_tng100_z0():
-    """The script on the T7's TNG100-3-Dark z = 0 (into a temp folder): voids profiled, fits converged, the interior
-    single-stream fractions between 0 and 1 with r < 0.5 R_v at least as single-stream as r < R_v."""
+    """The script on TNG100-3-Dark z = 0 under DTFE_DATA_ROOT (into a temp folder): voids profiled, fits converged,
+    the interior single-stream fractions between 0 and 1 with r < 0.5 R_v at least as single-stream as r < R_v."""
     from dtfelib import cli
     sim = "TNG100-3-Dark"
-    snapdir = cli.sim_dir(sim) / "snapdir_099"
+    snapdir = cli.sim_dir(sim, data_root()) / "snapdir_099"
     if not (snapdir / "ps_output.a_streams").is_file():
         raise Skip(f"{snapdir} not on disk")
     tmp = Path(tempfile.mkdtemp(prefix="profiles_tng_"))
     try:
-        env = {**os.environ, "DTFE_SIM": sim, "DTFE_FIGURES_ROOT": str(tmp), "DTFE_NO_MIRROR": "1", "MPLBACKEND": "Agg"}
+        env = {**os.environ, "DTFE_SIM": sim, "DTFE_FIGURES_ROOT": str(tmp), "MPLBACKEND": "Agg"}
         out = subprocess.run([sys.executable, str(REPO / "python" / "plot" / "plot_void_profile_evolution.py"),
                               "--sim", sim, "--snaps", "99", "--out", str(tmp / "o"), "--n-boot", "50"],
                              capture_output=True, text=True, timeout=1200, env=env)
@@ -338,14 +338,14 @@ def main():
     print("=" * 60)
     print("synthetic:")
     check("interior_single_fraction: exact periodic count at 0.5 and 1 R, all-single = 1, NaN radius, a cell on the sphere", t_interior_fraction)
-    check("2026-10-11: profile_grids converts the single-stream mask once, not per bin; same profile bit for bit", t_single_converted_once)
+    check("profile_grids converts the single-stream mask once, not per bin; same profile bit for bit", t_single_converted_once)
     check("fit_hsw recovers a known HSW 2014 profile within 4 sigma; too few shells ok=False; stack_scatter = std/sqrt(n); fit_stack's min_count", t_hsw_fit)
     check("panel (b) units: linear_v_r(R = 1) / (a H) = -(1/3) f x Delta(<x) at z = 0, 1, 5", t_linear_normalised)
     check("r_v_by_definition: crossing, the fallback said once, the C3 key read when catalog has it", t_definition_fallback)
     check("plot_void_profile_evolution.py on two synthetic snapshots: files, per-snapshot caches, single-stream box and interior fractions exact, strict JSON, --replot without grids gives the same tables, the _deep tag", t_script_synthetic)
     check("plot_void_profile_evolution.py --help: no ' -- ' in the shown text", t_help_text)
     print("data-backed:")
-    check("TNG100-3-Dark z = 0 on the T7: fits, interior single-stream fractions ordered", t_tng100_z0)
+    check("TNG100-3-Dark z = 0 (DTFE_DATA_ROOT): fits, interior single-stream fractions ordered", t_tng100_z0)
     print("-" * 60)
     print(f"RESULT: {len(PASS)} passed, {len(FAIL)} failed")
     if SKIP:

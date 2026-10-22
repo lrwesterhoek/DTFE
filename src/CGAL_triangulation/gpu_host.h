@@ -44,7 +44,7 @@ struct PSGpuGrids
     //                  kernels' own words, handed over unconverted) and 'mass' stays EMPTY. The caller adds the
     //                  GPU-deferred and released tetrahedra into the same integers and converts to float once
     //                  (ps_interpolation.cc), so no deposit after the kernel rounds a share away.
-    //   massScale = 0  the float grid in 'mass' (PS_METAL_FLOAT_MASS=1 / PS_GPU_FLOAT_MASS=1, kept for A/B, or a
+    //   massScale = 0  the float grid in 'mass' (PS_GPU_FLOAT_MASS=1, kept for A/B, or a
     //                  total mass that gives no usable unit) and 'massFx' stays EMPTY.
     std::vector<float>    mass;     // subTotal      accumulated MASS (float form; see above)
     std::vector<int64_t>  massFx;   // subTotal      accumulated MASS (fixed-point form; see above)
@@ -164,7 +164,7 @@ struct DTFEGpuGrids
 // The device sums every grid as an exact 64-bit fixed-point integer per cell (dtfe_gpu_fixed.h
 // sets the units from a bound of the batch's shares; metal/dtfe_deposit.metal's header says how the kernels keep
 // the sum independent of the order their threads add in) and the host converts each cell to these floats once,
-// so two runs give byte-identical grids (DTFE_METAL_FLOAT_GRIDS=1 / DTFE_GPU_FLOAT_GRIDS=1 keep the float atomics
+// so two runs give byte-identical grids (DTFE_GPU_FLOAT_GRIDS=1 keeps the float atomics
 // for A/B). A failed command buffer / kernel resumes from the batch's last checkpoint, the PS deposit's policy
 // (gpu_metal_retry.h / gpu_cuda_retry.cuh); a false return after the upload means that policy gave up.
 bool dtfeGpuDepositAveraged1(std::vector<float>& verts,      // nTet*12: 4 vertices, region-relative
@@ -267,7 +267,7 @@ struct PSGpuPlan
 
 // The plan of a call (its arguments as psGpuDepositFields takes them). The mass grid is an exact 64-bit fixed-point
 // sum (DepositParams.massFixed in the kernel says why) unless floatMass, the host's A/B switch to float atomics
-// (PS_METAL_FLOAT_MASS=1; the CUDA/HIP host also reads PS_GPU_FLOAT_MASS=1). Its unit covers the caller's own
+// (PS_GPU_FLOAT_MASS=1). Its unit covers the caller's own
 // deposits too (massExtra): the caller adds the deferred and released tets into these words.
 inline PSGpuPlan psGpuPlan(const size_t subDims[3], bool fVel, bool fDisp, bool fGrad, bool fVolW, bool fCaustic,
                            bool fExact, bool fScal, bool fSGrad, std::vector<float> const& masses, double massExtra,

@@ -59,7 +59,7 @@ for r in o1 o2; do OMP_NUM_THREADS=4 "$BIN" "$SNAP" "$TMP/$r" "${C[@]}" --partit
 grep -q "partition merge order  : partition index" "$TMP/o1.log"; check "R1 the run says it merges in index order" $?
 same "$TMP/o1" "$TMP/o2"; check "R1 two --ordered-merge runs at --max-concurrent 4: byte-identical grids" $?
 
-echo ">> R7: the staged ordered merge (the default since 2026-10-14), partition 0 held back 2 s"
+echo ">> R7: the staged ordered merge (the default), partition 0 held back 2 s"
 "$BIN" --help 2>&1 | grep -q -- "--completion-order-merge"; check "R7 '--completion-order-merge' is in the help" $?
 R7=(env OMP_NUM_THREADS=4 DTFE_TEST_DELAY_PARTITION=0:2 "$BIN" "$SNAP")
 P3=(--partition 3 3 3 --max-concurrent 4)
@@ -183,7 +183,7 @@ OUT="$TMP/safe"; mkdir -p "$OUT"
 sleep 0 & DEAD=$!; wait "$DEAD"   # a pid that no longer runs
 echo stale > "$OUT/r.den.part.$DEAD"
 echo old > "$OUT/r.den"            # the stale part's final file exists: the part is a leftover, removed
-echo only > "$OUT/r.only.part.$DEAD"   # no final file: maybe the only copy of an output, kept (2026-10-11)
+echo only > "$OUT/r.only.part.$DEAD"   # no final file: maybe the only copy of an output, kept
 echo alive > "$OUT/r.den.part.$$"
 "$BIN" "$SNAP" "$OUT/r" "${C[@]}" --partition 2 2 2 --max-concurrent 1 > "$OUT/r.log" 2>&1; rc=$?
 [ "$rc" = 0 ] && [ -s "$OUT/r.den" ] && [ -s "$OUT/r.a_den" ]; check "R4 a normal run exits 0 with its outputs in place" $?

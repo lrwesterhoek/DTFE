@@ -1,18 +1,20 @@
-# Shared configuration for run_dtfe.sh, run_ps_dtfe.sh and download_snapshots.sh.
+# Shared configuration for run_dtfe.sh, run_ps_dtfe.sh, run_ps_pipeline.sh and download_snapshots.sh.
 # Sourced, not executed. Every value can be overridden per run:
-#   - environment: DTFE_DATA_ROOT=/scratch/tng DTFE_SIM=TNG50-3-Dark ./run_ps_dtfe.sh
+#   - environment: DTFE_DATA_ROOT=/path/to/IllustrisTNG DTFE_SIM=TNG50-3-Dark ./run_ps_dtfe.sh
 #                  GRID_SIZE=256 ./run_ps_dtfe.sh -s TNG50-3-Dark   (or DTFE_GRID_SIZE / DTFE_PADDING)
 #   - script flags: ./run_ps_dtfe.sh -s TNG50-3-Dark -d /path/to/sim -g 256 99
-# The simulation has NO default: every run names it, with -s or DTFE_SIM (require_simulation).
+# The data root and the simulation have NO default: every run sets DTFE_DATA_ROOT (require_data_root; a driver's -d,
+# the simulation's own folder, stands in for it) and names the simulation with -s or DTFE_SIM (require_simulation).
 # The Python side (python/dtfelib/cli.py) honours the same DTFE_DATA_ROOT / DTFE_SIM variables.
 
-# Root of the simulation data. Two layouts are recognised (see sim_dir below):
-#   per family  $DATA_ROOT/<family>/<sim>/snapdir_NNN/   the Samsung T7 (default):
-#               Illustris TNG/TNG100/TNG100-3-Dark, Illustris TNG/TNG300/TNG300-3-Dark, ...
-#   flat        $DATA_ROOT/<sim>/snapdir_NNN/            e.g. DTFE_DATA_ROOT=~/output (the old copy)
-# where <family> is the simulation name up to its first '-' (TNG100-3-Dark -> TNG100). With the
-# T7 unplugged the run scripts stop at "no snapshots under ..." rather than writing elsewhere.
-DATA_ROOT="${DTFE_DATA_ROOT:-/Volumes/Samsung T7/Illustris TNG}"
+source "$(dirname "${BASH_SOURCE[0]}")/h5py_python.sh"   # h5py_python: the python with numpy and h5py
+
+# Root of the simulation data, the folder that holds the simulations. Two layouts are recognised (see sim_dir):
+#   per family  $DATA_ROOT/<family>/<sim>/snapdir_NNN/   e.g. TNG100/TNG100-3-Dark, TNG300/TNG300-3-Dark, ...
+#   flat        $DATA_ROOT/<sim>/snapdir_NNN/            e.g. TNG100-3-Dark
+# where <family> is the simulation name up to its first '-' (TNG100-3-Dark -> TNG100). A root that does not
+# exist (a data disk not mounted) stops the run scripts rather than letting them write elsewhere.
+DATA_ROOT="${DTFE_DATA_ROOT:-}"
 
 # The directory of simulation $1 under DATA_ROOT, in whichever layout holds it: an existing
 # <sim> or <family>/<sim> directory wins; a simulation not on disk yet goes into its family
@@ -32,6 +34,14 @@ sim_dir() {
 # Simulation to process; snapshots live in $(sim_dir $SIMULATION)/snapdir_NNN/. No default: -s or DTFE_SIM.
 SIMULATION="${DTFE_SIM:-}"
 
+# Stops a driver that was not told where the simulations are (after its option parsing, so --help still works).
+# Every driver that reads or writes data calls it unless its -d names the simulation's folder itself.
+require_data_root() {
+    [ -n "${DATA_ROOT}" ] && return 0
+    echo "Error: no data root: set DTFE_DATA_ROOT to the folder that holds the simulations (e.g. DTFE_DATA_ROOT=~/IllustrisTNG)." >&2
+    exit 2
+}
+
 # Stops a driver that was not told which simulation to process (after its option parsing, so --help still works).
 require_simulation() {
     [ -n "${SIMULATION}" ] && return 0
@@ -47,9 +57,9 @@ SNAPSHOTS=(99)
 # Environment-overridable like DATA_ROOT above. The run scripts source this file BEFORE parsing
 # their flags, so precedence is:  -g flag  >  environment  >  the default here. PADDING's 50 is the PS-DTFE
 # scripts' default; run_dtfe.sh has its own, 15 (complete at z = 0 on TNG50/100/300; see there).
-# GRID_SIZE 512: the production grids of both estimators (every thesis grid on the T7, and run_ps_pipeline.sh's
-# and the launcher's default) are 512^3; 1024 would make a bare driver run a grid 8x the production one (~14 GB
-# per field set, a scratch dir needed) that nothing downstream reads.
+# GRID_SIZE 512: the production grids of both estimators (run_ps_pipeline.sh's and the launcher's default too)
+# are 512^3; 1024 would make a bare driver run a grid 8x the production one (~14 GB per field set, a scratch dir
+# needed) that nothing downstream reads.
 GRID_SIZE="${GRID_SIZE:-${DTFE_GRID_SIZE:-512}}"
 PADDING="${PADDING:-${DTFE_PADDING:-50}}"
 
@@ -61,22 +71,15 @@ INPUT_SUBDIR="snapdir"
 # download_snapshots.sh source it too and print their own messages).
 
 # data_root_problem <data dir>: prints why the data cannot be there and returns 1 when the DATA ROOT
-# itself is missing (the T7 unplugged, or remounted by macOS as '/Volumes/Samsung T7 1'); returns 0
-# otherwise. A missing SIMULATION under an existing root is not this function's business: the drivers
-# keep skipping its snapshots and exit 1 with 'nothing processed'.
+# itself is missing (a data disk not mounted, or mounted under another name); returns 0 otherwise. A
+# missing SIMULATION under an existing root is not this function's business: the drivers keep skipping
+# its snapshots and exit 1 with 'nothing processed'.
 data_root_problem() {
     local dir="$1" root="${DATA_ROOT}"
     [ -d "${dir}" ] && return 0
     case "${dir}" in "${root}"|"${root}"/*) ;; *) root="$(dirname "${dir}")" ;; esac   # -d given: its parent
     [ -d "${root}" ] && return 0
     echo "Error: the data folder '${root}' does not exist: is the data disk mounted?" >&2
-    local v found=0
-    for v in /Volumes/Samsung\ T7*; do
-        [ -d "${v}" ] || continue
-        [ "${found}" = 0 ] && echo "       Volumes that look like it:" >&2
-        echo "         ${v}   (DTFE_DATA_ROOT='${v}/Illustris TNG' to use it)" >&2
-        found=1
-    done
     echo "       Set DTFE_DATA_ROOT (or -d DATA_DIR) to where the snapshots are." >&2
     return 1
 }

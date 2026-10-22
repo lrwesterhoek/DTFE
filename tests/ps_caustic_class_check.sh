@@ -315,8 +315,8 @@ echo ""
 echo "(I) D4 umbilic indicator (bit 6) on a wave with NO caustic anywhere. A*k=0.15 never shell-"
 echo "    crosses, so there is no singularity of any kind to indicate. The transverse eigenvalues"
 echo "    are nevertheless exactly equal everywhere (nothing displaces y or z), which is precisely"
-echo "    the trap: 'two eigenvalues coincide' is true in the whole box and used to flag 97.6% of"
-echo "    it. An umbilic needs the coincident pair to sit AT ZERO, not merely to be equal."
+echo "    the trap: 'two eigenvalues coincide' is true in the whole box and, as the criterion, flags 97.6%"
+echo "    of it. An umbilic needs the coincident pair to sit AT ZERO, not merely to be equal."
 "${PY}" "${SCRIPT_DIR}/generate_ps_test_data.py" --out "${TMP}/pcc_weak.hdf5" --n 32 \
         --box "${BOX}" --amplitude-factor 0.15 >/dev/null
 "${BIN}" "${TMP}/pcc_weak.hdf5" "${TMP}/pcc_weak" --grid 48 --periodic --field density \
@@ -345,11 +345,11 @@ sys.exit(1 if fails else 0)
 PYEOF
 
 echo ""
-echo "(J) The fold flag is GEOMETRIC (2026-10-13, audit finding 3): '.caustic' = a folded tetrahedron"
+echo "(J) The fold flag is GEOMETRIC: '.caustic' = a folded tetrahedron"
 echo "    overlaps the cell, not 'a folded tetrahedron deposited a sample here'. Two geometries just past"
 echo "    shell crossing, whose young walls are thinner than the sampling: the pancake (amplitude 1.05) and"
-echo "    the crossed waves (1.3), 27 particles per axis on 48^3 so no lattice lines up. Before the fix the"
-echo "    flag marked 4364 of 4608 and 15844 of 25408 fold cells there. Asserted, cell for cell:"
+echo "    the crossed waves (1.3), 27 particles per axis on 48^3 so no lattice lines up. A flag per deposited"
+echo "    sample marks only 4364 of 4608 and 15844 of 25408 fold cells there. Asserted, cell for cell:"
 echo "    J1 '.caustic' == dtfelib's fold, (streams > 1 + tol) | (hidden_streams & 1), from either pair;"
 echo "    J2 folds the samples missed ARE flagged (non-vacuous), and are exactly the hidden-bit cells;"
 echo "    J3 the flag does not depend on the deposit (nSub 1 == nSub 3 == the exact deposit) and is exactly the"

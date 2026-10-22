@@ -1,8 +1,9 @@
 # Command cheatsheet
 
 Every script in the repo with its useful flag combinations. All paths are relative to the
-repository root; quote the repo path (it contains spaces). Scripts that need h5py should be
-run with a python whose h5py works (`/opt/homebrew/bin/python3` on the development Mac).
+repository root; quote paths that contain spaces. Scripts that need h5py should be
+run with a python whose h5py works (the shell scripts and tests pick one: `PYTHON`, else the first of `python3`,
+Homebrew's and `/usr/local`'s that imports numpy and h5py).
 The binaries' `--full_help` and each script's `--help` are the reference for every option and default.
 
 ---
@@ -61,14 +62,15 @@ object directory automatically. Header edits rebuild all affected objects (auto-
 
 ## Download (`scripts/download_snapshots.sh`)
 
-API key: `-k KEY`, or `TNG_API_KEY` env, or `~/.tng_api_key` (recommended). Everything lands
-in the simulation's folder, `sim_dir <SIM>` in `scripts/config.sh` (Python: `dtfelib.cli.sim_dir`);
-`-d` overrides. The data root (`DTFE_DATA_ROOT`) defaults to the Samsung T7,
-`/Volumes/Samsung T7/Illustris TNG`, whose simulations sit in FAMILY folders --
-`<root>/<family>/<sim>/`, e.g. `TNG100/TNG100-3-Dark`, family = the name up to its first `-`.
-A flat `<root>/<sim>/` root works too (e.g. `DTFE_DATA_ROOT=~/output`); an
-existing flat folder wins. With the T7 unplugged the scripts stop rather than write elsewhere.
-Anything whose merged/converted product already exists is skipped automatically.
+API key: `-k KEY`, or `TNG_API_KEY` env, or `~/.tng_api_key` (recommended). The data root, the folder that
+holds the simulations, is REQUIRED and has no default: `export DTFE_DATA_ROOT=~/IllustrisTNG` (or any
+`/path/to/IllustrisTNG`) before any script below; without it every script stops with "no data root" (`-d` does
+not replace it). Everything lands in the simulation's folder, `sim_dir <SIM>` in `scripts/config.sh`
+(Python: `dtfelib.cli.sim_dir`); `-d` overrides. The simulations may sit in FAMILY folders --
+`<root>/<family>/<sim>/`, e.g. `TNG100/TNG100-3-Dark`, family = the name up to its first `-` -- or
+flat, `<root>/<sim>/`; an existing flat folder wins, and a new simulation goes beside its family's
+folder when that exists. A data root that does not exist (a disk not mounted) stops the scripts rather
+than letting them write elsewhere. Anything whose merged/converted product already exists is skipped automatically.
 
 ```bash
 ./scripts/download_snapshots.sh -s TNG50-3-Dark 0 4 17 33 50 99    # raw snapshot chunks (z=20..0)
@@ -78,7 +80,7 @@ Anything whose merged/converted product already exists is skipped automatically.
                                                            #   ('-Dark' stripped: ICs are
                                                            #    served under TNG100-3)
 ./scripts/download_snapshots.sh -s TNG50-3-Dark                    # default snapshot ladder (19 snaps)
-./scripts/download_snapshots.sh -k 0123abcd -d /scratch/tng -s TNG300-3-Dark 99
+./scripts/download_snapshots.sh -k 0123abcd -d /scratch/TNG300-3-Dark -s TNG300-3-Dark 99   # into another folder
 ```
 
 ## Merge / units (`python/tools/merge_HDF5.py`, `convert_ic_units.py`)
@@ -87,7 +89,7 @@ Every `combined_*` file is h-FREE (ckpc, 1e10 Msun, ckpc km/s) with self-describ
 `HFreeUnits` / `divided_by_h` markers. Chunk counts are auto-detected.
 
 ```bash
-SIMDIR="/Volumes/Samsung T7/Illustris TNG/TNG50/TNG50-3-Dark"   # a simulation folder on the T7
+SIMDIR="$DTFE_DATA_ROOT/TNG50/TNG50-3-Dark"   # a simulation folder (here in the per-family layout)
 python3 python/tools/merge_HDF5.py -d "$SIMDIR" 0 4 17 33 50 99   # snapshots
 python3 python/tools/merge_HDF5.py -d "$SIMDIR" --groupcats 0 99  # group catalogs
 python3 python/tools/merge_HDF5.py -d "$SIMDIR" --trees           # SubLink trees
@@ -113,8 +115,9 @@ without snapshot numbers it merges 0 4 17 33 50.
 ## Run scripts (`scripts/run_ps_dtfe.sh`, `run_dtfe.sh`, `run_ps_pipeline.sh`)
 
 Config comes from `scripts/config.sh` (`DTFE_DATA_ROOT`, `DTFE_SIM` env; the simulation folder is
-resolved by `sim_dir`, flat or per-family -- see Download above) plus flags. The simulation is REQUIRED: `-s SIM`
-or `DTFE_SIM` (no default; the lines below without `-s` assume `export DTFE_SIM=TNG100-3-Dark`). Positional
+resolved by `sim_dir`, flat or per-family -- see Download above) plus flags. The data root is REQUIRED (the lines
+below assume `export DTFE_DATA_ROOT=~/IllustrisTNG`), and so is the simulation: `-s SIM` or `DTFE_SIM` (no default;
+the lines below without `-s` assume `export DTFE_SIM=TNG100-3-Dark`). Positional
 arguments override the snapshot list (default: 99). Partitioning is auto-tuned unless `PARTITION` /
 `MAX_CONCURRENT` are set. Both default to the production settings (512^3, the GPU on a GPU build,
 the T-web and V-web at `LAMBDA_TH` 0.3).
@@ -195,8 +198,6 @@ GRID_SIZE=512 PTS_VEL_GRAD=1 ./scripts/run_ps_pipeline.sh
 # then render:  python3 python/plot/plot_pointeval.py --sims all
 ```
 
-`scripts/thesis_runs.sh ps27|dtfe27|dtfe27planes|caustics|caustics2|voids|overnight|all` is the recipe of the thesis
-grids and figures (`--help` lists each stage's settings, time and memory; `DRY_RUN=1` prints every command).
 
 ## The binaries directly (`./DTFE`, `./PS-DTFE`)
 
@@ -323,7 +324,7 @@ Estimator("snap.hdf5", options=["--ps-vertex-mass"], verbose=1)      # any extra
 Estimator("snap.hdf5", per_stream=True, lagrangian_positions=True,  # .stream_lagrangian: q(x) per
           scalar_dataset="Potential")               #   stream; .scalar/.stream_scalar: the dataset
 Estimator("big.hdf5", partition=4, resident=3,      # COMPOSITE: 4^3 partition tessellations on disk,
-          tessellation_cache="/Volumes/T7/tess")    #   at most 3 in memory (default: the RAM budget)
+          tessellation_cache="/scratch/dtfe-tess")  #   at most 3 in memory (default: the RAM budget)
 Estimator.from_arrays(x, velocities=v, lagrangian=q, values=phi, box=100.0)   # numpy arrays in
 ```
 The answers are bit-identical to a `--sample-points` run on the same points; a single point takes
@@ -339,7 +340,7 @@ with the same split. `--serve-progress` writes progress lines to stderr (the lau
 `DTFE_SERVE_INDEX=0|1` forces the walk or the cell index.
 
 ```bash
-python3 python/tools/upgrade_tess_cache.py "/Volumes/Samsung T7/Illustris TNG/.dtfe-tessellation-cache"  # old cache files -> chunked
+python3 python/tools/upgrade_tess_cache.py "$DTFE_DATA_ROOT/.dtfe-tessellation-cache"  # old cache files -> chunked
 ```
 Cache files are written in 16 MB chunks, compressed and decompressed on several cores
 (`DTFE_TESS_CACHE_THREADS=N` pins the threads per file, `DTFE_TESS_CACHE_LEGACY=1` writes the old single
@@ -417,7 +418,8 @@ thread count (default: all cores, or cores / concurrent partitions inside a part
 
 ## Analysis (`python/analyze.py`, `python/plot/*.py`)
 
-All plot scripts share the CLI from `dtfelib.cli`: `--data-root PATH`, `--sim NAME`,
+All plot scripts share the CLI from `dtfelib.cli`: `--data-root PATH` (else `DTFE_DATA_ROOT`: one of the two
+is required, there is no default), `--sim NAME`,
 `--snap N`, `--method auto|ps|dtfe`, `--raw` (unaveraged grids), `--smooth SIGMA_CELLS`,
 `--prefix` (an alternate `OUTPUT_PREFIX` grid set). `--sim` is required unless `DTFE_SIM` is set (there is no
 default simulation); `analyze.py` takes it from `DTFE_SIM` only. The lines below without either assume
@@ -446,9 +448,8 @@ DTFE_VOID_GATE=none DTFE_SIM=TNG100-3-Dark python3 python/plot/plot_void_populat
 python3 python/plot/plot_void_crossbox.py --sims TNG50-3-Dark TNG100-3-Dark TNG300-3-Dark --smooth-mpc 2.1625   # side by side
 # also: plot_cosmic_web, plot_eigenvalues, plot_shear_triaxial, plot_velDiv_den, plot_PDF_CDF,
 #       plot_phi_delta, plot_tidal_correlation, plot_shape_filter, plot_contour_filter,
-#       plot_ellipses_contour_3D, plot_smoothing_comparison, plot_conclusions_synthesis,
-#       plot_pk_compare, plot_web_streams, plot_void_profiles, plot_void_profile_evolution,
-#       plot_void_environment, plot_void_convergence
+#       plot_ellipses_contour_3D, plot_smoothing_comparison, plot_pk_compare, plot_web_streams,
+#       plot_void_profiles, plot_void_profile_evolution, plot_void_environment, plot_void_convergence
 # void scripts: set DTFE_SIM to the --sim (the cached catalogue's lengths are in that frame);
 # DTFE_SIGMA_MPC=2.1625 smooths every box at one physical scale; DTFE_CACHE_DIR moves the cache
 

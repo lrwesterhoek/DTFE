@@ -37,6 +37,7 @@
 #endif
 
 #include "user_options.h"
+#include "env_knobs.h"
 
 #ifdef PHASE_SPACE
 // failed GPU buffers / kernels (each one resumes the pass from its last checkpoint; 3 failures of one chunk send
@@ -186,9 +187,8 @@ inline void runProgressInit(User_options const &u)
 {
     RunProgress &p = runProgressState();
     std::lock_guard<std::mutex> lock( p.m );
-    char const *off = std::getenv( "DTFE_NO_PROGRESS" );
     p.on = not u.outputFilename.empty() and not u.psServe and not u.autoTuneReport
-           and not ( off and off[0] and off[0] != '0' );
+           and not Env::flag( "DTFE_NO_PROGRESS" );
     p.path = u.outputFilename + ".runlog.progress";
     p.start = std::chrono::steady_clock::now();
     runProgressWriteLocked( p );

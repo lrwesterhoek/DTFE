@@ -16,14 +16,14 @@
 #   ./install.sh --jobs N     parallel build jobs (default: all cores)
 #   ./install.sh --no-python  skip step 4 (the editable 'pip install -e python' of dtfelib)
 #   ./install.sh --no-gui     skip step 5 (the GUI's PySide6 environment; e.g. on a cluster)
-#   ./install.sh --no-app     set up the GUI, but no "DTFE Launcher" app / Desktop shortcut
+#   ./install.sh --no-app     set up the GUI, but no "Lamina" app / Desktop shortcut
 #   ./install.sh --double     ALSO build the double-precision pair (DTFE-double / PS-DTFE-double, DOUBLE=1,
 #                             same GPU backend): every position and field in double, ~2x the memory
 #
 # The GUI (scripts/gui.sh) gets its own virtual environment, ~/.venvs/dtfe-gui (DTFE_GUI_VENV
 # overrides), made with --system-site-packages so it sees this Python's numpy/h5py, holding
 # PySide6 (~1 GB). Already set up -> left alone. It never fails the install: the binaries come first.
-# Then scripts/install_gui_app.sh makes it launchable like any application: "DTFE Launcher.app" in
+# Then scripts/install_gui_app.sh makes it launchable like any application: "Lamina.app" in
 # /Applications + a Desktop shortcut on macOS (give it Full Disk Access once: the repository and
 # the data are on protected locations), a .desktop entry on Linux.
 #
@@ -37,9 +37,9 @@
 
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."   # run from the repo root (this script lives in scripts/)
-source scripts/install_lib.sh            # backup_binaries / restore_binaries / build_failed_hint
+source scripts/install_lib.sh            # backup_binaries / restore_binaries / build_failed_hint / term_colours
 
-BLUE='\033[0;34m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
+term_colours
 info()  { echo -e "${BLUE}[install]${NC} $1"; }
 good()  { echo -e "${GREEN}[install]${NC} $1"; }
 warn()  { echo -e "${YELLOW}[install]${NC} $1"; }
@@ -144,7 +144,7 @@ if [ "$FORCE_CPU" -eq 0 ]; then
     elif [ "$UNAME_S" = "Linux" ]; then
         # NVIDIA: the CUDA toolkit's nvcc (PATH or /usr/local/cuda); AMD: ROCm's hipcc (PATH or
         # /opt/rocm). The kernels are ports of the Metal ones: compiled and CPU-fallback-tested on
-        # Linux, not yet validated on NVIDIA/AMD hardware -- run tests/dtfe_metal_check.sh and the
+        # Linux, not validated on NVIDIA/AMD hardware -- run tests/dtfe_metal_check.sh and the
         # PS parity suites on the first GPU machine (metal/README.md, "CUDA / HIP").
         if command -v nvcc >/dev/null 2>&1 || [ -x /usr/local/cuda/bin/nvcc ]; then
             GPU_ARG="CUDA=1"
@@ -264,9 +264,9 @@ if [ "$DO_GUI" -eq 1 ]; then
     [ "$GUI_STATE" = "ready" ] && good "GUI ready: scripts/gui.sh"
     if [ "$GUI_STATE" = "ready" ] && [ "$DO_APP" -eq 1 ]; then
         if DTFE_GUI_PYTHON="$GUI_PY" bash scripts/install_gui_app.sh; then
-            GUI_STATE="ready (DTFE Launcher: Applications + Desktop)"
+            GUI_STATE="ready (Lamina: Applications + Desktop)"
         else
-            warn "could not make the DTFE Launcher app (see above); scripts/gui.sh still works"
+            warn "could not make the Lamina app (see above); scripts/gui.sh still works"
         fi
     fi
 else

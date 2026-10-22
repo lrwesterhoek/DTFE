@@ -132,15 +132,15 @@ for geo, title in (("pan", "pancake"), ("crw", "crossed waves")):
         s = load(base, sext)
         u = np.rint(load(base, uext)).astype(np.int32)
         single = np.abs(s - 1.0) <= TOL
-        keep = single & ((u & 1) == 0)                       # the new single-stream mask
-        old_keep = single & (u == 0)                         # the old conservative one (bit 2 = old flag)
+        keep = single & ((u & 1) == 0)                       # the single-stream mask
+        old_keep = single & (u == 0)                         # the conservative one (any bit set: dropped)
         bad = int((keep & cell_multi).sum())
         check(f"X [{tag}] every dense point of a kept cell is single-stream", bad == 0,
               f"{bad} of {int(keep.sum())} kept cells hold a multi-stream point")
         rec = int((keep & ~old_keep).sum())
-        check(f"X [{tag}] single-stream cells the old mass flag dropped are kept now", rec > 0,
+        check(f"X [{tag}] single-stream cells the conservative mask drops are kept", rec > 0,
               f"{rec} cells recovered: the mask keeps {int(keep.sum())} of {int(single.sum())} "
-              f"streams==1 cells, the old flag {int(old_keep.sum())}")
+              f"streams==1 cells, the conservative mask {int(old_keep.sum())}")
         dev = float(np.abs(exact[keep] - 1.0).max()) if keep.any() else 0.0
         check(f"Y [{tag}] the exact deposit reads 1 in every kept cell", dev < 2e-5,
               f"max |exact streams - 1| = {dev:.2e}")
@@ -148,7 +148,7 @@ for geo, title in (("pan", "pancake"), ("crw", "crossed waves")):
         missed = single & (exact > 1.0 + 2e-5)               # multi-stream volume the samples missed
         nm, nmf = int(missed.sum()), int((missed & flagged).sum())
         check(f"Y [{tag}] every wall the samples missed is flagged", nmf == nm and nm > 0,
-              f"{nmf} of {nm} (the old mass flag: {int((missed & ((u & 2) != 0)).sum())})")
+              f"{nmf} of {nm} (bit 2, the mass flag: {int((missed & ((u & 2) != 0)).sum())})")
         confirmed = flagged & ((exact > 1.0 + 2e-5) | cell_multi)
         nf, nc = int(flagged.sum()), int(confirmed.sum())
         lowest = float((exact[flagged] - 1.0).min()) if nf else 0.0

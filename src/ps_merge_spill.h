@@ -38,6 +38,7 @@
 #include <sys/vfs.h>   // statfs: a tmpfs default folder is RAM, where a spill saves nothing
 #endif
 
+#include "env_knobs.h"
 #include "quantities.h"
 #include "partition_checkpoint.h"   // forEachAccumulator: the one list of a Quantities' accumulators
 
@@ -56,10 +57,7 @@ inline std::string folder(std::string const &scratchDir, std::string &why)
     std::string dir = scratchDir;
     bool const fromScratch = not dir.empty();
     if ( dir.empty() )
-    {
-        char const *tmp = std::getenv( "TMPDIR" );
-        dir = ( tmp and tmp[0] ) ? tmp : "/tmp";
-    }
+        dir = Env::text( "TMPDIR", "/tmp" );
     while ( dir.size() > 1 and dir.back() == '/' ) dir.pop_back();
     struct stat st;
     if ( ::stat( dir.c_str(), &st ) != 0 or not S_ISDIR( st.st_mode ) or ::access( dir.c_str(), W_OK ) != 0 )
@@ -99,8 +97,7 @@ inline bool room(std::string const &dir, double const bytes, double const reserv
 // it for both (the tests' forced spills into the temp folder of a CI runner with less than 16 GB free)
 inline double margin(std::string const &scratchDir)
 {
-    if ( char const *env = std::getenv( "DTFE_SPILL_MIN_GB" ) )
-        if ( env[0] != '\0' ) return std::max( 0., std::atof( env ) ) * 1.e9;
+    if ( Env::isSet( "DTFE_SPILL_MIN_GB" ) ) return std::max( 0., Env::real( "DTFE_SPILL_MIN_GB", 0. ) ) * 1.e9;
     return scratchDir.empty() ? 16.e9 : 2.e9;
 }
 

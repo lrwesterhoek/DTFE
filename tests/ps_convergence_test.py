@@ -2,7 +2,7 @@
 """PS-DTFE convergence test: single-stream density profile vs the analytic Zel'dovich solution.
 
 Test-design notes:
-  * Uses the volume-AVERAGED field (density_a, --avg-subsamples 3): since the deposit became
+  * Uses the volume-AVERAGED field (density_a, --avg-subsamples 3): since the deposit is
     mass-conserving, the plain (nSub=1) field carries per-tetrahedron quantization noise that
     GROWS as tets shrink toward the cell size -- the '_a' fields are the science-quality
     estimator (see run_ps_dtfe.sh) and the ones whose convergence is meaningful.
@@ -24,7 +24,9 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-TMP = os.path.join(HERE, "tmp")
+# the suites' temp root, as the shell suites use it: $DTFE_TEST_TMP, else ${TMPDIR:-/tmp}/dtfe-tests
+TMP = os.path.join(os.environ.get("DTFE_TEST_TMP") or os.path.join(os.environ.get("TMPDIR") or "/tmp", "dtfe-tests"),
+                   "ps_convergence_test")
 
 GRID = 96
 BOX = 100.0

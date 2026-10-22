@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The Explore tab's void features, offscreen, on a synthetic snapshot (no T7, no binary):
+"""The Explore tab's void features, offscreen, on a synthetic snapshot (no simulation data, no binary):
 
   1. the void inspector: hovering an outline names the void (R_v, R_eff, delta, flags), clicking it fills the
      inspector (every R_v definition the catalogue has, R_eff, central delta, flags, centre), 'Go to its centre'
@@ -14,7 +14,7 @@
   5. the caustic (fold) map of a periodic PS run is the exact fold flag (dtfelib io.caustic_is_fold),
      not the stored per-sample grid of older runs; the caustic-class map stays the stored mask; an
      exact zoom's fold and class maps read its class grid (the 0/1 '.caustic' would give no fold at all).
-  6. the Save options (figsave.py): the default save is the old one pixel for pixel (and byte for byte);
+  6. the Save options (figsave.py): the default save is the reference one pixel for pixel (and byte for byte);
      full resolution = the data's shape and the screen's pixels, with or without the outlines; no axes, title, colour
      bar, units (Mpc, Mpc/h from the header's h, cells), overlays, margins none, width, dpi, PDF/SVG text kept as
      text, TIFF, transparency, font size; the same for the figure grid (separate and merged panels); the presets,
@@ -59,7 +59,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("MPLBACKEND", "Agg")
 os.environ["DTFE_GUI_NO_NOTIFY"] = "1"
 TMP = Path(tempfile.mkdtemp(prefix="gui_explore_"))
-os.environ["DTFE_FIGURES_ROOT"] = str(TMP / "figures")     # BEFORE runspec is imported: no test figure on the T7
+os.environ["DTFE_FIGURES_ROOT"] = str(TMP / "figures")     # BEFORE runspec is imported: no test figure in the real root
 
 import grids as G  # noqa: E402
 import void_outlines as VO  # noqa: E402
@@ -217,7 +217,7 @@ def save_options_pure():
           "dropped, the typed title kept for the session",
           o["dpi"] == FS.DPI_MAX and o["format"] == "png" and o["frame"] is True and o["width"] == 0.0
           and o["font_scale"] == 1.5 and o["unit"] == "mpc_h" and "colour" not in o and o["title_text"] == "T", str(o))
-    check("the defaults are what was always written: 200 dpi, a tight crop, PNG, everything on",
+    check("the defaults are the reference save's: 200 dpi, a tight crop, PNG, everything on",
           FS.options() == FS.DEFAULTS and FS.save_kwargs(FS.options(), 200) == {"dpi": 200, "bbox_inches": "tight"}
           and FS.rc(FS.options(), "png") == {})
     check("persistent()/dumps(): the typed title is never remembered between sessions; loads() of garbage = defaults",
@@ -288,8 +288,8 @@ def save_options_pure():
     d_small = FS.match_dpi(small, [(sax, 64)])
     held = sax.get_position().width * small.get_size_inches()[0] * d_small      # the axes' pixels at that dpi
     check("match_dpi: the dpi at which an axes 3.5 in wide holds 700 data pixels is 200, 1200 at most; a 64 pixel "
-          "plane (18 dpi wanted) gets 72 dpi and a figure shrunk until its axes hold 64 pixels (2026-10-15: the "
-          "dpi stopped at 72, 252 pixels)",
+          "plane (18 dpi wanted) gets 72 dpi and a figure shrunk until its axes hold 64 pixels (a dpi "
+          "stopped at 72 alone gives 252 pixels)",
           abs(FS.match_dpi(fig, [(ax, 700)]) - 200.0) < 1e-6 and FS.match_dpi(fig, [(ax, 10 ** 6)]) == FS.DPI_MAX
           and d_small == FS.DPI_MIN and abs(held - 64) < 0.05 and small.get_size_inches()[0] < 2.0
           and tuple(fig.get_size_inches()) == (7.0, 6.0), f"{d_small} {held} {small.get_size_inches()}")
@@ -318,7 +318,7 @@ def save_options_pure():
 
 
 def _old_save_png(x, f):
-    """ExploreControls.save_png as it was before the Save options, verbatim but for 'self': the reference
+    """ExploreControls.save_png without the Save options, verbatim but for 'self': the reference
     the default save must equal pixel for pixel."""
     import explore as E
     req = x._req
@@ -390,8 +390,8 @@ def saving_map(qa, x, view):
     w_new = x.save_png(d / "new.png")
     x.save_png(d / "explicit.png", FS.options())
     old, new = _png(d / "old.png"), _png(d / "new.png")
-    check("the default save is the old one: the same pixels as save_png before the Save options (and the same bytes); "
-          "the explicit defaults too; the voids' CSV beside it as before",
+    check("the default save is the reference one: the same pixels as save_png without the Save options (and the same "
+          "bytes); the explicit defaults too; the voids' CSV beside it",
           old.shape == new.shape and np.array_equal(old, new) and np.array_equal(new, _png(d / "explicit.png"))
           and (d / "old.png").read_bytes() == (d / "new.png").read_bytes() and len(w_new) == 2,
           f"{old.shape} {new.shape} {w_new}")
@@ -457,7 +457,7 @@ def saving_map(qa, x, view):
         got[unit + str(extra)] = (fig.axes[0].get_xlabel(), fig.axes[0].get_xlim())
         plt.close(fig)
     h = G.hubble(x.current)
-    check("units: Mpc as before; Mpc/h (the snapshot header's h = 0.6774) scales the axes; cells count the grid's "
+    check("units: Mpc; Mpc/h (the snapshot header's h = 0.6774) scales the axes; cells count the grid's "
           "cells; the unit can be left out of the name",
           got["mpc{}"][0] == f"{xn} [Mpc]" and got["mpc_h{}"][0] == f"{xn} [Mpc/h]" and abs(h - 0.6774) < 1e-12
           and np.allclose(got["mpc_h{}"][1], (glo[0] * h, ghi[0] * h)) and got["cells{}"][0] == f"{xn} [cells]"
@@ -505,7 +505,7 @@ def saving_map(qa, x, view):
     x.save_png(d / "match.png", FS.options({"match_data": True, "voids": False}))
     mw = _png(d / "match.png").shape[1]
     check("match the data: a 64 px map needs less than 72 dpi: 72 dpi and a smaller figure, the map's axes 64 x 64 "
-          "pixels as the data (2026-10-15: 389, resampled), the text around it",
+          "pixels as the data (not 389, resampled), the text around it",
           dpi == FS.DPI_MIN and abs(ext.width - n0) < 0.6 and abs(ext.height - n1) < 0.6 and n0 + 40 < mw < 389,
           f"{dpi} {ext.width} x {ext.height} {mw}")
     # no margins with 'match the data': the map's own pixels, unresampled (as full resolution)
@@ -547,7 +547,7 @@ def saving_map(qa, x, view):
         wraps = fig.axes[0].title.get_wrap()
     plt.close(fig)
     check("Slide: every text 1.8 times larger (the title 8 -> 14.4 pt, the axis names 10 -> 18 pt); the long title "
-          "wraps instead of running over the colour bar's top label (review)",
+          "wraps instead of running over the colour bar's top label",
           abs(size[0] - 14.4) < 1e-9 and abs(size[1] - 18.0) < 1e-9 and wraps, f"{size} {wraps}")
     # a width or dpi far too large is refused BEFORE matplotlib allocates the picture (50 in at
     # 1200 dpi would be 60000 px across, 12 GB): no file, no figure left open, Save image says why
@@ -663,7 +663,7 @@ def saving_grid(qa, x, view):
     fig.set_dpi(dpi)
     widths = [ax.get_window_extent(fig.canvas.get_renderer()).width for ax in fig.axes[:2]]
     check("the grid, match the data: 64-cell panels at 72 dpi in a smaller figure, each panel 64 pixels across "
-          "(2026-10-15: about 210, resampled)", dpi == FS.DPI_MIN and all(abs(w - T) < 0.6 for w in widths),
+          "(not about 210, resampled)", dpi == FS.DPI_MIN and all(abs(w - T) < 0.6 for w in widths),
           f"{dpi} {widths}")
     x.save_grid(d / "grid.tif", FS.options())
     x.save_grid(d / "borderless_match.png", FS.options({"margins": "none", "match_data": True, "voids": False}))
@@ -1056,7 +1056,7 @@ def fold_map():
     hid[:, 10, :] = 1.0                             # a fold thinner than the sampling: hidden-streams bit 1 only
     hid[5, :, :] = 2.0                              # bit 2 alone (an unsampled tetrahedron's mass): no fold
     raw = np.zeros((N, N, N), np.float32)
-    raw[:, :, 20] = 1.0                             # the pre-fix stored flag: half the sheet, none of the thin fold
+    raw[:, :, 20] = 1.0                             # the per-sample stored flag: half the sheet, none of the thin fold
     ccm = np.full((N, N, N), 1 + 4, np.float32)
     for sfx, arr in (("a_streams", st), ("a_hidden_streams", hid), ("caustic", raw), ("causticClass", ccm)):
         arr.tofile(str(d / f"ps_output.{sfx}"))
@@ -1186,7 +1186,7 @@ def mean_field_pure():
     from dtfelib import FieldSet
     from dtfelib.cli import add_ps_gradient_arg
     import argparse
-    print("PS velocity derivatives: the mean field (2026-10-15)")
+    print("PS velocity derivatives: the mean field")
     data = TMP / "mf data"
     d = mean_field_data(data)
     outs = {o.prefix: o for _t, o in G.find_outputs(data)}

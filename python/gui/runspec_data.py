@@ -12,7 +12,6 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import runspec as _rs
-from dtfelib.cli import DATA_ROOT, sim_dir
 
 
 def api_key_available() -> bool:
@@ -54,7 +53,7 @@ class DataSpec:
     """Getting a simulation onto disk: download_snapshots.sh (particle snapshots, group
     catalogues, merger trees, initial conditions) and merge_HDF5.py (h-free combined files).
     Downloads run first, then merges, one step each. The API key is never on a command line."""
-    data_root: str = str(DATA_ROOT)
+    data_root: str = field(default_factory=lambda: _rs.default_data_root())
     sim: str = ""
     snapshots: list[int] = field(default_factory=list)
     download_snapshots: bool = True
@@ -68,7 +67,7 @@ class DataSpec:
     delete_chunks: bool = False
 
     def sim_path(self) -> Path:
-        return sim_dir(self.sim, self.data_root)
+        return _rs.sim_dir(self.sim, self.data_root)
 
     def _downloads(self) -> bool:
         return self.download_snapshots or self.download_groupcats or self.download_trees or self.download_ics

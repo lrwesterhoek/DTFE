@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Phase-Space DTFE counterpart of run_dtfe.sh: tessellates in Lagrangian space, so each
 # particle needs Eulerian Coordinates plus a Lagrangian position. HDF5-only (input 105).
-# Shared defaults (DATA_ROOT, SIMULATION, SNAPSHOTS, GRID_SIZE, PADDING) live in config.sh.
+# DTFE_DATA_ROOT (the folder that holds the simulations; -d names a simulation's folder instead) and the simulation
+# (-s or DTFE_SIM) are required; the
+# shared defaults (SNAPSHOTS, GRID_SIZE, PADDING) live in config.sh.
 #
 # Usage:
 #   ./run_ps_dtfe.sh [-d DATA_DIR] [-s SIMULATION] [-g GRID_SIZE] [-n AVG_SUBSAMPLES] [-m] [-e] [snapshot ...]
@@ -10,9 +12,8 @@
 #          DTFE_PRECISION=double), else the CPU; PS_METAL=0 runs the CPU deposit on a GPU build.
 #     -e   exact conservative deposit (same as PS_EXACT=1; --ps-exact-deposit, GPU-capable, slower)
 #   Production defaults: GRID_SIZE 512 (config.sh), the GPU when built, vertex masses, volume-weighted
-#   velocity moments, the caustic classes, FIELDS = the nine of the thesis grids (density, velocity, its gradient /
-#   divergence / shear / vorticity, the dispersion, the T-web and the V-web), LAMBDA_TH 0.3 -- the settings of the
-#   production run of all 27 snapshots (scripts/thesis_runs.sh ps27), which adds the 4096^2 image plane.
+#   velocity moments, the caustic classes, FIELDS = the nine production fields (density, velocity, its gradient /
+#   divergence / shear / vorticity, the dispersion, the T-web and the V-web), LAMBDA_TH 0.3.
 #   A rerun into a prefix that holds an earlier run's files: once it exits 0, the files it did not write (an image
 #   plane, caustics or a field the new run lacks) are MOVED into <prefix>.superseded/<date_time>/ with the old
 #   run log (config.sh supersede_extras; never deleted), so the folder holds one run's set.
@@ -66,24 +67,24 @@ PTS_VEL_GRAD="${PTS_VEL_GRAD:-0}"   # 1 = with SAMPLE_POINTS, also write '.pts_v
                            # sample point (float64 x9). dtfelib.PointPlane derives the
                            # divergence / shear / vorticity maps from it, so this is what makes
                            # the velocity-derivative fields available to the hi-res figures.
-PTS_CONVENTIONS="${PTS_CONVENTIONS:-grid}"  # with SAMPLE_POINTS (2026-10-15): the points' conventions, the binary's
+PTS_CONVENTIONS="${PTS_CONVENTIONS:-grid}"  # with SAMPLE_POINTS: the points' conventions, the binary's
                            # --pts-conventions. 'grid' (default; the binary's own) = the grids' vertex
                            # masses (PS_VERTEX_MASS) and volume weighting (PS_VOLUME_WEIGHTED) at the points too;
                            # 'legacy' = the reference implementation's estimators (rho_bar*V_lag masses, density-
                            # weighted stream means), which reproduce a plane made with them -- about 0.82 of the grid's
                            # density contrast at z = 20 (the launcher's Runs tab warns about such planes). Only
                            # 'legacy' is passed, so a 'grid' run's command line carries no --pts-conventions.
-PS_METAL="${PS_METAL:-auto}"  # 1 = the deposit on the GPU (--ps-gpu), 0 = the CPU; 'auto' (default, 2026-10-13; it
+PS_METAL="${PS_METAL:-auto}"  # 1 = the deposit on the GPU (--ps-gpu), 0 = the CPU; 'auto' (default: it
                            # follows the build) = 1 when the binary is a GPU build (config.sh gpu_build_default),
                            # resolved below once DTFE_PRECISION has chosen the binary
-ORDERED_MERGE="${ORDERED_MERGE:-1}"  # 1 (default since 2026-10-14; it was 0) = --ordered-merge: the partitions' grids are
+ORDERED_MERGE="${ORDERED_MERGE:-1}"  # 1 (default) = --ordered-merge: the partitions' grids are
                            # added in partition index order, so two identical runs write bit-identical grids (and a
                            # killed run resumes to exactly the grids of an uninterrupted one). The binary's own
                            # default, and STAGED: a partition finished before its turn parks its sub-grids in memory
                            # (while the machine has it free) and its thread goes on, so no thread idles behind a slow
                            # partition. Passed explicitly, so the run log says it. 0 = --completion-order-merge:
                            # added as they finish, the grids then differ run to run in the last bits.
-FIXED_POINT_MERGE="${FIXED_POINT_MERGE:-0}"  # 1 = --fixed-point-merge (2026-10-15, OPT-IN, to compare against the default): each
+FIXED_POINT_MERGE="${FIXED_POINT_MERGE:-0}"  # 1 = --fixed-point-merge (OPT-IN, to compare against the default): each
                            # partition is added AS IT FINISHES into exact integer full grids (9 B per summed component and
                            # cell during the loop instead of 4), so the grids are the same bytes at any concurrency and
                            # completion order and nothing parks or spills; they differ from the ordered merge at ~1e-7.
@@ -109,8 +110,8 @@ PS_VERTEX_MASS="${PS_VERTEX_MASS:-1}"  # 1 (default) = chart-independent tet mas
                            # verified against regular DTFE on TNG50-3). Velocities are unaffected either way.
                            # Set PS_VERTEX_MASS=0 only for true-lattice Lagrangian inputs or A/B comparisons.
 _caller_vw="${PS_VOLUME_WEIGHTED:-}"   # (the caller's own value: an unset one yields to PS_LINEAR_DEPOSIT=1, below)
-PS_VOLUME_WEIGHTED="${PS_VOLUME_WEIGHTED:-1}"  # 1 (default since 2026-10-13; it was 0 here, while every thesis PS grid,
-                           # run_ps_pipeline.sh and the launcher used 1) = volume-weighted velocity moments
+PS_VOLUME_WEIGHTED="${PS_VOLUME_WEIGHTED:-1}"  # 1 (default, the production convention, as in
+                           # run_ps_pipeline.sh and the launcher) = volume-weighted velocity moments
                            # (--ps-volume-weighted): velocity/gradient/div/shear/vort become VOLUME averages per
                            # cell (the standard-DTFE '_a' convention that -aHf*delta refers to) instead of the
                            # mass-weighted (momentum-like) means of PS_VOLUME_WEIGHTED=0. The DISPERSION is
@@ -119,7 +120,7 @@ PS_VOLUME_WEIGHTED="${PS_VOLUME_WEIGHTED:-1}"  # 1 (default since 2026-10-13; it
                            # literature-standard estimator for every field at once. Works with the CPU and GPU (-m)
                            # deposits. Not with PS_LINEAR_DEPOSIT=1 (the binary refuses both): left unset, it is 0
                            # then (said below).
-PS_CAUSTICS="${PS_CAUSTICS:-1}"      # 1 (default since 2026-10-13, as the 2026-10-12 production rerun of all 27
+PS_CAUSTICS="${PS_CAUSTICS:-1}"      # 1 (default, as the production run of all 27
                            # snapshots: +33% time, +1.2 GB on TNG, every other output unchanged) =
                            # flag fold-caustic cells (--ps-caustics): writes '.caustic'
                            # (0/1 fold flag) and '.causticClass' -- the caustic stratification bitmask
@@ -174,7 +175,7 @@ usage() { echo "Usage: $0 [-d DATA_DIR] [-s SIMULATION] [-g GRID_SIZE] [-n AVG_S
 
 driver_help_version "${BASH_SOURCE[0]}" "${1:-}"   # -h / --help print the header and run nothing; --version the revision
 
-DRY_RUN="${DRY_RUN:-0}"          # 1 = print the commands and paths, run nothing (survey rank 19, 2026-10-05)
+DRY_RUN="${DRY_RUN:-0}"          # 1 = print the commands and paths, run nothing
 while getopts "d:s:g:n:meh" opt; do
     case "$opt" in
         d) DATA_DIR="$OPTARG" ;;
@@ -188,6 +189,7 @@ while getopts "d:s:g:n:meh" opt; do
     esac
 done
 shift $((OPTIND - 1))
+[ -n "${DATA_DIR}" ] || require_data_root   # -d names the simulation's folder itself
 require_simulation
 
 snapshot_args "$@"              # positional arguments override the default snapshot list (config.sh)
@@ -211,10 +213,8 @@ data_root_problem "${DATA_DIR}" || exit 2
 # an explicitly empty LAGRANGIAN_INPUT= forces the snapshot path even if an IC file sits beside it.
 LAGRANGIAN_INPUT="${LAGRANGIAN_INPUT-${DATA_DIR}/combined_ics.hdf5}"
 
-# python with a WORKING h5py, used only to look for the 'InitialCoordinates' dataset below (plain
-# python3 resolves to a broken x86_64 h5py on the dev machine, same override the test scripts use)
-PY_H5="${PYTHON:-python3}"
-command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY_H5=/opt/homebrew/bin/python3.14
+# python with a WORKING h5py, used only to look for the 'InitialCoordinates' dataset below (config.sh h5py_python)
+PY_H5="$(h5py_python)"
 
 # Echoes yes/no/unknown for whether $1 carries its own Lagrangian positions. On 'unknown' (no usable
 # h5py) we neither guess nor skip: the run is attempted and the binary decides, since it errors
@@ -251,8 +251,8 @@ PYEOF
 LAMBDA_TH="${LAMBDA_TH:-0.3}"
 # Same velocity-derivative set as run_dtfe.sh (gradient_a divergence_a shear_a vorticity_a, all
 # derived from the density-weighted multi-stream velocity gradient -- single-stream caveat above)
-# plus the PS-only dispersion and the T-web / V-web classes: the nine fields of the thesis grids (the default,
-# so a bare run has what the void and web figures read).
+# plus the PS-only dispersion and the T-web / V-web classes: the nine production fields (the default, so a
+# bare run has what the void and web figures read).
 # Env-overridable, e.g. FIELDS="density_a velocity_a" for a lighter batch.
 FIELDS="${FIELDS:-density_a velocity_a gradient_a divergence_a shear_a vorticity_a dispersion_a tweb_a vweb_a}"
 

@@ -62,7 +62,7 @@ for b in ./DTFE ./PS-DTFE; do [ -x "$b" ] || { echo "FAIL: $b is not built (make
 export GPU_BUILD=CUDAEMU=1      # dtfe_metal_check.sh: the mode its no-op make uses
 export DTFE_TEST_PRECISION=single
 export DTFE_AUTO_T_VERTEX="${DTFE_AUTO_T_VERTEX:-1e-15}"
-PY="${PYTHON:-python3}"
+source "${SCRIPT_DIR}/lib.sh"   # PY: the python with numpy and h5py
 export PYTHON="$PY"
 BASE="${DTFE_TEST_TMP:-${TMPDIR:-/tmp}/dtfe-tests}/cudaemu_check"
 mkdir -p "$BASE"

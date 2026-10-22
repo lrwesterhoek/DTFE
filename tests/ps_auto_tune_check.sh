@@ -117,9 +117,9 @@ agrep "A suggests the max feasible in-RAM grid" "largest that fits at these fiel
 agrep "A warns off the broken escape hatches"   "--partNo'/'--region' are NOT a way out"                "${LOG_A}"
 # the misleading blame-the-split message must not appear
 if grep -q "even a single .*-split partition is predicted to exceed the memory budget" "${LOG_A}"; then
-    check "A old blame-the-split warning is gone" 0
+    check "A no blame-the-split warning" 0
 else
-    check "A old blame-the-split warning is gone" 1
+    check "A no blame-the-split warning" 1
 fi
 # Over budget with a LARGE particle set (DTFE_AUTO_MINN=1000 makes this one count as large): the
 # fallback must still SPLIT -- one partition at a time, the smallest per-partition triangulation --
@@ -282,7 +282,7 @@ env DTFE_RAM_GB=64 "${BIN}" "${SNAP}" "${TMP}/at_h2" --grid 256 --field density_
     "${COMMON_H[@]}" > "${TMP}/at_h2.log" 2>&1
 agrep "H2 a deposit-bound small run keeps one domain" "^AUTO-TUNE-REPORT partition=1 " "${TMP}/at_h2.log"
 ph=$(sed -n 's/.* predicted_gb=\([0-9.]*\) .*/\1/p' "${TMP}/at_h2.log")
-check "H2 the single-domain report predicts a sane peak: ${ph:-none} GB < 12 (it used to say 52)" \
+check "H2 the single-domain report predicts a sane peak: ${ph:-none} GB < 12" \
       "$(awk -v p="${ph:-99}" 'BEGIN{print (p > 0 && p < 12) ? 1 : 0}')"
 # H3 (GPU builds): the GPU deposit serialises on one queue -> a split cannot speed it up
 if [ "${GPU_H}" = 1 ]; then
@@ -381,7 +381,7 @@ for f in ("a_den", "a_streams"):
     b = np.fromfile(f"{t}/at_j.{f}", real)
     assert a.size == b.size and a.size > 0, f
     worst = max(worst, float(np.max(np.abs(a - b) / np.maximum(np.abs(a), 1e-30))))
-print(f"   .... gated vs free: max rel {worst:.1e} (the merge's float sums; index order since 2026-10-14)")
+print(f"   .... gated vs free: max rel {worst:.1e} (the merge's float sums, in index order)")
 sys.exit(0 if worst < 1e-5 else 1)
 PYEOF
     then check "J6 ... and its grids equal the ungated run's to float rounding" 1
@@ -490,7 +490,7 @@ check "N a plane outside the fold estimates ${nf:-none} streams/point (true 1, w
       "$(awk -v s="${nf:-0}" 'BEGIN{print (s > 0.9 && s < 1.1) ? 1 : 0}')"
 check "N a plane through the fold estimates ${nd:-none} streams/point (true 3, within 10%)" \
       "$(awk -v s="${nd:-0}" 'BEGIN{print (s > 2.7 && s < 3.3) ? 1 : 0}')"
-check "N the box-wide estimate (the old rule) is the box mean, ${nb:-none} (true 1.33)" \
+check "N the box-wide estimate (DTFE_AUTO_PTS_BOXMEAN=1) is the box mean, ${nb:-none} (true 1.33)" \
       "$(awk -v s="${nb:-0}" 'BEGIN{print (s > 1.2 && s < 1.45) ? 1 : 0}')"
 rm -f "${TMP}"/at_n*
 

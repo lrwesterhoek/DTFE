@@ -25,9 +25,9 @@ import numpy as np
 from _harness import check as _check, setup, summary
 
 # the figure root is inherited by the scripts run in fresh interpreters
-setup("dtfelib_figs_", paths=("python",), no_mirror=False, mpl_agg=False)
+setup("dtfelib_figs_", paths=("python",), mpl_agg=False)
 os.environ.setdefault("DTFE_SIM", "TNG50-4-Dark")    # the box these synthetic tests stand for; a data-tier run sets its own
-DATA_BACKED = False     # main() sets it before the tier that needs the T7: only THERE is a missing file a skip
+DATA_BACKED = False     # main() sets it before the tier that needs DTFE_DATA_ROOT's data: only THERE is a missing file a skip
 
 
 def check(name, fn):
@@ -415,7 +415,7 @@ def t_velocity_single_stream_float_mask():
         kept = ~np.isnan(v1).any(axis=-1)
         assert np.array_equal(kept, single), (
             f"mask must keep exactly the ~1.0 cells: kept {kept.sum()} of {single.sum()} "
-            f"single-stream cells (the '!= 1' bug keeps 0)")
+            f"single-stream cells (a '!= 1' test keeps 0)")
         assert np.array_equal(v1[single], vel[single]), "kept velocities must be untouched"
         assert np.isnan(v1[~single]).all(), "multi-stream cells must be fully NaN"
 
@@ -452,7 +452,7 @@ def t_velocity_single_stream_float_mask():
 
 def t_sim_dir_layouts():
     """dtfelib.cli.sim_dir / find_sims resolve BOTH data layouts exactly like config.sh's sim_dir:
-    per family <root>/<family>/<sim> (the Samsung T7), and flat <root>/<sim> (~/output), under a
+    per family <root>/<family>/<sim> (e.g. ~/IllustrisTNG/TNG100/TNG100-3-Dark), and flat <root>/<sim> (~/output), under a
     root whose name has a space; an existing flat directory wins, a new simulation goes beside its
     family, a name without a family stays flat."""
     import shutil
@@ -1283,7 +1283,7 @@ def t_void_cache_frame():
                 assert np.array_equal(t["deep"], t["delta_c"] < float(prov["deep_void_threshold"])) and t["deep"].any() and not t["deep"].all(), t["deep"]
         finally:
             config.DEEP_VOID_THRESHOLD = old_deep
-        back, said = load(1)                                         # back to the thesis threshold: the flag returns
+        back, said = load(1)                                         # back to the default threshold: the flag returns
         assert "deep threshold" in said and np.array_equal(back["deep"], cat["deep"]) and float(back["deep_threshold"]) == old_deep, said
         # the cuts retuned: the flag follows without a rebuild
         old_cuts = config.ELLIPSOID_CUT_RULES
@@ -1609,12 +1609,11 @@ def t_void_profiles():
 
 def _void_pin_config(root, saved, n=64, box=64.0):
     """The void-script tests' config: the frame of the synthetic ladder (config's cell = the headers' box / n, else
-    frame_of refuses everything), caches + figures + the thesis mirror under 'root', and the CURRENT catalogue knobs as
+    frame_of refuses everything), caches + figures under 'root', and the CURRENT catalogue knobs as
     FRESH objects (never the live dict mutated) -- the fixture's largest semi-axis is 9.3 Mpc against max_axis 10, so
     a retune of the cuts must not move it. The old values go into 'saved' first, for the caller's finally."""
     import config
-    pins = {"CACHE_DIR": Path(root) / "cache", "THESIS_FIGURES_DIR": Path(root) / "mirror",
-            "LOCAL_FIGURES_ROOT": str(Path(root) / "figures"),
+    pins = {"CACHE_DIR": Path(root) / "cache", "LOCAL_FIGURES_ROOT": str(Path(root) / "figures"),
             "CELL_SIZE": box / n, "BOX_SIZE": box, "FIELD_RESOLUTION": n, "SMOOTHING_SIGMA_CELLS": 1.5,
             "PRODUCTION_SMOOTHING": (1.5, 11),                    # the fixture's sigma IS its production: untagged names
             # 0.1 / 10 Mpc in this 1 Mpc cell with sigma = 1.5 cells: 0.1 cells, 10/1.5 sigma (L/2 = 32 Mpc does not bind)
@@ -1657,7 +1656,7 @@ def _void_ladder_snapdir(data, snap, z, seed, prefixes, n=64, box=64.0):
 def t_void_scripts():
     """plot_void_profiles.py and plot_void_population.py end to end, in process, on two synthetic 64^3 snapshots
     (box 64 Mpc, six Gaussian density dips -> six well-resolved voids at --smooth 1.5; config's frame and catalogue
-    knobs pinned by _void_pin_config, caches, figures and the thesis mirror on temp dirs). Profiles: an .npz + .png
+    knobs pinned by _void_pin_config, caches and figures on temp dirs). Profiles: an .npz + .png
     per redshift with the keys that define R_eff and the stack, named by --prefix when given, an unreadable snapshot
     file counted failed while the NEXT snapshot is still done (exit 1). Population: the abundance figure + npz (the
     other estimator's curves from ITS catalogue), R_eff the one definition (catalog.r_eff_mpc), counts and 'deep'
@@ -1681,7 +1680,7 @@ def t_void_scripts():
         _sys.path.remove(plot_dir)
     root = Path(tempfile.mkdtemp(prefix="dtfe_voidrun_"))
     saved = {}
-    old_argv, old_root, old_voids = list(_sys.argv), cli.DATA_ROOT, pipeline.SnapshotProducts.voids
+    old_argv, old_root, old_voids = list(_sys.argv), cli._data_root_override, pipeline.SnapshotProducts.voids
     old_out, old_fig = pvp.OUTPUT_DIR, pop.FIGURE_ROOT
     old_rc = dict(matplotlib.rcParams.copy())               # style.apply() restyles the process
     data = root / "data"
@@ -1732,7 +1731,6 @@ def t_void_scripts():
         names = sorted(q.name for q in out.iterdir()) if out.is_dir() else []
         # a non-default --edges tags the names: '_edges0-10-20', the default stack's names stay free
         assert code == 0 and names == [f"void_profiles_ps_resolved_edges0-10-20_z{z}.{e}" for z in ("0.00", "0.50") for e in ("npz", "png")], (code, names, text[-600:])
-        assert sorted(q.name for q in (root / "mirror" / "void_profiles" / "SYN").iterdir()) == [q for q in names if q.endswith(".png")]
         assert not (Path(saved["LOCAL_FIGURES_ROOT"]) / "void_profiles" / "SYN").exists()
         f = npz(out / "void_profiles_ps_resolved_edges0-10-20_z0.00.npz")
         need = {"bins", "edges", "count", "r_eff_mpc", "index", "delta_c", "redshift", "sample", "method", "dropped", "points",
@@ -1761,11 +1759,11 @@ def t_void_scripts():
         assert code == 0 and (out / "void_profiles_ps_mw_resolved_z0.00.npz").is_file() and (out / "void_profiles_ps_mw_resolved_z0.00.png").is_file(), (code, sorted(q.name for q in out.iterdir()), text[-400:])
         assert str(npz(out / "void_profiles_ps_mw_resolved_z0.00.npz")["prefix"]) == "ps_mw"
         assert (out / "void_profiles_ps_resolved_edges0-10-20_z0.00.npz").read_bytes() == before
-        # --out: the user's folder and nothing into the thesis tree; without --edges the bins are in smoothing lengths
+        # --out: the user's folder and nothing into the default one; without --edges the bins are in smoothing lengths
         from dtfelib import profiles as _prof
-        own, mirrored = root / "own_out", sorted((root / "mirror").rglob("*.png"))
+        own, default_files = root / "own_out", sorted(out.rglob("*"))
         code, text = run(pvp, ["--snaps", "99", "--out", str(own)])
-        assert code == 0 and (own / "void_profiles_ps_resolved_z0.00.png").is_file() and sorted((root / "mirror").rglob("*.png")) == mirrored, (code, text[-400:])
+        assert code == 0 and (own / "void_profiles_ps_resolved_z0.00.png").is_file() and sorted(out.rglob("*")) == default_files, (code, text[-400:])
         assert np.allclose(npz(own / "void_profiles_ps_resolved_z0.00.npz")["edges"], _prof.default_edges_mpc(1.5 * 1.0, 64.0))
         # the default bins spelled out by hand are the default (no tag, the same file); other bins never touch it
         dflt = ",".join(f"{e:.4g}" for e in _prof.default_edges_mpc(1.5 * 1.0, 64.0))
@@ -1872,7 +1870,7 @@ def t_void_scripts():
         for k, v in saved.items():
             setattr(config, k, v)
         _sys.argv = old_argv
-        cli.DATA_ROOT = old_root
+        cli.use_data_root(old_root)
         pipeline.SnapshotProducts.voids = old_voids
         pvp.OUTPUT_DIR, pop.FIGURE_ROOT = old_out, old_fig
         dict.update(matplotlib.rcParams, old_rc)
@@ -1906,7 +1904,7 @@ def t_void_crossbox_outlines():
             _sys.path.remove(d)
     root = Path(tempfile.mkdtemp(prefix="dtfe_crossbox_"))
     saved = {}
-    old_root, old_rc = cli.DATA_ROOT, dict(matplotlib.rcParams.copy())
+    old_root, old_rc = cli._data_root_override, dict(matplotlib.rcParams.copy())
     data, out = root / "data", root / "out"
     try:
         _void_pin_config(root, saved, n, box)
@@ -2000,7 +1998,7 @@ def t_void_crossbox_outlines():
     finally:
         for k, v in saved.items():
             setattr(config, k, v)
-        cli.DATA_ROOT = old_root
+        cli.use_data_root(old_root)
         dict.update(matplotlib.rcParams, old_rc)
         gc.redshift_table.cache_clear()
         shutil.rmtree(root, ignore_errors=True)
@@ -2025,7 +2023,7 @@ def t_void_population_unreadable():
     finally:
         _sys.path.remove(plot_dir)
     root = Path(tempfile.mkdtemp(prefix="dtfe_voidbad_"))
-    saved, old_argv, old_root, old_fig = {}, list(_sys.argv), cli.DATA_ROOT, pop.FIGURE_ROOT
+    saved, old_argv, old_root, old_fig = {}, list(_sys.argv), cli._data_root_override, pop.FIGURE_ROOT
     old_rc = dict(matplotlib.rcParams.copy())
     data = root / "data"
     try:
@@ -2059,7 +2057,7 @@ def t_void_population_unreadable():
         for k, v in saved.items():
             setattr(config, k, v)
         _sys.argv = old_argv
-        cli.DATA_ROOT = old_root
+        cli.use_data_root(old_root)
         pop.FIGURE_ROOT = old_fig
         dict.update(matplotlib.rcParams, old_rc)
         gc.redshift_table.cache_clear()
@@ -2138,16 +2136,14 @@ def t_power_spectrum():
 
 def t_pk_script():
     """plot_pk_compare.py in process on a synthetic snapshot: the file is named by what it holds (both estimators,
-    one --method, a --prefix), nothing is mirrored under --out, a lone estimator gets a note, and plot_pk draws each
+    one --method, a --prefix), a lone estimator gets a note, and plot_pk draws each
     estimator's own Nyquist pair when the grids differ in size (one grey pair when they agree)."""
     import io as _io, shutil, sys as _sys, tempfile
     from contextlib import redirect_stdout
     import matplotlib.pyplot as plt
-    import config
     from dtfelib import spectra
     root = Path(tempfile.mkdtemp(prefix="dtfe_pkrun_"))
-    old_thesis, old_argv = config.THESIS_FIGURES_DIR, list(_sys.argv)
-    config.THESIS_FIGURES_DIR = root / "mirror"
+    old_argv = list(_sys.argv)
     _sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "python" / "plot"))
     try:
         import plot_pk_compare as ppk
@@ -2169,7 +2165,7 @@ def t_pk_script():
             return code, buf.getvalue(), sorted(q.name for q in out.iterdir())
         code, text, names = run(["--snaps", "50", "99"])
         assert code == 0 and names == ["pk_dtfe+ps_z0.50.npz", "pk_dtfe+ps_z0.50.png", "pk_ps_z0.00.npz", "pk_ps_z0.00.png"], (code, names, text[-300:])
-        assert "only PS-DTFE grids here" in text and not (root / "mirror").exists()
+        assert "only PS-DTFE grids here" in text
         z = np.load(root / "out" / "pk_dtfe+ps_z0.50.npz")
         assert list(z["methods"]) == ["dtfe", "ps"] and str(z["prefix"]) == "" and z["dtfe_k"].shape == z["ps_k"].shape
         code, text, names = run(["--snaps", "50", "--method", "dtfe"])
@@ -2238,7 +2234,6 @@ def t_pk_script():
             for f in held.values():
                 real_close(f)
     finally:
-        config.THESIS_FIGURES_DIR = old_thesis
         _sys.argv = old_argv
         shutil.rmtree(root, ignore_errors=True)
 
@@ -2399,10 +2394,10 @@ def t_caustic_skeleton():
 
 
 def t_caustic_fold_exact():
-    """The geometric fold flag for grids of any date: io.caustic_is_fold(mask, streams=,
+    """The geometric fold flag for any grid: io.caustic_is_fold(mask, streams=,
     hidden=) = streams > 1 + tol | hidden bit 1 | the mask's fold bits, the mask-only form unchanged, the tolerance edge,
     the union with single_stream_mask's complement, the slab path (memmaps, several slabs) equal to one pass, the
-    argument checks; FieldSet.fold_mask() on synthetic snapshots: a pre-fix grid (fold bits only where a sample hit,
+    argument checks; FieldSet.fold_mask() on synthetic snapshots: a sample-flagged grid (fold bits only where a sample hit,
     the hidden bit on the thin rest) gives the whole fold, the averaged pair by default, and the fallbacks without a
     streams grid (the class mask, then the 0/1 'caustic' grid) and under method='dtfe'."""
     import shutil, tempfile
@@ -2449,7 +2444,7 @@ def t_caustic_fold_exact():
     finally:
         dio._FOLD_SLAB_CELLS = old_slab
         shutil.rmtree(d, ignore_errors=True)
-    # FieldSet.fold_mask on a PRE-FIX grid: a wall plane x = 3 that the samples saw (streams 3, fold bits) and a thin
+    # FieldSet.fold_mask on a SAMPLE-FLAGGED grid: a wall plane x = 3 that the samples saw (streams 3, fold bits) and a thin
     # one x = 6 they missed (streams 1, hidden bit 1, the mask's det<0 bit absent): the fold is both planes
     root = Path(tempfile.mkdtemp(prefix="dtfelib_foldfs_"))
     try:
@@ -2496,7 +2491,7 @@ def t_caustic_fold_exact():
 
 def t_caustic_crossed_waves():
     """The crossed-waves runs tests/ps_caustic_class_check.sh leaves under the suites' temp root ($DTFE_TEST_TMP,
-    then ${TMPDIR:-/tmp}/dtfe-tests, then the old tests/tmp): on pcc_out (CPU, no --ps-caustic-cusps) the nested
+    then ${TMPDIR:-/tmp}/dtfe-tests): on pcc_out (CPU, no --ps-caustic-cusps) the nested
     cumulative masks, fold within sheet, more streams with every collapsed axis, a JSON-able summary, no cusp bits;
     on pcc_a4 (--ps-caustic-cusps) the cusp and swallowtail fractions are their own bits' and differ; pcc_nocusp
     reads 'not computed'; the parity-only pcc_out_gpulin is refused. No pcc_out: FileNotFoundError -- a SKIP in the
@@ -2505,7 +2500,7 @@ def t_caustic_crossed_waves():
     from dtfelib import skeleton as sk
     from dtfelib.io import CAUSTIC_CUSP, CAUSTIC_SWALLOWTAIL
     roots = [Path(os.environ["DTFE_TEST_TMP"])] if os.environ.get("DTFE_TEST_TMP") else []
-    roots += [Path(os.environ.get("TMPDIR") or "/tmp") / "dtfe-tests", Path(__file__).resolve().parent / "tmp"]
+    roots += [Path(os.environ.get("TMPDIR") or "/tmp") / "dtfe-tests"]
 
     def find(name, suffixes):
         return next((r / name for r in roots if all((r / (name + s)).is_file() for s in suffixes)), None)
@@ -2586,8 +2581,9 @@ def t_caustic_skeleton_script():
     """plot_caustic_skeleton.py: summary_text prints '--' and why for the cusp / swallowtail rows of a grid without bit
     7/8 (only those rows), percentages when it has them, mass apart from volume; void_block centres a void on its cell
     centre, its medians are None (no NaN, no RuntimeWarning) with no well-resolved void and with every void beyond the
-    cut-out. Then main() in process on synthetic snapshots (its outputs, the thesis mirror and the caches pointed at
-    temp dirs): .json/.txt/.png per redshift, a strict JSON, --connectivity passed on, no mirror under --out; a
+    cut-out. Then main() in process on synthetic snapshots (its outputs and the caches pointed at
+    temp dirs): .json/.txt/.png per redshift, a strict JSON, --connectivity passed on, nothing in the default folder
+    under --out; a
     snapshot without a grid, without a snapdir or with a parity-only grid exits 1; a failed --voids (the frame
     refusal) exits 1 with 'voids_error' in the JSON; a delivered one writes the 'voids' block and npz
     without a RuntimeWarning. Names: a non-default option tags the set ('_c6', '_reff', '_shells...',
@@ -2601,15 +2597,15 @@ def t_caustic_skeleton_script():
     from dtfelib.io import CAUSTIC_PARITY_POS, CAUSTIC_PARITY_NEG, CAUSTIC_COLLAPSE, CAUSTIC_CUSP, CAUSTIC_DEGENERATE
     root = Path(tempfile.mkdtemp(prefix="dtfe_skelrun_"))
     plot_dir = str(Path(__file__).resolve().parent.parent / "python" / "plot")
-    old_cfg = (config.THESIS_FIGURES_DIR, config.LOCAL_FIGURES_ROOT, config.CACHE_DIR)
+    old_cfg = (config.LOCAL_FIGURES_ROOT, config.CACHE_DIR)
     old_argv, old_path = list(_sys.argv), list(_sys.path)
     pcs = saved = None
     try:
         if plot_dir not in _sys.path:
             _sys.path.insert(0, plot_dir)
         import plot_caustic_skeleton as pcs                 # BEFORE config is patched: OUTPUT_DIR is set at import
-        saved = (pcs.OUTPUT_DIR, pcs.MIRROR, pcs.pipeline, pcs.style)
-        config.THESIS_FIGURES_DIR, config.LOCAL_FIGURES_ROOT, config.CACHE_DIR = root / "mirror", str(root / "local"), root / "cache"
+        saved = (pcs.OUTPUT_DIR, pcs.pipeline, pcs.style)
+        config.LOCAL_FIGURES_ROOT, config.CACHE_DIR = str(root / "local"), root / "cache"
         pcs.OUTPUT_DIR = root / "default_out"               # never the repo's figures/ (a run without --out lands here)
         with matplotlib.rc_context():                       # main() calls style.apply(): rcParams back afterwards
             n = 8
@@ -2703,7 +2699,7 @@ def t_caustic_skeleton_script():
             assert "voids" not in j and "voids_error" not in j
             t = (root / "out" / "caustic_skeleton_z0.50.txt").read_text()
             assert "no bit 7/8 in this grid" in t and any(ln.split()[:3] == ["cusp", "--", "--"] for ln in t.splitlines()), t
-            assert not (root / "mirror").exists() and not (root / "default_out").exists()      # --out: no thesis mirror
+            assert not (root / "default_out").exists()                                         # --out: its folder only
             code, text, names = run(["--snaps", "50", "--connectivity", "6"])                   # reaches the components
             assert names == files("_c6"), names                                                 # its own files: '_c6'
             j = strict(root / "out" / "caustic_skeleton_z0.50_c6.json")
@@ -2732,7 +2728,7 @@ def t_caustic_skeleton_script():
                                 delta_values=np.array([-0.6, -0.4], np.float32))
                 def release(self):
                     pass
-            real = saved[2]
+            real = saved[1]
             pcs.pipeline = types.SimpleNamespace(products=lambda *a, **kw: _Prod(), add_smoothing_mpc_arg=real.add_smoothing_mpc_arg,
                                                  apply_smoothing_args=real.apply_smoothing_args,
                                                  smoothing_length_mpc=real.smoothing_length_mpc, smoothing_tag=real.smoothing_tag)
@@ -2745,7 +2741,7 @@ def t_caustic_skeleton_script():
                 def set_title(self, ax, text, *a, **k):
                     self.titles.append(text)
                     return self.real.set_title(ax, text, *a, **k)
-            pcs.style = spy = _TitleSpy(saved[3])
+            pcs.style = spy = _TitleSpy(saved[2])
             with warnings.catch_warnings():             # undefined medians: None, not an all-NaN / empty (nan)median;
                 # only numpy's two messages: matplotlib's own autoscaling on the all-NaN column is not under test
                 warnings.filterwarnings("error", category=RuntimeWarning, message=r"(All-NaN slice|Mean of empty slice)")
@@ -2760,7 +2756,7 @@ def t_caustic_skeleton_script():
                 assert sorted(zv.files) == ["bounded", "dist_cells", "dist_reff", "fold", "index", "r_eff_cells", "radius", "sheet",
                                             "shells"], zv.files
                 assert list(zv["index"]) == [0] and bool(zv["bounded"][0]) and np.isnan(zv["dist_cells"][0]) and np.isnan(zv["dist_reff"][0])
-            assert not (root / "mirror").exists() and not (root / "default_out").exists()
+            assert not (root / "default_out").exists()
             # the names. The default --voids set is untagged; a plain run into the same folder rewrites the three
             # files and removes that set's _voids.npz (an earlier run's, not this one's); other shells are '_shells...'
             code, text, names = run(["--snaps", "50", "--voids"])
@@ -2780,8 +2776,8 @@ def t_caustic_skeleton_script():
                 assert code == 0 and len(said) == 1 and ("distinct" in said[0]) == distinct, (args, said, text[-300:])
     finally:
         if saved is not None:
-            pcs.OUTPUT_DIR, pcs.MIRROR, pcs.pipeline, pcs.style = saved
-        config.THESIS_FIGURES_DIR, config.LOCAL_FIGURES_ROOT, config.CACHE_DIR = old_cfg
+            pcs.OUTPUT_DIR, pcs.pipeline, pcs.style = saved
+        config.LOCAL_FIGURES_ROOT, config.CACHE_DIR = old_cfg
         _sys.argv = old_argv
         _sys.path[:] = old_path
         shutil.rmtree(root, ignore_errors=True)
@@ -2816,7 +2812,7 @@ def _synthetic_snapdir(root, sim, snap, z, n=8, grids=("tweb", "velVweb", "strea
 
 
 def t_webstreams_script():
-    """plot_web_streams.py end to end (in-process, its outputs and the thesis mirror pointed at temp dirs):
+    """plot_web_streams.py end to end (in-process, its outputs pointed at temp dirs):
     two redshifts give two sets of files (z0.50 and z0.00); the tables sum to 1; a truncated V-web grid at one
     snapshot keeps that snapshot's T-web table, is named in the summary and exits 1; a web nobody has exits 1
     only when asked for by name; an unreadable combined file between two good snapshots (h5py's OSError must not
@@ -2831,15 +2827,15 @@ def t_webstreams_script():
     import matplotlib as mpl
     import config
     root = Path(tempfile.mkdtemp(prefix="dtfe_wsrun_"))
-    old_thesis, old_figs, old_argv = config.THESIS_FIGURES_DIR, config.LOCAL_FIGURES_ROOT, list(_sys.argv)
+    old_figs, old_argv = config.LOCAL_FIGURES_ROOT, list(_sys.argv)
     plot_dir = str(Path(__file__).resolve().parent.parent / "python" / "plot")
     _sys.path.insert(0, plot_dir)
     pws = old_pws = None
     try:
         with mpl.rc_context():                      # main() applies the house style: it must not outlive the test
             import plot_web_streams as pws          # BEFORE config is patched: the import-time paths restored below are the real ones
-            old_pws = (pws.OUTPUT_DIR, pws.MIRROR)  # (main() sets the MIRROR global on every run)
-            config.THESIS_FIGURES_DIR, config.LOCAL_FIGURES_ROOT = root / "mirror", str(root / "figures")
+            old_pws = pws.OUTPUT_DIR
+            config.LOCAL_FIGURES_ROOT = str(root / "figures")
             pws.OUTPUT_DIR = root / "figures" / "web_streams"   # a run that ignored --out lands here, not in the repo
             data = root / "data"
             _synthetic_snapdir(data, "SYN", 50, 0.5)
@@ -2876,8 +2872,8 @@ def t_webstreams_script():
             t = json.loads((out / "web_streams_tweb_z0.50.json").read_text())
             assert abs(sum(e["volume_fraction"] for e in t["classes"].values()) - 1.0) < 1e-12 and t["redshift"] == 0.5 and t["web"] == "T-web"
             assert abs(t["classes"]["node"]["stream_bins"]["1 < s <= 3"]["volume"] - 0.5) < 1e-12      # the multi-stream plane is half of class 3
-            assert not (root / "mirror").exists() and not (Path(pws.OUTPUT_DIR) / "SYN").exists(), \
-                ("--out wrote into the thesis mirror or the default folder", sorted(str(q.relative_to(root)) for q in root.rglob("*.png") if out not in q.parents))
+            assert not (Path(pws.OUTPUT_DIR) / "SYN").exists(), \
+                ("--out wrote into the default folder", sorted(str(q.relative_to(root)) for q in root.rglob("*.png") if out not in q.parents))
             shutil.rmtree(out)
             code, text, out = run(["--snaps", "99", "98"])
             names = sorted(q.name for q in out.iterdir())
@@ -2931,8 +2927,8 @@ def t_webstreams_script():
             assert code == 0 and "V-web no grid for 099" in text, (code, text[-300:])
     finally:
         if old_pws is not None:
-            pws.OUTPUT_DIR, pws.MIRROR = old_pws
-        config.THESIS_FIGURES_DIR, config.LOCAL_FIGURES_ROOT = old_thesis, old_figs
+            pws.OUTPUT_DIR = old_pws
+        config.LOCAL_FIGURES_ROOT = old_figs
         _sys.argv = old_argv
         if plot_dir in _sys.path:
             _sys.path.remove(plot_dir)
@@ -2990,7 +2986,7 @@ def t_slice_maps():
     """Figures' slice-map helpers -- the fixed density range wins, a symmetric
     norm, the stream rule, an empty log slice skipped, no title under the house style, a footnote and ticks,
     a row of panels -- and the three map scripts run in process on a synthetic snapshot, writing their
-    53 files (no thesis mirror). A spy on figures._save sees every
+    53 files. A spy on figures._save sees every
     map the scripts draw (48; the quiver and the histograms save on their own) and pins, under the default
     SHOW_TITLES False, no title anywhere but a colour-bar label naming each panel (lambda_i of the file's web
     in panel i, T-web | V-web | their difference, the house label of each single scalar map -- the class
@@ -3008,7 +3004,7 @@ def t_slice_maps():
     import config
     from dtfelib import figures as style
     root = Path(tempfile.mkdtemp(prefix="dtfe_maps_"))
-    old_cfg = (config.THESIS_FIGURES_DIR, config.LOCAL_FIGURES_ROOT, config.CACHE_DIR, config.SHOW_TITLES)
+    old_cfg = (config.LOCAL_FIGURES_ROOT, config.CACHE_DIR, config.SHOW_TITLES)
     old_argv, old_save = list(_sys.argv), style._save
     plot_dir = str(Path(__file__).resolve().parent.parent / "python" / "plot")
     _sys.path.insert(0, plot_dir)
@@ -3021,7 +3017,7 @@ def t_slice_maps():
                                    (plot_cosmic_web, "OUTPUT_DIR", out / "web")):
                 patched.append((mod, attr, getattr(mod, attr)))
                 setattr(mod, attr, val)
-            config.THESIS_FIGURES_DIR, config.LOCAL_FIGURES_ROOT, config.CACHE_DIR = root / "mirror", str(root / "figures"), root / "cache"
+            config.LOCAL_FIGURES_ROOT, config.CACHE_DIR = str(root / "figures"), root / "cache"
             config.SHOW_TITLES = False                                      # the house default, stated
             rng = np.random.default_rng(4)
             dens = rng.lognormal(0.0, 1.0, size=(16, 16)).astype(np.float32)
@@ -3052,7 +3048,6 @@ def t_slice_maps():
                                   dict(data=div, cmap='RdBu_r', norm=style.norm_symmetric(div), title="d")],
                                  100.0, 0, path=root / "row.png", suptitle="row", footnote="under")
             assert rw["path"].is_file() and len(rw["ranges"]) == 2 and rw["ranges"][0] == (-0.5, 3.5)
-            assert not (root / "mirror").exists()                               # the map scripts' maps are not mirrored
             # the three scripts, in process, on a synthetic snapshot: their 53 files
             n, z = 8, 0.5
             data = root / "data"
@@ -3066,7 +3061,7 @@ def t_slice_maps():
             den_ps.tofile(str(snapdir / "ps_output.a_den"))
             seen = []
 
-            def spy(fig, path, mirror):                                     # what the map looks like at save time
+            def spy(fig, path):                                             # what the map looks like at save time
                 panels = []
                 for a in fig.axes:
                     if a.images:
@@ -3076,7 +3071,7 @@ def t_slice_maps():
                 sup = getattr(fig, "_suptitle", None)                       # (Figure.get_suptitle is matplotlib >= 3.8: CI and Docker run Ubuntu's 3.6)
                 seen.append(dict(path=str(Path(path).relative_to(out)), size=tuple(float(v) for v in fig.get_size_inches()),
                                  suptitle=sup.get_text() if sup is not None else "", panels=panels))
-                old_save(fig, path, mirror)
+                old_save(fig, path)
             style._save = spy
             for mod, argv in ((plot_DTFE, ["--sim", "SYN", "--data-root", str(data), "--snaps", "50"]),
                               (plot_PS_DTFE, ["--sim", "SYN", "--data-root", str(data), "--snap", "50"]),
@@ -3098,7 +3093,6 @@ def t_slice_maps():
             assert sum(f.startswith("ps/fields/SYN/snap050/") for f in files) == 24 and sum(f.startswith("web/") for f in files) == 17
             assert "web/snapshot_050_z0.50/xy_plane/tweb_vweb_residual_xy_plane_z0.50.png" in files
             assert "ps/fields/SYN/snap050/xy_plane/ps_comparison_xy_plane_z0.50.png" in files
-            assert not (root / "mirror").exists()
 
             # ---- what the spy saw: one record per slice_map / slice_row figure
             def kind(rel):                                                  # 'dtfe:density', 'ps:velDisp', 'web:residual', ...
@@ -3238,7 +3232,7 @@ def t_slice_maps():
         style._save = old_save
         for mod, attr, val in patched:
             setattr(mod, attr, val)
-        config.THESIS_FIGURES_DIR, config.LOCAL_FIGURES_ROOT, config.CACHE_DIR, config.SHOW_TITLES = old_cfg
+        config.LOCAL_FIGURES_ROOT, config.CACHE_DIR, config.SHOW_TITLES = old_cfg
         _sys.argv = old_argv
         if plot_dir in _sys.path:
             _sys.path.remove(plot_dir)
@@ -3252,7 +3246,6 @@ py, script, figroot, argv = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
 sys.path[:0] = [py, str(Path(script).parent)]
 import config
 config.LOCAL_FIGURES_ROOT = figroot                    # plot_PS_DTFE reads FIGURE_ROOT at import: patch first
-config.THESIS_FIGURES_DIR = str(Path(figroot) / "mirror")
 import matplotlib as mpl
 from matplotlib.figure import Figure
 KEYS = ("font.family", "mathtext.fontset", "font.size", "axes.labelsize", "axes.titlesize", "xtick.labelsize",
@@ -3332,7 +3325,7 @@ def t_pointeval_style():
 def _run_py(args, env_extra=None, cwd=None, timeout=300):
     """A fresh interpreter (the plot scripts patch config / matplotlib at import): (returncode, stdout + stderr)."""
     import os, subprocess, sys as _sys
-    env = dict(os.environ, MPLBACKEND="Agg", DTFE_NO_MIRROR="1", **(env_extra or {}))
+    env = dict(os.environ, MPLBACKEND="Agg", **(env_extra or {}))
     res = subprocess.run([_sys.executable] + [str(a) for a in args], capture_output=True, text=True, env=env,
                          cwd=cwd, timeout=timeout)
     return res.returncode, res.stdout + res.stderr
@@ -3494,11 +3487,11 @@ def fake(snapshot, redshift, args):
     return {"redshift": redshift, "total_density": 1e-4, "maxima": 10.0, "minima": 20.0, "1saddle": 30.0, "2saddle": 40.0}
 def spy(fig, path, **kw):
     seen.append([list(map(float, l.get_xdata())) for ax in fig.axes for l in ax.lines])
-m.process_snapshot, m.save_plot_to_multiple_paths = fake, spy
+m.process_snapshot, m.save_figure = fake, spy
 m.main()
 print("RESULT " + json.dumps(seen))
 """
-        rc, log = _run_py(["-c", drv, Path(plot).parent, plot], env_extra={"DTFE_FIGURES_ROOT": str(figs)})
+        rc, log = _run_py(["-c", drv, Path(plot).parent, plot], env_extra={"DTFE_FIGURES_ROOT": str(figs), "DTFE_DATA_ROOT": str(data)})
         line = [l for l in log.splitlines() if l.startswith("RESULT ")]
         assert rc == 0 and line, log[-1500:]
         import json
@@ -3510,8 +3503,8 @@ print("RESULT " + json.dumps(seen))
         shutil.rmtree(root, ignore_errors=True)
 
 
-def t_science_fixes_2026_10_07():
-    """The thesis mirror keeps the sim folder under a figure root with no
+def t_science_fixes():
+    """save_figure makes the figure's folder under a figure root with a space and no
     'figures' in its path (any DTFE_FIGURES_ROOT); the ellipsoid cuts are rules turned into Mpc at CALL
     time (10 sigma, L/2, 1 cell); a cache older than its density grid is rebuilt; the profile bins are in
     smoothing lengths, closed at the wrap cap L/6."""
@@ -3520,16 +3513,13 @@ def t_science_fixes_2026_10_07():
     import config
     from dtfelib import figures as F, pipeline, profiles as prof
     tmp = Path(_tf.mkdtemp(prefix="dtfe_sci_"))
-    old = (config.LOCAL_FIGURES_ROOT, config.THESIS_FIGURES_DIR, config.SMOOTHING_SIGMA_CELLS, config.CACHE_DIR)
+    old = (config.LOCAL_FIGURES_ROOT, config.SMOOTHING_SIGMA_CELLS, config.CACHE_DIR)
     try:
-        # the mirror: relative to the figure root first, then below a 'figures/' folder, then the bare name
+        # the figure lands where it is saved, its folders made first, and nowhere else
         root = tmp / "DTFE figures"
-        config.LOCAL_FIGURES_ROOT, config.THESIS_FIGURES_DIR = str(root), tmp / "mirror"
-        assert F.mirror_relative_path(root / "void_profiles" / "TNG100-3-Dark" / "a.png") == "void_profiles/TNG100-3-Dark/a.png"
-        assert F.mirror_relative_path(tmp / "x" / "figures" / "b" / "c.png") == "b/c.png"
-        assert F.mirror_relative_path(tmp / "elsewhere" / "d.png") == "d.png"
-        F.save_plot_to_multiple_paths(Figure(figsize=(1, 1)), root / "void_profiles" / "SIM" / "e.png", dpi=20)
-        assert (tmp / "mirror" / "void_profiles" / "SIM" / "e.png").is_file() and not (tmp / "mirror" / "e.png").exists()
+        config.LOCAL_FIGURES_ROOT = str(root)
+        F.save_figure(Figure(figsize=(1, 1)), root / "void_profiles" / "SIM" / "e.png", dpi=20)
+        assert [str(q.relative_to(tmp)) for q in tmp.rglob("*.png")] == ["DTFE figures/void_profiles/SIM/e.png"]
         # the cuts at call time: 10 sigma with sigma as set NOW (a --smooth override), L/2 when that binds
         cell, box = float(config.CELL_SIZE), float(config.BOX_SIZE)
         for sig, want in ((10.0, 100.0 * cell), (5.0, 50.0 * cell), (30.0, 0.5 * box)):
@@ -3538,7 +3528,7 @@ def t_science_fixes_2026_10_07():
             assert abs(c["max_axis_mpc"] - want) < 1e-9 * want and abs(c["min_axis_mpc"] - cell) < 1e-12 \
                 and c["max_axis_ratio"] == 10.0, (sig, c, want)
             assert np.allclose(pipeline._cuts_array(), [cell, want, 10.0])
-        config.SMOOTHING_SIGMA_CELLS = old[2]
+        config.SMOOTHING_SIGMA_CELLS = old[1]
         # a cache older than the density grid it came from is rebuilt; a newer one is used
         config.CACHE_DIR = tmp / "cache"
         grid = tmp / "ps_output.a_den"
@@ -3589,7 +3579,7 @@ def t_science_fixes_2026_10_07():
         # sigma = 0 (no smoothing) counts as one cell: no zero-size cut, bins or radii
         config.SMOOTHING_SIGMA_CELLS = 0.0
         assert abs(pipeline.smoothing_length_mpc() - cell) < 1e-12 and abs(pipeline.ellipsoid_cuts_mpc()["max_axis_mpc"] - 10 * cell) < 1e-9
-        config.SMOOTHING_SIGMA_CELLS = old[2]
+        config.SMOOTHING_SIGMA_CELLS = old[1]
         try:
             prof.default_edges_mpc(0.0, 60.0)
             raise AssertionError("a zero smoothing length gave bins")
@@ -3611,7 +3601,7 @@ def t_science_fixes_2026_10_07():
         assert np.allclose(e, (0.0, 5.40625, 7.56875, 10.8125, 110.717449 / 6)), e
         assert prof.default_edges_mpc(5.0, 60.0) == (0.0, 10.0), prof.default_edges_mpc(5.0, 60.0)
     finally:
-        config.LOCAL_FIGURES_ROOT, config.THESIS_FIGURES_DIR, config.SMOOTHING_SIGMA_CELLS, config.CACHE_DIR = old
+        config.LOCAL_FIGURES_ROOT, config.SMOOTHING_SIGMA_CELLS, config.CACHE_DIR = old
         import shutil as _sh
         _sh.rmtree(tmp, ignore_errors=True)
 
@@ -3683,40 +3673,13 @@ def t_void_radius_and_physical_smoothing():
         env = dict(_os.environ, DTFE_SIM=sim, DTFE_SIGMA_MPC=sig)
         out = _sp.run([_sys.executable, "-c", probe], cwd=py, env=env, capture_output=True, text=True).stdout.split()
         assert len(out) == 3 and abs(float(out[0]) - want[0]) < 1e-6 and int(out[1]) == want[1], (sim, out)
-    # the thesis outputs are safe from it: analyze.py compute/plot/all refuse; no figure goes into the thesis tree
+    # the core figures (saved under their production names) are safe from it: analyze.py compute/plot/all refuse
     env = dict(_os.environ, DTFE_SIM="TNG100-3-Dark", DTFE_SIGMA_MPC="5.0")
     r = _sp.run([_sys.executable, "analyze.py", "plot"], cwd=py, env=env, capture_output=True, text=True)
     assert r.returncode != 0 and "refused" in (r.stderr + r.stdout), (r.returncode, r.stderr[-300:])
-    import tempfile as _tf
-    from matplotlib.figure import Figure
-    from dtfelib import figures as F
-    tmp = Path(_tf.mkdtemp(prefix="dtfe_tag_"))
-    oldf = (config.LOCAL_FIGURES_ROOT, config.THESIS_FIGURES_DIR, config.SMOOTHING_SIGMA_CELLS, config.FOOTPRINT_SIZE)
-    try:
-        config.LOCAL_FIGURES_ROOT, config.THESIS_FIGURES_DIR = str(tmp / "figs"), tmp / "mirror"
-        pipeline.set_smoothing(mpc=2.1625)
-        F.save_plot_to_multiple_paths(Figure(figsize=(1, 1)), tmp / "figs" / "x" / "a.png", dpi=20)
-        assert (tmp / "figs" / "x" / "a.png").is_file() and not (tmp / "mirror").exists()
-    finally:
-        config.LOCAL_FIGURES_ROOT, config.THESIS_FIGURES_DIR, config.SMOOTHING_SIGMA_CELLS, config.FOOTPRINT_SIZE = oldf
-        import shutil as _sh
-        _sh.rmtree(tmp, ignore_errors=True)
 
 
-def t_thesis_mirror_outside_repo():
-    """config.THESIS_FIGURES_DIR lies OUTSIDE the repo. A fallback of DTFE/Figures (config.py lives in python/)
-    is, on macOS's case-insensitive disk, the repo's own figures/ folder: every figure
-    save_plot_to_multiple_paths mirrors would land in the repo, not the thesis."""
-    import config
-    repo = str(Path(__file__).resolve().parents[1]).lower()
-    mirror = Path(str(config.THESIS_FIGURES_DIR)).resolve()
-    low = str(mirror).lower()
-    assert not (low == repo or low.startswith(repo + "/")), f"the thesis mirror {mirror} is inside the repo"
-    if config._THESIS_DIR is None:
-        assert mirror == Path(__file__).resolve().parents[2] / "Figures", mirror
-
-
-def t_distinct_claims_2026_10_08():
+def t_distinct_claims():
     """catalog.distinct_mask takes its claims from EVERY well-resolved void, each the sphere of
     min(R_v, R_eff) (its R_eff when it has no R_v), then narrows to the caller's sample. The callers pass the voids WITH
     an R_v, so claims from the sample alone would let a deeper void without one claim nothing, and the minima inside
@@ -3788,7 +3751,7 @@ def t_distinct_claims_2026_10_08():
     assert list(pr["index"]) == [2, 4] and pr["n_overlapping"] == 2 and pr["dropped"] == 0, (list(pr["index"]), pr["n_overlapping"])
 
 
-def t_cache_atomic_2026_10_08():
+def t_cache_atomic():
     """A cache is written whole or not at all (pipeline._save_npz: a sibling temp file, then os.replace). A
     normal save leaves one file; a save interrupted midway (KeyboardInterrupt from an array) the previous file
     byte-identical and no temp sibling. A cut, empty or non-zip cache (a killed non-atomic write) is 'unreadable' to
@@ -3987,104 +3950,44 @@ def t_void_tracking_script():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def t_thesis_mirror_guard():
-    """A figure in a folder whose names carry neither the simulation nor the estimator
-    (config.THESIS_NAMED_DIRS: ANALYSIS_DIRS plus what figures_path hands out) goes into the thesis Figures/ tree only
-    from TNG50-3-Dark's standard-DTFE grids (figures.note_source / thesis_mirror_refusal): another DTFE_SIM, another
-    box's grids or PS-DTFE grids are refused, said once per process and without '--'; a per-simulation folder mirrors
-    regardless; DTFE_NO_MIRROR turns every mirror off. analyze.py says which in its banner and closing line and hands
-    --no-mirror to its children as DTFE_NO_MIRROR (os.environ untouched; run_step stubbed: no plot script runs)."""
-    import io as _io, os as _os, shutil, sys as _sys, tempfile, types
+def t_figures_path_and_analyze_plot():
+    """config.figures_path names a folder under the figure root read at CALL time (ANALYSIS_DIRS' name, else the key);
+    figures.save_figure saves there and nowhere else. analyze.py 'plot' hands its scripts the caller's environment
+    unchanged (os.environ untouched; run_step stubbed: no plot script runs) and its closing line names the figure root,
+    without '--'."""
+    import io as _io, shutil, sys as _sys, tempfile
     from contextlib import redirect_stdout
     from matplotlib.figure import Figure
     import config
-    from dtfelib import figures as F, pipeline
+    from dtfelib import figures as F
     import analyze
-    tmp = Path(tempfile.mkdtemp(prefix="dtfe_mirrorguard_"))
-    old = (config.LOCAL_FIGURES_ROOT, config.THESIS_FIGURES_DIR, config.SIMULATION, set(config.THESIS_NAMED_DIRS))
-    old_env = _os.environ.pop("DTFE_NO_MIRROR", None)
-    old_argv, old_step = list(_sys.argv), analyze.run_step
-    ns = types.SimpleNamespace
-
-    def reset():                                                 # process-global: each case starts from none
-        F._SOURCES.clear()
-        F._SAID.clear()
+    tmp = Path(tempfile.mkdtemp(prefix="dtfe_figpaths_"))
+    old = (config.LOCAL_FIGURES_ROOT, config.SIMULATION)
+    old_argv, old_step, old_env = list(_sys.argv), analyze.run_step, dict(os.environ)
     try:
-        reset()
-        assert pipeline.smoothing_tag() == "", "a leaked smoothing: the guard would not be reached"
-        root, mirror = tmp / "figs", tmp / "mirror"
-        config.LOCAL_FIGURES_ROOT, config.THESIS_FIGURES_DIR = str(root), mirror
-        assert config.figures_path("void_analysis") == f"{root}/void_analysis" and config.figures_path("smoothing_comparison")
-        assert {"void_analysis", "smoothing_comparison"} <= config.THESIS_NAMED_DIRS and "void_profiles" not in config.THESIS_NAMED_DIRS
-
-        def save(rel):                                           # saved locally always; mirrored?
-            F.save_plot_to_multiple_paths(Figure(figsize=(1, 1)), root / rel, dpi=10)
-            assert (root / rel).is_file(), rel
-            return (mirror / rel).is_file()
-
-        def said(text):
-            return [ln for ln in text.splitlines() if "not copied into the thesis Figures/ tree" in ln]
-        config.SIMULATION = "TNG100-3-Dark"
-        buf = _io.StringIO()
-        with redirect_stdout(buf):
-            got = (save("void_analysis/a.png"), save("smoothing_comparison/b.png"), save("void_profiles/SYN/x.png"))
-        assert got == (False, False, True), got
-        lines = said(buf.getvalue())
-        assert len(lines) == 1 and "TNG100-3-Dark" in lines[0] and "--" not in lines[0], buf.getvalue()
-        config.SIMULATION = "TNG50-3-Dark"
-        reset()
-        assert F.thesis_mirror_refusal() is None and save("void_analysis/c.png")              # nothing noted: mirrored
-        F.note_source(ns(snapdir=tmp / "TNG50-3-Dark" / "snapdir_099", method="dtfe", prefix="output."))
-        assert save("void_analysis/d.png")
-        F.note_source(ns(snapdir=tmp / "TNG50-3-Dark" / "snapdir_099", method="ps", prefix="ps_output."))
-        buf = _io.StringIO()
-        with redirect_stdout(buf):
-            assert not save("void_analysis/e.png") and not save("void_analysis/e2.png")
-        lines = said(buf.getvalue())
-        assert len(lines) == 1 and "PS-DTFE grids" in lines[0] and "--" not in lines[0], buf.getvalue()
-        reset()
-        F.note_source(ns(snapdir=tmp / "TNG100-3-Dark" / "snapdir_099", method="dtfe", prefix="output."))   # another box's
-        with redirect_stdout(_io.StringIO()):
-            assert not save("void_analysis/f.png")
-        reset()
-        _os.environ["DTFE_NO_MIRROR"] = "1"
-        assert not save("void_analysis/g.png") and not save("void_profiles/SYN/h.png")
-        del _os.environ["DTFE_NO_MIRROR"]
-        # analyze.py: the banner and the closing line say whether the mirror is on; --no-mirror reaches the children
+        root = tmp / "figs"
+        config.LOCAL_FIGURES_ROOT = str(root)
+        assert config.figures_path("void_analysis") == f"{root}/void_analysis", config.figures_path("void_analysis")
+        assert config.figures_path("smoothing_comparison") == f"{root}/smoothing_comparison"
+        F.save_figure(Figure(figsize=(1, 1)), root / "void_analysis" / "a.png", dpi=10)
+        assert [str(q.relative_to(tmp)) for q in tmp.rglob("*.png")] == ["figs/void_analysis/a.png"]
         steps = []
         analyze.run_step = lambda cmd, label, env=None: (steps.append((label, env)), (0, 0.0))[1]
-
-        def run(argv, sim):
-            config.SIMULATION = sim
-            del steps[:]
-            _sys.argv = ["analyze.py"] + argv
-            buf = _io.StringIO()
-            with redirect_stdout(buf):
-                try:
-                    analyze.main()
-                    code = 0
-                except SystemExit as e:
-                    code = e.code
-            lines = [ln for ln in buf.getvalue().splitlines() if ln.startswith(("Thesis figure mirror", "All done"))]
-            assert code in (0, None) and len(lines) == 2 and all("--" not in ln for ln in lines), (code, buf.getvalue()[-600:])
-            return lines, list(steps)
-        lines, st = run(["plot", "--only", "plot_eigenvalues.py"], "TNG100-3-Dark")
-        assert lines[0] == "Thesis figure mirror: off (TNG100-3-Dark is not the thesis simulation TNG50-3-Dark)", lines
-        assert "Nothing was copied into the thesis Figures/ tree" in lines[1] and st == [("plot_eigenvalues.py", None)], (lines, st)
-        lines, st = run(["plot", "--only", "plot_eigenvalues.py", "--no-mirror"], "TNG50-3-Dark")
-        assert lines[0] == "Thesis figure mirror: off (asked for)" and len(st) == 1 and st[0][1]["DTFE_NO_MIRROR"] == "1", (lines, st)
-        assert "DTFE_NO_MIRROR" not in _os.environ
-        lines, st = run(["plot", "--only", "plot_eigenvalues.py"], "TNG50-3-Dark")
-        assert lines[0] == f"Thesis figure mirror: {mirror} (figures made from TNG50-3-Dark standard DTFE grids only)", lines
-        assert "Figures made from the thesis grids are mirrored" in lines[1] and st == [("plot_eigenvalues.py", None)], (lines, st)
+        config.SIMULATION = "TNG100-3-Dark"
+        _sys.argv = ["analyze.py", "plot", "--only", "plot_eigenvalues.py"]
+        buf = _io.StringIO()
+        with redirect_stdout(buf):
+            try:
+                analyze.main()
+                code = 0
+            except SystemExit as e:
+                code = e.code
+        lines = [ln for ln in buf.getvalue().splitlines() if ln.startswith("All done")]
+        assert code in (0, None) and len(lines) == 1 and "--" not in lines[0], (code, buf.getvalue()[-600:])
+        assert f"Figures are under {root}; key numbers in {root}/void_analysis/void_shape_table.txt" in lines[0], lines
+        assert steps == [("plot_eigenvalues.py", None)] and dict(os.environ) == old_env, steps
     finally:
-        reset()
-        config.LOCAL_FIGURES_ROOT, config.THESIS_FIGURES_DIR, config.SIMULATION = old[:3]
-        config.THESIS_NAMED_DIRS.clear()
-        config.THESIS_NAMED_DIRS.update(old[3])
-        _os.environ.pop("DTFE_NO_MIRROR", None)
-        if old_env is not None:
-            _os.environ["DTFE_NO_MIRROR"] = old_env
+        config.LOCAL_FIGURES_ROOT, config.SIMULATION = old
         _sys.argv, analyze.run_step = old_argv, old_step
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -4101,7 +4004,8 @@ def t_analyze_ladder_on_disk():
     from dtfelib import cli, pipeline
     import analyze
     root = Path(tempfile.mkdtemp(prefix="dtfe_ladder_"))
-    old = (config.SIMULATION, cli.DATA_ROOT, config.CACHE_DIR, config.LOCAL_FIGURES_ROOT, pipeline.products, list(_sys.argv))
+    old = (config.SIMULATION, cli._data_root_override, config.CACHE_DIR, config.LOCAL_FIGURES_ROOT, pipeline.products,
+           list(_sys.argv))
     sim = "SYNLADDER"
 
     def call(fn):
@@ -4130,7 +4034,6 @@ def t_analyze_ladder_on_disk():
         code, text, lines = check()
         assert code == 0 and all("OK (all PS-DTFE fields)" in lines[f"snapdir_{s}"] for s in ("050", "099")), (code, text[-800:])
         assert sum("not on disk" in ln for ln in lines.values()) == 14 and "not on disk" in lines["snapdir_067"], lines
-        assert f"The figures will be {sim} PS-DTFE" in text and "takes TNG50-3-Dark standard DTFE figures only" in text, text[-400:]
         (root / "data" / sim / "snapdir_050" / "ps_output.a_velGrad").unlink()
         code, text, lines = check()
         assert code == 1 and "INCOMPLETE (PS-DTFE): missing ps_output.a_velGrad" in lines["snapdir_050"] and "Re-run DTFE for: 050" in text, (code, text[-600:])
@@ -4154,7 +4057,8 @@ def t_analyze_ladder_on_disk():
         code, text = call(lambda: analyze.export([], root / "export"))
         assert code == 1 and asked == ["050", "099"] and f"Not on disk, left out: {absent}" in text, (code, asked, text[-600:])
     finally:
-        config.SIMULATION, cli.DATA_ROOT, config.CACHE_DIR, config.LOCAL_FIGURES_ROOT, pipeline.products, _sys.argv = old
+        config.SIMULATION, old_root, config.CACHE_DIR, config.LOCAL_FIGURES_ROOT, pipeline.products, _sys.argv = old
+        cli.use_data_root(old_root)
         shutil.rmtree(root, ignore_errors=True)
 
 
@@ -4289,47 +4193,46 @@ def main():
     print(" dtfelib merger-tree / void-tracking tests")
     print("=" * 60)
     print("synthetic:")
-    check("the thesis figure mirror lies outside the repo (case-insensitively: DTFE/Figures IS DTFE/figures on macOS)", t_thesis_mirror_outside_repo)
-    check("2026-10-08: the thesis mirror takes the thesis-named folders from TNG50-3-Dark standard DTFE only (said once, no '--'), per-sim folders as before, DTFE_NO_MIRROR; analyze.py's banner, closing line and --no-mirror env (synthetic)", t_thesis_mirror_guard)
-    check("2026-10-07: the measured void radius R_v (analytic, periodic, overdense), distinct voids deepest first, the smoothing in Mpc (set_smoothing, DTFE_SIGMA_MPC, footprint) and its 10-cell anchor (synthetic)", t_void_radius_and_physical_smoothing)
-    check("2026-10-08: distinct_mask's claims from every resolved void (a no-R_v void blocks, an unresolved one never), snapshot_stats' counts add up, void_profiles 'deep' = the de-duplication within it (synthetic)", t_distinct_claims_2026_10_08)
-    check("2026-10-07: the mirror keeps the sim folder under a root without 'figures' in its path; the cuts are 10 sigma / L/2 / 1 cell at CALL time; a cache older than its grid is rebuilt; profile bins in sigma (synthetic)", t_science_fixes_2026_10_07)
-    check("2026-10-08: _save_npz whole or not at all (an interrupted save leaves the old file, no temp); a cut / empty / non-zip cache is rebuilt with one write; void_outlines' clean exit on a damaged member (synthetic)", t_cache_atomic_2026_10_08)
+    check("figures_path under the figure root at call time, save_figure there only; analyze.py plot: the caller's environment, a closing line naming the figure root (synthetic)", t_figures_path_and_analyze_plot)
+    check("the measured void radius R_v (analytic, periodic, overdense), distinct voids deepest first, the smoothing in Mpc (set_smoothing, DTFE_SIGMA_MPC, footprint) and its 10-cell anchor (synthetic)", t_void_radius_and_physical_smoothing)
+    check("distinct_mask's claims from every resolved void (a no-R_v void blocks, an unresolved one never), snapshot_stats' counts add up, void_profiles 'deep' = the de-duplication within it (synthetic)", t_distinct_claims)
+    check("save_figure under a root without 'figures' in its path; the cuts are 10 sigma / L/2 / 1 cell at CALL time; a cache older than its grid is rebuilt; profile bins in sigma (synthetic)", t_science_fixes)
+    check("_save_npz whole or not at all (an interrupted save leaves the old file, no temp); a cut / empty / non-zip cache is rebuilt with one write; void_outlines' clean exit on a damaged member (synthetic)", t_cache_atomic)
     check("cross-epoch limits store: a subset run keeps the series' maxima (synthetic)", t_limits_store)
     check("map ranges: symmetric about 0, log range of an empty slice (synthetic)", t_map_limits)
     check("webstreams: stream bins + caustic class by web class, chunked == whole (synthetic)", t_webstreams)
     check("void catalogue export: every column against its source, units read back, CSV parse, provenance key by key, the frame guard's hint by cause, no header = FileNotFoundError (synthetic)", t_void_catalog_export)
-    check("void cache frame: a header not config's refused before the cache is touched; frame-only, cuts-only and July caches re-derived without the field; 'deep' follows its threshold (synthetic)", t_void_cache_frame)
+    check("void cache frame: a header not config's refused before the cache is touched; frame-only, cuts-only and record-less caches re-derived without the field; 'deep' follows its threshold (synthetic)", t_void_cache_frame)
     check("analyze.py export: each exit clause alone, the summary, --format, a void-less catalogue, the default folder (synthetic)", t_export_driver)
     check("void profiles: exact step + outflow, periodic wrap, bulk cancels, the catalogue rows, the hidden bit, the cell-centre convention, the 16/84 band, min_count, linear v_r at z = 0 and 1 (synthetic)", t_void_profiles)
-    check("plot_void_profiles.py + plot_void_population.py end to end: npz keys + the --prefix tag, an unreadable snapshot counted failed and the next still done, abundance from each estimator's own catalogue, the one R_eff, 'deep' at the live threshold, --other-estimator at the panel only, the population's _overlaps / _dtfe names, the profiles' _edges tag (2026-10-11), a 1.3x header REFUSED before its cache (synthetic)", t_void_scripts)
+    check("plot_void_profiles.py + plot_void_population.py end to end: npz keys + the --prefix tag, an unreadable snapshot counted failed and the next still done, abundance from each estimator's own catalogue, the one R_eff, 'deep' at the live threshold, --other-estimator at the panel only, the population's _overlaps / _dtfe names, the profiles' _edges tag, a 1.3x header REFUSED before its cache (synthetic)", t_void_scripts)
     check("plot_void_population.py: an unreadable snapshot file is left out and the rest analysed (synthetic)", t_void_population_unreadable)
     check("plot_void_tracking.py: catalog_at lets a frame refusal through, main() exits REFUSED, the set's name tag, only this set's stale void<K> files removed (synthetic)", t_void_tracking_script)
     check("plot_void_crossbox.py worker + --replot figure, tools/void_outlines.py, pipeline.adopt_snapshot_grid (synthetic)", t_void_crossbox_outlines)
     check("power spectrum: a known spectrum recovered for an even and an odd N, Parseval, mode count; linear P(k): sigma_8, D(z), f, k_eq, T(k) pinned (synthetic)", t_power_spectrum)
-    check("plot_pk_compare.py end to end: names by estimator/prefix, the _nb<N> / _ref<S> / _noref tags of non-default options (2026-10-11), no mirror under --out, a lone estimator's note, the Nyquist pairs (synthetic)", t_pk_script)
-    check("2026-10-11: analyze.py voids registers plot_void_convergence.py (K4) after the fate census, run with --sim (synthetic)", t_void_scripts_convergence)
-    check("2026-10-11: analyze.py cache --prune lists the '_v1' and unreachable-smoothing namespaces, old fate links and dead temp files (dry run by default), --yes deletes exactly those, --keep-mpc (synthetic)", t_cache_prune)
+    check("plot_pk_compare.py end to end: names by estimator/prefix, the _nb<N> / _ref<S> / _noref tags of non-default options, a lone estimator's note, the Nyquist pairs (synthetic)", t_pk_script)
+    check("analyze.py voids registers plot_void_convergence.py after the fate census, run with --sim (synthetic)", t_void_scripts_convergence)
+    check("analyze.py cache --prune lists the '_v1' and unreachable-smoothing namespaces, old fate links and dead temp files (dry run by default), --yes deletes exactly those, --keep-mpc (synthetic)", t_cache_prune)
     check("caustic skeleton: classes, periodic merge across a face/edge/corner, 6/18/26-connectivity, components, cusp vs swallowtail bits and 'not computed', the parity-only refusal, json_safe, per-void shells + the wall distance (synthetic)", t_caustic_skeleton)
-    check("the geometric fold flag (2026-10-13): caustic_is_fold with streams/hidden, its slabs and checks, FieldSet.fold_mask on a pre-fix grid and its fallbacks (synthetic)", t_caustic_fold_exact)
-    check("plot_caustic_skeleton.py end to end: files per redshift, strict JSON, '--' cusp rows, --connectivity, no mirror under --out, no grid / parity-only / failed --voids exit 1, void_block with no or censored voids, the option name tags, the stale _voids.npz removed, the 'distinct' title (synthetic)", t_caustic_skeleton_script)
+    check("the geometric fold flag: caustic_is_fold with streams/hidden, its slabs and checks, FieldSet.fold_mask on a sample-flagged grid and its fallbacks (synthetic)", t_caustic_fold_exact)
+    check("plot_caustic_skeleton.py end to end: files per redshift, strict JSON, '--' cusp rows, --connectivity, nothing in the default folder under --out, no grid / parity-only / failed --voids exit 1, void_block with no or censored voids, the option name tags, the stale _voids.npz removed, the 'distinct' title (synthetic)", t_caustic_skeleton_script)
     check("plot_web_streams.py end to end: files per redshift, a truncated web, an unreadable snapshot file mid-series, the exit rule, the _snaps / _<prefix> / _raw name tags (synthetic)", t_webstreams_script)
     check("analyze.py compute: a missing snapdir and an unreadable snapshot file are counted failed, each with its own reason (synthetic)", t_compute_missing_data)
     check("analyze.py check / compute / export on the snapdirs on disk: PS-DTFE grids complete, absent = 'not on disk' (no failure), incomplete or nothing at all exit 1, the default ids (synthetic)", t_analyze_ladder_on_disk)
     check("slice maps: the house-style helpers' ranges and rules; the three map scripts write the same 53 files with the house norms, floors, panel labels, orientation and sizes; empty slices skipped (synthetic)", t_slice_maps)
     check("point-eval maps: one look and one path from plot_PS_DTFE (--pointeval-only and full) and plot_pointeval.py, fresh interpreters (synthetic)", t_pointeval_style)
     check("point-eval maps: slab / smooth / fixed-range renders get their own names, not 'up to date' against the plane render (synthetic)", t_pointeval_name_tags)
-    check("2026-10-11: plot_pointeval_panels.py reads a K > 1 plane (KxK blocks: density averaged, streams the largest); plot_pointeval.py renders a standard-DTFE slice beside PS-DTFE grids (--method dtfe, and auto following the slice) (synthetic)", t_pointeval_supersample_and_estimator)
-    check("2026-10-11: plot_halo_tracking.py samples the environment from --prefix / --raw's grids, and --data-root reaches the trees (synthetic)", t_halo_tracking_grid_set)
-    check("2026-10-11: plot_velDiv_den.py / plot_PDF_CDF.py evolution summaries from this run's snapshots only, each summary naming its simulation and estimator (synthetic)", t_evolution_summaries_this_run)
+    check("plot_pointeval_panels.py reads a K > 1 plane (KxK blocks: density averaged, streams the largest); plot_pointeval.py renders a standard-DTFE slice beside PS-DTFE grids (--method dtfe, and auto following the slice) (synthetic)", t_pointeval_supersample_and_estimator)
+    check("plot_halo_tracking.py samples the environment from --prefix / --raw's grids, and --data-root reaches the trees (synthetic)", t_halo_tracking_grid_set)
+    check("plot_velDiv_den.py / plot_PDF_CDF.py evolution summaries from this run's snapshots only, each summary naming its simulation and estimator (synthetic)", t_evolution_summaries_this_run)
     check("sample_grid conventions", t_sample_grid)
     check("periodic helpers", t_periodic_helpers)
     check("track_center across box wrap", t_track_center_wrap)
     check("match_catalog_void (periodic)", t_match_catalog_void)
     check("shape estimators: vectorized == loop reference", t_shape_estimators)
-    check("2026-10-11: smooth_field / find_local_minima slab-threaded == scipy's serial filters bit for bit (synthetic)",
+    check("smooth_field / find_local_minima slab-threaded == scipy's serial filters bit for bit (synthetic)",
           t_threaded_filters)
-    check("2026-10-11: find_critical_points' minimum/maximum box filters slab-threaded == scipy's serial filters bit "
+    check("find_critical_points' minimum/maximum box filters slab-threaded == scipy's serial filters bit "
           "for bit at 256^3 (synthetic)", t_threaded_critical_points)
     check("FieldSet caustic loader (synthetic)", t_caustic_field_loader)
     check("velocity_single_stream float-streams + hidden-streams mask (synthetic)", t_velocity_single_stream_float_mask)

@@ -52,8 +52,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$ROOT" || exit 1
-PY="${PYTHON:-python3}"
-command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/python3.14
+source "${SCRIPT_DIR}/lib.sh"   # PY: the python with numpy and h5py
 if [ "${1:-}" != "--no-build" ]; then
     echo ">> building PS-DTFE-2d and DTFE-2d (make ... DIM=2) ..."
     make PS-DTFE DTFE DIM=2 -j4 >/dev/null || { echo "FAIL: the 2D build"; exit 1; }

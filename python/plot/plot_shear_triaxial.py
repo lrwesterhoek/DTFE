@@ -18,7 +18,7 @@ from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
 from dtfelib import fields as dtfe
-from dtfelib.figures import save_plot_to_multiple_paths
+from dtfelib.figures import save_figure
 import config
 from dtfelib import figures as style
 from dtfelib import make_parser, sim_dir, add_ps_gradient_arg, mean_field_wanted
@@ -101,7 +101,7 @@ def visualize_shear_magnitude(shear_slice, slice_dim, redshift, box_size, save_p
     cbar.set_label('Shear Magnitude [km/s/Mpc]')
     ax.set_aspect('equal', adjustable='box')
     plt.tight_layout()
-    save_plot_to_multiple_paths(fig, save_path, dpi=DPI, bbox_inches='tight')
+    save_figure(fig, save_path, dpi=DPI, bbox_inches='tight')
     plt.close(fig)
 
 
@@ -119,7 +119,7 @@ def visualize_triaxiality(T_slice, slice_dim, redshift, box_size, save_path):
     cbar.set_label('Triaxiality')
     ax.set_aspect('equal', adjustable='box')
     plt.tight_layout()
-    save_plot_to_multiple_paths(fig, save_path, dpi=DPI, bbox_inches='tight')
+    save_figure(fig, save_path, dpi=DPI, bbox_inches='tight')
     plt.close(fig)
 
 
@@ -205,7 +205,6 @@ def main():
         try:
             fs = FieldSet(sim_dir(args.sim, args.data_root) / f"snapdir_{snapshot}",   # flat or per-family
                           method=args.method, averaged=not args.raw, prefix=args.prefix)
-            style.note_source(fs)                   # the thesis mirror takes the thesis box's standard DTFE only
             r = compute_snapshot_slices(fs, mean_field=mean_field_wanted(args))
         except FileNotFoundError:
             print(f"  skipping snapshot {snapshot} (no {args.method} fields)")

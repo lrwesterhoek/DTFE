@@ -19,7 +19,7 @@ Files: void_profiles_<method|prefix>_<sample>[_reff][_overlaps][_edges<e0>-<e1>-
 '_edges...' only for --edges other than the default bins, so a rerun with other bins never replaces them.
 
     python3 plot/plot_void_profiles.py --sim TNG100-3-Dark --snaps 99 50
-    python3 plot/plot_void_profiles.py --sim TNG100-3-Dark --snaps 99 --out ~/profiles   (no thesis-tree copy)
+    python3 plot/plot_void_profiles.py --sim TNG100-3-Dark --snaps 99 --out ~/profiles
     python3 plot/plot_void_profiles.py --sim TNG300-3-Dark --snaps 99 --smooth-mpc 2.1625 --radius r_eff
     python3 plot/plot_void_profiles.py --sim TNG50-4-Dark --snap 99 --method dtfe --sample deep --edges 0,3,6,12
 """
@@ -37,7 +37,6 @@ from dtfelib import make_parser, pipeline, profiles
 from dtfelib import figures as style
 
 OUTPUT_DIR = Path(config.LOCAL_FIGURES_ROOT) / "void_profiles"
-MIRROR = True                              # --out: the user's folder, nothing goes into the thesis tree
 
 
 def plot_stack(st, prof, title, path, z, linear=True, fits=None):
@@ -84,7 +83,7 @@ def plot_stack(st, prof, title, path, z, linear=True, fits=None):
         axes[0][0].text(0.5, 0.5, f"no radius bin with {st['min_count']} voids", transform=axes[0][0].transAxes, ha="center", color="0.4")
     style.set_suptitle(fig, title)
     fig.tight_layout()
-    style.save_plot_to_multiple_paths(fig, path, mirror=MIRROR)
+    style.save_figure(fig, path)
     plt.close(fig)
 
 
@@ -118,8 +117,6 @@ def main():
     parser.add_argument("--out", default=None, help=f"output folder (default {OUTPUT_DIR}/<sim>)")
     pipeline.add_smoothing_mpc_arg(parser)
     args = parser.parse_args()
-    global MIRROR
-    MIRROR = args.out is None
     style.apply()
     pipeline.apply_smoothing_args(args, "void-profiles")  # the catalogue's cache namespace follows, as in the other scripts
     default_edges = list(profiles.default_edges_mpc(pipeline.smoothing_length_mpc(), config.BOX_SIZE, args.radius))

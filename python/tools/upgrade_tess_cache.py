@@ -9,7 +9,7 @@ body is inflated and recompressed chunk by chunk, the result is checked (the inf
 SHA-256 must be the old one's) and only then renamed over the old file. Files already chunked are
 left alone; occupancy maps ('.occ') and globals records do not change.
 
-    python3 python/tools/upgrade_tess_cache.py "/Volumes/Samsung T7/Illustris TNG/.dtfe-tessellation-cache"
+    python3 python/tools/upgrade_tess_cache.py ~/IllustrisTNG/.dtfe-tessellation-cache
 
 Run it only when no OLD binary (built before the chunked format) uses that folder -- a query server
 started before the update cannot read converted files. -j sets the number of files converted at once.

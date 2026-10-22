@@ -4,6 +4,11 @@
  *                           Kapteyn Astronomical Institute
  *                           University of Groningen, the Netherlands
  *
+ *  Copyright (c) 2026       Luuk Westerhoek
+ *
+ *                           Kapteyn Astronomical Institute
+ *                           University of Groningen, the Netherlands
+ *
  *
  *  This program is free software: you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by

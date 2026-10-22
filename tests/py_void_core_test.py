@@ -12,8 +12,8 @@
   * the R_v search's half-box margin with the reach recorded; the cache folder setting, 'analyze.py cache
     --move' and the setup's offer to keep the caches out of iCloud Drive.
 
-SYNTHETIC tests always run (CI: no T7); the DATA-BACKED one (TNG100-3-Dark z = 0 on the T7) is skipped when the
-snapshot is not on disk.
+SYNTHETIC tests always run (CI: no data); the DATA-BACKED one (TNG100-3-Dark z = 0 under DTFE_DATA_ROOT) is skipped
+when DTFE_DATA_ROOT is unset or the snapshot is not on disk.
 
 Usage:  python3 tests/py_void_core_test.py            (exit 0 = pass)
 """
@@ -31,9 +31,9 @@ from pathlib import Path
 
 import numpy as np
 
-from _harness import REPO, Skip, check as _check, setup, summary
+from _harness import REPO, Skip, check as _check, data_root, setup, summary
 
-setup("void_core_figs_", paths=("python",), no_mirror=False, mpl_agg=False)
+setup("void_core_figs_", paths=("python",), mpl_agg=False)
 os.environ.setdefault("DTFE_SIM", "TNG50-4-Dark")    # the box these synthetic tests stand for; a data-tier run sets its own
 os.environ.pop("DTFE_VOID_GATE", None)          # this process tests the default gate; the subprocesses set their own
 _PY = REPO / "python"
@@ -313,11 +313,11 @@ def t_env_overrides():
 
 
 def t_real_tng100_z0():
-    """TNG100-3-Dark z = 0 (T7): the served catalogue carries the current R_v settings and all three radii; the crossing
-    median of the distinct voids is 7.42 Mpc (6.94 under a 15-sigma cap). A fresh
+    """TNG100-3-Dark z = 0 (under DTFE_DATA_ROOT): the served catalogue carries the current R_v settings and all
+    three radii; the crossing median of the distinct voids is 7.42 Mpc (6.94 under a 15-sigma cap). A fresh
     interpreter (DTFE_SIM decides config's frame); the shared cache is read, or re-measured once if stale."""
     from dtfelib.cli import sim_dir
-    if not (sim_dir("TNG100-3-Dark") / "snapdir_099").is_dir():
+    if not (sim_dir("TNG100-3-Dark", data_root()) / "snapdir_099").is_dir():
         raise Skip("TNG100-3-Dark snapdir_099 not on disk")
     code = ("import numpy as np, config; from dtfelib import pipeline, catalog\n"
             "cat = pipeline.products('099', sim='TNG100-3-Dark').voids()\n"
@@ -325,7 +325,7 @@ def t_real_tng100_z0():
             "res = np.asarray(cat['well_resolved']).astype(bool)\n"
             "d = catalog.distinct_mask(cat, res & np.isfinite(catalog.r_v_mpc(cat)), config.FIELD_RESOLUTION)\n"
             "print(int(d.sum()), *[float(np.nanmedian(catalog.r_v_mpc(cat, k)[d])) for k in catalog.R_V_DEFINITIONS])\n")
-    env = dict(os.environ, DTFE_SIM="TNG100-3-Dark", DTFE_NO_MIRROR="1")
+    env = dict(os.environ, DTFE_SIM="TNG100-3-Dark")
     env.pop("DTFE_VOID_GATE", None)
     env.pop("DTFE_SIGMA_MPC", None)             # the production namespace, whatever this shell exports
     env.pop("DTFE_CACHE_DIR", None)
@@ -339,8 +339,7 @@ def t_real_tng100_z0():
 
 def t_crossbox_constant():
     """config.CROSSBOX_SMOOTHING_MPC = 2.1625 is the ONE cross-box smoothing: plot_void_crossbox's
-    default and analyze.py's cache inventory import it (an assignment that names it, not an equal literal), and
-    scripts/thesis_runs.sh's literal (a recipe, kept on purpose) equals it."""
+    default and analyze.py's cache inventory import it (an assignment that names it, not an equal literal)."""
     import re
     import config
     assert config.CROSSBOX_SMOOTHING_MPC == 2.1625, config.CROSSBOX_SMOOTHING_MPC
@@ -355,10 +354,6 @@ def t_crossbox_constant():
     for f, name in (("plot/plot_void_crossbox.py", "DEFAULT_SIGMA_MPC"), ("analyze.py", "CACHE_SMOOTHING_MPC")):
         src = (_PY / f).read_text()
         assert re.search(rf"^{name} = .*config\.CROSSBOX_SMOOTHING_MPC", src, re.M), f"{f}: {name} not from config"
-    sh = (_PY.parent / "scripts" / "thesis_runs.sh").read_text()
-    m = re.search(r"^CROSSBOX_SMOOTH_MPC=(\S+)$", sh, re.M)
-    assert m and float(m.group(1)) == config.CROSSBOX_SMOOTHING_MPC, m
-    assert "--smooth-mpc 2.1625" not in sh, "thesis_runs.sh: a bare literal left beside CROSSBOX_SMOOTH_MPC"
 
 
 def t_r_v_cap():
@@ -544,9 +539,10 @@ def t_cache_move():
                  70: (1, "/usr/bin/python3 /repo/python/plot/plot_void_fate.py --sim TNG100-3-Dark"),
                  71: (1, "vim analyze.py"), 72: (1, "/x/Python /repo/python/gui/app.py"),
                  73: (1, "python3 -m pytest tests/py_analyze_helpers.py"),
-                 # the launcher as scripts/gui.sh starts it on macOS (the host bundle), and a job run by its
-                 # interpreter (missing either would let --move go ahead with the launcher open)
-                 74: (1, "/Users/x/.venvs/dtfe-gui/DTFE Launcher.app/Contents/MacOS/DTFE Launcher "
+                 # the launcher as scripts/gui.sh starts it on macOS (the host bundle: Lamina, or DTFE Launcher from
+                 # an older install_gui_app.sh), and a job run by its interpreter (missing either would let --move
+                 # go ahead with the launcher open)
+                 74: (1, "/Users/x/.venvs/dtfe-gui/Lamina.app/Contents/MacOS/Lamina "
                          "/Users/x/Mobile Documents/DTFE/python/gui/app.py"),
                  75: (74, "/Users/x/.venvs/dtfe-gui/DTFE Launcher.app/Contents/MacOS/DTFE Launcher "
                           "/repo/python/void_cache.py --sim TNG100-3-Dark"),
@@ -632,27 +628,26 @@ def main():
     print(" void core: R_v definitions, cache identity, cache dir, void gate")
     print("=" * 60)
     print("synthetic:")
-    check("2026-10-11: crossing / delta08 / ridge from one shell matrix on an analytic compensated void (periodic, "
+    check("crossing / delta08 / ridge from one shell matrix on an analytic compensated void (periodic, "
           "shallow, overdense, truncated), the crossing = void_radius_cells", t_radii_definitions)
-    check("2026-10-11: catalog.R_V_DEFINITIONS, r_v_cells / r_v_mpc per definition, NaN without the key", t_r_v_accessors)
-    check("2026-10-11: R_v settings in the cache identity: built with them; missing or other ones re-measured once from "
+    check("catalog.R_V_DEFINITIONS, r_v_cells / r_v_mpc per definition, NaN without the key", t_r_v_accessors)
+    check("R_v settings in the cache identity: built with them; missing or other ones re-measured once from "
           "the smoothed field (no Hessian), then silent", t_r_v_cache_identity)
-    check("2026-10-11: DTFE_VOID_GATE=none ungates the served catalogue only (cache bytes unchanged), tag 'gatenone'; "
+    check("DTFE_VOID_GATE=none ungates the served catalogue only (cache bytes unchanged), tag 'gatenone'; "
           "export columns r_v_delta08_mpc / r_v_ridge_mpc and the R_v provenance", t_void_gate_and_export)
-    check("2026-10-11: DTFE_CACHE_DIR (default kept, ~ expanded, the products follow) and DTFE_VOID_GATE at config "
+    check("DTFE_CACHE_DIR (default kept, ~ expanded, the products follow) and DTFE_VOID_GATE at config "
           "import (an unknown value refused)", t_env_overrides)
-    check("2026-10-11 (G2): config.CROSSBOX_SMOOTHING_MPC = 2.1625 imported by plot_void_crossbox and analyze; "
-          "thesis_runs.sh's literal equals it", t_crossbox_constant)
-    check("2026-10-11: R_v search cap 24 sigma (a sigma short of L/2 at production): a 20-sigma void is measured, "
+    check("config.CROSSBOX_SMOOTHING_MPC = 2.1625 imported by plot_void_crossbox and analyze", t_crossbox_constant)
+    check("R_v search cap 24 sigma (a sigma short of L/2 at production): a 20-sigma void is measured, "
           "not NaN", t_r_v_cap)
-    check("2026-10-11 (3d): analyze.py cache --move: dry run by default; refused while in use, on a clash or a failed "
+    check("analyze.py cache --move: dry run by default; refused while in use, on a clash or a failed "
           "verify (nothing touched); moved byte for byte, the setting read by a new interpreter", t_cache_move)
-    check("2026-10-11 (3d): the setup offers the caches out of iCloud Drive only when the repository and the caches are "
+    check("the setup offers the caches out of iCloud Drive only when the repository and the caches are "
           "in it, and its button runs the same move", t_setup_wizard_cache_offer)
-    check("2026-10-11 (3c): the half-box clause has a sigma's margin; the reach is recorded, a legacy record served "
+    check("the half-box clause has a sigma's margin; the reach is recorded, a legacy record served "
           "where the margin changes nothing and re-measured where it binds", t_r_v_half_box_margin)
     print("data-backed:")
-    check("2026-10-11: TNG100-3-Dark z = 0 served with today's R_v settings; distinct median radii in order", t_real_tng100_z0)
+    check("TNG100-3-Dark z = 0 served with the current R_v settings; distinct median radii in order", t_real_tng100_z0)
     print("=" * 60)
     return summary()
 

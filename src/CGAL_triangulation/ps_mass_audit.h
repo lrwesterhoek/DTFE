@@ -27,6 +27,8 @@
 #include <cstdlib>
 #include <mutex>
 
+#include "../env_knobs.h"
+
 namespace PSMassAudit
 {
     // read once: the switch is per run. 2 adds the per-particle closure (ps_interpolation.cc), on ONE domain
@@ -34,7 +36,7 @@ namespace PSMassAudit
     // or --ps-gpu to get one
     inline int level()
     {
-        static int const v = [] { char const *e = std::getenv("PS_MASS_AUDIT"); return e ? std::atoi(e) : 0; }();
+        static int const v = int( Env::integer( "PS_MASS_AUDIT", 0 ) );
         return v;
     }
     inline bool on() { return level() >= 1; }

@@ -182,7 +182,7 @@ check("C perturbed-IC mass conserved (vertex-mass)", abs((dv + 1).mean() - 1.0) 
 # tet take its shares with it (deficit ~ the dropped fraction; 0.74% at TNG z=0, 5.8e-4 here).
 dc = load(f"{tmp}/pvm_crw_vm", ".den")
 check("E crossed-waves mass survives dropped tets", abs(dc.mean() - 1.0) < 5e-5,
-      f"mean = {dc.mean():.8f} (pre-fix binaries: ~0.99942)")
+      f"mean = {dc.mean():.8f} (counting every tet: ~0.99942)")
 
 # ---------- (D) GPU parity with the flag ----------
 if gpu:

@@ -54,7 +54,7 @@ BIN="${PS_BIN}"
 precision_require "${BIN}"
 TMP="${DTFE_TEST_TMP:-${TMPDIR:-/tmp}/dtfe-tests}"; mkdir -p "${TMP}"
 SNAP="${TMP}/ptc_input.hdf5"
-# The cache must live on a LOCAL volume -- the repo itself is in iCloud, which the binary rejects.
+# The cache must live on a LOCAL volume -- the binary rejects iCloud Drive, where a repository may sit.
 # ${TMPDIR:-/tmp} keeps this working on Linux CI, where /private/tmp does not exist and the binary
 # would refuse the path for not being a directory.
 CACHE="${TESS_CACHE_DIR:-${TMPDIR:-/tmp}/dtfe-tesscache-test}"
@@ -225,7 +225,7 @@ else
 fi
 
 echo ""
-echo "(G2) a PARTITIONED standard run caches every partition's sub-domains (2026-10-15)"
+echo "(G2) a PARTITIONED standard run caches every partition's sub-domains"
 # A standard partition is split into thread sub-boxes, each its own tessellation (DTFE_parallel), so a 2x2x2 split at
 # 2 threads writes 16 files; a sub-box's particles are selected from its partition's padded copy, so its descriptor
 # names the partition's region too (as its 'box=': 8 distinct ones over the 16 files). Under '--sample-points' a
@@ -414,7 +414,7 @@ else
 fi
 
 echo ""
-echo "(L) two runs writing ONE cache folder at the same moment: each writer has its own temp file (2026-10-08)"
+echo "(L) two runs writing ONE cache folder at the same moment: each writer has its own temp file"
 # Two writers of one partition (a batch run beside the composite server, which shares the folder) that shared one
 # '<file>.part' -- or one '<map>.occ.tmp', or the globals record's '.part' -- would both truncate it, so the first
 # rename could publish a file with a hole. So each writes '<file>.part.<pid>' (the map '.occ.tmp.<pid>') and renames it

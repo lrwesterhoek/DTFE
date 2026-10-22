@@ -4,7 +4,7 @@ At the production smoothing (10 cells) every box smooths on its own scale, and t
 statistics are that scale (at sigma = 2.1625 Mpc TNG100 and TNG300 agree on the distinct-void density to
 0.3% and on R_v to 3% at z = 0, 7-11% at z = 0.5-1, the resolved fraction to 2 points). This figure makes
 the comparison at a common sigma in Mpc (--smooth-mpc, default 2.1625: 10.0002 TNG100-3-Dark cells, a hair above
-its production 10 cells = 2.16245 Mpc, kept because the earlier results use it; the minima footprint follows it in
+its production 10 cells = 2.16245 Mpc, config.CROSSBOX_SMOOTHING_MPC; the minima footprint follows it in
 each box, pipeline.set_smoothing). The definitions are the per-box scripts':
 
   * resolved      : well_resolved (config.ELLIPSOID_CUT_RULES, in Mpc via pipeline.ellipsoid_cuts_mpc)
@@ -12,7 +12,7 @@ each box, pipeline.set_smoothing). The definitions are the per-box scripts':
   * distinct      : the resolved voids with an R_v, deepest first, none inside a deeper one's region
                     (catalog.distinct_mask) -- plot_void_population.snapshot_stats, the abundance sample
   * shapes        : the BBKS ellipticity e and prolateness p of the minima (the BBKS-valid sample of
-                    plot_void_population.bbks_valid, the thesis's e and p), medians with bootstrap 68% intervals,
+                    plot_void_population.bbks_valid), medians with bootstrap 68% intervals,
                     against the minima of a Gaussian random field with the same smoothed linear spectrum
                     (dtfelib.theory, BBKS 1986 eqs 7.6, A14, A15): at each void's own height nu = -delta_min /
                     sigma_0(z) (gamma and sigma_0 of the linear EH98 spectrum smoothed with this sigma), and over all
@@ -25,7 +25,7 @@ Every box runs in its OWN process (DTFE_SIM=<sim>: config's frame -- cell, box -
 crossbox_<sim>_<method>_s<sigma>Mpc.npz; this process draws them together. Catalogues come from (and go into) the
 pipeline cache under the sigma's own namespace, so a rerun is fast; --replot only redraws from the .npz files.
 
-Outputs (figures/void_crossbox/, never mirrored into the thesis tree -- a common sigma is not the production one):
+Outputs (figures/void_crossbox/):
   crossbox_<method>_s<sigma>Mpc_z<z>.png   top: resolved fraction, distinct voids per (100 Mpc)^3 (beside all minima
                                            and the minima with an R_v: the gate, not formation, sets the rise and
                                            fall) and median R_v against z; middle, at z: dn/dlnR_v and the stacked
@@ -53,7 +53,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 import config
-from dtfelib.cli import DATA_ROOT
 from dtfelib import figures as style
 
 DEFAULT_SIGMA_MPC = config.CROSSBOX_SMOOTHING_MPC   # 2.1625 = 10.0002 cells of TNG100-3-Dark (110.7 Mpc / 512;
@@ -113,13 +112,13 @@ def measure(sim, method="ps", prefix=None, data_root=None, zs=DEFAULT_Z, rv_rang
     resolved voids); at the snapshots nearest 'zs' (within Z_TOLERANCE) the profiles of the distinct resolved voids
     in r/R_v, stacked over rv_range_sigma x sigma. Uses the smoothing as set NOW (pipeline.set_smoothing) and
     config's frame, which must be this sim's. Returns flat arrays for an .npz."""
-    from dtfelib import pipeline, catalog, profiles, use_data_root
+    from dtfelib import pipeline, catalog, profiles, use_data_root, require_data_root
     from dtfelib import environment as env
     from dtfelib import groupcat as gc
     import plot_void_population as pop
 
-    data_root = data_root or DATA_ROOT
     use_data_root(data_root)                       # the trees' redshift table and the ladder read it too
+    data_root = require_data_root(data_root)
     sigma = pipeline.smoothing_length_mpc()
     ztab = gc.redshift_table(sim)
     ladder = sorted({int(d.name.split("_")[1]) for d in env.sim_dir(sim, data_root).glob("snapdir_*")})
@@ -393,8 +392,7 @@ def draw(results, z_target, args, out_dir) -> Path:
                             f"footprint follows sigma in each box)")
     fig.tight_layout()
     path = out_dir / f"crossbox_{args.method}_{sigma_tag(sigma)}_z{z_target:.2f}.png"
-    # the house style, never mirrored: a common sigma is not the thesis's production smoothing
-    style.save_plot_to_multiple_paths(fig, path, dpi=config.DPI, mirror=False)
+    style.save_figure(fig, path, dpi=config.DPI)
     plt.close(fig)
     return path
 
@@ -441,7 +439,8 @@ def draw_shapes(results, z_target, row, colors):
     row[2].set_xlabel("BBKS ellipticity e"); row[2].set_ylabel("pdf")
     style.set_title(row[2], f"z = {z_target:g}; dashed: Gaussian field at the same heights")
     row[2].grid(alpha=0.3)
-    row[2].legend(fontsize=7)
+    if row[2].get_legend_handles_labels()[0]:
+        row[2].legend(fontsize=7)
 
 
 def main(argv=None):
@@ -454,10 +453,11 @@ def main(argv=None):
                    help="the boxes to compare, e.g. --sims TNG50-3-Dark TNG100-3-Dark TNG300-3-Dark (required)")
     p.add_argument("--method", choices=("ps", "dtfe"), default="ps", help="the field estimator (default ps)")
     p.add_argument("--prefix", default=None, help="a grid set's output prefix (default the method's)")
-    p.add_argument("--data-root", type=Path, default=None, help=f"the data root (default {DATA_ROOT})")
+    p.add_argument("--data-root", type=Path, default=None,
+                   help="the folder that holds the simulations (default: DTFE_DATA_ROOT)")
     p.add_argument("--smooth-mpc", type=float, default=DEFAULT_SIGMA_MPC, metavar="MPC",
                    help=f"the common smoothing length in Mpc (default {DEFAULT_SIGMA_MPC}: 10.0002 TNG100-3-Dark cells, "
-                        "just above its production 10 cells = 2.16245 Mpc; the earlier results use it)")
+                        "just above its production 10 cells = 2.16245 Mpc)")
     p.add_argument("--z", type=float, nargs="+", default=list(DEFAULT_Z),
                    help="the redshifts of the bottom row, one figure each (default 0 0.5 1)")
     p.add_argument("--rv-range", type=float, nargs=2, default=list(DEFAULT_RV_RANGE), metavar=("LO", "HI"),

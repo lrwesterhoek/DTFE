@@ -63,7 +63,7 @@ def read_header(combined: Path, mpc_unit: float) -> dict:
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     src = p.add_mutually_exclusive_group()          # required, except with --same-as
-    src.add_argument("--sim", help="simulation name (path via dtfelib DATA_ROOT); needs --snap")
+    src.add_argument("--sim", help="simulation name (under DTFE_DATA_ROOT); needs --snap")
     src.add_argument("--combined", type=Path, help="explicit combined_*.hdf5 snapshot path")
     p.add_argument("--snap", type=int, help="snapshot number (with --sim)")
     p.add_argument("--mpc-unit", type=float, default=1000.0,

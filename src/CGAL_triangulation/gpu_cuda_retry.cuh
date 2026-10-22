@@ -11,9 +11,10 @@
    grids.
 
    Included by the two .cu hosts INSIDE their anonymous namespace (the gpu_exact_clip.cuh pattern), after
-   gpu_cuda_compat.h, "../message.h" and the std headers (<algorithm> <chrono> <cstdlib> <cstring> <memory> <new>
-   <string> <vector> <unistd.h>). A binary links ONE of them (PS-DTFE: ps_gpu_cuda.cu, DTFE and libDTFE:
-   dtfe_gpu_cuda.cu), so the process-wide statics below (the pace, the fault hook) are that binary's. */
+   gpu_cuda_compat.h, "../message.h" (which brings env_knobs.h) and the std headers (<algorithm> <chrono> <cstdlib>
+   <cstring> <memory> <new> <string> <vector> <unistd.h>). A binary links ONE of them (PS-DTFE: ps_gpu_cuda.cu,
+   DTFE and libDTFE: dtfe_gpu_cuda.cu), so the process-wide statics below (the pace, the fault hook) are that
+   binary's. */
 
 // The error codes the policy tells apart, per runtime: the launch timeout is the display watchdog's kill
 // (Linux X/Wayland or the Windows TDR), the allocation failure is out of memory. (gpu_cuda_compat.h has no
@@ -87,7 +88,7 @@ GpuFaultHook& gpuFaultHook()
 {
     static GpuFaultHook h = [] {
         GpuFaultHook r;
-        if (const char* env = getenv("DTFE_GPU_FAULT_AT"))
+        if (const char* env = Env::value("DTFE_GPU_FAULT_AT"))
         {
             r.at = atol(env);
             if (const char* colon = strchr(env, ':')) r.kind = colon + 1;

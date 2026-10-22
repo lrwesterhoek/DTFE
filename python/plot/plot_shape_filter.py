@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 import matplotlib.pyplot as plt
-from dtfelib.figures import save_plot_to_multiple_paths
+from dtfelib.figures import save_figure
 import config
 from dtfelib import figures as style
 from dtfelib import pipeline
@@ -63,7 +63,7 @@ def plot_axis_ratios(axis_ratios, density_values=None, redshift=None, save_path=
     plt.tight_layout()
     
     if save_path:
-        save_plot_to_multiple_paths(plt.gcf(), save_path, dpi=DPI, bbox_inches='tight')
+        save_figure(plt.gcf(), save_path, dpi=DPI, bbox_inches='tight')
         plt.close()
     else:
         plt.show()
@@ -103,7 +103,7 @@ def plot_bbks_parameters(bbks_params, density_values=None, redshift=None, save_p
     plt.tight_layout()
     
     if save_path:
-        save_plot_to_multiple_paths(plt.gcf(), save_path, dpi=DPI, bbox_inches='tight')
+        save_figure(plt.gcf(), save_path, dpi=DPI, bbox_inches='tight')
         plt.close()
     else:
         plt.show()
@@ -128,7 +128,7 @@ def _plot_histogram(values, xlabel, color, bins, save_path, redshift=None,
     style.set_title(ax, title)
 
     plt.tight_layout()
-    save_plot_to_multiple_paths(fig, save_path, dpi=DPI, bbox_inches='tight')
+    save_figure(fig, save_path, dpi=DPI, bbox_inches='tight')
     plt.close(fig)
 
 
@@ -163,7 +163,6 @@ def process_snapshot(snapshot, redshift, sim=None, method=None, prefix=None, dat
         p = pipeline.products(snapshot, redshift, sim=sim, method=method, prefix=prefix, data_root=data_root)
         cat = p.voids()
         grid_n = p.fs.grid_n
-        style.note_source(p.fs)                     # the thesis mirror takes the thesis box's standard DTFE only
         p.release()
 
         if len(cat['coords']) == 0:

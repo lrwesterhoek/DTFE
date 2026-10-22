@@ -3,7 +3,9 @@
 # Batch-run standard DTFE over a set of TNG snapshots (redshifts).
 #
 # Companion to download_snapshots.sh, which fetches the snapshot files first.
-# Shared defaults (DATA_ROOT, SIMULATION, SNAPSHOTS, GRID_SIZE) live in config.sh. PADDING (or DTFE_PADDING), the
+# DTFE_DATA_ROOT (the folder that holds the simulations; -d names a simulation's folder instead) and the simulation
+# (-s or DTFE_SIM) are required; the
+# shared defaults (SNAPSHOTS, GRID_SIZE) live in config.sh. PADDING (or DTFE_PADDING), the
 # padding in mean particle spacings, defaults to 15 here, not config.sh's 50 (the PS-DTFE scripts' value).
 #
 # Usage:
@@ -13,11 +15,11 @@
 #          o_d for DTFE_PRECISION=double), else the CPU; DTFE_METAL=0 runs the CPU on a GPU build.
 #     -e   every '_a' cell the EXACT average of the linear interpolant over the cell (--exact-average). The
 #          DEFAULT (DTFE_EXACT_AVERAGE=1, the production standard: no sampling noise, the mass exact to ~3e-8);
-#          -e is kept for old command lines. DTFE_EXACT_AVERAGE=0 gives the Monte-Carlo sample mean (1.1-1.7x
+#          -e overrides an exported DTFE_EXACT_AVERAGE=0. DTFE_EXACT_AVERAGE=0 gives the Monte-Carlo sample mean (1.1-1.7x
 #          faster at 512^3 on the GPU; the GPU is what makes the exact average affordable: ~6.6x the CPU's speed)
 #   Production defaults: GRID_SIZE 512 (config.sh), padding 15, the GPU when built, the exact cell
 #   average, FIELDS = density, velocity, its gradient / divergence / shear / vorticity, the T-web and the V-web,
-#   LAMBDA_TH 0.3 -- what scripts/thesis_runs.sh's dtfe27 stage runs, minus its explicit split.
+#   LAMBDA_TH 0.3.
 #   OUTPUT_PREFIX (default 'output'): the files are <snapdir>/<prefix>.*; another prefix keeps a variant beside
 #   the default set (dtfelib reads 'output.' for standard DTFE). A 'ps_*' prefix is refused: that is PS-DTFE's
 #   naming (an OUTPUT_PREFIX exported for run_ps_dtfe.sh would otherwise overwrite the phase-space grids).
@@ -64,10 +66,10 @@ MAX_CONCURRENT="${MAX_CONCURRENT:-}"  # cap on concurrent triangulations to boun
 DTFE_METAL="${DTFE_METAL:-auto}"  # 1 = the '_a' interpolation on the GPU (--gpu), 0 = the CPU; 'auto' (default,
                                  # the drivers' rule) = 1 when the binary is a GPU build (config.sh
                                  # gpu_build_default), resolved below once DTFE_PRECISION has chosen the binary
-DTFE_EXACT_AVERAGE="${DTFE_EXACT_AVERAGE:-1}"  # 1 (default since 2026-10-13, the production standard) = exact cell
+DTFE_EXACT_AVERAGE="${DTFE_EXACT_AVERAGE:-1}"  # 1 (default, the production standard) = exact cell
                                  # averages (--exact-average: no sampling noise, mass exact to ~3e-8); 0 = the
                                  # Monte-Carlo sample mean
-DRY_RUN="${DRY_RUN:-0}"          # 1 = print the commands and paths, run nothing (survey rank 19, 2026-10-05)
+DRY_RUN="${DRY_RUN:-0}"          # 1 = print the commands and paths, run nothing
 AUTO_TUNE_REPORT="${AUTO_TUNE_REPORT:-0}"  # 1 = only ASK the binary's auto-tuner what this run would need
                                  # (--auto-tune-report): per snapshot one line
                                  #   AUTO-TUNE-REPORT snap=NNN partition=.. mc=.. predicted_gb=.. budget_gb=.. over_budget=0|1 ...
@@ -93,7 +95,7 @@ TESS_CACHE="${TESS_CACHE:-}"     # a LOCAL folder: reuse the Delaunay tessellati
 LAMBDA_TH="${LAMBDA_TH:-0.3}"    # eigenvalue threshold of the T-web / V-web classes (--lambda_th), the SAME default as
                                  # run_ps_dtfe.sh (the binary's own default is 0.0: a run without this flag classifies
                                  # differently from a scripted one)
-DTFE_RESUME="${DTFE_RESUME:-1}"  # 1 (default) = resume a killed partitioned run, as run_ps_dtfe.sh's PS_RESUME (2026-10-13):
+DTFE_RESUME="${DTFE_RESUME:-1}"  # 1 (default) = resume a killed partitioned run, as run_ps_dtfe.sh's PS_RESUME:
                                  # when the snapshot's checkpoint file exists (<prefix>.runlog.checkpoint/checkpoint
                                  # beside the outputs, or under SCRATCH_DIR; config.sh ps_checkpoint_dir, the same rule
                                  # for both binaries), --resume is passed and only the partitions it lacks are computed.
@@ -101,7 +103,7 @@ DTFE_RESUME="${DTFE_RESUME:-1}"  # 1 (default) = resume a killed partitioned run
                                  # DTFE_RESUME=0 starts over (the new run replaces the checkpoint)
 
 DATA_DIR=""                # default: sim_dir $SIMULATION (config.sh); override with -d
-OUTPUT_PREFIX="${OUTPUT_PREFIX:-output}"   # -> <snapdir>/<prefix>.* (2026-10-13; it was always 'output'). Another
+OUTPUT_PREFIX="${OUTPUT_PREFIX:-output}"   # -> <snapdir>/<prefix>.* (default 'output'). Another
                                  # prefix keeps a variant beside the default set, e.g. OUTPUT_PREFIX=output_mc with
                                  # DTFE_EXACT_AVERAGE=0; dtfelib reads 'output.' for standard DTFE. 'ps_*' is refused
                                  # below: PS-DTFE's naming, so an export meant for run_ps_dtfe.sh cannot overwrite
@@ -147,12 +149,13 @@ while getopts "d:s:g:meh" opt; do
     esac
 done
 shift $((OPTIND - 1))
+[ -n "${DATA_DIR}" ] || require_data_root   # -d names the simulation's folder itself
 require_simulation
 
 snapshot_args "$@"              # positional arguments override the default snapshot list (config.sh)
 
 [ -z "${DATA_DIR}" ] && DATA_DIR="$(sim_dir "${SIMULATION}")"
-data_root_problem "${DATA_DIR}" || exit 2     # preflight (2026-10-11): the data disk unmounted, said up front
+data_root_problem "${DATA_DIR}" || exit 2     # preflight: the data disk unmounted, said up front
 
 cd "$REPO_ROOT" || exit 1
 

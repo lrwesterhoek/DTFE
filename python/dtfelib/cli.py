@@ -20,47 +20,65 @@ from pathlib import Path
 
 from .io import FieldSet
 
-# Same environment variables as the shell side (config.sh): DTFE_DATA_ROOT / DTFE_SIM. The default
-# root is the Samsung T7, which groups simulations by family (Illustris TNG/TNG100/TNG100-3-Dark);
-# sim_dir() resolves that layout and the flat one (e.g. DTFE_DATA_ROOT=~/output).
-DATA_ROOT = Path(os.environ.get("DTFE_DATA_ROOT", "/Volumes/Samsung T7/Illustris TNG"))
+# Same environment variables as the shell side (config.sh): DTFE_DATA_ROOT / DTFE_SIM. Neither has a default: the data
+# root is read where data is needed (require_data_root), never at import, so every module imports without it.
+# sim_dir() resolves both layouts under it: flat <root>/<sim>, or per family <root>/TNG100/TNG100-3-Dark.
+NO_DATA_ROOT = "no data root: set DTFE_DATA_ROOT to the folder that holds the simulations"
 
 
 class NoSimulation(ValueError):
     """No simulation was named: there is no default, a run gives --sim NAME or DTFE_SIM=NAME."""
 
 
+class NoDataRoot(ValueError):
+    """No data root was named: there is no default, a run sets DTFE_DATA_ROOT (or gives a script's --data-root)."""
+
+
+_data_root_override = None          # use_data_root(): a script's --data-root for every helper of this process
+
+
+def require_data_root(root=None) -> Path:
+    """The folder that holds the simulations: 'root' when given, else the one use_data_root() set for this process,
+    else $DTFE_DATA_ROOT (~ expanded). There is no default; without any of them this raises NoDataRoot."""
+    if root:
+        return Path(root).expanduser()
+    if _data_root_override is not None:
+        return _data_root_override
+    env = os.environ.get("DTFE_DATA_ROOT")
+    if env:
+        return Path(env).expanduser()
+    raise NoDataRoot(NO_DATA_ROOT)
+
+
 def require_sim(sim: str | None = None) -> str:
     """The simulation to work on: 'sim' when given, else $DTFE_SIM. There is no default; without either this raises
-    NoSimulation, naming both ways to give one and the simulations found under DATA_ROOT."""
+    NoSimulation, naming both ways to give one and the simulations found under the data root (when one is set)."""
     sim = sim or os.environ.get("DTFE_SIM")
     if sim:
         return sim
     try:
-        found = find_sims(DATA_ROOT) if DATA_ROOT.is_dir() else []
-    except OSError:
-        found = []
+        root = require_data_root()
+        found = find_sims(root) if root.is_dir() else []
+    except (NoDataRoot, OSError):
+        root, found = None, []
     raise NoSimulation("no simulation given: pass --sim NAME or set DTFE_SIM=NAME"
-                       + (f" (under {DATA_ROOT}: {', '.join(found)})" if found else ""))
+                       + (f" (under {root}: {', '.join(found)})" if found else ""))
+
 
 # Where every figure goes (config.LOCAL_FIGURES_ROOT, the launcher's figure browser): DTFE_FIGURES_ROOT, else
-# the T7 while it is mounted (python/figures inside iCloud reaches 8.8 GB), else
-# python/figures. On the T7 it is a folder INSIDE the user's 'Illustris TNG': the volume root is root's (APFS with
-# owners), so a folder at the volume root, '/Volumes/Samsung T7/DTFE figures', cannot be created. NOT derived
-# from DATA_ROOT: the launcher hands its data root only to the scripts it runs, so the launcher and its scripts
-# would look in different places. The tests set DTFE_FIGURES_ROOT to a temp dir.
-_T7_DATA = Path("/Volumes/Samsung T7/Illustris TNG")
-FIGURES_ROOT = Path(os.environ.get("DTFE_FIGURES_ROOT") or
-                    (_T7_DATA / "figures" if _T7_DATA.is_dir() else Path(__file__).resolve().parents[1] / "figures"))
+# python/figures (git-ignored). Not derived from the data root: the launcher hands its data root only to the scripts
+# it runs, so the launcher and its scripts would look in different places. The tests set DTFE_FIGURES_ROOT to a
+# temp dir.
+FIGURES_ROOT = Path(os.environ.get("DTFE_FIGURES_ROOT") or Path(__file__).resolve().parents[1] / "figures")
 DEFAULT_SNAP = 99
 
 
 def sim_dir(sim: str, root=None) -> Path:
-    """Directory of simulation `sim` under `root` (default DATA_ROOT), in either layout: flat
+    """Directory of simulation `sim` under `root` (default require_data_root()), in either layout: flat
     <root>/<sim>, or per family <root>/<family>/<sim> with <family> the name up to its first '-'
     (TNG100-3-Dark -> TNG100). An existing directory wins; a simulation not on disk yet goes into
     its family folder when that exists, else flat. Mirrors sim_dir in scripts/config.sh."""
-    root = DATA_ROOT if root is None else Path(root)
+    root = require_data_root(root)
     flat = root / sim
     family = root / sim.split("-", 1)[0]
     if flat.is_dir():
@@ -70,19 +88,23 @@ def sim_dir(sim: str, root=None) -> Path:
     return flat
 
 
-def use_data_root(root) -> Path:
-    """Make `root` this process's default data root: what a script's --data-root means for every dtfelib
-    helper that is not handed a root explicitly (groupcat, trees, environment, pipeline.products without
-    data_root=...). sim_dir() reads the default at call time, so the switch reaches them all. Returns it."""
-    global DATA_ROOT
-    DATA_ROOT = Path(root)
-    return DATA_ROOT
+def use_data_root(root) -> Path | None:
+    """Make `root` this process's data root: what a script's --data-root means for every dtfelib helper that is
+    not handed a root explicitly (groupcat, trees, environment, pipeline.products without data_root=...).
+    require_data_root() reads it at call time, so the switch reaches them all. None (a script run without
+    --data-root) clears it: DTFE_DATA_ROOT applies again. Returns the root now in force, None when none is."""
+    global _data_root_override
+    _data_root_override = Path(root).expanduser() if root else None
+    try:
+        return require_data_root()
+    except NoDataRoot:
+        return None
 
 
 def find_sims(root=None, pattern: str = "snapdir_*") -> list[str]:
-    """Names of the simulations under `root` (default DATA_ROOT), in either layout, whose
+    """Names of the simulations under `root` (default require_data_root()), in either layout, whose
     directory contains something matching `pattern` (e.g. 'snapdir_*/combined_*.hdf5')."""
-    root = DATA_ROOT if root is None else Path(root)
+    root = require_data_root(root)
     if not root.is_dir():
         return []
     names = set()
@@ -94,8 +116,8 @@ def find_sims(root=None, pattern: str = "snapdir_*") -> list[str]:
 
 def make_parser(description: str = "") -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=description)
-    p.add_argument("--data-root", type=Path, default=DATA_ROOT,
-                   help=f"simulation output root (default {DATA_ROOT})")
+    p.add_argument("--data-root", type=Path, default=None,
+                   help="the folder that holds the simulations (default: DTFE_DATA_ROOT; one of the two is needed)")
     env_sim = os.environ.get("DTFE_SIM")
     p.add_argument("--sim", default=env_sim, required=not env_sim,
                    help="simulation name (required unless DTFE_SIM is set; there is no default)")
@@ -151,6 +173,10 @@ def make_fieldset(description: str = "", extra=None, argv=None):
     if extra is not None:
         extra(parser)
     args = parser.parse_args(argv)
+    try:
+        args.data_root = require_data_root(args.data_root)
+    except NoDataRoot as e:
+        parser.error(str(e))
     fs = FieldSet(snapdir(args), method=args.method, averaged=not args.raw,
                   prefix=args.prefix)
     return fs, args

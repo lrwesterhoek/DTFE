@@ -3,7 +3,7 @@ mean-field velocity derivatives: mean_field_derivatives, the V-web of the mean f
 the same on one plane in a single pass over the grid, mean_field_plane, for the launcher's Explore).
 
 Plain numpy/scipy only -- no config or I/O; callers pass everything in. Import as
-`from dtfelib import fields as dtfe` (the historical alias used by the plot scripts).
+`from dtfelib import fields as dtfe` (the alias the plot scripts use).
 """
 
 from __future__ import annotations

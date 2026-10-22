@@ -21,8 +21,15 @@
 #   A5  GPU builds only (a GPU stamp in o/ or o_d/; SKIP otherwise, so CI's CPU-only build runs A1-A4): --gpu
 #       keeps the box mean within 1e-4 of 1 and matches the CPU grid like tests/dtfe_metal_check.sh (means
 #       to 1e-5 of the peak, at most 1e-3 of the cells more than 1e-3 apart: a sample on a cell face)
+#   A6  'velocityStd_a' only with '--method 2': method 1 (the default), --exact-average, method 3 and --CIC stop
+#       at option parsing with exit 1 and their error (method 1's: 'You cannot use the averaging method 1 ...'),
+#       rather than leaving the grid empty and segfaulting in the sub-domain merge; '-m 2' writes a finite,
+#       non-negative '.a_velStd'
+#   A7  'dispersion' and 'dispersion_a' (PS-DTFE fields) stop at option parsing with exit 1 and the error that names
+#       PS-DTFE, in this binary and in ./DTFE-2d when it is built (not after the triangulation with an internal
+#       size error in 3D and a segfault in 2D)
 # --exact-average itself does not sample (tests/run_tests.py's stored
-# regression covers it). About 20 s on the Mac (7 runs of 2-3 s).
+# regression covers it). About 20 s on the Mac (7 runs of 2-3 s, and A6's and A7's short ones).
 # Usage: tests/dtfe_mc_average_check.sh [--no-build]   (--no-build is accepted and ignored: nothing is built)
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -51,7 +58,7 @@ run() {
     env ${envs[@]+"${envs[@]}"} "${DTFE_BIN}" "$SNAP" "$TMP/$name" "${C[@]}" ${pad[@]+"${pad[@]}"} "$@" > "$TMP/$name.log" 2>&1 \
         || { echo "FAIL: run $name (see $TMP/$name.log)"; exit 1; }
 }
-echo ">> demo/z0_64.gadget at 64^3: the default average, the old one (DTFE_MC_LEGACY=1), --exact-average"
+echo ">> demo/z0_64.gadget at 64^3: the default average, the legacy one (DTFE_MC_LEGACY=1), --exact-average"
 run n
 run l DTFE_MC_LEGACY=1 --
 run e -- --exact-average
@@ -68,8 +75,34 @@ if [ "$GPU" = "1" ]; then
 else
     echo ">> A5 SKIP: $OBJ carries no GPU stamp (a METAL=1 / CUDA=1 / HIP=1 / CUDAEMU=1 build runs it)"
 fi
+echo ">> A6: 'velocityStd_a' with methods 1 and 3, --exact-average and --CIC (rejected), and with -m 2"
+V=(--grid 16 --periodic --padding 12 --field density_a velocityStd_a)
+A6=""
+for c in "m1||You cannot use the averaging method 1 " "exact|--exact-average|'--exact-average' cannot compute 'velocityStd_a'" \
+         "m3|-m 3|You cannot use the averaging method 3 " "cic|--CIC|is not available with NGP/CIC/TSC/PCS/SPH/Voronoi"; do
+    IFS='|' read -r tag extra text <<< "$c"
+    # shellcheck disable=SC2086   # $extra: none or one option with its value
+    "${DTFE_BIN}" "$SNAP" "$TMP/v_$tag" "${V[@]}" $extra > "$TMP/v_$tag.log" 2>&1
+    rc=$?
+    grep -qF -- "$text" "$TMP/v_$tag.log" && said=1 || said=0
+    A6="$A6 $tag:$rc:$said"
+done
+"${DTFE_BIN}" "$SNAP" "$TMP/v_m2" "${V[@]}" -m 2 --seed 7 > "$TMP/v_m2.log" 2>&1 || { echo "FAIL: run v_m2 (see $TMP/v_m2.log)"; exit 1; }
+echo ">> A7: 'dispersion' and 'dispersion_a' in the standard binaries (rejected: PS-DTFE fields)"
+A7=""
+DISP_BINS=("${DTFE_BIN}"); [ -x ./DTFE-2d ] && DISP_BINS+=(./DTFE-2d)
+for b in "${DISP_BINS[@]}"; do
+    for f in dispersion dispersion_a; do
+        tag="$(basename "$b")/$f"
+        # the error comes before the snapshot is read, so the 3D demo serves the 2D binary too
+        "$b" "$SNAP" "$TMP/disp_${f}" --grid 16 --periodic --field "$f" > "$TMP/disp_$(basename "$b")_$f.log" 2>&1
+        rc=$?
+        grep -qF -- "are PS-DTFE fields" "$TMP/disp_$(basename "$b")_$f.log" && said=1 || said=0
+        A7="$A7 $tag:$rc:$said"
+    done
+done
 
-"$PY" - "$TMP" "$GPU" <<'PYEOF'
+"$PY" - "$TMP" "$GPU" "$A6" "$A7" <<'PYEOF'
 import numpy as np, os, sys
 REAL = np.dtype(os.environ.get("DTFE_TEST_REAL", "float32"))   # tests/precision.sh
 tmp, gpu = sys.argv[1], sys.argv[2] == "1"
@@ -113,6 +146,20 @@ if gpu:
     check("A5", abs(dg) < MEAN_TOL and meanrel < 1e-5 and frac < 1e-3,
           f"--gpu: box mean - 1 {dg:+.2e}; against the CPU: mean {meanrel:.1e} of the peak (< 1e-5), "
           f"cells > 1e-3 of the peak apart {frac:.1e} (< 1e-3)")
+rejected = [c.split(":") for c in sys.argv[3].split()]
+good = [tag for tag, rc, said in rejected if rc == "1" and said == "1"]
+bad = [f"{tag} (exit {rc}{'' if said == '1' else ', no error text'})" for tag, rc, said in rejected if tag not in good]
+std = rd("v_m2", "a_velStd")
+check("A6", len(good) == 4 and std.size == 16 ** 3 and np.isfinite(std).all() and (std >= 0).all() and std.mean() > 0,
+      f"velocityStd_a rejected with exit 1 and its error by {', '.join(good) or 'none'}"
+      f"{'; NOT by ' + ', '.join(bad) if bad else ''}; -m 2 writes {std.size} finite cells >= 0 (mean {std.mean():.3g})")
+disp = [c.split(":") for c in sys.argv[4].split()]
+good = [tag for tag, rc, said in disp if rc == "1" and said == "1"]
+bad = [f"{tag} (exit {rc}{'' if said == '1' else ', no error text'})" for tag, rc, said in disp if tag not in good]
+check("A7", len(disp) >= 2 and not bad,
+      f"dispersion fields rejected with exit 1 and the PS-DTFE error by {', '.join(good) or 'none'}"
+      f"{'; NOT by ' + ', '.join(bad) if bad else ''}"
+      f"{'' if any(t.startswith('DTFE-2d/') for t, _, _ in disp) else ' (./DTFE-2d not built: 3D only)'}")
 print("RESULT:", "PASS  (the Monte-Carlo '_a' average conserves the mass and does not depend on the split)"
       if not fails else f"FAIL ({fails} check(s))")
 sys.exit(1 if fails else 0)

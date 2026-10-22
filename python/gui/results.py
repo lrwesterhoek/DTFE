@@ -611,7 +611,7 @@ def scan_runs(root, extra_dirs=()) -> list[RunRecord]:
     (_read_run), newest first. A '.runlog.partial' is 'running' when a live process names its root, else
     'killed' (a run killed outright: no exit code reached its end)."""
     out: list[RunRecord] = []
-    root = Path(root)
+    root = Path(root).expanduser() if str(root).strip() else None     # an empty root is none, not the working dir
     groups: dict[Path, tuple[dict, str, int | None]] = {}       # '<dir>/<prefix>' -> ({suffix: log}, sim, snap)
 
     def add(log: Path, sim: str = "", snap: int | None = None):
@@ -621,7 +621,7 @@ def scan_runs(root, extra_dirs=()) -> list[RunRecord]:
         logs, _, _ = groups.setdefault(log.parent / log_prefix(log.name), ({}, sim, snap))   # found under the data
         logs[sfx] = log                                                                   # root first: its sim stays
 
-    if root.is_dir():
+    if root is not None and root.is_dir():
         for pattern in ("*/snapdir_*/*.runlog*", "*/*/snapdir_*/*.runlog*"):
             for log in root.glob(pattern):
                 add(log, log.parent.parent.name, _snap_of(log.parent))
@@ -915,7 +915,7 @@ def diagnose(log: str, exit_codes=()) -> list[Diagnosis]:
                              "what each snapshot needs; a scratch directory moves the grids to disk "
                              "(bit-identical results), and a smaller slice plane or fewer concurrent "
                              "partitions lower the rest.", "check_memory"))
-    if re.search(r"no snapshots under|data root not found|No such file or directory: '?/Volumes/", tail):
+    if re.search(r"no snapshots under|data root not found|no data root|No such file or directory: '?/Volumes/", tail):
         out.append(Diagnosis("Data not found",
                              "The data folder is missing. Is the external disk plugged in? Choose "
                              "the data root again.", "choose_root"))

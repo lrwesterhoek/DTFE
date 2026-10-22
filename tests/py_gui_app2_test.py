@@ -10,7 +10,7 @@ Three tiers:
     symlink named PS-DTFE where ps's comm must say so).
   * QT (when PySide6 imports, else SKIP): the RunningNow table, the Runs browser's Voids column, the window's
     status strip, 'Build void catalogue' -> a queue job, and a failed memory-check pass landing in the log.
-  * DATA-BACKED (the T7 mounted, else SKIP): the void-catalogue status of the real TNG100-3-Dark grids.
+  * DATA-BACKED (DTFE_DATA_ROOT, else SKIP): the void-catalogue status of the real TNG100-3-Dark grids.
 
 Usage:  python3 tests/py_gui_app2_test.py            (exit 0 = pass)
         ~/.venvs/dtfe-gui/bin/python tests/py_gui_app2_test.py    (also the Qt tier)
@@ -28,7 +28,7 @@ from pathlib import Path
 
 from _harness import FAIL, PASS, REPO as ROOT, SKIP, setup, summary
 
-setup("gui_app2_figs_", paths=("python/gui",), no_mirror=False, mpl_agg=False)    # before runspec is imported
+setup("gui_app2_figs_", paths=("python/gui",), mpl_agg=False)    # before runspec is imported
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ["DTFE_GUI_NO_NOTIFY"] = "1"
 
@@ -187,11 +187,11 @@ def t_memory():
 
 def t_running_now(tmp: Path):
     print("running now (runspec.parse_run_args / running_now / progress_files):")
-    a = rs.parse_run_args("./PS-DTFE /Volumes/Samsung T7/Illustris TNG/TNG50/TNG50-3-Dark/snapdir_099/combined_099.hdf5 "
-                          "/Volumes/Samsung T7/Illustris TNG/TNG50/TNG50-3-Dark/snapdir_099/ps_output --grid 512 --periodic")
+    a = rs.parse_run_args("./PS-DTFE /Users/x/My Data/Illustris TNG/TNG50/TNG50-3-Dark/snapdir_099/combined_099.hdf5 "
+                          "/Users/x/My Data/Illustris TNG/TNG50/TNG50-3-Dark/snapdir_099/ps_output --grid 512 --periodic")
     check("parse_run_args: paths with spaces, the simulation and snapshot from the snapdir",
-          a == {"exe": "PS-DTFE", "input": "/Volumes/Samsung T7/Illustris TNG/TNG50/TNG50-3-Dark/snapdir_099/combined_099.hdf5",
-                "output": "/Volumes/Samsung T7/Illustris TNG/TNG50/TNG50-3-Dark/snapdir_099/ps_output",
+          a == {"exe": "PS-DTFE", "input": "/Users/x/My Data/Illustris TNG/TNG50/TNG50-3-Dark/snapdir_099/combined_099.hdf5",
+                "output": "/Users/x/My Data/Illustris TNG/TNG50/TNG50-3-Dark/snapdir_099/ps_output",
                 "sim": "TNG50-3-Dark", "snap": 99}, a)
     check("... a custom run (no snapdir) and a line that is not a run", rs.parse_run_args(
         "/x/DTFE-double /data/my run.hdf5 /out/my run --grid 64")["output"] == "/out/my run"
@@ -260,8 +260,8 @@ def t_plot_sets(tmp: Path):
     print("Plots sets (runspec.FIGURE_SETS):")
     base = dict(data_root=str(tmp), sim="TNGX-1-Dark", snapshots=[33, 99])
     keys = [fs.key for fs in rs.FIGURE_SETS]
-    check("the new sets are registered and the thesis set stays last",
-          all(k in keys for k in ("crossbox", "voidevol", "voidenv", "voidfate", "voidconv", "voidcat")) and keys[-1] == "thesis", keys)
+    check("the new sets are registered and the core set stays last",
+          all(k in keys for k in ("crossbox", "voidevol", "voidenv", "voidfate", "voidconv", "voidcat")) and keys[-1] == "core", keys)
     plain = {st.argv[1].split("/")[-1]: st for st in rs.PlotSpec(
         sets=["voidtrack", "crossbox", "voidevol", "voidenv", "voidfate", "voidconv", "voidcat"], **base).steps()}
     cb = plain["plot_void_crossbox.py"].argv
@@ -336,9 +336,12 @@ def t_void_status_headless(tmp: Path):
         (d / f).unlink()
 
 
-def t_void_status_t7():
-    print("data-backed void status (TNG100-3-Dark on the T7):")
-    root = Path(os.environ.get("DTFE_DATA_ROOT") or "/Volumes/Samsung T7/Illustris TNG")
+def t_void_status_data():
+    print("data-backed void status (TNG100-3-Dark under DTFE_DATA_ROOT):")
+    if not os.environ.get("DTFE_DATA_ROOT"):
+        skip("void status of TNG100-3-Dark 099", "no data root: DTFE_DATA_ROOT is unset")
+        return
+    root = Path(os.environ["DTFE_DATA_ROOT"]).expanduser()
     sd = rs.sim_dir("TNG100-3-Dark", str(root)) / "snapdir_099"
     if not (sd / "ps_output.runlog").is_file() or not (sd / "ps_output.a_den").is_file():
         skip("void status of TNG100-3-Dark 099", f"no grids under {sd}")
@@ -360,7 +363,7 @@ def t_qt(tmp: Path):
     except ImportError as e:
         skip("the Qt tier", f"PySide6 not importable: {e}")
         return
-    app = QApplication.instance() or QApplication([])
+    app = QApplication.instance() or QApplication([])  # noqa: F841  (kept referenced while the tier runs)
     import runs_view as RV
 
     def spin(ms):
@@ -429,7 +432,21 @@ def t_qt(tmp: Path):
     ini = tmp / "launcher.ini"
     w = A.MainWindow(remember=False, settings=QSettings(str(ini), QSettings.IniFormat))
     try:
+        # the data root: DTFE_DATA_ROOT when the launcher starts with one, else none (its setup asks for the folder)
+        # and every job refused for it; the folder chosen reaches each job's environment as DTFE_DATA_ROOT
+        env_root = os.environ.get("DTFE_DATA_ROOT", "")
+        w._read_widgets()
+        probs = w.spec.problems()
+        check("a new window starts at DTFE_DATA_ROOT, else with no data root and a job refused for it",
+              w.root_edit.text() == env_root
+              and (bool(env_root) or any(lv == "error" and "no data root" in m for lv, m in probs)),
+              (w.root_edit.text(), probs[:2]))
         w.root_edit.setText(str(tmp))
+        w._read_widgets()
+        check("... the folder chosen is every job's data root and reaches its environment as DTFE_DATA_ROOT",
+              w.spec.data_root == w.pipe.data_root == w.plots.data_root == w.data.data_root == str(tmp)
+              and w.spec.command()[1]["DTFE_DATA_ROOT"] == str(tmp)
+              and w.pipe.command()[1]["DTFE_DATA_ROOT"] == str(tmp), w.spec.data_root)
         for _ in range(60):
             if w.mem_strip.text():
                 break
@@ -484,7 +501,7 @@ def t_qt(tmp: Path):
         off = not w.om_check.isChecked()
         w._load_run_settings(R.parse_runlog(d / "ps_output.runlog", "TNGQ-1-Dark", 99))
         check("'Load settings' carries the ordered merge: on for a run made with it (and for one without a flag, "
-              "today's default), off for a --completion-order-merge run",
+              "the default), off for a --completion-order-merge run",
               on and off and w.om_check.isChecked(), (on, off))
         # the start-over tick (Grids, Pipeline) reaches run_ps_dtfe.sh as PS_RESUME=0; the banner of a
         # refused resume ticks it; its text has no '--'; 'Load settings' leaves it alone (a one-off choice)
@@ -646,7 +663,7 @@ def main() -> int:
     t_plot_sets(tmp)
     t_void_status_headless(tmp)
     t_qt(tmp)
-    t_void_status_t7()
+    t_void_status_data()
     print("-" * 60)
     return summary()
 

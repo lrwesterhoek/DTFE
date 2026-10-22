@@ -41,6 +41,8 @@
 #include <cstdlib>
 #include <unistd.h>   // isatty -> only colour a real terminal
 
+#include "env_knobs.h"   // NO_COLOR, CLICOLOR_FORCE
+
 
 #define OUT std::cout
 
@@ -48,16 +50,15 @@
 namespace MESSAGE
 {
 
-// ANSI colours for the runtime log; emitted only when stdout is a real terminal and NO_COLOR is unset, so piped output stays clean.
-// CLICOLOR_FORCE (non-empty, not "0") forces colours through pipes -- run_ps_dtfe.sh sets it so colours survive its 'tee' runlog pipe.
+// ANSI colours for the runtime log; emitted only when stdout is a real terminal and NO_COLOR is unset or empty, so piped output stays clean.
+// CLICOLOR_FORCE (a flag: on unless empty, 0, false, no or off) forces colours through pipes -- run_ps_dtfe.sh sets it so colours survive its 'tee' runlog pipe.
 inline bool colorEnabled()
 {
     static bool const enabled = []()
     {
-        if ( std::getenv("NO_COLOR")!=nullptr )
+        if ( Env::isSet("NO_COLOR") )
             return false;
-        char const *force = std::getenv("CLICOLOR_FORCE");
-        if ( force!=nullptr and force[0]!='\0' and not (force[0]=='0' and force[1]=='\0') )
+        if ( Env::flag("CLICOLOR_FORCE") )
             return true;
         return isatty(STDOUT_FILENO)==1;
     }();

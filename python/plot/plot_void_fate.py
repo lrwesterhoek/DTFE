@@ -12,8 +12,8 @@ Classes (Lagrangian linking, lagrangian.py's constants): SURVIVE (>= 50% of the 
 MERGE (two or more progenitors pass >= 50% to the same followed descendant), UNRESOLVED (survive or merge, but into
 a minimum that is not followed: not distinct, not well resolved or without R_v -- the void lives on, out of the
 sample), SPLIT (no 50% descendant, but two or more with >= 25% each) and VANISH (no void of the next snapshot
-receives these thresholds: a void-in-cloud crushed, or its matter spread thin). The thesis's Limitations section
-reads the 598 -> 453 void-count decline as 'mergers and void-in-cloud collapse'; this is that census.
+receives these thresholds: a void-in-cloud crushed, or its matter spread thin). The census tells whether a falling
+void count comes from mergers or from void-in-cloud collapse.
 
 Outputs (figures/void_fate/<sim>/):
   fate_census.png   (a) counts per class per interval (stacked bars), (b) the fraction of each snapshot's voids
@@ -58,7 +58,6 @@ from dtfelib import groupcat as gc
 from dtfelib import figures as style
 
 FIGURE_ROOT = Path(config.figures_path("void_fate"))
-MIRROR = True
 CLASS_COLORS = {"survive": "tab:green", "merge": "tab:blue", "unresolved": "yellowgreen", "split": "tab:orange",
                 "vanish": "0.55"}
 # drawing order: the voids that live on (followed, then not), split, and the real vanishing on top
@@ -74,7 +73,7 @@ def peak_rss_gb() -> float:
 
 
 def name_tag(method, prefix) -> str:
-    """'' for PS-DTFE's default grids (as every file on the T7), else '_<method>' or '_<prefix>' (lagrangian.link_tag:
+    """'' for PS-DTFE's default grids, else '_<method>' or '_<prefix>' (lagrangian.link_tag:
     the link caches carry the same tag, shared with plot_void_tracking --link particles)."""
     return L.link_tag(method, prefix)
 
@@ -239,7 +238,7 @@ def plot_census(intervals, direct, chain, ztab, args, path):
     style.set_suptitle(fig, f"{args.sim}: fate of the distinct resolved voids (Lagrangian particle links"
                             f"{', exclusive members' if getattr(args, 'exclusive', False) else ''})")
     fig.tight_layout()
-    style.save_plot_to_multiple_paths(fig, path, mirror=MIRROR)
+    style.save_figure(fig, path)
     plt.close(fig)
 
 
@@ -257,7 +256,6 @@ def chained_survival(intervals):
 
 
 def main(argv=None):
-    global MIRROR
     parser = make_parser("Fate census of the voids: link every snapshot's distinct resolved voids to every void of "
                          "the next snapshot by their member particles (survive, merge, unresolved, split, vanish).")
     parser.add_argument("--snaps", type=int, nargs="+", default=None,
@@ -270,12 +268,10 @@ def main(argv=None):
                              "units of its R_v (a partition of the matter: overlapping high-z voids then cannot both "
                              "pass half their matter to one descendant); files tagged '_exclusive'")
     parser.add_argument("--out", type=Path, default=None,
-                        help="write the figure, table and npz into this folder instead (nothing goes into the "
-                             "thesis tree)")
+                        help="write the figure, table and npz into this folder instead")
     pipeline.add_smoothing_mpc_arg(parser)
     args = parser.parse_args(argv)
     pipeline.apply_smoothing_args(args, "void-fate")
-    MIRROR = args.out is None
     use_data_root(args.data_root)
     ztab = gc.redshift_table(args.sim)
     ladder = args.snaps or sorted({int(d.name.split("_")[1]) for d in env.sim_dir(args.sim).glob("snapdir_*")})
@@ -284,7 +280,6 @@ def main(argv=None):
     for s in sorted(ladder):
         try:
             vs = L.VoidSnapshot(args.sim, s, args.method, args.prefix, args.data_root, exclusive=args.exclusive)
-            style.note_source(vs.fs)
             snaps.append(vs)
         except FileNotFoundError as e:
             print(f"  snap {s:3d}: left out ({e})")

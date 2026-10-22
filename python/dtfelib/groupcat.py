@@ -1,7 +1,7 @@
 """FoF/Subfind group catalogs + subhalo member particles, without offset files.
 
 Reads the fof_subhalo_tab_NNN.X.hdf5 chunks downloaded by `download_snapshots.sh -c` into
-<DATA_ROOT>/<sim>/groups_NNN/, and (for shape/orientation work) the raw snapshot chunks in
+<data root>/<sim>/groups_NNN/, and (for shape/orientation work) the raw snapshot chunks in
 snapdir_NNN/ -- TNG snapshots store particles in FoF-group order (each group's subhalo
 particles first, catalog order, then the group's "fuzz"), so a subhalo's particle range is
 computable from GroupLenType / GroupNsubs / GroupFirstSub / SubhaloLenType alone:

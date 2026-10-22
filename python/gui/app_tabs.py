@@ -148,7 +148,7 @@ class TabsMixin:
         self.d_table.setRowCount(0)
         self.d_target.setText("")
         self.d_whole.setText("")
-        if sim and Path(root).is_dir():
+        if sim and rs.root_ok(root):
             sp = rs.sim_dir(sim, root)
             n_part = rs.dm_particles(sim)
             size = (f"  ·  {round(n_part ** (1 / 3))}³ particles, {n_part * rs.MERGED_BYTES_PER_PARTICLE / 1e9:.1f} GB "
@@ -710,6 +710,16 @@ class TabsMixin:
         col.addWidget(g)
         g, self.o_fields = self._fields_group()
         self.o_fields_box = g
+        col.addWidget(g)
+
+        g = QGroupBox("More options")
+        f = QFormLayout(g)
+        self.o_extra = QLineEdit(placeholderText="options the tab has no control for, as on a command line")
+        self.o_extra.setToolTip("Any of the program's options the tab has no control for, typed as on a command "
+                                "line (see the program's help): they go after the tab's own, and an option the "
+                                "tab sets already is reported, not passed twice.")
+        self.o_extra.editingFinished.connect(self._changed)
+        f.addRow("Extra options", self.o_extra)
         col.addWidget(g)
 
         g = QGroupBox("Output")

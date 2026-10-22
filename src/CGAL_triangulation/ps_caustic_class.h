@@ -331,7 +331,7 @@ inline bool deformationTensor(double const Ax[NO_DIM][NO_DIM],
 
 /* The classification bits that follow from an ALREADY-COMPUTED spectrum. Split out so analyzeTet
    can reuse the eigenvalues it has instead of asking classifyTet to solve the cubic a second time
-   (which is exactly what it used to do -- see the note there). */
+   (see the note there). */
 inline CausticMask bitsFromSpectrum(double const ev[], int const nReal)
 {
     CausticMask bits = 0;

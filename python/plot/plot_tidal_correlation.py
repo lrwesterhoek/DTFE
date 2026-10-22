@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
 
-from dtfelib.figures import save_plot_to_multiple_paths
+from dtfelib.figures import save_figure
 from dtfelib import make_parser
 import config
 from dtfelib import figures as style
@@ -80,7 +80,7 @@ def plot_alignment_histogram(cos, combo, redshift, snapshot, lo, hi,
     ax.grid(alpha=0.25, linestyle=':', linewidth=1.0)
     ax.legend(framealpha=0.9, loc='upper left')
     plt.tight_layout()
-    save_plot_to_multiple_paths(
+    save_figure(
         fig, output_dir / f'alignment_{combo}_snap{snapshot}'
                           f'_z{redshift:.2f}.png',
         dpi=DPI, bbox_inches='tight', facecolor='white')
@@ -111,7 +111,7 @@ def plot_alignment_evolution(rows, combo):
     ax.grid(alpha=0.25, linestyle=':', linewidth=1.0)
     ax.legend(framealpha=0.9)
     plt.tight_layout()
-    save_plot_to_multiple_paths(
+    save_figure(
         fig, Path(OUTPUT_DIR) / f'tidal_alignment_evolution_{combo}.png',
         dpi=DPI, bbox_inches='tight', facecolor='white')
     plt.close(fig)
@@ -124,7 +124,6 @@ def analyze_snapshot(snapshot, redshift, output_root, sim, method, prefix=None, 
     try:
         p = pipeline.products(snapshot, redshift, sim=sim, method=method, prefix=prefix, data_root=data_root)
         cat = p.voids()
-        style.note_source(p.fs)                     # the thesis mirror takes the thesis box's standard DTFE only
         coords = np.asarray(cat['coords'], dtype=int)
         n = len(coords)
         if n < 10:

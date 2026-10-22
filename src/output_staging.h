@@ -36,6 +36,8 @@
 #include <utility>
 #include <vector>
 
+#include "env_knobs.h"
+
 struct OutputStaging
 {
     bool begun = false, rescue = false;
@@ -129,8 +131,7 @@ inline int outputStageCleanStale(std::string const &outputFilename)
 // the rescue folder: $TMPDIR/dtfe-rescue/<parent folder>_<output name> (another '-<pid>' when it exists)
 inline std::string outputStageMakeRescueDir(std::string const &outputFilename)
 {
-    char const *tmp = std::getenv( "TMPDIR" );
-    std::string root = ( tmp and tmp[0] ) ? std::string( tmp ) : std::string( "/tmp" );
+    std::string root = Env::text( "TMPDIR", "/tmp" );
     while ( root.size() > 1 and root.back() == '/' ) root.pop_back();
     root += "/dtfe-rescue";
     ::mkdir( root.c_str(), 0755 );
@@ -167,7 +168,7 @@ inline void outputStageBegin(std::string const &outputFilename)
     s.outDir = outputStageDirOf( outputFilename );
     if ( outputStageDirWritable( s.outDir ) ) return;
     double waitSec = 300.;
-    if ( char const *env = std::getenv( "DTFE_OUTPUT_WAIT" ) ) waitSec = std::max( 0., std::atof( env ) );
+    waitSec = std::max( 0., Env::real( "DTFE_OUTPUT_WAIT", waitSec ) );
     if ( waitSec > 0. )
         std::fprintf( stderr, "The output folder '%s' cannot be written now (an unmounted disk?); waiting up to %.0f s "
                       "for it (DTFE_OUTPUT_WAIT) ...\n", s.outDir.c_str(), waitSec );

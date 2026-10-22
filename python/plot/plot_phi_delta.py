@@ -16,7 +16,7 @@ import scipy.fft as sfft
 from scipy.spatial import cKDTree
 from scipy.stats import spearmanr
 
-from dtfelib.figures import save_plot_to_multiple_paths
+from dtfelib.figures import save_figure
 from dtfelib import make_parser
 import config
 from dtfelib import figures as style
@@ -154,8 +154,8 @@ def plot_profile(radii, profile, lo, hi, redshift, output_path):
     ax.grid(alpha=0.25, linestyle=':', linewidth=1.0)
     ax.legend(framealpha=0.9)
     plt.tight_layout()
-    save_plot_to_multiple_paths(fig, output_path, dpi=DPI,
-                                bbox_inches='tight', facecolor='white')
+    save_figure(fig, output_path, dpi=DPI,
+                bbox_inches='tight', facecolor='white')
     plt.close(fig)
 
 
@@ -233,10 +233,10 @@ def plot_max_slices(delta, phi, phi_coords, phi_values, void_coords,
         plt.tight_layout()
 
         stem = f'phi_max_slice_snap{snapshot}_z{redshift:.2f}_m{i:02d}.png'
-        save_plot_to_multiple_paths(fig, output_dir / stem, dpi=DPI,
-                                    bbox_inches='tight', facecolor='white')
+        save_figure(fig, output_dir / stem, dpi=DPI,
+                    bbox_inches='tight', facecolor='white')
         if i == top:
-            save_plot_to_multiple_paths(
+            save_figure(
                 fig, output_dir / f'phi_top_hill_snap{snapshot}'
                                   f'_z{redshift:.2f}.png',
                 dpi=DPI, bbox_inches='tight', facecolor='white')
@@ -266,8 +266,8 @@ def plot_trend(zs, values, null_lo, null_hi, ylabel, fname, ref_line=None):
     ax.grid(alpha=0.25, linestyle=':', linewidth=1.0)
     ax.legend(framealpha=0.9)
     plt.tight_layout()
-    save_plot_to_multiple_paths(fig, Path(OUTPUT_DIR) / fname, dpi=DPI,
-                                bbox_inches='tight', facecolor='white')
+    save_figure(fig, Path(OUTPUT_DIR) / fname, dpi=DPI,
+                bbox_inches='tight', facecolor='white')
     plt.close(fig)
 
 
@@ -290,7 +290,7 @@ def plot_profile_evolution(profile_rows):
     ax.legend(framealpha=0.9,
               title='Shaded: 95% null' if config.SHOW_NULL_BANDS else None)
     plt.tight_layout()
-    save_plot_to_multiple_paths(
+    save_figure(
         fig, Path(OUTPUT_DIR) / 'phi_delta_profile_evolution.png',
         dpi=DPI, bbox_inches='tight', facecolor='white')
     plt.close(fig)
@@ -303,7 +303,6 @@ def analyze_snapshot(snapshot, redshift, output_root, sim, method, prefix=None, 
     try:
         p = pipeline.products(snapshot, redshift, sim=sim, method=method, prefix=prefix, data_root=data_root)
         _set_geometry(p.fs)
-        style.note_source(p.fs)                     # the thesis mirror takes the thesis box's standard DTFE only
         cat = p.voids()
         maxima = p.phi_maxima()
         phi_coords = np.asarray(maxima['coords'], dtype=int)

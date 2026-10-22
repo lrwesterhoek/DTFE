@@ -39,7 +39,7 @@ radius), and a non-default smoothing writes into its own folder (plot_void_popul
 Examples:
   python3 plot/plot_void_environment.py --sim TNG100-3-Dark
   python3 plot/plot_void_environment.py --sim TNG100-3-Dark --criterion density_raw
-  python3 plot/plot_void_environment.py --sim TNG50-3-Dark --tracking-dir "/Volumes/Samsung T7/Illustris TNG/figures/void_tracking/TNG50-3-Dark"
+  python3 plot/plot_void_environment.py --sim TNG50-3-Dark --tracking-dir ~/tracking/TNG50-3-Dark
 """
 
 import _bootstrap  # noqa: F401  (puts python/ on sys.path)
@@ -63,7 +63,6 @@ from dtfelib import cli
 FOLDER = "void_environment"
 PCT = (16, 50, 84)
 TYPE_COLORS = {"R": "tab:blue", "S": "tab:red"}
-MIRROR = True
 # the per-void quantities stored and drawn: (key, label, histogram range or None)
 QUANTITIES = (("r_v_mpc", r"$R_v$ [Mpc]", None),
               ("delta_c", r"central $\delta$ (smoothed)", (-1.0, 0.2)),
@@ -79,7 +78,7 @@ TABLE_KEYS = ("index", "delta_enclosed", "vic", "r_v_mpc", "delta_c", "e", "p", 
 # the per-void quantity each criterion thresholds at 0 (the velocity: its sign; shown in units of H a R_v)
 DECIDING = {"velocity": "v_shell_norm", "density_smoothed": "delta_smoothed_enclosed", "density_raw": "delta_enclosed"}
 # the criterion whose files carry no tag: density_raw, the earlier default -- the untagged
-# environment_*.png / environment_stats.npz (and their thesis mirrors) hold its fraction, and a name must not change
+# environment_*.png / environment_stats.npz hold its fraction, and a name must not change
 # meaning (plot_void_population's rule), so the default velocity is tagged '_velocity' like the others
 UNTAGGED_CRITERION = "density_raw"
 CRIT_STYLE = {"velocity": "-", "density_smoothed": "--", "density_raw": ":"}
@@ -174,7 +173,7 @@ def plot_evolution(sims, z, summ, sim, methods, factor, path, criterion=classify
     style.set_suptitle(fig, f"{sim}: void-in-void and void-in-cloud by {criterion_text(criterion, factor)} "
                             f"({'/'.join(methods)}, distinct well-resolved voids)")
     fig.tight_layout()
-    style.save_plot_to_multiple_paths(fig, path, mirror=MIRROR)
+    style.save_figure(fig, path)
     plt.close(fig)
 
 
@@ -197,7 +196,9 @@ def plot_snapshot(envd, summ, z, sim, factor, path, criterion=classify.DEFAULT_C
         if key in DECIDING.values():
             ax.axvline(0.0, color="k", lw=1.2 if key == deciding else 0.6, ls="-" if key == deciding else ":")
         ax.set_xlabel(lab.replace("2R_v", f"{factor:g}R_v") if key == "delta_enclosed" else lab)
-        ax.set_ylabel("voids"); ax.legend(fontsize=7)
+        ax.set_ylabel("voids")
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(fontsize=7)
         ax.grid(alpha=0.3)
     ax = flat[len(QUANTITIES)]
     bins = np.asarray(envd["bins"])
@@ -246,17 +247,13 @@ def plot_snapshot(envd, summ, z, sim, factor, path, criterion=classify.DEFAULT_C
                             f"{summ['n_S']} void-in-cloud, {summ['n_R']} void-in-void "
                             f"(f = {summ['f_vic']:.2f}, {summ['dropped']} beyond the wrap rule)")
     fig.tight_layout()
-    style.save_plot_to_multiple_paths(fig, path, mirror=MIRROR)
+    style.save_figure(fig, path)
     plt.close(fig)
 
 
 def default_tracking_dir(sim):
-    """plot_void_tracking's folder for 'sim' at this smoothing: under the figure root, else on the T7's figure tree
-    (the tests and some runs move the figure root, the tracking files stay where they were written)."""
-    for root in (Path(config.LOCAL_FIGURES_ROOT), cli._T7_DATA / "figures"):
-        d = root / "void_tracking" / sim / pipeline.smoothing_tag()
-        if any(d.glob("void*_track*.npz")):
-            return d
+    """plot_void_tracking's folder for 'sim' at this smoothing, under the figure root (--tracking-dir names
+    another one)."""
     return Path(config.LOCAL_FIGURES_ROOT) / "void_tracking" / sim / pipeline.smoothing_tag()
 
 
@@ -295,7 +292,6 @@ def classify_tracks(files, sim, method, prefix, data_root, factor, criterion=cla
         try:
             cell, _box, n, _src = catalog.frame_of(prod)
             cat = prod.voids()
-            style.note_source(prod.fs)
             dens = prod.density_raw
             grids = {}
             if criterion == "velocity":
@@ -357,7 +353,7 @@ def plot_tracking(typed, sim, factor, path, criterion=classify.DEFAULT_CRITERION
     style.set_suptitle(fig, f"{sim}: {len(typed)} tracked voids, {n_s} void-in-cloud at the reference snapshot "
                             f"({criterion_text(criterion, factor)})")
     fig.tight_layout()
-    style.save_plot_to_multiple_paths(fig, path, mirror=MIRROR)
+    style.save_figure(fig, path)
     plt.close(fig)
 
 
@@ -381,7 +377,7 @@ def main(argv=None):
     parser.add_argument("--snaps", type=int, nargs="*", default=None, help="snapshots (default: every one with grids)")
     parser.add_argument("--tracking-dir", default=None,
                         help="folder of plot_void_tracking's void<K>_track.npz files (default: void_tracking/<sim> "
-                             "under the figure root, else on the T7's figure tree)")
+                             "under the figure root)")
     parser.add_argument("--tracking-tag", default="", help="the tracking set's file tag (default: the untagged set)")
     pipeline.add_smoothing_mpc_arg(parser)
     args = parser.parse_args(argv)
@@ -401,7 +397,6 @@ def main(argv=None):
                                         definition=args.r_v_definition, criterion=args.criterion)
             method_used[s], prefix_used[s] = prod.fs.method, prod.fs.prefix
             zs[s] = float(ztab.get(s, prod.redshift))
-            style.note_source(prod.fs)
         except OSError as err:                      # no grids: silent (FileNotFoundError), unreadable: said
             if not isinstance(err, FileNotFoundError):
                 print(f"  snap {s:3d}: unreadable, left out: {err}")

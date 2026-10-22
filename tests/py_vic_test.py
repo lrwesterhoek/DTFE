@@ -8,8 +8,8 @@ default), the smoothed Delta(<3 R_v) and the raw Delta(<2 R_v), and plot_void_en
     an unknown criterion, a velocity without a redshift); classify_voids' default = the velocity on a stubbed
     snapshot; the figure script end to end on a stubbed pipeline (default untagged, '_density_raw' tagged, the npz
     keys, the figure text names the criterion and its shell, no option syntax in it).
-  * DATA-BACKED (the T7; skipped without it): TNG100-3-Dark z = 0 in a fresh interpreter (DTFE_SIM sets the frame):
-    the void-in-cloud fraction under every criterion strictly between 0 and 1, and the voids' infall fraction above
+  * DATA-BACKED (DTFE_DATA_ROOT; skipped without it): TNG100-3-Dark z = 0 in a fresh interpreter (DTFE_SIM sets
+    the frame): the void-in-cloud fraction under every criterion strictly between 0 and 1, and the voids' infall fraction above
     that of random centres with the same radii, whose mean v_shell_norm is ~0 (a periodic flow has no net flux).
 
 Usage:  python3 tests/py_vic_test.py            (exit 0 = pass)
@@ -27,7 +27,7 @@ from pathlib import Path
 
 import numpy as np
 
-from _harness import REPO, check as _check, setup, summary
+from _harness import REPO, check as _check, data_root, setup, summary
 
 setup("vic_figs_", mpl_agg=False)
 DATA_BACKED = False
@@ -235,8 +235,8 @@ def t_environment_script():
     from dtfelib import classify, catalog, cli
     rho, vel, cat = _three_voids()
     root = Path(tempfile.mkdtemp(prefix="vic_run_"))
-    saved = (pev.pipeline, pev.catalog, pev.style.note_source, pev.style.set_suptitle, catalog.frame_of,
-             catalog.assert_frame, cli.DATA_ROOT)
+    saved = (pev.pipeline, pev.catalog, pev.style.set_suptitle, catalog.frame_of,
+             catalog.assert_frame, cli._data_root_override)
     titles = []
     try:
         data = root / "data" / "SYN"
@@ -251,8 +251,7 @@ def t_environment_script():
         frame = lambda p: (1.0, 64.0, 64, "header")
         catalog.frame_of, catalog.assert_frame = frame, (lambda c, cell: None)
         pev.catalog = types.SimpleNamespace(frame_of=frame, r_v_mpc=catalog.r_v_mpc, R_V_DEFINITIONS=catalog.R_V_DEFINITIONS)
-        pev.style.note_source = lambda fs: None
-        real_title = saved[3]
+        real_title = saved[2]
         pev.style.set_suptitle = lambda fig, text, *a, **kw: (titles.append(text), real_title(fig, text, *a, **kw))[1]
         tdir = root / "tracking"
         tdir.mkdir()
@@ -302,7 +301,7 @@ def t_environment_script():
         assert pev.name_tag({99: "ps"}, {99: "ps_output."}, False, 2.0, "crossing", "density_raw") == ""
         assert all("--" not in pev.criterion_text(c) for c in classify.CRITERIA)
     finally:
-        (pev.pipeline, pev.catalog, pev.style.note_source, pev.style.set_suptitle, catalog.frame_of,
+        (pev.pipeline, pev.catalog, pev.style.set_suptitle, catalog.frame_of,
          catalog.assert_frame, _root) = saved
         cli.use_data_root(_root)                    # main()'s --data-root is process-wide
         shutil.rmtree(root, ignore_errors=True)
@@ -311,7 +310,7 @@ def t_environment_script():
 # ---------------------------------------------------------------- data-backed: TNG100-3-Dark
 def t_tng100_criteria():
     from dtfelib import cli
-    sd = cli.sim_dir("TNG100-3-Dark", os.environ.get("DTFE_DATA_ROOT", str(cli._T7_DATA))) / "snapdir_099"
+    sd = cli.sim_dir("TNG100-3-Dark", data_root()) / "snapdir_099"
     if not any(sd.glob("ps_output.*vel")):
         raise FileNotFoundError(f"no PS-DTFE velocity in {sd}")
     code = ("import sys; sys.path.insert(0, 'python'); import numpy as np\n"

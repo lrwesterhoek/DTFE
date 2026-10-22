@@ -36,8 +36,7 @@ for dim in 3 2; do
     done
 done
 
-PY="${PYTHON:-python3}"
-command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/python3.14
+source "${SCRIPT_DIR}/lib.sh"   # PY: the python with numpy and h5py
 if [ ! -x ./DTFE ] || ! "$PY" -c 'import numpy' 2>/dev/null; then
     echo "   SKIP  end to end: ./DTFE or numpy missing"
 else

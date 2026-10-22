@@ -43,7 +43,6 @@ from dtfelib import figures as style
 
 OUTPUT_DIR = Path(config.LOCAL_FIGURES_ROOT) / "power_spectrum"
 LABEL = {"dtfe": "DTFE", "ps": "PS-DTFE"}
-MIRROR = True                   # into the thesis Figures tree too; off under --out (main sets it)
 
 
 def spectra_of(snapdir, methods, prefix, nbins):
@@ -164,7 +163,7 @@ def plot_pk(ps, z, box, title, path, labels=None, note=None, ref=None):
         axr.set_ylim(max(0.05, 0.7 * float(allr.min())), 1.5 * float(allr.max()))
     style.set_suptitle(fig, title)
     fig.tight_layout()
-    style.save_plot_to_multiple_paths(fig, path, mirror=MIRROR)
+    style.save_figure(fig, path)
     plt.close(fig)
 
 
@@ -182,7 +181,6 @@ def option_tag(args) -> str:
 
 
 def main():
-    global MIRROR
     parser = make_parser("Density power spectrum: DTFE and PS-DTFE grids against linear theory.")
     parser.add_argument("--snaps", type=int, nargs="*", default=None, help="snapshots (default: --snap)")
     parser.add_argument("--nbins", type=int, default=DEFAULT_NBINS,
@@ -195,7 +193,6 @@ def main():
     args = parser.parse_args()
     style.apply()
     out_dir = Path(args.out).expanduser() if args.out else OUTPUT_DIR / args.sim
-    MIRROR = args.out is None
     methods = ("dtfe", "ps") if args.method == "auto" and args.prefix is None else (args.method if args.method != "auto" else "ps",)
     labels = dict(LABEL)
     if args.prefix:                                 # the curve is named by what was loaded

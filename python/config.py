@@ -76,8 +76,8 @@ COSMOLOGY = {
 
 
 # Gaussian smoothing (grid cells) for the derived-product pipeline (delta, Hessian, void
-# catalogs, critical points). 10.0 is the production value every thesis correlation/void
-# catalog was built with (cache namespaces r512_s10_*); at 0 the catalogs degenerate into
+# catalogs, critical points). 10.0 is the production value: the default correlation and void
+# catalogues are built with it (cache namespaces r512_s10_*); at 0 the catalogs degenerate into
 # single-cell noise dips.
 SMOOTHING_SIGMA_CELLS = 10.0
 
@@ -103,8 +103,8 @@ def footprint_for(sigma_cells):
 # 10 cells is 1.0 / 2.2 / 5.9 Mpc in TNG50 / 100 / 300, so their 10-cell catalogues are different voids -- and the
 # footprint follows it (footprint_for). Here, at import, so every module-level copy follows; the void scripts'
 # --smooth-mpc does the same at run time (dtfelib.pipeline.set_smoothing). FOR THE VOID SCRIPTS AND 'analyze.py export'
-# (which tag their outputs): analyze.py compute/plot/all refuse to run under it, and no figure made under it is copied
-# into the thesis Figures/ tree. The cells are rounded to 1e-9, so 10 x CELL_SIZE gives exactly 10.0 cells, footprint 11
+# (which tag their outputs): analyze.py compute/plot/all refuse to run under it (the core figures are saved under
+# their production names). The cells are rounded to 1e-9, so 10 x CELL_SIZE gives exactly 10.0 cells, footprint 11
 # and the production caches.
 if os.environ.get("DTFE_SIGMA_MPC"):
     SMOOTHING_SIGMA_CELLS = round(float(os.environ["DTFE_SIGMA_MPC"])
@@ -114,11 +114,10 @@ if SIMULATION:
     SMOOTHING_SIGMA_MPC = SMOOTHING_SIGMA_CELLS * CELL_SIZE
 
 # The cross-box comparison's common smoothing length in Mpc: 10.0002 TNG100-3-Dark cells
-# (110.7 Mpc / 512; production 10 cells = 2.16245 Mpc), the value the comparison was made with, kept so its results stay
-# comparable. ONE number every Python user imports -- plot_void_crossbox.DEFAULT_SIGMA_MPC, analyze.py's cache
-# inventory (CACHE_SMOOTHING_MPC), the launcher (gui/runspec.py) -- because it names cache namespaces
-# (r512_s21.4291_f23 on TNG50): 2.16 next to 2.1625 makes a second, unreachable namespace.
-# scripts/thesis_runs.sh keeps the literal (a recipe of the runs made), commented with this name.
+# (110.7 Mpc / 512; production 10 cells = 2.16245 Mpc). ONE number every Python user imports --
+# plot_void_crossbox.DEFAULT_SIGMA_MPC, analyze.py's cache inventory (CACHE_SMOOTHING_MPC), the launcher
+# (gui/runspec.py) -- because it names cache namespaces (r512_s21.4291_f23 on TNG50): 2.16 next to 2.1625 makes a
+# second, unreachable namespace.
 CROSSBOX_SMOOTHING_MPC = 2.1625
 
 GRADIENT_THRESHOLD = 0.1
@@ -128,8 +127,8 @@ DEEP_VOID_THRESHOLD = -0.1
 # only at call time, through dtfelib.pipeline.ellipsoid_cuts_mpc(), so a script's --smooth reaches it. A
 # fixed 10 Mpc gate -- TNG50's 10 sigma -- would keep 2 of 495 TNG100 voids and 0 of 650
 # TNG300 voids at z = 0: the semi-axes are curvature lengths of the smoothed field and grow with the smoothing.
-# 10 sigma reproduces the TNG50 sample (+72/-0 of 8433 flags over the thesis snapshots; no thesis number used
-# the gate: its tables average ALL voids) and keeps 103 (TNG100) and 409 (TNG300) voids at z = 0. The box
+# 10 sigma reproduces the 10 Mpc TNG50-3-Dark sample (+72/-0 of 8433 flags over its snapshots) and keeps 103
+# (TNG100) and 409 (TNG300) voids at z = 0. The box
 # clause: a semi-axis beyond L/2 overlaps its own periodic image (inert at sigma = 10 cells, binding above 25.6).
 # The minimum axis and the axis ratio never decide a void at sigma = 10 cells.
 ELLIPSOID_CUT_RULES = {
@@ -158,8 +157,7 @@ CORRELATION_SEED = 42
 
 # Draw the shaded central-95% (2.5-97.5 percentile) Monte-Carlo null
 # envelopes on the correlation / alignment / profile plots
-# (plot_marked_correlation_BBKS, plot_tidal_correlation, plot_phi_delta,
-# plot_conclusions_synthesis). Off by default. The null statistics are still
+# (plot_marked_correlation_BBKS, plot_tidal_correlation, plot_phi_delta). Off by default. The null statistics are still
 # computed and reported in the console/summary output regardless of this flag.
 SHOW_NULL_BANDS = False
 
@@ -182,29 +180,7 @@ VOID_EIGENVALUE_CRITERION = 'trace'
 
 _REPO_ROOT = Path(__file__).resolve().parent
 
-
-def _find_thesis_dir():
-    for parent in Path(__file__).resolve().parents:
-        if (parent / 'Thesis_Final.tex').exists():
-            return parent
-    return None
-
-
-_THESIS_DIR = _find_thesis_dir()
-# The fallback is the 'Figures' folder NEXT TO the repo. _REPO_ROOT is DTFE/python,
-# so that folder is two levels up: one level up is DTFE/Figures, which on macOS's case-insensitive
-# disk IS the repo's own figures/ folder.
-THESIS_FIGURES_DIR = (_THESIS_DIR / 'Figures') if _THESIS_DIR else (_REPO_ROOT.parent.parent / 'Figures')
-
-# What the thesis's figures and tables were made from (TNG50-3-Dark, not -4 -- the unprefixed
-# caches equal TNG50-3-Dark_dtfe_*, tex 615/626 -- with standard DTFE). The thesis scripts name their figures without
-# either (figures_path), so only this simulation's figures of this estimator may go into the thesis Figures/ tree
-# (dtfelib.figures.save_plot_to_multiple_paths): a TNG100 run, or one on PS-DTFE grids (FieldSet's auto-detect picks
-# them when they are there, as on the T7), would replace the thesis figures under the same names.
-THESIS_SIMULATION = "TNG50-3-Dark"
-THESIS_METHOD = "dtfe"
-
-LOCAL_FIGURES_ROOT = str(FIGURES_ROOT)     # dtfelib.cli: DTFE_FIGURES_ROOT, else the T7, else python/figures
+LOCAL_FIGURES_ROOT = str(FIGURES_ROOT)     # dtfelib.cli: DTFE_FIGURES_ROOT, else python/figures
 
 ANALYSIS_DIRS = {
     'dtfe': 'dtfe_analysis',
@@ -222,24 +198,17 @@ ANALYSIS_DIRS = {
 }
 
 
-# the folders figures_path has handed out: their figures carry neither the simulation nor the estimator in their
-# names, so the thesis mirror takes them only from THESIS_SIMULATION's THESIS_METHOD grids
-THESIS_NAMED_DIRS = set(ANALYSIS_DIRS.values())
-
-
 def figures_path(analysis_key):
-    subdir = ANALYSIS_DIRS.get(analysis_key, analysis_key)
-    THESIS_NAMED_DIRS.add(subdir)               # the pass-through keys too ('smoothing_comparison', 'synthesis')
-    return f"{LOCAL_FIGURES_ROOT}/{subdir}"
+    """The folder of one core analysis's figures under the figure root (LOCAL_FIGURES_ROOT, read at call time):
+    ANALYSIS_DIRS' name for a known key, else the key itself."""
+    return f"{LOCAL_FIGURES_ROOT}/{ANALYSIS_DIRS.get(analysis_key, analysis_key)}"
 
 
-# Data location: single source of truth is dtfelib (DATA_ROOT / SIMULATION, both env-
-# overridable; every plot script can also override per run with --sim / --data-root).
-# Note: TNG50-3-Dark's on-disk DTFE outputs predate the h-free unit overhaul and are
-# stale for absolute units (mean-relative quantities remain usable).
+# Data location: dtfelib.cli (DTFE_DATA_ROOT, required: require_data_root; the simulation from DTFE_SIM); every
+# plot script can also give them per run with --data-root / --sim.
 
 # DTFE_CACHE_DIR moves the derived-product caches (python/cache: the void catalogues, slices, limits)
-# elsewhere, e.g. off iCloud Drive, which syncs every catalogue; unset, the default and every existing cache stay.
+# elsewhere, e.g. off a cloud-synced folder such as iCloud Drive, which syncs every catalogue; unset, python/cache.
 # A PERSISTENT per-user setting does the same without an environment variable: the
 # one line of cache_setting_file() (~/.config/dtfe/cache_dir, or under $XDG_CONFIG_HOME), written by
 # 'analyze.py cache --move DIR' and the launcher's setup, which move the existing cache there first. Order: the

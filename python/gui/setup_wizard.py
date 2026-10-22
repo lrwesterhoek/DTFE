@@ -114,7 +114,7 @@ def save_api_key(key: str, path: Path = rs.API_KEY_FILE) -> None:
 class SetupDialog(QDialog):
     def __init__(self, parent=None, data_root: str = ""):
         super().__init__(parent)
-        self.setWindowTitle("Set up the DTFE launcher")
+        self.setWindowTitle("Set up Lamina")
         self.resize(720, 520)
         self.run_demo = False
         self._build: QProcess | None = None

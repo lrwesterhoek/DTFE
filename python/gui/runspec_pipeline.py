@@ -10,7 +10,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import runspec as _rs
-from dtfelib.cli import DATA_ROOT, FIGURES_ROOT, sim_dir
+from dtfelib.cli import FIGURES_ROOT
 from dtfelib.io import plane_geometry_matches
 from runspec import LAMBDA_TH_DEFAULT, POINTEVAL_DERIVATIVE_SMOOTH, PS_DEFAULT_FIELDS   # the dataclass defaults
 
@@ -35,7 +35,7 @@ class PipelineSpec:
     point-evaluated figures. The run options travel to run_ps_dtfe.sh through the environment, as
     the Grids job's do (the script's own defaults are the production ones: GPU, vertex masses,
     volume-weighted moments); the plane's geometry reaches tools/make_image_plane.py the same way."""
-    data_root: str = str(DATA_ROOT)
+    data_root: str = field(default_factory=lambda: _rs.default_data_root())
     sims: list[str] = field(default_factory=list)
     nu: int = 8192                  # image-plane pixels across the box
     axis: str = "z"
@@ -88,7 +88,7 @@ class PipelineSpec:
             self.gpu = _rs.gpu_build_default("ps", self.precision)
 
     def plane_json(self, sim: str, nu: int | None = None) -> Path:
-        return sim_dir(sim, self.data_root) / f"hires_plane_{self.axis}{nu or self.nu}.json"
+        return _rs.sim_dir(sim, self.data_root) / f"hires_plane_{self.axis}{nu or self.nu}.json"
 
     def adaptive_sizes(self) -> list[int]:
         sizes, nu = [], self.nu
@@ -164,7 +164,7 @@ class PipelineSpec:
         everything is stale then). The count: else a 4096^2 slice newer than an older 8192^2 plane
         would read as current, so the script would skip the compute and every render fail on the size mismatch."""
         import json
-        sp = sim_dir(sim, self.data_root)
+        sp = _rs.sim_dir(sim, self.data_root)
         plane_bin = self.plane_json(sim, nu).with_suffix(".bin")
         plane_ok = (plane_bin.is_file() and self.plane_json(sim, nu).is_file()
                     and self.plane_matches(sim, nu) is not False)
@@ -194,7 +194,7 @@ class PipelineSpec:
             if not self.sims:
                 out.append(("error", "no simulations selected"))
             for sim in self.sims:
-                if not sim_dir(sim, self.data_root).is_dir():
+                if not _rs.sim_dir(sim, self.data_root).is_dir():
                     out.append(("error", f"{sim} not found under {self.data_root}"))
         if not 16 <= self.nu <= 65536:
             out.append(("error", f"image plane of {self.nu} px is outside 16..65536"))
@@ -249,7 +249,8 @@ class PipelineSpec:
         if self.force:
             out.append(("warning", "FORCE recomputes every snapshot, including up-to-date ones"))
         if self.adaptive:
-            unplanned = [sim for sim in self.sims if sim_dir(sim, self.data_root).is_dir() and not self.plan.get(sim)]
+            unplanned = [sim for sim in self.sims
+                         if _rs.sim_dir(sim, self.data_root).is_dir() and not self.plan.get(sim)]
             if unplanned:
                 out.append(("error", "adaptive plane size: run 'Check memory' first ("
                                      + ", ".join(unplanned) + " not planned yet)"))
@@ -310,8 +311,7 @@ class PipelineSpec:
             env["FORCE"] = "1"
         if self.plan_only:
             env["DRY_RUN"] = "1"
-        if _rs.PYTHON != _rs.PIPELINE_PY_DEFAULT:
-            env["PY"] = _rs.PYTHON
+        env["PY"] = _rs.PYTHON             # the figure steps' python (as the download tab passes it)
         return [str(_rs.PIPELINE_SCRIPT)], env
 
     def _render_step(self, sim: str, nu: int, snaps: list[int] | None) -> _rs.Step:

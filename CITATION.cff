@@ -1,0 +1,62 @@
+cff-version: 1.2.0
+message: >-
+  If you use Lamina, cite it as below, together with the papers of the methods you use: Schaap & van de Weygaert
+  (2000) for DTFE, Feldbrugge (2024) for PS-DTFE, and Cautun & van de Weygaert (2011) for the DTFE public software
+  Lamina builds on (all listed under references).
+title: "Lamina: Linear Adaptive Multi-stream Interpolation for N-body Analysis"
+abstract: >-
+  Two Delaunay tessellation field estimators for cosmological simulations: DTFE and the phase-space DTFE (PS-DTFE),
+  which resolves the streams where the dark-matter sheet has folded. With GPU deposits (Metal, CUDA, HIP), exact cell
+  averages and point evaluation, a Python package (dtfelib) and a graphical launcher.
+type: software
+authors:
+  - family-names: Westerhoek
+    given-names: Luuk
+    affiliation: "Kapteyn Astronomical Institute, University of Groningen"
+  - family-names: Cautun
+    given-names: Marius C.
+    affiliation: "Kapteyn Astronomical Institute, Durham University, Leiden University"
+repository-code: "https://github.com/lrwesterhoek/DTFE"
+license: GPL-3.0-or-later
+keywords:
+  - cosmology
+  - cosmic web
+  - Delaunay tessellation
+  - DTFE
+  - phase space
+  - density estimation
+  - N-body simulations
+references:
+  - type: article
+    title: "Continuous Fields and Discrete Samples: Reconstruction through Delaunay Tessellations"
+    authors:
+      - family-names: Schaap
+        given-names: W. E.
+      - family-names: van de Weygaert
+        given-names: R.
+    journal: "Astronomy and Astrophysics"
+    volume: 363
+    start: "L29"
+    end: "L32"
+    year: 2000
+    doi: "10.48550/arXiv.astro-ph/0011007"
+  - type: software
+    title: "The DTFE public software: The Delaunay Tessellation Field Estimator code"
+    authors:
+      - family-names: Cautun
+        given-names: Marius C.
+      - family-names: van de Weygaert
+        given-names: Rien
+    year: 2011
+    doi: "10.48550/arXiv.1105.0370"
+    identifiers:
+      - type: other
+        value: "ascl:1105.003"
+        description: "Astrophysics Source Code Library"
+  - type: article
+    title: "Phase-Space Delaunay Tessellation Field Estimator"
+    authors:
+      - family-names: Feldbrugge
+        given-names: Job
+    year: 2024
+    doi: "10.48550/arXiv.2402.16234"

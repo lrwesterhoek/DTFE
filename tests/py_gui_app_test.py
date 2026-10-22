@@ -7,7 +7,7 @@ then grids + image plane + plot_pointeval.py) and Data (download through a FAKE 
 local TNG-like chunks -- no network -- then merge_HDF5.py) -- and Stop killing the process tree.
 
 Every figure goes into a temp folder (DTFE_FIGURES_ROOT, set before the launcher is imported and inherited
-by the scripts it runs) -- never the real figures root, which is the T7 when it is mounted.
+by the scripts it runs) -- never the real figures root.
 
 Needs PySide6 and the built ./PS-DTFE (make PS-DTFE); without either it reports SKIP and exits
 0 -- unless DTFE_GUI_TEST_REQUIRED=1 (as in CI), where a skip is a failure, so a broken PySide6
@@ -28,7 +28,7 @@ import numpy as np
 
 from _harness import REPO as ROOT, check_ok as check, setup, summary
 
-setup("gui_app_figs_", paths=("python/gui",), no_mirror=False, mpl_agg=False)    # BEFORE runspec is imported
+setup("gui_app_figs_", paths=("python/gui",), mpl_agg=False)    # BEFORE runspec is imported
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ["DTFE_GUI_NO_NOTIFY"] = "1"          # no desktop notifications from a test run
 REQUIRED = os.environ.get("DTFE_GUI_TEST_REQUIRED") == "1"
@@ -45,6 +45,8 @@ import app as A  # noqa: E402
 import explore as E  # noqa: E402
 import grids as G  # noqa: E402
 from PySide6.QtCore import QPointF  # noqa: E402
+from PySide6.QtGui import QAction  # noqa: E402
+from PySide6.QtWidgets import QFormLayout  # noqa: E402
 import runspec as rs  # noqa: E402
 
 SIM = "GUITEST-1-Dark"
@@ -127,7 +129,7 @@ def main():
         return 1 if REQUIRED else 0
     qa = QApplication([])
     tmp = Path(tempfile.mkdtemp(prefix="gui_app_"))
-    data = tmp / "fam root"                                   # a space, like 'Samsung T7'
+    data = tmp / "fam root"                                   # a space, like an external disk's name
     repo_figs = rs.FIGURES_ROOT / "fields" / SIM
     try:
         sim = data / "GUITEST" / SIM
@@ -145,672 +147,709 @@ def main():
         w.show()
         qa.processEvents()
 
-        print("window:")
-        check("simulation discovered in the per-family root",
-              [w.sim_combo.itemText(i) for i in range(w.sim_combo.count())] == [SIM])
-        check("both snapshots listed and ticked, none done yet",
-              [(w.snap_list.item(i).data(0x0100), w.snap_list.item(i).checkState().value)
-               for i in range(w.snap_list.count())] == [(50, 2), (99, 2)]
-              and "done" not in w.snap_list.item(0).text())
-        check("the command preview is the RunSpec's shell line", w.cmd_view.toPlainText() == spec.shell_line())
-        check("Run is enabled for a valid spec", w.run_btn.isEnabled())
-        w.dtfe_radio.setChecked(True)
-        qa.processEvents()
-        check("DTFE mode disables the PS-only options (the hi-res slice works with both estimators) and switches script",
-              not w.ps_group.isEnabled() and w.slice_group.isEnabled()
-              and "scripts/run_dtfe.sh" in w.cmd_view.toPlainText())
-        w.ps_radio.setChecked(True)
-        w.snap_list.item(0).setCheckState(w.snap_list.item(0).checkState().Unchecked)
-        w.snap_list.item(1).setCheckState(w.snap_list.item(1).checkState().Unchecked)
-        qa.processEvents()
-        check("no snapshots ticked blocks Run, with a neutral hint (not a red error)", not w.run_btn.isEnabled()
-              and any(w.checks.item(i).text().startswith("→") and "tick the snapshots" in w.checks.item(i).text()
-                      for i in range(w.checks.count()))
-              and not any(w.checks.item(i).text().startswith("✖") for i in range(w.checks.count())))
-        w._select_snaps("all")
-        qa.processEvents()
-        check("'All' re-ticks them and re-enables Run", w.spec.snapshots == [50, 99] and w.run_btn.isEnabled())
-
-        print("run:")
-        seen = set()
-        tick = QTimer(interval=20)
-        tick.timeout.connect(lambda: w.proc is not None and seen.add((w.bar.value(), w.bar.maximum(),
-                                                                       w.snap_label.text())))
-        tick.start()
-        # ... and every bar change as it happens: on a tiny run the last partition and the end of
-        # the run can fall between two 20 ms samples (missed 8/8 once on Ubuntu)
-        w.bar.valueChanged.connect(lambda v: w.proc is not None
-                                   and seen.add((v, w.bar.maximum(), w.snap_label.text())))
-        w.run_btn.click()
-        dt = wait_idle(w, 300)
-        tick.stop()
-        log = w.log.toPlainText()
-        check(f"a real two-snapshot run finishes ({dt:.0f} s)", w.status.text() == "Finished", w.status.text())
-        check("the exit summary is shown", w.snap_label.text() == "2 processed, 0 skipped, 0 failed.",
-              w.snap_label.text())
-        check("the partition bar reached 8/8", (8, 8) in {(v, m) for v, m, _ in seen}, str(sorted(seen)[-3:]))
-        check("the snapshot counter stepped 1/2 -> 2/2",
-              {"snapshot 1/2", "snapshot 2/2"} <= {s for _, _, s in seen})
-        check("progress fragments kept out of the log, results kept in",
-              "[partitions" not in log and log.count("processed successfully") == 2)
-        check("both snapshots now marked done",
-              all("done" in w.snap_list.item(i).text() for i in range(w.snap_list.count())))
-        check("outputs written with the chosen prefix",
-              all((sim / f"snapdir_{n:03d}" / "ps_gui.a_den").is_file() for n in (50, 99)))
-
-        print("plots:")
-        w.tabs.setCurrentIndex(A.PLOTS)
-        qa.processEvents()
-        marks = lambda: ["grids" in w.snap_list.item(i).text() for i in range(w.snap_list.count())]  # noqa: E731
-        check("the default prefix finds no grids (the run wrote 'ps_gui')", marks() == [False, False])
-        check("no figure set ticked blocks Run", not w.run_btn.isEnabled())
-        w.fig_list.item(0).setCheckState(w.fig_list.item(0).checkState().Checked)     # Field slice maps
-        w.pl_method.setCurrentIndex(w.pl_method.findData("ps"))
-        w.pl_prefix.setText("ps_gui")
-        w.pl_prefix.editingFinished.emit()
-        qa.processEvents()
-        check("... the 'ps_gui' prefix marks both snapshots as having grids", marks() == [True, True])
-        steps = w.plots.steps()
-        check("one plot_PS_DTFE.py call per snapshot, with estimator and prefix",
-              [st.argv[2:] for st in steps] == [["--sim", SIM, "--snap", str(n), "--method", "ps", "--prefix",
-                                                 "ps_gui"] for n in (50, 99)]
-              and all(st.env["MPLBACKEND"] == "Agg" and st.env["DTFE_SIM"] == SIM for st in steps),
-              str([st.argv[2:] for st in steps]))
-        check("the preview lists both commands", w.cmd_view.toPlainText() == rs.script_text(steps))
-        w.run_btn.click()
-        dt = wait_idle(w, 300)
-        n_figs = w.figures.list.count()
-        check(f"both plot steps succeed ({dt:.0f} s)", w.status.text() == "Finished"
-              and w.snap_label.text() == "2/2 steps OK", f"{w.status.text()} | {w.snap_label.text()}")
-        check("the figures they wrote are listed and the browser is shown",
-              n_figs > 0 and w.results.currentWidget() is w.figures
-              and w.results.tabText(w.results.indexOf(w.figures)) == f"Figures ({n_figs} new)"
-              and all(SIM in w.figures.list.item(i).text() for i in range(n_figs)), f"{n_figs} figures")
-        check("the first figure is previewed", w.figures.preview.pixmap() is not None
-              and not w.figures.preview.pixmap().isNull())
-        check("the Figures menu can open or reveal the selected figure, like the buttons",
-              w.fig_open_action.isEnabled() and w.fig_reveal_action.isEnabled()
-              and w.fig_mode_actions[0].isChecked())
-        w.results.setCurrentIndex(w.results.indexOf(w.log))
-        qa.processEvents()
-        check("... but not while the browser is off screen", not w.fig_open_action.isEnabled()
-              and not w.fig_reveal_action.isEnabled() and w.fig_refresh_action.isEnabled())
-        w.fig_mode_actions[1].trigger()               # Figures > All Figures
-        qa.processEvents()
-        check("Figures > All Figures brings the browser up, listing every figure",
-              w.results.currentWidget() is w.figures and w.figures.mode.currentIndex() == 1
-              and w.figures.list.count() >= n_figs and w.fig_open_action.isEnabled())
-        w.figures.mode.setCurrentIndex(0)
-        qa.processEvents()
-        check("choosing in the drop-down ticks the menu's choice", w.fig_mode_actions[0].isChecked()
-              and not w.fig_mode_actions[1].isChecked() and w.figures.list.count() == n_figs)
-        w.results.setCurrentIndex(w.results.indexOf(w.log))
-        w.fig_refresh_action.trigger()                # Figures > Refresh Figures
-        qa.processEvents()
-        check("Figures > Refresh Figures brings the browser up too",
-              w.results.currentWidget() is w.figures and w.figures.list.count() == n_figs)
-
-        print("pipeline:")
-        w.tabs.setCurrentIndex(A.PIPELINE)
-        qa.processEvents()
-        check("the pipeline tab disables the snapshot list and plans both snapshots",
-              not w.snap_list.isEnabled() and f"{SIM}: 2 of 2 snapshots to compute" in w.estimate.text(),
-              w.estimate.text())
-        w.p_plan.setChecked(True)
-        qa.processEvents()
-        check("plan only: one DRY_RUN step, no render", len(w.pipe.steps()) == 1
-              and w.pipe.steps()[0].env.get("DRY_RUN") == "1" and not w.p_render.isEnabled())
-        w.run_btn.click()
-        wait_idle(w, 60)
-        check("the plan announces both snapshots and computes nothing",
-              w.status.text() == "Finished" and "run_ps_dtfe.sh" in w.log.toPlainText()
-              and not (sim / "hires_plane_z64.bin").exists(), w.status.text())
-        w.p_plan.setChecked(False)
-        qa.processEvents()
-        check("the real pipeline is two steps: pipeline, then plot_pointeval.py on its own plane",
-              [st.label for st in w.pipe.steps()] == [f"run_ps_pipeline.sh {SIM}", f"plot_pointeval.py {SIM}"]
-              and str(sim / "hires_plane_z64.json") in w.pipe.steps()[1].argv)
-
-        print("pipeline options:")
-        # the caustic classes are on by default (run_ps_dtfe.sh's default, the production runs'), so the
-        # cusps box is enabled (unticked) from the start
-        check("the run options show the scripts' defaults; cusps wait for caustics, the slab and projection for planes",
-              w.p_deposit.currentData() == "sampled" and w.p_nsub.value() == 3 and w.p_nsub.isEnabled()
-              and w.p_gpu.isChecked() == rs.gpu_build_default("ps") and w.p_vm.isChecked() and w.p_vw.isChecked()
-              and w.p_ca.isChecked()
-              and w.p_cu.isEnabled() and not w.p_cu.isChecked() and not w.p_pt.isHidden() and w.p_planes.value() == 1
-              and not w.p_thick.isEnabled() and w.p_super.value() == 1 and not w.p_rproject.isEnabled()
-              and w.p_render_box.isEnabled() and w.p_rsmoothd.value() == rs.POINTEVAL_DERIVATIVE_SMOOTH)
-        w.p_ca.setChecked(True)
-        w.p_cu.setChecked(True)
-        w.p_gpu.setChecked(False)
-        w.p_nsub.setValue(2)
-        w.p_planes.setValue(4)
-        qa.processEvents()
-        texts = lambda: [w.checks.item(i).text() for i in range(w.checks.count())]  # noqa: E731
-        check("a handful of planes warns of ghosting; cusps on a GPU-less run pass the checks",
-              any("ghosts" in t for t in texts()) and not any("cusps" in t for t in texts()), str(texts()))
-        w.p_planes.setValue(16)
-        w.p_thick.setValue(3.0)
-        w.p_super.setValue(2)
-        w.p_rfields.setText("density, streams")
-        w.p_rfields.editingFinished.emit()
-        w.p_rproject.setCurrentIndex(w.p_rproject.findData("slab"))
-        w.p_rfixed.setChecked(True)
-        qa.processEvents()
-        env = w.pipe.command()[1]
-        st = w.pipe.steps()
-        check("the options reach the pipeline's environment, the render step and the estimate",
-              w.p_cu.isEnabled() and w.p_thick.isEnabled() and w.p_rproject.isEnabled()
-              and [env[k] for k in ("PS_CAUSTICS", "PS_CAUSTIC_CUSPS", "PS_GPU", "AVG_SUBSAMPLES", "PLANES", "THICKNESS",
-                                    "SUPERSAMPLE")] == ["1", "1", "0", "2", "16", "3", "2"]
-              and st[1].argv[st[1].argv.index("--fields") + 1] == "density,streams"
-              and st[1].argv[st[1].argv.index("--project") + 1] == "slab" and "--fixed-range" in st[1].argv
-              and "× 16 planes" in w.estimate.text() and f"{16 * 64 * 64 * 4 / 1e6:.1f}M points" in w.estimate.text(),
-              f"{env} | {st[1].argv} | {w.estimate.text()}")
-        mstep = w.pipe.check_step(SIM, [99], 64)
-        check("the memory check of these settings carries them, sized by the planned points, without -m",
-              "-m" not in mstep.argv and mstep.env["PS_CAUSTICS"] == "1" and mstep.env["AVG_SUBSAMPLES"] == "2"
-              and mstep.env.get("DTFE_AUTO_PTS_N") == str(16 * 64 * 64 * 4), f"{mstep.argv} {mstep.env}")
-        check("at 16 planes the ghosting warning is gone", not any("ghosts" in t for t in texts()), str(texts()))
-        w.p_ca.setChecked(False)
-        qa.processEvents()
-        check("unticking caustics greys the (still ticked) cusps box without blocking the run",
-              not w.p_cu.isEnabled() and w.p_cu.isChecked() and not w.pipe.caustic_cusps
-              and not any("cusps" in t for t in texts()), str(texts()))
-        w.p_ca.setChecked(True)
-        qa.processEvents()
-        check("... and ticking it again brings the cusps back", w.pipe.caustic_cusps and w.p_cu.isEnabled())
-        w.p_deposit.setCurrentIndex(w.p_deposit.findData("exact"))
-        qa.processEvents()
-        check("the exact deposit ticks the GPU (as on the Grids tab) and greys the sub-samples",
-              w.pipe.deposit == "exact" and (w.p_gpu.isChecked() or not rs.gpu_built("ps"))
-              and not w.p_nsub.isEnabled() and w.pipe.command()[1]["PS_EXACT"] == "1")
-        for cb in (w.p_ca, w.p_cu, w.p_rfixed):
-            cb.setChecked(False)
-        w.p_deposit.setCurrentIndex(w.p_deposit.findData("sampled"))
-        w.p_gpu.setChecked(True)
-        w.p_nsub.setValue(3)
-        w.p_planes.setValue(1)
-        w.p_super.setValue(1)
-        w.p_rfields.setText("")
-        w.p_rfields.editingFinished.emit()
-        w.p_rproject.setCurrentIndex(0)
-        qa.processEvents()
-        check("back at the defaults: the same two steps, GPU on",
-              [st.label for st in w.pipe.steps()] == [f"run_ps_pipeline.sh {SIM}", f"plot_pointeval.py {SIM}"]
-              and w.pipe.command()[1]["PS_GPU"] == "1" and w.pipe.planes == 1 and w.pipe.render_fields == "")
-        seen.clear()
-        tick.start()
-        w.run_btn.click()
-        dt = wait_idle(w, 600)
-        tick.stop()
-        check(f"pipeline + render succeed ({dt:.0f} s)", w.status.text() == "Finished", w.status.text())
-        check("the pipeline's snapshot plan drove the counter (2 planned)",
-              any(s.endswith("/2") for _, _, s in seen), str({s for _, _, s in seen}))
-        check("slices written, and nothing left to compute",
-              all((sim / f"snapdir_{n:03d}" / "ps_output.pts_den").is_file() for n in (50, 99))
-              and f"{SIM}: 0 of 2 snapshots to compute" in w.estimate.text(), w.estimate.text())
-        pe = rs.figures([tmp / "figs"])
-        check("the point-evaluated figures are in the browser",
-              len(pe) > 0 and w.figures.list.count() == len(pe), f"{len(pe)} on disk, {w.figures.list.count()} listed")
-
-        print("data (download + merge, with a fake wget -- no network):")
-        fixtures, fakebin = tmp / "fixtures", tmp / "bin"
-        for n in (50, 99):
-            make_raw_chunks(fixtures / f"snapshot-{n}", n, chunks=2)
-        fakebin.mkdir()
-        (fakebin / "wget").write_text(FAKE_WGET.replace("@FIXTURES@", str(fixtures)))
-        (fakebin / "wget").chmod(0o755)
-        os.environ["PATH"] = f"{fakebin}:{os.environ['PATH']}"
-        os.environ["TNG_API_KEY"] = SECRET
-        (data / "GUIDL").mkdir()                       # an (empty) family folder for the new run
-        w.tabs.setCurrentIndex(A.DATA)
-        w.d_sim.setCurrentText(DL_SIM)
-        w.d_sim.lineEdit().editingFinished.emit()
-        qa.processEvents()
-        rows = {w.d_table.item(r, 0).data(0x0100): r for r in range(w.d_table.rowCount())}
-        check("the Data tab lists the redshift ladder for a simulation not on disk yet",
-              {0, 50, 99} <= set(rows) and "(new folder)" in w.d_target.text()
-              and w.d_target.text().startswith(f"GUIDL/{DL_SIM}")
-              and w.d_target.toolTip().startswith(str(data / "GUIDL" / DL_SIM)), w.d_target.text())
-        for n in (50, 99):
-            w.d_table.item(rows[n], 0).setCheckState(w.d_table.item(rows[n], 0).checkState().Checked)
-        qa.processEvents()
-        check("download + merge of the ticked snapshots, as two steps",
-              [st.label for st in w.data.steps()] == ["download snapshots 50 99", "merge snapshots 50 99"]
-              and w.run_btn.isEnabled(), str([st.label for st in w.data.steps()]))
-        check("the API key is on no command line", SECRET not in w.cmd_view.toPlainText()
-              and all(SECRET not in " ".join(st.argv) + str(st.env) for st in w.data.steps()))
-        seen.clear()
-        tick.start()
-        w.run_btn.click()
-        dt = wait_idle(w, 120)
-        tick.stop()
-        sd = data / "GUIDL" / DL_SIM
-        check(f"download + merge succeed ({dt:.0f} s)", w.status.text() == "Finished", w.status.text())
-        check("the downloaded files were counted", any("4 files" in s for _, _, s in seen),
-              str({s for _, _, s in seen}))
-        check("the merge showed its chunk progress", (2, 2) in {(v, m) for v, m, _ in seen})
-        check("both combined files verify against the header totals",
-              all((sd / f"snapdir_{n:03d}" / f"combined_{n:03d}.hdf5").is_file() for n in (50, 99))
-              and w.log.toPlainText().count("Particles merged: [4096]") == 2
-              and "MISMATCH" not in w.log.toPlainText(), w.log.toPlainText()[-600:])
-        check("the key never reached the log", SECRET not in w.log.toPlainText())
-        rows = {w.d_table.item(r, 0).data(0x0100): r for r in range(w.d_table.rowCount())}
-        check("the table now shows them merged, chunks kept",
-              all(w.d_table.item(rows[n], 2).text() == "merged (+2 chunks)" for n in (50, 99)))
-        check("the new simulation appears in the shared simulation list",
-              DL_SIM in [w.sim_combo.itemText(i) for i in range(w.sim_combo.count())])
-        check("running it again has nothing left to do (merged items are never re-merged)",
-              not w.run_btn.isEnabled() and w.data.steps() == [])
-        # a download that stopped early: the fixture serves 2 chunks of a snapshot whose header promises 3
-        make_raw_chunks(fixtures / "snapshot-67", 67, chunks=3)
-        (fixtures / "snapshot-67" / "snap_067.2.hdf5").unlink()
-        w.d_table.item(rows[67], 0).setCheckState(w.d_table.item(rows[67], 0).checkState().Checked)
-        qa.processEvents()
-        steps67 = w.data.steps()
-        check("snapshot 67 ticked: download + merge, the merge chained to its download", [st.label for st in steps67]
-              == ["download snapshots 67", "merge snapshots 67"] and steps67[1].after == "download snapshots 67",
-              str([(st.label, st.after) for st in steps67]))
-        (sd / "snapdir_067").mkdir(parents=True, exist_ok=True)
-        (sd / "snapdir_067" / "combined_067.hdf5.partial").write_text("stale")       # a merge stopped half-way before
-        w.run_btn.click()
-        wait_idle(w, 120)
-        st67 = rs.snapshot_state(sd, 67)
-        check("2 of the header's 3 chunks: the merge step FAILS (it merged what was there and called it done)",
-              w.status.text() == "Finished: 1 of 2 steps failed", w.status.text())
-        check("... no combined file, the chunks kept, the stale .partial gone and no new one",
-              st67 == {"chunks": 2, "merged": False, "gc_chunks": 0, "gc_merged": False}
-              and not list((sd / "snapdir_067").glob("*.partial")), str(st67))
-        check("... the log names the missing chunk and the header's count",
-              "snap_067.2.hdf5" in w.log.toPlainText() and "the header promises 3" in w.log.toPlainText(),
-              w.log.toPlainText()[-500:])
-        rows = {w.d_table.item(r, 0).data(0x0100): r for r in range(w.d_table.rowCount())}
-        check("the table does not show it merged", "merged" not in w.d_table.item(rows[67], 2).text(),
-              w.d_table.item(rows[67], 2).text())
-        w.d_table.item(rows[67], 0).setCheckState(w.d_table.item(rows[67], 0).checkState().Unchecked)
-        qa.processEvents()
-        # a download that fails outright (no fixture: the fake wget exits 8): the merge is skipped, not run on nothing
-        w.d_table.item(rows[33], 0).setCheckState(w.d_table.item(rows[33], 0).checkState().Checked)
-        qa.processEvents()
-        w.run_btn.click()
-        wait_idle(w, 120)
-        log33 = w.log.toPlainText()
-        check("a failed download: its merge step is skipped and counted failed (half a download is never merged)",
-              w.status.text() == "Finished: 2 of 2 steps failed" and "merge snapshots 33: skipped, 'download snapshots 33' failed" in log33
-              and "Error downloading snapshot-33" in log33 and not rs.snapshot_state(sd, 33)["merged"],
-              f"{w.status.text()} | {log33[-400:]}")
-        w.d_table.item(rows[33], 0).setCheckState(w.d_table.item(rows[33], 0).checkState().Unchecked)
-        qa.processEvents()
-        os.environ.pop("TNG_API_KEY")
-
-        print("memory check:")
-        (sim / "hires_plane_z64.bin").unlink(missing_ok=True)
-        import numpy as np
-        np.random.default_rng(3).uniform(0, 100, (64 * 64, 3)).tofile(sim / "slice_plane_z64.bin")
-        w._fill_sim_dependent()                     # the window lists a simulation's planes when it loads it
-        w.tabs.setCurrentIndex(A.GRIDS)
-        w.sim_combo.setCurrentText(SIM)
-        qa.processEvents()
-        w._select_snaps("all")
-        w.prefix_edit.setText("ps_mem")
-        w.prefix_edit.editingFinished.emit()
-        w.grid_combo.setCurrentText("32")
-        w.plane_combo.setCurrentIndex(w.plane_combo.findData(str(sim / "slice_plane_z64.bin")))
-        qa.processEvents()
-        check("the slice is selected", w.spec.slice_plane.endswith("slice_plane_z64.bin"), w.spec.slice_plane)
-        lines = lambda: [w.checks.item(i).text() for i in range(w.checks.count())]  # noqa: E731
-        check("an unchecked slice run says memory is not checked yet",
-              any("memory not checked" in t for t in lines()), str(lines()))
-        check("'Check memory' is offered for a PS grids run, in the window and in the Run menu",
-              w.mem_btn.isEnabled() and w.mem_action.isEnabled() and w.mem_action.text() == "Check Memory")
-        w.mem_btn.click()
-        wait_check(w, 120)
-        check("the check reports every snapshot fits", any(t.startswith("✔") and "memory: all 2 snapshots fit" in t
-                                                            for t in lines()), str(lines()))
-        res = w.mem_results[w.spec.memory_key()]
-        check("... from the binary's own report (partition, concurrency, prediction, budget)",
-              {(SIM, 50, None), (SIM, 99, None)} <= set(res) and all("predicted_gb" in r and "budget_gb" in r
-                                                                      for r in res.values()), str(res))
-        os.environ["DTFE_MEM_BUDGET_GB"] = "0.0001"             # a machine far too small
-        w.mem_action.trigger()                                    # this time from the menu
-        check("Run > Check Memory starts the same check (the menu item then cancels it)",
-              w._mcheck is not None and w.mem_action.text() == "Cancel Memory Check"
-              and w.mem_btn.text() == "Cancel check")
-        wait_check(w, 120)
-        check("over the budget: a warning per snapshot, naming what lowers it",
-              sum("over the" in t and "budget" in t and "smaller slice plane" in t for t in lines()) == 2, str(lines()))
-        del os.environ["DTFE_MEM_BUDGET_GB"]
-        w.grid_combo.setCurrentText("16")
-        qa.processEvents()
-        check("changed settings are not covered by the old check", any("memory not checked" in t for t in lines()))
-        # standard DTFE too -- run_dtfe.sh AUTO_TUNE_REPORT=1 asks the standard binary's own tuner
-        w.dtfe_radio.setChecked(True)
-        w.plane_combo.setCurrentIndex(0)                         # no slice: a standard slice needs one triangulation
-        qa.processEvents()
-        check("'Check memory' is offered for a standard-DTFE grids run too",
-              w.spec.estimator == "dtfe" and w.mem_btn.isEnabled() and w.mem_action.isEnabled())
-        w.mem_btn.click()
-        wait_check(w, 120)
-        res = w.mem_results.get(w.spec.memory_key(), {})
-        check("... and its report covers both snapshots, which fit", {(SIM, 50, None), (SIM, 99, None)} <= set(res)
-              and any(t.startswith("✔") and "memory: all 2 snapshots fit" in t for t in lines()), str(lines()))
-        check("... from run_dtfe.sh, writing nothing beside the data",
-              not list((sim / "snapdir_099").glob("output.*")) and not list((sim / "snapdir_050").glob("output.*")),
-              str(list((sim / "snapdir_099").glob("output.*"))))
-        os.environ["DTFE_MEM_BUDGET_GB"] = "0.0001"
-        w.mem_btn.click()
-        wait_check(w, 120)
-        check("... over the budget: a warning per snapshot with the standard run's own remedies",
-              sum("over the" in t and "budget" in t and "smaller padding" in t for t in lines()) == 2, str(lines()))
-        del os.environ["DTFE_MEM_BUDGET_GB"]
-        w.ps_radio.setChecked(True)
-        qa.processEvents()
-
-        rs.ADAPTIVE_MIN_NU, min_nu = 64, rs.ADAPTIVE_MIN_NU      # small planes for a small box
-        w.tabs.setCurrentIndex(A.PIPELINE)
-        w.p_nu.setCurrentText("1024")
-        w.p_grid.setCurrentText("32")
-        w.p_prefix.setText("ps_mem")
-        w.p_prefix.editingFinished.emit()
-        w.p_render.setChecked(False)
-        qa.processEvents()
-        # Planes large enough that their points, not the tessellation, set the difference (1024²: ~0.2
-        # GB of point records, 512²: ~0.05). The budget must sit between the two sizes' SMALLEST
-        # possible footprints: the tuner splits a small particle set whose one domain
-        # does not fit, so a budget between the unsplit predictions is met by a split at the larger
-        # plane, and nothing would be halved. A budget just above the fixed part (the full grid and
-        # the points, which no split reduces) makes the binary report that smallest split.
-        steps = {nu: w.pipe.check_step(SIM, [99], nu) for nu in (1024, 512)}
-
-        def report(nu, budget=None):
-            env = dict(os.environ, **steps[nu].env)
-            if budget is not None:
-                env["DTFE_MEM_BUDGET_GB"] = budget
-            r = subprocess.run(steps[nu].argv, env=env, capture_output=True, text=True, cwd=str(ROOT))
-            return rs.parse_reports(r.stdout).get(99, {})
-
-        fixed = max(report(nu).get("fixed_gb", 0.) for nu in steps)
-        outs = {nu: report(nu, f"{fixed + 0.01:.4f}").get("predicted_gb") for nu in steps}
-        check("a larger plane needs more memory, even split as finely as the tuner goes",
-              outs[1024] and outs[512] and outs[1024] - outs[512] > 0.05, str(outs))
-        os.environ["DTFE_MEM_BUDGET_GB"] = f"{(outs[1024] + outs[512]) / 2:.4f}"
-        w.p_adaptive.setChecked(True)
-        qa.processEvents()
-        check("adaptive without a check is refused", not w.run_btn.isEnabled()
-              and any("run 'Check memory' first" in t for t in lines()), str(lines()))
-        w.mem_btn.click()
-        wait_check(w, 300)
-        check("the check halves the plane where it does not fit, and plans the fitting size",
-              w.pipe.plan.get(SIM) == {"050": 512, "099": 512} and w.run_btn.isEnabled(), str(w.pipe.plan))
-        check("the pipeline then runs at that size, on those snapshots",
-              [(st.env.get("NU"), st.env.get("SNAPS")) for st in w.pipe.steps()] == [("512", "50 99")],
-              str([(st.env.get("NU"), st.env.get("SNAPS")) for st in w.pipe.steps()]))
-        w.p_adaptive.setChecked(False)
-        qa.processEvents()
-        check("without Adaptive the over-budget size is a warning that names the size that fits",
-              any("at 1024² needs" in t and "512² fits" in t for t in lines()), str(lines()))
-        del os.environ["DTFE_MEM_BUDGET_GB"]
-        rs.ADAPTIVE_MIN_NU = min_nu
-
-        print("queue:")
-        w.q_wait.setChecked(False)           # (a real DTFE run may be going on this machine)
-        w.q_stop_on_fail.setChecked(True)
-        w.tabs.setCurrentIndex(A.GRIDS)
-        w.sim_combo.setCurrentText(SIM)
-        qa.processEvents()
-        w.prefix_edit.setText("ps_q1")
-        w.prefix_edit.editingFinished.emit()
-        w.grid_combo.setCurrentText("16")
-        w._select_snaps("none")
-        w.snap_list.item(0).setCheckState(w.snap_list.item(0).checkState().Checked)          # 050 only
-        qa.processEvents()
-        w.queue_btn.click()                                                                    # job 1: grids
-        check("'Add to queue' queues the Grids job and shows the queue",
-              len(w.queue) == 1 and w.queue[0].kind == "grids" and w.queue[0].state == "waiting"
-              and w.results.currentWidget() is w.queue_tab and "050" in w.queue[0].title, str(w.queue))
-        w.tabs.setCurrentIndex(A.PLOTS)
-        qa.processEvents()
-        w.pl_prefix.setText("ps_q1")                  # grids that job 1 has not written yet
-        w.pl_prefix.editingFinished.emit()           # (snapshots shared with the Grids tab: 050)
-        qa.processEvents()
-        check("a plot of grids a queued job will write can be queued (only a warning now)",
-              w.queue_btn.isEnabled())
-        w.queue_btn.click()                                                                    # job 2: plots
-        fields_item, thesis_item = w.fig_list.item(0), w.fig_list.item(len(rs.FIGURE_SETS) - 1)
-        fields_item.setCheckState(fields_item.checkState().Unchecked)
-        thesis_item.setCheckState(thesis_item.checkState().Checked)
-        w.opt_widgets[("thesis", "mode")][1].setCurrentText("check")   # exits 1: no DTFE grids here
-        qa.processEvents()
-        w.queue_btn.click()                                                                    # job 3: fails
-        thesis_item.setCheckState(thesis_item.checkState().Unchecked)
-        fields_item.setCheckState(fields_item.checkState().Checked)
-        w.opt_widgets[("fields", "pointeval_only")][1].setChecked(True)
-        qa.processEvents()
-        vmin_w, vmax_w = w.opt_widgets[("panels", "vmin")][1], w.opt_widgets[("panels", "vmax")][1]
-        vmax_w.setValue(2.3e5)
-        vmin_w.setValue(0.003)
-        check("the panels' density limits hold real densities (TNG100 z=0 peaks at 2.3e5; voids go below 0.01; the "
-              "default float box stopped at 1000 and 0.01)", vmax_w.value() == 2.3e5 and abs(vmin_w.value() - 0.003) < 1e-9,
-              f"{vmin_w.value()} {vmax_w.value()}")
-        vmax_w.setValue(0.0)
-        vmin_w.setValue(0.0)
-        check("Run > Add to Queue is offered like the button", w.queue_action.isEnabled())
-        w.queue_action.trigger()                                                               # job 4, from the menu
-        check("four jobs queued, all waiting", [j.state for j in w.queue] == ["waiting"] * 4
-              and w.results.tabText(w.results.indexOf(w.queue_tab)) == "Queue (4 waiting)")
-        titles = [j.title for j in w.queue]
-        w.q_list.setCurrentRow(3)
-        qa.processEvents()
-        check("the Queue menu offers what the buttons offer for the selected (last) job",
-              all(getattr(w, f"q_{k}_action").isEnabled() == getattr(w, f"q_{k}").isEnabled()
-                  for k in ("start", "up", "down", "remove", "clear"))
-              and w.q_up_action.isEnabled() and not w.q_down_action.isEnabled()
-              and w.q_start_action.text() == "Start Queue")
-        w.q_up_action.trigger()                       # Queue > Move Job Up
-        moved = [j.title for j in w.queue]
-        w.q_down_action.trigger()                     # ... and back down
-        check("Move Job Up / Down reorder the queue", moved == titles[:2] + [titles[3], titles[2]]
-              and [j.title for j in w.queue] == titles, str(moved))
-        check("the queue's options are ticked in the menu like on the tab",
-              w.q_stop_on_fail_action.isChecked() and not w.q_wait_action.isChecked())
-        w.q_wait_action.setChecked(True)
-        check("... and ticking one in the menu ticks the tab's box (and back)", w.q_wait.isChecked())
-        w.q_wait.setChecked(False)
-        check("...", not w.q_wait_action.isChecked())
-        w.results.setCurrentIndex(w.results.indexOf(w.log))
-        qa.processEvents()
-        check("with the Queue tab not on screen: no moving or removing, but the queue can start",
-              not w.q_up_action.isEnabled() and not w.q_remove_action.isEnabled() and w.q_start_action.isEnabled())
-        w.q_start_action.trigger()                    # Queue > Start Queue
-        check("Queue > Start Queue starts it (its log comes up, as with the button)",
-              w._queue_running and w.results.currentWidget() is w.log and not w.q_start_action.isEnabled())
-        dt = wait_queue(w, 600)
-        states = [j.state for j in w.queue]
-        check(f"the queue runs in order and stops at the failed job ({dt:.0f} s)",
-              states == ["done", "done", "failed", "waiting"] and "failed" in w.status.text(),
-              f"{states} | {w.status.text()}")
-        check("job 2 plotted the grids job 1 wrote",
-              (sim / "snapdir_050" / "ps_q1.a_den").is_file()
-              and len(rs.figures([repo_figs / "snap050"], since=w._figs_since)) > 0)
-        log = w.log.toPlainText()
-        check("one log for the whole queue, with a header per job",
-              all(f"Queue job {k}/4" in log for k in (1, 2, 3)) and "Queue job 4/4" not in log)
-        check("the failed job's note says how far it got, and how long it took",
-              w.queue[2].note.startswith("0/1 steps OK, took ") and w.queue[2].note.endswith(" s"), w.queue[2].note)
-        w.q_stop_on_fail.setChecked(False)
-        qa.processEvents()
-        check("the button offers to resume (and so does the menu)", w.q_start.text() == "Resume queue"
-              and w.q_start.isEnabled() and w.q_start_action.text() == "Resume Queue" and w.q_start_action.isEnabled())
-        w.q_start.click()
-        wait_queue(w, 300)
-        check("resumed: the last job ran too", [j.state for j in w.queue] == ["done", "done", "failed", "done"]
-              and w.status.text().startswith("Queue finished"), w.status.text())
-
-        orig_jobs = rs.running_jobs
-        rs.running_jobs = lambda max_age=2.0: [(424242, "PS-DTFE")]     # pretend another run is going
-        try:
-            check("Queue > Clear Finished Jobs is offered for a finished queue", w.q_clear_action.isEnabled())
-            w.q_clear_action.trigger()
-            check("'Clear finished' empties a finished queue", w.queue == [] and not w.q_clear_action.isEnabled())
-            w.q_wait.setChecked(True)
-            w._wait_poll_ms = 200
-            w.tabs.setCurrentIndex(A.GRIDS)
-            w.prefix_edit.setText("ps_q2")
-            w.prefix_edit.editingFinished.emit()
-            qa.processEvents()
-            w.queue_btn.click()
-            w.q_start.click()
-            loop = QEventLoop()
-            QTimer.singleShot(1000, loop.quit)
-            loop.exec()
-            check("a grids job waits while another PS-DTFE runs",
-                  w.proc is None and w.queue[0].state == "waiting" and "waiting for PS-DTFE (pid 424242)"
-                  in w.status.text() and w.stop_btn.isEnabled(), w.status.text())
-            w.stop_btn.click()
-            check("Stop while waiting pauses the queue", not w._queue_running and w.status.text() == "Queue paused")
-        finally:
-            rs.running_jobs = orig_jobs
-        w.q_wait.setChecked(False)
-        w.q_start.click()
-        wait_queue(w, 300)
-        check("resumed once free, the job runs", w.queue[0].state == "done"
-              and (sim / "snapdir_050" / "ps_q2.a_den").is_file(), w.queue[0].note)
-        # a queued job never starts beside a memory check (it polls until the check is over), and a
-        # Pipeline job that finds nothing to compute (a simulation folder without merged snapshots) fails:
-        # run_ps_pipeline.sh exits 1 and the render chained to it is skipped, not run on nothing
-        empty = data / "GUIEMPTY" / "GUIEMPTY-1-Dark"
-        empty.mkdir(parents=True)
-        ep = rs.PipelineSpec(data_root=str(data), sims=["GUIEMPTY-1-Dark"], nu=64, grid=32, gpu=False,
-                             figures_root=str(tmp / "figs"))
-        lab = [st.label for st in ep.steps()]
-        w.queue.append(rs.QueuedJob.of("pipeline", ep))
-        w._refresh_queue()
-        poll_ms = w._wait_poll_ms
-        w._wait_poll_ms, w._mcheck, w._queue_running = 100, {"proc": None}, True     # a check going on
-        try:
-            w._next_queued()
-            spin(500)                                     # five polls
-            held = (w.proc is None and w.queue[-1].state == "waiting"
-                    and w.status.text().startswith("Queue: waiting for the memory check to finish"))
-            status_held = w.status.text()
-        finally:
-            w._mcheck = None
-        check("a queued job waits while a memory check runs (no process started; it looks again)", held
-              and not [e for lvl, e in ep.problems() if lvl == "error"], status_held)
-        wait_queue(w, 60)                                 # the next poll starts it: nothing else calls _next_queued
-        log = w.log.toPlainText()
-        check("... the check over, it starts; finding no snapshot, the pipeline exits 1, the render is skipped and the "
-              "job counts as failed", w.queue[-1].state == "failed" and w._results == [(lab[0], 1), (lab[1], 1)]
-              and "!! nothing to compute" in log and w.queue[-1].note.startswith("0/2 steps OK")
-              and f"!! {lab[1]}: skipped, '{lab[0]}' failed (run the job again)" in log,
-              f"{w.queue[-1].state} {w._results} {log[-500:]}")
-        shutil.rmtree(data / "GUIEMPTY")
-        w._wait_poll_ms = poll_ms
-        del w.queue[-1]
-        w._refresh_queue()
-        w._save_queue()
-
-        ini = QSettings(str(tmp / "gui.ini"), QSettings.IniFormat)
-        w2 = A.MainWindow(remember=True, settings=ini)
-        w2.queue = [rs.QueuedJob.of("grids", w.spec), rs.QueuedJob.of("plots", w.plots)]
-        w2.queue[1].state = "running"
-        w2.q_wait.setChecked(False)
-        w2._save_queue()
-        w3 = A.MainWindow(remember=True, settings=QSettings(str(tmp / "gui.ini"), QSettings.IniFormat))
-        check("the queue and its options survive a restart (a job left running comes back 'stopped')",
-              [(j.kind, j.state) for j in w3.queue] == [("grids", "waiting"), ("plots", "stopped")]
-              and w3.queue[0].spec == w.spec.to_dict() and not w3.q_wait.isChecked(),
-              str([(j.kind, j.state) for j in w3.queue]))
-        w2.close()
-        w3.close()
-        # a state saved before the exact default holds the launcher's old start, 'sampled', for a
-        # standard-DTFE job: it opens at the exact cell average, once; a Monte-Carlo choice made afterwards is kept
-        import json as _json
-        mig = QSettings(str(tmp / "gui_mig.ini"), QSettings.IniFormat)
-        mig.setValue("spec", _json.dumps(rs.RunSpec(data_root=str(data), estimator="dtfe", deposit="sampled").to_dict()))
-        mig.setValue("custom", _json.dumps(rs.CustomSpec(estimator="dtfe", deposit="sampled").to_dict()))
-        mig.sync()
-        wm = A.MainWindow(remember=True, settings=QSettings(str(tmp / "gui_mig.ini"), QSettings.IniFormat))
-        moved = (wm.spec.deposit, wm.custom.deposit, wm.deposit_combo.currentData(), wm.o_deposit.currentData())
-        wm.deposit_combo.setCurrentIndex(wm.deposit_combo.findData("sampled"))
-        qa.processEvents()
-        wm.close()
-        wk = A.MainWindow(remember=True, settings=QSettings(str(tmp / "gui_mig.ini"), QSettings.IniFormat))
-        check("a saved standard-DTFE job at the old start 'sampled' opens at the exact cell average (Grids and Custom "
-              "tabs), once: a Monte-Carlo choice made afterwards survives the next restart",
-              moved == ("exact",) * 4 and wk.spec.estimator == "dtfe" and wk.spec.deposit == "sampled"
-              and wk.custom.deposit == "exact", f"{moved} {wk.spec.deposit} {wk.custom.deposit}")
-        wk.close()
-        # the partitions merge in index order by default (the staged merge); a state saved before that default
-        # holds the old start, the tick off, on the Grids, Pipeline and Custom tabs: on, once; unticking it is kept
-        mig2 = QSettings(str(tmp / "gui_mig2.ini"), QSettings.IniFormat)
-        mig2.setValue("spec", _json.dumps(rs.RunSpec(data_root=str(data), ordered_merge=False).to_dict()))
-        mig2.setValue("pipeline", _json.dumps(rs.PipelineSpec(ordered_merge=False).to_dict()))
-        mig2.setValue("custom", _json.dumps(rs.CustomSpec(ordered_merge=False).to_dict()))
-        mig2.sync()
-        wo = A.MainWindow(remember=True, settings=QSettings(str(tmp / "gui_mig2.ini"), QSettings.IniFormat))
-        moved = (wo.spec.ordered_merge, wo.pipe.ordered_merge, wo.custom.ordered_merge,
-                 wo.om_check.isChecked(), wo.p_om.isChecked(), wo.o_om.isChecked())
-        wo.om_check.setChecked(False)
-        qa.processEvents()
-        wo.close()
-        wq = A.MainWindow(remember=True, settings=QSettings(str(tmp / "gui_mig2.ini"), QSettings.IniFormat))
-        check("a saved job at the old ordered-merge start (off) opens with the partitions merged in index order (Grids, "
-              "Pipeline and Custom tabs), once: unticking it afterwards survives the next restart",
-              moved == (True,) * 6 and not wq.spec.ordered_merge and wq.pipe.ordered_merge and wq.custom.ordered_merge,
-              f"{moved} {wq.spec.ordered_merge} {wq.pipe.ordered_merge} {wq.custom.ordered_merge}")
-        wq.close()
-
+        _window(qa, w, spec)
+        seen, tick = _grids_run(w, sim)
+        _plots_run(qa, w)
+        _pipeline_run(qa, w, sim)
+        _pipeline_options(qa, w, tmp, sim, seen, tick)
+        _data_download_merge(qa, w, tmp, data, seen, tick)
+        _memory_check(qa, w, sim)
+        _queue(qa, w, tmp, data, repo_figs, sim)
         new_user_features(qa, w, tmp, data, sim)
         launcher_run_log(qa, w, tmp)
-
-        print("stop:")
-        w.tabs.setCurrentIndex(A.GRIDS)
-        qa.processEvents()
-        w.deposit_combo.setCurrentIndex(w.deposit_combo.findData("exact"))  # slow: exact CPU deposit
-        w.grid_combo.setCurrentText("256")
-        w.prefix_edit.setText("ps_gui_stop")
-        w.prefix_edit.editingFinished.emit()
-        qa.processEvents()
-        check("Run > Run is offered like the button, Stop is not (nothing running)",
-              w.run_action.isEnabled() and not w.stop_action.isEnabled())
-        w.run_action.trigger()                        # from the menu this time
-        check("... and starts the run: now Stop is offered and Run is not",
-              w.proc is not None and w.stop_action.isEnabled() and not w.run_action.isEnabled())
-        pid = int(w.proc.processId())
-        loop = QEventLoop()
-        QTimer.singleShot(3000, loop.quit)
-        loop.exec()
-        tree = A._descendants(pid)
-        names = subprocess.run(["ps", "-o", "comm=", "-p", ",".join(map(str, tree))],
-                               capture_output=True, text=True).stdout.split()
-        check("the run's process tree reaches the PS-DTFE binary",
-              any(n.endswith("PS-DTFE") for n in names), str(names))
-        w.stop_action.trigger()                       # Run > Stop
-        wait_idle(w, 30)
-        # a process takes a moment to die (tearing down GBs of memory in a VM: it was still 'R' at
-        # the instant the shell exited, on Ubuntu), so allow the GUI's 5 s grace + its SIGKILL;
-        # a ZOMBIE (state Z) has exited and only waits for its parent to collect it -- where PID 1
-        # never does (a docker RUN shell), a killed orphan stays listed that way; it is not running
-        deadline = time.time() + 10
-        while True:
-            rows = subprocess.run(["ps", "-o", "pid=,stat=,comm=", "-p", ",".join(map(str, tree))],
-                                  capture_output=True, text=True).stdout.splitlines()
-            alive = [r.strip() for r in rows if r.split() and not r.split()[1].startswith("Z")]
-            if not alive or time.time() > deadline:
-                break
-            loop = QEventLoop()
-            QTimer.singleShot(250, loop.quit)       # keep the GUI's timers (its SIGKILL) running
-            loop.exec()
-        check("Stop ends every process of the run", not alive and w.status.text() == "Stopped",
-              f"alive={alive} all={[r.strip() for r in rows]} status={w.status.text()}")
+        _stop(qa, w)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
         shutil.rmtree(repo_figs, ignore_errors=True)       # only the synthetic simulation's figures
     print("-" * 60)
     return summary(show_zero_skips=False)
+
+
+def _window(qa, w, spec):
+    """The main window: discovery, the command preview, the estimator switch and the snapshot ticks."""
+    print("window:")
+    check("simulation discovered in the per-family root",
+          [w.sim_combo.itemText(i) for i in range(w.sim_combo.count())] == [SIM])
+    check("both snapshots listed and ticked, none done yet",
+          [(w.snap_list.item(i).data(0x0100), w.snap_list.item(i).checkState().value)
+           for i in range(w.snap_list.count())] == [(50, 2), (99, 2)]
+          and "done" not in w.snap_list.item(0).text())
+    check("the command preview is the RunSpec's shell line", w.cmd_view.toPlainText() == spec.shell_line())
+    check("Run is enabled for a valid spec", w.run_btn.isEnabled())
+    w.dtfe_radio.setChecked(True)
+    qa.processEvents()
+    check("DTFE mode disables the PS-only options (the hi-res slice works with both estimators) and switches script",
+          not w.ps_group.isEnabled() and w.slice_group.isEnabled()
+          and "scripts/run_dtfe.sh" in w.cmd_view.toPlainText())
+    w.ps_radio.setChecked(True)
+    w.snap_list.item(0).setCheckState(w.snap_list.item(0).checkState().Unchecked)
+    w.snap_list.item(1).setCheckState(w.snap_list.item(1).checkState().Unchecked)
+    qa.processEvents()
+    check("no snapshots ticked blocks Run, with a neutral hint (not a red error)", not w.run_btn.isEnabled()
+          and any(w.checks.item(i).text().startswith("→") and "tick the snapshots" in w.checks.item(i).text()
+                  for i in range(w.checks.count()))
+          and not any(w.checks.item(i).text().startswith("✖") for i in range(w.checks.count())))
+    w._select_snaps("all")
+    qa.processEvents()
+    check("'All' re-ticks them and re-enables Run", w.spec.snapshots == [50, 99] and w.run_btn.isEnabled())
+
+
+def _grids_run(w, sim):
+    """A real two-snapshot PS-DTFE run from the Run button: progress, log, exit summary and 'done' marks."""
+    print("run:")
+    seen = set()
+    tick = QTimer(interval=20)
+    tick.timeout.connect(lambda: w.proc is not None and seen.add((w.bar.value(), w.bar.maximum(),
+                                                                   w.snap_label.text())))
+    tick.start()
+    # ... and every bar change as it happens: on a tiny run the last partition and the end of
+    # the run can fall between two 20 ms samples (missed 8/8 once on Ubuntu)
+    w.bar.valueChanged.connect(lambda v: w.proc is not None
+                               and seen.add((v, w.bar.maximum(), w.snap_label.text())))
+    w.run_btn.click()
+    dt = wait_idle(w, 300)
+    tick.stop()
+    log = w.log.toPlainText()
+    check(f"a real two-snapshot run finishes ({dt:.0f} s)", w.status.text() == "Finished", w.status.text())
+    check("the exit summary is shown", w.snap_label.text() == "2 processed, 0 skipped, 0 failed.",
+          w.snap_label.text())
+    check("the partition bar reached 8/8", (8, 8) in {(v, m) for v, m, _ in seen}, str(sorted(seen)[-3:]))
+    check("the snapshot counter stepped 1/2 -> 2/2",
+          {"snapshot 1/2", "snapshot 2/2"} <= {s for _, _, s in seen})
+    check("progress fragments kept out of the log, results kept in",
+          "[partitions" not in log and log.count("processed successfully") == 2)
+    check("both snapshots now marked done",
+          all("done" in w.snap_list.item(i).text() for i in range(w.snap_list.count())))
+    check("outputs written with the chosen prefix",
+          all((sim / f"snapdir_{n:03d}" / "ps_gui.a_den").is_file() for n in (50, 99)))
+    return seen, tick
+
+
+def _plots_run(qa, w):
+    """A real plot run per snapshot from the Plots tab, its figures in the browser, the Figures menu."""
+    print("plots:")
+    w.tabs.setCurrentIndex(A.PLOTS)
+    qa.processEvents()
+    marks = lambda: ["grids" in w.snap_list.item(i).text() for i in range(w.snap_list.count())]  # noqa: E731
+    check("the default prefix finds no grids (the run wrote 'ps_gui')", marks() == [False, False])
+    check("no figure set ticked blocks Run", not w.run_btn.isEnabled())
+    w.fig_list.item(0).setCheckState(w.fig_list.item(0).checkState().Checked)     # Field slice maps
+    w.pl_method.setCurrentIndex(w.pl_method.findData("ps"))
+    w.pl_prefix.setText("ps_gui")
+    w.pl_prefix.editingFinished.emit()
+    qa.processEvents()
+    check("... the 'ps_gui' prefix marks both snapshots as having grids", marks() == [True, True])
+    steps = w.plots.steps()
+    check("one plot_PS_DTFE.py call per snapshot, with estimator and prefix",
+          [st.argv[2:] for st in steps] == [["--sim", SIM, "--snap", str(n), "--method", "ps", "--prefix",
+                                             "ps_gui"] for n in (50, 99)]
+          and all(st.env["MPLBACKEND"] == "Agg" and st.env["DTFE_SIM"] == SIM for st in steps),
+          str([st.argv[2:] for st in steps]))
+    check("the preview lists both commands", w.cmd_view.toPlainText() == rs.script_text(steps))
+    w.run_btn.click()
+    dt = wait_idle(w, 300)
+    n_figs = w.figures.list.count()
+    check(f"both plot steps succeed ({dt:.0f} s)", w.status.text() == "Finished"
+          and w.snap_label.text() == "2/2 steps OK", f"{w.status.text()} | {w.snap_label.text()}")
+    check("the figures they wrote are listed and the browser is shown",
+          n_figs > 0 and w.results.currentWidget() is w.figures
+          and w.results.tabText(w.results.indexOf(w.figures)) == f"Figures ({n_figs} new)"
+          and all(SIM in w.figures.list.item(i).text() for i in range(n_figs)), f"{n_figs} figures")
+    check("the first figure is previewed", w.figures.preview.pixmap() is not None
+          and not w.figures.preview.pixmap().isNull())
+    check("the Figures menu can open or reveal the selected figure, like the buttons",
+          w.fig_open_action.isEnabled() and w.fig_reveal_action.isEnabled()
+          and w.fig_mode_actions[0].isChecked())
+    w.results.setCurrentIndex(w.results.indexOf(w.log))
+    qa.processEvents()
+    check("... but not while the browser is off screen", not w.fig_open_action.isEnabled()
+          and not w.fig_reveal_action.isEnabled() and w.fig_refresh_action.isEnabled())
+    w.fig_mode_actions[1].trigger()               # Figures > All Figures
+    qa.processEvents()
+    check("Figures > All Figures brings the browser up, listing every figure",
+          w.results.currentWidget() is w.figures and w.figures.mode.currentIndex() == 1
+          and w.figures.list.count() >= n_figs and w.fig_open_action.isEnabled())
+    w.figures.mode.setCurrentIndex(0)
+    qa.processEvents()
+    check("choosing in the drop-down ticks the menu's choice", w.fig_mode_actions[0].isChecked()
+          and not w.fig_mode_actions[1].isChecked() and w.figures.list.count() == n_figs)
+    w.results.setCurrentIndex(w.results.indexOf(w.log))
+    w.fig_refresh_action.trigger()                # Figures > Refresh Figures
+    qa.processEvents()
+    check("Figures > Refresh Figures brings the browser up too",
+          w.results.currentWidget() is w.figures and w.figures.list.count() == n_figs)
+
+
+def _pipeline_run(qa, w, sim):
+    """The Pipeline tab: a plan-only run, then the two steps of the real pipeline."""
+    print("pipeline:")
+    w.tabs.setCurrentIndex(A.PIPELINE)
+    qa.processEvents()
+    check("the pipeline tab disables the snapshot list and plans both snapshots",
+          not w.snap_list.isEnabled() and f"{SIM}: 2 of 2 snapshots to compute" in w.estimate.text(),
+          w.estimate.text())
+    w.p_plan.setChecked(True)
+    qa.processEvents()
+    check("plan only: one DRY_RUN step, no render", len(w.pipe.steps()) == 1
+          and w.pipe.steps()[0].env.get("DRY_RUN") == "1" and not w.p_render.isEnabled())
+    w.run_btn.click()
+    wait_idle(w, 60)
+    check("the plan announces both snapshots and computes nothing",
+          w.status.text() == "Finished" and "run_ps_dtfe.sh" in w.log.toPlainText()
+          and not (sim / "hires_plane_z64.bin").exists(), w.status.text())
+    w.p_plan.setChecked(False)
+    qa.processEvents()
+    check("the real pipeline is two steps: pipeline, then plot_pointeval.py on its own plane",
+          [st.label for st in w.pipe.steps()] == [f"run_ps_pipeline.sh {SIM}", f"plot_pointeval.py {SIM}"]
+          and str(sim / "hires_plane_z64.json") in w.pipe.steps()[1].argv)
+
+
+def _pipeline_options(qa, w, tmp, sim, seen, tick):
+    """The Pipeline tab's options in its environment, render step, estimate and memory check; a real run."""
+    print("pipeline options:")
+    # the caustic classes are on by default (run_ps_dtfe.sh's default, the production runs'), so the
+    # cusps box is enabled (unticked) from the start
+    check("the run options show the scripts' defaults; cusps wait for caustics, the slab and projection for planes",
+          w.p_deposit.currentData() == "sampled" and w.p_nsub.value() == 3 and w.p_nsub.isEnabled()
+          and w.p_gpu.isChecked() == rs.gpu_build_default("ps") and w.p_vm.isChecked() and w.p_vw.isChecked()
+          and w.p_ca.isChecked()
+          and w.p_cu.isEnabled() and not w.p_cu.isChecked() and not w.p_pt.isHidden() and w.p_planes.value() == 1
+          and not w.p_thick.isEnabled() and w.p_super.value() == 1 and not w.p_rproject.isEnabled()
+          and w.p_render_box.isEnabled() and w.p_rsmoothd.value() == rs.POINTEVAL_DERIVATIVE_SMOOTH)
+    w.p_ca.setChecked(True)
+    w.p_cu.setChecked(True)
+    w.p_gpu.setChecked(False)
+    w.p_nsub.setValue(2)
+    w.p_planes.setValue(4)
+    qa.processEvents()
+    texts = lambda: [w.checks.item(i).text() for i in range(w.checks.count())]  # noqa: E731
+    check("a handful of planes warns of ghosting; cusps on a GPU-less run pass the checks",
+          any("ghosts" in t for t in texts()) and not any("cusps" in t for t in texts()), str(texts()))
+    w.p_planes.setValue(16)
+    w.p_thick.setValue(3.0)
+    w.p_super.setValue(2)
+    w.p_rfields.setText("density, streams")
+    w.p_rfields.editingFinished.emit()
+    w.p_rproject.setCurrentIndex(w.p_rproject.findData("slab"))
+    w.p_rfixed.setChecked(True)
+    qa.processEvents()
+    env = w.pipe.command()[1]
+    st = w.pipe.steps()
+    check("the options reach the pipeline's environment, the render step and the estimate",
+          w.p_cu.isEnabled() and w.p_thick.isEnabled() and w.p_rproject.isEnabled()
+          and [env[k] for k in ("PS_CAUSTICS", "PS_CAUSTIC_CUSPS", "PS_GPU", "AVG_SUBSAMPLES", "PLANES", "THICKNESS",
+                                "SUPERSAMPLE")] == ["1", "1", "0", "2", "16", "3", "2"]
+          and st[1].argv[st[1].argv.index("--fields") + 1] == "density,streams"
+          and st[1].argv[st[1].argv.index("--project") + 1] == "slab" and "--fixed-range" in st[1].argv
+          and "× 16 planes" in w.estimate.text() and f"{16 * 64 * 64 * 4 / 1e6:.1f}M points" in w.estimate.text(),
+          f"{env} | {st[1].argv} | {w.estimate.text()}")
+    mstep = w.pipe.check_step(SIM, [99], 64)
+    check("the memory check of these settings carries them, sized by the planned points, without -m",
+          "-m" not in mstep.argv and mstep.env["PS_CAUSTICS"] == "1" and mstep.env["AVG_SUBSAMPLES"] == "2"
+          and mstep.env.get("DTFE_AUTO_PTS_N") == str(16 * 64 * 64 * 4), f"{mstep.argv} {mstep.env}")
+    check("at 16 planes the ghosting warning is gone", not any("ghosts" in t for t in texts()), str(texts()))
+    w.p_ca.setChecked(False)
+    qa.processEvents()
+    check("unticking caustics greys the (still ticked) cusps box without blocking the run",
+          not w.p_cu.isEnabled() and w.p_cu.isChecked() and not w.pipe.caustic_cusps
+          and not any("cusps" in t for t in texts()), str(texts()))
+    w.p_ca.setChecked(True)
+    qa.processEvents()
+    check("... and ticking it again brings the cusps back", w.pipe.caustic_cusps and w.p_cu.isEnabled())
+    w.p_deposit.setCurrentIndex(w.p_deposit.findData("exact"))
+    qa.processEvents()
+    check("the exact deposit ticks the GPU (as on the Grids tab) and greys the sub-samples",
+          w.pipe.deposit == "exact" and (w.p_gpu.isChecked() or not rs.gpu_built("ps"))
+          and not w.p_nsub.isEnabled() and w.pipe.command()[1]["PS_EXACT"] == "1")
+    for cb in (w.p_ca, w.p_cu, w.p_rfixed):
+        cb.setChecked(False)
+    w.p_deposit.setCurrentIndex(w.p_deposit.findData("sampled"))
+    w.p_gpu.setChecked(True)
+    w.p_nsub.setValue(3)
+    w.p_planes.setValue(1)
+    w.p_super.setValue(1)
+    w.p_rfields.setText("")
+    w.p_rfields.editingFinished.emit()
+    w.p_rproject.setCurrentIndex(0)
+    qa.processEvents()
+    check("back at the defaults: the same two steps, GPU on",
+          [st.label for st in w.pipe.steps()] == [f"run_ps_pipeline.sh {SIM}", f"plot_pointeval.py {SIM}"]
+          and w.pipe.command()[1]["PS_GPU"] == "1" and w.pipe.planes == 1 and w.pipe.render_fields == "")
+    seen.clear()
+    tick.start()
+    w.run_btn.click()
+    dt = wait_idle(w, 600)
+    tick.stop()
+    check(f"pipeline + render succeed ({dt:.0f} s)", w.status.text() == "Finished", w.status.text())
+    check("the pipeline's snapshot plan drove the counter (2 planned)",
+          any(s.endswith("/2") for _, _, s in seen), str({s for _, _, s in seen}))
+    check("slices written, and nothing left to compute",
+          all((sim / f"snapdir_{n:03d}" / "ps_output.pts_den").is_file() for n in (50, 99))
+          and f"{SIM}: 0 of 2 snapshots to compute" in w.estimate.text(), w.estimate.text())
+    pe = rs.figures([tmp / "figs"])
+    check("the point-evaluated figures are in the browser",
+          len(pe) > 0 and w.figures.list.count() == len(pe), f"{len(pe)} on disk, {w.figures.list.count()} listed")
+
+
+def _data_download_merge(qa, w, tmp, data, seen, tick):
+    """The Data tab: download + merge through a fake wget, a short download and a failed one."""
+    print("data (download + merge, with a fake wget -- no network):")
+    fixtures, fakebin = tmp / "fixtures", tmp / "bin"
+    for n in (50, 99):
+        make_raw_chunks(fixtures / f"snapshot-{n}", n, chunks=2)
+    fakebin.mkdir()
+    (fakebin / "wget").write_text(FAKE_WGET.replace("@FIXTURES@", str(fixtures)))
+    (fakebin / "wget").chmod(0o755)
+    os.environ["PATH"] = f"{fakebin}:{os.environ['PATH']}"
+    os.environ["TNG_API_KEY"] = SECRET
+    (data / "GUIDL").mkdir()                       # an (empty) family folder for the new run
+    w.tabs.setCurrentIndex(A.DATA)
+    w.d_sim.setCurrentText(DL_SIM)
+    w.d_sim.lineEdit().editingFinished.emit()
+    qa.processEvents()
+    rows = {w.d_table.item(r, 0).data(0x0100): r for r in range(w.d_table.rowCount())}
+    check("the Data tab lists the redshift ladder for a simulation not on disk yet",
+          {0, 50, 99} <= set(rows) and "(new folder)" in w.d_target.text()
+          and w.d_target.text().startswith(f"GUIDL/{DL_SIM}")
+          and w.d_target.toolTip().startswith(str(data / "GUIDL" / DL_SIM)), w.d_target.text())
+    for n in (50, 99):
+        w.d_table.item(rows[n], 0).setCheckState(w.d_table.item(rows[n], 0).checkState().Checked)
+    qa.processEvents()
+    check("download + merge of the ticked snapshots, as two steps",
+          [st.label for st in w.data.steps()] == ["download snapshots 50 99", "merge snapshots 50 99"]
+          and w.run_btn.isEnabled(), str([st.label for st in w.data.steps()]))
+    check("the API key is on no command line", SECRET not in w.cmd_view.toPlainText()
+          and all(SECRET not in " ".join(st.argv) + str(st.env) for st in w.data.steps()))
+    seen.clear()
+    tick.start()
+    w.run_btn.click()
+    dt = wait_idle(w, 120)
+    tick.stop()
+    sd = data / "GUIDL" / DL_SIM
+    check(f"download + merge succeed ({dt:.0f} s)", w.status.text() == "Finished", w.status.text())
+    check("the downloaded files were counted", any("4 files" in s for _, _, s in seen),
+          str({s for _, _, s in seen}))
+    check("the merge showed its chunk progress", (2, 2) in {(v, m) for v, m, _ in seen})
+    check("both combined files verify against the header totals",
+          all((sd / f"snapdir_{n:03d}" / f"combined_{n:03d}.hdf5").is_file() for n in (50, 99))
+          and w.log.toPlainText().count("Particles merged: [4096]") == 2
+          and "MISMATCH" not in w.log.toPlainText(), w.log.toPlainText()[-600:])
+    check("the key never reached the log", SECRET not in w.log.toPlainText())
+    rows = {w.d_table.item(r, 0).data(0x0100): r for r in range(w.d_table.rowCount())}
+    check("the table now shows them merged, chunks kept",
+          all(w.d_table.item(rows[n], 2).text() == "merged (+2 chunks)" for n in (50, 99)))
+    check("the new simulation appears in the shared simulation list",
+          DL_SIM in [w.sim_combo.itemText(i) for i in range(w.sim_combo.count())])
+    check("running it again has nothing left to do (merged items are never re-merged)",
+          not w.run_btn.isEnabled() and w.data.steps() == [])
+    # a download that stopped early: the fixture serves 2 chunks of a snapshot whose header promises 3
+    make_raw_chunks(fixtures / "snapshot-67", 67, chunks=3)
+    (fixtures / "snapshot-67" / "snap_067.2.hdf5").unlink()
+    w.d_table.item(rows[67], 0).setCheckState(w.d_table.item(rows[67], 0).checkState().Checked)
+    qa.processEvents()
+    steps67 = w.data.steps()
+    check("snapshot 67 ticked: download + merge, the merge chained to its download", [st.label for st in steps67]
+          == ["download snapshots 67", "merge snapshots 67"] and steps67[1].after == "download snapshots 67",
+          str([(st.label, st.after) for st in steps67]))
+    (sd / "snapdir_067").mkdir(parents=True, exist_ok=True)
+    (sd / "snapdir_067" / "combined_067.hdf5.partial").write_text("stale")       # a merge stopped half-way before
+    w.run_btn.click()
+    wait_idle(w, 120)
+    st67 = rs.snapshot_state(sd, 67)
+    check("2 of the header's 3 chunks: the merge step FAILS (it merged what was there and called it done)",
+          w.status.text() == "Finished: 1 of 2 steps failed", w.status.text())
+    check("... no combined file, the chunks kept, the stale .partial gone and no new one",
+          st67 == {"chunks": 2, "merged": False, "gc_chunks": 0, "gc_merged": False}
+          and not list((sd / "snapdir_067").glob("*.partial")), str(st67))
+    check("... the log names the missing chunk and the header's count",
+          "snap_067.2.hdf5" in w.log.toPlainText() and "the header promises 3" in w.log.toPlainText(),
+          w.log.toPlainText()[-500:])
+    rows = {w.d_table.item(r, 0).data(0x0100): r for r in range(w.d_table.rowCount())}
+    check("the table does not show it merged", "merged" not in w.d_table.item(rows[67], 2).text(),
+          w.d_table.item(rows[67], 2).text())
+    w.d_table.item(rows[67], 0).setCheckState(w.d_table.item(rows[67], 0).checkState().Unchecked)
+    qa.processEvents()
+    # a download that fails outright (no fixture: the fake wget exits 8): the merge is skipped, not run on nothing
+    w.d_table.item(rows[33], 0).setCheckState(w.d_table.item(rows[33], 0).checkState().Checked)
+    qa.processEvents()
+    w.run_btn.click()
+    wait_idle(w, 120)
+    log33 = w.log.toPlainText()
+    check("a failed download: its merge step is skipped and counted failed (half a download is never merged)",
+          w.status.text() == "Finished: 2 of 2 steps failed" and "merge snapshots 33: skipped, 'download snapshots 33' failed" in log33
+          and "Error downloading snapshot-33" in log33 and not rs.snapshot_state(sd, 33)["merged"],
+          f"{w.status.text()} | {log33[-400:]}")
+    w.d_table.item(rows[33], 0).setCheckState(w.d_table.item(rows[33], 0).checkState().Unchecked)
+    qa.processEvents()
+    os.environ.pop("TNG_API_KEY")
+
+
+def _memory_check(qa, w, sim):
+    """Check memory for PS-DTFE and standard-DTFE Grids jobs, and the Pipeline tab's adaptive plane size."""
+    print("memory check:")
+    (sim / "hires_plane_z64.bin").unlink(missing_ok=True)
+    import numpy as np
+    np.random.default_rng(3).uniform(0, 100, (64 * 64, 3)).tofile(sim / "slice_plane_z64.bin")
+    w._fill_sim_dependent()                     # the window lists a simulation's planes when it loads it
+    w.tabs.setCurrentIndex(A.GRIDS)
+    w.sim_combo.setCurrentText(SIM)
+    qa.processEvents()
+    w._select_snaps("all")
+    w.prefix_edit.setText("ps_mem")
+    w.prefix_edit.editingFinished.emit()
+    w.grid_combo.setCurrentText("32")
+    w.plane_combo.setCurrentIndex(w.plane_combo.findData(str(sim / "slice_plane_z64.bin")))
+    qa.processEvents()
+    check("the slice is selected", w.spec.slice_plane.endswith("slice_plane_z64.bin"), w.spec.slice_plane)
+    lines = lambda: [w.checks.item(i).text() for i in range(w.checks.count())]  # noqa: E731
+    check("an unchecked slice run says memory is not checked yet",
+          any("memory not checked" in t for t in lines()), str(lines()))
+    check("'Check memory' is offered for a PS grids run, in the window and in the Run menu",
+          w.mem_btn.isEnabled() and w.mem_action.isEnabled() and w.mem_action.text() == "Check Memory")
+    w.mem_btn.click()
+    wait_check(w, 120)
+    check("the check reports every snapshot fits", any(t.startswith("✔") and "memory: all 2 snapshots fit" in t
+                                                        for t in lines()), str(lines()))
+    res = w.mem_results[w.spec.memory_key()]
+    check("... from the binary's own report (partition, concurrency, prediction, budget)",
+          {(SIM, 50, None), (SIM, 99, None)} <= set(res) and all("predicted_gb" in r and "budget_gb" in r
+                                                                  for r in res.values()), str(res))
+    os.environ["DTFE_MEM_BUDGET_GB"] = "0.0001"             # a machine far too small
+    w.mem_action.trigger()                                    # this time from the menu
+    check("Run > Check Memory starts the same check (the menu item then cancels it)",
+          w._mcheck is not None and w.mem_action.text() == "Cancel Memory Check"
+          and w.mem_btn.text() == "Cancel check")
+    wait_check(w, 120)
+    check("over the budget: a warning per snapshot, naming what lowers it",
+          sum("over the" in t and "budget" in t and "smaller slice plane" in t for t in lines()) == 2, str(lines()))
+    del os.environ["DTFE_MEM_BUDGET_GB"]
+    w.grid_combo.setCurrentText("16")
+    qa.processEvents()
+    check("changed settings are not covered by the old check", any("memory not checked" in t for t in lines()))
+    # standard DTFE too -- run_dtfe.sh AUTO_TUNE_REPORT=1 asks the standard binary's own tuner
+    w.dtfe_radio.setChecked(True)
+    w.plane_combo.setCurrentIndex(0)                         # no slice: a standard slice needs one triangulation
+    qa.processEvents()
+    check("'Check memory' is offered for a standard-DTFE grids run too",
+          w.spec.estimator == "dtfe" and w.mem_btn.isEnabled() and w.mem_action.isEnabled())
+    w.mem_btn.click()
+    wait_check(w, 120)
+    res = w.mem_results.get(w.spec.memory_key(), {})
+    check("... and its report covers both snapshots, which fit", {(SIM, 50, None), (SIM, 99, None)} <= set(res)
+          and any(t.startswith("✔") and "memory: all 2 snapshots fit" in t for t in lines()), str(lines()))
+    check("... from run_dtfe.sh, writing nothing beside the data",
+          not list((sim / "snapdir_099").glob("output.*")) and not list((sim / "snapdir_050").glob("output.*")),
+          str(list((sim / "snapdir_099").glob("output.*"))))
+    os.environ["DTFE_MEM_BUDGET_GB"] = "0.0001"
+    w.mem_btn.click()
+    wait_check(w, 120)
+    check("... over the budget: a warning per snapshot with the standard run's own remedies",
+          sum("over the" in t and "budget" in t and "smaller padding" in t for t in lines()) == 2, str(lines()))
+    del os.environ["DTFE_MEM_BUDGET_GB"]
+    w.ps_radio.setChecked(True)
+    qa.processEvents()
+
+    rs.ADAPTIVE_MIN_NU, min_nu = 64, rs.ADAPTIVE_MIN_NU      # small planes for a small box
+    w.tabs.setCurrentIndex(A.PIPELINE)
+    w.p_nu.setCurrentText("1024")
+    w.p_grid.setCurrentText("32")
+    w.p_prefix.setText("ps_mem")
+    w.p_prefix.editingFinished.emit()
+    w.p_render.setChecked(False)
+    qa.processEvents()
+    # Planes large enough that their points, not the tessellation, set the difference (1024²: ~0.2
+    # GB of point records, 512²: ~0.05). The budget must sit between the two sizes' SMALLEST
+    # possible footprints: the tuner splits a small particle set whose one domain
+    # does not fit, so a budget between the unsplit predictions is met by a split at the larger
+    # plane, and nothing would be halved. A budget just above the fixed part (the full grid and
+    # the points, which no split reduces) makes the binary report that smallest split.
+    steps = {nu: w.pipe.check_step(SIM, [99], nu) for nu in (1024, 512)}
+
+    def report(nu, budget=None):
+        env = dict(os.environ, **steps[nu].env)
+        if budget is not None:
+            env["DTFE_MEM_BUDGET_GB"] = budget
+        r = subprocess.run(steps[nu].argv, env=env, capture_output=True, text=True, cwd=str(ROOT))
+        return rs.parse_reports(r.stdout).get(99, {})
+
+    fixed = max(report(nu).get("fixed_gb", 0.) for nu in steps)
+    outs = {nu: report(nu, f"{fixed + 0.01:.4f}").get("predicted_gb") for nu in steps}
+    check("a larger plane needs more memory, even split as finely as the tuner goes",
+          outs[1024] and outs[512] and outs[1024] - outs[512] > 0.05, str(outs))
+    os.environ["DTFE_MEM_BUDGET_GB"] = f"{(outs[1024] + outs[512]) / 2:.4f}"
+    w.p_adaptive.setChecked(True)
+    qa.processEvents()
+    check("adaptive without a check is refused", not w.run_btn.isEnabled()
+          and any("run 'Check memory' first" in t for t in lines()), str(lines()))
+    w.mem_btn.click()
+    wait_check(w, 300)
+    check("the check halves the plane where it does not fit, and plans the fitting size",
+          w.pipe.plan.get(SIM) == {"050": 512, "099": 512} and w.run_btn.isEnabled(), str(w.pipe.plan))
+    check("the pipeline then runs at that size, on those snapshots",
+          [(st.env.get("NU"), st.env.get("SNAPS")) for st in w.pipe.steps()] == [("512", "50 99")],
+          str([(st.env.get("NU"), st.env.get("SNAPS")) for st in w.pipe.steps()]))
+    w.p_adaptive.setChecked(False)
+    qa.processEvents()
+    check("without Adaptive the over-budget size is a warning that names the size that fits",
+          any("at 1024² needs" in t and "512² fits" in t for t in lines()), str(lines()))
+    del os.environ["DTFE_MEM_BUDGET_GB"]
+    rs.ADAPTIVE_MIN_NU = min_nu
+
+
+def _queue(qa, w, tmp, data, repo_figs, sim):
+    """The job queue: order, a failed job, resume, waiting for other runs and checks, restarts and saved states."""
+    print("queue:")
+    w.q_wait.setChecked(False)           # (a real DTFE run may be going on this machine)
+    w.q_stop_on_fail.setChecked(True)
+    w.tabs.setCurrentIndex(A.GRIDS)
+    w.sim_combo.setCurrentText(SIM)
+    qa.processEvents()
+    w.prefix_edit.setText("ps_q1")
+    w.prefix_edit.editingFinished.emit()
+    w.grid_combo.setCurrentText("16")
+    w._select_snaps("none")
+    w.snap_list.item(0).setCheckState(w.snap_list.item(0).checkState().Checked)          # 050 only
+    qa.processEvents()
+    w.queue_btn.click()                                                                    # job 1: grids
+    check("'Add to queue' queues the Grids job and shows the queue",
+          len(w.queue) == 1 and w.queue[0].kind == "grids" and w.queue[0].state == "waiting"
+          and w.results.currentWidget() is w.queue_tab and "050" in w.queue[0].title, str(w.queue))
+    w.tabs.setCurrentIndex(A.PLOTS)
+    qa.processEvents()
+    w.pl_prefix.setText("ps_q1")                  # grids that job 1 has not written yet
+    w.pl_prefix.editingFinished.emit()           # (snapshots shared with the Grids tab: 050)
+    qa.processEvents()
+    check("a plot of grids a queued job will write can be queued (a warning, not a refusal)",
+          w.queue_btn.isEnabled())
+    w.queue_btn.click()                                                                    # job 2: plots
+    fields_item, core_item = w.fig_list.item(0), w.fig_list.item(len(rs.FIGURE_SETS) - 1)
+    fields_item.setCheckState(fields_item.checkState().Unchecked)
+    core_item.setCheckState(core_item.checkState().Checked)
+    w.opt_widgets[("core", "mode")][1].setCurrentText("check")     # exits 1: no DTFE grids here
+    qa.processEvents()
+    w.queue_btn.click()                                                                    # job 3: fails
+    core_item.setCheckState(core_item.checkState().Unchecked)
+    fields_item.setCheckState(fields_item.checkState().Checked)
+    w.opt_widgets[("fields", "pointeval_only")][1].setChecked(True)
+    qa.processEvents()
+    vmin_w, vmax_w = w.opt_widgets[("panels", "vmin")][1], w.opt_widgets[("panels", "vmax")][1]
+    vmax_w.setValue(2.3e5)
+    vmin_w.setValue(0.003)
+    check("the panels' density limits hold real densities (TNG100 z=0 peaks at 2.3e5; voids go below 0.01; the "
+          "default float box stopped at 1000 and 0.01)", vmax_w.value() == 2.3e5 and abs(vmin_w.value() - 0.003) < 1e-9,
+          f"{vmin_w.value()} {vmax_w.value()}")
+    vmax_w.setValue(0.0)
+    vmin_w.setValue(0.0)
+    check("Run > Add to Queue is offered like the button", w.queue_action.isEnabled())
+    w.queue_action.trigger()                                                               # job 4, from the menu
+    check("four jobs queued, all waiting", [j.state for j in w.queue] == ["waiting"] * 4
+          and w.results.tabText(w.results.indexOf(w.queue_tab)) == "Queue (4 waiting)")
+    titles = [j.title for j in w.queue]
+    w.q_list.setCurrentRow(3)
+    qa.processEvents()
+    check("the Queue menu offers what the buttons offer for the selected (last) job",
+          all(getattr(w, f"q_{k}_action").isEnabled() == getattr(w, f"q_{k}").isEnabled()
+              for k in ("start", "up", "down", "remove", "clear"))
+          and w.q_up_action.isEnabled() and not w.q_down_action.isEnabled()
+          and w.q_start_action.text() == "Start Queue")
+    w.q_up_action.trigger()                       # Queue > Move Job Up
+    moved = [j.title for j in w.queue]
+    w.q_down_action.trigger()                     # ... and back down
+    check("Move Job Up / Down reorder the queue", moved == titles[:2] + [titles[3], titles[2]]
+          and [j.title for j in w.queue] == titles, str(moved))
+    check("the queue's options are ticked in the menu like on the tab",
+          w.q_stop_on_fail_action.isChecked() and not w.q_wait_action.isChecked())
+    w.q_wait_action.setChecked(True)
+    check("... and ticking one in the menu ticks the tab's box (and back)", w.q_wait.isChecked())
+    w.q_wait.setChecked(False)
+    check("...", not w.q_wait_action.isChecked())
+    w.results.setCurrentIndex(w.results.indexOf(w.log))
+    qa.processEvents()
+    check("with the Queue tab not on screen: no moving or removing, but the queue can start",
+          not w.q_up_action.isEnabled() and not w.q_remove_action.isEnabled() and w.q_start_action.isEnabled())
+    w.q_start_action.trigger()                    # Queue > Start Queue
+    check("Queue > Start Queue starts it (its log comes up, as with the button)",
+          w._queue_running and w.results.currentWidget() is w.log and not w.q_start_action.isEnabled())
+    dt = wait_queue(w, 600)
+    states = [j.state for j in w.queue]
+    check(f"the queue runs in order and stops at the failed job ({dt:.0f} s)",
+          states == ["done", "done", "failed", "waiting"] and "failed" in w.status.text(),
+          f"{states} | {w.status.text()}")
+    check("job 2 plotted the grids job 1 wrote",
+          (sim / "snapdir_050" / "ps_q1.a_den").is_file()
+          and len(rs.figures([repo_figs / "snap050"], since=w._figs_since)) > 0)
+    log = w.log.toPlainText()
+    check("one log for the whole queue, with a header per job",
+          all(f"Queue job {k}/4" in log for k in (1, 2, 3)) and "Queue job 4/4" not in log)
+    check("the failed job's note says how far it got, and how long it took",
+          w.queue[2].note.startswith("0/1 steps OK, took ") and w.queue[2].note.endswith(" s"), w.queue[2].note)
+    w.q_stop_on_fail.setChecked(False)
+    qa.processEvents()
+    check("the button offers to resume (and so does the menu)", w.q_start.text() == "Resume queue"
+          and w.q_start.isEnabled() and w.q_start_action.text() == "Resume Queue" and w.q_start_action.isEnabled())
+    w.q_start.click()
+    wait_queue(w, 300)
+    check("resumed: the last job ran too", [j.state for j in w.queue] == ["done", "done", "failed", "done"]
+          and w.status.text().startswith("Queue finished"), w.status.text())
+
+    orig_jobs = rs.running_jobs
+    rs.running_jobs = lambda max_age=2.0: [(424242, "PS-DTFE")]     # pretend another run is going
+    try:
+        check("Queue > Clear Finished Jobs is offered for a finished queue", w.q_clear_action.isEnabled())
+        w.q_clear_action.trigger()
+        check("'Clear finished' empties a finished queue", w.queue == [] and not w.q_clear_action.isEnabled())
+        w.q_wait.setChecked(True)
+        w._wait_poll_ms = 200
+        w.tabs.setCurrentIndex(A.GRIDS)
+        w.prefix_edit.setText("ps_q2")
+        w.prefix_edit.editingFinished.emit()
+        qa.processEvents()
+        w.queue_btn.click()
+        w.q_start.click()
+        loop = QEventLoop()
+        QTimer.singleShot(1000, loop.quit)
+        loop.exec()
+        check("a grids job waits while another PS-DTFE runs",
+              w.proc is None and w.queue[0].state == "waiting" and "waiting for PS-DTFE (pid 424242)"
+              in w.status.text() and w.stop_btn.isEnabled(), w.status.text())
+        w.stop_btn.click()
+        check("Stop while waiting pauses the queue", not w._queue_running and w.status.text() == "Queue paused")
+    finally:
+        rs.running_jobs = orig_jobs
+    w.q_wait.setChecked(False)
+    w.q_start.click()
+    wait_queue(w, 300)
+    check("resumed once free, the job runs", w.queue[0].state == "done"
+          and (sim / "snapdir_050" / "ps_q2.a_den").is_file(), w.queue[0].note)
+    # a queued job never starts beside a memory check (it polls until the check is over), and a
+    # Pipeline job that finds nothing to compute (a simulation folder without merged snapshots) fails:
+    # run_ps_pipeline.sh exits 1 and the render chained to it is skipped, not run on nothing
+    empty = data / "GUIEMPTY" / "GUIEMPTY-1-Dark"
+    empty.mkdir(parents=True)
+    ep = rs.PipelineSpec(data_root=str(data), sims=["GUIEMPTY-1-Dark"], nu=64, grid=32, gpu=False,
+                         figures_root=str(tmp / "figs"))
+    lab = [st.label for st in ep.steps()]
+    w.queue.append(rs.QueuedJob.of("pipeline", ep))
+    w._refresh_queue()
+    poll_ms = w._wait_poll_ms
+    w._wait_poll_ms, w._mcheck, w._queue_running = 100, {"proc": None}, True     # a check going on
+    try:
+        w._next_queued()
+        spin(500)                                     # five polls
+        held = (w.proc is None and w.queue[-1].state == "waiting"
+                and w.status.text().startswith("Queue: waiting for the memory check to finish"))
+        status_held = w.status.text()
+    finally:
+        w._mcheck = None
+    check("a queued job waits while a memory check runs (no process started; it looks again)", held
+          and not [e for lvl, e in ep.problems() if lvl == "error"], status_held)
+    wait_queue(w, 60)                                 # the next poll starts it: nothing else calls _next_queued
+    log = w.log.toPlainText()
+    check("... the check over, it starts; finding no snapshot, the pipeline exits 1, the render is skipped and the "
+          "job counts as failed", w.queue[-1].state == "failed" and w._results == [(lab[0], 1), (lab[1], 1)]
+          and "!! nothing to compute" in log and w.queue[-1].note.startswith("0/2 steps OK")
+          and f"!! {lab[1]}: skipped, '{lab[0]}' failed (run the job again)" in log,
+          f"{w.queue[-1].state} {w._results} {log[-500:]}")
+    shutil.rmtree(data / "GUIEMPTY")
+    w._wait_poll_ms = poll_ms
+    del w.queue[-1]
+    w._refresh_queue()
+    w._save_queue()
+
+    ini = QSettings(str(tmp / "gui.ini"), QSettings.IniFormat)
+    w2 = A.MainWindow(remember=True, settings=ini)
+    w2.queue = [rs.QueuedJob.of("grids", w.spec), rs.QueuedJob.of("plots", w.plots)]
+    w2.queue[1].state = "running"
+    w2.q_wait.setChecked(False)
+    w2._save_queue()
+    w3 = A.MainWindow(remember=True, settings=QSettings(str(tmp / "gui.ini"), QSettings.IniFormat))
+    check("the queue and its options survive a restart (a job left running comes back 'stopped')",
+          [(j.kind, j.state) for j in w3.queue] == [("grids", "waiting"), ("plots", "stopped")]
+          and w3.queue[0].spec == w.spec.to_dict() and not w3.q_wait.isChecked(),
+          str([(j.kind, j.state) for j in w3.queue]))
+    w2.close()
+    w3.close()
+    # a state saved before the exact default holds the launcher's old start, 'sampled', for a
+    # standard-DTFE job: it opens at the exact cell average, once; a Monte-Carlo choice made afterwards is kept
+    import json as _json
+    mig = QSettings(str(tmp / "gui_mig.ini"), QSettings.IniFormat)
+    mig.setValue("spec", _json.dumps(rs.RunSpec(data_root=str(data), estimator="dtfe", deposit="sampled").to_dict()))
+    mig.setValue("custom", _json.dumps(rs.CustomSpec(estimator="dtfe", deposit="sampled").to_dict()))
+    mig.sync()
+    wm = A.MainWindow(remember=True, settings=QSettings(str(tmp / "gui_mig.ini"), QSettings.IniFormat))
+    moved = (wm.spec.deposit, wm.custom.deposit, wm.deposit_combo.currentData(), wm.o_deposit.currentData())
+    wm.deposit_combo.setCurrentIndex(wm.deposit_combo.findData("sampled"))
+    qa.processEvents()
+    wm.close()
+    wk = A.MainWindow(remember=True, settings=QSettings(str(tmp / "gui_mig.ini"), QSettings.IniFormat))
+    check("a saved standard-DTFE job at the old start 'sampled' opens at the exact cell average (Grids and Custom "
+          "tabs), once: a Monte-Carlo choice made afterwards survives the next restart",
+          moved == ("exact",) * 4 and wk.spec.estimator == "dtfe" and wk.spec.deposit == "sampled"
+          and wk.custom.deposit == "exact", f"{moved} {wk.spec.deposit} {wk.custom.deposit}")
+    wk.close()
+    # the partitions merge in index order by default (the staged merge); a state saved before that default
+    # holds the old start, the tick off, on the Grids, Pipeline and Custom tabs: on, once; unticking it is kept
+    mig2 = QSettings(str(tmp / "gui_mig2.ini"), QSettings.IniFormat)
+    mig2.setValue("spec", _json.dumps(rs.RunSpec(data_root=str(data), ordered_merge=False).to_dict()))
+    mig2.setValue("pipeline", _json.dumps(rs.PipelineSpec(ordered_merge=False).to_dict()))
+    mig2.setValue("custom", _json.dumps(rs.CustomSpec(ordered_merge=False).to_dict()))
+    mig2.sync()
+    wo = A.MainWindow(remember=True, settings=QSettings(str(tmp / "gui_mig2.ini"), QSettings.IniFormat))
+    moved = (wo.spec.ordered_merge, wo.pipe.ordered_merge, wo.custom.ordered_merge,
+             wo.om_check.isChecked(), wo.p_om.isChecked(), wo.o_om.isChecked())
+    wo.om_check.setChecked(False)
+    qa.processEvents()
+    wo.close()
+    wq = A.MainWindow(remember=True, settings=QSettings(str(tmp / "gui_mig2.ini"), QSettings.IniFormat))
+    check("a saved job at the old ordered-merge start (off) opens with the partitions merged in index order (Grids, "
+          "Pipeline and Custom tabs), once: unticking it afterwards survives the next restart",
+          moved == (True,) * 6 and not wq.spec.ordered_merge and wq.pipe.ordered_merge and wq.custom.ordered_merge,
+          f"{moved} {wq.spec.ordered_merge} {wq.pipe.ordered_merge} {wq.custom.ordered_merge}")
+    wq.close()
+
+
+def _stop(qa, w):
+    """Run > Stop ends every process of a running job."""
+    print("stop:")
+    w.tabs.setCurrentIndex(A.GRIDS)
+    qa.processEvents()
+    w.deposit_combo.setCurrentIndex(w.deposit_combo.findData("exact"))  # slow: exact CPU deposit
+    w.grid_combo.setCurrentText("256")
+    w.prefix_edit.setText("ps_gui_stop")
+    w.prefix_edit.editingFinished.emit()
+    qa.processEvents()
+    check("Run > Run is offered like the button, Stop is not (nothing running)",
+          w.run_action.isEnabled() and not w.stop_action.isEnabled())
+    w.run_action.trigger()                        # from the menu this time
+    check("... and starts the run: now Stop is offered and Run is not",
+          w.proc is not None and w.stop_action.isEnabled() and not w.run_action.isEnabled())
+    pid = int(w.proc.processId())
+    loop = QEventLoop()
+    QTimer.singleShot(3000, loop.quit)
+    loop.exec()
+    tree = A._descendants(pid)
+    names = subprocess.run(["ps", "-o", "comm=", "-p", ",".join(map(str, tree))],
+                           capture_output=True, text=True).stdout.split()
+    check("the run's process tree reaches the PS-DTFE binary",
+          any(n.endswith("PS-DTFE") for n in names), str(names))
+    w.stop_action.trigger()                       # Run > Stop
+    wait_idle(w, 30)
+    # a process takes a moment to die (tearing down GBs of memory in a VM: it was still 'R' at
+    # the instant the shell exited, on Ubuntu), so allow the GUI's 5 s grace + its SIGKILL;
+    # a ZOMBIE (state Z) has exited and only waits for its parent to collect it -- where PID 1
+    # never does (a docker RUN shell), a killed orphan stays listed that way; it is not running
+    deadline = time.time() + 10
+    while True:
+        rows = subprocess.run(["ps", "-o", "pid=,stat=,comm=", "-p", ",".join(map(str, tree))],
+                              capture_output=True, text=True).stdout.splitlines()
+        alive = [r.strip() for r in rows if r.split() and not r.split()[1].startswith("Z")]
+        if not alive or time.time() > deadline:
+            break
+        loop = QEventLoop()
+        QTimer.singleShot(250, loop.quit)       # keep the GUI's timers (its SIGKILL) running
+        loop.exec()
+    check("Stop ends every process of the run", not alive and w.status.text() == "Stopped",
+          f"alive={alive} all={[r.strip() for r in rows]} status={w.status.text()}")
 
 
 def spin(ms):
@@ -839,8 +878,26 @@ def wait_for(cond, limit):
 def new_user_features(qa, w, tmp, data, sim):
     import presets as P
     import setup_wizard as SW
-    lines = lambda: [w.checks.item(i).text() for i in range(w.checks.count())]  # noqa: E731
+    _layout(qa, w)
+    _presets(qa, w, P)
+    demo, root, json = _custom_snapshot(qa, w, tmp, P)
+    _runs(qa, w)
+    x, s99, QTest = _explore(qa, w, tmp, sim, root)
+    _map_axes(w, tmp, root, x)
+    img = _figure_grid(qa, w, tmp, sim, json, x, s99)
+    _zoom(qa, w, x, QTest, img)
+    _zoom_progress(w, tmp, x, img)
+    cmd, sq = _exact_zoom(w, tmp, x, img)
+    _exact_zoom_partitioned(qa, w, tmp, demo, root, cmd, x, sq)
+    two_d_gui(qa, w, tmp)                             # (Explore still alive: it shuts down next)
+    x.shutdown()
+    _failure_advice(qa, w, tmp)
+    _setup_dialog(w, tmp, data, SW)
+    _job_clock(qa, w, tmp, data, demo, root)
 
+
+def _layout(qa, w):
+    """The window's layout: tick boxes, painted tabs, field widths, no '--' in its texts, the commands box, menus."""
     print("layout:")
     views = (w.snap_list, w.d_table, w.p_sims, w.fig_list)
     check("every checkable list and table draws its own tick boxes (macOS draws only the current row's)",
@@ -849,9 +906,9 @@ def new_user_features(qa, w, tmp, data, sim):
         w.tabs.setCurrentIndex(i)
         qa.processEvents()
         check(f"tab {i} paints", not w.grab().isNull())
-    forms = w.findChildren(A.QFormLayout)
+    forms = w.findChildren(QFormLayout)
     check("every form lets its fields take the available width (paths are not squeezed)",
-          forms and all(f.fieldGrowthPolicy() == A.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
+          forms and all(f.fieldGrowthPolicy() == QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
                         for f in forms), f"{len(forms)} forms")
     # the window's own words never contain '--' (flags live in the commands, which are exempt)
     def visible_texts():
@@ -913,7 +970,7 @@ def new_user_features(qa, w, tmp, data, sim):
     del w.run_setup
     check("File > Setup… opens the setup dialog, kept in the File menu (not moved to the app menu)",
           opened == [0] and file_menu.actions()[0] is w.setup_action and w.setup_action.text() == "Setup…"
-          and w.setup_action.menuRole() == A.QAction.MenuRole.NoRole)
+          and w.setup_action.menuRole() == QAction.MenuRole.NoRole)
     w.show_cmds_action.trigger()
     qa.processEvents()
     check("View > Show Commands shows them", not w.cmd_box.isHidden() and w.show_commands
@@ -926,6 +983,9 @@ def new_user_features(qa, w, tmp, data, sim):
           w.vm_check.toolTip().startswith("PS-DTFE only") and len(w.vm_check.toolTip()) > 200
           and "--" not in w.vm_check.toolTip())
 
+
+def _presets(qa, w, P):
+    """The Grids tab's presets, parallel triangulation, precision and the deposit choice per estimator."""
     print("presets:")
     combo = w._preset_grids[0]
     combo.setCurrentIndex(combo.findData("Quick look"))
@@ -1025,6 +1085,9 @@ def new_user_features(qa, w, tmp, data, sim):
     w._delete_preset("grids")
     check("... and can be deleted", combo.findData("mine") < 0 and "mine" not in w.user_presets)
 
+
+def _custom_snapshot(qa, w, tmp, P):
+    """The Custom snapshot tab: the demo run, its settings, deposit, padding, alpha shape, GPU and memory check."""
     print("custom snapshot:")
     demo = rs.demo_spec(tmp / "demo", gpu=False)
     w.custom = demo
@@ -1137,7 +1200,11 @@ def new_user_features(qa, w, tmp, data, sim):
     w._load_into_widgets()
     w._changed()
     qa.processEvents()
+    return demo, root, json
 
+
+def _runs(qa, w):
+    """The Runs browser: its menu actions, the listed runs and Load settings."""
     print("runs:")
     w.results.setCurrentIndex(w.results.indexOf(w.log))
     w.tabs.setCurrentIndex(A.EXPLORE)
@@ -1174,6 +1241,9 @@ def new_user_features(qa, w, tmp, data, sim):
     check("the estimate line has the time of the earlier identical runs",
           "earlier run" in w.estimate.text() and "per snapshot" in w.estimate.text(), w.estimate.text())
 
+
+def _explore(qa, w, tmp, sim, root):
+    """The Explore tab: output menus, void outlines, several outputs of a snapshot, arrow keys, vectors, server."""
     print("explore:")
     w._explore_output(str(root))
     qa.processEvents()
@@ -1385,6 +1455,11 @@ def new_user_features(qa, w, tmp, data, sim):
     check("looking for outputs again keeps the slice and the running server's answers",
           ok and x.index.value() == i_before and x._server_running and w.explore_view.streams.rowCount() >= 1
           and "Start the query server" not in w.explore_view.answer_title.text(), w.explore_view.answer_title.text())
+    return x, s99, QTest
+
+
+def _map_axes(w, tmp, root, x):
+    """The map's axes and colour bar, difference maps, a fixed range, Save image and a hi-res slice."""
     print("map axes, colour bar, difference map:")
     from PySide6.QtGui import QFontMetrics
     cv, cb, o = w.explore_view.canvas, w.explore_view.colorbar, x.current
@@ -1561,6 +1636,10 @@ def new_user_features(qa, w, tmp, data, sim):
     ez = E.load_exact_planes(sroot, (2, 2, 2))
     check("a zoom shows the scalar field (the exact zoom's '.a_scalar' is read; the server's answer has none)",
           sp is not None and np.all(sp == 7.0) and getattr(ez, "scalar", None) is not None and np.all(ez.scalar == 3.0))
+
+
+def _figure_grid(qa, w, tmp, sim, json, x, s99):
+    """The figure grid: tiles, the composer's rows and menus, opened files, snapshot keys, sidecars, a job's finish."""
     print("figure grid:")
     cur_root, cur_field = str(x.current.root), x.field.currentData()
     x.grid_set_layout(1, 2)
@@ -1917,8 +1996,8 @@ def new_user_features(qa, w, tmp, data, sim):
           and "PS-DTFE · X (cust_ps)" in labels and "PS-DTFE · X (cust_ps2)" in labels and "DTFE · X" in labels, f"{rows} {labels}")
     by_label = {typ1.itemText(k): typ1.itemData(k) for k in range(typ1.count())}
     want_dup = {f"PS-DTFE · X ({cds[k]})": str(cds[k] / "X") for k in ("dupA", "dupB")}
-    check("... two more of them in two folders both named 'out' read with their FULL folder, each entry its own run "
-          "(review 2026-10-05 [32]); the told-apart ones keep the short folder",
+    check("... two more of them in two folders both named 'out' read with their FULL folder, each entry its own run; "
+          "the told-apart ones keep the short folder",
           all(by_label.get(lab) == root_ for lab, root_ in want_dup.items()) and len(labels) == len(set(labels))
           and by_label.get("PS-DTFE · X (cust_ps)") == str(cds["ps"] / "X"), str(by_label))
     snap1 = x.grid_table.cellWidget(1, E._C_SNAP)
@@ -2060,6 +2139,11 @@ def new_user_features(qa, w, tmp, data, sim):
     check("a failed slice with a newer request pending sends that request and keeps the picture meanwhile",
           kept and ok and w.explore_view.canvas._img is not None)
     img = w.explore_view.canvas._img
+    return img
+
+
+def _zoom(qa, w, x, QTest, img):
+    """Zooms through the query server: drags, clicks, timing, Back, Zoom Out and late results."""
     print("zoom:")
     x.zoom_res.setValue(96)
     check("no zoom yet: Zoom Out is off in the menu and on the tab", not w.zoom_out_action.isEnabled()
@@ -2177,6 +2261,9 @@ def new_user_features(qa, w, tmp, data, sim):
     finally:
         os.utime(g_, ns=(st_.st_atime_ns, st_.st_mtime_ns))
 
+
+def _zoom_progress(w, tmp, x, img):
+    """A composite query server: partitions in memory, a zoom's progress over its partitions, cache paths."""
     # a COMPOSITE query server (a large snapshot's): its zoom requests report their progress over the
     # partitions they visit (--serve-progress), which the bar follows and the state line sums up
     print("zoom progress on a composite query server:")
@@ -2245,6 +2332,9 @@ def new_user_features(qa, w, tmp, data, sim):
     check("a server line about building a partition's cell index shows as 'indexing partition k of n'",
           "indexing partition 2 of 3" in shown, shown)
 
+
+def _exact_zoom(w, tmp, x, img):
+    """An exact zoom of the periodic phase-space demo: its planes' redshift factor, command and region mean."""
     print("exact zoom and the standard-DTFE server:")
     # the planes an exact zoom wrote are in u-units; with the output's redshift the loader
     # applies the slice map's (1/(1+z))^exp (velocity 0.5, dispersion 1.0), the density stays
@@ -2312,7 +2402,11 @@ def new_user_features(qa, w, tmp, data, sim):
     x.zoom_res.setValue(64)
     w.zoom_out_action.trigger()
     wait_for(lambda: not x.is_zoomed() and not x._busy, 30)
+    return cmd, sq
 
+
+def _exact_zoom_partitioned(qa, w, tmp, demo, root, cmd, x, sq):
+    """Exact zooms over a partitioned cache, the long-zoom question, Cancel, standard and non-periodic runs."""
     # a PARTITIONED tessellation cache, as the query server of a large snapshot leaves it (built here
     # by the binary's server, which exits when its stdin closes): an exact zoom then reuses that split,
     # loads the partitions that reach the region and skips the others
@@ -2533,9 +2627,10 @@ def new_user_features(qa, w, tmp, data, sim):
     del x._open_other
     check("Explore > Open Output… works from any tab: Explore comes up first",
           opened == [A.EXPLORE] and w.tabs.currentIndex() == A.EXPLORE and w.save_image_action.isEnabled())
-    two_d_gui(qa, w, tmp)                             # (Explore still alive: it shuts down next)
-    x.shutdown()
 
+
+def _failure_advice(qa, w, tmp):
+    """A failed job's advice and its dismissal."""
     print("failure advice:")
     bad = tmp / "not_a_snapshot.hdf5"
     bad.write_text("this is not HDF5")
@@ -2550,6 +2645,9 @@ def new_user_features(qa, w, tmp, data, sim):
           not w.banner.isHidden() and "failed" in w.banner_text.text().lower(), w.banner_text.text())
     w.banner.hide()
 
+
+def _setup_dialog(w, tmp, data, SW):
+    """The setup dialog: the data folder, programs, the API key and Finish."""
     print("setup:")
     dlg = SW.SetupDialog(w, str(data))
     check("setup: four pages, the configured data folder proposed", dlg.pages.count() == 4
@@ -2575,6 +2673,9 @@ def new_user_features(qa, w, tmp, data, sim):
     check("setup: Finish creates the data folder and remembers the demo choice",
           dlg.result() == 1 and new_root.is_dir() and dlg.run_demo)
 
+
+def _job_clock(qa, w, tmp, data, demo, root):
+    """The job clock, find in the log, Copy Log, window geometry, drops, field availability and the job ETA."""
     print("the job clock, the log, the window, drops:")
     check("a job's wall clock: 'took ...' beside the bar once it ends", w.clock.text().startswith("took "), w.clock.text())
     check("clock and duration texts", A.clock_text(7) == "0:07" and A.clock_text(760) == "12:40"

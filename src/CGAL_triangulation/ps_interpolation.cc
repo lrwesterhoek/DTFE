@@ -196,6 +196,8 @@ inline void psFxToReal(std::vector<int64_t> &w, float const scale, std::vector<E
 // PS_MASS_AUDIT=1: the deposit's mass bookkeeping (opt-in diagnostic)
 #include "ps_mass_audit.h"
 
+#include "../env_knobs.h"
+
 #if NO_DIM==3
 // --ps-exact-deposit: analytic tetrahedron-cell intersection moments (Powell & Abel 2015).
 // Vendored C library; r3d.h carries its own extern "C" guard. 3D only.
@@ -278,11 +280,8 @@ struct TetBoxSAT
 // per partition, so the two levels never oversubscribe. DTFE_DEPOSIT_THREADS pins it.
 static int psDepositThreads()
 {
-    if ( const char *env = std::getenv("DTFE_DEPOSIT_THREADS") )
-    {
-        int const v = std::atoi(env);
-        if ( v > 0 ) return v;
-    }
+    if ( long const v = Env::integer( "DTFE_DEPOSIT_THREADS", 0 ); v > 0 )
+        return int( v );
     int cores = int( std::thread::hardware_concurrency() );
 #ifdef OPEN_MP
     cores = omp_get_max_threads();
@@ -996,7 +995,7 @@ static inline void psDebugDegreesCheck(PSPassCtx const &passCtx, bool const degr
     DT &dt = passCtx.dt;
     User_options &userOptions = passCtx.userOptions;
     Box &boxCoordinates = passCtx.boxCoordinates;
-    if ( degreesLazy && metalDeposited && std::getenv("PS_DEBUG_DEGREES") )
+    if ( degreesLazy && metalDeposited && Env::flag( "PS_DEBUG_DEGREES" ) )
     {   // self-check of the lazy degrees: every vertex the extraction computed must carry the full pass's count
         std::unordered_map<void const*, int32_t> full;
         size_t degDropped = 0;
@@ -1145,15 +1144,14 @@ static inline void psDepositThreadMode(PSPassCtx const &passCtx, PSLayoutCtx con
         int const blockCap = std::max( 1, int( blocks / 4 ) + 1 );
         nDepThreads = std::max( 1, std::min( nDepThreads, blockCap ) );
         int const slabThreads = std::max( 1, std::min( wantThreads, blockCap ) );
-        char const *slabEnv = std::getenv("DTFE_DEPOSIT_SLABS");
-        int const slabSetting = slabEnv ? std::atoi(slabEnv) : -1;     // 1 force, 0 never, else automatic
+        int const slabSetting = Env::tristate( "DTFE_DEPOSIT_SLABS" );     // 1 force, 0 never, unset automatic
         // automatic: only when the copies leave fewer than HALF the threads -- a slab run classifies a
         // straddling tet once per slab (~1.6x the work): on a clustered TNG sub-cube at 512^3 (2 cells per
         // tet, copies for 5 of 10 threads) 10 slab threads take 46.8 s, the 5 copy threads 42.5 s; on 768^3
         // (copies for 2) slabs take 28 s instead of 64. At 256^3 (copies fit) 10 copy threads are 2x the slab
         // speed. The fixed-point grids, the counts and the flags are shared (psAddCount), so the default
         // single build copies nothing and this switch only meets the float sums (the double build,
-        // PS_METAL_FLOAT_MOMENTS=1) on fine grids.
+        // PS_GPU_FLOAT_MOMENTS=1) on fine grids.
         if ( slabSetting != 0 and slabThreads > 1 and subDims[0] >= 2
              and ( slabSetting == 1 or 2 * nDepThreads < slabThreads ) and noTotalCells < size_t(UINT32_MAX) )
         {
@@ -1171,9 +1169,8 @@ static inline void psDepositThreadMode(PSPassCtx const &passCtx, PSLayoutCtx con
     if ( metalDeposited && deferredOrd.size() >= DEFERRED_SLAB_MIN && !userOptions.psCausticCusps
          && subDims[0] >= 2 && noTotalCells < size_t(UINT32_MAX) )
     {
-        char const *slabEnv = std::getenv("DTFE_DEPOSIT_SLABS");
         int const slabThreads = std::max( 1, std::min( psDepositThreads(), int( deferredOrd.size() / 1024 ) + 1 ) );
-        if ( !( slabEnv && std::atoi(slabEnv) == 0 ) && slabThreads > 1 )
+        if ( Env::tristate( "DTFE_DEPOSIT_SLABS" ) != 0 && slabThreads > 1 )
         {
             slabMode = true;
             nDepThreads = slabThreads;
@@ -1333,8 +1330,8 @@ static inline void psSlabBinning(PSPassCtx const &passCtx, PSLayoutCtx const &la
         int const perThread = std::max( 2, std::min( 64 / std::max( 1, nDepThreads ),
                               int( std::lround( double(nx) / ( 4. * std::max( 1., meanExtent ) * double(nDepThreads) ) ) ) ) );
         nSlabs = int( std::min<long>( nx, std::min( 64L, long(perThread) * long(nDepThreads) ) ) );
-        if ( const char *env = std::getenv("DTFE_DEPOSIT_NSLABS") )
-            if ( std::atoi(env) > 0 ) nSlabs = std::min( int(nx), std::min( 64, std::atoi(env) ) );
+        if ( long const v = Env::integer( "DTFE_DEPOSIT_NSLABS", 0 ); v > 0 )
+            nSlabs = int( std::min( long(nx), std::min( 64L, v ) ) );
         slabXLo.assign( size_t(nSlabs), 0 ); slabXHi.assign( size_t(nSlabs), 0 );
         std::vector<int> slabOfX( static_cast<size_t>(nx), 0 );
         {
@@ -1988,12 +1985,11 @@ void interpolateGrid_phaseSpace(DT &dt,
     // copy mode's threads add atomically, the serial loop and the slabs plainly). The moment grids follow the same
     // rule (fxg below); under weightIsDensity their normalizer is this grid. Single-precision build only: in the
     // double build a unit of 2^-62 of the pass's mass is coarser than a double sum in a light cell, so the GPU words
-    // become doubles at the copy and the CPU keeps its double '+='. PS_METAL_FLOAT_MASS=1 (CUDA/HIP:
-    // PS_GPU_FLOAT_MASS=1) selects the float grid on GPU and CPU, for comparison. Memory: 8 B per sub-grid cell in
-    // place of the 4 B float grid, which is allocated only at the conversion (auto_tune.h counts it).
-    auto envOn = [](char const *name) { char const *e = std::getenv(name); return e && std::atoi(e) != 0; };
+    // become doubles at the copy and the CPU keeps its double '+='. PS_GPU_FLOAT_MASS=1 (alias PS_METAL_FLOAT_MASS)
+    // selects the float grid on GPU and CPU, for comparison. Memory: 8 B per sub-grid cell in place of the 4 B float
+    // grid, which is allocated only at the conversion (auto_tune.h counts it).
     bool const massFxWanted = std::is_same<Real, float>::value && field.density
-                              && !envOn("PS_METAL_FLOAT_MASS") && !envOn("PS_GPU_FLOAT_MASS");
+                              && !Env::flag( { "PS_GPU_FLOAT_MASS", "PS_METAL_FLOAT_MASS" } );
     std::vector<int64_t> massFx;   // totalGrid fixed-point words while massFxOn, else EMPTY
     float massFxScale = 0.f;       // their unit: 1/massFxScale mass (a power of two)
     bool massFxOn = false;
@@ -2008,9 +2004,9 @@ void interpolateGrid_phaseSpace(DT &dt,
     //   - all threads add into ONE set of words (no private copies), converted once after the loop (fxToReal).
     // A grid's Real accumulator stays EMPTY while its words live (fxEnsureReal allocates it when a grid falls back to
     // float sums). Single-precision build only, like the mass (a 2^-61 unit is coarser than a double sum).
-    // PS_METAL_FLOAT_MOMENTS=1 (or PS_GPU_FLOAT_MOMENTS=1) selects the float sums on GPU and CPU, the items' weight
-    // totals included, for comparison (PS_METAL_FLOAT_MASS is the mass grid's own switch).
-    bool const fxGpuWanted = !envOn("PS_METAL_FLOAT_MOMENTS") && !envOn("PS_GPU_FLOAT_MOMENTS");
+    // PS_GPU_FLOAT_MOMENTS=1 (alias PS_METAL_FLOAT_MOMENTS) selects the float sums on GPU and CPU, the items' weight
+    // totals included, for comparison (PS_GPU_FLOAT_MASS is the mass grid's own switch).
+    bool const fxGpuWanted = !Env::flag( { "PS_GPU_FLOAT_MOMENTS", "PS_METAL_FLOAT_MOMENTS" } );
     bool const fxMomWanted = fxGpuWanted && std::is_same<Real, float>::value;
     struct FxWords { std::vector<int64_t> w; float scale = 0.f; };
     FxWords fxg[PS_FX_CPU_N];      // grid g's words (EMPTY = its Real accumulator is in use) and their unit
@@ -2537,7 +2533,7 @@ void interpolateGrid_phaseSpace(DT &dt,
         // take the same units. Under --ps-window both count only the tets that reach the window (this loop skips
         // the others before the filter; the CPU walk applies the same test, fxBoundWalk says why),
         // and the window's MASS unit is taken from these bounds as well (B[DW], PSFixedUnits.massTotal) -- so the
-        // bounds are summed under --ps-window even when the moments are float sums (PS_METAL_FLOAT_MOMENTS=1)
+        // bounds are summed under --ps-window even when the moments are float sums (PS_GPU_FLOAT_MOMENTS=1)
         bool const fxBoundsWanted = fxGpuWanted || windowMode;
         std::vector<PSFixedBounds> gpuBoundPart( fxBoundsWanted ? noTotalCells / 256 + 1 : 0 );
         // grid and canonical frame of the per-tet records (the CPU exact test's own definitions)
@@ -2781,7 +2777,7 @@ void interpolateGrid_phaseSpace(DT &dt,
         for (ReleasedTet const &rt : releasedTets) releasedMass += double(rt.mass);
         // the moment grids' units (fxg): one per grid the kernel deposits, from the bounds above, so the
         // host's later integer adds (the deferred and released tets) stay within them too; dispw's unit only says
-        // "the mass grid is it" (the host then skips it when its mass grid is fixed). PS_METAL_FLOAT_MOMENTS=1: none.
+        // "the mass grid is it" (the host then skips it when its mass grid is fixed). PS_GPU_FLOAT_MOMENTS=1: none.
         PSFixedUnits fxUnits;
         PSFixedBounds gpuBounds;
         for (PSFixedBounds const &b : gpuBoundPart) gpuBounds.add( b );   // in block order (see gpuBoundPart)
@@ -2870,7 +2866,7 @@ void interpolateGrid_phaseSpace(DT &dt,
                 if ( g == PS_FX_DW && massFxOn ) continue;            // (the density after the loop)
                 bool const fromMass = ( g == PS_FX_MOMW && momwIsMass ) || ( g == PS_FX_DW && dwIsMass );
                 if ( fxMomWanted && fromMass && gpuFixed && !massFxOn )
-                {   // (copied while the density below still reads them: PS_GPU_FLOAT_MASS=1 on a Metal build)
+                {   // (copied while the density below still reads them)
                     fxg[g].scale = gpuOut.massScale;
                     if ( field.density ) fxg[g].w = gpuOut.massFx;
                     else fxg[g].w.swap( gpuOut.massFx );
@@ -3141,7 +3137,7 @@ void interpolateGrid_phaseSpace(DT &dt,
     // bytes of one private copy of every accumulator this run uses: the Real ones only. A grid whose fixed-point
     // words stand in for it is EMPTY (the density under massFx, the moment grids under fxg: the words are shared),
     // and the counts and flags are shared too -- so the default single build copies NOTHING, and only
-    // the float sums (PS_METAL_FLOAT_MOMENTS=1 / PS_METAL_FLOAT_MASS=1, the double build) still cost a copy per thread.
+    // the float sums (PS_GPU_FLOAT_MOMENTS=1 / PS_GPU_FLOAT_MASS=1, the double build) still cost a copy per thread.
     auto vecBytes = [](auto const &v) -> double { return double(v.size()) * double(sizeof(v[0])); };
     double accBytes = vecBytes(releasedMult) + vecBytes(exactMult) + vecBytes(dispWeight) + vecBytes(massWeight)
                     + vecBytes(dispVel) + vecBytes(quantities->density) + vecBytes(quantities->velocity)
@@ -4296,8 +4292,8 @@ void interpolateGrid_phaseSpace(DT &dt,
     // The density grid holds MASS (the per-tet shares): divide by the cell volume and by averageDensity, so the
     // written field is rho/rho_bar (the SAME convention as standard DTFE). Mass conservation makes the box mean 1 for
     // any nSub, up to the accumulators: the single build's exact fixed-point grid (massFx above) is rounded once per
-    // cell to float, the double build's sums are good to ~1e-15, and the float grid of PS_METAL_FLOAT_MASS=1 /
-    // PS_GPU_FLOAT_MASS=1 loses shares below half an ulp (~2% at 1e7 deposits into one cell). Tetrahedra the cell
+    // cell to float, the double build's sums are good to ~1e-15, and the float grid of PS_GPU_FLOAT_MASS=1 loses
+    // shares below half an ulp (~2% at 1e7 deposits into one cell). Tetrahedra the cell
     // filters drop take their mass along in every build. The stream count is averaged over the nSub^NO_DIM
     // sub-samples below.
     double const auditGridPre = ( massAudit && field.density ) ? gridSum() : -1.;

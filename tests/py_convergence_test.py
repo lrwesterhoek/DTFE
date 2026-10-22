@@ -5,8 +5,8 @@
 
 Two tiers:
   * SYNTHETIC (always run, CI): analytic compensated voids on a 64^3 grid, hand-made catalogues and results.
-  * DATA-BACKED (the T7's TNG100-3-Dark z = 0 grid and its cached catalogues): the 256^3 block-averaged catalogue
-    against the native one; skipped with a note when the data is not there.
+  * DATA-BACKED (TNG100-3-Dark z = 0's grid and cached catalogues under DTFE_DATA_ROOT): the 256^3 block-averaged
+    catalogue against the native one; skipped with a note when DTFE_DATA_ROOT is unset or the data is not there.
 
 Usage:  python3 tests/py_convergence_test.py            (exit 0 = pass)
 """
@@ -23,7 +23,7 @@ from pathlib import Path
 
 import numpy as np
 
-from _harness import REPO, Skip, check, setup, summary
+from _harness import REPO, Skip, check, data_root, setup, summary
 
 _FIGS_TMP = setup("convergence_figs_")
 os.environ.setdefault("DTFE_SIM", "TNG50-4-Dark")    # the box these synthetic tests stand for; a data-tier run sets its own
@@ -314,8 +314,8 @@ def t_tng100_grid():
     voids (median R_v ratio within 3% of 1, >= 85% of the native voids matched; measured: 0.997, 73 of 77)."""
     from dtfelib import cli
     sim = "TNG100-3-Dark"
-    if not (cli.sim_dir(sim) / "snapdir_099").is_dir():
-        raise Skip(f"no {sim} snapdir_099 under {cli.DATA_ROOT}")
+    if not (cli.sim_dir(sim, data_root()) / "snapdir_099").is_dir():
+        raise Skip(f"no {sim} snapdir_099 under {data_root()}")
     if os.environ.get("DTFE_SIM") != sim:
         raise Skip("the TNG100 frame needs DTFE_SIM=TNG100-3-Dark (run the data tier with it set)")
     from dtfelib import pipeline, catalog, convergence as cv

@@ -14,10 +14,6 @@ and triggers a recompute. Under 'all' the compute phase runs in its own subproce
 working set is returned to the OS before the plot scripts start. Without snapshot ids,
 compute and export take config's ladder where the snapdir exists.
 
-The core figures' names carry neither the simulation nor the estimator, so the thesis
-Figures/ tree takes them only from config.THESIS_SIMULATION's standard-DTFE grids
-(config.THESIS_METHOD); --no-mirror copies nothing there.
-
 'voids' runs VOID_SCRIPTS with --sim config.SIMULATION (DTFE_SIM): each writes per-simulation folders and tags a
 non-default smoothing itself, so DTFE_SIGMA_MPC is allowed there. A script named there (or in --only) that is not in
 python/plot yet is skipped with a note, not failed.
@@ -42,8 +38,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import config
 
-# Core figure set only: the tracking/synthesis scripts (plot_PS_DTFE, plot_cosmic_web,
-# plot_halo_tracking, plot_void_tracking, plot_void_population, plot_conclusions_synthesis)
+# Core figure set only: the tracking scripts (plot_PS_DTFE, plot_cosmic_web,
+# plot_halo_tracking, plot_void_tracking, plot_void_population)
 # need PS-DTFE grids and/or merger-tree data and are run separately.
 PLOT_SCRIPTS = [
     'plot_DTFE.py',
@@ -106,7 +102,7 @@ def snapshots_on_disk():
 def check_data():
     """Per config snapshot: absent (not on disk: compute and plot leave it out), or the estimator the scripts load
     there and whether its grids are complete. Counting standard DTFE's output.* alone, a box with
-    PS-DTFE grids alone (every box on the T7) would read INCOMPLETE everywhere while compute and plot use those grids.
+    PS-DTFE grids alone would read INCOMPLETE everywhere while compute and plot use those grids.
     'missing' = the incomplete snapdirs (exit 1), and no snapdir at all."""
     from dtfelib.cli import sim_dir
     base = sim_dir(config.SIMULATION)
@@ -139,10 +135,6 @@ def check_data():
         print(f"\n  not on disk (compute and plot leave them out): {', '.join(absent_dirs)}")
     if missing:
         print(f"\n  -> Re-run DTFE for: {', '.join(missing)}")
-    if used and (used != {config.THESIS_METHOD} or config.SIMULATION != config.THESIS_SIMULATION):
-        print(f"\n  The figures will be {config.SIMULATION} {' and '.join(ESTIMATOR_NAME[m] for m in sorted(used))}; "
-              f"the thesis Figures/ tree takes {config.THESIS_SIMULATION} {ESTIMATOR_NAME[config.THESIS_METHOD]} "
-              f"figures only.")
     return missing, mism
 
 
@@ -339,8 +331,8 @@ def cache_inventory(root=None, keep_mpc=(), keep_cells=()):
     from dtfelib import pipeline
     m_now = re.match(NAMESPACE_RE, pipeline._param_hash())
     sig0, fp0 = config.PRODUCTION_SMOOTHING
-    # the fixed-R size function's catalogues (plot_void_population.FIXED_R_SMOOTH_CELLS 10 5 3, and TNG300's 3 2 in
-    # thesis_runs.sh voids) and its --size-smooth 5 are live too
+    # the fixed-R size function's catalogues (plot_void_population.FIXED_R_SMOOTH_CELLS 10 5 3, and the 3 2 a coarse
+    # box like TNG300 is run at: FIXED_R_CELLS) and its --size-smooth 5 are live too
     cells_ok = {f"{float(c):g}" for c in (sig0, *config.SMOOTHING_COMPARISON_SIGMAS, *FIXED_R_CELLS, *keep_cells)}
     mpcs = list(CACHE_SMOOTHING_MPC) + [float(m) for m in keep_mpc]
     if os.environ.get('DTFE_SIGMA_MPC'):
@@ -472,10 +464,11 @@ def cache_command(prune=False, yes=False, keep_mpc=(), keep_cells=(), root=None)
 # catalogues in-process, its jobs run the scripts) and the binaries a Pipeline job runs before its analysis. A python
 # whose command line names one of these is a user; the binaries are found by name, as the launcher's own check does
 # (runspec.dtfe_processes' pgrep pattern). The interpreter may also be the macOS host bundle scripts/gui.sh starts the
-# launcher in ('<venv>/DTFE Launcher.app/Contents/MacOS/DTFE Launcher <repo>/python/gui/app.py'; its sys.executable,
+# launcher in ('<venv>/Lamina.app/Contents/MacOS/Lamina <repo>/python/gui/app.py', or 'DTFE Launcher' for a host made
+# by an older install_gui_app.sh; its sys.executable,
 # runspec.PYTHON's last fallback for the jobs), and the launcher is matched by its script path whatever runs it: a
 # pattern that wants a 'python...' word before it misses the usual way the launcher is open.
-_CACHE_USER_SCRIPTS = re.compile(r"(?i)(?:python[^\s/]*|DTFE Launcher)\s.*?(?:\banalyze\.py|\bselftest\.py|"
+_CACHE_USER_SCRIPTS = re.compile(r"(?i)(?:python[^\s/]*|Lamina|DTFE Launcher)\s.*?(?:\banalyze\.py|\bselftest\.py|"
                                  r"\bplot_\w+\.py|\bvoid_outlines\.py|\bvoid_cache\.py)(?:\s|$)"
                                  r"|(?:^|[\s/])gui/app\.py(?:\s|$)")
 _DTFE_BINARY = r"^(PS-)?DTFE(-.*)?$"
@@ -711,9 +704,6 @@ def main():
                         help="run only the named plot scripts (in 'voids' mode: these instead of VOID_SCRIPTS)")
     parser.add_argument('--out', default=None, help="'export': the output folder (default figures/void_catalog/<sim>)")
     parser.add_argument('--format', default='both', choices=['csv', 'hdf5', 'both'], help="'export': which files")
-    parser.add_argument('--no-mirror', action='store_true',
-                        help="copy nothing into the thesis Figures/ tree (it takes only "
-                             f"{config.THESIS_SIMULATION} {ESTIMATOR_NAME[config.THESIS_METHOD]} figures anyway)")
     parser.add_argument('--prune', action='store_true',
                         help="'cache': list only what is unreachable, as a DRY RUN (nothing is deleted without --yes)")
     parser.add_argument('--yes', action='store_true',
@@ -742,9 +732,6 @@ def main():
         # before the banner and the gate/smoothing refusals: it reads no grid and writes no figure
         cache_command(args.prune, args.yes, args.keep_mpc, args.keep_cells)
         return
-    # --no-mirror reaches the plot subprocesses through their environment (dtfelib.figures reads DTFE_NO_MIRROR)
-    child_env = dict(os.environ, DTFE_NO_MIRROR='1') if args.no_mirror else None
-
     script_dir = Path(__file__).resolve().parent
 
     print(f"Canonical dataset: {len(config.SNAPSHOT_TO_REDSHIFT)} snapshots "
@@ -754,18 +741,7 @@ def main():
           f"footprint: {config.FOOTPRINT_SIZE}, "
           f"smoothing: {config.SMOOTHING_SIGMA_CELLS} cells "
           f"({config.SMOOTHING_SIGMA_MPC:.2f} Mpc)")
-    print(f"Cache: {config.CACHE_DIR} ({config.CACHE_DIR_SOURCE})")
-    # the core figures' names carry neither the simulation nor the estimator: the thesis tree takes them only from
-    # the thesis simulation's standard-DTFE grids (dtfelib.figures; the scripts say it when a grid set is refused)
-    if args.no_mirror or os.environ.get('DTFE_NO_MIRROR'):
-        mirror_off = "asked for"
-    elif config.SIMULATION != config.THESIS_SIMULATION:
-        mirror_off = f"{config.SIMULATION} is not the thesis simulation {config.THESIS_SIMULATION}"
-    else:
-        mirror_off = None
-    print("Thesis figure mirror: " + (f"off ({mirror_off})" if mirror_off else
-          f"{config.THESIS_FIGURES_DIR} (figures made from {config.THESIS_SIMULATION} "
-          f"{ESTIMATOR_NAME[config.THESIS_METHOD]} grids only)") + "\n")
+    print(f"Cache: {config.CACHE_DIR} ({config.CACHE_DIR_SOURCE})\n")
 
     if args.mode == 'check':
         print("Data check:")
@@ -778,7 +754,7 @@ def main():
     results, skipped = {}, []
     if args.mode == 'voids':
         # before the smoothing refusal: these scripts tag a non-default smoothing's files and folders themselves
-        skipped = run_scripts(args.only if args.only else VOID_SCRIPTS, script_dir, results, env=child_env,
+        skipped = run_scripts(args.only if args.only else VOID_SCRIPTS, script_dir, results,
                               extra=('--sim', str(config.SIMULATION)))
         summarize(results, skipped, "Void figures are in per-simulation folders under "
                                     f"{config.LOCAL_FIGURES_ROOT} (void_population/, void_profiles/, ...).")
@@ -793,16 +769,16 @@ def main():
         # refusal below would blame DTFE_SIGMA_MPC at the production smoothing. 'compute' stays allowed: its caches (the
         # void catalogue keeps the production gate, gate_view is never saved; slices, limits) do not depend on it
         sys.exit(f"refused: DTFE_VOID_GATE={os.environ.get('DTFE_VOID_GATE', '')!r} (void gate '{gate}', not the "
-                 f"production 'ellipsoid'): '{args.mode}' writes the thesis figures under their production names. "
+                 f"production 'ellipsoid'): '{args.mode}' writes the core figures under their production names. "
                  f"Unset DTFE_VOID_GATE; it is for the void scripts (they tag their outputs 'gate{gate}').")
     sig0, fp0 = config.PRODUCTION_SMOOTHING
     if (float(config.SMOOTHING_SIGMA_CELLS), int(config.FOOTPRINT_SIZE)) != (float(sig0), int(fp0)):
-        # the thesis scripts save under the PRODUCTION names (and into the thesis Figures/ tree): a left-over
+        # the core scripts save under the PRODUCTION names: a left-over
         # DTFE_SIGMA_MPC would overwrite them with another smoothing's figures and void_shape_table.txt (the same
         # test as smoothing_tag()'s smoothing part)
         sys.exit(f"refused: the smoothing is {config.SMOOTHING_SIGMA_CELLS:g} cells / footprint {config.FOOTPRINT_SIZE} "
                  f"(DTFE_SIGMA_MPC={os.environ.get('DTFE_SIGMA_MPC', '')!r}), not the production "
-                 f"{config.PRODUCTION_SMOOTHING}: '{args.mode}' writes the thesis figures under their production names. "
+                 f"{config.PRODUCTION_SMOOTHING}: '{args.mode}' writes the core figures under their production names. "
                  f"Unset DTFE_SIGMA_MPC; it is for the void scripts and 'export' (both tag their outputs).")
     if args.mode == 'compute':
         compute(args.snaps)
@@ -811,20 +787,18 @@ def main():
     if args.mode == 'all':
         # compute in its own subprocess so its working set is released before plotting
         code, dt = run_step([sys.executable, __file__, 'compute'] + args.snaps,
-                            'analyze.py compute', env=child_env)
+                            'analyze.py compute')
         results['compute'] = (code, dt)
         if code != 0:
             print("\ncompute failed; aborting before the plot phase.")
             sys.exit(1)
 
     if args.mode in ('plot', 'all'):
-        skipped = run_scripts(args.only if args.only else PLOT_SCRIPTS, script_dir, results, env=child_env)
+        skipped = run_scripts(args.only if args.only else PLOT_SCRIPTS, script_dir, results)
 
     summarize(results, skipped,
-              (f"Nothing was copied into the thesis Figures/ tree ({mirror_off}); " if mirror_off else
-               "Figures made from the thesis grids are mirrored into the thesis Figures/ tree; ")
-              + f"key numbers in {config.LOCAL_FIGURES_ROOT}/void_analysis/void_shape_table.txt "
-              "and shear_analysis/shear_stats.txt.")
+              f"Figures are under {config.LOCAL_FIGURES_ROOT}; key numbers in "
+              f"{config.LOCAL_FIGURES_ROOT}/void_analysis/void_shape_table.txt and shear_analysis/shear_stats.txt.")
 
 
 def summarize(results, skipped, done_note):

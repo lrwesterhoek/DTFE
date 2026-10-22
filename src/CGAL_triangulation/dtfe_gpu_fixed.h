@@ -18,6 +18,7 @@
 
 #include "gpu_host.h"            // DTFEGpuGrids
 #include "ps_deposit_params.h"
+#include "../env_knobs.h"
 
 // The grids are 64-bit fixed-point sums (the kernel's header says why): grid g holds integers in
 // units of 1/scale[g], scale = 2^k, set per BATCH from a bound B of the sum of |share| over everything the batch
@@ -122,7 +123,7 @@ struct DTFEGpuKnobs
     uint32_t itemSamples = 48;
     int      cacheK      = 2;
     bool     noWrite     = false;   // DTFE_GPU_DEBUG_NOWRITE: timing experiment, all the work, no atomics
-    bool     floatGrids  = false;   // DTFE_METAL_FLOAT_GRIDS=1 / DTFE_GPU_FLOAT_GRIDS=1: float atomics (A/B)
+    bool     floatGrids  = false;   // DTFE_GPU_FLOAT_GRIDS=1 (alias DTFE_METAL_FLOAT_GRIDS): float atomics (A/B)
 };
 
 // The knobs from the environment; itemsOk: the host can run the item kernels at all.
@@ -130,13 +131,11 @@ inline DTFEGpuKnobs dtfeGpuKnobs(bool itemsOk)
 {
     DTFEGpuKnobs k;
     k.useItems = itemsOk;
-    if (const char* env = std::getenv("DTFE_GPU_ITEMS")) k.useItems = k.useItems && std::atoi(env) != 0;
-    if (const char* env = std::getenv("DTFE_GPU_ITEM_SAMPLES"))
-    { long v = std::atol(env); if (v >= 4 && v <= 100000) k.itemSamples = uint32_t(v); }
-    if (const char* env = std::getenv("DTFE_GPU_CACHE_K")) { int v = std::atoi(env); k.cacheK = (v == 4 || v == 8) ? v : 2; }
-    k.noWrite = std::getenv("DTFE_GPU_DEBUG_NOWRITE") != nullptr;
-    auto envOn = [](const char* n) { const char* e = std::getenv(n); return e && std::atoi(e) != 0; };
-    k.floatGrids = envOn("DTFE_METAL_FLOAT_GRIDS") || envOn("DTFE_GPU_FLOAT_GRIDS");
+    k.useItems = k.useItems && Env::flag("DTFE_GPU_ITEMS", true);
+    if (long const v = Env::integer("DTFE_GPU_ITEM_SAMPLES", 0); v >= 4 && v <= 100000) k.itemSamples = uint32_t(v);
+    if (long const v = Env::integer("DTFE_GPU_CACHE_K", 2); v == 4 || v == 8) k.cacheK = int(v);
+    k.noWrite = Env::flag("DTFE_GPU_DEBUG_NOWRITE");
+    k.floatGrids = Env::flag({"DTFE_GPU_FLOAT_GRIDS", "DTFE_METAL_FLOAT_GRIDS"});
     return k;
 }
 
@@ -144,8 +143,8 @@ inline DTFEGpuKnobs dtfeGpuKnobs(bool itemsOk)
 // ---------------------------------------------------------------- one sub-domain's batch
 // The batch's parameter block, in either host's DepositParams (zeroed by the host; the fields named here are
 // the same in both): the exact sums' units from this batch's values, before the upload consumes them -- the
-// shared full grid (allowFixed false) and DTFE_METAL_FLOAT_GRIDS=1 / DTFE_GPU_FLOAT_GRIDS=1 keep the float
-// atomics --, the grids' geometry, the field flags (all off under DTFE_GPU_DEBUG_NOWRITE) and the item length.
+// shared full grid (allowFixed false) and DTFE_GPU_FLOAT_GRIDS=1 keep the float atomics --, the grids' geometry,
+// the field flags (all off under DTFE_GPU_DEBUG_NOWRITE) and the item length.
 // DTFE_GPU_DEBUG_NOATOMIC: 1 = no atomics in the final reduction; 2 = also skip the gradient's reduction loop;
 // 3 = also the gradient's eviction atomics (timing experiments only). Returns the exact kernel's item, a block
 // of cells of the tetrahedron's window (DTFE_GPU_EXACT_CELLS, default 16), which is then P.itemSamples.
@@ -174,12 +173,13 @@ inline uint32_t dtfeBatchParams(Params& P, DTFEGpuKnobs const& k, const std::vec
     P.fScal = fScal ? 1 : 0;
     P.fSGrad = fSGrad ? 1 : 0;
     if (k.noWrite) P.fDen = P.fVel = P.fGrad = P.fScal = P.fSGrad = 0;
-    P.debugNoAtomic = std::getenv("DTFE_GPU_DEBUG_NOATOMIC") ? uint32_t(std::max(1, std::atoi(std::getenv("DTFE_GPU_DEBUG_NOATOMIC")))) : 0u;
+    long const noAtomic = Env::integer("DTFE_GPU_DEBUG_NOATOMIC", 0);   // 1, 2, 3: fewer atomics; 0: all
+    P.debugNoAtomic = noAtomic > 0 ? uint32_t(noAtomic) : 0u;
     P.itemSamples = k.itemSamples;
     uint32_t exactCells = 16;
     if (exact)
     {
-        if (const char* env = std::getenv("DTFE_GPU_EXACT_CELLS")) { long v = std::atol(env); if (v > 0) exactCells = uint32_t(v); }
+        if (long const v = Env::integer("DTFE_GPU_EXACT_CELLS", 0); v > 0) exactCells = uint32_t(v);
         P.itemSamples = exactCells;
     }
     return exactCells;
@@ -279,7 +279,7 @@ inline void dtfeGpuInitGrids(DTFEGpuGrids& out, size_t nCell, bool fDen, bool fV
     out.scalar_grad.assign(fSGrad ? nCell * 3 : 0, 0.f);
 }
 
-// The batch's timing line (DTFE_METAL_TIMING / DTFE_GPU_TIMING), from either host's Batch and Stats; sinceBegin >= 0
+// The batch's timing line (DTFE_GPU_TIMING), from either host's Batch and Stats; sinceBegin >= 0
 // (the shared grid) adds when the batch was ready and how long it waited for the device.
 template <class Batch, class Stats>
 inline void dtfeLogBatch(const char* backend, const Batch& b, const Stats& st, double waitSec, double runSec,
@@ -302,7 +302,7 @@ inline void dtfeLogBatch(const char* backend, const Batch& b, const Stats& st, d
 // OPT-IN (DTFE_GPU_SHARED=1): false (err set) otherwise. dtfe_metal_host.cc dtfeGpuSharedBegin has the measurement.
 inline bool dtfeSharedOptedIn(std::string& err)
 {
-    if (!(std::getenv("DTFE_GPU_SHARED") && std::atoi(std::getenv("DTFE_GPU_SHARED")) != 0))
+    if (!Env::flag("DTFE_GPU_SHARED"))
     {
         err = "off by default (DTFE_GPU_SHARED=1 turns it on; the per-sub-domain grids measured faster)";
         return false;
@@ -314,7 +314,7 @@ inline bool dtfeSharedOptedIn(std::string& err)
 inline bool dtfeSharedGridFits(size_t nCell, bool fDen, bool fVel, bool fGrad, bool fScal, bool fSGrad, double capGb,
                                std::string& err)
 {
-    if (const char* env = std::getenv("DTFE_GPU_SHARED_GB")) { double v = std::atof(env); if (v > 0) capGb = v; }
+    if (double const v = Env::real("DTFE_GPU_SHARED_GB", 0.); v > 0) capGb = v;
     double const needGb = double(nCell) * ((fDen ? 4 : 0) + (fVel ? 12 : 0) + (fGrad ? 36 : 0) + (fScal ? 4 : 0) + (fSGrad ? 12 : 0)) / 1e9;
     if (needGb > capGb)
     {

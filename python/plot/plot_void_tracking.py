@@ -352,8 +352,8 @@ def main(argv=None):
 
 
 def _set_tag(args, grids):
-    """The name tag of this run's set: '' for PS-DTFE's default grids from snapshot 99 (every file on the
-    T7); else '_<method>' or '_<prefix>', and '_snap<N>'; '_particles' for --link particles, and
+    """The name tag of this run's set: '' for PS-DTFE's default grids from snapshot 99; else '_<method>' or
+    '_<prefix>', and '_snap<N>'; '_particles' for --link particles, and
     '_exclusive' after it for partitioned members. The radius has its own suffix on the figures."""
     method, prefix = grids
     default_prefix = {"ps": "ps_output.", "dtfe": "output."}         # io's: an estimator's own grids

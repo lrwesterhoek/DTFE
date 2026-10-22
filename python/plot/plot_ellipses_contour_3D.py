@@ -13,7 +13,7 @@ from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Ellipse
-from dtfelib.figures import save_plot_to_multiple_paths
+from dtfelib.figures import save_figure
 import config
 from dtfelib import figures as style
 from dtfelib import pipeline
@@ -316,7 +316,6 @@ def process_single_snapshot(snapshot, redshift, args):
         p = pipeline.products(snapshot, sim=args.sim, method=args.method, prefix=args.prefix,
                               data_root=args.data_root)
         grid_n = p.fs.grid_n
-        style.note_source(p.fs)                     # the thesis mirror takes the thesis box's standard DTFE only
         box_size = p.fs.meta.box_mpc
         redshift = p.redshift
         cat = p.voids()
@@ -379,8 +378,8 @@ def process_single_snapshot(snapshot, redshift, args):
             output_path_1 = plane_output_dir / f"void_analysis_z{redshift:.2f}_snap{snapshot}_basic.png"
             output_path_2 = plane_output_dir / f"void_analysis_z{redshift:.2f}_snap{snapshot}_ellipses.png"
 
-            save_plot_to_multiple_paths(fig1, output_path_1, dpi=DPI, bbox_inches='tight', facecolor='white')
-            save_plot_to_multiple_paths(fig2, output_path_2, dpi=DPI, bbox_inches='tight', facecolor='white')
+            save_figure(fig1, output_path_1, dpi=DPI, bbox_inches='tight', facecolor='white')
+            save_figure(fig2, output_path_2, dpi=DPI, bbox_inches='tight', facecolor='white')
 
             plt.close(fig1)
             plt.close(fig2)

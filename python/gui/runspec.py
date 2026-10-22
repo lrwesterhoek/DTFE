@@ -39,8 +39,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT / "python") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "python"))
 
-from dtfelib.cli import DATA_ROOT, FIGURES_ROOT, find_sims, sim_dir  # noqa: E402  (after the path fix-up)
-from dtfelib.estimator import STANDARD_PADDING  # noqa: E402  (the Custom tab's standard '--padding')
+from dtfelib.cli import FIGURES_ROOT, find_sims  # noqa: E402  (after the path fix-up)
+from dtfelib.cli import sim_dir as _cli_sim_dir  # noqa: E402
 import config  # noqa: E402  (python/config.py: only dtfelib.cli at import; its h5py is lazy)
 
 PS_SCRIPT = REPO_ROOT / "scripts" / "run_ps_dtfe.sh"
@@ -48,7 +48,7 @@ DTFE_SCRIPT = REPO_ROOT / "scripts" / "run_dtfe.sh"
 PIPELINE_SCRIPT = REPO_ROOT / "scripts" / "run_ps_pipeline.sh"
 PLOT_DIR = REPO_ROOT / "python" / "plot"
 ANALYZE = REPO_ROOT / "python" / "analyze.py"
-# FIGURES_ROOT (dtfelib.cli, = config.LOCAL_FIGURES_ROOT): DTFE_FIGURES_ROOT, else the T7, else python/figures
+# FIGURES_ROOT (dtfelib.cli, = config.LOCAL_FIGURES_ROOT): DTFE_FIGURES_ROOT, else python/figures
 LEGACY_FIGURES_ROOT = REPO_ROOT / "python" / "figures"     # an earlier default, saved verbatim in specs
 
 
@@ -60,10 +60,31 @@ def _current_figures_root(d: dict) -> dict:
     if root and Path(root) == LEGACY_FIGURES_ROOT:
         d = dict(d, figures_root=str(FIGURES_ROOT))
     return d
+# The data root is the launcher's own field (its setup asks for it; every job gets it as DTFE_DATA_ROOT). A new job
+# starts at DTFE_DATA_ROOT when the launcher was started with one, else at none: an empty root is no folder at all
+# (never the working directory), so nothing is found under it and every job refuses to run until one is chosen.
+_NO_ROOT = Path("/nonexistent-data-root")       # what sim_dir() puts an empty root's simulations under
+
+
+def default_data_root() -> str:
+    """A new job's data root: $DTFE_DATA_ROOT, else '' (none chosen yet). Read at call time."""
+    return os.environ.get("DTFE_DATA_ROOT", "")
+
+
+def root_ok(data_root) -> bool:
+    """Whether 'data_root' names an existing folder ('' names none: Path('') would be the working directory)."""
+    return bool(str(data_root).strip()) and Path(data_root).expanduser().is_dir()
+
+
+def sim_dir(sim: str, data_root) -> Path:
+    """dtfelib.cli.sim_dir under the launcher's data root 'data_root' only (never $DTFE_DATA_ROOT behind the
+    field's back): an empty one puts the simulation under a folder that does not exist."""
+    return _cli_sim_dir(sim, Path(data_root).expanduser() if str(data_root).strip() else _NO_ROOT)
+
+
 # the interpreter for the figure scripts (numpy/scipy/matplotlib/h5py): $PY as in the
 # pipeline script, else the python3 on PATH -- NOT the GUI's own venv interpreter
 PYTHON = os.environ.get("PY") or shutil.which("python3") or sys.executable
-PIPELINE_PY_DEFAULT = "/opt/homebrew/bin/python3"         # run_ps_pipeline.sh's own PY default
 
 # (name passed to --field, label). run_ps_dtfe.sh takes any subset via FIELDS; its default is all nine
 # (the T-web and V-web are in the production set). run_dtfe.sh takes the subset it computes (no dispersion), its
@@ -79,13 +100,13 @@ PS_FIELDS = [
     ("tweb_a", "T-web"),
     ("vweb_a", "V-web"),
 ]
-# run_ps_dtfe.sh's FIELDS default (the nine of the thesis grids, the T-web and V-web included; a Grids or
+# run_ps_dtfe.sh's FIELDS default (all nine, the T-web and V-web included; a Grids or
 # Pipeline job passes FIELDS only when its ticks differ, so this must stay the script's default)
 PS_DEFAULT_FIELDS = [n for n, _ in PS_FIELDS]
 WEB_FIELDS = ("tweb_a", "vweb_a")        # the cosmic-web classes: the only consumers of lambda_th
 LAMBDA_TH_DEFAULT = 0.3                  # run_ps_dtfe.sh / run_dtfe.sh LAMBDA_TH (the binary alone: 0.0, so a Custom
                                          # run without it would classify differently from a scripted one)
-# run_dtfe.sh's FIELDS default (with the T-web and V-web, as its production grids), likewise mirrored
+# run_dtfe.sh's FIELDS default (with the T-web and V-web, as its production grids), likewise kept equal
 DTFE_FIELDS = ["density_a", "velocity_a", "gradient_a", "divergence_a", "shear_a", "vorticity_a"] + list(WEB_FIELDS)
 DTFE_ALLOWED_FIELDS = list(DTFE_FIELDS)  # what the standard binary computes (no dispersion: PS only)
 
@@ -109,7 +130,7 @@ def production_deposit(estimator: str) -> str:
 
 @dataclass
 class RunSpec:
-    data_root: str = str(DATA_ROOT)
+    data_root: str = field(default_factory=default_data_root)
     sim: str = ""
     snapshots: list[int] = field(default_factory=list)
     estimator: str = "ps"            # "ps" (run_ps_dtfe.sh) | "dtfe" (run_dtfe.sh)
@@ -164,14 +185,11 @@ class RunSpec:
     # ------------------------------------------------------------------ checks
     def problems(self) -> list[tuple[str, str]]:
         """(level, message) pairs, level 'error' (blocks Run) or 'warning'."""
-        out: list[tuple[str, str]] = []
-        root = Path(self.data_root)
-        if not root.is_dir():
-            out.append(("error", f"data root not found: {root} (is the T7 plugged in?)"))
-        elif not self.sim:
+        out: list[tuple[str, str]] = _root_problems(self.data_root)
+        if not out and not self.sim:
             out.append(("error", "no simulation selected"))
-        elif not self.sim_path().is_dir():
-            out.append(("error", f"{self.sim} not found under {root}"))
+        elif not out and not self.sim_path().is_dir():
+            out.append(("error", f"{self.sim} not found under {Path(self.data_root).expanduser()}"))
         if not self.snapshots:
             out.append(("error", "no snapshots selected"))
         if self.grid < 8 or self.grid > 4096:
@@ -363,7 +381,7 @@ def export_script(steps: list[Step], title: str, slurm: dict | None = None) -> s
             opts += [("mail-type", "END,FAIL"), ("mail-user", slurm["mail"])]
         lines += [f"#SBATCH --{k}={v}" for k, v in opts if v not in (None, "", 0)]
     lines += [f"# {title}",
-              f"# exported by the DTFE launcher on {time.strftime('%Y-%m-%d %H:%M')}: {len(steps)} "
+              f"# exported by Lamina on {time.strftime('%Y-%m-%d %H:%M')}: {len(steps)} "
               f"command{'s' if len(steps) != 1 else ''}, run in order from the repository root",
               "# (on another machine: fix REPO and the data paths first)",
               f"REPO={_q(str(REPO_ROOT))}",
@@ -445,8 +463,10 @@ def _run_option_env(spec) -> dict[str, str]:
 
 
 def _root_problems(data_root: str) -> list[tuple[str, str]]:
-    root = Path(data_root)
-    return [] if root.is_dir() else [("error", f"data root not found: {root} (is the T7 plugged in?)")]
+    if not str(data_root).strip():
+        return [("error", "no data root: choose the folder that holds the simulations (the Data root field, or Setup)")]
+    root = Path(data_root).expanduser()
+    return [] if root.is_dir() else [("error", f"data root not found: {root} (an external disk that is unplugged?)")]
 
 
 def _busy_problems() -> list[tuple[str, str]]:
@@ -660,12 +680,11 @@ class Opt:
     row: str = ""
 
 
-# analyze.py's core plot scripts (its PLOT_SCRIPTS: kept equal by the runspec test) + the synthesis figure,
-# which analyze.py runs only when named in --only
-THESIS_SCRIPTS = ("plot_DTFE.py", "plot_velDiv_den.py", "plot_eigenvalues.py", "plot_shear_triaxial.py",
-                  "plot_PDF_CDF.py", "plot_contour_filter.py", "plot_shape_filter.py", "plot_ellipses_contour_3D.py",
-                  "plot_marked_correlation_BBKS.py", "plot_smoothing_comparison.py", "plot_phi_delta.py",
-                  "plot_tidal_correlation.py", "plot_conclusions_synthesis.py")
+# analyze.py's core plot scripts (its PLOT_SCRIPTS: kept equal by the runspec test)
+CORE_SCRIPTS = ("plot_DTFE.py", "plot_velDiv_den.py", "plot_eigenvalues.py", "plot_shear_triaxial.py",
+                "plot_PDF_CDF.py", "plot_contour_filter.py", "plot_shape_filter.py", "plot_ellipses_contour_3D.py",
+                "plot_marked_correlation_BBKS.py", "plot_smoothing_comparison.py", "plot_phi_delta.py",
+                "plot_tidal_correlation.py")
 POINTEVAL_DERIV_SMOOTH = 10.0   # dtfelib.pointeval.DERIVATIVE_SMOOTH (plot_pointeval's own default): the runspec test
 DENSITY_LIMITS = (0.0, 1e7, 4)  # rho/rho_bar: TNG100-3-Dark z=0 reaches 2.3e5 (99.99th pct 913); voids go below 0.01
 
@@ -863,7 +882,7 @@ FIGURE_SETS: tuple[FigureSet, ...] = (
               opts=(Opt("sims", "Boxes", "text", CROSSBOX_SIMS, help="space-separated simulation names"),
                     Opt("smooth_mpc", "Common smoothing in Mpc", "float", CROSSBOX_SMOOTH_MPC,
                         help=f"{CROSSBOX_SMOOTH_MPC:g} = config.CROSSBOX_SMOOTHING_MPC (2.1625 = 10.0002 TNG100-3-Dark "
-                             "cells, the earlier results' value)",
+                             "cells)",
                         limits=(0.0, 100.0, 4)),
                     Opt("z", "Redshifts of the bottom row", "text", "0 0.5 1", help="space-separated, one figure each"),
                     Opt("n_boot", "Bootstrap resamples (0 = the script's default)", "int", 0),
@@ -921,16 +940,15 @@ FIGURE_SETS: tuple[FigureSet, ...] = (
               "Walls, filaments and nodes from the collapse classes of a run with caustics on, and per void the "
               "fold fraction around its wall and the distance to the nearest wall.", "caustic_skeleton/<sim>",
               opts=(Opt("voids", "Per-void statistics", "bool", True), _RADIUS, _OVERLAPS, _SMOOTH_MPC) + _SKEL_OPTS),
-    FigureSet("thesis", "Thesis analysis set", "analyze.py", "series",
+    FigureSet("core", "Core analysis set", "analyze.py", "series",
               "The core analysis figures (eigenvalues, void shapes, correlations, ...) through "
               "analyze.py: 'compute' fills python/cache from the standard-DTFE grids with the "
               "smoothing of python/config.py, 'plot' draws from that cache, 'export' writes the void "
               "catalogues (CSV + HDF5, under void_catalog/<sim>).", "<analysis>/",
               common=False,
               opts=(Opt("mode", "Mode", "choice", "all", ("all", "compute", "plot", "check", "export")),
-                    Opt("only", "Only these scripts", "multi", "", THESIS_SCRIPTS,
-                        help="tick some to run only those; none ticked = the full core set (the synthesis figure "
-                             "is run only when ticked)"))),
+                    Opt("only", "Only these scripts", "multi", "", CORE_SCRIPTS,
+                        help="tick some to run only those; none ticked = the full core set"))),
 )
 FIGURE_SET = {fs.key: fs for fs in FIGURE_SETS}
 
@@ -941,7 +959,7 @@ MERGE_TOOL = REPO_ROOT / "python" / "tools" / "merge_HDF5.py"
 API_KEY_FILE = Path.home() / ".tng_api_key"     # download_snapshots.sh reads it (or TNG_API_KEY)
 
 # DM particles per side of every TNG run (the -Dark twin has the same DM count). A raw -Dark
-# snapshot is ~61 bytes per particle (measured on the T7: TNG50-3/100-3/300-3, 4 chunks each),
+# snapshot is ~61 bytes per particle (measured: TNG50-3/100-3/300-3, 4 chunks each),
 # the merged combined_NNN.hdf5 32 (float32 x3 + uint64 + float32 x3).
 TNG_DM_PER_SIDE = {"TNG50-1": 2160, "TNG50-2": 1080, "TNG50-3": 540, "TNG50-4": 270,
                    "TNG100-1": 1820, "TNG100-2": 910, "TNG100-3": 455,
@@ -1063,7 +1081,8 @@ def next_waiting(queue: list[QueuedJob]) -> int | None:
 
 # ---------------------------------------------------------------------- discovery helpers
 def simulations(root) -> list[str]:
-    return find_sims(root, "snapdir_*/combined_*.hdf5")
+    """The simulations with merged snapshots under the data root 'root'; none for an empty root."""
+    return find_sims(Path(root).expanduser(), "snapdir_*/combined_*.hdf5") if root_ok(root) else []
 
 
 def snapshots(sim_path: Path, prefix: str = "ps_output", estimator: str = "ps", done=None) -> list[dict]:
@@ -1459,9 +1478,9 @@ def memory_text(mem: dict, procs: dict | None = None) -> str:
     return " · ".join(bits) or "memory: unknown"
 
 
-# the binary's command line: '<exe> <input> <output root> [--options]'; the paths may hold spaces ('Samsung T7',
-# 'Mobile Documents'), so the input is matched up to its snapshot suffix and the output root up to the next option
-# (the launcher's own Custom runs name the binary by its absolute path, which holds spaces under iCloud)
+# the binary's command line: '<exe> <input> <output root> [--options]'; the paths may hold spaces (an external
+# disk's name, 'Mobile Documents'), so the input is matched up to its snapshot suffix and the output root up to the
+# next option (the launcher's own Custom runs name the binary by its absolute path, which may hold spaces too)
 _ARGV = re.compile(r"^(?P<exe>(?:.*?/)?(?:PS-)?DTFE(?:-[\w-]+)?)\s+(?P<input>.+?\.(?:hdf5|h5|hdf|bin|dat|txt|\d+))"
                    r"\s+(?P<output>.+?)(?=\s+--|\s*$)")
 _SNAPDIR = re.compile(r"(?:^|/)snapdir_(\d{3})(?:/|$)")
@@ -1543,10 +1562,9 @@ def progress_files(data_root, extra_dirs=()) -> list[Path]:
     """Every progress sidecar '<prefix>.runlog.progress' (C1) under the data root's snapshot folders (per-family
     and flat layout) and in the custom-snapshot output folders."""
     found: list[Path] = []
-    root = Path(data_root)
-    if root.is_dir():
+    if root_ok(data_root):                      # an empty root is none (not the working directory)
         for pattern in ("*/snapdir_*/*.runlog.progress", "*/*/snapdir_*/*.runlog.progress"):
-            found += root.glob(pattern)
+            found += Path(data_root).expanduser().glob(pattern)
     for d in extra_dirs:
         if Path(d).is_dir():
             found += Path(d).glob("*.runlog.progress")

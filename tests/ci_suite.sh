@@ -23,7 +23,7 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$(dirname "$SCRIPT_DIR")"
-PY="${PYTHON:-python3}"
+source "${SCRIPT_DIR}/lib.sh"   # PY: the python with numpy and h5py
 ARCH="${ARCH_FLAGS:--mtune=generic}"
 JOBS="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
 step() { echo; echo "==== $*"; }
@@ -112,7 +112,7 @@ EOF
         fi
     done
     echo "  no python3.10 / python3.11 on PATH: the oldest-Python parse check skipped"
-    [ "${1:-}" != "required" ]          # the oldpy stage: a skip is a failure (2026-10-11)
+    [ "${1:-}" != "required" ]          # the oldpy stage: a skip is a failure
 }
 
 stage_core() {
@@ -131,11 +131,11 @@ stage_core() {
     step "--scratch-dir (out-of-core accumulators)"; tests/ps_scratch_check.sh --no-build
     # AFTER the program suites: ps_caustic_class_check.sh leaves the crossed-waves run (pcc_out.*) under the
     # temp root, which the caustic-skeleton test's real-grid half reads (else it is a SKIP, not a pass)
-    step "dtfelib python suite (synthetic tier; the data-backed tier skips without the T7)"; "$PY" tests/py_dtfelib_test.py
+    step "dtfelib python suite (synthetic tier; the data-backed tier skips without simulation data)"; "$PY" tests/py_dtfelib_test.py
     # the suites' own contract: skips that DTFE_TEST_REQUIRED=1 turns into failures, which the double
     # stage relies on, and run_tests.py's regression SKIP in a fresh reference folder, which it does not
     step "skip / fail contract of run_tests.py and ps_double_check.sh"; tests/run_tests_check.sh --no-build
-    # the void analyses, one suite each (synthetic; the T7 parts skip)
+    # the void analyses, one suite each (synthetic; the data-backed parts skip without simulation data)
     step "void catalogue: R_v definitions, cache identity, gate"; MPLBACKEND=Agg "$PY" tests/py_void_core_test.py
     step "void profiles across z + HSW fits";   MPLBACKEND=Agg "$PY" tests/py_profiles_test.py
     step "size function theory, cross-box shapes"; MPLBACKEND=Agg "$PY" tests/py_population_test.py
@@ -146,9 +146,8 @@ stage_core() {
     step "void-in-cloud criteria";               MPLBACKEND=Agg "$PY" tests/py_vic_test.py
     # what the README tells a user to type exists in the code, and the drivers' knobs are documented
     step "docs drift (README / COMMANDS.md against the code)"; "$PY" tests/docs_drift_check.py
-    # the python analysis stack end to end on a synthetic two-snapshot set (pins its own temp folders; its mirror
-    # check needs the thesis mirror ON, so a DTFE_NO_MIRROR from the caller's shell is dropped)
-    step "python selftest (synthetic pipeline + the core plot scripts)"; env -u DTFE_NO_MIRROR MPLBACKEND=Agg "$PY" python/selftest.py
+    # the python analysis stack end to end on a synthetic two-snapshot set (pins its own temp folders)
+    step "python selftest (synthetic pipeline + the core plot scripts)"; MPLBACKEND=Agg "$PY" python/selftest.py
 }
 
 stage_oldpy() {

@@ -6,7 +6,7 @@ import matplotlib as mpl
 import matplotlib.pyplot as plt
 from scipy.stats import gaussian_kde
 from matplotlib.lines import Line2D
-from dtfelib.figures import save_plot_to_multiple_paths
+from dtfelib.figures import save_figure
 import config
 from dtfelib import figures as style
 from dtfelib import pipeline
@@ -99,7 +99,6 @@ def process_snapshot(snapshot, redshift, sim, method, prefix=None, data_root=Non
     try:
         p = pipeline.products(snapshot, redshift, sim=sim, method=method, prefix=prefix, data_root=data_root)
         cat = p.voids()
-        style.note_source(p.fs)                     # the thesis mirror takes the thesis box's standard DTFE only
         p.release()
 
         if len(cat['coords']) == 0:
@@ -272,7 +271,7 @@ def plot_contour_axis_ratios(snapshots_data, snapshot_ids, output_path=None):
     plt.tight_layout()
     
     if output_path:
-        save_plot_to_multiple_paths(plt.gcf(), output_path, dpi=DPI, bbox_inches='tight')
+        save_figure(plt.gcf(), output_path, dpi=DPI, bbox_inches='tight')
         plt.close()
     else:
         plt.show()
@@ -410,7 +409,7 @@ def plot_contour_bbks(snapshots_data, snapshot_ids, output_path=None):
     plt.tight_layout()
     
     if output_path:
-        save_plot_to_multiple_paths(plt.gcf(), output_path, dpi=DPI, bbox_inches='tight')
+        save_figure(plt.gcf(), output_path, dpi=DPI, bbox_inches='tight')
         plt.close()
     else:
         plt.show()
@@ -486,7 +485,7 @@ def plot_distribution_evolution(snapshots_data, snapshot_ids, column, xlabel, ou
     plt.legend(title='Redshift', ncol=2)
     plt.grid(alpha=0.3)
     plt.tight_layout()
-    save_plot_to_multiple_paths(plt.gcf(), output_path, dpi=DPI, bbox_inches='tight')
+    save_figure(plt.gcf(), output_path, dpi=DPI, bbox_inches='tight')
     plt.close()
 
 
@@ -512,7 +511,7 @@ def _evolution_panel(zp1, series, ylabel, output_path):
     ax.set_xscale('log')
     ax.invert_xaxis()
     plt.tight_layout()
-    save_plot_to_multiple_paths(fig, output_path, dpi=DPI, bbox_inches='tight')
+    save_figure(fig, output_path, dpi=DPI, bbox_inches='tight')
     plt.close(fig)
 
 

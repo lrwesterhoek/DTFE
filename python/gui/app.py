@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DTFE / PS-DTFE launcher (PySide6).
+"""Lamina, the launcher of the DTFE and PS-DTFE programs (PySide6).
 
 Six tabs; the first five are jobs (runspec.py):
   Data       scripts/download_snapshots.sh and python/tools/merge_HDF5.py: snapshots, group
@@ -32,9 +32,9 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import QLocale, QProcess, QSettings, Qt, QTimer
-from PySide6.QtGui import QAction, QColor, QIcon, QKeySequence, QShortcut
+from PySide6.QtGui import QColor, QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidgetItem, QMainWindow,
+    QApplication, QComboBox, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QListWidgetItem, QMainWindow,
     QMessageBox, QPushButton, QAbstractItemView, QAbstractSpinBox, QSplitter, QStackedWidget, QTabWidget, QVBoxLayout,
     QWidget,
 )
@@ -132,9 +132,9 @@ class MainWindow(TabsMixin, SpecsMixin, RunMixin, MenusMixin, CheckMixin, QMainW
         QLocale.setDefault(QLocale.c())      # spin boxes read and show '2.00', as every label does (not the system's
         super().__init__()                   # '2,00'); BEFORE the window exists: children inherit the parent's locale
         self.setLocale(QLocale.c())
-        self.setWindowTitle("DTFE / PS-DTFE launcher")
+        self.setWindowTitle("Lamina")
         self.remember = remember
-        self.settings = settings or QSettings("DTFE", "launcher")
+        self.settings = settings or QSettings("DTFE", "launcher")   # the settings' key: saved choices stay where they are
         self.spec = spec or self._restore("spec", rs.RunSpec)
         self.pipe = pipeline or self._restore("pipeline", rs.PipelineSpec)
         self.plots = plots or self._restore("plots", rs.PlotSpec)
@@ -290,8 +290,8 @@ class MainWindow(TabsMixin, SpecsMixin, RunMixin, MenusMixin, CheckMixin, QMainW
         self._fill_snaps()
         self._refresh_queue()
         self.refresh()
-        # re-check every few seconds while idle: jobs started or finished in a terminal, the T7
-        # plugged in or out
+        # re-check every few seconds while idle: jobs started or finished in a terminal, an external
+        # disk plugged in or out
         self._poll = QTimer(self, interval=4000)
         self._poll.timeout.connect(lambda: self.proc is None and self.refresh())
         self._poll.start()
@@ -581,7 +581,7 @@ class MainWindow(TabsMixin, SpecsMixin, RunMixin, MenusMixin, CheckMixin, QMainW
         if tab == OWN:
             steps = job.steps() if job.input_file else []
         else:
-            steps = job.steps() if (tab == PIPELINE or job.sim) and Path(job.data_root).is_dir() else []
+            steps = job.steps() if (tab == PIPELINE or job.sim) and rs.root_ok(job.data_root) else []
         n = len(steps)
         self.cmd_title.setText("Command" if n <= 1 else f"Commands ({n}, run in order)")
         self.cmd_view.setPlainText(rs.script_text(steps) if steps else
@@ -607,8 +607,8 @@ class MainWindow(TabsMixin, SpecsMixin, RunMixin, MenusMixin, CheckMixin, QMainW
         self.queue_btn.setEnabled(not blocked)
         # both estimators (the standard binary's auto-tuner reports too)
         checkable = ((tab == GRIDS and bool(self.spec.snapshots)
-                      and bool(self.spec.sim) and Path(job.data_root).is_dir())
-                     or (tab == PIPELINE and bool(self.pipe.sims) and Path(job.data_root).is_dir())
+                      and bool(self.spec.sim) and rs.root_ok(job.data_root))
+                     or (tab == PIPELINE and bool(self.pipe.sims) and rs.root_ok(job.data_root))
                      or (tab == OWN and self._custom_checkable()))
         mem_ok = self._mcheck is not None or (checkable and self.proc is None)
         self.mem_btn.setVisible(tab in (GRIDS, PIPELINE, OWN))
@@ -621,7 +621,7 @@ class MainWindow(TabsMixin, SpecsMixin, RunMixin, MenusMixin, CheckMixin, QMainW
     def _estimate(self, tab: int, steps: list[rs.Step]) -> str:
         if tab == DATA:
             d = self.data
-            if not d.sim or not Path(d.data_root).is_dir():
+            if not d.sim or not rs.root_ok(d.data_root):
                 return ""
             if not steps:
                 return ""
@@ -914,7 +914,7 @@ def smoke_report(w: MainWindow) -> str:
         f"python3 for the scripts: {rs.PYTHON} ({deps(rs.PYTHON)})",
         f"wget: {rs.shutil.which('wget') or 'not found'}",
         f"TNG API key available: {rs.api_key_available()}",
-        f"data root: {root} ({'found' if Path(root).is_dir() else 'NOT found'}), "
+        f"data root: {root or '(none chosen)'} ({'found' if rs.root_ok(root) else 'NOT found'}), "
         f"{w.sim_combo.count()} simulations",
         f"PS-DTFE: {'built' if (rs.REPO_ROOT / 'PS-DTFE').is_file() else 'NOT built'}, "
         f"GPU {'yes' if rs.gpu_built('ps') else 'no'}, parallel triangulation (TBB) {'yes' if rs.tbb_built() else 'no'}; "
@@ -965,10 +965,10 @@ def _macos_app_name(name: str) -> bool:
 def main():
     # the Dock and Cmd-Tab name a process after its BUNDLE, which scripts/install_gui_app.sh's GUI
     # host provides; without the host (plain interpreter) this at least fixes the menu bar
-    _macos_app_name("DTFE Launcher")            # before QApplication builds the menu bar
+    _macos_app_name("Lamina")                   # before QApplication builds the menu bar
     app = QApplication(sys.argv)
-    app.setApplicationName("DTFE launcher")
-    app.setApplicationDisplayName("DTFE Launcher")
+    app.setApplicationName("Lamina")
+    app.setApplicationDisplayName("Lamina")
     icon = os.environ.get("DTFE_GUI_ICON", "")          # set by the app bundle / .desktop launcher
     if icon and Path(icon).is_file():
         app.setWindowIcon(QIcon(icon))
@@ -980,7 +980,7 @@ def main():
     w.show()
     # first launch: the setup dialog -- unless this is an existing, working installation (settings
     # remembered, data folder present, programs built), which it would only interrupt
-    working = (bool(w.settings.value("spec")) and Path(w.root_edit.text()).is_dir()
+    working = (bool(w.settings.value("spec")) and rs.root_ok(w.root_edit.text())
                and (rs.REPO_ROOT / "PS-DTFE").is_file())
     if "--setup" in sys.argv[1:] or (not w.settings.value("setup_done") and not working):
         QTimer.singleShot(300, w.run_setup)

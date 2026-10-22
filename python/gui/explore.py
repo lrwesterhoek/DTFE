@@ -99,7 +99,8 @@ def default_cache_dir(near: str) -> Path:
     output: the data root; your own file's output: its folder) -- that disk has the room, ~0.15 KB
     per tessellation vertex -- unless it is iCloud Drive or read-only, else the user cache."""
     root = Path(near)
-    if root.is_dir() and "Mobile Documents" not in str(root.resolve()) and os.access(root, os.W_OK):
+    if str(near).strip() and root.is_dir() and "Mobile Documents" not in str(root.resolve()) \
+            and os.access(root, os.W_OK):
         return root / ".dtfe-tessellation-cache"
     base = Path.home() / ("Library/Caches" if sys.platform == "darwin" else ".cache")
     return base / "DTFE" / "tessellations"
@@ -243,7 +244,7 @@ class SliceWorker(QObject):
 WINDOW_GRID_MAX = 1 << 20
 
 # The time an exact zoom of a phase-space run will take, from measured rates (TNG100-3-Dark,
-# 94M particles, from the Samsung T7, M1 Max): reading snapshot + initial conditions 16 s for 6.0 GB
+# 94M particles, from an external SSD, M1 Max): reading snapshot + initial conditions 16 s for 6.0 GB
 # (skipped when the snapshot's globals are recorded and every needed partition is cached); per BUILT
 # partition 3 s selecting its particles (all 94M scanned; a cached one skips it); 8.4 s loading a
 # cached single-stream 6.0M-vertex tessellation (a 0.88 GB file) -- a chunked file loads 1.68x faster

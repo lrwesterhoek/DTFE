@@ -21,8 +21,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$ROOT" || exit 1
-PY="${PYTHON:-python3}"
-command -v /opt/homebrew/bin/python3.14 >/dev/null 2>&1 && PY=/opt/homebrew/bin/python3.14
+source "${SCRIPT_DIR}/lib.sh"   # PY: the python with numpy and h5py
 # a pair missing is a SKIP, or a FAILURE under DTFE_TEST_REQUIRED=1, which ci_suite.sh's double stage sets after
 # building both pairs. precision.sh's skip_or_fail, inlined: sourcing
 # precision.sh would announce one precision for a suite that runs both.

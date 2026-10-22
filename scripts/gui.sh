@@ -16,9 +16,9 @@ if [ -z "${PY}" ]; then
     if [ -x "${VENV}/bin/python" ]; then PY="${VENV}/bin/python"; else PY=python3; fi
 fi
 # macOS: run inside the GUI host bundle scripts/install_gui_app.sh puts next to the venv, so the
-# Dock, Cmd-Tab and the menu bar say "DTFE Launcher" rather than "Python" (the plain interpreter
+# Dock, Cmd-Tab and the menu bar say "Lamina" rather than "Python" (the plain interpreter
 # is the fallback whenever the host is missing or cannot import PySide6)
-HOST="${VENV:-}/DTFE Launcher.app/Contents/MacOS/DTFE Launcher"
+HOST="${VENV:-}/Lamina.app/Contents/MacOS/Lamina"
 if [ "$(uname -s)" = "Darwin" ] && [ -n "${VENV:-}" ] && [ "${PY}" = "${VENV}/bin/python" ] \
    && [ -x "${HOST}" ] && "${HOST}" -c "import PySide6" 2>/dev/null; then
     exec "${HOST}" "${REPO_ROOT}/python/gui/app.py" "$@"

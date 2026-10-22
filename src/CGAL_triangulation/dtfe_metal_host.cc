@@ -111,7 +111,8 @@ struct Ctx
 int kSlot(int cacheK) { return cacheK == 2 ? 0 : cacheK == 8 ? 2 : 1; }
 
 std::mutex& ctxMutex() { static std::mutex m; return m; }
-bool timingOn() { static bool t = getenv("DTFE_METAL_TIMING") != nullptr; return t; }
+// DTFE_GPU_TIMING=1 (alias DTFE_METAL_TIMING): one line per batch
+bool timingOn() { static bool t = Env::flag({"DTFE_GPU_TIMING", "DTFE_METAL_TIMING"}); return t; }
 
 Ctx& ctx()
 {
@@ -391,8 +392,8 @@ bool runBatch(Ctx& c, Batch& b, Grids& g, ChunkState& cs, Stats& st, bool shared
     size_t const MIN_CHUNK = exact ? 1024 : useItems ? 4096 : 2048;
     size_t const MAX_CHUNK = exact ? 499968 : useItems ? 4000000 : 499968;   // (multiples of CHUNK_ALIGN)
     size_t firstChunk = exact ? 8192 : useItems ? 65536 : 25088;
-    if (const char* env = getenv("DTFE_METAL_CHUNK"))
-    { long v = atol(env); if (v > 0) firstChunk = size_t(v); }
+    // DTFE_GPU_CHUNK (alias DTFE_METAL_CHUNK): the opening chunk
+    if (long const v = Env::integer({"DTFE_GPU_CHUNK", "DTFE_METAL_CHUNK"}, 0); v > 0) firstChunk = size_t(v);
     GpuPace& pace = gpuPace();        // targetSec 0.25 s, gapUs 8 ms (~3% overhead) until escalated
     // an escalated pace (an earlier batch's failures) opens with a proportionally smaller chunk
     if (pace.targetSec < GPU_PACE_TARGET0)
@@ -427,7 +428,7 @@ bool runBatch(Ctx& c, Batch& b, Grids& g, ChunkState& cs, Stats& st, bool shared
         uint32_t e = 1;
         while (size_t(e * 2) * (4 + stride * valueBytes) <= budget) e *= 2;
         if (size_t(e) * (4 + stride * valueBytes) > budget) e = 0;
-        if (const char* env = getenv("DTFE_GPU_TABLE")) { if (atoi(env) == 0) e = 0; }
+        if (!Env::flag("DTFE_GPU_TABLE", true)) e = 0;
         tableEntries = e >= 64 ? e : 0;
         if (tableEntries)
         {
@@ -450,10 +451,10 @@ bool runBatch(Ctx& c, Batch& b, Grids& g, ChunkState& cs, Stats& st, bool shared
     // DTFE_GPU_CHECKPOINT_CHUNKS=<n>: a checkpoint every n command buffers (0 = only the batch-start snapshot).
     // Unset: every ~10 s of GPU work (n = 10 s / the current buffer target), as the PS deposit's.
     long ckChunks = -1;
-    if (const char* env = getenv("DTFE_GPU_CHECKPOINT_CHUNKS")) { ckChunks = atol(env); if (ckChunks < 0) ckChunks = 0; }
+    if (Env::isSet("DTFE_GPU_CHECKPOINT_CHUNKS")) ckChunks = std::max(0L, Env::integer("DTFE_GPU_CHECKPOINT_CHUNKS", 0));
     // DTFE_GPU_PACE_RECOVER_SEC=<s>: the clean GPU work after which an escalated pace steps back (GpuPace)
     double paceRecoverSec = 90.;
-    if (const char* env = getenv("DTFE_GPU_PACE_RECOVER_SEC")) { double v = atof(env); if (v >= 0.) paceRecoverSec = v; }
+    if (double const v = Env::real("DTFE_GPU_PACE_RECOVER_SEC", -1.); v >= 0.) paceRecoverSec = v;
     std::vector<MTL::Buffer*> const gridBufs = g.buffers();
     GpuSnapshot snap;
     // the batch's start: its grids are zero (per call: freshly zeroed; shared: its owner box, never written by

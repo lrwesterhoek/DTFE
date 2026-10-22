@@ -32,10 +32,10 @@
 // Singularity threshold of matrixInverse(), RELATIVE: a matrix counts as singular when |det| is
 // below REAL_PRECISSION times the product of its row norms. By Hadamard's inequality that ratio is
 // a pure shape measure in [0,1] (1 for orthogonal rows), so the test is independent of the length
-// unit and of the simplex's size. It used to be an ABSOLUTE |det| < 1e-6, in (length unit)^3: every
-// well-shaped tetrahedron with edges below ~0.01 Mpc was declared singular -- the PS-DTFE deposit
-// then DROPPED it (22.6% of the mass lost on a 1 Mpc box at 48^3, i.e. TNG50-1 resolution) and the
-// standard binary interpolated a constant field (zero gradient) inside it.
+// unit and of the simplex's size. An ABSOLUTE |det| < 1e-6, in (length unit)^3, would declare every
+// well-shaped tetrahedron with edges below ~0.01 Mpc singular: the PS-DTFE deposit would DROP it
+// (22.6% of the mass lost on a 1 Mpc box at 48^3, i.e. TNG50-1 resolution) and the standard binary
+// would interpolate a constant field (zero gradient) inside it.
 #define REAL_PRECISSION 1.e-6
 
 // Product of the row norms of an NxN matrix (the Hadamard bound on |det|).

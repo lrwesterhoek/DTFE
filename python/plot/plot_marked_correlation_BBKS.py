@@ -8,7 +8,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.ndimage import gaussian_filter1d
 
-from dtfelib.figures import save_plot_to_multiple_paths
+from dtfelib.figures import save_figure
 from dtfelib import make_parser
 import config
 from dtfelib import figures as style
@@ -178,8 +178,8 @@ def plot_panel(r, curve, lo, hi, color, label, ylabel, null_level, ylim,
     ax.set_ylim(*ylim)
 
     plt.tight_layout()
-    save_plot_to_multiple_paths(fig, output_path, dpi=DPI,
-                                bbox_inches='tight', facecolor='white')
+    save_figure(fig, output_path, dpi=DPI,
+                bbox_inches='tight', facecolor='white')
     plt.close(fig)
 
 
@@ -196,7 +196,6 @@ def process_snapshot(snapshot, redshift, args):
 
     try:
         cat = p.voids()
-        style.note_source(p.fs)                     # the thesis mirror takes the thesis box's standard DTFE only
         p.release()
 
         pos, e_marks, p_marks, major = void_sample(cat)

@@ -1,16 +1,14 @@
 """Figure styling and output for the plot scripts: colormaps, rcParams, colour norms,
-and save_plot_to_multiple_paths (local figures dir + thesis mirror).
+and save_figure (a figure saved where it belongs, its folder made first).
 
-Import as `from dtfelib import figures as style` (the historical alias). Reads config
+Import as `from dtfelib import figures as style` (the scripts' alias). Reads config
 only at call time, so a test harness can patch config before running a script.
 """
 
-import os
 from pathlib import Path
 
 import matplotlib as mpl
 import config
-from .cli import require_sim
 
 CMAP = {
     'density': 'plasma',
@@ -266,88 +264,11 @@ def delta_contour_levels(field_slice, norm, num_contours=20):
     return _np.unique(_np.asarray(levels))
 
 
-def mirror_relative_path(primary_path) -> str:
-    """Where a figure goes below the thesis Figures/ tree: its path below config.LOCAL_FIGURES_ROOT (read at
-    call time) when it lies under it, else below its first 'figures/' folder, else its bare name. The root
-    comes first: DTFE_FIGURES_ROOT may name any folder, and under one without '/figures/' in
-    its path the folder test alone would drop every mirrored file flat
-    into Figures/, simulations' names colliding."""
-    p = Path(primary_path).expanduser()
-    try:
-        return p.resolve().relative_to(Path(str(config.LOCAL_FIGURES_ROOT)).expanduser().resolve()).as_posix()
-    except (ValueError, OSError):
-        pass
-    s = str(p).replace('\\', '/')
-    return s.split('/figures/', 1)[1] if '/figures/' in s else p.name
-
-
-# The thesis mirror's guard. The thesis scripts name their figures without the simulation or the
-# estimator (config.figures_path), so a run on another box, or on PS-DTFE grids (FieldSet's auto-detect picks them
-# whenever they are there, as on the T7), would replace the thesis's TNG50-3-Dark standard-DTFE figures under the same
-# names. Those folders take a figure only when the run is on config.THESIS_SIMULATION and every grid set the
-# script noted (note_source) is config.THESIS_METHOD's default one. The per-simulation folders (void_profiles/<sim>/,
-# web_streams/<sim>/, ...) cannot collide and mirror unguarded. DTFE_NO_MIRROR (analyze.py --no-mirror) turns every
-# mirror off.
-_SOURCES = set()            # (simulation, method, prefix) of the grids this process's thesis figures are made from
-_SAID = set()               # each refusal is said once per process, not once per figure
-_ESTIMATOR = {'ps': 'PS-DTFE', 'dtfe': 'standard-DTFE'}
-
-
-def note_source(fs):
-    """A thesis script's data: the FieldSet (a pipeline product's .fs) its figures are made from. Its snapshot
-    folder's parent names the simulation; the method and the prefix say which grids were read."""
-    snapdir = getattr(fs, 'snapdir', None)
-    sim = Path(snapdir).parent.name if snapdir is not None else require_sim(config.SIMULATION)
-    _SOURCES.add((sim, str(getattr(fs, 'method', '')), str(getattr(fs, 'prefix', ''))))
-
-
-def thesis_mirror_refusal():
-    """Why a figure named without its simulation and estimator may not go into the thesis tree now; None: it may.
-    Read at call time (config, the environment, the noted sources)."""
-    from .io import _PREFIX
-    if os.environ.get('DTFE_NO_MIRROR'):
-        return "the run asked for no thesis mirror"
-    want_sim, want_method = config.THESIS_SIMULATION, config.THESIS_METHOD
-    if config.SIMULATION != want_sim:
-        return f"the simulation is {config.SIMULATION} (DTFE_SIM), not the thesis's {want_sim}"
-    for sim, method, prefix in sorted(_SOURCES):
-        if sim != want_sim:
-            return f"made from {sim}'s grids, not the thesis simulation {want_sim}'s"
-        if method != want_method or prefix != _PREFIX.get(want_method):
-            return (f"made from {_ESTIMATOR.get(method, method)} grids ({prefix}*), not the thesis's "
-                    f"{_ESTIMATOR.get(want_method, want_method)} ones ({_PREFIX.get(want_method)}*)")
-    return None
-
-
-def save_plot_to_multiple_paths(fig, primary_path, dpi=300, mirror=True, **kwargs):
-    """Save a figure to its primary path and mirror it into the thesis Figures/ tree
-    (config.THESIS_FIGURES_DIR, read at call time), preserving its path below the figure root
-    (mirror_relative_path). mirror=False saves the primary path only: a script run with --out (a path outside
-    the figure root) would otherwise drop its files FLAT into the thesis tree's root, where simulations' names
-    collide. A figure in one of config.THESIS_NAMED_DIRS is mirrored only when
-    thesis_mirror_refusal() has no objection, and the refusal is said."""
-    primary_path = Path(primary_path)
-    primary_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(primary_path, dpi=dpi, **kwargs)
-    if not mirror or os.environ.get('DTFE_NO_MIRROR'):
-        return
-    from . import pipeline as _pl                         # here: pipeline imports this module's package at load
-    if _pl.smoothing_tag():
-        return                                            # the thesis tree holds production-smoothing figures only
-
-    rel = mirror_relative_path(primary_path)
-    if rel.split('/', 1)[0] in getattr(config, 'THESIS_NAMED_DIRS', ()):
-        why = thesis_mirror_refusal()
-        if why:
-            if why not in _SAID:
-                _SAID.add(why)
-                print(f"  not copied into the thesis Figures/ tree: {why}. These file names carry neither the "
-                      f"simulation nor the estimator; only {config.THESIS_SIMULATION} "
-                      f"{_ESTIMATOR.get(config.THESIS_METHOD, config.THESIS_METHOD)} figures go there.")
-            return
-    additional_path = Path(str(config.THESIS_FIGURES_DIR)) / rel
-    additional_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(additional_path, dpi=dpi, **kwargs)
+def save_figure(fig, path, dpi=300, **kwargs):
+    """Save a figure to 'path' (its folder made first); dpi and every other keyword go to fig.savefig."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=dpi, **kwargs)
 
 
 # ---------------------------------------------------------------- slice maps in the house style
@@ -467,24 +388,18 @@ def _draw_panel(fig, ax, panel, box_mpc, plane, ylabel=True):
     return im
 
 
-def _save(fig, path, mirror):
+def _save(fig, path):
     import matplotlib.pyplot as _plt
     if path is not None:
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if mirror:
-            save_plot_to_multiple_paths(fig, path, dpi=config.DPI, bbox_inches='tight')
-        else:
-            fig.savefig(path, dpi=config.DPI, bbox_inches='tight')
+        save_figure(fig, path, dpi=config.DPI, bbox_inches='tight')
     _plt.close(fig)
 
 
 def slice_map(data, box_mpc, plane, cmap, norm=None, label='', title='', path=None, vmin=None, vmax=None,
               interpolation=None, text=None, footnote=None, cbar_ticks=None, cbar_ticklabels=None, floor=False,
-              figsize=(8, 7), mirror=False):
-    """One slice map in the house style, saved to 'path' (config.DPI, tight; mirror=True also into the
-    thesis Figures tree) and closed. 'data' is passed as imshow wants it (rows vertical: the scripts keep
-    their .T); 'text' = a boxed note in the corner, 'footnote' = a line under the axes. Returns
+              figsize=(8, 7)):
+    """One slice map in the house style, saved to 'path' (config.DPI, tight) and closed. 'data' is passed as
+    imshow wants it (rows vertical: the scripts keep their .T); 'text' = a boxed note in the corner, 'footnote' = a line under the axes. Returns
     {'path', 'vmin', 'vmax'} -- the range drawn, for tests and logs."""
     import matplotlib.pyplot as _plt
     fig, ax = _plt.subplots(figsize=figsize)
@@ -495,11 +410,11 @@ def slice_map(data, box_mpc, plane, cmap, norm=None, label='', title='', path=No
         ax.text(0.5, -0.12, footnote, transform=ax.transAxes, ha='center', fontsize=9, style='italic')
     fig.tight_layout()
     lo, hi = im.norm.vmin, im.norm.vmax
-    _save(fig, path, mirror)
+    _save(fig, path)
     return {'path': None if path is None else Path(path), 'vmin': lo, 'vmax': hi}
 
 
-def slice_row(panels, box_mpc, plane, path=None, suptitle='', footnote=None, figsize=None, mirror=False):
+def slice_row(panels, box_mpc, plane, path=None, suptitle='', footnote=None, figsize=None):
     """A row of maps of one plane (a triptych of eigenvalues, the density next to the streams, the two webs
     and their residual): 'panels' = the dicts _draw_panel takes; only the first carries the y label.
     'footnote' goes under the row. Returns {'path', 'ranges': [(vmin, vmax), ...]}."""
@@ -514,5 +429,5 @@ def slice_row(panels, box_mpc, plane, path=None, suptitle='', footnote=None, fig
         fig.text(0.5, -0.02, footnote, ha='center', style='italic')
     set_suptitle(fig, suptitle, y=1.02)
     fig.tight_layout()
-    _save(fig, path, mirror)
+    _save(fig, path)
     return {'path': None if path is None else Path(path), 'ranges': ranges}

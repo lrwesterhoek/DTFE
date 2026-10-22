@@ -392,10 +392,10 @@ def build_void_catalog(delta_s, hessian):
 
 def set_smoothing(cells=None, mpc=None):
     """Set the smoothing length for this process: in cells (a script's --smooth: the footprint stays as it is, the
-    thesis's r512_s5_f11 / s20_f11 caches rely on that) or in Mpc (--smooth-mpc: the same physical scale in every
-    box, the footprint following it -- config.footprint_for). Keeps config.SMOOTHING_SIGMA_MPC in step. In cells the
+    smoothing comparison's r512_s5_f11 / s20_f11 caches rely on that) or in Mpc (--smooth-mpc: the same physical
+    scale in every box, the footprint following it -- config.footprint_for). Keeps config.SMOOTHING_SIGMA_MPC in step. In cells the
     footprint is the PRODUCTION one even after an Mpc setting or under DTFE_SIGMA_MPC (else '--smooth 10' would give
-    r512_s10_f5, neither the thesis's s10_f11 nor the Mpc run). Returns sigma
+    r512_s10_f5, neither the production s10_f11 nor the Mpc run). Returns sigma
     in cells. Neither given (or <= 0): nothing changes."""
     if cells and mpc:
         raise ValueError("give the smoothing in cells or in Mpc, not both")
@@ -433,8 +433,8 @@ def smoothing_tag() -> str:
     and folder names -- 's2.1625Mpc_f5' -- so a --smooth / --smooth-mpc run never overwrites the default products.
     Six significant digits: '.3g' would make 2.16 and 2.1625 Mpc one tag over two different caches.
     A non-default void gate (DTFE_VOID_GATE, void_gate) adds 'gatenone': 'gatenone' alone at the
-    production smoothing, 's2.1625Mpc_f5_gatenone' with both -- so every caller that keys names (and the thesis
-    mirror's refusal) on this tag keeps the ungated products apart with no change of its own."""
+    production smoothing, 's2.1625Mpc_f5_gatenone' with both -- so every caller that keys names on this tag keeps
+    the ungated products apart with no change of its own."""
     parts = []
     sig0, fp0 = config.PRODUCTION_SMOOTHING
     if (float(config.SMOOTHING_SIGMA_CELLS), int(config.FOOTPRINT_SIZE)) != (float(sig0), int(fp0)):
@@ -708,7 +708,7 @@ class SnapshotProducts:
         self.sim = require_sim(sim)              # --sim / DTFE_SIM: there is no default simulation
         self.method = method or "auto"
         self.prefix = prefix                     # alternate OUTPUT_PREFIX set, see FieldSet
-        self.data_root = data_root               # None = DATA_ROOT (DTFE_DATA_ROOT); a script's --data-root
+        self.data_root = data_root               # None = require_data_root() (DTFE_DATA_ROOT); a script's --data-root
         self._fs = None
         self._redshift = redshift
         self._ram = {}
@@ -959,8 +959,8 @@ class SnapshotProducts:
 
 
 def products(snapshot, redshift=None, sim=None, method=None, prefix=None, data_root=None):
-    """The derived products of one snapshot. data_root: a script's --data-root (default: DATA_ROOT, so
-    DTFE_DATA_ROOT); the caches stay keyed by (sim, prefix, method, snapshot), as they are for a root
+    """The derived products of one snapshot. data_root: a script's --data-root (default: require_data_root(),
+    so DTFE_DATA_ROOT); the caches stay keyed by (sim, prefix, method, snapshot), as they are for a root
     set through the environment."""
     return SnapshotProducts(snapshot, redshift, sim=sim, method=method, prefix=prefix, data_root=data_root)
 

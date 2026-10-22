@@ -121,57 +121,35 @@ void countGpuRetry(GpuFault f, long code, std::string const& desc)
 } // namespace
 
 
-bool psGpuDepositFields(std::vector<float>& verts,
-                          std::vector<float>& vels,
-                          std::vector<float>& masses,
-                          std::vector<float>& dens,
-                          std::vector<float>& scal,
-                          const double boxLo[3], const double dx[3],
-                          const size_t nGrid[3], const size_t subOrigin[3], const size_t subDims[3],
-                          int nSub, bool periodic,
-                          bool fVel, bool fDisp, bool fGrad, bool fLinear,
-                          bool fVolW, bool fCaustic, bool fExact, bool fScal, bool fSGrad, bool windowMode,
-                          double massExtra, PSFixedUnits const& fxUnits,
-                          PSGpuGrids& out, std::vector<uint32_t>& deferred, std::string& err)
+namespace {
+
+// The arguments of psHostUploadBuffers: psGpuDepositFields' locals (the record arrays it consumes, by reference).
+struct PSHostUploadArgs
 {
-    std::lock_guard<std::mutex> lock(ctxMutex());   // serialize dispatches (single queue)
-    Ctx& c = ctx();
-    if (!c.ready) { err = c.err; return false; }
+    Ctx&                 c;
+    std::vector<float>  &verts, &vels, &masses, &dens, &scal;
+    DepositParams const& P;
+    PSGpuPlan const&     pl;
+    size_t               nCell;
+};
 
-    // the plan (the selected grids, their fixed-point form and device sizes; gpu_host.h, shared with ps_gpu_cuda.cu).
-    // PS_METAL_FLOAT_MASS=1 keeps float mass atomics, for comparison.
-    bool const floatMass = getenv("PS_METAL_FLOAT_MASS") && atoi(getenv("PS_METAL_FLOAT_MASS")) != 0;
-    PSGpuPlan const pl = psGpuPlan(subDims, fVel, fDisp, fGrad, fVolW, fCaustic, fExact, fScal, fSGrad, masses,
-                                   massExtra, fxUnits, floatMass);
-    size_t const nCell = pl.nCell;
-    psGpuInitGrids(out, pl, fxUnits);
-    deferred.clear();
-    if (masses.empty())                 // nothing to deposit (empty partition; the caller may still add released tets)
-    {
-        psGpuZeroWords(out, pl);
-        return true;
-    }
-    if (verts.size() != masses.size() * size_t(PS_TET_STRIDE))
-    {
-        err = "tet record size mismatch (verts must hold PS_TET_STRIDE floats per tet)";
-        return false;
-    }
+// A call's buffers as the upload leaves them (null: allocation failed), and which optional per-tet arrays are real.
+struct PSHostBuffers
+{
+    MTL::Buffer *bV, *bU, *bM, *bD, *bSc, *bP, *bMass, *bMassFx, *bMom, *bM2, *bGrad, *bStr, *bMomW, *bCaust, *bSV,
+                *bDV, *bDW, *bScal, *bSG, *bBad;
+    bool haveVels, haveDens, haveScal;
+};
 
-    DepositParams P = psGpuParams(pl, fxUnits, boxLo, dx, nGrid, subOrigin, subDims, nSub, periodic, fLinear,
-                                  windowMode, not dens.empty(), not scal.empty(), masses.size());
-
-    NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
-
-    // newBuffer(ptr,...) copies the host array into the MTL buffer; free each host array
-    // IMMEDIATELY so at most one array is double-held at a time (instead of all three, a
-    // multi-GB difference per partition at production scale). On failure the CPU fallback
-    // re-deposits from the triangulation, never from these arrays.
-    size_t const nTetTotal = masses.size();
-    auto zeroBuf = [&](size_t bytes) {
-        MTL::Buffer* b = c.dev->newBuffer(bytes, MTL::ResourceStorageModeShared);
-        if (b) std::memset(b->contents(), 0, bytes);
-        return b;
-    };
+// Uploads the per-tet records and the parameter block, freeing each host array at once, and allocates the zeroed grids.
+template <class ZeroBuf>
+PSHostBuffers psHostUploadBuffers(PSHostUploadArgs const& u, ZeroBuf& zeroBuf)
+{
+    Ctx& c = u.c;
+    std::vector<float> &verts = u.verts, &vels = u.vels, &masses = u.masses, &dens = u.dens, &scal = u.scal;
+    DepositParams const& P = u.P;
+    PSGpuPlan const& pl = u.pl;
+    size_t const nCell = u.nCell;
     MTL::Buffer* bV = c.dev->newBuffer(verts.data(),  verts.size()  * sizeof(float), MTL::ResourceStorageModeShared);
     std::vector<float>().swap(verts);
     // vels is empty for density-only runs (kernel never reads it then): bind a dummy. Whether it
@@ -216,6 +194,253 @@ bool psGpuDepositFields(std::vector<float>& verts,
     MTL::Buffer* bSG    = zeroBuf(pl.sgBytes);
     // the non-finite guard's counters of depositFields (ps_deposit.metal FieldGrids.bad), one word per slot
     MTL::Buffer* bBad   = zeroBuf(FX_DROP_SLOTS * 4);
+    return PSHostBuffers{ bV, bU, bM, bD, bSc, bP, bMass, bMassFx, bMom, bM2, bGrad, bStr, bMomW, bCaust, bSV, bDV,
+                          bDW, bScal, bSG, bBad, haveVels, haveDens, haveScal };
+}
+
+// Picks the per-tet kernel's opening chunk: by deposit kind or PS_GPU_CHUNK (alias PS_METAL_CHUNK), scaled down
+// under an escalated pace.
+size_t psHostFirstChunk(bool const fExact, GpuPace const& pace, size_t const MIN_CHUNK)
+{
+    // --ps-exact-deposit costs ~1-2 orders of magnitude more per tet (analytic clipping of
+    // every cell in the window vs a barycentric test per sample), so start far smaller: the
+    // adaptive controller only retargets AFTER the first chunk, and one oversized opening
+    // buffer is exactly what the watchdog kills.
+    size_t baseChunk = fExact ? 500 : 25000;
+    if (long const v = Env::integer({"PS_GPU_CHUNK", "PS_METAL_CHUNK"}, 0); v > 0) baseChunk = size_t(v);
+    // an escalated pace (an earlier partition's failures) opens with a proportionally smaller chunk
+    if (pace.targetSec < 0.25)
+        baseChunk = std::max(size_t(double(baseChunk) * pace.targetSec / 0.25), MIN_CHUNK);
+    return baseChunk;
+}
+
+// The chunk checkpoints' settings (DTFE_GPU_CHECKPOINT_CHUNKS, DTFE_GPU_PACE_RECOVER_SEC).
+struct PSHostCkEnv
+{
+    long   ckChunks;
+    double paceRecoverSec;
+};
+
+// Reads how often a pass checkpoints and after how much clean GPU work an escalated pace steps back.
+PSHostCkEnv psHostCheckpointEnv()
+{
+    // DTFE_GPU_CHECKPOINT_CHUNKS=<n>: a checkpoint every n command buffers (0 = only the pass-start
+    // snapshot). Unset: every ~10 s of GPU work (n = 10 s / the current buffer target, so an escalated
+    // pace of 0.02 s buffers does not checkpoint 12x as often). A checkpoint memcpy's the accumulator
+    // grids (~24 B per cell for density + velocity: ~0.4 GB at 256^3, ~0.1 s) into ONE spare host copy,
+    // allocated at the first checkpoint and held until the partition's deposit returns.
+    long ckChunks = -1;
+    if (Env::isSet("DTFE_GPU_CHECKPOINT_CHUNKS")) ckChunks = std::max(0L, Env::integer("DTFE_GPU_CHECKPOINT_CHUNKS", 0));
+    // DTFE_GPU_PACE_RECOVER_SEC=<s>: the clean GPU work after which an escalated pace steps back (GpuPace above)
+    double paceRecoverSec = 90.;
+    if (double const v = Env::real("DTFE_GPU_PACE_RECOVER_SEC", -1.); v >= 0.) paceRecoverSec = v;
+    return PSHostCkEnv{ ckChunks, paceRecoverSec };
+}
+
+// The arguments of psHostExactItems: psGpuDepositFields' locals (by reference those it sets).
+struct PSHostItemsArgs
+{
+    Ctx&                 c;
+    MTL::Buffer*         bV;
+    DepositParams const& P;
+    PSGpuPlan const&     pl;
+    const size_t*        nGrid;
+    size_t               nTetTotal;
+    bool                 periodic, windowMode, timing;
+    bool&                useItems;
+    uint32_t&            blockCells;
+    MTL::Buffer         *&bItems, *&bSumW;
+    size_t&              nItems;
+};
+
+// Bounds the tets' windows and fills the exact items' (tet, block) list; the items are off if their buffers fail.
+void psHostExactItems(PSHostItemsArgs const& x)
+{
+    Ctx& c = x.c;
+    MTL::Buffer* bV = x.bV;
+    DepositParams const& P = x.P;
+    PSGpuPlan const& pl = x.pl;
+    const size_t* nGrid = x.nGrid;
+    size_t const nTetTotal = x.nTetTotal;
+    bool const periodic = x.periodic, windowMode = x.windowMode, timing = x.timing;
+    bool& useItems = x.useItems;
+    uint32_t& blockCells = x.blockCells;
+    MTL::Buffer *&bItems = x.bItems, *&bSumW = x.bSumW;
+    size_t& nItems = x.nItems;
+    if (useItems)
+    {
+        std::vector<uint64_t> bound;
+        double const total = psExactItemBounds(static_cast<float const*>(bV->contents()), nTetTotal, P, nGrid,
+                                               periodic, windowMode, bound, blockCells, nItems);
+        if (timing)
+            fprintf(stderr, "PS-DTFE Metal: exact items: %zu tets, %zu items of %u cells, window bound %.3g cells\n",
+                    nTetTotal, nItems, blockCells, total);
+        bItems = c.dev->newBuffer(std::max<size_t>(nItems, 1) * 2 * sizeof(uint32_t), MTL::ResourceStorageModeShared);
+        // the per-tet weight totals: a float each, or (sumWFixed) two uint words in the tet's own unit
+        // (+ the non-finite guard's counter words of the items kernel, at ExactItemParams.badAt)
+        bSumW  = c.dev->newBuffer(std::max<size_t>(nTetTotal, 1) * (pl.sumWFixed ? 8 : sizeof(float)) + FX_DROP_SLOTS * 4,
+                                  MTL::ResourceStorageModeShared);
+        if (!bItems || !bSumW)
+        {
+            // too big for GPU-visible memory: the one-thread-per-tet kernel still works
+            if (bItems) bItems->release();
+            if (bSumW)  bSumW->release();
+            bItems = bSumW = nullptr;
+            useItems = false;
+        }
+        else
+        {
+            uint32_t* it = static_cast<uint32_t*>(bItems->contents());
+            for (size_t t = 0; t < nTetTotal; ++t)
+            {
+                uint64_t const nb = (bound[t] + blockCells - 1) / blockCells;
+                for (uint64_t k = 0; k < nb; ++k) { *it++ = uint32_t(t); *it++ = uint32_t(std::min<uint64_t>(k, 0xFFFFFFFFu)); }
+            }
+        }
+    }
+}
+
+// Reports the passes' failed buffers and checkpoints (after any failure, else under PS_GPU_TIMING).
+void psHostReportPasses(bool const success, int const nFailed, int const nResumedCk, GpuSnapshot const& snap,
+                        bool const timing)
+{
+    if (nFailed > 0)
+        fprintf(stderr, "%sPS-DTFE Metal: deposit %s after %d failed buffer(s) (%d resumed from a periodic checkpoint); "
+                        "%d checkpoint(s), %.0f MB held, %.3f s copying%s\n",
+                success ? MESSAGE::cYellow() : MESSAGE::cRed(), success ? "recovered on the GPU" : "gave up",
+                nFailed, nResumedCk, snap.taken, snap.bytes / 1.e6, snap.sec, MESSAGE::cReset());
+    else if (timing)
+        fprintf(stderr, "PS-DTFE Metal: checkpoints: %d, %.0f MB held, %.3f s copying\n", snap.taken, snap.bytes / 1.e6, snap.sec);
+}
+
+// The arguments of psHostCopyBack: psGpuDepositFields' locals (by reference the call's outputs).
+struct PSHostCopyArgs
+{
+    PSHostBuffers const&   B;
+    PSGpuPlan const&       pl;
+    size_t                 nCell, nTetTotal;
+    bool                   fCaustic;
+    PSGpuGrids&            out;
+    std::vector<uint32_t>& deferred;
+};
+
+// Lists the deferred tets (their negated masses) and copies the kept grids into 'out'.
+void psHostCopyBack(PSHostCopyArgs const& k)
+{
+    PSHostBuffers const& B = k.B;
+    MTL::Buffer *bM = B.bM, *bMass = B.bMass, *bMassFx = B.bMassFx, *bMom = B.bMom, *bM2 = B.bM2, *bGrad = B.bGrad,
+                *bStr = B.bStr, *bMomW = B.bMomW, *bCaust = B.bCaust, *bSV = B.bSV, *bDV = B.bDV, *bDW = B.bDW,
+                *bScal = B.bScal, *bSG = B.bSG;
+    PSGpuPlan const& pl = k.pl;
+    size_t const nCell = k.nCell, nTetTotal = k.nTetTotal;
+    bool const fCaustic = k.fCaustic;
+    PSGpuGrids& out = k.out;
+    std::vector<uint32_t>& deferred = k.deferred;
+    // tets the kernel could not classify exactly (a sample within float rounding of a face):
+    // it negated their masses and deposited nothing; the caller deposits them on the CPU
+    bool const massAudit = PSMassAudit::on();
+    {
+        float const* mb = static_cast<float const*>(bM->contents());
+        double deferredMass = 0.;
+        for (size_t t = 0; t < nTetTotal; ++t)
+            if (mb[t] < 0.f) { deferred.push_back(uint32_t(t)); deferredMass -= double(mb[t]); }
+        if (massAudit) out.auditDeferredMass = deferredMass;
+    }
+
+    if (pl.massFixed)
+    {
+        // the words themselves, not their float decode: adding the deferred tets' shares into decoded floats
+        // would round away every share below half an ulp of a busy cell, always downward (1.6e-5 of the box
+        // mass at TNG50-3-Dark z=0.5). Low word first: on this little-endian host each pair is the int64
+        // (ps_deposit_params.h).
+        out.massFx.resize(nCell);
+        std::memcpy(out.massFx.data(), bMassFx->contents(), nCell * 8);
+        if (massAudit)
+        {   // the exact integer total (the partition's mass is below 2^62 units: no overflow)
+            int64_t q = 0;
+            for (size_t i = 0; i < nCell; ++i) q += out.massFx[i];
+            out.auditFixedTotal = psMassFixedMass(q, pl.massScale);
+        }
+    }
+    else
+        std::memcpy(out.mass.data(), bMass->contents(), nCell * 4);
+    // each moment grid: its words (fixed point; each low/high pair IS the int64 on this little-endian
+    // host, as for the mass) or its floats
+    MTL::Buffer* const fxBuf[PS_FX_N] = { bMom, bM2, bGrad, bMomW, bSV, bDV, nullptr, bScal, bSG };
+    std::vector<float>* const flt[PS_FX_N] = { &out.mom, &out.m2, &out.grad, &out.momw, &out.streamvol, &out.dispvel,
+                                               nullptr, &out.scal, &out.sgrad };
+    for (int g = 0; g < PS_FX_N; ++g)
+    {
+        if (!pl.sel[g] || !fxBuf[g]) continue;
+        size_t const n = nCell * PS_FX_COMPS[g];
+        if (pl.fxOn[g]) { out.fx[g].resize(n); std::memcpy(out.fx[g].data(), fxBuf[g]->contents(), n * 8); }
+        else std::memcpy(flt[g]->data(), fxBuf[g]->contents(), n * 4);
+    }
+    std::memcpy(out.streams.data(), bStr->contents(),  nCell * 4);
+    if (fCaustic) std::memcpy(out.caustic.data(), bCaust->contents(), nCell * 4);
+    if (pl.fDispOwn && !pl.dispwIsMass) std::memcpy(out.dispw.data(), bDW->contents(), nCell * 4);
+}
+
+} // namespace
+
+
+bool psGpuDepositFields(std::vector<float>& verts,
+                          std::vector<float>& vels,
+                          std::vector<float>& masses,
+                          std::vector<float>& dens,
+                          std::vector<float>& scal,
+                          const double boxLo[3], const double dx[3],
+                          const size_t nGrid[3], const size_t subOrigin[3], const size_t subDims[3],
+                          int nSub, bool periodic,
+                          bool fVel, bool fDisp, bool fGrad, bool fLinear,
+                          bool fVolW, bool fCaustic, bool fExact, bool fScal, bool fSGrad, bool windowMode,
+                          double massExtra, PSFixedUnits const& fxUnits,
+                          PSGpuGrids& out, std::vector<uint32_t>& deferred, std::string& err)
+{
+    std::lock_guard<std::mutex> lock(ctxMutex());   // serialize dispatches (single queue)
+    Ctx& c = ctx();
+    if (!c.ready) { err = c.err; return false; }
+
+    // the plan (the selected grids, their fixed-point form and device sizes; gpu_host.h, shared with ps_gpu_cuda.cu).
+    // PS_GPU_FLOAT_MASS=1 (alias PS_METAL_FLOAT_MASS) keeps float mass atomics, for comparison.
+    bool const floatMass = Env::flag({"PS_GPU_FLOAT_MASS", "PS_METAL_FLOAT_MASS"});
+    PSGpuPlan const pl = psGpuPlan(subDims, fVel, fDisp, fGrad, fVolW, fCaustic, fExact, fScal, fSGrad, masses,
+                                   massExtra, fxUnits, floatMass);
+    size_t const nCell = pl.nCell;
+    psGpuInitGrids(out, pl, fxUnits);
+    deferred.clear();
+    if (masses.empty())                 // nothing to deposit (empty partition; the caller may still add released tets)
+    {
+        psGpuZeroWords(out, pl);
+        return true;
+    }
+    if (verts.size() != masses.size() * size_t(PS_TET_STRIDE))
+    {
+        err = "tet record size mismatch (verts must hold PS_TET_STRIDE floats per tet)";
+        return false;
+    }
+
+    DepositParams P = psGpuParams(pl, fxUnits, boxLo, dx, nGrid, subOrigin, subDims, nSub, periodic, fLinear,
+                                  windowMode, not dens.empty(), not scal.empty(), masses.size());
+
+    NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+
+    // newBuffer(ptr,...) copies the host array into the MTL buffer; free each host array
+    // IMMEDIATELY so at most one array is double-held at a time (instead of all three, a
+    // multi-GB difference per partition at production scale). On failure the CPU fallback
+    // re-deposits from the triangulation, never from these arrays.
+    size_t const nTetTotal = masses.size();
+    auto zeroBuf = [&](size_t bytes) {
+        MTL::Buffer* b = c.dev->newBuffer(bytes, MTL::ResourceStorageModeShared);
+        if (b) std::memset(b->contents(), 0, bytes);
+        return b;
+    };
+    PSHostBuffers const B = psHostUploadBuffers(PSHostUploadArgs{ c, verts, vels, masses, dens, scal, P, pl, nCell }, zeroBuf);
+    MTL::Buffer *bV = B.bV, *bU = B.bU, *bM = B.bM, *bD = B.bD, *bSc = B.bSc, *bP = B.bP, *bMass = B.bMass,
+                *bMassFx = B.bMassFx, *bMom = B.bMom, *bM2 = B.bM2, *bGrad = B.bGrad, *bStr = B.bStr, *bMomW = B.bMomW,
+                *bCaust = B.bCaust, *bSV = B.bSV, *bDV = B.bDV, *bDW = B.bDW, *bScal = B.bScal, *bSG = B.bSG,
+                *bBad = B.bBad;
+    bool const haveVels = B.haveVels, haveDens = B.haveDens, haveScal = B.haveScal;
     if (!bV || !bU || !bM || !bD || !bSc || !bP || !bMass || !bMassFx || !bMom || !bM2 || !bGrad || !bStr || !bMomW || !bCaust || !bSV || !bDV || !bDW || !bScal || !bSG || !bBad)
     {
         err = "Metal buffer allocation failed (out of GPU-visible memory?)";
@@ -230,34 +455,19 @@ bool psGpuDepositFields(std::vector<float>& verts,
     // WindowServer in. The chunk size adapts toward pace.targetSec. A killed buffer may have deposited part of
     // its atomics, so a failure resumes from the pass's last snapshot (runChunked below); the caller deposits
     // the partition on the CPU only after a fatal error, 3 failures of one chunk or 16 in the deposit, or
-    // when no snapshot can be held. PS_METAL_CHUNK=<n> sets the per-tet kernel's starting chunk size.
+    // when no snapshot can be held. PS_GPU_CHUNK=<n> (alias PS_METAL_CHUNK) sets the per-tet kernel's starting
+    // chunk size.
     size_t const MIN_CHUNK = fExact ? 50 : 2000;
     size_t const MAX_CHUNK = 500000;
     GpuPace& pace = gpuPace();        // targetSec 0.25 s, gapUs 8 ms (~3% overhead) until escalated
-    // --ps-exact-deposit costs ~1-2 orders of magnitude more per tet (analytic clipping of
-    // every cell in the window vs a barycentric test per sample), so start far smaller: the
-    // adaptive controller only retargets AFTER the first chunk, and one oversized opening
-    // buffer is exactly what the watchdog kills.
-    size_t baseChunk = fExact ? 500 : 25000;
-    if (const char* env = getenv("PS_METAL_CHUNK"))
-    { long v = atol(env); if (v > 0) baseChunk = size_t(v); }
-    // an escalated pace (an earlier partition's failures) opens with a proportionally smaller chunk
-    if (pace.targetSec < 0.25)
-        baseChunk = std::max(size_t(double(baseChunk) * pace.targetSec / 0.25), MIN_CHUNK);
+    size_t baseChunk = psHostFirstChunk(fExact, pace, MIN_CHUNK);
     std::string lastErr;
-    // PS_METAL_TIMING=1: one line per kernel run (threads, buffers, GPU-busy and wall seconds)
-    bool const timing = getenv("PS_METAL_TIMING") && atoi(getenv("PS_METAL_TIMING")) != 0;
+    // PS_GPU_TIMING=1 (alias PS_METAL_TIMING): one line per kernel run (threads, buffers, GPU-busy and wall seconds)
+    bool const timing = Env::flag({"PS_GPU_TIMING", "PS_METAL_TIMING"});
 
-    // DTFE_GPU_CHECKPOINT_CHUNKS=<n>: a checkpoint every n command buffers (0 = only the pass-start
-    // snapshot). Unset: every ~10 s of GPU work (n = 10 s / the current buffer target, so an escalated
-    // pace of 0.02 s buffers does not checkpoint 12x as often). A checkpoint memcpy's the accumulator
-    // grids (~24 B per cell for density + velocity: ~0.4 GB at 256^3, ~0.1 s) into ONE spare host copy,
-    // allocated at the first checkpoint and held until the partition's deposit returns.
-    long ckChunks = -1;
-    if (const char* env = getenv("DTFE_GPU_CHECKPOINT_CHUNKS")) { ckChunks = atol(env); if (ckChunks < 0) ckChunks = 0; }
-    // DTFE_GPU_PACE_RECOVER_SEC=<s>: the clean GPU work after which an escalated pace steps back (GpuPace above)
-    double paceRecoverSec = 90.;
-    if (const char* env = getenv("DTFE_GPU_PACE_RECOVER_SEC")) { double v = atof(env); if (v >= 0.) paceRecoverSec = v; }
+    PSHostCkEnv const ck = psHostCheckpointEnv();
+    long ckChunks = ck.ckChunks;
+    double paceRecoverSec = ck.paceRecoverSec;
     std::vector<MTL::Buffer*> const gridBufs = { bMass, bMassFx, bMom, bM2, bGrad, bStr, bMomW, bCaust, bSV, bDV, bDW, bScal, bSG };
     GpuSnapshot snap;
     int nFailed = 0, nResumedCk = 0;   // failed buffers of this deposit, and how many resumed from a periodic checkpoint
@@ -460,43 +670,14 @@ bool psGpuDepositFields(std::vector<float>& verts,
     // The items follow the caller's cost order, keeping a SIMD group's threads on similar work.
     // PS_EXACT_ITEMS=0 keeps the one-thread-per-tet kernel (A/B), PS_EXACT_ITEM_CELLS sets the block.
     bool useItems = fExact;
-    if (const char* env = getenv("PS_EXACT_ITEMS")) useItems = useItems && atoi(env) != 0;
+    useItems = useItems && Env::flag("PS_EXACT_ITEMS", true);
     MTL::Buffer* bItems = nullptr;
     MTL::Buffer* bSumW  = nullptr;
     size_t nItems = 0;
     uint32_t blockCells = 16;
-    if (const char* env = getenv("PS_EXACT_ITEM_CELLS")) { long v = atol(env); if (v > 0) blockCells = uint32_t(v); }
-    if (useItems)
-    {
-        std::vector<uint64_t> bound;
-        double const total = psExactItemBounds(static_cast<float const*>(bV->contents()), nTetTotal, P, nGrid,
-                                               periodic, windowMode, bound, blockCells, nItems);
-        if (timing)
-            fprintf(stderr, "PS-DTFE Metal: exact items: %zu tets, %zu items of %u cells, window bound %.3g cells\n",
-                    nTetTotal, nItems, blockCells, total);
-        bItems = c.dev->newBuffer(std::max<size_t>(nItems, 1) * 2 * sizeof(uint32_t), MTL::ResourceStorageModeShared);
-        // the per-tet weight totals: a float each, or (sumWFixed) two uint words in the tet's own unit
-        // (+ the non-finite guard's counter words of the items kernel, at ExactItemParams.badAt)
-        bSumW  = c.dev->newBuffer(std::max<size_t>(nTetTotal, 1) * (pl.sumWFixed ? 8 : sizeof(float)) + FX_DROP_SLOTS * 4,
-                                  MTL::ResourceStorageModeShared);
-        if (!bItems || !bSumW)
-        {
-            // too big for GPU-visible memory: the one-thread-per-tet kernel still works
-            if (bItems) bItems->release();
-            if (bSumW)  bSumW->release();
-            bItems = bSumW = nullptr;
-            useItems = false;
-        }
-        else
-        {
-            uint32_t* it = static_cast<uint32_t*>(bItems->contents());
-            for (size_t t = 0; t < nTetTotal; ++t)
-            {
-                uint64_t const nb = (bound[t] + blockCells - 1) / blockCells;
-                for (uint64_t k = 0; k < nb; ++k) { *it++ = uint32_t(t); *it++ = uint32_t(std::min<uint64_t>(k, 0xFFFFFFFFu)); }
-            }
-        }
-    }
+    if (long const v = Env::integer("PS_EXACT_ITEM_CELLS", 0); v > 0) blockCells = uint32_t(v);
+    psHostExactItems(PSHostItemsArgs{ c, bV, P, pl, nGrid, nTetTotal, periodic, windowMode, timing, useItems,
+                                      blockCells, bItems, bSumW, nItems });
     struct ExactItemParams { uint32_t nItems, phase, blockCells, badAt; };   // == the MSL struct
     uint32_t const badAt = uint32_t(std::max<size_t>(nTetTotal, 1) * (pl.sumWFixed ? 2 : 1));   // past the per-tet totals
     auto runItems = [&](uint32_t phase) -> bool
@@ -605,13 +786,7 @@ bool psGpuDepositFields(std::vector<float>& verts,
     }
     else
         success = runPerTet(bV, bU, bM, bD, bSc, nTetTotal, true);
-    if (nFailed > 0)
-        fprintf(stderr, "%sPS-DTFE Metal: deposit %s after %d failed buffer(s) (%d resumed from a periodic checkpoint); "
-                        "%d checkpoint(s), %.0f MB held, %.3f s copying%s\n",
-                success ? MESSAGE::cYellow() : MESSAGE::cRed(), success ? "recovered on the GPU" : "gave up",
-                nFailed, nResumedCk, snap.taken, snap.bytes / 1.e6, snap.sec, MESSAGE::cReset());
-    else if (timing)
-        fprintf(stderr, "PS-DTFE Metal: checkpoints: %d, %.0f MB held, %.3f s copying\n", snap.taken, snap.bytes / 1.e6, snap.sec);
+    psHostReportPasses(success, nFailed, nResumedCk, snap, timing);
     for (MTL::Buffer* b : {bItems, bSumW}) if (b) b->release();
     if (!success)
     {
@@ -624,49 +799,7 @@ bool psGpuDepositFields(std::vector<float>& verts,
     for (int k = 0; k < FX_DROP_SLOTS; ++k)
         if (badRun[k]) fixedShareDropped(k, badRun[k]);
 
-    // tets the kernel could not classify exactly (a sample within float rounding of a face):
-    // it negated their masses and deposited nothing; the caller deposits them on the CPU
-    bool const massAudit = PSMassAudit::on();
-    {
-        float const* mb = static_cast<float const*>(bM->contents());
-        double deferredMass = 0.;
-        for (size_t t = 0; t < nTetTotal; ++t)
-            if (mb[t] < 0.f) { deferred.push_back(uint32_t(t)); deferredMass -= double(mb[t]); }
-        if (massAudit) out.auditDeferredMass = deferredMass;
-    }
-
-    if (pl.massFixed)
-    {
-        // the words themselves, not their float decode: adding the deferred tets' shares into decoded floats
-        // would round away every share below half an ulp of a busy cell, always downward (1.6e-5 of the box
-        // mass at TNG50-3-Dark z=0.5). Low word first: on this little-endian host each pair is the int64
-        // (ps_deposit_params.h).
-        out.massFx.resize(nCell);
-        std::memcpy(out.massFx.data(), bMassFx->contents(), nCell * 8);
-        if (massAudit)
-        {   // the exact integer total (the partition's mass is below 2^62 units: no overflow)
-            int64_t q = 0;
-            for (size_t i = 0; i < nCell; ++i) q += out.massFx[i];
-            out.auditFixedTotal = psMassFixedMass(q, pl.massScale);
-        }
-    }
-    else
-        std::memcpy(out.mass.data(), bMass->contents(), nCell * 4);
-    // each moment grid: its words (fixed point; each low/high pair IS the int64 on this little-endian
-    // host, as for the mass) or its floats
-    MTL::Buffer* const fxBuf[PS_FX_N] = { bMom, bM2, bGrad, bMomW, bSV, bDV, nullptr, bScal, bSG };
-    std::vector<float>* const flt[PS_FX_N] = { &out.mom, &out.m2, &out.grad, &out.momw, &out.streamvol, &out.dispvel,
-                                               nullptr, &out.scal, &out.sgrad };
-    for (int g = 0; g < PS_FX_N; ++g)
-    {
-        if (!pl.sel[g] || !fxBuf[g]) continue;
-        size_t const n = nCell * PS_FX_COMPS[g];
-        if (pl.fxOn[g]) { out.fx[g].resize(n); std::memcpy(out.fx[g].data(), fxBuf[g]->contents(), n * 8); }
-        else std::memcpy(flt[g]->data(), fxBuf[g]->contents(), n * 4);
-    }
-    std::memcpy(out.streams.data(), bStr->contents(),  nCell * 4);
-    if (fCaustic) std::memcpy(out.caustic.data(), bCaust->contents(), nCell * 4);
-    if (pl.fDispOwn && !pl.dispwIsMass) std::memcpy(out.dispw.data(), bDW->contents(), nCell * 4);
+    psHostCopyBack(PSHostCopyArgs{ B, pl, nCell, nTetTotal, fCaustic, out, deferred });
 
     for (MTL::Buffer* b : {bV,bU,bM,bD,bSc,bP,bMass,bMassFx,bMom,bM2,bGrad,bStr,bMomW,bCaust,bSV,bDV,bDW,bScal,bSG,bBad}) b->release();
     pool->release();

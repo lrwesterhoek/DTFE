@@ -114,10 +114,10 @@ void initializeGadget(std::string filename,
     *noBytesVel = buffer4 / (3*thisNoParts);
 
     // Only 4 (float) and 8 (double) bytes/value exist. Some writers store inconsistent record
-    // markers (demo/z0_64.gadget brackets its float32 velocity block with npart*36-byte
-    // markers): trusting such a marker made every read/skip branch silently do nothing (there
-    // is no 12-byte branch) and the block delimiter check then failed with a misleading
-    // "file is corrupt". Warn and fall back to float32, the standard Gadget width.
+    // markers (e.g. npart*36-byte markers around a float32 velocity block): trusting such a marker
+    // would leave every read/skip branch doing nothing (there is no 12-byte branch) and the block
+    // delimiter check would then fail with a misleading "file is corrupt". Warn and fall back to
+    // float32, the standard Gadget width.
     if ( *noBytesPos!=4 and *noBytesPos!=8 )
     {
         MESSAGE::Warning warning( userOptions->verboseLevel );

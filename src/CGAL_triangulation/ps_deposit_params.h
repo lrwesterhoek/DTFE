@@ -7,6 +7,8 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "../env_knobs.h"
+
 // Per-tetrahedron record of the GPU deposit: PS_TET_STRIDE floats per tet in the 'verts'
 // buffer, laid out as documented at TET_STRIDE in metal/ps_deposit.metal (which must match).
 constexpr int PS_TET_STRIDE = 16;
@@ -131,7 +133,7 @@ struct PSFixedBounds
 
 // The units a pass's caller hands the GPU host: scale[g] > 0 = grid g as a fixed-point sum in units
 // of 1/scale[g] (the host still deposits only the grids its flags select), 0 = float atomics
-// (PS_METAL_FLOAT_MOMENTS=1 / PS_GPU_FLOAT_MOMENTS=1, or a bound without a unit); sumW = the exact items' per-tet
+// (PS_GPU_FLOAT_MOMENTS=1, or a bound without a unit); sumW = the exact items' per-tet
 // weight totals as fixed-point sums as well.
 struct PSFixedUnits
 {
@@ -185,7 +187,7 @@ inline bool psFixedShareOk(double const product, int const slot, int64_t &q)
 // 0 / unset: off (tests/ps_fixed_moments_check.sh, tests/dtfe_gpu_retry_check.sh use it).
 inline unsigned long fixedShareTestNanEvery()
 {
-    static unsigned long const k = [] { char const *e = std::getenv( "DTFE_TEST_NAN_SHARE" ); long const v = e ? std::atol( e ) : 0;
+    static unsigned long const k = [] { long const v = Env::integer( "DTFE_TEST_NAN_SHARE", 0 );
                                         return v > 0 ? (unsigned long)v : 0ul; }();
     return k;
 }

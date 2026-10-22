@@ -2,7 +2,7 @@
 abundance and the stacked profiles properties of the voids, or of the grid, the particle mass, the field estimator?
 
 Three rows per redshift (dtfelib.convergence holds the machinery; every definition is the pipeline's: minima,
-the void gate of DTFE_VOID_GATE (none in the thesis recipe: rows (a) and (b) are R_v statistics), crossing R_v, the
+the void gate of DTFE_VOID_GATE (best none: rows (a) and (b) are R_v statistics), crossing R_v, the
 distinct sample of catalog.distinct_mask, profiles.profile_grids / stack):
 
   (a) GRID      the snapshot's density grid block-averaged by --factors (512^3 -> 256^3, 128^3: exactly the cell
@@ -19,7 +19,7 @@ distinct sample of catalog.distinct_mask, profiles.profile_grids / stack):
 A panel that cannot be drawn (no crossbox products, no snapshot with both estimators' grids) says so on the figure
 and in the log, and the rest is drawn.
 
-Outputs (figures/void_convergence/<sim>/[<smoothing tag>/]; never mirrored -- a test of the method, not a result):
+Outputs (figures/void_convergence/<sim>/[<smoothing tag>/]):
   convergence_<set>_z<z>.png             the three rows at one redshift
   convergence_<set>.txt                  the numbers (per z: per factor, the masses, the estimators)
   convergence_<set>.npz                  the same as arrays
@@ -168,7 +168,7 @@ def estimator_table(est, path):
 def load_crossbox(args):
     """(b): the crossbox per-box results at the common sigma UNDER THIS PROCESS'S VOID GATE (plot_void_crossbox's own
     file tag, sigma_tag: '_gatenone' under DTFE_VOID_GATE=none); [] (said) when none is there. The
-    gate matters: rows (a) and (b) are R_v statistics, which the thesis takes ungated, so an ungated run must find
+    gate matters: rows (a) and (b) are R_v statistics, best taken ungated, so an ungated run must find
     the ungated files."""
     import plot_void_crossbox as cb
     d = Path(args.crossbox_dir).expanduser()
@@ -321,10 +321,12 @@ def draw(z, grid, est, cross, args, sigma, path):
         sets = est.get("sets", {"ps": "ps", "dtfe": "dtfe"})
         style.set_title(axes[2, 0], f"(c) estimator, snapshot {est['snap']} (grid sets {sets['ps']} / {sets['dtfe']})")
         for ax in axes[2]:
-            ax.grid(alpha=0.3); ax.legend(fontsize=7)
+            ax.grid(alpha=0.3)
+            if ax.get_legend_handles_labels()[0]:
+                ax.legend(fontsize=7)
     style.set_suptitle(fig, f"{args.sim}: void statistics against grid, particle mass and estimator, z = {z:g}")
     fig.tight_layout()
-    style.save_plot_to_multiple_paths(fig, path, dpi=config.DPI, mirror=False)
+    style.save_figure(fig, path, dpi=config.DPI)
     plt.close(fig)
 
 
@@ -421,7 +423,6 @@ def main(argv=None):
         if snap is not None:
             prod = pipeline.products(snap, sim=args.sim, method=method, prefix=args.prefix, data_root=args.data_root)
             try:
-                style.note_source(prod.fs)
                 grid = grid_rows(prod, args, args.factors)
             except FileNotFoundError as e:
                 print(f"  (a): no {method} grids at snapshot {snap} ({e})")

@@ -6,8 +6,8 @@ refusal.
 
 Two tiers:
   * SYNTHETIC (always run, CI): known values and limits of the theory, the figures from hand-made statistics.
-  * DATA-BACKED (the T7's cached TNG100-3-Dark z = 0 catalogue): the size function's sample and ratio on real voids;
-    skipped with a note when the data or the cache is not there.
+  * DATA-BACKED (the cached TNG100-3-Dark z = 0 catalogue under DTFE_DATA_ROOT): the size function's sample and ratio
+    on real voids; skipped with a note when DTFE_DATA_ROOT is unset or the data or the cache is not there.
 
 Usage:  python3 tests/py_population_test.py            (exit 0 = pass)
 """
@@ -24,7 +24,7 @@ from pathlib import Path
 
 import numpy as np
 
-from _harness import REPO, Skip, check, setup, summary
+from _harness import REPO, Skip, check, data_root, setup, summary
 
 _FIGS_TMP = setup("population_figs_")
 os.environ.setdefault("DTFE_SIM", "TNG50-4-Dark")    # the box these synthetic tests stand for; a data-tier run sets its own
@@ -309,12 +309,12 @@ def t_analyze_gate_refusal():
 
 # ---------------------------------------------------------------- data-backed
 def t_tng100_size_function():
-    """The T7's TNG100-3-Dark z = 0 (snapshot 99) catalogue from the production cache: the size function's sample is
+    """TNG100-3-Dark's z = 0 (snapshot 99) catalogue from the production cache: the size function's sample is
     the distinct voids, and measured / Vdn at its median R_v is finite and positive."""
     from dtfelib import cli
     sim = "TNG100-3-Dark"
-    if not (cli.sim_dir(sim) / "snapdir_099").is_dir():
-        raise Skip(f"no {sim} snapdir_099 under {cli.DATA_ROOT}")
+    if not (cli.sim_dir(sim, data_root()) / "snapdir_099").is_dir():
+        raise Skip(f"no {sim} snapdir_099 under {data_root()}")
     if os.environ.get("DTFE_SIM") != sim:
         raise Skip("the TNG100 frame needs DTFE_SIM=TNG100-3-Dark (run the data tier with it set)")
     import plot_void_population as pop
@@ -342,8 +342,8 @@ def t_tng100_size_smooth():
     10 cells (31% at z = 0), and measured / Vdn at its median is finite."""
     from dtfelib import cli
     sim = "TNG100-3-Dark"
-    if not (cli.sim_dir(sim) / "snapdir_099").is_dir():
-        raise Skip(f"no {sim} snapdir_099 under {cli.DATA_ROOT}")
+    if not (cli.sim_dir(sim, data_root()) / "snapdir_099").is_dir():
+        raise Skip(f"no {sim} snapdir_099 under {data_root()}")
     if os.environ.get("DTFE_SIM") != sim:
         raise Skip("the TNG100 frame needs DTFE_SIM=TNG100-3-Dark (run the data tier with it set)")
     import plot_void_population as pop

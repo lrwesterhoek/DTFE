@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # COMPUTE ONLY: for every snapshot of every simulation, regenerate the analysis grids
-# (current physics: --ps-vertex-mass + per-field --ps-volume-weighted, both defaults) AND point-evaluate a
+# (the production physics: --ps-vertex-mass + per-field --ps-volume-weighted, both defaults) AND point-evaluate a
 # full-box high-resolution image plane of the continuous phase-space field. Both share the
 # snapshot's single triangulation (run_ps_dtfe.sh SAMPLE_POINTS), so the image planes cost
 # only the point evaluation on top of the grid regen.
@@ -22,9 +22,11 @@
 # A snapshot without a run log is judged by the file times alone (said per snapshot).
 # Interrupted batches continue where they stopped. FORCE=1 recomputes everything.
 #
-# Env knobs (all optional):
+# Env knobs:
+#   DTFE_DATA_ROOT  the folder that holds the simulations -- REQUIRED, no default
 #   SIMS          simulations to process -- REQUIRED, no default: names, or 'all' for every simulation under
-#                 $DATA_ROOT with snapshots, in either layout -- flat <sim>/ or per-family <family>/<sim>/)
+#                 $DTFE_DATA_ROOT with snapshots, in either layout -- flat <sim>/ or per-family <family>/<sim>/)
+#   The rest are optional:
 #   NU            image-plane pixels across the box (default 8192; ~13 kpc/px at TNG100-3)
 #   AXIS, CENTER  plane orientation/position (default z, box centre). Changing CENTER with an
 #                 existing plane file regenerates the plane -- which makes every snapshot's
@@ -78,8 +80,9 @@ case "${1:-}" in
 esac
 USER_GRID="${GRID_SIZE:-}"          # capture BEFORE config.sh, which sets its own GRID_SIZE
 source "${SCRIPT_DIR}/config.sh"
+require_data_root                    # before SIMS=all looks for simulations under it
 
-PY="${PY:-$(command -v /opt/homebrew/bin/python3 || command -v python3)}"   # the launcher passes its own PY
+PY="${PY:-$(h5py_python)}"          # the launcher passes its own PY (config.sh h5py_python otherwise)
 NU="${NU:-8192}"
 AXIS="${AXIS:-z}"
 CENTER="${CENTER:-}"
@@ -90,7 +93,7 @@ PLANES="${PLANES:-1}"
 THICKNESS="${THICKNESS:-2}"
 SUPERSAMPLE="${SUPERSAMPLE:-1}"
 WINDOW="${WINDOW:-}"
-PS_GPU="${PS_GPU:-auto}"   # auto: resolved below, as run_ps_dtfe.sh resolves its PS_METAL (2026-10-13)
+PS_GPU="${PS_GPU:-auto}"   # auto: resolved below, as run_ps_dtfe.sh resolves its PS_METAL
 PS_VOLUME_WEIGHTED="${PS_VOLUME_WEIGHTED:-1}"
 FORCE="${FORCE:-0}"
 DRY_RUN="${DRY_RUN:-0}"
@@ -157,8 +160,8 @@ run_settings() {
 }
 
 # same_settings <have> <want> (run_settings outputs): equal, except that the grids on disk may carry MORE
-# fields than asked for (the thesis set adds tweb_a/vweb_a to the pipeline's default list: a rerun with the
-# default must not recompute grids it already has)
+# fields than asked for (grids made with a longer FIELDS list hold every field a rerun with a shorter one asks
+# for: that rerun must not recompute them)
 same_settings() {
     [ "$(printf '%s\n' "$1" | grep -v '^--field ')" = "$(printf '%s\n' "$2" | grep -v '^--field ')" ] || return 1
     local have=" $(printf '%s\n' "$1" | sed -n 's/^--field //p') " f
@@ -230,7 +233,7 @@ for sim in ${SIMS}; do
         echo "-- reusing ${plane}.bin"
     fi
     # The points a slice of THIS plane holds: planes x nv x nu x K^2 from its sidecar (K = 1 when the sidecar
-    # predates the option), else the plane file's own count (3 float64 per point). The file times alone would take
+    # has no 'supersample' entry), else the plane file's own count (3 float64 per point). The file times alone would take
     # an older 4096^2 slice for current against an even older hires_plane_z8192 (the default NU 8192), so the
     # compute would be skipped and every render fail on the size mismatch.
     plane_pts=""
@@ -264,7 +267,7 @@ print(int(s.get("planes", 1)) * int(s["nv"]) * int(s["nu"]) * int(s.get("supersa
         sd="${simdir}/snapdir_$(printf "%03d" "$n")"
         cf="${sd}/combined_$(printf "%03d" "$n").hdf5"
         # with PTS_VEL_GRAD on, a snapshot lacking .pts_velGrad is stale even if its
-        # .pts_den is current (it predates the flag)
+        # .pts_den is current (a run without the flag made it)
         vg_ok=1
         if [ "${PTS_VEL_GRAD}" = "1" ] && [ ! -f "${sd}/${PREFIX}.pts_velGrad" ]; then vg_ok=0; fi
         if [ "${FORCE}" != "1" ] && [ "${plane_new}" != "1" ] && [ "${vg_ok}" = "1" ] \

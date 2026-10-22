@@ -509,10 +509,10 @@ def draw_pixel_circles(ax, shape, circles, dashed=(), clips=()) -> int:
 
 # ---------------------------------------------------------------------- the dialog
 def _qt():
-    from PySide6.QtCore import QLocale, Qt
-    from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFormLayout,
-                                   QGroupBox, QHBoxLayout, QLabel, QLineEdit, QPushButton, QRadioButton, QSpinBox,
-                                   QVBoxLayout, QWidget)
+    from PySide6.QtCore import QLocale, Qt  # noqa: F401  (handed back through locals())
+    from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFormLayout,  # noqa: F401
+                                   QGroupBox, QHBoxLayout, QLabel, QLineEdit, QPushButton, QRadioButton, QSpinBox,  # noqa: F401
+                                   QVBoxLayout, QWidget)  # noqa: F401
     return locals()
 
 

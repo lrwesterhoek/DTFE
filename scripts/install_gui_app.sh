@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Make the GUI launchable like any other application.
 #
-#   scripts/install_gui_app.sh               macOS: "DTFE Launcher.app" in /Applications (or
+#   scripts/install_gui_app.sh               macOS: "Lamina.app" in /Applications (or
 #                                            ~/Applications when /Applications is not writable)
 #                                            + a shortcut to it on the Desktop.
 #                                            Linux: a .desktop entry in ~/.local/share/applications
@@ -15,21 +15,22 @@
 # Finder get a bare PATH, so the launcher reads PATH and the DTFE settings (DTFE_*, TNG_API_KEY,
 # PY, PYTHON) from the user's login shell, as a Terminal window would have them: the GUI then runs
 # the same python3, wget and data root as the terminal. Its output goes to
-# ~/Library/Logs/DTFE Launcher.log. Re-running replaces the app it made before (and only that).
+# ~/Library/Logs/Lamina.log. Re-running replaces the app it made before (and only that), and takes away an app it
+# made under the name "DTFE Launcher" (the same bundle identifiers).
 #
-# macOS privacy protection: an app started from Finder may not read iCloud Drive (where this
-# repository lives) or an external drive (the T7) until it is given access, and for this app
+# macOS privacy protection: an app started from Finder may not read iCloud Drive or an external
+# drive (where the repository or the data may be) until it is given access, and for this app
 # macOS does not ask -- it refuses. Give it Full Disk Access once (System Settings > Privacy &
 # Security > Full Disk Access > +); the launcher explains this and opens that pane when it is
 # refused. macOS gives that access to the PROCESS that is the app, so the bundle's executable is
 # a small compiled program that stays alive as the parent of everything the GUI starts: with a
 # shell script as the executable the process would be /bin/bash to macOS, which the access given
-# to "DTFE Launcher" does not cover (tried: refused even with Full Disk Access switched on).
+# to "Lamina" does not cover (tried: refused even with Full Disk Access switched on).
 # The bundle is ad-hoc signed and rebuilt byte-identically, so the access given survives
 # re-running this script (until the repository moves or the launcher itself changes).
 #
 # The GUI itself runs in a second, small bundle next to its PySide6 environment
-# (~/.venvs/dtfe-gui/DTFE Launcher.app): an executable that embeds the environment's Python.
+# (~/.venvs/dtfe-gui/Lamina.app): an executable that embeds the environment's Python.
 # macOS names a running app after the bundle of its process, and Python's own process belongs
 # to Python.app -- so without it the Dock and Cmd-Tab say "Python". Started directly (e.g. kept
 # in the Dock) it hands over to the real app above. Built for framework Pythons (Homebrew,
@@ -37,7 +38,8 @@
 
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-NAME="DTFE Launcher"
+NAME="Lamina"
+OLD_NAME="DTFE Launcher"     # the apps this script made under that name are taken away (same identifiers)
 BUNDLE_ID="local.dtfe.launcher"
 APPS_DIR=""
 DESKTOP=1
@@ -67,7 +69,7 @@ if [ "$(uname -s)" != "Darwin" ]; then
     DESK="$(xdg-user-dir DESKTOP 2>/dev/null || echo "$HOME/Desktop")/dtfe-launcher.desktop"
     if [ "$REMOVE" -eq 1 ]; then
         rm -f "$ENTRY" "$DESK" "$APPS/dtfe-launcher.png"
-        echo "removed the DTFE Launcher entries"; exit 0
+        echo "removed the $NAME entries"; exit 0
     fi
     need_gui_python
     mkdir -p "$APPS"
@@ -112,6 +114,14 @@ to_trash() {
     [ -e "$dest" ] && dest="$HOME/.Trash/$(basename "$1" .app) $(date +%H.%M.%S).app"
     mv "$1" "$dest"
 }
+remove_old_name() {   # the app, shortcut and GUI host this script made under OLD_NAME
+    [ -L "$HOME/Desktop/$OLD_NAME.app" ] && rm "$HOME/Desktop/$OLD_NAME.app" && echo "removed the Desktop shortcut to $OLD_NAME"
+    if ours "$APPS_DIR/$OLD_NAME.app"; then
+        "$LSREGISTER" -u "$APPS_DIR/$OLD_NAME.app" >/dev/null 2>&1 || true
+        to_trash "$APPS_DIR/$OLD_NAME.app" && echo "moved $APPS_DIR/$OLD_NAME.app to the Trash"
+    fi
+    if ours "$VENV/$OLD_NAME.app" "$HOST_ID"; then rm -rf "$VENV/$OLD_NAME.app" && echo "removed the GUI host $VENV/$OLD_NAME.app"; fi
+}
 
 if [ "$REMOVE" -eq 1 ]; then
     [ -L "$LINK" ] && rm "$LINK" && echo "removed the Desktop shortcut"
@@ -122,10 +132,12 @@ if [ "$REMOVE" -eq 1 ]; then
         echo "no $NAME.app of ours in $APPS_DIR"
     fi
     if ours "$HOST_APP" "$HOST_ID"; then rm -rf "$HOST_APP" && echo "removed the GUI host $HOST_APP"; fi
+    remove_old_name
     exit 0
 fi
 
 need_gui_python
+remove_old_name
 if [ -e "$APP" ] && ! ours "$APP"; then
     echo "$APP exists and was not made by this script; not replacing it" >&2
     exit 1
@@ -160,35 +172,35 @@ cat > "$B/Info.plist" <<EOF
 EOF
 plutil -lint "$B/Info.plist" >/dev/null
 
-# the launch script (Resources/launcher.sh): $REPO is baked in (quoted for the spaces in iCloud paths)
+# the launch script (Resources/launcher.sh): $REPO is baked in (quoted: the path may hold spaces)
 {
     echo '#!/bin/bash'
     echo "# $NAME -- made by scripts/install_gui_app.sh; re-run it if the repository moves."
     echo "# Run by the app's executable, which stays its parent (see install_gui_app.sh)."
     printf 'REPO=%q\n' "$REPO"
     cat <<'EOF'
-LOG="$HOME/Library/Logs/DTFE Launcher.log"
+LOG="$HOME/Library/Logs/Lamina.log"
 mkdir -p "$(dirname "$LOG")"
 echo "=== $(date '+%Y-%m-%d %H:%M:%S') launch ===" >> "$LOG"
 alert() {
     echo "launcher: $1" >> "$LOG"
-    /usr/bin/osascript -e 'on run argv' -e 'display alert "DTFE Launcher" message (item 1 of argv) as critical' \
+    /usr/bin/osascript -e 'on run argv' -e 'display alert "Lamina" message (item 1 of argv) as critical' \
         -e 'end run' "$1" >/dev/null 2>&1
 }
 settings_alert() {   # the macOS privacy refusal: say why, offer the pane where access is given
     local a
     echo "launcher: no access to the repository (Full Disk Access?)" >> "$LOG"
     a="$(/usr/bin/osascript -e 'on run argv' \
-        -e 'display alert "DTFE Launcher needs access to your files" message (item 1 of argv) buttons {"Cancel", "Open Settings"} default button 2' \
+        -e 'display alert "Lamina needs access to your files" message (item 1 of argv) buttons {"Cancel", "Open Settings"} default button 2' \
         -e 'end run' "$1" 2>/dev/null)"
     case "$a" in *"Open Settings"*) /usr/bin/open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles" ;; esac
 }
 if [ ! -x "$REPO/scripts/gui.sh" ]; then
-    alert "The DTFE repository is not where this launcher expects it: $REPO -- run scripts/install_gui_app.sh from its new location."
+    alert "The repository is not where Lamina expects it: $REPO -- run scripts/install_gui_app.sh from its new location."
     exit 1
 fi
 if ! head -c 1 "$REPO/scripts/gui.sh" >/dev/null 2>&1; then
-    settings_alert "macOS has not given DTFE Launcher access to the DTFE repository ($REPO) -- iCloud Drive and external drives such as the T7 are protected. In System Settings > Privacy & Security > Full Disk Access, add DTFE Launcher (the + button, then Applications) and switch it on, then open DTFE Launcher again."
+    settings_alert "macOS has not given Lamina access to the repository ($REPO) -- iCloud Drive and external drives are protected. In System Settings > Privacy & Security > Full Disk Access, add Lamina (the + button, then Applications) and switch it on, then open Lamina again."
     exit 1
 fi
 # Finder starts apps with a bare PATH: take PATH and the DTFE settings from the login shell, as a
@@ -334,7 +346,7 @@ print("#define VENV_PYTHON", json.dumps(sys.argv[1], ensure_ascii=False))
 print("#define OUTER_APP", json.dumps(sys.argv[2], ensure_ascii=False))' "$GUI_PY" "$APP" > "$BUILD/host_paths.h"
         cat > "$BUILD/host.c" <<'EOF'
 /* The GUI's process: the environment's Python, embedded, inside a bundle of our own, so that
-   macOS names it "DTFE Launcher" (Dock, Cmd-Tab, menu bar). Made by scripts/install_gui_app.sh. */
+   macOS names it "Lamina" (Dock, Cmd-Tab, menu bar). Made by scripts/install_gui_app.sh. */
 #include <Python.h>
 #include <stdlib.h>
 #include <string.h>

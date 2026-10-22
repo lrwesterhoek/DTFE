@@ -17,6 +17,8 @@
 #
 # Usage:
 #   ./download_snapshots.sh [-k API_KEY] [-c|-t|-i] [-d DATA_DIR] [-s SIMULATION] [snapshot ...]
+# DTFE_DATA_ROOT, the folder that holds the simulations, is required unless -d names the simulation's folder, and so
+# is the simulation (-s or DTFE_SIM); the files land in the simulation's folder under it (config.sh sim_dir) or in -d.
 #
 # Examples:
 #   ./download_snapshots.sh -c -s TNG50-3-Dark            # groupcats for the default ladder
@@ -143,6 +145,7 @@ while getopts "k:d:s:ctih" opt; do
     esac
 done
 shift $((OPTIND - 1))
+[ -n "${DATA_DIR}" ] || require_data_root   # -d names the simulation's folder itself
 require_simulation
 
 snapshot_args "$@"              # positional arguments override the default snapshot list (config.sh)
