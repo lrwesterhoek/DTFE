@@ -16,7 +16,7 @@ authors:
   - family-names: Cautun
     given-names: Marius C.
     affiliation: "Kapteyn Astronomical Institute, Durham University, Leiden University"
-repository-code: "https://github.com/lrwesterhoek/DTFE"
+repository-code: "https://github.com/lrwesterhoek/Lamina"
 license: GPL-3.0-or-later
 version: "1.0.0"
 date-released: "2026-10-23"
