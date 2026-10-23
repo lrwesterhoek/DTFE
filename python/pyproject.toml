@@ -13,7 +13,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dtfelib"
-version = "0.1.0"
+version = "1.0.0"
 description = "Python front end of the DTFE / PS-DTFE field estimators: loaders, analysis and the interactive Estimator"
 readme = { text = "See the repository README (sections 'Phase-Space DTFE' and 'Interactive point evaluation').", content-type = "text/plain" }
 requires-python = ">=3.10"

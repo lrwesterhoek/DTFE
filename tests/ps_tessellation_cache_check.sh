@@ -391,7 +391,7 @@ rm -f "${LINKDIR}"
 echo ""
 echo "(K) the chunk codec: libdeflate and zlib read each other's files (both write plain gzip members)"
 run "${TMP}/ptc_codec_probe" "${GRID}" --tessellation-cache "${CACHE}"
-if echo "${RUN_OUT}" | grep -q "read with libdeflate"; then
+if grep -q "read with libdeflate" <<< "${RUN_OUT}"; then
     for w in zlib libdeflate; do
         KC="${CACHE}-codec-${w}"; rm -rf "${KC}"; mkdir -p "${KC}"
         if [ "${w}" = zlib ]; then export DTFE_TESS_CACHE_ZLIB=1; fi

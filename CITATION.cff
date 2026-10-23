@@ -18,6 +18,8 @@ authors:
     affiliation: "Kapteyn Astronomical Institute, Durham University, Leiden University"
 repository-code: "https://github.com/lrwesterhoek/DTFE"
 license: GPL-3.0-or-later
+version: "1.0.0"
+date-released: "2026-10-23"
 keywords:
   - cosmology
   - cosmic web

@@ -41,7 +41,7 @@
 
     ROOM: a write needs the grids' bytes + 1 GB free while it goes (the new file beside the old one), and,
     counting the old file's bytes as free, twice the grids' bytes + 2 GB (the checkpoint and the outputs still
-    to be written: on the T7 the checkpoint must never be what makes their write fail);
+    to be written: on a nearly full data disk the checkpoint must never be what makes their write fail);
     short of that the write is skipped with a warning (once) and the previous checkpoint stays.
 
     POINTS: a '--sample-points' run is checkpointed too. Its per-point stream records (ps_point_eval.cc)

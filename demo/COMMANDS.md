@@ -298,7 +298,7 @@ mkdir -p /private/tmp/dtfe-tess
 
 Common to both: `--grid N [NY NZ]`, `--periodic`, `--input 101|105|106|111|112|121|122`,
 `--MpcUnit <units per Mpc>` (default 1000), `--partition X Y Z`, `--max-concurrent N`, `--verbose 0..3`,
-`--region`, `--padding`. Input 101 = binary Gadget, 105 = Gadget HDF5 (default), 106 = its HI data, 111 = text
+`--padding` (`--region` / `--regionMpc` only in the standard binary: PS-DTFE refuses them, use `--box`). Input 101 = binary Gadget, 105 = Gadget HDF5 (default), 106 = its HI data, 111 = text
 `x y z w`, 112 = text positions-only, 121 / 122 = raw binary (count, box, pos, weights, vels / structured).
 
 **Which flags reach the GPU** (`METAL=1`, `CUDA=1` or `HIP=1` build): the grid deposit, and

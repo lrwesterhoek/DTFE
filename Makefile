@@ -37,7 +37,7 @@
 # Add or override compiler flags:
 #   make DTFE EXTRA_FLAGS="-Wno-unused -march=native"
 #
-# Note: Library headers are included with -I to suppress warnings from
+# Note: Library headers are included with -isystem to suppress warnings from
 # external code you cannot modify. Your own code warnings will still be shown.
 #
 # TARGETS:
@@ -391,36 +391,40 @@ OPTIONS_COMMON += -DBOOST_ALLOW_DEPRECATED_HEADERS
 # do not modify below this line
 SRC = ./src
 # third-party headers come in by -isystem: their own warnings (Boost's under recent LLVM) stay out of
-# the build log, while every warning in this code is still reported
+# the build log, while every warning in this code is still reported. sysinc gives a folder its -isystem,
+# except the compiler's own system folders (a Linux package's /usr/include): an explicit -isystem moves
+# them ahead of libstdc++'s headers, whose '#include_next <math.h>' then fails under GCC, and they are
+# system folders (no warnings) already
+sysinc = $(if $(filter /usr/include /usr/local/include,$(abspath $(strip $(1)))),,-isystem $(strip $(1)))
 INCLUDES =
 LIBRARIES =
 
 # Library path setup
 ifneq ($(strip $(GSL_PATH)),)
-    INCLUDES += -isystem $(strip $(GSL_PATH))/include
+    INCLUDES += $(call sysinc,$(strip $(GSL_PATH))/include)
     LIBRARIES += -L$(strip $(GSL_PATH))/lib
 endif
 ifneq ($(strip $(BOOST_PATH)),)
-    INCLUDES += -isystem $(strip $(BOOST_PATH))/include
+    INCLUDES += $(call sysinc,$(strip $(BOOST_PATH))/include)
     LIBRARIES += -L$(strip $(BOOST_PATH))/lib
 endif
 ifneq ($(strip $(CGAL_PATH)),)
-    INCLUDES += -isystem $(strip $(CGAL_PATH))/include
+    INCLUDES += $(call sysinc,$(strip $(CGAL_PATH))/include)
     LIBRARIES += -L$(strip $(CGAL_PATH))/lib
 endif
 ifneq ($(strip $(GMP_PATH)),)
-    INCLUDES += -isystem $(strip $(GMP_PATH))/include
+    INCLUDES += $(call sysinc,$(strip $(GMP_PATH))/include)
     LIBRARIES += -L$(strip $(GMP_PATH))/lib
 endif
 ifneq ($(strip $(MPFR_PATH)),)
-    INCLUDES += -isystem $(strip $(MPFR_PATH))/include
+    INCLUDES += $(call sysinc,$(strip $(MPFR_PATH))/include)
     LIBRARIES += -L$(strip $(MPFR_PATH))/lib
 endif
 ifneq ($(strip $(HDF5_PATH)),)
-    INCLUDES += -isystem $(strip $(HDF5_PATH))/include
+    INCLUDES += $(call sysinc,$(strip $(HDF5_PATH))/include)
     LIBRARIES += -L$(strip $(HDF5_PATH))/lib   # -lhdf5/-lhdf5_cpp added once via HDF5_LIBS (avoid duplicate-library linker warning)
     ifneq ($(strip $(HDF5_EXTRA_INC)),)
-        INCLUDES += -isystem $(strip $(HDF5_EXTRA_INC))
+        INCLUDES += $(call sysinc,$(HDF5_EXTRA_INC))
     endif
     ifneq ($(strip $(HDF5_EXTRA_LIB)),)
         LIBRARIES += -L$(strip $(HDF5_EXTRA_LIB))
@@ -429,7 +433,7 @@ ifneq ($(strip $(HDF5_PATH)),)
     OPTIONS_PS += -DHDF5
 endif
 ifneq ($(strip $(FFTW_PATH)),)
-    INCLUDES += -isystem $(strip $(FFTW_PATH))/include
+    INCLUDES += $(call sysinc,$(strip $(FFTW_PATH))/include)
     LIBRARIES += -L$(strip $(FFTW_PATH))/lib
 endif
 
@@ -511,7 +515,7 @@ endif
 ifeq ($(HAVE_LIBDEFLATE),1)
     OPTIONS_COMMON += -DDTFE_HAVE_LIBDEFLATE
     ifneq ($(LIBDEFLATE_PATH),/usr)
-        INCLUDES  += -isystem $(LIBDEFLATE_PATH)/include
+        INCLUDES  += $(call sysinc,$(LIBDEFLATE_PATH)/include)
         BASE_LIBS += -L$(LIBDEFLATE_PATH)/lib
     endif
     BASE_LIBS += -ldeflate
@@ -542,7 +546,7 @@ ifeq ($(TBB),auto)
 endif
 ifeq ($(TBB_PS),1)
     OPTIONS_PS   += -DPARALLEL_TRIANGULATION -DCGAL_LINKED_WITH_TBB
-    INCLUDES     += -isystem $(TBB_PATH)/include
+    INCLUDES     += $(call sysinc,$(TBB_PATH)/include)
     PS_TBB_LIBS  := -L$(TBB_PATH)/lib -ltbb -ltbbmalloc
     TBB_BUILD_ARG := $(if $(filter 1,$(TBB)),TBB=1,)
 else

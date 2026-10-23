@@ -477,7 +477,7 @@ if [ -d o_ps ] && [ ! -f o_ps/.gpu_mode_off ]; then   # any GPU backend stamp (m
     # combination must fall back to the parity-only fold flag AND say so.
     lin="$("${BIN}" "${SNAP}" "${OUT}_gpulin" --grid "${GRID}" --periodic --field density --MpcUnit 1 \
             --max-concurrent 1 --ps-caustics --ps-linear-deposit --ps-gpu 2>&1 || true)"
-    if echo "${lin}" | grep -q "ps-linear-deposit"; then
+    if grep -q "ps-linear-deposit" <<< "${lin}"; then
         echo "   PASS  --ps-caustics --ps-linear-deposit --ps-gpu warns that the stratification is CPU-only"
     else
         echo "   FAIL  the --ps-linear-deposit GPU combination did not warn"

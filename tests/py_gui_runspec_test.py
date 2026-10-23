@@ -791,9 +791,14 @@ def core_grids_warning():
 
 
 def _write_log(path: Path, text: str, mtime: float | None = None):
+    before = path.stat().st_mtime_ns if path.exists() else None
     path.write_text(text)
     if mtime is not None:
         os.utime(path, (mtime, mtime))
+    elif before is not None and path.stat().st_mtime_ns == before:
+        # a coarse file clock (Linux: a tick of milliseconds) gives a quick same-size rewrite the old mtime, and
+        # results.parse_runlog's (size, mtime_ns) cache would hand back the previous log's record
+        os.utime(path, ns=(before + 1000, before + 1000))
 
 
 def new_features(tmp: Path, sim: Path):

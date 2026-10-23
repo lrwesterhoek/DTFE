@@ -53,14 +53,14 @@ check() { if [ "$2" = 0 ]; then PASS=$((PASS+1)); echo "  PASS $1"; else FAILS=$
 C=(--grid 48 --periodic --input 105 --MpcUnit 1 --verbose 2 --field density velocity density_a)
 
 echo ">> R1: --ordered-merge, --partition 3 3 3 --max-concurrent 4, twice"
-"$BIN" --help 2>&1 | grep -q -- "--ordered-merge"; check "R1 '--ordered-merge' is in the help" $?
+grep -q -- "--ordered-merge" <<< "$("${BIN}" --help 2>&1)"; check "R1 '--ordered-merge' is in the help" $?
 for r in o1 o2; do OMP_NUM_THREADS=4 "$BIN" "$SNAP" "$TMP/$r" "${C[@]}" --partition 3 3 3 --max-concurrent 4 --ordered-merge \
     > "$TMP/$r.log" 2>&1 || { echo "FAIL: $r (see $TMP/$r.log)"; exit 1; }; done
 grep -q "partition merge order  : partition index" "$TMP/o1.log"; check "R1 the run says it merges in index order" $?
 same "$TMP/o1" "$TMP/o2"; check "R1 two --ordered-merge runs at --max-concurrent 4: byte-identical grids" $?
 
 echo ">> R7: the staged ordered merge (the default), partition 0 held back 2 s"
-"$BIN" --help 2>&1 | grep -q -- "--completion-order-merge"; check "R7 '--completion-order-merge' is in the help" $?
+grep -q -- "--completion-order-merge" <<< "$("${BIN}" --help 2>&1)"; check "R7 '--completion-order-merge' is in the help" $?
 R7=(env OMP_NUM_THREADS=4 DTFE_TEST_DELAY_PARTITION=0:2 "$BIN" "$SNAP")
 P3=(--partition 3 3 3 --max-concurrent 4)
 "${R7[@]}" "$TMP/st" "${C[@]}" "${P3[@]}" > "$TMP/st.log" 2>&1 || { echo "FAIL: st (see $TMP/st.log)"; exit 1; }

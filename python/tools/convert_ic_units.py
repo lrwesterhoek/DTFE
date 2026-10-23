@@ -11,7 +11,7 @@ the little-h removed). This applies the identical convention to the ICs:
     Velocities, ParticleIDs, MassTable, all other attributes: unchanged
 
 Usage:
-    python3 python/convert_ic_units.py <snap_ics.hdf5> <combined_ics.hdf5>
+    python3 python/tools/convert_ic_units.py <snap_ics.hdf5> <combined_ics.hdf5>
 
 h is taken from the input file's Header/HubbleParam.
 """

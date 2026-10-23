@@ -1,3 +1,200 @@
+VERSION 1.0.0 (Lamina, 2026-10-23)
+The project is now called Lamina (Linear Adaptive Multi-stream Interpolation for N-body Analysis): the standard
+DTFE program './DTFE', the phase-space DTFE './PS-DTFE' (after Feldbrugge 2024), the Python package dtfelib and a
+graphical launcher. The programs and dtfelib keep their names. Version numbers restart at 1.0.0: the entries
+below are the DTFE versions Lamina continues (1.3.0 = the phase-space work up to 2026-07-12, never tagged; 1.2.2
+and older = the public DTFE of Cautun & van de Weygaert 2011). Changes since 1.3.0:
+
+Upgrading from the 1.3.0 code
+- Removed options: '--metal' and '--ps-metal' (use '--gpu' / '--ps-gpu').
+- The shell scripts moved from the repository root to scripts/ (config.sh, install.sh, install_dependencies.sh,
+  download_snapshots.sh, run_dtfe.sh, run_ps_dtfe.sh); documentation/ is now docs/.
+- No default data root and no default simulation: DTFE_DATA_ROOT names the folder that holds the simulations (a
+  driver's '-d' names a simulation's own folder instead), and every run names its simulation ('-s' or DTFE_SIM,
+  the plot scripts' '--sim', the pipeline's SIMS). The drivers stop with exit status 2 without them.
+  dtfelib.DATA_ROOT is gone: use dtfelib.cli.require_data_root().
+- Refused now, where they used to crash or give wrong grids: 'dispersion' / 'dispersion_a' in './DTFE' (they are
+  PS-DTFE fields); 'velocityStd_a' in './DTFE' except with '--method 2'; '--partNo', '--region' and '--regionMpc'
+  in PS-DTFE (they select particles in Eulerian space; use '--partition' / '--box'); '--redshiftSpace' in both
+  programs (it was never implemented and ran as a silent no-op). Other combinations that cannot work are refused
+  with the reason.
+- Changed defaults: PS-DTFE merges its partitions in index order (bit-reproducible; '--completion-order-merge' is
+  the old order); partitions are padded in Lagrangian space ('--ps-lag-padding 8'; 0 = the old Eulerian rule);
+  an explicit '--partition 1' keeps one tessellation. The drivers use the GPU when the binary has one;
+  run_dtfe.sh writes eight fields (T-web and V-web included) with exact cell averages and padding 15;
+  run_ps_dtfe.sh writes nine fields with vertex masses, volume-weighted velocity moments and caustic flags.
+- Outputs whose values or meaning changed:
+  * standard-DTFE Monte-Carlo '_a' averages are unbiased and independent of the split, threads and padding (they
+    lost 0.17-0.29% of the mass); DTFE_MC_LEGACY=1 restores the old sampling;
+  * '.caustic' is the exact geometric fold flag (the old per-sample flag marked 21.0% of the cells of a
+    TNG100-3-Dark z=1 grid where folded tetrahedra overlap 33.6%);
+  * '.streams' counts sub-samples and is a float under every deposit (test single-stream cells with a tolerance);
+    with '--ps-exact-deposit' the integer count of touching tetrahedra moved to '.tetTouch';
+  * '.unresolved' is now '.hidden_streams', a bitmask (dtfelib still reads the old name);
+  * V-web eigenvalues at a != 1 (the sqrt(a) factor was missing) and T-web eigenvalues of near-degenerate cells
+    (now computed in double) change;
+  * PS point evaluation follows the grid's estimators ('--pts-conventions grid', the default; 'legacy' gives the
+    old values);
+  * interlaced grids ('--interlace') from earlier versions are wrong for the Fourier modes negative in exactly
+    one axis: rerun them.
+- The launcher is now called Lamina: scripts/install_gui_app.sh makes Lamina.app, moves an older 'DTFE Launcher'
+  app it made to the Trash and keeps the settings; grant Full Disk Access again.
+- Removed from the repository: scripts/thesis_runs.sh, python/plot/plot_conclusions_synthesis.py,
+  python/tools/cosmodtfe_comparison/ and the third-party PDFs in docs/ (docs/DTFE_user_guide.pdf stays).
+
+Phase-space DTFE (PS-DTFE)
+- '--ps-vertex-mass': tetrahedron masses that do not depend on the Lagrangian chart; removes the suppressed
+  density contrast when evolved initial positions are the Lagrangian input.
+- '--ps-volume-weighted': velocity moments weighted by Eulerian volume, the standard-DTFE convention (the
+  dispersion stays mass-weighted).
+- '.hidden_streams' / '.a_hidden_streams': bit 1 marks cells that a folded tetrahedron overlaps while '.streams'
+  misses it, bit 2 cells holding the mass of a tetrahedron too small for a sample.
+- '--ps-exact-deposit' and '--ps-caustics' run on the GPU and in 2D. '.causticClass' classifies the folds
+  (parity, collapse multiplicity, umbilic indicator); '--ps-caustic-cusps' adds A3 cusp and A4 swallowtail bits
+  (CPU deposit).
+- '--ps-window x0 x1 y0 y1 z0 z1' (Mpc): compute and write only a box of the full grid, equal to the full run's
+  cells; with '--partition' and '--tessellation-cache', partitions that cannot reach the window are skipped.
+- '--ps-alpha-shape' (non-periodic runs): drops convex-hull slivers, so a partitioned run agrees with one
+  tessellation.
+- '--parallel-triangulation' (TBB, opt-in): about 2.7x faster triangulation.
+- '--fixed-point-merge' (opt-in): an order-free exact integer merge of the partitions (9 bytes per component and
+  cell).
+- Point evaluation: '--pts-lagrangian' (each stream's Lagrangian position), '--pts-scalar' with
+  '--scalar-dataset', and the fold flag with '--ps-caustics'.
+- PS_MASS_AUDIT=1 or 2 prints the mass bookkeeping of every pass.
+
+Standard DTFE
+- '--exact-average' runs on the GPU (6.6x the CPU for 0.26M particles at 256^3) and in 2D; on a 512^3 TNG run it
+  costs 1.14-1.65x the wall time of the sampled average.
+- The '--gpu' '_a' interpolation is rewritten and sums in exact fixed point: two GPU runs are byte-identical.
+- Monte-Carlo cell averages ('--method 1'): samples centred on each tetrahedron's centroid, vertex order hashed
+  from the positions; unbiased (box mean 1.00002 on the demo) and the same for any split.
+- '--sample-points' and '--serve' work with '--partition', '--pts-vel-grad' and '--pts-scalar'.
+- '--scale-factor a' for the V-web (else the snapshot's 'Time'); the T-web works in 2D.
+
+Both programs
+- 'make DOUBLE=1' builds DTFE-double / PS-DTFE-double (float64 grids, about twice the memory); 'make DIM=2'
+  builds DTFE-2d / PS-DTFE-2d for 2D snapshots (CPU only). All sets coexist with the single 3D pair; a snapshot
+  with the wrong number of coordinate columns is refused with the name of the binary to use.
+- GPU backends METAL=1 (Apple Silicon), CUDA=1 and HIP=1, one per build; '--gpu' / '--ps-gpu' at run time, and
+  the CPU with a warning when no device works. CUDA and HIP are line-by-line ports of the Metal kernels,
+  compile-tested and validated through the CPU emulation (CUDAEMU=1, warp widths 32 and 64); they have not yet
+  run on NVIDIA or AMD hardware.
+- GPU robustness: paced command buffers, periodic grid snapshots and cause-aware retries; a chunk that keeps
+  failing runs on the CPU, and the log counts the retries by cause and the passes that fell back.
+- Exact sums: the PS mass and moment grids (GPU and CPU) and the standard '_a' GPU grids are 64-bit fixed-point
+  sums, so PS grids are identical run to run at any thread count and '--max-concurrent'.
+- Auto-tuning when '--partition' / '--max-concurrent' are not given: the budget is 60% of the RAM, never more
+  than the other programs leave free less 4 GB (DTFE_MEM_FRACTION, DTFE_MEM_BUDGET_GB); a time-aware split below
+  2e6 particles; a partition waits until the free memory holds it; grids above 2^32 cells. '--auto-tune-report'
+  prints the plan and exits.
+- '--scratch-dir DIR': allocations of 1 GB and more live in unlinked files on a local disk, the outputs
+  unchanged (a 64 GB machine runs a 1024^3 grid with the full field set).
+- '--tessellation-cache DIR': later runs on the same input reuse the tessellation (compressed, about 0.15 KB per
+  vertex); a changed input is a miss, never a wrong result.
+- '--resume': a killed partitioned run continues from <prefix>.runlog.checkpoint, byte-identical to an
+  uninterrupted run (the drivers pass it themselves).
+- The next partition is tessellated while the GPU deposits ('--no-overlap' / '--ps-no-overlap' switch it off).
+- '--serve' ('--serve-progress', '--serve-resident N'): an interactive tessellation server for Python
+  (dtfelib.Estimator); a composite of partitions on disk serves boxes too large for the memory; 2D too.
+- '--pts-vel-grad' writes the velocity gradient at the sample points.
+- Exact point location (CGAL predicates with simulation of simplicity): a point on a shared face, edge or vertex
+  is counted once, identically under any '--partition'; point evaluation is multi-threaded.
+- Crash-safe output: files are written as <file>.part.<pid> and renamed when complete; when the output folder
+  disappears the grids go to $TMPDIR/dtfe-rescue/ and the program exits with status 3; <prefix>.runlog.progress
+  reports the progress.
+- '--interlace' also works without '--periodic', on a region at least half a cell inside the box.
+- Environment variables follow one rule (empty = unset; 0, false, no, off switch off; 'auto' where a knob has
+  three states), listed in one README table; the *_GPU_* names are primary, the *_METAL_* spellings aliases.
+- '--version' and the run log's 'Build:' line give the git revision and the build time.
+
+Correctness fixes
+- PS-DTFE: the GPU mass grid dropped small shares in float atomics (0.06% of the box mass); now exact.
+- PS-DTFE: stream counts over-counted tetrahedra that fell back to their centroid (11.6% of the cells too high
+  at nSub=1 on crossed waves).
+- PS-DTFE: valid small tetrahedra were dropped by an absolute determinant guard; it is relative now.
+- PS-DTFE: the cut of near-flat tetrahedra depended on CGAL's vertex labels, so partitioned and padded runs kept
+  different ones; a partitioned run now equals one tessellation.
+- PS-DTFE: periodic seams deposited tetrahedra twice or not at all near the box faces; '--box' region faces of
+  non-periodic runs piled up mass; '--partition' seams came from convex-hull slivers.
+- PS-DTFE: a single-domain periodic run on an exact lattice lost 4.1% of the mass (a tie at the box edge).
+- Point evaluation counted points near shared faces twice (PS-DTFE) and had coverage holes (standard DTFE).
+- '--partition' with one value read garbage counts and could write all-zero grids with exit status 0; one value
+  now means that many partitions per axis.
+- '--interlace': the half-cell phase was wrong for modes negative in exactly one axis (31% off).
+- NGP/CIC/TSC/PCS indexed the grid with 32-bit integers (heap corruption above about 1290^3 cells).
+- T-web and V-web eigenvalues are computed in double (the float solution was 6e-4 off for degenerate cells).
+- '--Voronoi' wrote an empty density file or crashed on split runs; it now takes only the density.
+- The HDF5 reader takes per-particle masses from 'Masses' when 'Mass' is absent (IllustrisTNG, GADGET-4).
+- Linux: a thin '--region' no longer throws bad_alloc; an empty partition box on clustered data no longer
+  crashes.
+
+Scripts and data workflow
+- Run logs: <prefix>.runlog.partial while running, renamed .runlog on success or .runlog.failed; a lock
+  refuses a second driver on the same snapshot; a rerun moves the earlier run's leftover files to
+  <prefix>.superseded/<date_time>/ (never deleted).
+- Each snapshot is checked first: the data disk present, the output folder writable with room for the grids
+  (DTFE_SPACE_CHECK=0 skips the space check).
+- DRY_RUN=1 prints the commands; AUTO_TUNE_REPORT=1 prints the binary's plan; a killed run resumes on the next
+  driver run (PS_RESUME=0 / DTFE_RESUME=0 start over).
+- DTFE_PRECISION=double runs the double pair; GRID_SIZE / PADDING (or DTFE_GRID_SIZE / DTFE_PADDING) are read
+  from the environment; snapshot numbers are decimal ('099'); the drivers keep the Mac awake, print the peak
+  memory and run on Linux.
+- Driver knobs for the new options (PS_EXACT, PS_LINEAR_DEPOSIT, PS_CAUSTIC_CUSPS, PS_PARALLEL_TRI,
+  PS_LAG_PADDING, ORDERED_MERGE, FIXED_POINT_MERGE, PTS_CONVENTIONS, SAMPLE_POINTS, PTS_VEL_GRAD, TESS_CACHE,
+  SCRATCH_DIR and more): each driver's '--help' lists them.
+- scripts/run_ps_pipeline.sh (new): per snapshot of SIMS, the grids and a full-box point-evaluated image plane
+  from one tessellation; finished snapshots are skipped.
+- Downloads: download_snapshots.sh removes truncated chunks before fetching and exits non-zero on any error;
+  merge_HDF5.py (now with '-d DIR' required) writes a combined file only after checking it against the header's
+  chunk count and the particle totals.
+- Two layouts of the data root are recognised: <root>/<family>/<sim>/ (e.g. TNG100/TNG100-3-Dark) and
+  <root>/<sim>/.
+- scripts/install.sh installs the dependencies, builds the best backend, rebuilds existing double and 2D sets,
+  installs dtfelib and the launcher, and keeps the old binaries when a compile fails. The scripts and tests run
+  PYTHON, else the first python3 that imports numpy and h5py.
+
+dtfelib, analysis and the void toolkit
+- dtfelib.Estimator: a live '--serve' process, the tessellation built once and queried at any points from
+  Python (density, velocity, streams, dispersion, gradients), bit-identical to '--sample-points';
+  Estimator.from_arrays() takes particles straight from numpy.
+- FieldSet: float32 and float64 grids, memory-mapped loading above a RAM budget, slices and streamed slabs;
+  mean_field=True gives the gradients of the mean flow grad<v> for PS grids (the files hold the stream average
+  <grad v>); single-stream and fold masks. PointPlane loads .pts_* image planes.
+- The plot scripts share one command line ('--data-root', '--sim', '--snap', '--method', ...); figures go to
+  DTFE_FIGURES_ROOT, else python/figures; a non-default option tags the file name.
+- Void toolkit: catalogues of smoothed-density minima with their shapes, a measured radius R_v beside the
+  ellipsoid radius, distinct voids, a smoothing fixed in Mpc across boxes; abundance and size function against
+  theory, stacked profiles and their evolution, void-in-cloud against void-in-void, fate between snapshots by
+  particle IDs, tracking back in time, cross-box comparison, convergence in grid, particle mass and estimator.
+  'analyze.py export' writes the catalogues as CSV and HDF5.
+- Further analyses: the caustic skeleton (walls, filaments, nodes), stream multiplicity per T-web / V-web class,
+  P(k) of both estimators against linear theory, image planes (plot_pointeval.py, plot_pointeval_panels.py).
+- analyze.py gained the 'export', 'voids' and 'cache' modes (listing, pruning and moving the analysis cache).
+
+The launcher (new: scripts/gui.sh, Lamina.app)
+- Tabs Data (downloads and merges), Grids (the drivers), Custom snapshot (either program on any file), Pipeline,
+  Plots and Explore. Every job shows the exact commands it runs, checks refused combinations and the memory,
+  exports a bash or SLURM script, and waits in a queue kept across sessions.
+- Explore: slices of any run, a point-evaluation server behind the map (a click lists every stream there, a
+  dragged rectangle zooms, an exact zoom reruns the region), figure grids, void outlines and inspector, export
+  for publication.
+- Runs and Running now: every run log on disk (settings, time, peak memory, GPU retries), outputs made before an
+  output-changing fix flagged, resumable runs, stop buttons. A first-run setup builds the programs and opens a
+  demo.
+
+Build, tests and documentation
+- Makefile: zlib required (tessellation cache); libdeflate and TBB optional (LIBDEFLATE=, TBB=auto|0|1);
+  third-party headers through -isystem, so every build mode compiles without warnings; GCC builds use
+  -ffp-contract=off for bit-identical results.
+- Linux: a Dockerfile (CPU) and CI with six jobs: the single, double and 2D pairs and the launcher; every .py
+  under Python 3.10 plus pyflakes; compile variants and libDTFE; the CUDA/HIP emulation at warp widths 32 and
+  64; CUDA and HIP compiles. tests/ci_suite.sh is the one list of suites.
+- tests/dev/: battery.sh (31 stages, the Metal GPU suites included) and bytecmp.sh (byte-for-byte comparison of
+  two builds' outputs).
+- The README rewritten for Lamina, demo/COMMANDS.md as a cheat sheet, CITATION.cff, AUTHORS and COPYRIGHT.
+
+
 VERSION 1.3.0
 - Added exact '_a' volume averaging for the STANDARD DTFE binary, '--exact-average'
   (reuses the vendored third_party/r3d): the volume-averaged fields are computed by

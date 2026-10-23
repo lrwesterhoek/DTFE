@@ -496,7 +496,7 @@ rm -f "${TMP}"/at_n*
 
 # ---------- (O) the parallel insert's transient ----------
 echo ">> O: --parallel-triangulation is in the predicted peak"
-if "${BIN}" --help 2>&1 | grep -q -- "--parallel-triangulation"; then
+if grep -q -- "--parallel-triangulation" <<< "$("${BIN}" --help 2>&1)"; then
     pred_o() {
         env DTFE_RAM_GB=64 "${BIN}" "${SNAP}" "${TMP}/at_o" --grid 32 --periodic --input 105 --MpcUnit 1 --field density \
             --partition 2 2 2 --max-concurrent 2 --auto-tune-report "$@" 2>/dev/null \

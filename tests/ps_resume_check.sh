@@ -49,7 +49,7 @@ C=(--grid 48 --periodic --input 105 --MpcUnit 1 --field density velocity density
    --partition 4 4 4)
 
 echo ">> C1: the uninterrupted --ordered-merge reference (64 partitions, --max-concurrent 4)"
-"$BIN" --help 2>&1 | grep -q -- "--resume"; check "C1 '--resume' is in the help" $?
+grep -q -- "--resume" <<< "$("${BIN}" --help 2>&1)"; check "C1 '--resume' is in the help" $?
 OMP_NUM_THREADS=4 "$BIN" "$SNAP" "$TMP/ref" "${C[@]}" --verbose 2 --max-concurrent 4 --ordered-merge > "$TMP/ref.log" 2>&1 \
     || { echo "FAIL: ref (see $TMP/ref.log)"; exit 1; }
 grep -q "checkpoints of the merged grids go to '$TMP/ref.runlog.checkpoint'" "$TMP/ref.log" \

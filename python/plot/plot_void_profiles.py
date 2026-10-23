@@ -97,7 +97,7 @@ def edges_tag(edges, default_edges) -> str:
 
 
 def main():
-    parser = make_parser("Void-centred stacked profiles in r / R_eff (density, v_r, single-stream fraction).")
+    parser = make_parser("Void-centred stacked profiles in r / R_v (r / R_eff with --radius r_eff): density, v_r, single-stream fraction.")
     parser.add_argument("--snaps", type=int, nargs="*", default=None, help="snapshots (default: --snap)")
     parser.add_argument("--sample", choices=("resolved", "deep"), default="resolved",
                         help="well-resolved voids, or those also deeper than config.DEEP_VOID_THRESHOLD")

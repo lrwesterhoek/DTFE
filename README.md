@@ -441,8 +441,9 @@ A cell's value is either the field at the cell centre (`density`, ...) or its av
 Both binaries evaluate their fields at arbitrary points (`--sample-points FILE`: text `x y z` lines or raw float64
 triples), one record per point: `.pts_den`, `.pts_vel`, `.pts_streams` (PS-DTFE: the stream count; standard DTFE: 0/1
 coverage), and with options `.pts_velGrad` (`--pts-vel-grad`), the density gradient (`--pts-den-grad`), the caustic bits
-(`--ps-caustics`), and in PS-DTFE the per-stream records (`--per-stream`, `--per-stream-ids`), each stream's Lagrangian
-origin (`--pts-lagrangian`) and a per-particle dataset along it (`--pts-scalar --scalar-dataset NAME`). Point location
+`.pts_caustic` (`--ps-caustics`; the bits of `.causticClass`), and in PS-DTFE the per-stream records (`--per-stream`,
+`--per-stream-ids`), each stream's Lagrangian origin (`--pts-lagrangian`) and a per-particle dataset along it
+(`--pts-scalar --scalar-dataset NAME`). Point location
 is exact: a point on a shared face, edge or vertex is counted once per stream, also across the periodic boundary and
 under any `--partition` split (each partition answers the points in the tetrahedra whose centroid it owns, so the
 values equal one triangulation's to rounding). `--ps-stream-density dtfe|geometric` picks the per-stream estimator.
@@ -580,8 +581,9 @@ The files and fields of the TNG data are described in the
 
 1. **Download and merge** (a TNG API key in `~/.tng_api_key`, `TNG_API_KEY` or `-k`):
    `DTFE_SIM=TNG100-3-Dark scripts/download_snapshots.sh 50 99` fetches the raw chunks (`-c` the group catalogues,
-   `-t` the merger trees, `-i` the initial conditions; no numbers: the 19-snapshot ladder) and merges them with
-   `python/tools/merge_HDF5.py`; a combined file appears only when every chunk is there and the totals verify.
+   `-t` the merger trees, `-i` the initial conditions; no numbers: the 19-snapshot ladder);
+   `python3 python/tools/merge_HDF5.py -d <the simulation's folder> 50 99` merges them (the launcher's Data tab runs
+   both); a combined file appears only when every chunk is there and the totals verify.
 2. **Run an estimator**: `DTFE_SIM=TNG100-3-Dark scripts/run_ps_dtfe.sh 50 99` (phase-space) or
    `DTFE_SIM=TNG100-3-Dark scripts/run_dtfe.sh 50 99` (standard; with no numbers both run snapshot 99). Both default to the production
    settings, so `-g 512 -m` (and run_dtfe.sh's `-e`) are not needed; run_ps_dtfe.sh's `-e` selects the exact deposit.
@@ -603,6 +605,7 @@ is unset or the data disk is missing, and skips a snapshot whose folder is not w
 | `DTFE_SIM` (or `-s`) | the simulation | none: required |
 | `DTFE_FIGURES_ROOT` | where every figure goes (the plot scripts, `analyze.py`, the launcher) | `python/figures` (git-ignored) |
 | `PYTHON` | the python the scripts (and the test suites) run for numpy and h5py; the launcher passes its own as `PY` | the first of `python3` on `PATH`, Homebrew's and `/usr/local`'s that imports both (`scripts/h5py_python.sh`) |
+| `DTFE_PY_RAM_GB`, `DTFE_PY_LOAD_FRAC` | dtfelib's `FieldSet.load`: the available RAM in GB, and the share of it one grid may take before `mode='auto'` memory-maps it instead of reading it | detected; 0.5 |
 | `DTFE_SIGMA_MPC` | the void catalogue's smoothing in Mpc, the same in every box (for the void scripts and `analyze.py export`) | unset: 10 cells |
 | `GRID_SIZE` (or `-g`) | cells per axis of the grids | 512 (`config.sh`; `DTFE_GRID_SIZE` too; the production grids of both estimators) |
 | `PADDING` | the padding of each partition (and in standard DTFE of each thread's sub-box) in mean particle spacings; `DTFE_PADDING` too | standard DTFE 15 (`run_dtfe.sh`), PS-DTFE 50 (`config.sh`; it matters only for an unsplit tessellation or `PS_LAG_PADDING=0`) |

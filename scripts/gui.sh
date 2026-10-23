@@ -1,13 +1,20 @@
 #!/usr/bin/env bash
-# Graphical launcher for run_ps_dtfe.sh / run_dtfe.sh (python/gui/app.py, PySide6 prototype).
+# Lamina's graphical launcher (python/gui/app.py, PySide6): the drivers, the plot scripts and Explore.
 #
-#   scripts/gui.sh
+#   scripts/gui.sh            open the window
+#   scripts/gui.sh --setup    open the first-run setup dialog again
+#   scripts/gui.sh --smoke    build the window, print what its jobs would use, and quit
+#   scripts/gui.sh --help     this text
 #
 # Uses DTFE_GUI_PYTHON if set, else the venv scripts/install.sh sets up (~/.venvs/dtfe-gui, or
 # DTFE_GUI_VENV), else python3. Set up once with scripts/install.sh, or by hand:
 #   python3 -m venv ~/.venvs/dtfe-gui --system-site-packages   # keeps numpy/h5py from the system
 #   ~/.venvs/dtfe-gui/bin/pip install PySide6
+
 set -euo pipefail
+case "${1:-}" in
+    -h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+esac
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 PY="${DTFE_GUI_PYTHON:-}"

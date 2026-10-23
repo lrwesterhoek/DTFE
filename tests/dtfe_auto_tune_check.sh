@@ -61,7 +61,7 @@ if [ "${1:-}" != "--no-build" ] && ! precision_double; then
     make DTFE $(cat o/.build_mode 2>/dev/null || true) >/dev/null
 fi
 [ -x "${BIN}" ] || { echo "FAIL: ${BIN} not built"; exit 1; }
-GPU=0; "${BIN}" --help 2>&1 | grep -q -- "--gpu" && grep -Eq "METAL=1|CUDA=1|HIP=1" "o$(precision_double && echo _d)/.build_mode" 2>/dev/null && GPU=1
+GPU=0; grep -q -- "--gpu" <<< "$("${BIN}" --help 2>&1)" && grep -Eq "METAL=1|CUDA=1|HIP=1" "o$(precision_double && echo _d)/.build_mode" 2>/dev/null && GPU=1
 
 echo ">> generating the clustered test snapshot ..."
 "${PY}" "${SCRIPT_DIR}/generate_ps_test_data.py" --out "${SNAP}" --n "${N}" --box "${BOX}" --crossed-waves \
@@ -129,9 +129,9 @@ for cfg in "b3|3 3 3|8" "b4|4 4 4|4"; do
     out="$(compare_counts "${tag}" "${split}" "${mc}")"
     printf '%s\n' "${out}" | grep '^   \.\.\.\.' || true
     check "B ${split// /x} x ${mc}: the busiest partition and its padded vertices (sum and per thread) within 10% of the run's" \
-          "$(printf '%s\n' "${out}" | grep -q '^OKB 1' && echo 1 || echo 0)"
+          "$(grep -q '^OKB 1' <<< "${out}" && echo 1 || echo 0)"
     check "C ... and the run's busiest partition holds >= 1.5x the box-average count the old model used" \
-          "$(printf '%s\n' "${out}" | grep -q 'OKC 1' && echo 1 || echo 0)"
+          "$(grep -q 'OKC 1' <<< "${out}" && echo 1 || echo 0)"
 done
 rm -f "${TMP}"/da_b*.a_den "${TMP}"/da_b*badGridPoints*
 
@@ -160,11 +160,11 @@ PYEOF
     rm -f "${TMP}/da_${tag}".a_* "${TMP}/da_${tag}"*badGridPoints*
 }
 out="$(run_e e_cpu)"; printf '%s\n' "${out}" | grep '^   \.\.\.\.' || true
-check "E the SUMMARY of an auto-tuned standard run carries the 'memory model' line" "$(printf '%s\n' "${out}" | grep -q NOLINE && echo 0 || echo 1)"
-check "E CPU, sampled average: measured <= 1.35x predicted" "$(printf '%s\n' "${out}" | grep -q 'OKE 1' && echo 1 || echo 0)"
+check "E the SUMMARY of an auto-tuned standard run carries the 'memory model' line" "$(grep -q NOLINE <<< "${out}" && echo 0 || echo 1)"
+check "E CPU, sampled average: measured <= 1.35x predicted" "$(grep -q 'OKE 1' <<< "${out}" && echo 1 || echo 0)"
 if [ "${GPU}" = 1 ]; then
     out="$(run_e e_gpu --gpu --exact-average)"; printf '%s\n' "${out}" | grep '^   \.\.\.\.' || true
-    check "E GPU, exact average: measured <= 1.35x predicted" "$(printf '%s\n' "${out}" | grep -q 'OKE 1' && echo 1 || echo 0)"
+    check "E GPU, exact average: measured <= 1.35x predicted" "$(grep -q 'OKE 1' <<< "${out}" && echo 1 || echo 0)"
 else
     echo "   SKIP  E GPU (this build has no GPU backend)"
 fi
